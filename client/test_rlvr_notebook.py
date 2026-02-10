@@ -12,24 +12,30 @@ os.environ.setdefault("TINKER_BASE_URL", "http://localhost:8000")
 
 def generate_problem():
     n = random.choice([2, 4, 6])
-    nums = [random.choices(range(1, 10), k=1)[0] if random.random() < 0.7 else random.randint(10, 19) for _ in range(n)]
+    nums = [random.choices(range(1, 10), k=1)[0] if random.random() < 0.7 
+            else random.randint(10, 19) for _ in range(n)]
     sums = [nums[i] + nums[i+1] for i in range(0, len(nums), 2)]
     answer = math.prod(sums)
     return nums, sums, answer
+
+SYSTEM_PROMPT = """Add adjacent pairs of numbers, then multiply the results.
+
+Example: 3, 5, 2, 4
+- Add pairs: 3+5=8, 2+4=6
+- Multiply: 8×6=48
+- Answer: <answer>48</answer>
+
+Now solve the problem below. Put your final answer in <answer>X</answer> tags."""
 
 def compute_reward(response, correct_answer, concise_bonus=False):
     rewards = {"format": 0.0, "correct": 0.0, "concise": 0.0}
     answer_match = re.search(r'<answer>\s*(\d+)\s*</answer>', response)
     if answer_match:
         rewards["format"] = 0.1
-        if int(answer_match.group(1)) == correct_answer:
-            rewards["correct"] = 1.0
-            
+        if int(answer_match.group(1)) == correct_answer: rewards["correct"] = 1.0
     if concise_bonus:
         words = len(response.split())
-        if words < 200:
-            rewards["concise"] = 0.3 * max(0, (200 - words) / 180)
-            
+        if words < 200: rewards["concise"] = 0.3 * max(0, (200 - words) / 180)
     rewards["total"] = sum(rewards.values())
     return rewards
 
@@ -41,7 +47,7 @@ async def main():
     print(f"\n3. Creating LoRA Training Client for '{base_model}'...")
     try:
         training_client = await service_client.create_lora_training_client_async(
-            base_model=base_model, rank=16
+            base_model=base_model, rank=8
         )
     except Exception as e:
         print(f"Error creating client: {e}")
@@ -49,93 +55,66 @@ async def main():
 
     tokenizer = training_client.get_tokenizer()
 
-    SYSTEM_PROMPT = """Add adjacent pairs of numbers, then multiply the results.
-Example: 3, 5, 2, 4
-- Add pairs: 3+5=8, 2+4=6
-- Multiply: 8×6=48
-- Answer: <answer>48</answer>
-
-Now solve the problem below. Put your final answer in <answer>X</answer> tags."""
-
     def make_prompt_tokens(problem):
-        nums, sums, answer = problem
-        user_msg = f"We are given the numbers: {', '.join(map(str, nums))}"
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg}
-        ]
+        nums, _, _ = problem
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, 
+                    {"role": "user", "content": ", ".join(map(str, nums))}]
         text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
         return tokenizer.encode(text, add_special_tokens=False)
+
+    print(tokenizer.decode(make_prompt_tokens(generate_problem())))
 
     def compute_advantages(rollouts):
         """GRPO-style: normalize rewards to mean=0, std=1."""
         rewards = np.array([r["reward"] for r in rollouts])
-        if rewards.std() < 1e-8:
-            return [0.0] * len(rollouts)
+        if rewards.std() < 1e-8: return [0.0] * len(rollouts)
         return ((rewards - rewards.mean()) / (rewards.std() + 1e-8)).tolist()
 
     def make_rl_datum(rollout: dict, advantage: float) -> types.Datum:
         """Create Datum for importance sampling loss."""
         prompt_tokens, completion_tokens = rollout["prompt_tokens"], rollout["completion_tokens"]
-        full_tokens = list(prompt_tokens) + list(completion_tokens)
-        
+        full_tokens = prompt_tokens + list(completion_tokens)
+    
         input_tokens, target_tokens = full_tokens[:-1], full_tokens[1:]
-        
         n_prompt = len(prompt_tokens) - 1
         n_completion = len(completion_tokens)
-        
+    
         return types.Datum(
-            model_input=types.ModelInput.from_ints(tokens=input_tokens),
-            loss_fn_inputs={
-                "target_tokens": target_tokens,
-                "weights": [1.0] * len(target_tokens),
-                "logprobs": [0.0] * n_prompt + list(rollout["completion_logprobs"]),
-                "advantages": [0.0] * n_prompt + [advantage] * n_completion
-            }
-        )
+        model_input=types.ModelInput.from_ints(tokens=input_tokens),
+        loss_fn_inputs={
+            "target_tokens": target_tokens,
+            "logprobs": [0.0] * n_prompt + list(rollout["completion_logprobs"]),
+            "advantages": [0.0] * n_prompt + [advantage] * n_completion
+        }
+    )
 
-    async def run_rollouts(n_problems=4, n_samples=4, concise_bonus=False):
+    def run_rollouts(n_problems=4, n_samples=4, concise_bonus=False):
         """Generate fresh problems, sample completions, compute rewards."""
         rollouts = []
-        sampling_client = await training_client.save_weights_and_get_sampling_client_async(name="rlvr_notebook_sampler")
-        
+        sampling_client = training_client.save_weights_and_get_sampling_client()
         for _ in range(n_problems):
-            problem = generate_problem() 
+            problem = generate_problem()  # Fresh each time
             ans = problem[2]
             prompt_tokens = make_prompt_tokens(problem)
-            
-            response = await sampling_client.sample_async(
+            response = sampling_client.sample(
                 prompt=types.ModelInput.from_ints(tokens=prompt_tokens),
                 num_samples=n_samples,
                 sampling_params=types.SamplingParams(max_tokens=256, temperature=0.8)
-            )
-            
+            ).result()
             for seq in response.sequences:
-                completion_text = tokenizer.decode(seq.tokens)
-                reward_info = compute_reward(completion_text, ans, concise_bonus)
-                rollouts.append({
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": seq.tokens,
-                    "completion_logprobs": seq.logprobs,
-                    "completion_text": completion_text,
-                    "reward": reward_info["total"],
-                    "reward_breakdown": reward_info,
-                    "correct_answer": ans
-                })
+                reward_info = compute_reward(tokenizer.decode(seq.tokens), ans, concise_bonus)
+                rollouts.append({ "prompt_tokens": prompt_tokens, "completion_tokens": seq.tokens, "completion_logprobs": seq.logprobs, "completion_text": tokenizer.decode(seq.tokens), "reward": reward_info["total"], "reward_breakdown": reward_info, "correct_answer": ans })
         return rollouts
 
-    async def train_step(n_problems=4, n_samples=4, lr=1e-4, concise_bonus=False):
-        rollouts = await run_rollouts(n_problems, n_samples, concise_bonus)
+    def train_step(n_problems=4, n_samples=4, lr=1e-4, concise_bonus=False):
+        """One RL step: rollouts → advantages → update."""
+        rollouts = run_rollouts(n_problems, n_samples, concise_bonus)
         advantages = compute_advantages(rollouts)
-        
         datums = [make_rl_datum(r, a) for r, a in zip(rollouts, advantages)]
         
-        fwdbwd_future = await training_client.forward_backward_async(datums, "importance_sampling")
-        await fwdbwd_future
-        
-        optim_future = await training_client.optim_step_async(types.AdamParams(learning_rate=lr))
-        await optim_future
-        
+        training_client.forward_backward(datums, "importance_sampling").result()
+        training_client.optim_step(types.AdamParams(learning_rate=lr)).result()
+    
         rewards = [r["reward"] for r in rollouts]
         words = [len(r["completion_text"].split()) for r in rollouts]
         return {
@@ -144,10 +123,11 @@ Now solve the problem below. Put your final answer in <answer>X</answer> tags.""
             "words": np.mean(words),
         }, rollouts
 
+    # Training loop - fresh problems each iteration!
     history = []
     print(f"{'Iter':>4} | {'Reward':>6} | {'Acc':>5} | {'Words':>5}\n" + "-" * 40)
     for i in range(10):
-        metrics, rollouts = await train_step(n_problems=8, n_samples=8, lr=2e-4, concise_bonus=(i>5))
+        metrics, rollouts = train_step(n_problems=8, n_samples=8, lr=2e-4, concise_bonus=(i>5))
         history.append(metrics)
         print(f"{i+1:>4} | {metrics['reward']:>6.2f} | {metrics['accuracy']:>5.0%} | {metrics['words']:>5.0f}")
 

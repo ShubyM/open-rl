@@ -108,6 +108,8 @@ class TrainerEngine:
                 
                 ratio = torch.exp(target_logprobs - ref_tensor)
                 # Policy gradient loss: -ratio * advantage * mask
+                if weights_tensor.numel() == 0:
+                    weights_tensor = torch.ones_like(advantages_tensor)
                 elementwise_loss = - (ratio * advantages_tensor) * weights_tensor
                 loss = elementwise_loss.sum()
             else:
