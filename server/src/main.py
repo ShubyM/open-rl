@@ -55,6 +55,9 @@ async def create_model(req: dict):
                 "type": "create_model"
             })
         except Exception as e:
+            import traceback
+            traceback.print_exc()
+
             set_future_result(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
 
     asyncio.create_task(_load_model_task())
@@ -92,6 +95,9 @@ async def forward_backward(req: dict):
             result["type"] = "forward_backward"
             set_future_result(req_id, result)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
+
             set_future_result(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
 
     asyncio.create_task(_fwd_task())
@@ -110,6 +116,9 @@ async def optim_step(req: dict):
             result["type"] = "optim_step"
             set_future_result(req_id, result)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
+
             set_future_result(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
             
     asyncio.create_task(_optim_task())
@@ -173,6 +182,9 @@ async def asample(req: dict):
                 "type": "sample"
             })
         except Exception as e:
+            import traceback
+            traceback.print_exc()
+
             set_future_result(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
             
     asyncio.create_task(_sample_task())

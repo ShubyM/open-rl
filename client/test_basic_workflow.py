@@ -4,8 +4,8 @@ import tinker
 from tinker import types
 
 # Make sure to point the tinker client at our backend server.
-os.environ["TINKER_API_KEY"] = "tml-dummy-key"
-os.environ["TINKER_BASE_URL"] = "http://localhost:8000"
+os.environ.setdefault("TINKER_API_KEY", "tml-dummy-key")
+os.environ.setdefault("TINKER_BASE_URL", "http://localhost:8000")
 
 async def main():
     print("1. Initializing Service Client...")

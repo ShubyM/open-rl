@@ -5,8 +5,8 @@ import random
 import matplotlib.pyplot as plt
 from tinker import ServiceClient, types
 
-os.environ["TINKER_API_KEY"] = "tml-dummy-key"
-os.environ["TINKER_BASE_URL"] = "http://127.0.0.1:8000"
+os.environ.setdefault("TINKER_API_KEY", "tml-dummy-key")
+os.environ.setdefault("TINKER_BASE_URL", "http://127.0.0.1:8000")
 
 PHRASES = [
     "Hello world!",

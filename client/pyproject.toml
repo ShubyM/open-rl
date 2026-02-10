@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "jinja2",
     "matplotlib>=3.10.8",
     "requests>=2.32.5",
     "tinker>=0.12.0",

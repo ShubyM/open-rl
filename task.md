@@ -22,3 +22,10 @@
 + [ ] Build logic for generating single-digit addition/subtraction prompts
 + [ ] Calculate exact-match rewards
 + [ ] Run RL test for 100 epochs to prove `Qwen-0.5B` convergence.
+
+## Phase 5: Reproducing "Tinkering with Tinker" Notebook
+- [x] Create implementation plan
+- [x] Write SFT test script `client/test_sft_notebook.py`
+- [x] Write RLVR test script `client/test_rlvr_notebook.py`
+- [x] Update Makefile with `run-client-sft-notebook` and `run-client-rlvr-notebook` targets
++ [x] Run test scripts on remote GCP VM

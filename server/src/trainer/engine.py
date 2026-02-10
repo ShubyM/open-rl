@@ -51,6 +51,9 @@ class TrainerEngine:
         """
         assert self.model is not None, "Model not loaded."
         
+        if self.optimizer is not None:
+            self.optimizer.zero_grad()
+        
         total_loss = 0.0
         loss_fn_outputs = []
         
@@ -73,7 +76,9 @@ class TrainerEngine:
             targets_tensor = torch.tensor(targets_data, dtype=torch.long, device=self.device)
             
             # Forward pass
-            outputs = self.model(inputs_tensor)
+            print(f"inputs_tensor shape: {inputs_tensor.shape}")
+            print(f"targets_tensor shape: {targets_tensor.shape}")
+            outputs = self.model(inputs_tensor, use_cache=False)
             logits = outputs.logits[0] # Shape: (SeqLen, VocabSize)
             
             # log_softmax
@@ -153,7 +158,7 @@ class TrainerEngine:
         print(f"DEBUG: grad_norm={total_norm}")
 
         self.optimizer.step()
-        self.optimizer.zero_grad()
+        # self.optimizer.zero_grad()
         return {
             "metrics": {"grad_norm:mean": total_norm} # actual grad norm
         }
