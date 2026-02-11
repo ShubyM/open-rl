@@ -33,18 +33,48 @@ def compute_reward(response, correct_answer, concise_bonus=False):
     response = response.strip()
     rewards = {"format": 0.0, "correct": 0.0, "concise": 0.0}
     
-    # Perfect match: No conversational filler, just the tags and the exact correct answer.
+    # Check if the correct answer is factually present anywhere to avoid pure hallucination
+    if correct_answer.lower() not in response.lower():
+        rewards["correct"] = -1.0
+        rewards["format"] = -1.0
+        rewards["total"] = -2.0
+        return rewards
+
+    # Evaluate Formatting and Exactness
     if response.lower() == f"<answer>{correct_answer.lower()}</answer>":
+        # Perfect exact match, no whitespaces
         rewards["format"] = 1.0
         rewards["correct"] = 1.0
     else:
-        # Partial match: Has the tags, but includes extra text or hallucinations
-        answer_match = re.search(r'<answer>\s*(.*?)\s*</answer>', response, re.IGNORECASE)
+        answer_match = re.search(r'<answer>(.*?)</answer>', response, re.IGNORECASE)
+        any_tag_match = re.search(r'<(.*?)>(.*?)</\1>', response, re.IGNORECASE)
+        
         if answer_match:
-            rewards["format"] = 0.5
-            if correct_answer.lower() in answer_match.group(1).lower():
+            inner_text = answer_match.group(1)
+            # Must be an exact match (with or without padding) inside the tags
+            if inner_text.lower() == correct_answer.lower():
+                # Perfect match but maybe has conversational text OUTSIDE the tags
                 rewards["correct"] = 1.0
+                rewards["format"] = 0.8
+            elif inner_text.strip().lower() == correct_answer.lower():
+                # Matches exactly but has whitespaces padding the inside of the tag
+                rewards["correct"] = 1.0
+                rewards["format"] = 0.5
+            else:
+                # Inside the tag contains extra conversational words or is the wrong answer
+                rewards["correct"] = -1.0
+                rewards["format"] = -0.5
+        elif any_tag_match:
+            inner_text = any_tag_match.group(2)
+            if inner_text.strip().lower() == correct_answer.lower():
+                # Correct answer, but hallucinated a different XML tag
+                rewards["correct"] = 0.0
+                rewards["format"] = 0.1
+            else:
+                rewards["correct"] = -1.0
+                rewards["format"] = -1.0
         else:
+            rewards["correct"] = -1.0
             rewards["format"] = -1.0 # Failed to format completely
             
     rewards["total"] = sum(rewards.values())
@@ -113,7 +143,7 @@ async def main():
             future = sampling_client.sample_async(
                 prompt=types.ModelInput.from_ints(tokens=prompt_tokens),
                 num_samples=n_samples,
-                sampling_params=types.SamplingParams(max_tokens=25, temperature=0.8)
+                sampling_params=types.SamplingParams(max_tokens=25, temperature=1.8)
             )
             futures.append(future)
             
@@ -189,6 +219,11 @@ async def main():
         metrics, rollouts = await train_step(n_problems=4, n_samples=8, lr=5e-4, concise_bonus=False)
         history.append(metrics)
         print(f"{i+1:>4} | {metrics['reward']:>6.2f} | {metrics['accuracy']:>5.0%} | {metrics['words']:>5.0f}")
+        if rollouts:
+            for r in rollouts:
+                sample_text = r['completion_text'].replace('\n', ' ').strip()
+                sample_reward = r['reward']
+                print(f"       -> Sample: {sample_text} (Reward: {sample_reward})")
 
     print("\n-> Generating plot...")
     fig, axes = plt.subplots(1, 3, figsize=(12, 3))
