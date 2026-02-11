@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import random
 import math
@@ -8,7 +9,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tinker import ServiceClient, types
 
-logging.getLogger("tinker").setLevel(logging.WARNING)
+# Suppress noisy polling / retry logs from the tinker SDK
+logging.getLogger("tinker").setLevel(logging.ERROR)
 
 os.environ.setdefault("TINKER_API_KEY", "tml-dummy-key")
 os.environ.setdefault("TINKER_BASE_URL", "http://localhost:8000")
@@ -153,7 +155,33 @@ async def main():
             "words": np.mean(words),
         }, rollouts
 
-    # Training loop - fresh problems each iteration!
+    # ------------------------------------------------------------------
+    # Baseline Evaluation (Before Training)
+    # ------------------------------------------------------------------
+    print("\n--- Baseline Evaluation (Before Training) ---")
+    base_client = training_client.save_weights_and_get_sampling_client(name="initial_base")
+
+    def test_model(client, problem):
+        tokens = make_prompt_tokens(problem)
+        resp = client.sample(types.ModelInput.from_ints(tokens=tokens), num_samples=1,
+                            sampling_params=types.SamplingParams(max_tokens=25, temperature=0.3)).result()
+        text = tokenizer.decode(resp.sequences[0].tokens)
+        return text, compute_reward(text, problem[2])
+
+    eval_problems = [generate_problem() for _ in range(5)]
+    baseline_rewards = []
+    
+    for p in eval_problems:
+        text_base, reward_base = test_model(base_client, p)
+        baseline_rewards.append(reward_base['total'])
+        print(f"Problem: {p[0]}\nBase Response: {text_base.strip()}\nBase Reward: {reward_base['total']}\n")
+        
+    print(f"Avg Baseline Reward: {np.mean(baseline_rewards):.2f}\n")
+
+    # ------------------------------------------------------------------
+    # Training loop - fresh problems each iteration
+    # ------------------------------------------------------------------
+    print("--- Starting RL Training Loop ---")
     history = []
     print(f"{'Iter':>4} | {'Reward':>6} | {'Acc':>5} | {'Words':>5}\n" + "-" * 40)
     num_steps = 15
@@ -180,36 +208,41 @@ async def main():
     plt.savefig('showcase_metrics.png')
     print("Saved 'showcase_metrics.png'")
 
-    print("\n4. Saving weights and creating sampling clients...")
+    # ------------------------------------------------------------------
+    # Trained Evaluation (After Training)
+    # ------------------------------------------------------------------
+    print("\n--- Trained Evaluation (After Training) ---")
     trained_client = training_client.save_weights_and_get_sampling_client(name="rlvr_concise_v1")
 
-    print("\n5. Comparing base vs trained model...")
-    base_training_client = await service_client.create_lora_training_client_async(base_model=base_model, rank=8)
-    base_client = base_training_client.save_weights_and_get_sampling_client()
-
-    def test_model(client, problem):
-        tokens = make_prompt_tokens(problem)
-        resp = client.sample(types.ModelInput.from_ints(tokens=tokens), num_samples=1,
-                            sampling_params=types.SamplingParams(max_tokens=256, temperature=0.3)).result()
-        text = tokenizer.decode(resp.sequences[0].tokens)
-        return text, compute_reward(text, problem[2])
-
-    ds = []
-    for _ in range(5):
-        p = generate_problem()
+    trained_rewards = []
+    for p in eval_problems:
         text, reward = test_model(trained_client, p)
-        text_base, reward_base = test_model(base_client, p)
-        ds.append((text, reward, text_base, reward_base))
-        print(f"Problem: {p[0]}\nTrained Reward: {reward['total']}\nBase Reward: {reward_base['total']}\n")
+        trained_rewards.append(reward['total'])
+        print(f"Problem: {p[0]}\nTrained Response: {text.strip()}\nTrained Reward: {reward['total']}\n")
+        
+    print(f"Avg Trained Reward: {np.mean(trained_rewards):.2f}\n")
 
+class Logger:
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w")
 
-    ds = []
-    for _ in range(5):
-        p = generate_problem()
-        text, reward = test_model(trained_client, p)
-        text_base, reward_base = test_model(base_client, p)
-        ds.append((text, reward, text_base, reward_base))
-        print(f"Problem: {p[0]}\nTrained Reward: {reward['total']}\nBase Reward: {reward_base['total']}\n")
- 
+    def __getattr__(self, attr):
+        return getattr(self.terminal, attr)
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
 if __name__ == "__main__":
+    sys.stdout = Logger("showcase_results.log")
+    print("=" * 60)
+    print("Starting Kube-RL Showcase: The Strict Formatter Test")
+    print("Log saved to: showcase_results.log")
+    print("=" * 60 + "\n")
     asyncio.run(main())
