@@ -1,4 +1,5 @@
 import torch
+import threading
 from typing import Dict, Any, List
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import get_peft_model, LoraConfig, TaskType
@@ -12,6 +13,7 @@ class TrainerEngine:
         
         # Store optimizers per model_id
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
+        self._init_lock = threading.Lock()
         
         # Decide device
         if torch.cuda.is_available():
@@ -24,39 +26,40 @@ class TrainerEngine:
         self.base_model_name = None
 
     def load_model(self, base_model: str, rank: int, model_id: str):
-        if self.model is None or self.base_model_name != base_model:
-            self.base_model_name = base_model
-            print(f"Loading base model {base_model} to {self.device}...")
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(base_model)
-            
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-            base_model_obj = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                torch_dtype=dtype,
-                device_map=self.device
-            )
-            
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=rank,
-                lora_alpha=rank * 2,
-                target_modules=["q_proj", "v_proj"]
-            )
-            # Apply PEFT with the specific adapter name
-            self.model = get_peft_model(base_model_obj, peft_config, adapter_name=model_id)
-            self.model.train()
-            print(f"Base model loaded and wrapped with LoRA adapter '{model_id}'.")
-        else:
-            print(f"Adding new LoRA adapter '{model_id}' to existing base model...")
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=rank,
-                lora_alpha=rank * 2,
-                target_modules=["q_proj", "v_proj"]
-            )
-            self.model.add_adapter(model_id, peft_config)
-            self.model.train()
+        with self._init_lock:
+            if self.model is None or self.base_model_name != base_model:
+                self.base_model_name = base_model
+                print(f"Loading base model {base_model} to {self.device}...")
+                
+                self.tokenizer = AutoTokenizer.from_pretrained(base_model)
+                
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+                base_model_obj = AutoModelForCausalLM.from_pretrained(
+                    base_model,
+                    torch_dtype=dtype,
+                    device_map=self.device
+                )
+                
+                peft_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=rank,
+                    lora_alpha=rank * 2,
+                    target_modules=["q_proj", "v_proj"]
+                )
+                # Apply PEFT with the specific adapter name
+                self.model = get_peft_model(base_model_obj, peft_config, adapter_name=model_id)
+                self.model.train()
+                print(f"Base model loaded and wrapped with LoRA adapter '{model_id}'.")
+            else:
+                print(f"Adding new LoRA adapter '{model_id}' to existing base model...")
+                peft_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=rank,
+                    lora_alpha=rank * 2,
+                    target_modules=["q_proj", "v_proj"]
+                )
+                self.model.add_adapter(model_id, peft_config)
+                self.model.train()
             
         # Reset/initialize optimizer for this new adapter
         if model_id in self.optimizers:
@@ -101,16 +104,21 @@ class TrainerEngine:
             logits = outputs.logits[0] # Shape: (SeqLen, VocabSize)
             
             # gather logprobs for the target tokens
-            # Targets are typically aligned sequentially covering the full text, offset by 1.
-            # E.g. logits[:-1] predict targets[1:]. We clamp length to the shortest one to avoid NaN indexing
-            seq_len = min(logits.size(0) - 1, targets_tensor.size(0))
+            # The client SDK already offsets inputs vs targets.
+            seq_len = min(logits.size(0), targets_tensor.size(0))
             
             sliced_logits = logits[:seq_len]
-            sliced_targets = targets_tensor[-seq_len:] # Match target alignment (right aligned)
+            sliced_targets = targets_tensor[:seq_len] 
             
             target_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1)\
                                 .gather(dim=-1, index=sliced_targets.unsqueeze(-1))\
                                 .squeeze(-1)
+            
+            # Clamp weights tensor if it exists, otherwise ones
+            if weights_tensor.numel() > 0:
+                weights_tensor = weights_tensor[:seq_len]
+            else:
+                weights_tensor = torch.ones_like(target_logprobs)
             
             if loss_fn == "cross_entropy":
                 elementwise_loss = -target_logprobs * weights_tensor
@@ -128,20 +136,14 @@ class TrainerEngine:
                 advantages_tensor = torch.tensor(advs, dtype=target_logprobs.dtype, device=self.device)
                 
                 # Align reference logits and advantages to the generated right-aligned targets
-                ref_tensor = ref_tensor[-seq_len:]
-                advantages_tensor = advantages_tensor[-seq_len:]
+                ref_tensor = ref_tensor[:seq_len]
+                advantages_tensor = advantages_tensor[:seq_len]
                 
                 # Prevent overflow in exp() by explicitly clamping diff
                 diff = target_logprobs - ref_tensor
                 diff = torch.clamp(diff, min=-20.0, max=20.0)
                 
                 ratio = torch.exp(diff)
-                
-                # Clamp weights tensor if it exists, otherwise ones
-                if weights_tensor.numel() > 0:
-                    weights_tensor = weights_tensor[-seq_len:]
-                else:
-                    weights_tensor = torch.ones_like(advantages_tensor)
                     
                 elementwise_loss = - (ratio * advantages_tensor) * weights_tensor
                 # Add nan_to_num to be absolutely sure no trailing NaNs poison the gradients
@@ -232,12 +234,16 @@ class TrainerEngine:
         input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
         
         with torch.no_grad():
+            attention_mask = torch.ones_like(input_tensor)
             outputs = self.model.generate(
                 input_tensor, 
+                attention_mask=attention_mask,
                 max_new_tokens=max_tokens,
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                 do_sample=(num_samples > 1),
                 temperature=0.8 if num_samples > 1 else None, 
+                top_p=None,
+                top_k=None,
                 num_return_sequences=num_samples,
                 output_scores=True,
                 return_dict_in_generate=True

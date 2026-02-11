@@ -5,6 +5,14 @@ from fastapi.responses import JSONResponse
 from .trainer.engine import engine
 import traceback
 from contextlib import asynccontextmanager
+import logging
+
+class FilterNoisyEndpoints(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "retrieve_future" not in msg and "session_heartbeat" not in msg
+
+logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
 futures_store = {}
 request_queue = asyncio.Queue()
@@ -31,11 +39,13 @@ async def clock_cycle_loop():
                     models_to_reqs[m_id] = []
                 models_to_reqs[m_id].append(r)
                 
+            print(f"\n[CLOCK CYCLE] Popped {len(batch)} requests across {len(models_to_reqs)} distinct model tenant(s).")
+                
             for m_id, reqs in models_to_reqs.items():
                 if len(reqs) == 0:
                     continue
                     
-                print(f"--- Clock Cycle processing model_id: {m_id} with {len(reqs)} requests ---")
+                print(f"  -> [TENSOR CORE] Hot-swapping to LoRA adapter: {m_id}")
                 
                 # Set active adapter
                 try:
@@ -46,6 +56,7 @@ async def clock_cycle_loop():
                         set_future_result(r["req_id"], {"type": "RequestFailedResponse", "error_message": str(e)})
                     continue
                     
+                print(f"     Executing {len(reqs)} operations for {m_id}...")
                 # Execute sequentially
                 for r in reqs:
                     req_id = r["req_id"]

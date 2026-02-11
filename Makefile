@@ -12,7 +12,7 @@ run-client-simple:
 	cd client && uv run python test_simple_rl.py
 
 run-client-sft:
-	cd client && uv run python test_sft.py
+	cd client && uv run python test_sft.py $(ARGS)
 
 run-client-rlvr:
 	cd client && uv run python test_rlvr.py
