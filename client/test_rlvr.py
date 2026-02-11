@@ -126,7 +126,7 @@ async def main():
     # Training loop - fresh problems each iteration!
     history = []
     print(f"{'Iter':>4} | {'Reward':>6} | {'Acc':>5} | {'Words':>5}\n" + "-" * 40)
-    num_steps = 2
+    num_steps = 20
     for i in range(num_steps):
         metrics, rollouts = train_step(n_problems=8, n_samples=8, lr=2e-4, concise_bonus=(i>5))
         history.append(metrics)
