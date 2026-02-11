@@ -14,4 +14,4 @@ For our MVP (single user, single model), is it acceptable to simply hold the PyT
 We're building an SFT MVP first. Does the SFT process under the hood strictly use LoRA (as Tinker’s `create_lora_training_client` implies)? Is there a specific configuration for LoRA (e.g., specific modules) or QLoRA that you want it to default to?
 
 # 5. Client Library
-Will you be using an existing `tinker` Python library (meaning we must exactly mimic the wire protocol and API schema of Thinker), or are we also building a custom `cute-rl` Python client that implements the Tinker-like interfaces described in the docs?
+Will you be using an existing `tinker` Python library (meaning we must exactly mimic the wire protocol and API schema of Thinker), or are we also building a custom `kube-rl` Python client that implements the Tinker-like interfaces described in the docs?

@@ -1,6 +1,6 @@
-# Cute-RL: High-Throughput RL Infrastructure
+# Kube-RL: High-Throughput RL Infrastructure
 
-Cute-RL is a multi-tenant Reinforcement Learning HTTP backend. It's built to mimic high-performance production systems (such as Tinker API) using a minimalist PyTorch and PEFT (Parameter-Efficient Fine-Tuning) stack.
+Kube-RL is a multi-tenant Reinforcement Learning HTTP backend. It's built to mimic high-performance production systems (such as Tinker API) using a minimalist PyTorch and PEFT (Parameter-Efficient Fine-Tuning) stack.
 
 ## Architecture
 
@@ -10,7 +10,7 @@ The server uses an asynchronous batched "Clock Cycle" engine. Instead of redunda
 
 ## The 4 Key Training Primitives
 
-To train a model against the Cute-RL backend, you utilize the 4 fundamental SDK primitives: Model Creation, Forward-Backward Pass, Optimizer Step, and Sampling. 
+To train a model against the Kube-RL backend, you utilize the 4 fundamental SDK primitives: Model Creation, Forward-Backward Pass, Optimizer Step, and Sampling. 
 
 Below is a basic python training loop showcasing these 4 primitives using Supervised Fine-Tuning (SFT) as an example:
 

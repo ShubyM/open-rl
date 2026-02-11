@@ -1,6 +1,6 @@
-# Cute-RL Server MVP: System Architecture & Design
+# Kube-RL Server MVP: System Architecture & Design
 
-This document summarizes the final architecture of the Cute-RL API backend after refactoring it to a multi-tenant, batched "Clock Cycle" engine. The server is designed to emulate the behavior of high-throughput RL infrastructure while minimizing VRAM footprint via LoRA hot-swapping.
+This document summarizes the final architecture of the Kube-RL API backend after refactoring it to a multi-tenant, batched "Clock Cycle" engine. The server is designed to emulate the behavior of high-throughput RL infrastructure while minimizing VRAM footprint via LoRA hot-swapping.
 
 ## High-Level Architecture
 

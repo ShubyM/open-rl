@@ -100,7 +100,7 @@ async def lifespan(app: FastAPI):
     # Cleanup if needed
     task.cancel()
 
-app = FastAPI(title="Cute-RL Server MVP", lifespan=lifespan)
+app = FastAPI(title="Kube-RL Server MVP", lifespan=lifespan)
 
 def set_future_result(req_id, result_data):
     futures_store[req_id] = result_data

@@ -3,9 +3,12 @@ import asyncio
 import random
 import math
 import re
+import logging
 import numpy as np
 import matplotlib.pyplot as plt
 from tinker import ServiceClient, types
+
+logging.getLogger("tinker").setLevel(logging.WARNING)
 
 os.environ.setdefault("TINKER_API_KEY", "tml-dummy-key")
 os.environ.setdefault("TINKER_BASE_URL", "http://localhost:8000")
@@ -88,27 +91,48 @@ async def main():
         }
     )
 
-    def run_rollouts(n_problems=4, n_samples=4, concise_bonus=False):
-        """Generate fresh problems, sample completions, compute rewards."""
+    async def run_rollouts(n_problems=4, n_samples=4, concise_bonus=False):
+        """Generate fresh problems, sample completions concurrently, compute rewards."""
         rollouts = []
         sampling_client = training_client.save_weights_and_get_sampling_client()
-        for _ in range(n_problems):
-            problem = generate_problem()  # Fresh each time
-            ans = problem[2]
+        
+        # Fire off all generation requests simultaneously
+        problems = [generate_problem() for _ in range(n_problems)]
+        futures = []
+        
+        for problem in problems:
             prompt_tokens = make_prompt_tokens(problem)
-            response = sampling_client.sample(
+            future = sampling_client.sample_async(
                 prompt=types.ModelInput.from_ints(tokens=prompt_tokens),
                 num_samples=n_samples,
                 sampling_params=types.SamplingParams(max_tokens=256, temperature=0.8)
-            ).result()
+            )
+            futures.append(future)
+            
+        # Await ALL network responses simultaneously
+        responses = await asyncio.gather(*futures)
+        
+        for problem, response in zip(problems, responses):
+            ans = problem[2]
+            prompt_tokens = make_prompt_tokens(problem)
+            
             for seq in response.sequences:
-                reward_info = compute_reward(tokenizer.decode(seq.tokens), ans, concise_bonus)
-                rollouts.append({ "prompt_tokens": prompt_tokens, "completion_tokens": seq.tokens, "completion_logprobs": seq.logprobs, "completion_text": tokenizer.decode(seq.tokens), "reward": reward_info["total"], "reward_breakdown": reward_info, "correct_answer": ans })
+                text = tokenizer.decode(seq.tokens)
+                reward_info = compute_reward(text, ans, concise_bonus)
+                rollouts.append({
+                    "prompt_tokens": prompt_tokens, 
+                    "completion_tokens": seq.tokens, 
+                    "completion_logprobs": seq.logprobs, 
+                    "completion_text": text, 
+                    "reward": reward_info["total"], 
+                    "reward_breakdown": reward_info, 
+                    "correct_answer": ans 
+                })
         return rollouts
 
-    def train_step(n_problems=4, n_samples=4, lr=1e-4, concise_bonus=False):
+    async def train_step(n_problems=4, n_samples=4, lr=1e-4, concise_bonus=False):
         """One RL step: rollouts → advantages → update."""
-        rollouts = run_rollouts(n_problems, n_samples, concise_bonus)
+        rollouts = await run_rollouts(n_problems, n_samples, concise_bonus)
         advantages = compute_advantages(rollouts)
         datums = [make_rl_datum(r, a) for r, a in zip(rollouts, advantages)]
         
@@ -128,7 +152,7 @@ async def main():
     print(f"{'Iter':>4} | {'Reward':>6} | {'Acc':>5} | {'Words':>5}\n" + "-" * 40)
     num_steps = 20
     for i in range(num_steps):
-        metrics, rollouts = train_step(n_problems=8, n_samples=8, lr=2e-4, concise_bonus=(i>5))
+        metrics, rollouts = await train_step(n_problems=8, n_samples=8, lr=2e-4, concise_bonus=(i>5))
         history.append(metrics)
         print(f"{i+1:>4} | {metrics['reward']:>6.2f} | {metrics['accuracy']:>5.0%} | {metrics['words']:>5.0f}")
 

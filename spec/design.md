@@ -1,4 +1,4 @@
-# Cute-RL API Design Spec
+# Kube-RL API Design Spec
 
 ## Overview
 This project builds an API for post-training LLMs, inspired heavily by the [Tinker API](https://tinker-docs.thinkingmachines.ai/). 

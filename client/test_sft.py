@@ -57,11 +57,15 @@ async def run_sft(service_client, client_name: str, target_answer: str, max_epoc
 
     history = []
     for epoch in range(max_epochs):
-        fwdbwd_future = await training_client.forward_backward_async(datums, "cross_entropy")
-        fwdbwd_result = await fwdbwd_future
-
-        optim_future = await training_client.optim_step_async(types.AdamParams(learning_rate=5e-4))
-        optim_result = await optim_future
+        # Dispatch and await BOTH requests simultaneously so they pipeline over the network
+        fwdbwd_future, optim_future = await asyncio.gather(
+            training_client.forward_backward_async(datums, "cross_entropy"),
+            training_client.optim_step_async(types.AdamParams(learning_rate=5e-4))
+        )
+        
+        # The futures are now fully resolved, extract their underlying SDK results
+        fwdbwd_result = fwdbwd_future.result()
+        optim_result = optim_future.result()
 
         logprobs = np.concatenate([out['logprobs'].tolist() for out in fwdbwd_result.loss_fn_outputs])
         weights_arr = np.concatenate([d.loss_fn_inputs['weights'].tolist() for d in datums])
