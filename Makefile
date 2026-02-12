@@ -26,3 +26,12 @@ run-client-showcase-parallel:
 # Generate diagrams using local mmdc zsh alias
 diagrams:
 	zsh -ic "mmdc -i design_arch.mmd -o design_arch.svg"
+
+# Sync server to remote host b1
+# TODO: sync only server directory
+# TODO: avoid syncing pycache files
+server-sync:
+	rsync -avz --exclude '.git' --exclude '.venv' ./ b1:~/work/kube-rl
+
+server-tunnel:
+	ssh -fN -L 8000:localhost:8000 b1

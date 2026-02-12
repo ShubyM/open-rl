@@ -2,9 +2,7 @@ import uuid
 import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from .trainer.engine import engine
-import traceback
-from contextlib import asynccontextmanager
+from .engine import engine, futures_store, request_queue, set_future_result, lifespan
 import logging
 
 class FilterNoisyEndpoints(logging.Filter):
@@ -14,96 +12,7 @@ class FilterNoisyEndpoints(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
-futures_store = {}
-request_queue = asyncio.Queue()
-
-async def clock_cycle_loop():
-    while True:
-        try:
-            # Wait for at least one item
-            req = await request_queue.get()
-            batch = [req]
-            
-            # Briefly sleep to allow "pipelining" (grouping requests that arrive concurrently)
-            await asyncio.sleep(0.05) 
-            
-            # Drain the queue of any other requests that arrived during the wait
-            while not request_queue.empty():
-                batch.append(request_queue.get_nowait())
-                
-            # Group by model_id
-            models_to_reqs = {}
-            for r in batch:
-                m_id = r.get("model_id")
-                if m_id not in models_to_reqs:
-                    models_to_reqs[m_id] = []
-                models_to_reqs[m_id].append(r)
-                
-            print(f"\n[CLOCK CYCLE] Popped {len(batch)} requests across {len(models_to_reqs)} distinct model tenant(s).")
-                
-            for m_id, reqs in models_to_reqs.items():
-                if len(reqs) == 0:
-                    continue
-                    
-                print(f"  -> [TENSOR CORE] Hot-swapping to LoRA adapter: {m_id}")
-                
-                # Set active adapter
-                try:
-                    await asyncio.to_thread(engine.set_active_adapter, m_id)
-                except Exception as e:
-                    print(f"Failed to set adapter {m_id}: {e}")
-                    for r in reqs:
-                        set_future_result(r["req_id"], {"type": "RequestFailedResponse", "error_message": str(e)})
-                    continue
-                    
-                print(f"     Executing {len(reqs)} operations for {m_id}...")
-                # Execute sequentially
-                for r in reqs:
-                    req_id = r["req_id"]
-                    req_type = r["type"]
-                    try:
-                        if req_type == "forward_backward":
-                            data = r["data"]
-                            loss_fn = r["loss_fn"]
-                            loss_config = r["loss_config"]
-                            result = await asyncio.to_thread(engine.forward_backward, data, loss_fn, loss_config, m_id)
-                            result["type"] = "forward_backward"
-                            set_future_result(req_id, result)
-                        elif req_type == "optim_step":
-                            adam_params = r["adam_params"]
-                            result = await asyncio.to_thread(engine.optim_step, adam_params, m_id)
-                            result["type"] = "optim_step"
-                            set_future_result(req_id, result)
-                        elif req_type == "asample":
-                            prompt_tokens = r["prompt_tokens"]
-                            max_tokens = r["max_tokens"]
-                            num_samples = r["num_samples"]
-                            result = await asyncio.to_thread(engine.generate, prompt_tokens, max_tokens, num_samples, m_id)
-                            result["type"] = "sample"
-                            set_future_result(req_id, result)
-                    except Exception as e:
-                        traceback.print_exc()
-                        set_future_result(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
-                        
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"Error in clock cycle loop: {e}")
-            traceback.print_exc()
-            await asyncio.sleep(1)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Start the clock cycle loop
-    task = asyncio.create_task(clock_cycle_loop())
-    yield
-    # Cleanup if needed
-    task.cancel()
-
 app = FastAPI(title="Kube-RL Server MVP", lifespan=lifespan)
-
-def set_future_result(req_id, result_data):
-    futures_store[req_id] = result_data
 
 @app.get("/api/v1/healthz")
 async def health_check():
