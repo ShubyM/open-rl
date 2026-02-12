@@ -13,7 +13,7 @@ graph TD
         Group -->|Tenant A| SwapA["set_active_adapter A"]
         SwapA --> ExecA["Execute FwdBwd -> Optim -> Generate"]
         
-        ExecA -->|Tenant B| SwapB["set_active_adapter B"]
+        Group -->|Tenant B| SwapB["set_active_adapter B"]
         SwapB --> ExecB["Execute FwdBwd -> Optim -> Generate"]
     end
     
@@ -21,3 +21,4 @@ graph TD
     ExecB -->|7. Write Results| Store
     
     ClientA -->|8. Poll /retrieve_future| Store
+    ClientB -->|8. Poll /retrieve_future| Store

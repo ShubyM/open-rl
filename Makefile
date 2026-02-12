@@ -22,3 +22,7 @@ run-client-showcase:
 
 run-client-showcase-parallel:
 	cd client && uv run --no-sync -i https://pypi.org/simple python showcase_rlvr.py parallel
+
+# Generate diagrams using local mmdc zsh alias
+diagrams:
+	zsh -ic "mmdc -i design_arch.mmd -o design_arch.svg"
