@@ -20,7 +20,16 @@ def generate_problem():
         "France": "Paris", "Japan": "Tokyo", "Brazil": "Brasília", 
         "Canada": "Ottawa", "Australia": "Canberra", "Germany": "Berlin", 
         "India": "New Delhi", "Egypt": "Cairo", "Italy": "Rome", 
-        "South Africa": "Pretoria", "Mexico": "Mexico City", "Spain": "Madrid"
+        "South Africa": "Pretoria", "Mexico": "Mexico City", "Spain": "Madrid",
+        "Argentina": "Buenos Aires", "China": "Beijing", "Russia": "Moscow",
+        "South Korea": "Seoul", "United Kingdom": "London", "United States": "Washington, D.C.",
+        "Turkey": "Ankara", "Thailand": "Bangkok", "Vietnam": "Hanoi",
+        "Indonesia": "Jakarta", "Saudi Arabia": "Riyadh", "Iran": "Tehran",
+        "Pakistan": "Islamabad", "Nigeria": "Abuja", "Kenya": "Nairobi",
+        "Colombia": "Bogotá", "Peru": "Lima", "Chile": "Santiago",
+        "Venezuela": "Caracas", "Greece": "Athens", "Sweden": "Stockholm",
+        "Norway": "Oslo", "Poland": "Warsaw", "Ukraine": "Kyiv",
+        "New Zealand": "Wellington", "Philippines": "Manila", "Malaysia": "Kuala Lumpur"
     }
     country = random.choice(list(capitals.keys()))
     return [country], [], capitals[country]
@@ -29,8 +38,7 @@ SYSTEM_PROMPT = """You are a helpful geography assistant."""
 
 USER_PROMPT_TEMPLATE = "What is the capital of {country}? Use answer tags in the output."
 
-def compute_reward(response, correct_answer, concise_bonus=False):
-    response = response.strip()
+def compute_reward(response, correct_answer, target_tag="answer", concise_bonus=False):
     rewards = {"format": 0.0, "correct": 0.0, "concise": 0.0}
     
     # Check if the correct answer is factually present anywhere to avoid pure hallucination
@@ -40,58 +48,67 @@ def compute_reward(response, correct_answer, concise_bonus=False):
         rewards["total"] = -2.0
         return rewards
 
-    # Evaluate Formatting and Exactness
-    if response.lower() == f"<answer>{correct_answer.lower()}</answer>":
-        # Perfect exact match, no whitespaces
-        rewards["format"] = 1.0
-        rewards["correct"] = 1.0
-    else:
-        answer_match = re.search(r'<answer>(.*?)</answer>', response, re.IGNORECASE)
-        any_tag_match = re.search(r'<(.*?)>(.*?)</\1>', response, re.IGNORECASE)
-        
-        if answer_match:
-            inner_text = answer_match.group(1)
-            # Must be an exact match (with or without padding) inside the tags
-            if inner_text.lower() == correct_answer.lower():
-                # Perfect match but maybe has conversational text OUTSIDE the tags
-                rewards["correct"] = 1.0
-                rewards["format"] = 0.8
-            elif inner_text.strip().lower() == correct_answer.lower():
-                # Matches exactly but has whitespaces padding the inside of the tag
-                rewards["correct"] = 1.0
-                rewards["format"] = 0.5
+    target_match = re.search(f'<{target_tag}>(.*?)</{target_tag}>', response, re.IGNORECASE | re.DOTALL)
+    any_tag_match = re.search(r'<(.*?)>(.*?)</\1>', response, re.IGNORECASE | re.DOTALL)
+    
+    if target_match:
+        inner_text = target_match.group(1)
+        # Must be an exact match (with or without padding) inside the tags
+        if inner_text.strip().lower() == correct_answer.lower():
+            rewards["correct"] = 1.0
+            
+            # Base formatting reward based on inner whitespaces
+            fmt_score = 0.5 if inner_text == inner_text.strip() else 0.2
+                
+            # Adjust for casing
+            stripped_inner = inner_text.strip()
+            if stripped_inner == correct_answer:
+                fmt_score += 0.5  # Reward exact correct casing
+            elif stripped_inner.islower():
+                fmt_score -= 0.2  # Penalize all lowercase
+            elif stripped_inner.isupper():
+                fmt_score -= 0.2  # Penalize all uppercase
             else:
-                # Inside the tag contains extra conversational words or is the wrong answer
-                rewards["correct"] = -1.0
-                rewards["format"] = -0.5
-        elif any_tag_match:
-            inner_text = any_tag_match.group(2)
-            if inner_text.strip().lower() == correct_answer.lower():
-                # Correct answer, but hallucinated a different XML tag
-                rewards["correct"] = 0.0
-                rewards["format"] = 0.1
-            else:
-                rewards["correct"] = -1.0
-                rewards["format"] = -1.0
+                fmt_score -= 0.1  # Penalize incorrect mixed casing
+                
+            # Penalize extra conversational text or whitespaces outside the tags
+            if response != f"<{target_tag}>{inner_text}</{target_tag}>":
+                fmt_score -= 0.2
+                
+            rewards["format"] = max(0.0, round(fmt_score, 2))
+        else:
+            # Inside the tag contains extra conversational words or is the wrong answer
+            rewards["correct"] = -1.0
+            rewards["format"] = -0.5
+    elif any_tag_match:
+        inner_text = any_tag_match.group(2)
+        if inner_text.strip().lower() == correct_answer.lower():
+            # Correct answer, but hallucinated a different XML tag
+            rewards["correct"] = 0.0
+            rewards["format"] = 0.1
         else:
             rewards["correct"] = -1.0
-            rewards["format"] = -1.0 # Failed to format completely
-            
+            rewards["format"] = -1.0
+    else:
+        rewards["correct"] = -1.0
+        rewards["format"] = -1.0 # Failed to format completely
+        
     rewards["total"] = sum(rewards.values())
     return rewards
 
-async def main():
-    print("1. Initializing Service Client...")
-    service_client = ServiceClient()
-    
+async def run_rlvr_job(service_client, target_tag):
+    def log(msg):
+        for line in msg.split('\n'):
+            print(f"[{target_tag.upper():^7}] {line}")
+
+    log("Initializing LoRA Training Client...")
     base_model = "Qwen/Qwen3-4B-Instruct-2507"
-    print(f"\n3. Creating LoRA Training Client for '{base_model}'...")
     try:
         training_client = await service_client.create_lora_training_client_async(
             base_model=base_model, rank=8
         )
     except Exception as e:
-        print(f"Error creating client: {e}")
+        log(f"Error creating client: {e}")
         return
 
     tokenizer = training_client.get_tokenizer()
@@ -99,11 +116,11 @@ async def main():
     def make_prompt_tokens(problem):
         country = problem[0][0]
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, 
-                    {"role": "user", "content": USER_PROMPT_TEMPLATE.format(country=country)}]
+                    {"role": "user", "content": USER_PROMPT_TEMPLATE.format(country=country, tag=target_tag)}]
         text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
         return tokenizer.encode(text, add_special_tokens=False)
 
-    print(tokenizer.decode(make_prompt_tokens(generate_problem())))
+    log(tokenizer.decode(make_prompt_tokens(generate_problem())))
 
     def compute_advantages(rollouts):
         """GRPO-style: normalize rewards to mean=0, std=1."""
@@ -129,7 +146,7 @@ async def main():
         }
     )
 
-    async def run_rollouts(n_problems=4, n_samples=4, concise_bonus=False):
+    async def run_rollouts(n_problems=4, n_samples=8, concise_bonus=False):
         """Generate fresh problems, sample completions concurrently, compute rewards."""
         rollouts = []
         sampling_client = training_client.save_weights_and_get_sampling_client()
@@ -156,7 +173,7 @@ async def main():
             
             for seq in response.sequences:
                 text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
-                reward_info = compute_reward(text, ans, concise_bonus)
+                reward_info = compute_reward(text, ans, target_tag, concise_bonus)
                 rollouts.append({
                     "prompt_tokens": prompt_tokens, 
                     "completion_tokens": seq.tokens, 
@@ -188,15 +205,15 @@ async def main():
     # ------------------------------------------------------------------
     # Baseline Evaluation (Before Training)
     # ------------------------------------------------------------------
-    print("\n--- Baseline Evaluation (Before Training) ---")
-    base_client = training_client.save_weights_and_get_sampling_client(name="initial_base")
+    log("\n--- Baseline Evaluation (Before Training) ---")
+    base_client = training_client.save_weights_and_get_sampling_client(name=f"initial_base_{target_tag}")
 
     def test_model(client, problem):
         tokens = make_prompt_tokens(problem)
         resp = client.sample(types.ModelInput.from_ints(tokens=tokens), num_samples=1,
                             sampling_params=types.SamplingParams(max_tokens=25, temperature=0.3)).result()
         text = tokenizer.decode(resp.sequences[0].tokens, skip_special_tokens=True)
-        return text, compute_reward(text, problem[2])
+        return text, compute_reward(text, problem[2], target_tag)
 
     eval_problems = [generate_problem() for _ in range(5)]
     baseline_rewards = []
@@ -204,28 +221,30 @@ async def main():
     for p in eval_problems:
         text_base, reward_base = test_model(base_client, p)
         baseline_rewards.append(reward_base['total'])
-        print(f"Problem: {p[0]}\nBase Response: {text_base.strip()}\nBase Reward: {reward_base['total']}\n")
+        log(f"Problem: {p[0]}")
+        log(f"Base Response: {text_base.strip()}")
+        log(f"Base Reward: {reward_base['total']}\n")
         
-    print(f"Avg Baseline Reward: {np.mean(baseline_rewards):.2f}\n")
+    log(f"Avg Baseline Reward: {np.mean(baseline_rewards):.2f}\n")
 
     # ------------------------------------------------------------------
     # Training loop - fresh problems each iteration
     # ------------------------------------------------------------------
-    print("--- Starting RL Training Loop ---")
+    log("--- Starting RL Training Loop ---")
     history = []
-    print(f"{'Iter':>4} | {'Reward':>6} | {'Acc':>5} | {'Words':>5}\n" + "-" * 40)
+    log(f"{'Iter':>4} | {'Reward':>6} | {'Acc':>5} | {'Words':>5}\n" + "-" * 40)
     num_steps = 15
     for i in range(num_steps):
         metrics, rollouts = await train_step(n_problems=4, n_samples=8, lr=5e-4, concise_bonus=False)
         history.append(metrics)
-        print(f"{i+1:>4} | {metrics['reward']:>6.2f} | {metrics['accuracy']:>5.0%} | {metrics['words']:>5.0f}")
+        log(f"{i+1:>4} | {metrics['reward']:>6.2f} | {metrics['accuracy']:>5.0%} | {metrics['words']:>5.0f}")
         if rollouts:
             for r in rollouts:
                 sample_text = r['completion_text'].replace('\n', ' ').strip()
                 sample_reward = r['reward']
-                print(f"       -> Sample: {sample_text} (Reward: {sample_reward})")
+                log(f"       -> Sample: {sample_text} (Reward: {sample_reward})")
 
-    print("\n-> Generating plot...")
+    log("\n-> Generating plot...")
     fig, axes = plt.subplots(1, 3, figsize=(12, 3))
     iters = range(1, len(history) + 1)
     
@@ -240,44 +259,60 @@ async def main():
     axes[2].set_title("Avg Words")
     
     plt.tight_layout()
-    plt.savefig('showcase_metrics.png')
-    print("Saved 'showcase_metrics.png'")
+    plt.savefig(f'showcase_metrics_{target_tag}.png')
+    log(f"Saved 'showcase_metrics_{target_tag}.png'")
 
     # ------------------------------------------------------------------
     # Trained Evaluation (After Training)
     # ------------------------------------------------------------------
-    print("\n--- Trained Evaluation (After Training) ---")
-    trained_client = training_client.save_weights_and_get_sampling_client(name="rlvr_concise_v1")
+    log("\n--- Trained Evaluation (After Training) ---")
+    trained_client = training_client.save_weights_and_get_sampling_client(name=f"rlvr_concise_{target_tag}")
 
     trained_rewards = []
     for p in eval_problems:
         text, reward = test_model(trained_client, p)
         trained_rewards.append(reward['total'])
-        print(f"Problem: {p[0]}\nTrained Response: {text.strip()}\nTrained Reward: {reward['total']}\n")
+        log(f"Problem: {p[0]}")
+        log(f"Trained Response: {text.strip()}")
+        log(f"Trained Reward: {reward['total']}\n")
         
-    print(f"Avg Trained Reward: {np.mean(trained_rewards):.2f}\n")
+    log(f"Avg Trained Reward: {np.mean(trained_rewards):.2f}\n")
 
-class Logger:
-    def __init__(self, filename):
-        self.terminal = sys.stdout
-        self.log = open(filename, "w")
+async def main():
+    service_client = ServiceClient()
+    
+    log_file = open("showcase_parallel_results.log", "w")
+    class ParallelLogger:
+        def __init__(self, original_stdout):
+            self.original = original_stdout
+        def write(self, msg):
+            self.original.write(msg)
+            log_file.write(msg)
+            self.original.flush()
+            log_file.flush()
+        def flush(self):
+            self.original.flush()
+            log_file.flush()
+            
+    sys.stdout = ParallelLogger(sys.stdout)
 
-    def __getattr__(self, attr):
-        return getattr(self.terminal, attr)
+    print("============================================================")
+    print("Starting Kube-RL Showcase: Multi-Tenant Parallel Constraints")
+    print("Log saved to: showcase_parallel_results.log")
+    print("============================================================\n")
 
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()
-
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
+    if len(sys.argv) > 1 and sys.argv[1] == "parallel":
+        print(">> Running Dual Clients in Parallel (`answer` and `capital`) <<\n")
+        await asyncio.gather(
+            run_rlvr_job(service_client, "answer"),
+            run_rlvr_job(service_client, "capital")
+        )
+    else:
+        print(">> Running Single Client (`answer`) <<\n")
+        await run_rlvr_job(service_client, "answer")
+        
+    sys.stdout = sys.stdout.original
+    log_file.close()
 
 if __name__ == "__main__":
-    sys.stdout = Logger("showcase_results.log")
-    print("=" * 60)
-    print("Starting Kube-RL Showcase: The Strict Formatter Test")
-    print("Log saved to: showcase_results.log")
-    print("=" * 60 + "\n")
     asyncio.run(main())

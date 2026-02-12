@@ -20,3 +20,5 @@ run-client-rlvr:
 run-client-showcase:
 	cd client && uv run --no-sync -i https://pypi.org/simple python showcase_rlvr.py
 
+run-client-showcase-parallel:
+	cd client && uv run --no-sync -i https://pypi.org/simple python showcase_rlvr.py parallel
