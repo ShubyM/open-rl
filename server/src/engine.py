@@ -7,6 +7,9 @@ import asyncio
 import traceback
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+import subprocess
+import os
+import sys
 
 import math
 
@@ -281,6 +284,40 @@ class TrainerEngine:
 # Global singleton
 engine = TrainerEngine()
 
+vllm_process = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global vllm_process
+    print("[Gateway] Booting Multi-GPU Architecture...")
+    
+    # 1. Force PyTorch Trainer to GPU 0
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    
+    # 2. Boot vLLM Subprocess on GPU 1
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "1"
+    
+    print("[Gateway] Spawning vLLM Subprocess on Port 8001 (GPU 1)")
+    cwd = os.path.join(os.getcwd(), "server") if not os.getcwd().endswith("server") else os.getcwd()
+    
+    vllm_process = subprocess.Popen(
+        [sys.executable, "-m", "src.vllm_worker"],
+        env=env,
+        cwd=cwd
+    )
+    
+    # Start the clock cycle loop
+    task = asyncio.create_task(clock_cycle_loop())
+    yield
+    
+    # Cleanup if needed
+    task.cancel()
+    if vllm_process:
+        print("[Gateway] Terminating vLLM Subprocess...")
+        vllm_process.terminate()
+        vllm_process.wait()
+
 futures_store = {}
 request_queue = asyncio.Queue()
 
@@ -344,6 +381,22 @@ async def clock_cycle_loop():
                             result = await asyncio.to_thread(engine.optim_step, adam_params, m_id)
                             result["type"] = "optim_step"
                             set_future_result(req_id, result)
+                        elif req_type == "save_weights_for_sampler":
+                            import os
+                            # Save to disk/ramdisk so vLLM can load it
+                            tmp_dir = os.environ.get("KUBE_RL_TMP_DIR", "/tmp/kube-rl")
+                            ram_path = os.path.join(tmp_dir, "peft", m_id)
+                            os.makedirs(ram_path, exist_ok=True)
+                            
+                            # Because set_active_adapter(m_id) just ran, the engine model is active on this tenant!
+                            engine.model.save_pretrained(ram_path)
+                            
+                            result = {
+                                "path": None,
+                                "sampling_session_id": m_id,
+                                "type": "save_weights_for_sampler"
+                            }
+                            set_future_result(req_id, result)
                         elif req_type == "asample":
                             prompt_tokens = r["prompt_tokens"]
                             max_tokens = r["max_tokens"]
@@ -361,11 +414,3 @@ async def clock_cycle_loop():
             print(f"Error in clock cycle loop: {e}")
             traceback.print_exc()
             await asyncio.sleep(1)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Start the clock cycle loop
-    task = asyncio.create_task(clock_cycle_loop())
-    yield
-    # Cleanup if needed
-    task.cancel()

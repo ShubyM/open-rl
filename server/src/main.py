@@ -4,6 +4,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from .engine import engine, futures_store, request_queue, set_future_result, lifespan
 import logging
+import urllib.request
+import json
+import traceback
 
 class FilterNoisyEndpoints(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -122,11 +125,14 @@ async def optim_step(req: dict):
 async def save_weights_for_sampler(req: dict):
     req_id = str(uuid.uuid4())
     model_id = req.get("model_id") # Client passes the TrainingClient's model_id
-    futures_store[req_id] = {
-        "path": None,
-        "sampling_session_id": model_id, # Link the sampler to the SAME model_id!
+    futures_store[req_id] = {"status": "pending"}
+    
+    await request_queue.put({
+        "req_id": req_id,
+        "model_id": model_id,
         "type": "save_weights_for_sampler"
-    }
+    })
+    
     return {"request_id": req_id}
 
 @app.post("/api/v1/create_sampling_session")
@@ -143,19 +149,47 @@ async def asample(req: dict):
     prompt = req.get("prompt", {}).get("chunks", [])[0].get("tokens", [])
     params = req.get("sampling_params", {})
     max_tokens = params.get("max_tokens", 20)
+    temperature = params.get("temperature", 1.0)
     num_samples = req.get("num_samples", 1)
     
-    # Tinker API sends sampling_session_id during `asample`, which we mapped to model_id
     model_id = req.get("model_id") or req.get("sampling_session_id")
     
-    await request_queue.put({
-        "req_id": req_id,
-        "model_id": model_id,
-        "type": "asample",
-        "prompt_tokens": prompt,
-        "max_tokens": max_tokens,
-        "num_samples": num_samples
-    })
+    # IPC Bridge: Route to vLLM worker on Port 8001 instead of PyTorch Queue
+    async def _route_to_vllm():
+        try:
+            import os
+            tmp_dir = os.environ.get("KUBE_RL_TMP_DIR", "/tmp/kube-rl")
+            # PEFT natively saves adapters into subdirectories named after their adapter ID
+            lora_path = os.path.join(tmp_dir, "peft", model_id, model_id)
+            
+            payload = {
+                "request_id": req_id,
+                "prompt_token_ids": prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "lora_id": model_id,
+                "lora_path": lora_path 
+            }
+            
+            req_bytes = json.dumps(payload).encode('utf-8')
+            http_req = urllib.request.Request(
+                "http://127.0.0.1:8001/generate", 
+                data=req_bytes, 
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            def _make_req():
+                with urllib.request.urlopen(http_req, timeout=30.0) as f:
+                    return json.loads(f.read().decode('utf-8'))
+                    
+            data = await asyncio.to_thread(_make_req)
+            data["type"] = "sample"
+            set_future_result(req_id, data)
+        except Exception as e:
+            traceback.print_exc()
+            set_future_result(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
+
+    asyncio.create_task(_route_to_vllm())
     
     return {"request_id": req_id}
 
