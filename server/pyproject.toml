@@ -12,6 +12,7 @@ dependencies = [
     "peft",
     "pydantic",
     "torch",
+    "torch-c-dlpack-ext; sys_platform == 'linux'",
     "transformers",
     "trl",
     "uvicorn",
