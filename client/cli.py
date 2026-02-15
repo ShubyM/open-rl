@@ -5,8 +5,11 @@ import sys
 import os
 import json
 import logging
+# Suppress transformers logging ("PyTorch was not found..." etc.)
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 from datetime import datetime
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, logging as tr_logging
+tr_logging.set_verbosity_error()
 
 # Configure logging
 logging.basicConfig(level=logging.ERROR)

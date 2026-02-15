@@ -35,3 +35,25 @@ server-sync:
 
 server-tunnel:
 	ssh -fN -L 8000:localhost:8000 b1
+
+# CLI Targets
+# Usage: make run-cli list OR make run-cli chat --model ...
+# This hack allows passing arguments directly after the target name
+ifeq (run-cli,$(firstword $(MAKECMDGOALS)))
+  # use the rest as arguments for "run-cli"
+  CLI_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+  # ...and turn them into do-nothing targets so make doesn't complain
+  $(eval $(CLI_ARGS):;@:)
+endif
+
+run-cli:
+	@cd client && uv run --no-sync -i https://pypi.org/simple python cli.py $(CLI_ARGS)
+
+# Shortcut: make run-cli-list
+run-cli-list:
+	@cd client && uv run --no-sync -i https://pypi.org/simple python cli.py list
+
+# Shortcut: make run-cli-chat MODEL=... [PROMPT="..."]
+run-cli-chat:
+	@test -n "$(MODEL)" || (echo "Error: MODEL argument is required. Usage: make run-cli-chat MODEL=<model_id>" && exit 1)
+	@cd client && uv run --no-sync -i https://pypi.org/simple python cli.py chat --model $(MODEL) --system-prompt "$(or $(PROMPT),You are helpful geography assistant.)"
