@@ -206,7 +206,10 @@ async def run_rlvr_job(service_client, target_tag):
     # Baseline Evaluation (Before Training)
     # ------------------------------------------------------------------
     log("\n--- Baseline Evaluation (Before Training) ---")
-    base_client = training_client.save_weights_and_get_sampling_client(name=f"initial_base_{target_tag}")
+    # base_client = training_client.save_weights_and_get_sampling_client(name=f"initial_base_{target_tag}")
+    # Use explicit 2-step to preserve name/alias
+    res = training_client.save_weights_for_sampler(name=f"initial_base_{target_tag}").result()
+    base_client = service_client.create_sampling_client(res.path)
 
     def test_model(client, problem):
         tokens = make_prompt_tokens(problem)
@@ -266,7 +269,9 @@ async def run_rlvr_job(service_client, target_tag):
     # Trained Evaluation (After Training)
     # ------------------------------------------------------------------
     log("\n--- Trained Evaluation (After Training) ---")
-    trained_client = training_client.save_weights_and_get_sampling_client(name=f"rlvr_concise_{target_tag}")
+    # trained_client = training_client.save_weights_and_get_sampling_client(name=f"rlvr_concise_{target_tag}")
+    res = training_client.save_weights_for_sampler(name=f"rlvr_concise_{target_tag}").result()
+    trained_client = service_client.create_sampling_client(res.path)
 
     trained_rewards = []
     for p in eval_problems:

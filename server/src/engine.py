@@ -383,7 +383,12 @@ async def clock_cycle_loop():
                             set_future_result(req_id, result)
                         elif req_type == "save_weights_for_sampler":
                             seq_id = r.get("seq_id", 0)
+                            alias = r.get("alias")
                             import os
+                            import json
+                            import time
+                            from datetime import datetime
+                            
                             # Save to disk/ramdisk so vLLM can load it
                             tmp_dir = os.environ.get("KUBE_RL_TMP_DIR", "/tmp/kube-rl")
                             ram_path = os.path.join(tmp_dir, "peft", m_id)
@@ -392,9 +397,31 @@ async def clock_cycle_loop():
                             # Because set_active_adapter(m_id) just ran, the engine model is active on this tenant!
                             engine.model.save_pretrained(ram_path)
                             
+                            # Write metadata
+                            metadata = {
+                                "model_id": m_id,
+                                "alias": alias,
+                                "created_at": datetime.now().isoformat(),
+                                "timestamp": time.time()
+                            }
+                            try:
+                                with open(os.path.join(ram_path, "metadata.json"), "w") as f:
+                                    json.dump(metadata, f)
+                            except Exception as e:
+                                print(f"Failed to write metadata: {e}")
+                            
+                            # Use a tinker:// URI that encodes the session ID, satisfying SDK validation
+                            # and matching what we expect in asample (after stripping prefix)
+                            session_id = f"{m_id}-samp-{seq_id}"
+                            
+                            # Tinkers SDK `save_weights_and_get_sampling_client` expects path=None (ephemeral)
+                            # Tinkers SDK `save_weights_for_sampler` expects path!=None (named)
+                            # We use the presence of 'alias' to distinguish.
+                            result_path = f"tinker://{session_id}" if alias else None
+                            
                             result = {
-                                "path": None,
-                                "sampling_session_id": f"{m_id}-samp-{seq_id}",
+                                "path": result_path,
+                                "sampling_session_id": session_id,
                                 "type": "save_weights_for_sampler"
                             }
                             set_future_result(req_id, result)

@@ -175,7 +175,9 @@ async def main():
     print("Saved 'rlvr_notebook_metrics.png'")
 
     print("\n4. Saving weights and creating sampling clients...")
-    trained_client = training_client.save_weights_and_get_sampling_client(name="rlvr_concise_v1")
+    # trained_client = training_client.save_weights_and_get_sampling_client(name="rlvr_concise_v1")
+    res = training_client.save_weights_for_sampler(name="rlvr_concise_v1").result()
+    trained_client = service_client.create_sampling_client(res.path)
 
     print("\n5. Comparing base vs trained model...")
     base_training_client = await service_client.create_lora_training_client_async(base_model=base_model, rank=8)

@@ -1,4 +1,5 @@
 import uuid
+import os
 import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -126,22 +127,85 @@ async def save_weights_for_sampler(req: dict):
     req_id = str(uuid.uuid4())
     model_id = req.get("model_id") # Client passes the TrainingClient's model_id
     seq_id = req.get("sampling_session_seq_id", 0)
+    # Tinker SDK might send 'name' or 'alias', or 'path' (if using save_weights_for_sampler)
+    alias = req.get("name") or req.get("alias") or req.get("path")
+    
     futures_store[req_id] = {"status": "pending"}
     
     await request_queue.put({
         "req_id": req_id,
         "model_id": model_id,
         "seq_id": seq_id,
+        "alias": alias,
         "type": "save_weights_for_sampler"
     })
     
     return {"request_id": req_id}
 
+@app.get("/api/v1/list_adapters")
+async def list_adapters():
+    """
+    Scans the local temporary directory (used for RAM-disk sync) for available PEFT adapters.
+    Returns a list of adapters with metadata (creation time, alias) if available.
+    """
+    tmp_dir = os.environ.get("KUBE_RL_TMP_DIR", "/tmp/kube-rl")
+    peft_dir = os.path.join(tmp_dir, "peft")
+    
+    adapters = []
+    
+    if os.path.exists(peft_dir):
+        # Scan all directories in peft_dir
+        with os.scandir(peft_dir) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    model_id = entry.name
+                    metadata_path = os.path.join(entry.path, "metadata.json")
+                    
+                    adapter_info = {
+                        "model_id": model_id,
+                        "created_at": entry.stat().st_ctime, # Fallback to filesystem time
+                        "timestamp": entry.stat().st_ctime,
+                        "alias": None
+                    }
+                    
+                    # Try to read metadata.json
+                    if os.path.exists(metadata_path):
+                        try:
+                            with open(metadata_path, 'r') as f:
+                                meta = json.load(f)
+                                adapter_info.update(meta)
+                        except Exception:
+                            pass
+                            
+                    adapters.append(adapter_info)
+    
+    # Sort by creation time descending (newest first)
+    # Prefer 'timestamp' (float) if available, otherwise 'created_at' if it's a number
+    def get_sort_key(x):
+        ts = x.get("timestamp")
+        if isinstance(ts, (int, float)):
+            return ts
+        ca = x.get("created_at")
+        if isinstance(ca, (int, float)):
+            return ca
+        return 0
+        
+    adapters.sort(key=get_sort_key, reverse=True)
+    
+    return {"adapters": adapters}
+
 @app.post("/api/v1/create_sampling_session")
 async def create_sampling_session(req: dict):
-    # If client manually creates a session, we'll assign a mock one, 
-    # but the usual flow is save_weights -> uses the existing model_id
-    return {"sampling_session_id": req.get("model_id", "samp-session-live-123"), "type": "create_sampling_session"}
+    # Support 'model_path' from SDK (e.g. "tinker://uuid-samp-seq")
+    model_path = req.get("model_path")
+    model_id = req.get("model_id")
+    
+    if model_path and model_path.startswith("tinker://"):
+        sess_id = model_path[len("tinker://"):]
+    else:
+        sess_id = model_id or "samp-session-live-123"
+        
+    return {"sampling_session_id": sess_id, "type": "create_sampling_session"}
 
 @app.post("/api/v1/asample")
 async def asample(req: dict):
@@ -155,6 +219,9 @@ async def asample(req: dict):
     num_samples = req.get("num_samples", 1)
     
     model_id = req.get("model_id") or req.get("sampling_session_id")
+    # Strip potential tinker:// prefix explicitly
+    if model_id and model_id.startswith("tinker://"):
+        model_id = model_id[len("tinker://"):]
     
     # vLLM caches adapters natively based on the `lora_id` key. 
     # To force vLLM to reload weights after PyTorch trains them, we pass a unique sequential `lora_id`.
@@ -168,6 +235,7 @@ async def asample(req: dict):
             import os
             tmp_dir = os.environ.get("KUBE_RL_TMP_DIR", "/tmp/kube-rl")
             # PEFT natively saves adapters into subdirectories named after their adapter ID
+            # Engine saves to: tmp_dir/peft/m_id/m_id (because adapter_name=m_id)
             lora_path = os.path.join(tmp_dir, "peft", base_model_id, base_model_id) if base_model_id else None
             
             print(f"[Gateway DEBUG] Routing asample to vLLM. model_id_received={model_id} -> lora_id={lora_id}, lora_path={lora_path}")
@@ -194,7 +262,8 @@ async def asample(req: dict):
                     return json.loads(f.read().decode('utf-8'))
                     
             data = await asyncio.to_thread(_make_req)
-            data["type"] = "sample"
+            if data.get("type") != "RequestFailedResponse":
+                data["type"] = "sample"
             set_future_result(req_id, data)
         except Exception as e:
             traceback.print_exc()
