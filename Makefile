@@ -12,10 +12,10 @@ run-sft-parallel:
 	cd client && uv run --no-sync -i https://pypi.org/simple python test_sft.py --parallel
 
 run-rlvr:
-	cd client && uv run --no-sync -i https://pypi.org/simple python showcase_rlvr.py --steps 20
+	cd client && uv run --no-sync -i https://pypi.org/simple python showcase_rlvr.py --steps 15
 
 run-rlvr-parallel:
-	cd client && uv run --no-sync -i https://pypi.org/simple python showcase_rlvr.py parallel --steps 20
+	cd client && uv run --no-sync -i https://pypi.org/simple python showcase_rlvr.py parallel --steps 15
 
 # Generate diagrams using local mmdc zsh alias
 diagrams:

@@ -42,62 +42,56 @@ USER_PROMPT_TEMPLATE = "What is the capital of {country}? Use answer tags in the
 def compute_reward(response, correct_answer, target_tag="answer"):
     rewards = {"format": 0.0, "correct": 0.0}
     
-    # Check if the correct answer is factually present anywhere to avoid pure hallucination
-    if correct_answer.lower() not in response.lower():
+    # Clean up response for comparison
+    clean_response = response.strip()
+    
+    # 1. Check for strict exact match: <tag>Answer</tag>
+    # We allow whitespace inside the tags, but NO text outside the tags.
+    # e.g. " <answer> Paris </answer> " after strip is "<answer> Paris </answer>"
+    
+    # Regex for a single tag at start/end of string
+    full_match = re.fullmatch(f'<{target_tag}>(.*?)</{target_tag}>', clean_response, re.IGNORECASE | re.DOTALL)
+    
+    if full_match:
+        inner_text = full_match.group(1).strip()
+        if inner_text.lower() == correct_answer.lower():
+            rewards["correct"] = 1.0
+            rewards["format"] = 1.0
+            
+            # Bonus for perfect casing in the answer
+            if inner_text == correct_answer:
+                rewards["format"] += 0.5
+            elif inner_text.islower() or inner_text.isupper():
+                rewards["format"] -= 0.1
+                
+            rewards["total"] = sum(rewards.values())
+            return rewards
+
+    # 2. Key Fallback: Correct answer inside the tag, but with extra text outside
+    # We give a MUCH lower score to discourage "chatter"
+    partial_match = re.search(f'<{target_tag}>(.*?)</{target_tag}>', response, re.IGNORECASE | re.DOTALL)
+    if partial_match:
+        inner_text = partial_match.group(1).strip()
+        if inner_text.lower() == correct_answer.lower():
+            rewards["correct"] = 1.0
+            rewards["format"] = -0.5 # Big penalty for having extra text outside
+            rewards["total"] = 0.5   # Net positive, but small
+            return rewards
+            
+    # 3. Last Result: Wrong answer or no tags
+    # Check if answer is present at all to avoid complete -2.0 if they just forgot tags
+    if correct_answer.lower() in response.lower():
+        rewards["correct"] = 0.0 # Neutral, acknowledged presence
+        rewards["format"] = -1.0 # But failed format
+        rewards["total"] = -1.0
+    else:
         rewards["correct"] = -1.0
         rewards["format"] = -1.0
         rewards["total"] = -2.0
-        return rewards
-
-    target_match = re.search(f'<{target_tag}>(.*?)</{target_tag}>', response, re.IGNORECASE | re.DOTALL)
-    any_tag_match = re.search(r'<(.*?)>(.*?)</\1>', response, re.IGNORECASE | re.DOTALL)
-    
-    if target_match:
-        inner_text = target_match.group(1)
-        # Must be an exact match (with or without padding) inside the tags
-        if inner_text.strip().lower() == correct_answer.lower():
-            rewards["correct"] = 1.0
-            
-            # Base formatting reward based on inner whitespaces
-            fmt_score = 0.5 if inner_text == inner_text.strip() else 0.2
-                
-            # Adjust for casing
-            stripped_inner = inner_text.strip()
-            if stripped_inner == correct_answer:
-                fmt_score += 0.5  # Reward exact correct casing
-            elif stripped_inner.islower():
-                fmt_score -= 0.2  # Penalize all lowercase
-            elif stripped_inner.isupper():
-                fmt_score -= 0.2  # Penalize all uppercase
-            else:
-                fmt_score -= 0.1  # Penalize incorrect mixed casing
-                
-            # Penalize extra conversational text or whitespaces outside the tags
-            if response != f"<{target_tag}>{inner_text}</{target_tag}>":
-                fmt_score -= 0.2
-                
-            rewards["format"] = max(0.0, round(fmt_score, 2))
-        else:
-            # Inside the tag contains extra conversational words or is the wrong answer
-            rewards["correct"] = -1.0
-            rewards["format"] = -0.5
-    elif any_tag_match:
-        inner_text = any_tag_match.group(2)
-        if inner_text.strip().lower() == correct_answer.lower():
-            # Correct answer, but hallucinated a different XML tag
-            rewards["correct"] = 0.0
-            rewards["format"] = 0.1
-        else:
-            rewards["correct"] = -1.0
-            rewards["format"] = -1.0
-    else:
-        rewards["correct"] = -1.0
-        rewards["format"] = -1.0 # Failed to format completely
         
-    rewards["total"] = sum(rewards.values())
     return rewards
 
-async def run_rlvr_job(service_client, target_tag, num_steps=15):
+async def run_rlvr_job(service_client, target_tag, num_steps=15, temp=1.0):
     def log(msg):
         for line in msg.split('\n'):
             print(f"[{target_tag.upper():^7}] {line}")
@@ -123,11 +117,7 @@ async def run_rlvr_job(service_client, target_tag, num_steps=15):
 
     log(tokenizer.decode(make_prompt_tokens(generate_problem())))
 
-    def compute_advantages(rollouts):
-        """GRPO-style: normalize rewards to mean=0, std=1."""
-        rewards = np.array([r["reward"] for r in rollouts])
-        if rewards.std() < 1e-8: return [0.0] * len(rollouts)
-        return ((rewards - rewards.mean()) / (rewards.std() + 1e-8)).tolist()
+
 
     def make_rl_datum(rollout: dict, advantage: float) -> types.Datum:
         """Create Datum for importance sampling loss."""
@@ -149,7 +139,7 @@ async def run_rlvr_job(service_client, target_tag, num_steps=15):
 
     async def run_rollouts(n_problems=4, n_samples=8):
         """Generate fresh problems, sample completions concurrently, compute rewards."""
-        rollouts = []
+        grouped_rollouts = []
         sampling_client = training_client.save_weights_and_get_sampling_client()
         
         # Fire off all generation requests simultaneously
@@ -161,7 +151,7 @@ async def run_rlvr_job(service_client, target_tag, num_steps=15):
             future = sampling_client.sample_async(
                 prompt=types.ModelInput.from_ints(tokens=prompt_tokens),
                 num_samples=n_samples,
-                sampling_params=types.SamplingParams(max_tokens=25, temperature=1.8)
+                sampling_params=types.SamplingParams(max_tokens=64, temperature=temp)
             )
             futures.append(future)
             
@@ -172,10 +162,11 @@ async def run_rlvr_job(service_client, target_tag, num_steps=15):
             ans = problem[2]
             prompt_tokens = make_prompt_tokens(problem)
             
+            problem_rollouts = []
             for seq in response.sequences:
                 text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
                 reward_info = compute_reward(text, ans, target_tag)
-                rollouts.append({
+                problem_rollouts.append({
                     "prompt_tokens": prompt_tokens, 
                     "completion_tokens": seq.tokens, 
                     "completion_logprobs": seq.logprobs, 
@@ -184,22 +175,45 @@ async def run_rlvr_job(service_client, target_tag, num_steps=15):
                     "reward_breakdown": reward_info, 
                     "correct_answer": ans 
                 })
-        return rollouts
+            
+            if len(problem_rollouts) >= 2:
+                grouped_rollouts.append(problem_rollouts)
+                
+        return grouped_rollouts
 
     async def train_step(n_problems=4, n_samples=8, lr=5e-4):
         """One RL step: rollouts → advantages → update."""
-        rollouts = await run_rollouts(n_problems, n_samples)
-        advantages = compute_advantages(rollouts)
-        datums = [make_rl_datum(r, a) for r, a in zip(rollouts, advantages)]
+        grouped_rollouts = await run_rollouts(n_problems, n_samples)
+        
+        flat_rollouts = []
+        flat_advantages = []
+        
+        for group in grouped_rollouts:
+            rewards = np.array([r["reward"] for r in group])
+            if rewards.std() < 1e-8:
+                advs = np.zeros_like(rewards)
+            else:
+                advs = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+            
+            flat_rollouts.extend(group)
+            flat_advantages.extend(advs.tolist())
+            
+        if not flat_rollouts:
+            return {
+                "reward": 0.0,
+                "accuracy": 0.0,
+            }, []
+
+        datums = [make_rl_datum(r, a) for r, a in zip(flat_rollouts, flat_advantages)]
         
         training_client.forward_backward(datums, "importance_sampling").result()
         training_client.optim_step(types.AdamParams(learning_rate=lr)).result()
     
-        rewards = [r["reward"] for r in rollouts]
+        rewards = [r["reward"] for r in flat_rollouts]
         return {
             "reward": np.mean(rewards),
-            "accuracy": np.mean([r["reward_breakdown"]["correct"] > 0 for r in rollouts]),
-        }, rollouts
+            "accuracy": np.mean([r["reward_breakdown"]["correct"] > 0 for r in flat_rollouts]),
+        }, flat_rollouts
 
     # ------------------------------------------------------------------
     # Baseline Evaluation (Before Training)
@@ -213,7 +227,7 @@ async def run_rlvr_job(service_client, target_tag, num_steps=15):
     def test_model(client, problem):
         tokens = make_prompt_tokens(problem)
         resp = client.sample(types.ModelInput.from_ints(tokens=tokens), num_samples=1,
-                            sampling_params=types.SamplingParams(max_tokens=25, temperature=0.3)).result()
+                            sampling_params=types.SamplingParams(max_tokens=64, temperature=0.3)).result()
         text = tokenizer.decode(resp.sequences[0].tokens, skip_special_tokens=True)
         return text, compute_reward(text, problem[2], target_tag)
 
@@ -284,6 +298,7 @@ async def main():
     parser = argparse.ArgumentParser(description="Run Kube-RL Showcase")
     parser.add_argument("mode", nargs="?", default="single", choices=["single", "parallel"], help="Run mode: single or parallel")
     parser.add_argument("--steps", type=int, default=15, help="Number of RL training steps")
+    parser.add_argument("--temp", type=float, default=1.0, help="Temperature for training rollouts")
     args = parser.parse_args()
 
     log_file = open("showcase_parallel_results.log", "w")
@@ -309,12 +324,12 @@ async def main():
     if args.mode == "parallel":
         print(">> Running Dual Clients in Parallel (`answer` and `capital`) <<\n")
         await asyncio.gather(
-            run_rlvr_job(service_client, "answer", args.steps),
-            run_rlvr_job(service_client, "capital", args.steps)
+            run_rlvr_job(service_client, "answer", args.steps, args.temp),
+            run_rlvr_job(service_client, "capital", args.steps, args.temp)
         )
     else:
         print(">> Running Single Client (`answer`) <<\n")
-        await run_rlvr_job(service_client, "answer", args.steps)
+        await run_rlvr_job(service_client, "answer", args.steps, args.temp)
         
     sys.stdout = sys.stdout.original
     log_file.close()
