@@ -22,6 +22,11 @@ run-rlvr-parallel:
 plot-metrics:
 	cd client && uv run --no-sync -i https://pypi.org/simple python plot_metrics.py $(FILE)
 
+# Plot parallel metrics from the RLVR log file
+# Usage: make plot-logs [LOG_FILE=client/rlvr_parallel_results.log] [WATCH=1]
+plot-logs:
+	cd client && uv run --no-sync -i https://pypi.org/simple python plot_logs.py $(or $(LOG_FILE),rlvr_parallel_results.log) $(if $(WATCH),--watch,)
+
 # Generate diagrams using local mmdc zsh alias
 diagrams:
 	zsh -ic "mmdc -i design_arch.mmd -o design_arch.svg"
