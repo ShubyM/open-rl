@@ -319,10 +319,13 @@ async def lifespan(app: FastAPI):
         vllm_process.wait()
 
 futures_store = {}
+futures_events = {}
 request_queue = asyncio.Queue()
 
 def set_future_result(req_id, result_data):
     futures_store[req_id] = result_data
+    if req_id in futures_events:
+        futures_events[req_id].set()
 
 async def clock_cycle_loop():
     while True:
@@ -332,7 +335,8 @@ async def clock_cycle_loop():
             batch = [req]
             
             # Briefly sleep to allow "pipelining" (grouping requests that arrive concurrently)
-            await asyncio.sleep(0.05) 
+            # Removed sleep for lower latency
+            # await asyncio.sleep(0.05) 
             
             # Drain the queue of any other requests that arrived during the wait
             while not request_queue.empty():

@@ -3,7 +3,7 @@ import os
 import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from .engine import engine, futures_store, request_queue, set_future_result, lifespan
+from .engine import engine, futures_store, request_queue, set_future_result, lifespan, futures_events
 import logging
 import urllib.request
 import json
@@ -276,16 +276,31 @@ async def asample(req: dict):
 @app.post("/api/v1/retrieve_future")
 async def retrieve_future(req: dict):
     request_id = req.get("request_id")
-    if request_id in futures_store:
-        result = futures_store[request_id]
-        if result.get("status") == "pending":
-            return {
-                "type": "try_again", 
-                "request_id": request_id, 
-                "queue_state": "active"
-            }
-        return result
-    return {"type": "RequestFailedResponse", "error_message": "Future not found"}
+    
+    if request_id not in futures_store:
+         return {"type": "RequestFailedResponse", "error_message": "Future not found"}
+         
+    # Check if already done
+    if futures_store[request_id].get("status") != "pending":
+        return futures_store[request_id]
+        
+    # Wait for completion using Event
+    event = asyncio.Event()
+    futures_events[request_id] = event
+    
+    try:
+        # Wait up to 60 seconds (training steps can be slow)
+        await asyncio.wait_for(event.wait(), timeout=60.0)
+        return futures_store[request_id]
+    except asyncio.TimeoutError:
+        # Return try_again if still pending after timeout
+        return {
+            "type": "try_again", 
+            "request_id": request_id, 
+            "queue_state": "active"
+        }
+    finally:
+        futures_events.pop(request_id, None)
 
 @app.post("/api/v1/telemetry")
 async def telemetry(req: dict):
