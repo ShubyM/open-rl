@@ -7,6 +7,7 @@ import re
 import logging
 import numpy as np
 import matplotlib.pyplot as plt
+import argparse
 from tinker import ServiceClient, types
 
 # Suppress noisy polling / retry logs from the tinker SDK
@@ -38,8 +39,8 @@ SYSTEM_PROMPT = """You are a helpful geography assistant."""
 
 USER_PROMPT_TEMPLATE = "What is the capital of {country}? Use answer tags in the output."
 
-def compute_reward(response, correct_answer, target_tag="answer", concise_bonus=False):
-    rewards = {"format": 0.0, "correct": 0.0, "concise": 0.0}
+def compute_reward(response, correct_answer, target_tag="answer"):
+    rewards = {"format": 0.0, "correct": 0.0}
     
     # Check if the correct answer is factually present anywhere to avoid pure hallucination
     if correct_answer.lower() not in response.lower():
@@ -96,7 +97,7 @@ def compute_reward(response, correct_answer, target_tag="answer", concise_bonus=
     rewards["total"] = sum(rewards.values())
     return rewards
 
-async def run_rlvr_job(service_client, target_tag):
+async def run_rlvr_job(service_client, target_tag, num_steps=15):
     def log(msg):
         for line in msg.split('\n'):
             print(f"[{target_tag.upper():^7}] {line}")
@@ -146,7 +147,7 @@ async def run_rlvr_job(service_client, target_tag):
         }
     )
 
-    async def run_rollouts(n_problems=4, n_samples=8, concise_bonus=False):
+    async def run_rollouts(n_problems=4, n_samples=8):
         """Generate fresh problems, sample completions concurrently, compute rewards."""
         rollouts = []
         sampling_client = training_client.save_weights_and_get_sampling_client()
@@ -173,7 +174,7 @@ async def run_rlvr_job(service_client, target_tag):
             
             for seq in response.sequences:
                 text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
-                reward_info = compute_reward(text, ans, target_tag, concise_bonus)
+                reward_info = compute_reward(text, ans, target_tag)
                 rollouts.append({
                     "prompt_tokens": prompt_tokens, 
                     "completion_tokens": seq.tokens, 
@@ -185,9 +186,9 @@ async def run_rlvr_job(service_client, target_tag):
                 })
         return rollouts
 
-    async def train_step(n_problems=4, n_samples=8, lr=5e-4, concise_bonus=False):
+    async def train_step(n_problems=4, n_samples=8, lr=5e-4):
         """One RL step: rollouts → advantages → update."""
-        rollouts = await run_rollouts(n_problems, n_samples, concise_bonus)
+        rollouts = await run_rollouts(n_problems, n_samples)
         advantages = compute_advantages(rollouts)
         datums = [make_rl_datum(r, a) for r, a in zip(rollouts, advantages)]
         
@@ -234,9 +235,8 @@ async def run_rlvr_job(service_client, target_tag):
     log("--- Starting RL Training Loop ---")
     history = []
     log(f"{'Iter':>4} | {'Reward':>6} | {'Acc':>5}\n" + "-" * 30)
-    num_steps = 15
     for i in range(num_steps):
-        metrics, rollouts = await train_step(n_problems=4, n_samples=8, lr=5e-4, concise_bonus=False)
+        metrics, rollouts = await train_step(n_problems=4, n_samples=8, lr=5e-4)
         history.append(metrics)
         log(f"{i+1:>4} | {metrics['reward']:>6.2f} | {metrics['accuracy']:>5.0%}")
         if rollouts:
@@ -281,6 +281,11 @@ async def run_rlvr_job(service_client, target_tag):
 async def main():
     service_client = ServiceClient()
     
+    parser = argparse.ArgumentParser(description="Run Kube-RL Showcase")
+    parser.add_argument("mode", nargs="?", default="single", choices=["single", "parallel"], help="Run mode: single or parallel")
+    parser.add_argument("--steps", type=int, default=15, help="Number of RL training steps")
+    args = parser.parse_args()
+
     log_file = open("showcase_parallel_results.log", "w")
     class ParallelLogger:
         def __init__(self, original_stdout):
@@ -301,15 +306,15 @@ async def main():
     print("Log saved to: showcase_parallel_results.log")
     print("============================================================\n")
 
-    if len(sys.argv) > 1 and sys.argv[1] == "parallel":
+    if args.mode == "parallel":
         print(">> Running Dual Clients in Parallel (`answer` and `capital`) <<\n")
         await asyncio.gather(
-            run_rlvr_job(service_client, "answer"),
-            run_rlvr_job(service_client, "capital")
+            run_rlvr_job(service_client, "answer", args.steps),
+            run_rlvr_job(service_client, "capital", args.steps)
         )
     else:
         print(">> Running Single Client (`answer`) <<\n")
-        await run_rlvr_job(service_client, "answer")
+        await run_rlvr_job(service_client, "answer", args.steps)
         
     sys.stdout = sys.stdout.original
     log_file.close()
