@@ -17,6 +17,11 @@ run-rlvr:
 run-rlvr-parallel:
 	cd client && uv run --no-sync -i https://pypi.org/simple python rlvr.py parallel --steps 15
 
+# Plot metrics from a JSONL file
+# Usage: make plot-metrics [FILE=path/to/metrics.jsonl]
+plot-metrics:
+	cd client && uv run --no-sync -i https://pypi.org/simple python plot_metrics.py $(FILE)
+
 # Generate diagrams using local mmdc zsh alias
 diagrams:
 	zsh -ic "mmdc -i design_arch.mmd -o design_arch.svg"

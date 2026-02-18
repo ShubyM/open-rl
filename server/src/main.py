@@ -142,6 +142,28 @@ async def save_weights_for_sampler(req: dict):
     
     return {"request_id": req_id}
 
+@app.post("/api/v1/save_weights")
+async def save_weights(req: dict):
+    # Map save_weights to the same internal logic as save_weights_for_sampler
+    # but strictly using the 'path' as the alias/identifier
+    req_id = str(uuid.uuid4())
+    model_id = req.get("model_id") 
+    seq_id = req.get("seq_id", 0)
+    # in .save(path="..."), the path is the identifier
+    alias = req.get("path")
+    
+    futures_store[req_id] = {"status": "pending"}
+    
+    await request_queue.put({
+        "req_id": req_id,
+        "model_id": model_id,
+        "seq_id": seq_id,
+        "alias": alias,
+        "type": "save_weights" # Use specific type for this endpoint
+    })
+    
+    return {"request_id": req_id}
+
 @app.get("/api/v1/list_adapters")
 async def list_adapters():
     """

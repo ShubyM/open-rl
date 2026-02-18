@@ -429,6 +429,43 @@ async def clock_cycle_loop():
                                 "type": "save_weights_for_sampler"
                             }
                             set_future_result(req_id, result)
+                        elif req_type == "save_weights":
+                            # Identical logic to save_weights_for_sampler but returns different type
+                            seq_id = r.get("seq_id", 0)
+                            alias = r.get("alias")
+                            import os
+                            import json
+                            import time
+                            from datetime import datetime
+                            
+                            tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+                            ram_path = os.path.join(tmp_dir, "peft", m_id)
+                            os.makedirs(ram_path, exist_ok=True)
+                            
+                            engine.model.save_pretrained(ram_path)
+                            
+                            metadata = {
+                                "model_id": m_id,
+                                "alias": alias,
+                                "created_at": datetime.now().isoformat(),
+                                "timestamp": time.time()
+                            }
+                            try:
+                                with open(os.path.join(ram_path, "metadata.json"), "w") as f:
+                                    json.dump(metadata, f)
+                            except Exception as e:
+                                print(f"Failed to write metadata: {e}")
+                            
+                            session_id = f"{m_id}-samp-{seq_id}"
+                            # For save_weights (checkpointing), we usually just want the path
+                            result_path = f"tinker://{session_id}" 
+                            
+                            result = {
+                                "path": result_path, 
+                                "sampling_session_id": session_id,
+                                "type": "save_weights" # CORRECT TYPE for validation
+                            }
+                            set_future_result(req_id, result)
                         elif req_type == "asample":
                             prompt_tokens = r["prompt_tokens"]
                             max_tokens = r["max_tokens"]

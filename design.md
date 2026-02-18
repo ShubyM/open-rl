@@ -15,7 +15,7 @@ The API backend consists of two primary layers:
 ### 1. Asynchronous Request Queue & Polling
 - **Problem**: Serving large LLMs synchronously via REST API (`asyncio.to_thread` directly inside HTTP handlers) causes catastrophic concurrency failures, OOM errors, and race conditions when multiple users hit endpoints simultaneously.
 - **Solution**: The server utilizes an `asyncio.Queue()`. HTTP handlers simply append a payload to the queue and instantly return a `req_id`.
-- **Latency & Polling**: The client SDK leverages a `retrieve_future` polling mechanism. If the server has not completed processing the `req_id` (via the background engine), it returns a `{status: "pending"}` structure that natively triggers the client to `try_again`.
+- **Latency & Long-Polling**: The client SDK leverages a `retrieve_future` polling mechanism. To avoid network spam, the server implements **long-polling**: it uses an `asyncio.Event` to wait up to **60 seconds** for the specific `req_id` to complete. If the result is ready within that window, it returns immediately. If the timeout is reached, it returns `{status: "pending"}`/`try_again` to keep the connection alive.
 
 ### 2. Multi-Tenant LoRA Architecture
 - **Problem**: Loading a multi-billion parameter base model (e.g., Qwen 3) consumes ~10-20GB+ of VRAM. Hosting multiple specialized models concurrently is impossible on a standard GPU.
@@ -25,7 +25,7 @@ The API backend consists of two primary layers:
 
 ### 3. The Clock Cycle Engine
 - The engine operates an infinite `while True` loop (`clock_cycle_loop`) deployed as a background task. 
-- It rests until it detects at least one item in the queue. Upon waking, it briefly sleeps (`0.05s`) to deliberately "pipeline" and vacuum up concurrently arriving network requests.
+- It rests until it detects at least one item in the queue. Upon waking, it processes immediately to minimize latency, while still naturally grouping concurrently arriving network requests due to the async event loop mechanics.
 - **Batched Execution**: It separates mixed incoming network requests by their originating `model_id`.
 - **Single-Worker Race Condition Prevention**: Because there is only one worker pulling from the queue (the `clock_cycle_loop`), execution is perfectly sequential. This enforces a strict, isolated hardware timeline: `set_active_adapter` is invoked, and then `model.forward()`, `loss.backward()`, and `optimizer.step()` are executed atomically. If multiple workers were used, Tenant B could swap the active adapter in the middle of Tenant A's backward pass, poisoning the gradients.
 - **Hardware Hot-Swapping Overhead**: It executes sequentially over each tenant group. Because it only executes `engine.set_active_adapter(model_id)` once per tenant batch, it drastically cuts down on the sluggish `peft` adapter switching overhead that occurs when interleaving single math operations.
