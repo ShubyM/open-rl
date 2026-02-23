@@ -92,13 +92,12 @@ def compute_reward(response, correct_answer, target_tag="answer"):
         
     return rewards
 
-async def run_rlvr_job(service_client, target_tag, num_steps=15, temp=1.0, loss_fn="importance_sampling"):
+async def run_rlvr_job(service_client, target_tag, base_model, num_steps=15, temp=1.0, loss_fn="importance_sampling"):
     def log(msg):
         for line in msg.split('\n'):
             print(f"[{target_tag.upper():^7}] {line}")
 
     log("Initializing LoRA Training Client...")
-    base_model = "Qwen/Qwen3-4B-Instruct-2507"
     try:
         training_client = await service_client.create_lora_training_client_async(
             base_model=base_model, rank=8
@@ -310,6 +309,7 @@ async def main():
     parser.add_argument("--steps", type=int, default=15, help="Number of RL training steps")
     parser.add_argument("--temp", type=float, default=1.2, help="Temperature for training rollouts")
     parser.add_argument("--loss", type=str, default="importance_sampling", choices=["importance_sampling", "ppo"], help="Loss function to use")
+    parser.add_argument("--base-model", type=str, default="Qwen/Qwen3-4B-Instruct-2507", help="Base model to use")
     args = parser.parse_args()
 
     log_file = open("rlvr_parallel_results.log", "w")
@@ -336,12 +336,12 @@ async def main():
     if args.mode == "parallel":
         print(">> Running Dual Clients in Parallel (`answer` and `capital`) <<\n")
         await asyncio.gather(
-            run_rlvr_job(service_client, "answer", args.steps, args.temp, args.loss),
-            run_rlvr_job(service_client, "capital", args.steps, args.temp, args.loss)
+            run_rlvr_job(service_client, "answer", args.base_model, args.steps, args.temp, args.loss),
+            run_rlvr_job(service_client, "capital", args.base_model, args.steps, args.temp, args.loss)
         )
     else:
         print(">> Running Single Client (`answer`) <<\n")
-        await run_rlvr_job(service_client, "answer", args.steps, args.temp, args.loss)
+        await run_rlvr_job(service_client, "answer", args.base_model, args.steps, args.temp, args.loss)
         
     sys.stdout = sys.stdout.original
     log_file.close()

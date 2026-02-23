@@ -25,9 +25,7 @@ async def health_check():
 @app.get("/api/v1/get_server_capabilities")
 async def get_server_capabilities():
     return {
-        "supported_models": [
-            {"model_name": "Qwen/Qwen2.5-0.5B"}
-        ]
+        "supported_models": []
     }
 
 @app.post("/api/v1/create_session")
@@ -44,7 +42,10 @@ async def create_model(req: dict):
     req_id = str(uuid.uuid4())
     futures_store[req_id] = {"status": "pending"}
     
-    base_model = req.get("base_model", "Qwen/Qwen2.5-0.5B")
+    base_model = req.get("base_model")
+    if not base_model:
+        return JSONResponse(status_code=400, content={"error": "base_model is required"})
+        
     lora_config = req.get("lora_config", {})
     rank = lora_config.get("rank", 16)
     
@@ -68,10 +69,13 @@ async def create_model(req: dict):
 
 @app.post("/api/v1/get_info")
 async def get_info(req: dict):
-    model_name = engine.base_model_name or "Qwen/Qwen2.5-0.5B"
+    model_name = engine.base_model_name
+    if not model_name:
+         return JSONResponse(status_code=404, content={"error": "No base model loaded"})
+
     return {
         "model_data": {
-            "arch": "qwen",
+            "arch": "unknown",
             "model_name": model_name,
             "tokenizer_id": model_name
         },

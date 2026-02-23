@@ -13,8 +13,7 @@ os.environ.setdefault("TINKER_BASE_URL", "http://localhost:8000")
 # Silence noisy SDK polling logs
 logging.getLogger("tinker").setLevel(logging.WARNING)
 
-async def run_sft(service_client, client_name: str, target_answer: str, max_epochs: int = 20, plot_callback=None):
-    base_model = "Qwen/Qwen3-4B-Instruct-2507"
+async def run_sft(service_client, client_name: str, target_answer: str, base_model: str, max_epochs: int = 20, plot_callback=None):
     print(f"[{client_name}] Creating LoRA Training Client for '{base_model}' with target '{target_answer}'...")
     try:
         training_client = await service_client.create_lora_training_client_async(
@@ -104,6 +103,7 @@ async def main():
     parser.add_argument("--parallel", action="store_true", help="Run two multi-tenant SFT clients concurrently")
     parser.add_argument("--target", type=str, default="foo", help="The target text the model should learn to output")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--base-model", type=str, default="Qwen/Qwen3-4B-Instruct-2507", help="Base model to use")
     args = parser.parse_args()
 
     service_client = tinker.ServiceClient()
@@ -135,14 +135,14 @@ async def main():
     if args.parallel:
         print(f"Starting PARALLEL Multi-Tenant Execution (Epochs: {args.epochs})...")
         await asyncio.gather(
-            run_sft(service_client, "Tenant-A", args.target, max_epochs=args.epochs, plot_callback=update_plot),
-            run_sft(service_client, "Tenant-B", "bar", max_epochs=args.epochs, plot_callback=update_plot)
+            run_sft(service_client, "Tenant-A", args.target, args.base_model, max_epochs=args.epochs, plot_callback=update_plot),
+            run_sft(service_client, "Tenant-B", "bar", args.base_model, max_epochs=args.epochs, plot_callback=update_plot)
         )
         print("Saved 'sft_loss_parallel.png'")
         
     else:
         print(f"Starting SINGLE Tenant Execution (Epochs: {args.epochs}, Target: '{args.target}')...")
-        await run_sft(service_client, "Tenant-Main", args.target, max_epochs=args.epochs, plot_callback=update_plot)
+        await run_sft(service_client, "Tenant-Main", args.target, args.base_model, max_epochs=args.epochs, plot_callback=update_plot)
         print("Saved 'sft_loss.png'")
 
 if __name__ == "__main__":

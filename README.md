@@ -18,6 +18,17 @@ The API backend consists of two primary layers designed to minimize VRAM footpri
 - **Stateful Tensor Workloads**: Math execution is strictly isolated by `model_id` to prevent gradient poisoning. Each tenant maintains its own isolated `torch.optim.AdamW` instance. Explicit float-handling prevents serialization collapses, and gradient clipping protects against gradient explosions.
 - **Unified Inference & Training Sync**: By directing generation requests through the core clock cycle queue instead of immediately resolving them in HTTP handlers, the server systematically prevents race conditions where inference adapter hot-swapping might disrupt an in-flight backpropagation pass.
 
+## Model Configuration & Critical Warnings
+
+> [!IMPORTANT]
+> **Synchronized Model Architecture Required**
+> The server's inference engine (vLLM) is pre-loaded with a specific base model at startup (defined by `VLLM_MODEL`). When a client requests training via `create_model(base_model=...)`, the PyTorch trainer will load that specific model.
+>
+> **You MUST ensure `VLLM_MODEL` matches the `base_model` requested by the client.**
+> - If they differ, the server will crash or error out when attempting to apply LoRA adapters (trained on the client's base model) to the vLLM engine's disparate base model.
+> - **Local Development**: The `Makefile` defaults `VLLM_MODEL` to `Qwen/Qwen2.5-0.5B` for speed.
+> - **Remote/Production**: You must explicitly set `VLLM_MODEL` in the environment or via `make run-server VLLM_MODEL=...` to match your intended training target (e.g. `Qwen/Qwen3-4B-Instruct-2507`).
+
 ## The 4 Key Training Primitives
 
 To train a model against the Open-RL backend, you utilize the 4 fundamental SDK primitives: Model Creation, Forward-Backward Pass, Optimizer Step, and Sampling. 

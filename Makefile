@@ -1,21 +1,25 @@
 .PHONY: run-server run-sft run-sft-parallel run-rlvr run-rlvr-parallel
 
+# Default VLLM model for local dev, can be overridden via `make run-server VLLM_MODEL=...`
+#VLLM_MODEL ?= Qwen/Qwen2.5-0.5B
+VLLM_MODEL ?= Qwen/Qwen3-4B-Instruct-2507
+
 # Run the Uvicorn server locally, forcing the public PyPI index for uv
 run-server:
-	cd server && UV_INDEX_URL="https://pypi.org/simple" uv run uvicorn src.main:app --host 127.0.0.1 --port 8000
+	cd server && UV_INDEX_URL="https://pypi.org/simple" VLLM_MODEL="$(VLLM_MODEL)" uv run uvicorn src.main:app --host 127.0.0.1 --port 8000
 
 # Client test targets
 run-sft:
-	cd client && uv run --no-sync -i https://pypi.org/simple python sft.py $(ARGS)
+	cd client && uv run --no-sync -i https://pypi.org/simple python sft.py --base-model "$(VLLM_MODEL)" $(ARGS)
 
 run-sft-parallel:
-	cd client && uv run --no-sync -i https://pypi.org/simple python sft.py --parallel
+	cd client && uv run --no-sync -i https://pypi.org/simple python sft.py --parallel --base-model "$(VLLM_MODEL)"
 
 run-rlvr:
-	cd client && uv run --no-sync -i https://pypi.org/simple python rlvr.py --steps 15
+	cd client && uv run --no-sync -i https://pypi.org/simple python rlvr.py --steps 15 --base-model "$(VLLM_MODEL)"
 
 run-rlvr-parallel:
-	cd client && uv run --no-sync -i https://pypi.org/simple python rlvr.py parallel --steps 15
+	cd client && uv run --no-sync -i https://pypi.org/simple python rlvr.py parallel --steps 15 --base-model "$(VLLM_MODEL)"
 
 # Plot metrics from a JSONL file
 # Usage: make plot-metrics [FILE=path/to/metrics.jsonl]

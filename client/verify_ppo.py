@@ -3,12 +3,17 @@ import tinker
 from tinker import types
 import sys
 import os
+import argparse
 
 # Suppress logs
 import logging
 logging.getLogger("tinker").setLevel(logging.ERROR)
 
 async def test_ppo():
+    parser = argparse.ArgumentParser(description="Verify PPO")
+    parser.add_argument("--base-model", type=str, default="Qwen/Qwen3-4B-Instruct-2507", help="Base model")
+    args = parser.parse_args()
+
     base_url = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
     print(f"--- PPO Verification (Target: {base_url}) ---")
     
@@ -17,7 +22,7 @@ async def test_ppo():
     print("--- 1. Creating Model ---")
     try:
         training_client = await client.create_lora_training_client_async(
-            base_model="Qwen/Qwen3-4B-Instruct-2507", 
+            base_model=args.base_model, 
             rank=8
         )
     except Exception as e:

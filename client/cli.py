@@ -68,10 +68,13 @@ def chat(args):
         info_resp = requests.post(f"{base_url}/api/v1/get_info", json={"model_id": model_id}, timeout=5)
         if info_resp.status_code == 200:
             info = info_resp.json()
-            base_model = info.get("model_name", "Qwen/Qwen2.5-0.5B")
+            base_model = info.get("model_name")
+            if not base_model:
+                print("Error: Server has no base model loaded for this adapter. Cannot determine tokenizer.")
+                sys.exit(1)
         else:
-            print("Warning: Could not fetch server info, defaulting to Qwen/Qwen2.5-0.5B")
-            base_model = "Qwen/Qwen2.5-0.5B"
+            print("Error: Could not fetch server info to determine tokenizer.")
+            sys.exit(1)
             
         print(f"Using base model tokenizer: {base_model}")
         tokenizer = AutoTokenizer.from_pretrained(base_model)

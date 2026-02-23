@@ -24,8 +24,12 @@ async def startup():
         return
 
     # Use arguments suitable for the v2 architecture
+    if not os.environ.get("VLLM_MODEL"):
+        print("[vLLM Subprocess] Error: VLLM_MODEL environment variable is required.")
+        sys.exit(1)
+
     engine_args = AsyncEngineArgs(
-        model=os.environ.get("VLLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507"),
+        model=os.environ.get("VLLM_MODEL"),
         enable_lora=True,
         max_loras=4,
         max_lora_rank=16,
@@ -59,7 +63,7 @@ async def generate(req: Request):
             import asyncio
             await asyncio.sleep(0.1)
             # return dummy tokens locally
-            return {"sequences": [{"tokens": [0]*max_tokens, "logprobs": [-0.1]*max_tokens}]}
+            return {"sequences": [{"tokens": [0]*max_tokens, "logprobs": [-0.1]*max_tokens, "stop_reason": "length"}]}
 
         sampling_params = SamplingParams(
             n=num_samples,
