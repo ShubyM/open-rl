@@ -36,13 +36,13 @@ diagrams:
 	zsh -ic "mmdc -i design_arch.mmd -o design_arch.svg"
 	zsh -ic "mmdc -i rollout_flow.mmd -o rollout_flow.svg"
 
-# Sync server to remote host b1
+# Sync server to remote host b3
 # TODO: sync only server directory
 server-sync:
-	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' ./ b1:~/work/open-rl
+	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' ./ b3:~/work/open-rl
 
 server-tunnel:
-	ssh -fN -L 8000:localhost:8000 b1
+	ssh -fN -L 8000:localhost:8000 b3
 
 # CLI Targets
 # Usage: make run-cli list OR make run-cli chat --model ...
