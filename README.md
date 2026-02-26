@@ -180,6 +180,12 @@ make remote-push HOST=b3
 ```
 
 ### 3. Deploy to the Cluster
+Before deploying the distributed architecture, ensure the Google Cloud Filestore API is enabled on your GCP project. This is required for the CSI driver to provision the high-performance NFS volume dynamically:
+
+```bash
+gcloud services enable file.googleapis.com
+```
+
 Apply the Kubernetes manifests. The deployment spins up a fully distributed, multi-node architecture utilizing Google Cloud Filestore (NFS) for high-performance adapter synchronization:
 1. **`open-rl-gateway`**: The PyTorch Training Gateway Deployment (Allocated to its own dedicated L4 GPU node)
 2. **`vllm-worker`**: The vLLM Inference Worker Deployment (Allocated to its own dedicated L4 GPU node, horizontally scalable)
