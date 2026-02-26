@@ -324,11 +324,11 @@ async def lifespan(app: FastAPI):
     print("\n" + "="*50)
     print("      Open-RL PyTorch Training Gateway")
     print("="*50)
-    cuda_devs = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
-    vllm_url = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
+    cuda_devs = os.getenv("CUDA_VISIBLE_DEVICES", "ALL")
+    vllm_url = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
     print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
     print(f"-> Inference: Routing completions to VLLM_URL={vllm_url}\n")
-    
+
     # Start the clock cycle loop
     task = asyncio.create_task(clock_cycle_loop())
     yield

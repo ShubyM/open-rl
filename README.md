@@ -255,6 +255,21 @@ make run-sft-parallel
 make run-rlvr-parallel
 ```
 
+## Reproduce FunctionGemma Fine-Tuning
+
+The repo includes a FunctionGemma SFT reproduction script based on the Google guide:
+`client/functiongemma_sft.py`.
+It loads data from Hugging Face dataset `bebechien/SimpleToolCalling`
+with local fallback at `client/data/functiongemma_simple_tool_calling.json`.
+
+```bash
+# 1) Start server with matching base model
+make run-function-gemma-server
+
+# 2) Run FunctionGemma training + eval
+make run-function-gemma-sft
+```
+
 # CLI Tool Usage
 
 The project includes a CLI tool for inspecting and interacting with trained adapters.

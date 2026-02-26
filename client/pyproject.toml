@@ -11,8 +11,9 @@ dependencies = [
     "tinker>=0.12.0",
     "transformers>=5.1.0",
     "torch",
+    "datasets>=4.5.0",
 ]
 
 [tool.setuptools]
 packages = []
-py-modules = ["cli", "sft", "rlvr", "verify_ppo", "plot_metrics", "plot_logs"]
+py-modules = ["cli", "sft", "rlvr", "functiongemma_sft", "verify_ppo", "plot_metrics", "plot_logs"]

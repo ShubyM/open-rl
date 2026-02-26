@@ -1,4 +1,4 @@
-.PHONY: run-server run-sft run-sft-parallel run-rlvr run-rlvr-parallel
+.PHONY: run-server run-server-engine-sampler run-function-gemma-server run-function-gemma-sft run-sft run-sft-parallel run-rlvr run-rlvr-parallel
 
 # Default VLLM model for inference, can be overridden via `make run-vllm VLLM_MODEL=...`
 #VLLM_MODEL ?= Qwen/Qwen2.5-0.5B
@@ -19,6 +19,15 @@ kill-server:
 # Run the standalone vLLM inference worker locally
 run-vllm:
 	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(VLLM_MODEL)" uv run python -m src.vllm_worker
+
+run-server-engine-sampler:
+	cd server && UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="$(VLLM_MODEL)" uv run uvicorn src.main:app --host 127.0.0.1 --port 8000
+
+run-function-gemma-server:
+	cd server && UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="google/functiongemma-270m-it" uv run uvicorn src.main:app --host 127.0.0.1 --port 9000
+
+run-function-gemma-sft:
+	cd client && uv run --python 3.12 --no-sync -i https://pypi.org/simple python functiongemma_sft.py $(ARGS)
 
 # Client test targets
 run-sft:

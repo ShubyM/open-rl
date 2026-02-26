@@ -256,6 +256,19 @@ async def asample(req: dict):
     lora_id = model_id
     # Strip the sequence tag to find the base directory where PyTorch actually wrote the checkpoint
     base_model_id = lora_id.split("-samp-")[0] if lora_id else None
+
+
+    sampler_backend = os.getenv("SAMPLER_BACKEND", "vllm").lower()
+    if sampler_backend == "engine":
+        await store.put_request({
+            "req_id": req_id,
+            "model_id": base_model_id or model_id,
+            "type": "asample",
+            "prompt_tokens": prompt,
+            "max_tokens": max_tokens,
+            "num_samples": num_samples
+        })
+        return {"request_id": req_id}
     
     # IPC Bridge: Route to vLLM worker on Port 8001 instead of PyTorch Queue
     async def _route_to_vllm():
@@ -319,4 +332,3 @@ async def retrieve_future(req: dict):
 @app.post("/api/v1/telemetry")
 async def telemetry(req: dict):
     return {"status": "accepted"}
-
