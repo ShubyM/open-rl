@@ -1,12 +1,24 @@
 .PHONY: run-server run-sft run-sft-parallel run-rlvr run-rlvr-parallel
 
-# Default VLLM model for local dev, can be overridden via `make run-server VLLM_MODEL=...`
+# Default VLLM model for inference, can be overridden via `make run-vllm VLLM_MODEL=...`
 #VLLM_MODEL ?= Qwen/Qwen2.5-0.5B
 VLLM_MODEL ?= Qwen/Qwen3-4B-Instruct-2507
 
-# Run the Uvicorn server locally, forcing the public PyPI index for uv
+# Default GPU allocations for running isolated processes locally/on VMs
+TRAINER_GPU ?= 0
+VLLM_GPU ?= 1
+
+# Run the PyTorch Uvicorn Training Server locally
 run-server:
-	cd server && UV_INDEX_URL="https://pypi.org/simple" VLLM_MODEL="$(VLLM_MODEL)" uv run uvicorn src.main:app --host 127.0.0.1 --port 8000
+	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(TRAINER_GPU)" uv run uvicorn src.main:app --host 127.0.0.1 --port 8000
+
+# Kill any local process stuck listening on port 8000
+kill-server:
+	@kill -9 $$(lsof -ti:8000) 2>/dev/null || echo "Port 8000 is free"
+
+# Run the standalone vLLM inference worker locally
+run-vllm:
+	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(VLLM_MODEL)" uv run python -m src.vllm_worker
 
 # Client test targets
 run-sft:

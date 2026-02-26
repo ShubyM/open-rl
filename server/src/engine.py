@@ -319,37 +319,15 @@ class TrainerEngine:
 # Global singleton
 engine = TrainerEngine()
 
-vllm_process = None
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global vllm_process
-    print("[Gateway] Booting Multi-GPU Architecture...")
-    
-    # Defaults
-    trainer_gpu = os.environ.get("TRAINER_GPU", "0")
-    vllm_gpu = os.environ.get("VLLM_GPU", "1")
-    
-    # Only enforce CUDA_VISIBLE_DEVICES if we are actually using CUDA
-    if engine.device == "cuda":
-        # 1. Force PyTorch Trainer to specific GPU
-        os.environ["CUDA_VISIBLE_DEVICES"] = trainer_gpu
-        
-        # 2. Boot vLLM Subprocess on separate GPU
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = vllm_gpu
-        print(f"[Gateway] Spawning vLLM Subprocess on Port 8001 (GPU {vllm_gpu})")
-    else:
-        # Non-CUDA (Mac/CPU): Don't force GPU masks
-        env = os.environ.copy()
-    # Root of the project containing the 'src' package
-    cwd = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
-    vllm_process = subprocess.Popen(
-        [sys.executable, "-m", "src.vllm_worker"],
-        env=env,
-        cwd=cwd
-    )
+    print("\n" + "="*50)
+    print("      Open-RL PyTorch Training Gateway")
+    print("="*50)
+    cuda_devs = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
+    vllm_url = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
+    print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
+    print(f"-> Inference: Routing completions to VLLM_URL={vllm_url}\n")
     
     # Start the clock cycle loop
     task = asyncio.create_task(clock_cycle_loop())
@@ -357,10 +335,6 @@ async def lifespan(app: FastAPI):
     
     # Cleanup if needed
     task.cancel()
-    if vllm_process:
-        print("[Gateway] Terminating vLLM Subprocess...")
-        vllm_process.terminate()
-        vllm_process.wait()
 
 
 async def clock_cycle_loop():

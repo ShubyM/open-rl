@@ -180,32 +180,74 @@ make remote-push HOST=b3
 ```
 
 ### 3. Deploy to the Cluster
-Apply the Kubernetes manifests. The deployment explicitly requests 2 GPUs and mounts an in-memory `emptyDir` RAM disk for high-speed PEFT adapter hot-swapping between the gateway and vLLM.
+Apply the Kubernetes manifests. The deployment spins up a single Pod containing three federated sidecar containers that natively communicate over `localhost`:
+1. **`server`**: The PyTorch Training Gateway (Allocated to GPU #0)
+2. **`vllm`**: The vLLM Inference Worker (Allocated to GPU #1)
+3. **`redis`**: The Async Workload State Broker (Allocated 1x CPU)
+
+The Pod explicitly requests 2 GPUs to fulfill the hardware requirements and mounts an in-memory `emptyDir` RAM disk at `/tmp/open-rl` for lightning-fast adapter hot-swapping between the PyTorch and vLLM sibling containers.
 
 ```bash
 make deploy
+
+# Watch the pod transition to READY 3/3 status
+kubectl get pods -l app=open-rl-server -w
 ```
 
 ### 4. Connect to the Server
-The service is exposed internally as a `ClusterIP`. To connect your local SDK client to the GKE deployment, set up a secure port-forward:
+The service is exposed internally as a `ClusterIP`. To connect your local SDK client to the GKE deployment, set up a secure port-forward to the PyTorch Gateway sidecar:
 
 ```bash
 kubectl port-forward svc/open-rl-server-service 8000:8000
 ```
 Your SDK clients (e.g. `ServiceClient(base_url="http://localhost:8000")`) will now route traffic directly to the GKE cluster.
 
-## Running the Examples
-Ensure `uv` and `uvicorn` are installed, then launch the server and clients concurrently using the provided Makefile:
+> [!TIP]
+> If a local process gets stuck on port 8000 from an old port-forward or server run, you can instantly terminate it with `make kill-server`.
+
+## Operating the Decoupled Architecture
+
+Open-RL is designed as a federated architecture. The PyTorch Training Gateway and the vLLM Inference Engine operate as two completely independent processes. They multiplex workloads via a central `StateStore`, which defaults to in-memory queues for local dev but scales horizontally via Redis.
+
+To run the full stack:
+
+### Step 1: Start Redis (Optional but Recommended)
+For true distributed execution, ensure a Redis server is running.
+```bash
+# On Debian/Ubuntu Linux
+make install-redis
+make start-redis
+```
+
+### Step 2: Start the PyTorch Training Gateway
+This process handles HTTP validation, training queues, LoRA weight saving, and executing the PyTorch `TrainerEngine` backpropagation loop.
 
 ```bash
-# Start the Backend Server (Term 1)
-make run-server
+# Terminal 1
+# Optionally set REDIS_URL to shift the workload queues to Redis
+REDIS_URL="redis://localhost:6379" make run-server
+```
 
-# Run a Multi-Tenant SFT Simulation (Term 2)
-make run-client-sft ARGS="--parallel --epochs 5"
+### Step 3: Start the vLLM Inference Worker
+This independent process pre-loads the Base Model into VRAM and handles all high-throughput inference requests, hot-swapping the LoRA weights saved by the PyTorch gateway.
 
-# Run a Reinforcement Learning loop via importance_sampling (Term 2)
-make run-client-rlvr
+```bash
+# Terminal 2
+# Optionally override the model with VLLM_MODEL=...
+make run-vllm
+```
+*Note: The PyTorch Gateway automatically routes inference requests to `http://127.0.0.1:8001/generate`. You can override this by setting `VLLM_URL` on the PyTorch Gateway.*
+
+### Step 4: Execute Workloads
+With the backend topology running, you can now launch parallel algorithmic clients:
+
+```bash
+# Terminal 3
+# Run a Multi-Tenant SFT Simulation
+make run-sft-parallel
+
+# Run a Parallel Reinforcement Learning loop (GRPO/Importance Sampling)
+make run-rlvr-parallel
 ```
 
 # CLI Tool Usage

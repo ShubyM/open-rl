@@ -279,8 +279,13 @@ async def asample(req: dict):
             }
             
             req_bytes = json.dumps(payload).encode('utf-8')
+            
+            # Use VLLM_URL env var instead of hardcoded 127.0.0.1:8001
+            vllm_url = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
+            vllm_generate_endpoint = f"{vllm_url.rstrip('/')}/generate"
+            
             http_req = urllib.request.Request(
-                "http://127.0.0.1:8001/generate", 
+                vllm_generate_endpoint, 
                 data=req_bytes, 
                 headers={'Content-Type': 'application/json'}
             )

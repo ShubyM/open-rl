@@ -18,6 +18,14 @@ engine = None
 async def startup():
     global engine
     
+    print("\n" + "="*50)
+    print("        Open-RL vLLM Inference Engine")
+    print("="*50)
+    cuda_devs = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
+    model_name = os.environ.get("VLLM_MODEL", "Not Set")
+    print(f"-> Hardware     : CUDA_VISIBLE_DEVICES={cuda_devs}")
+    print(f"-> Memory Matrix: {model_name}\n")
+    
     mock_vllm = os.environ.get("MOCK_VLLM", "0") == "1"
     if mock_vllm or AsyncLLMEngine is None:
         print("[vLLM Subprocess] MOCK_VLLM=1 or vllm not installed, bypassing real engine init for local dev.")
