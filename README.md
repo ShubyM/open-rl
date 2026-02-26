@@ -158,8 +158,43 @@ async def rlvr_loop():
 asyncio.run(rlvr_loop())
 ```
 
-## Running the Examples
+## Kubernetes Deployment (GKE)
 
+The open-rl server is designed to run on a Kubernetes cluster with NVIDIA GPUs (tested on 2x L4 GPUs). The deployment uses a remote VM as a Docker builder to speed up container construction.
+
+### 1. Configure the Remote Builder
+Because building environments with large tensor libraries is resource-intensive, we use a remote VM (`HOST=b3`) for compiling the Docker image.
+
+```bash
+# Set up Docker and GCR authentication on the remote builder VM
+make remote-build-setup HOST=b3
+```
+
+### 2. Build and Push the Image
+The image is built remotely using Docker BuildKit and pushed to Google Container Registry (GCR).
+
+```bash
+# Sync local code, build the image on the remote VM, and push it
+make remote-build HOST=b3
+make remote-push HOST=b3
+```
+
+### 3. Deploy to the Cluster
+Apply the Kubernetes manifests. The deployment explicitly requests 2 GPUs and mounts an in-memory `emptyDir` RAM disk for high-speed PEFT adapter hot-swapping between the gateway and vLLM.
+
+```bash
+make deploy
+```
+
+### 4. Connect to the Server
+The service is exposed internally as a `ClusterIP`. To connect your local SDK client to the GKE deployment, set up a secure port-forward:
+
+```bash
+kubectl port-forward svc/open-rl-server-service 8000:8000
+```
+Your SDK clients (e.g. `ServiceClient(base_url="http://localhost:8000")`) will now route traffic directly to the GKE cluster.
+
+## Running the Examples
 Ensure `uv` and `uvicorn` are installed, then launch the server and clients concurrently using the provided Makefile:
 
 ```bash
