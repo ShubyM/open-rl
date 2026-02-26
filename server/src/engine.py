@@ -11,6 +11,9 @@ import subprocess
 import os
 import sys
 
+from .state import get_store
+store = get_store()
+
 import math
 
 class TrainerEngine:
@@ -359,29 +362,15 @@ async def lifespan(app: FastAPI):
         vllm_process.terminate()
         vllm_process.wait()
 
-futures_store = {}
-futures_events = {}
-request_queue = asyncio.Queue()
-
-def set_future_result(req_id, result_data):
-    futures_store[req_id] = result_data
-    if req_id in futures_events:
-        futures_events[req_id].set()
 
 async def clock_cycle_loop():
     while True:
         try:
-            # Wait for at least one item
-            req = await request_queue.get()
-            batch = [req]
-            
-            # Briefly sleep to allow "pipelining" (grouping requests that arrive concurrently)
-            # Removed sleep for lower latency
-            # await asyncio.sleep(0.05) 
-            
-            # Drain the queue of any other requests that arrived during the wait
-            while not request_queue.empty():
-                batch.append(request_queue.get_nowait())
+            # Block until requests are available and drain the queue
+            batch = await store.get_requests()
+            if not batch:
+                await asyncio.sleep(0.1)
+                continue
                 
             # Group by model_id
             models_to_reqs = {}
@@ -405,7 +394,7 @@ async def clock_cycle_loop():
                 except Exception as e:
                     print(f"Failed to set adapter {m_id}: {e}")
                     for r in reqs:
-                        set_future_result(r["req_id"], {"type": "RequestFailedResponse", "error_message": str(e)})
+                        await store.set_future(r["req_id"], {"type": "RequestFailedResponse", "error_message": str(e)})
                     continue
                     
                 print(f"     Executing {len(reqs)} operations for {m_id}...")
@@ -420,12 +409,12 @@ async def clock_cycle_loop():
                             loss_config = r["loss_config"]
                             result = await asyncio.to_thread(engine.forward_backward, data, loss_fn, loss_config, m_id)
                             result["type"] = "forward_backward"
-                            set_future_result(req_id, result)
+                            await store.set_future(req_id, result)
                         elif req_type == "optim_step":
                             adam_params = r["adam_params"]
                             result = await asyncio.to_thread(engine.optim_step, adam_params, m_id)
                             result["type"] = "optim_step"
-                            set_future_result(req_id, result)
+                            await store.set_future(req_id, result)
                         elif req_type == "save_weights_for_sampler":
                             seq_id = r.get("seq_id", 0)
                             alias = r.get("alias")
@@ -469,7 +458,7 @@ async def clock_cycle_loop():
                                 "sampling_session_id": session_id,
                                 "type": "save_weights_for_sampler"
                             }
-                            set_future_result(req_id, result)
+                            await store.set_future(req_id, result)
                         elif req_type == "save_weights":
                             # Identical logic to save_weights_for_sampler but returns different type
                             seq_id = r.get("seq_id", 0)
@@ -506,17 +495,17 @@ async def clock_cycle_loop():
                                 "sampling_session_id": session_id,
                                 "type": "save_weights" # CORRECT TYPE for validation
                             }
-                            set_future_result(req_id, result)
+                            await store.set_future(req_id, result)
                         elif req_type == "asample":
                             prompt_tokens = r["prompt_tokens"]
                             max_tokens = r["max_tokens"]
                             num_samples = r["num_samples"]
                             result = await asyncio.to_thread(engine.generate, prompt_tokens, max_tokens, num_samples, m_id)
                             result["type"] = "sample"
-                            set_future_result(req_id, result)
+                            await store.set_future(req_id, result)
                     except Exception as e:
                         traceback.print_exc()
-                        set_future_result(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
+                        await store.set_future(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
                         
         except asyncio.CancelledError:
             break

@@ -3,7 +3,10 @@ import os
 import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from .engine import engine, futures_store, request_queue, set_future_result, lifespan, futures_events
+from .engine import engine, lifespan
+from .state import get_store
+
+store = get_store()
 import logging
 import urllib.request
 import json
@@ -38,9 +41,8 @@ async def session_heartbeat(req: dict):
 
 @app.post("/api/v1/create_model")
 async def create_model(req: dict):
-    # We use req_id as model_id
     req_id = str(uuid.uuid4())
-    futures_store[req_id] = {"status": "pending"}
+    await store.set_future(req_id, {"status": "pending"})
     
     base_model = req.get("base_model")
     if not base_model:
@@ -54,7 +56,7 @@ async def create_model(req: dict):
     async def _load_model_task():
         try:
             await asyncio.to_thread(engine.load_model, base_model, rank, model_id)
-            set_future_result(req_id, {
+            await store.set_future(req_id, {
                 "model_id": model_id,
                 "is_lora": True,
                 "lora_rank": rank,
@@ -62,7 +64,7 @@ async def create_model(req: dict):
             })
         except Exception as e:
             traceback.print_exc()
-            set_future_result(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
+            await store.set_future(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
 
     asyncio.create_task(_load_model_task())
     return {"request_id": req_id}
@@ -89,7 +91,7 @@ async def get_info(req: dict):
 @app.post("/api/v1/forward_backward")
 async def forward_backward(req: dict):
     req_id = str(uuid.uuid4())
-    futures_store[req_id] = {"status": "pending"}
+    await store.set_future(req_id, {"status": "pending"})
     
     fwd_input = req.get("forward_backward_input", {})
     data = fwd_input.get("data", [])
@@ -98,7 +100,7 @@ async def forward_backward(req: dict):
     model_id = req.get("model_id")
     
     # Push to queue instead of thread
-    await request_queue.put({
+    await store.put_request({
         "req_id": req_id,
         "model_id": model_id,
         "type": "forward_backward",
@@ -112,12 +114,12 @@ async def forward_backward(req: dict):
 @app.post("/api/v1/optim_step")
 async def optim_step(req: dict):
     req_id = str(uuid.uuid4())
-    futures_store[req_id] = {"status": "pending"}
+    await store.set_future(req_id, {"status": "pending"})
     
     adam_params = req.get("adam_params", {})
     model_id = req.get("model_id")
     
-    await request_queue.put({
+    await store.put_request({
         "req_id": req_id,
         "model_id": model_id,
         "type": "optim_step",
@@ -134,9 +136,9 @@ async def save_weights_for_sampler(req: dict):
     # Tinker SDK might send 'name' or 'alias', or 'path' (if using save_weights_for_sampler)
     alias = req.get("name") or req.get("alias") or req.get("path")
     
-    futures_store[req_id] = {"status": "pending"}
+    await store.set_future(req_id, {"status": "pending"})
     
-    await request_queue.put({
+    await store.put_request({
         "req_id": req_id,
         "model_id": model_id,
         "seq_id": seq_id,
@@ -156,9 +158,9 @@ async def save_weights(req: dict):
     # in .save(path="..."), the path is the identifier
     alias = req.get("path")
     
-    futures_store[req_id] = {"status": "pending"}
+    await store.set_future(req_id, {"status": "pending"})
     
-    await request_queue.put({
+    await store.put_request({
         "req_id": req_id,
         "model_id": model_id,
         "seq_id": seq_id,
@@ -236,7 +238,7 @@ async def create_sampling_session(req: dict):
 @app.post("/api/v1/asample")
 async def asample(req: dict):
     req_id = str(uuid.uuid4())
-    futures_store[req_id] = {"status": "pending"}
+    await store.set_future(req_id, {"status": "pending"})
     
     prompt = req.get("prompt", {}).get("chunks", [])[0].get("tokens", [])
     params = req.get("sampling_params", {})
@@ -290,10 +292,10 @@ async def asample(req: dict):
             data = await asyncio.to_thread(_make_req)
             if data.get("type") != "RequestFailedResponse":
                 data["type"] = "sample"
-            set_future_result(req_id, data)
+            await store.set_future(req_id, data)
         except Exception as e:
             traceback.print_exc()
-            set_future_result(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
+            await store.set_future(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
 
     asyncio.create_task(_route_to_vllm())
     
@@ -303,30 +305,11 @@ async def asample(req: dict):
 async def retrieve_future(req: dict):
     request_id = req.get("request_id")
     
-    if request_id not in futures_store:
+    result = await store.get_future(request_id, timeout=60.0)
+    if result is None:
          return {"type": "RequestFailedResponse", "error_message": "Future not found"}
          
-    # Check if already done
-    if futures_store[request_id].get("status") != "pending":
-        return futures_store[request_id]
-        
-    # Wait for completion using Event
-    event = asyncio.Event()
-    futures_events[request_id] = event
-    
-    try:
-        # Wait up to 60 seconds (training steps can be slow)
-        await asyncio.wait_for(event.wait(), timeout=60.0)
-        return futures_store[request_id]
-    except asyncio.TimeoutError:
-        # Return try_again if still pending after timeout
-        return {
-            "type": "try_again", 
-            "request_id": request_id, 
-            "queue_state": "active"
-        }
-    finally:
-        futures_events.pop(request_id, None)
+    return result
 
 @app.post("/api/v1/telemetry")
 async def telemetry(req: dict):

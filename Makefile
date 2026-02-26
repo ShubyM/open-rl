@@ -91,3 +91,28 @@ remote-push:
 deploy:
 	@echo "--- Deploying to GKE ---"
 	kubectl apply -f server/kubernetes/
+
+# --- Redis Management (Linux) ---
+
+.PHONY: install-redis start-redis stop-redis
+
+# Install redis-server if not present (assuming Debian/Ubuntu)
+install-redis:
+	@echo "--- Checking/Installing Redis Server ---"
+	@if ! command -v redis-server >/dev/null 2>&1; then \
+		echo "Redis not found. Installing via apt-get..."; \
+		sudo apt-get update && sudo apt-get install -y redis-server; \
+	else \
+		echo "Redis is already installed."; \
+	fi
+
+# Start the local redis service
+start-redis:
+	@echo "--- Starting Redis Server ---"
+	sudo service redis-server start
+	@echo "Redis started. Check with: redis-cli ping"
+
+# Stop the local redis service
+stop-redis:
+	@echo "--- Stopping Redis Server ---"
+	sudo service redis-server stop
