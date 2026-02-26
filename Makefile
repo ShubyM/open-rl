@@ -36,13 +36,15 @@ diagrams:
 	zsh -ic "mmdc -i design_arch.mmd -o design_arch.svg"
 	zsh -ic "mmdc -i rollout_flow.mmd -o rollout_flow.svg"
 
-# Sync server to remote host b3
+HOST ?= b3
+
+# Sync server to remote host $(HOST)
 # TODO: sync only server directory
 server-sync:
-	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' ./ b3:~/work/open-rl
+	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' ./ $(HOST):~/work/open-rl
 
 server-tunnel:
-	ssh -fN -L 8000:localhost:8000 b3
+	ssh -fN -L 8000:localhost:8000 $(HOST)
 
 # CLI Targets
 # Usage: make run-cli list OR make run-cli chat --model ...
@@ -65,3 +67,27 @@ run-cli-list:
 run-cli-chat:
 	@test -n "$(MODEL)" || (echo "Error: MODEL argument is required. Usage: make run-cli-chat MODEL=<model_id>" && exit 1)
 	@cd client && uv run --no-sync -i https://pypi.org/simple python cli.py chat --model $(MODEL) --system-prompt "$(or $(PROMPT),You are helpful geography assistant.)"
+
+# --- Deployment Targets ---
+
+GCP_PROJECT ?= cdrollouts-sunilarora
+GCR_REPO ?= gcr.io/$(GCP_PROJECT)/open-rl-server
+IMAGE_TAG ?= latest
+
+remote-build-setup:
+	@echo "--- Setting up Remote Builder ($(HOST)) ---"
+	ssh $(HOST) "gcloud auth configure-docker -q"
+	@echo "--- Setup Complete! ---"
+
+remote-build: server-sync
+	@echo "--- Building Docker Image on $(HOST) ---"
+	ssh $(HOST) "cd ~/work/open-rl/server && DOCKER_BUILDKIT=1 docker build -t $(GCR_REPO):$(IMAGE_TAG) ."
+
+remote-push:
+	@echo "--- Pushing Image to GCR from $(HOST) ---"
+	ssh $(HOST) "docker push $(GCR_REPO):$(IMAGE_TAG)"
+
+
+deploy:
+	@echo "--- Deploying to GKE ---"
+	kubectl apply -f server/kubernetes/

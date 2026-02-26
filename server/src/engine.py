@@ -339,9 +339,8 @@ async def lifespan(app: FastAPI):
     else:
         # Non-CUDA (Mac/CPU): Don't force GPU masks
         env = os.environ.copy()
-        print(f"[Gateway] Spawning vLLM Subprocess on Port 8001 ({engine.device})")
-    
-    cwd = os.path.join(os.getcwd(), "server") if not os.getcwd().endswith("server") else os.getcwd()
+    # Root of the project containing the 'src' package
+    cwd = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
     vllm_process = subprocess.Popen(
         [sys.executable, "-m", "src.vllm_worker"],
@@ -441,7 +440,7 @@ async def clock_cycle_loop():
                             os.makedirs(ram_path, exist_ok=True)
                             
                             # Because set_active_adapter(m_id) just ran, the engine model is active on this tenant!
-                            engine.model.save_pretrained(ram_path)
+                            engine.model.save_pretrained(ram_path, selected_adapters=[m_id])
                             
                             # Write metadata
                             metadata = {
@@ -484,7 +483,7 @@ async def clock_cycle_loop():
                             ram_path = os.path.join(tmp_dir, "peft", m_id)
                             os.makedirs(ram_path, exist_ok=True)
                             
-                            engine.model.save_pretrained(ram_path)
+                            engine.model.save_pretrained(ram_path, selected_adapters=[m_id])
                             
                             metadata = {
                                 "model_id": m_id,
