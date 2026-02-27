@@ -56,6 +56,7 @@ plot-logs:
 diagrams:
 	zsh -ic "mmdc -i design_arch.mmd -o design_arch.svg"
 	zsh -ic "mmdc -i rollout_flow.mmd -o rollout_flow.svg"
+	zsh -ic "mmdc -i distributed_arch.mmd -o distributed_arch.svg"
 
 HOST ?= b3
 

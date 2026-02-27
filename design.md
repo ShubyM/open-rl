@@ -51,6 +51,9 @@ To completely bypass the Python Global Interpreter Lock (GIL) and prevent CPU bo
 - **IPC (Inter-Process Communication)**: The API Gateway routes the `prompt_token_ids` for `/api/v1/asample` requests to the vLLM subprocess via high-speed Unix Domain Sockets, completely isolating the CUDA contexts and maximizing VRAM stability.
 
 ### 2. LoRA Weight Synchronization
+
+![Distributed Architecture Flow](distributed_arch.svg)
+
 To scale generation speed without dragging down training latency, we must overcome the weight synchronization bottleneck between GPUs.
 - **Base Model Permanence**: The massive base model (e.g. 10GB Qwen) is loaded once onto the Trainer GPU (PyTorch) and identically onto the Inference GPU (vLLM). It is never sent across the PCIe bus/NVLink, as syncing 10GB per training step would destroy throughput.
 - **The NCCL/vLLM Challenge**: Theoretically, PyTorch's `torch.distributed.broadcast` (NCCL) could shoot the 50MB LoRA adapter weights directly from GPU 0 to GPU 1 in microseconds. However, vLLM utilizes a custom C++/CUDA backend and PagedAttention memory manager. You cannot safely overwrite raw tensor pointers from Python; it would require writing custom PyTorch-vLLM C++ bindings to catch the NCCL broadcast layer.
