@@ -4,19 +4,19 @@ Open-RL implements a training API for fine tuning LLMs using reinforcement learn
 
 ## Architecture
 
-The API backend consists of two primary layers designed to minimize VRAM footprint and handle high-throughput workloads:
-1. **The Asynchronous Gateway (FastAPI)**: Handles incoming HTTP requests from the Tinker SDK client, issues immediate future tracking IDs, and pushes workloads to a central asynchronous queue.
-2. **The Clock Cycle Engine (PyTorch/PEFT)**: A continuous background engine that drains the global request queue, batches operations by model tenant (`model_id`), manages PyTorch hardware resources lock-step, and executes actual tensor math.
+Open-RL is designed as a federated, multi-accelerator architecture that physically separates the PyTorch training loop from the vLLM inference engine. This decouples reinforcement learning generation speed from backpropagation, allowing high-throughput deployments without creating CPU bottlenecks or blocking the Python GIL.
 
-![API Backend Architecture](design_arch.svg)
+![Distributed Architecture Flow](distributed_arch.svg)
 
 ### Key Architectural Components
 
-- **Asynchronous Request Queue & Long-Polling**: To prevent concurrency failures and OOM errors when serving large LLMs synchronously, the server utilizes an `asyncio.Queue()`. HTTP handlers append a payload to the queue and instantly return a `req_id`. The client SDK leverages a `retrieve_future` polling mechanism, but to minimize network chatter, the server implements **long-polling**: it holds the request open for up to 60 seconds (using `asyncio.Event`) until the task completes, returning immediately when ready.
-- **Multi-Tenant LoRA Architecture**: The engine initializes and statically anchors exactly **one** Base Model in VRAM. When a client provisions a model, the engine injects a low-rank (e.g., Rank 16) adaptation layer (LoRA) mapped uniquely to that client's `model_id`. A thread-safe lock secures the base model during initialization.
-- **The Clock Cycle Engine**: Operating as an infinite background loop, it rests until it detects queue items. It briefly sleeps upon waking to deliberately "pipeline" concurrent requests. Because it batches execution by `model_id`, it executes `set_active_adapter` only once per tenant batch, drastically cutting down on sluggish adapter switching overhead.
-- **Stateful Tensor Workloads**: Math execution is strictly isolated by `model_id` to prevent gradient poisoning. Each tenant maintains its own isolated `torch.optim.AdamW` instance. Explicit float-handling prevents serialization collapses, and gradient clipping protects against gradient explosions.
-- **Unified Inference & Training Sync**: By directing generation requests through the core clock cycle queue instead of immediately resolving them in HTTP handlers, the server systematically prevents race conditions where inference adapter hot-swapping might disrupt an in-flight backpropagation pass.
+- **The Asynchronous Gateway & Clock Cycle Engine (Training GPU)**: The HTTP Gateway handles requests from the client SDK (via long-polling), issuing future tracking IDs and pushing workloads to an async queue (or Redis). Concurrently, the Clock Cycle Engine (PyTorch) continuously drains this queue, batches operations by model tenant (`model_id`) to minimize sluggish adapter switching, manages hardware resources lock-step, and executes actual tensor math.
+- **The vLLM Inference Worker (Inference GPU+)**: A dedicated inference worker that continuously hot-swaps LoRA weights and handles all high-speed generation requests concurrently. This engine permanently hosts the identical base model as the training worker.
+- **LoRA Weight Synchronization**: To avoid slow PCIe/NVLink data movement via NCCL into vLLM's custom backend, the PyTorch engine saves the trained LoRA adapters (`.safetensors`) directly to a shared parallel file system (e.g. Google Cloud Managed Lustre). The vLLM worker receives the file path over HTTP and streams the weights directly into its PagedAttention VRAM blocks in milliseconds.
+- **Multi-Tenant LoRA Architecture**: The engines initialize and statically anchor exactly **one** massive Base Model in VRAM. Clients uniquely inject low-rank (e.g., Rank 16) adaptation layers mapped to their `model_id`, vastly reducing memory overhead and allowing dozens of tenants to train simultaneously on the same GPU.
+- **Stateful Tensor Workloads & Math Safety**: Execution is strictly isolated by `model_id` to prevent gradient poisoning. Each tenant maintains its own completely isolated `torch.optim.AdamW` instance to prevent cross-contamination of momentum. Explicit bounds checking and gradient clipping protect against explosion.
+- **TITO (Tokens-In, Tokens-Out) Generation**: All inference operates natively on integer arrays. The API gateway routes `prompt_token_ids` to vLLM and receives generated `token_ids` back, ensuring perfect mathematical alignment with PyTorch for loss computation and preventing tokenization whitespace drift.
+- **Sync Barriers**: When a client requests an adapter save, the Gateway enforces a state lock for that tenant. Generation requests remain queued until the new LoRA weights are fully committed to disk and successfully hot-swapped by the vLLM engine, preventing race conditions.
 
 ## Model Configuration & Critical Warnings
 
@@ -239,9 +239,11 @@ Your SDK clients (e.g. `ServiceClient(base_url="http://localhost:8000")`) will n
 > [!TIP]
 > If a local process gets stuck on port 8000 from an old port-forward or server run, you can instantly terminate it with `make kill-server`.
 
-## Operating the Decoupled Architecture
 
-Open-RL is designed as a federated architecture. The PyTorch Training Gateway and the vLLM Inference Engine operate as two completely independent processes. They multiplex workloads via a central `StateStore`, which defaults to in-memory queues for local dev but scales horizontally via Redis.
+
+## Operating the Architecture
+
+Open-RL multiplexes workloads via a central `StateStore`, which defaults to in-memory queues for local dev but scales horizontally via Redis.
 
 To run the full stack:
 
