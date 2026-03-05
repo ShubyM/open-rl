@@ -21,10 +21,10 @@ run-vllm:
 	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(VLLM_MODEL)" uv run python -m src.vllm_worker
 
 run-server-engine-sampler:
-	cd server && UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="$(VLLM_MODEL)" uv run uvicorn src.main:app --host 127.0.0.1 --port 8000
+	cd server && ENABLE_GCP_TRACE=$(ENABLE_GCP_TRACE) UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="$(VLLM_MODEL)" uv run uvicorn src.main:app --host 127.0.0.1 --port 8000
 
 run-function-gemma-server:
-	cd server && UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="google/functiongemma-270m-it" uv run uvicorn src.main:app --host 127.0.0.1 --port 9000
+	cd server && ENABLE_GCP_TRACE=$(ENABLE_GCP_TRACE) UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="google/functiongemma-270m-it" uv run uvicorn src.main:app --host 127.0.0.1 --port 9000
 
 run-function-gemma-sft:
 	cd client && uv run --python 3.12 --no-sync -i https://pypi.org/simple python functiongemma_sft.py $(ARGS)
@@ -40,11 +40,15 @@ run-sft-parallel:
 JOBS ?= 2
 STEPS ?= 15
 
+# OpenTelemetry Tracing Toggles (0 = disabled, 1 = enabled)
+ENABLE_GCP_TRACE ?= 0
+ENABLE_CONSOLE_TRACE ?= 0
+
 run-rlvr:
-	cd client && uv run --no-sync -i https://pypi.org/simple python rlvr.py --jobs 1 --steps $(STEPS) --base-model "$(VLLM_MODEL)"
+	cd client && ENABLE_GCP_TRACE=$(ENABLE_GCP_TRACE) ENABLE_CONSOLE_TRACE=$(ENABLE_CONSOLE_TRACE) uv run --no-sync -i https://pypi.org/simple python rlvr.py --jobs 1 --steps $(STEPS) --base-model "$(VLLM_MODEL)"
 
 run-rlvr-parallel:
-	cd client && uv run --no-sync -i https://pypi.org/simple python rlvr.py --jobs $(JOBS) --steps $(STEPS) --base-model "$(VLLM_MODEL)"
+	cd client && ENABLE_GCP_TRACE=$(ENABLE_GCP_TRACE) ENABLE_CONSOLE_TRACE=$(ENABLE_CONSOLE_TRACE) uv run --no-sync -i https://pypi.org/simple python rlvr.py --jobs $(JOBS) --steps $(STEPS) --base-model "$(VLLM_MODEL)"
 
 # Plot metrics from a JSONL file
 # Usage: make plot-metrics [FILE=path/to/metrics.jsonl]
