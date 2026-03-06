@@ -12,6 +12,26 @@ import urllib.request
 import json
 import traceback
 
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+# Initialize OpenTelemetry TracerProvider
+provider = TracerProvider()
+trace.set_tracer_provider(provider)
+
+if os.environ.get("ENABLE_GCP_TRACE", "0") == "1":
+    try:
+        from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+        exporter = CloudTraceSpanExporter()
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+        print("OpenTelemetry: Configured GCP CloudTraceSpanExporter")
+    except ImportError:
+        print("OpenTelemetry: opentelemetry-exporter-gcp-trace is not installed")
+else:
+    print("OpenTelemetry: No exporter configured (ENABLE_GCP_TRACE=0)")
+
 class FilterNoisyEndpoints(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
@@ -20,6 +40,7 @@ class FilterNoisyEndpoints(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
 app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
+FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
 
 @app.get("/api/v1/healthz")
 async def health_check():
@@ -93,20 +114,24 @@ async def forward_backward(req: dict):
     req_id = str(uuid.uuid4())
     await store.set_future(req_id, {"status": "pending"})
     
+    carrier = {}
+    from opentelemetry import propagate
+    propagate.inject(carrier)
+    
     fwd_input = req.get("forward_backward_input", {})
     data = fwd_input.get("data", [])
     loss_fn = fwd_input.get("loss_fn", "cross_entropy")
     loss_config = fwd_input.get("loss_fn_config", {})
     model_id = req.get("model_id")
     
-    # Push to queue instead of thread
     await store.put_request({
         "req_id": req_id,
         "model_id": model_id,
         "type": "forward_backward",
         "data": data,
         "loss_fn": loss_fn,
-        "loss_config": loss_config
+        "loss_config": loss_config,
+        "trace_context": carrier
     })
     
     return {"request_id": req_id}
@@ -116,6 +141,10 @@ async def optim_step(req: dict):
     req_id = str(uuid.uuid4())
     await store.set_future(req_id, {"status": "pending"})
     
+    carrier = {}
+    from opentelemetry import propagate
+    propagate.inject(carrier)
+    
     adam_params = req.get("adam_params", {})
     model_id = req.get("model_id")
     
@@ -123,7 +152,8 @@ async def optim_step(req: dict):
         "req_id": req_id,
         "model_id": model_id,
         "type": "optim_step",
-        "adam_params": adam_params
+        "adam_params": adam_params,
+        "trace_context": carrier
     })
     
     return {"request_id": req_id}
@@ -138,12 +168,17 @@ async def save_weights_for_sampler(req: dict):
     
     await store.set_future(req_id, {"status": "pending"})
     
+    carrier = {}
+    from opentelemetry import propagate
+    propagate.inject(carrier)
+    
     await store.put_request({
         "req_id": req_id,
         "model_id": model_id,
         "seq_id": seq_id,
         "alias": alias,
-        "type": "save_weights_for_sampler"
+        "type": "save_weights_for_sampler",
+        "trace_context": carrier
     })
     
     return {"request_id": req_id}
@@ -160,12 +195,17 @@ async def save_weights(req: dict):
     
     await store.set_future(req_id, {"status": "pending"})
     
+    carrier = {}
+    from opentelemetry import propagate
+    propagate.inject(carrier)
+    
     await store.put_request({
         "req_id": req_id,
         "model_id": model_id,
         "seq_id": seq_id,
         "alias": alias,
-        "type": "save_weights" # Use specific type for this endpoint
+        "type": "save_weights", # Use specific type for this endpoint
+        "trace_context": carrier
     })
     
     return {"request_id": req_id}
@@ -257,6 +297,9 @@ async def asample(req: dict):
     # Strip the sequence tag to find the base directory where PyTorch actually wrote the checkpoint
     base_model_id = lora_id.split("-samp-")[0] if lora_id else None
 
+    carrier = {}
+    from opentelemetry import propagate
+    propagate.inject(carrier)
 
     sampler_backend = os.getenv("SAMPLER_BACKEND", "vllm").lower()
     if sampler_backend == "engine":
@@ -266,7 +309,8 @@ async def asample(req: dict):
             "type": "asample",
             "prompt_tokens": prompt,
             "max_tokens": max_tokens,
-            "num_samples": num_samples
+            "num_samples": num_samples,
+            "trace_context": carrier
         })
         return {"request_id": req_id}
     
@@ -297,17 +341,17 @@ async def asample(req: dict):
             vllm_url = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
             vllm_generate_endpoint = f"{vllm_url.rstrip('/')}/generate"
             
-            http_req = urllib.request.Request(
-                vllm_generate_endpoint, 
-                data=req_bytes, 
-                headers={'Content-Type': 'application/json'}
-            )
+            headers = {'Content-Type': 'application/json'}
+            from opentelemetry import propagate
+            propagate.inject(headers)
             
-            def _make_req():
-                with urllib.request.urlopen(http_req, timeout=30.0) as f:
-                    return json.loads(f.read().decode('utf-8'))
-                    
-            data = await asyncio.to_thread(_make_req)
+            import httpx
+            
+            # Use AsyncClient natively to prevent ThreadPool exhaustion from concurrent RL jobs!
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(vllm_generate_endpoint, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
             if data.get("type") != "RequestFailedResponse":
                 data["type"] = "sample"
             await store.set_future(req_id, data)
@@ -325,7 +369,10 @@ async def retrieve_future(req: dict):
     
     result = await store.get_future(request_id, timeout=60.0)
     if result is None:
-         return {"type": "RequestFailedResponse", "error_message": "Future not found"}
+         return JSONResponse(status_code=400, content={"type": "RequestFailedResponse", "error_message": "Future not found"})
+         
+    if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
+         return JSONResponse(status_code=400, content=result)
          
     return result
 

@@ -11,7 +11,26 @@ try:
 except ImportError:
     AsyncLLMEngine = None
 
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+provider = TracerProvider()
+trace.set_tracer_provider(provider)
+
+if os.environ.get("ENABLE_GCP_TRACE", "0") == "1":
+    try:
+        from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+        exporter = CloudTraceSpanExporter()
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+        print("OpenTelemetry: Configured GCP CloudTraceSpanExporter for vLLM Worker")
+    except ImportError:
+        print("OpenTelemetry: opentelemetry-exporter-gcp-trace is not installed")
+
+tracer = trace.get_tracer("vllm.inference.worker")
 app = FastAPI(title="Open-RL vLLM Subprocess")
+FastAPIInstrumentor.instrument_app(app, excluded_urls="/healthz")
 
 engine = None
 
@@ -41,7 +60,7 @@ async def startup():
         model=os.environ.get("VLLM_MODEL"),
         enable_lora=True,
         max_loras=4,
-        max_lora_rank=16,
+        max_lora_rank=64,
         max_model_len=8192, # Prevent KV cache OOM on massive context windows
         gpu_memory_utilization=0.60, # Leave room for other things if needed
         enforce_eager=True # Useful for small setups
@@ -97,9 +116,14 @@ async def generate(req: Request):
         )
         
         final_output = None
-        async for request_output in results_generator:
-            # vLLM streams back incremental states, we wait for the final one
-            final_output = request_output
+        with tracer.start_as_current_span("vllm_generate_tokens") as span:
+            span.set_attribute("vllm.prompt_len", len(prompt_token_ids) if prompt_token_ids else 0)
+            span.set_attribute("vllm.max_tokens", max_tokens)
+            if lora_id:
+                span.set_attribute("vllm.lora_id", lora_id)
+            async for request_output in results_generator:
+                # vLLM streams back incremental states, we wait for the final one
+                final_output = request_output
             
         sequences_out = []
         for output in final_output.outputs:

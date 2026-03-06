@@ -21,10 +21,10 @@ run-vllm:
 	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(VLLM_MODEL)" uv run python -m src.vllm_worker
 
 run-server-engine-sampler:
-	cd server && UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="$(VLLM_MODEL)" uv run uvicorn src.main:app --host 127.0.0.1 --port 8000
+	cd server && ENABLE_GCP_TRACE=$(ENABLE_GCP_TRACE) UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="$(VLLM_MODEL)" uv run uvicorn src.main:app --host 127.0.0.1 --port 8000
 
 run-function-gemma-server:
-	cd server && UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="google/functiongemma-270m-it" uv run uvicorn src.main:app --host 127.0.0.1 --port 9000
+	cd server && ENABLE_GCP_TRACE=$(ENABLE_GCP_TRACE) UV_INDEX_URL="https://pypi.org/simple" SAMPLER_BACKEND=engine VLLM_MODEL="google/functiongemma-270m-it" uv run uvicorn src.main:app --host 127.0.0.1 --port 9000
 
 run-function-gemma-sft:
 	cd client && uv run --python 3.12 --no-sync -i https://pypi.org/simple python functiongemma_sft.py $(ARGS)
@@ -36,11 +36,19 @@ run-sft:
 run-sft-parallel:
 	cd client && uv run --no-sync -i https://pypi.org/simple python sft.py --parallel --base-model "$(VLLM_MODEL)"
 
+# Default concurrent jobs for parallel execution
+JOBS ?= 2
+STEPS ?= 15
+
+# OpenTelemetry Tracing Toggles (0 = disabled, 1 = enabled)
+ENABLE_GCP_TRACE ?= 0
+ENABLE_CONSOLE_TRACE ?= 0
+
 run-rlvr:
-	cd client && uv run --no-sync -i https://pypi.org/simple python rlvr.py --steps 15 --base-model "$(VLLM_MODEL)"
+	cd client && ENABLE_GCP_TRACE=$(ENABLE_GCP_TRACE) ENABLE_CONSOLE_TRACE=$(ENABLE_CONSOLE_TRACE) uv run --no-sync -i https://pypi.org/simple python rlvr.py --jobs 1 --steps $(STEPS) --base-model "$(VLLM_MODEL)"
 
 run-rlvr-parallel:
-	cd client && uv run --no-sync -i https://pypi.org/simple python rlvr.py parallel --steps 15 --base-model "$(VLLM_MODEL)"
+	cd client && ENABLE_GCP_TRACE=$(ENABLE_GCP_TRACE) ENABLE_CONSOLE_TRACE=$(ENABLE_CONSOLE_TRACE) uv run --no-sync -i https://pypi.org/simple python rlvr.py --jobs $(JOBS) --steps $(STEPS) --base-model "$(VLLM_MODEL)"
 
 # Plot metrics from a JSONL file
 # Usage: make plot-metrics [FILE=path/to/metrics.jsonl]
@@ -94,6 +102,7 @@ run-cli-chat:
 
 GCP_PROJECT ?= cdrollouts-sunilarora
 GCR_REPO ?= gcr.io/$(GCP_PROJECT)/open-rl-server
+CLIENT_GCR_REPO ?= gcr.io/$(GCP_PROJECT)/open-rl-client
 IMAGE_TAG ?= latest
 
 remote-build-setup:
@@ -102,17 +111,45 @@ remote-build-setup:
 	@echo "--- Setup Complete! ---"
 
 remote-build: server-sync
-	@echo "--- Building Docker Image on $(HOST) ---"
+	@echo "--- Building Server Docker Image on $(HOST) ---"
 	ssh $(HOST) "cd ~/work/open-rl/server && DOCKER_BUILDKIT=1 docker build -t $(GCR_REPO):$(IMAGE_TAG) ."
 
 remote-push:
-	@echo "--- Pushing Image to GCR from $(HOST) ---"
+	@echo "--- Pushing Server Image to GCR from $(HOST) ---"
 	ssh $(HOST) "docker push $(GCR_REPO):$(IMAGE_TAG)"
 
+remote-client-build: server-sync
+	@echo "--- Building Client Docker Image on $(HOST) ---"
+	ssh $(HOST) "cd ~/work/open-rl/client && DOCKER_BUILDKIT=1 docker build -t $(CLIENT_GCR_REPO):$(IMAGE_TAG) ."
+
+remote-client-push:
+	@echo "--- Pushing Client Image to GCR from $(HOST) ---"
+	ssh $(HOST) "docker push $(CLIENT_GCR_REPO):$(IMAGE_TAG)"
 
 deploy:
-	@echo "--- Deploying to GKE ---"
+	@echo "--- Deploying Server to GKE ---"
 	kubectl apply -f server/kubernetes/
+
+run-client-job:
+	@echo "--- Deploying RLVR Client Job to GKE ---"
+	kubectl delete job open-rl-client-job --ignore-not-found=true
+	kubectl apply -f client/kubernetes/rlvr-job.yaml
+	@echo "Waiting for job to start..."
+	@sleep 4
+	kubectl logs -f job/open-rl-client-job
+
+stop-client-job:
+	@echo "--- Stopping RLVR Client Job ---"
+	kubectl delete job open-rl-client-job open-rl-client-job-parallel --ignore-not-found=true
+
+run-client-job-parallel:
+	@echo "--- Deploying Distributed RLVR Client Job Array to GKE ---"
+	kubectl delete job open-rl-client-job-parallel --ignore-not-found=true
+	kubectl apply -f client/kubernetes/rlvr-job-parallel.yaml
+	@echo "Waiting for jobs to start..."
+	@sleep 6
+	@echo "Tailing one of the array pods..."
+	kubectl logs -f job/open-rl-client-job-parallel
 
 # --- Redis Management (Linux) ---
 
