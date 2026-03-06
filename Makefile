@@ -66,7 +66,7 @@ diagrams:
 	zsh -ic "mmdc -i rollout_flow.mmd -o rollout_flow.svg"
 	zsh -ic "mmdc -i distributed_arch.mmd -o distributed_arch.svg"
 
-HOST ?= b3
+HOST ?= mars
 
 # Sync server to remote host $(HOST)
 # TODO: sync only server directory
@@ -103,6 +103,7 @@ run-cli-chat:
 GCP_PROJECT ?= cdrollouts-sunilarora
 GCR_REPO ?= gcr.io/$(GCP_PROJECT)/open-rl-server
 CLIENT_GCR_REPO ?= gcr.io/$(GCP_PROJECT)/open-rl-client
+TINKER_GCR_REPO ?= gcr.io/$(GCP_PROJECT)/tinker-cookbook
 IMAGE_TAG ?= latest
 
 remote-build-setup:
@@ -126,10 +127,27 @@ remote-client-push:
 	@echo "--- Pushing Client Image to GCR from $(HOST) ---"
 	ssh $(HOST) "docker push $(CLIENT_GCR_REPO):$(IMAGE_TAG)"
 
+tinker-sync:
+	@echo "--- Syncing tinker-cookbook to $(HOST) ---"
+	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' ../tinker-cookbook/ $(HOST):~/work/tinker-cookbook
+
+remote-tinker-build: tinker-sync
+	@echo "--- Building tinker-cookbook Docker Image on $(HOST) ---"
+	ssh $(HOST) "cd ~/work/tinker-cookbook && DOCKER_BUILDKIT=1 docker build -t $(TINKER_GCR_REPO):$(IMAGE_TAG) ."
+
+remote-tinker-push:
+	@echo "--- Pushing tinker-cookbook Image to GCR from $(HOST) ---"
+	ssh $(HOST) "docker push $(TINKER_GCR_REPO):$(IMAGE_TAG)"
+
 deploy:
 	@echo "--- Deploying Server to GKE ---"
 	kubectl apply -f server/kubernetes/
 
+<<<<<<< HEAD
+=======
+<<<<<<< Updated upstream
+=======
+>>>>>>> fb179e6 (Added tinker kubernetes jobs)
 run-client-job:
 	@echo "--- Deploying RLVR Client Job to GKE ---"
 	kubectl delete job open-rl-client-job --ignore-not-found=true
@@ -142,6 +160,41 @@ stop-client-job:
 	@echo "--- Stopping RLVR Client Job ---"
 	kubectl delete job open-rl-client-job open-rl-client-job-parallel --ignore-not-found=true
 
+<<<<<<< HEAD
+=======
+run-tinker-job:
+	@echo "--- Deploying Tinker RL Basic Job to GKE ---"
+	kubectl delete job tinker-rl-basic-job --ignore-not-found=true
+	kubectl apply -f client/kubernetes/tinker-rl-basic-job.yaml
+	@echo "Waiting for job to start..."
+	@sleep 4
+	kubectl logs -f job/tinker-rl-basic-job
+
+stop-tinker-job:
+	@echo "--- Stopping Tinker RL Basic Job ---"
+	kubectl delete job tinker-rl-basic-job --ignore-not-found=true
+
+logs-tinker-job:
+	@echo "--- Fetching Tinker RL Basic Job Logs ---"
+	kubectl logs -f job/tinker-rl-basic-job
+
+run-tinker-job-2:
+	@echo "--- Deploying Tinker RL Basic Job 2 to GKE ---"
+	kubectl delete job tinker-rl-basic-job-2 --ignore-not-found=true
+	kubectl apply -f client/kubernetes/tinker-rl-basic-job-2.yaml
+	@echo "Waiting for job to start..."
+	@sleep 4
+	kubectl logs -f job/tinker-rl-basic-job-2
+
+stop-tinker-job-2:
+	@echo "--- Stopping Tinker RL Basic Job 2 ---"
+	kubectl delete job tinker-rl-basic-job-2 --ignore-not-found=true
+
+logs-tinker-job-2:
+	@echo "--- Fetching Tinker RL Basic Job 2 Logs ---"
+	kubectl logs -f job/tinker-rl-basic-job-2
+
+>>>>>>> fb179e6 (Added tinker kubernetes jobs)
 run-client-job-parallel:
 	@echo "--- Deploying Distributed RLVR Client Job Array to GKE ---"
 	kubectl delete job open-rl-client-job-parallel --ignore-not-found=true
@@ -151,6 +204,10 @@ run-client-job-parallel:
 	@echo "Tailing one of the array pods..."
 	kubectl logs -f job/open-rl-client-job-parallel
 
+<<<<<<< HEAD
+=======
+>>>>>>> Stashed changes
+>>>>>>> fb179e6 (Added tinker kubernetes jobs)
 # --- Redis Management (Linux) ---
 
 .PHONY: install-redis start-redis stop-redis
