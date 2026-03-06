@@ -138,6 +138,19 @@ run-client-job:
 	@sleep 4
 	kubectl logs -f job/open-rl-client-job
 
+stop-client-job:
+	@echo "--- Stopping RLVR Client Job ---"
+	kubectl delete job open-rl-client-job open-rl-client-job-parallel --ignore-not-found=true
+
+run-client-job-parallel:
+	@echo "--- Deploying Distributed RLVR Client Job Array to GKE ---"
+	kubectl delete job open-rl-client-job-parallel --ignore-not-found=true
+	kubectl apply -f client/kubernetes/rlvr-job-parallel.yaml
+	@echo "Waiting for jobs to start..."
+	@sleep 6
+	@echo "Tailing one of the array pods..."
+	kubectl logs -f job/open-rl-client-job-parallel
+
 # --- Redis Management (Linux) ---
 
 .PHONY: install-redis start-redis stop-redis

@@ -345,17 +345,13 @@ async def asample(req: dict):
             from opentelemetry import propagate
             propagate.inject(headers)
             
-            http_req = urllib.request.Request(
-                vllm_generate_endpoint, 
-                data=req_bytes, 
-                headers=headers
-            )
+            import httpx
             
-            def _make_req():
-                with urllib.request.urlopen(http_req, timeout=30.0) as f:
-                    return json.loads(f.read().decode('utf-8'))
-                    
-            data = await asyncio.to_thread(_make_req)
+            # Use AsyncClient natively to prevent ThreadPool exhaustion from concurrent RL jobs!
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(vllm_generate_endpoint, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
             if data.get("type") != "RequestFailedResponse":
                 data["type"] = "sample"
             await store.set_future(req_id, data)

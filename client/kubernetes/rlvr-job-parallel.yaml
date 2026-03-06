@@ -1,10 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: open-rl-client-job
+  name: open-rl-client-job-parallel
   labels:
     app: open-rl-client
 spec:
+  completions: 10
+  parallelism: 10
+  completionMode: Indexed
   ttlSecondsAfterFinished: 600
   template:
     metadata:
@@ -26,7 +29,8 @@ spec:
             ephemeral-storage: "10Gi"
             memory: "4Gi"
             cpu: "1"
-        command: ["uv", "run", "--no-sync", "python", "rlvr.py", "--jobs", "1", "--steps", "30", "--n-problems", "16", "--n-samples", "8"]
+        command: ["sh", "-c"]
+        args: ["uv run --no-sync python rlvr.py --jobs 1 --job-idx $JOB_COMPLETION_INDEX --steps 30 --n-problems 16 --n-samples 8"]
         env:
         - name: ENABLE_GCP_TRACE
           value: "1"

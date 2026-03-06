@@ -123,7 +123,7 @@ def compute_reward(response, correct_answer, target_tag="answer"):
     return rewards
 
 @tracer.start_as_current_span("run_rlvr_job", kind=trace_api.SpanKind.CLIENT)
-async def run_rlvr_job(service_client, target_tag, job_idx, base_model, num_steps=15, temp=1.0, loss_fn="importance_sampling", total_jobs=1):
+async def run_rlvr_job(service_client, target_tag, job_idx, base_model, num_steps=15, temp=1.0, loss_fn="importance_sampling", total_jobs=1, n_problems=4, n_samples=8):
     span = trace_api.get_current_span()
     span.set_attribute("target_tag", target_tag)
     span.set_attribute("job_idx", job_idx)
@@ -314,7 +314,7 @@ async def run_rlvr_job(service_client, target_tag, job_idx, base_model, num_step
     N_PROBLEMS = 8
     import datetime
     for i in range(num_steps):
-        metrics, rollouts = await train_step(n_problems=N_PROBLEMS, n_samples=N_SAMPLES, lr=5e-5, loss_fn=loss_fn)
+        metrics, rollouts = await train_step(n_problems=n_problems, n_samples=n_samples, loss_fn=loss_fn)
         history.append(metrics)
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         log(f"{ts} | {i+1:>4} | {metrics['reward']:>6.2f} | {metrics['accuracy']:>5.0%}")
@@ -371,6 +371,9 @@ async def main():
     parser.add_argument("--temp", type=float, default=1.2, help="Temperature for training rollouts")
     parser.add_argument("--loss", type=str, default="importance_sampling", choices=["importance_sampling", "ppo"], help="Loss function to use")
     parser.add_argument("--base-model", type=str, default="Qwen/Qwen3-4B-Instruct-2507", help="Base model to use")
+    parser.add_argument("--job-idx", type=int, default=-1, help="Explicit Job ID for distributed Kubernetes Indexed Job execution.")
+    parser.add_argument("--n-problems", type=int, default=4, help="Number of problems/prompts to evaluate per step")
+    parser.add_argument("--n-samples", type=int, default=8, help="Number of diverse sample generations to request per problem")
     args = parser.parse_args()
 
     # Determine num_jobs from args
@@ -399,18 +402,26 @@ async def main():
     print("============================================================")
     print(f"Log Output: rlvr_parallel_results.log")
     print(f"Concurrency: {num_jobs} Jobs")
+    if args.job_idx >= 0:
+        print(f"Kubernetes Distributed Mode: Running Job Index {args.job_idx}")
     print("------------------------------------------------------------\n")
 
-    # Generate jobs with alternating tags
-    job_tasks = []
-    for i in range(num_jobs):
-        tag = "answer" if i % 2 == 0 else "capital"
-        job_tasks.append(
-            run_rlvr_job(service_client, tag, i, args.base_model, args.steps, args.temp, args.loss, num_jobs)
-        )
+    if args.job_idx >= 0:
+        # DISTRIBUTED K8S MODE: Run exactly one job uniquely tagged by the pod index
+        tag = "answer" if args.job_idx % 2 == 0 else "capital"
+        print(f">> Running Distributed Client {args.job_idx}... <<\n")
+        results = [await run_rlvr_job(service_client, tag, args.job_idx, args.base_model, args.steps, args.temp, args.loss, num_jobs, args.n_problems, args.n_samples)]
+    else:
+        # LOCAL MULTIPLEXING MODE: Gather them all inside this single python event loop
+        job_tasks = []
+        for i in range(num_jobs):
+            tag = "answer" if i % 2 == 0 else "capital"
+            job_tasks.append(
+                run_rlvr_job(service_client, tag, i, args.base_model, args.steps, args.temp, args.loss, num_jobs, args.n_problems, args.n_samples)
+            )
 
-    print(f">> Running {num_jobs} Clients... <<\n")
-    results = await asyncio.gather(*job_tasks)
+        print(f">> Running {num_jobs} Local Multiplexed Clients... <<\n")
+        results = await asyncio.gather(*job_tasks)
     
     print("\n============================================================")
     print("                      EXECUTION SUMMARY                     ")
