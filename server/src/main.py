@@ -10,6 +10,8 @@ store = get_store()
 import logging
 import urllib.request
 import json
+import time
+from datetime import datetime
 import traceback
 
 from opentelemetry import trace
@@ -163,50 +165,80 @@ async def save_weights_for_sampler(req: dict):
     req_id = str(uuid.uuid4())
     model_id = req.get("model_id") # Client passes the TrainingClient's model_id
     seq_id = req.get("sampling_session_seq_id", 0)
+    if not seq_id:
+        seq_id = int(time.time() * 1000)
     # Tinker SDK might send 'name' or 'alias', or 'path' (if using save_weights_for_sampler)
     alias = req.get("name") or req.get("alias") or req.get("path")
     
-    await store.set_future(req_id, {"status": "pending"})
+    # 1. Update the metadata.json instantly
+    tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+    ram_path = os.path.join(tmp_dir, "peft", model_id)
+    os.makedirs(ram_path, exist_ok=True)
     
-    carrier = {}
-    from opentelemetry import propagate
-    propagate.inject(carrier)
-    
-    await store.put_request({
-        "req_id": req_id,
+    metadata = {
         "model_id": model_id,
-        "seq_id": seq_id,
         "alias": alias,
-        "type": "save_weights_for_sampler",
-        "trace_context": carrier
-    })
+        "created_at": datetime.now().isoformat(),
+        "timestamp": time.time()
+    }
+    try:
+        with open(os.path.join(ram_path, "metadata.json"), "w") as f:
+            json.dump(metadata, f)
+    except Exception as e:
+        print(f"Failed to update alias metadata: {e}")
+        
+    session_id = f"{model_id}-samp-{seq_id}"
+    result_path = f"tinker://{session_id}" if alias else None
+    
+    result = {
+        "path": result_path,
+        "sampling_session_id": session_id,
+        "type": "save_weights_for_sampler"
+    }
+    
+    # Instantly resolve the future, bypassing the Redis queue!
+    await store.set_future(req_id, result)
     
     return {"request_id": req_id}
 
 @app.post("/api/v1/save_weights")
 async def save_weights(req: dict):
-    # Map save_weights to the same internal logic as save_weights_for_sampler
-    # but strictly using the 'path' as the alias/identifier
     req_id = str(uuid.uuid4())
     model_id = req.get("model_id") 
     seq_id = req.get("seq_id", 0)
+    if not seq_id:
+        seq_id = int(time.time() * 1000)
     # in .save(path="..."), the path is the identifier
     alias = req.get("path")
     
-    await store.set_future(req_id, {"status": "pending"})
+    # 1. Update the metadata.json instantly
+    tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+    ram_path = os.path.join(tmp_dir, "peft", model_id)
+    os.makedirs(ram_path, exist_ok=True)
     
-    carrier = {}
-    from opentelemetry import propagate
-    propagate.inject(carrier)
-    
-    await store.put_request({
-        "req_id": req_id,
+    metadata = {
         "model_id": model_id,
-        "seq_id": seq_id,
         "alias": alias,
-        "type": "save_weights", # Use specific type for this endpoint
-        "trace_context": carrier
-    })
+        "created_at": datetime.now().isoformat(),
+        "timestamp": time.time()
+    }
+    try:
+        with open(os.path.join(ram_path, "metadata.json"), "w") as f:
+            json.dump(metadata, f)
+    except Exception as e:
+        print(f"Failed to update alias metadata: {e}")
+        
+    session_id = f"{model_id}-samp-{seq_id}"
+    result_path = f"tinker://{session_id}"
+    
+    result = {
+        "path": result_path,
+        "sampling_session_id": session_id,
+        "type": "save_weights"
+    }
+    
+    # Instantly resolve the future, bypassing the Redis queue!
+    await store.set_future(req_id, result)
     
     return {"request_id": req_id}
 

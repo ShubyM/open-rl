@@ -143,11 +143,6 @@ deploy:
 	@echo "--- Deploying Server to GKE ---"
 	kubectl apply -f server/kubernetes/
 
-<<<<<<< HEAD
-=======
-<<<<<<< Updated upstream
-=======
->>>>>>> fb179e6 (Added tinker kubernetes jobs)
 run-client-job:
 	@echo "--- Deploying RLVR Client Job to GKE ---"
 	kubectl delete job open-rl-client-job --ignore-not-found=true
@@ -160,8 +155,6 @@ stop-client-job:
 	@echo "--- Stopping RLVR Client Job ---"
 	kubectl delete job open-rl-client-job open-rl-client-job-parallel --ignore-not-found=true
 
-<<<<<<< HEAD
-=======
 run-tinker-job:
 	@echo "--- Deploying Tinker RL Basic Job to GKE ---"
 	kubectl delete job tinker-rl-basic-job --ignore-not-found=true
@@ -194,7 +187,6 @@ logs-tinker-job-2:
 	@echo "--- Fetching Tinker RL Basic Job 2 Logs ---"
 	kubectl logs -f job/tinker-rl-basic-job-2
 
->>>>>>> fb179e6 (Added tinker kubernetes jobs)
 run-client-job-parallel:
 	@echo "--- Deploying Distributed RLVR Client Job Array to GKE ---"
 	kubectl delete job open-rl-client-job-parallel --ignore-not-found=true
@@ -204,10 +196,6 @@ run-client-job-parallel:
 	@echo "Tailing one of the array pods..."
 	kubectl logs -f job/open-rl-client-job-parallel
 
-<<<<<<< HEAD
-=======
->>>>>>> Stashed changes
->>>>>>> fb179e6 (Added tinker kubernetes jobs)
 # --- Redis Management (Linux) ---
 
 .PHONY: install-redis start-redis stop-redis

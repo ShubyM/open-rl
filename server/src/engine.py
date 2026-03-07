@@ -10,6 +10,9 @@ from fastapi import FastAPI
 import subprocess
 import os
 import sys
+import json
+import time
+from datetime import datetime
 
 from opentelemetry import trace
 tracer = trace.get_tracer(__name__)
@@ -77,6 +80,30 @@ class TrainerEngine:
         # Reset/initialize optimizer for this new adapter
         if model_id in self.optimizers:
             del self.optimizers[model_id]
+            
+        self._auto_save_adapter(model_id)
+
+    def _auto_save_adapter(self, model_id: str):
+        print(f"  -> [AUTO-SAVE] Saving weights for tenant: {model_id} to RAM Disk")
+        try:
+            tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+            ram_path = os.path.join(tmp_dir, "peft", model_id)
+            os.makedirs(ram_path, exist_ok=True)
+            
+            with tracer.start_as_current_span(f"auto_save_weights_{model_id}"):
+                self.model.save_pretrained(ram_path, selected_adapters=[model_id])
+                    
+            metadata = {
+                "model_id": model_id,
+                "alias": None,
+                "created_at": datetime.now().isoformat(),
+                "timestamp": time.time()
+            }
+            with open(os.path.join(ram_path, "metadata.json"), "w") as f:
+                json.dump(metadata, f)
+        except Exception as e:
+            print(f"[ERROR] Failed to auto-save weights for {model_id}: {e}")
+            traceback.print_exc()
 
     def set_active_adapter(self, model_id: str):
         with self._init_lock:
@@ -284,6 +311,10 @@ class TrainerEngine:
 
         optimizer.step()
         optimizer.zero_grad()
+        
+        # Auto-save for Hardware Pipeline bypass
+        self._auto_save_adapter(model_id)
+
         return {
             "metrics": {"grad_norm:mean": self._sanitize_float(total_norm)}
         }
@@ -361,46 +392,39 @@ async def clock_cycle_loop():
     while True:
         try:
             # Block until requests are available and drain the queue
+            # With the new RR Queue logic, this batch is guaranteed to belong to ONE tenant
             batch = await store.get_requests()
             if not batch:
                 await asyncio.sleep(0.1)
                 continue
                 
-            # Group by model_id
-            with tracer.start_as_current_span("clock_cycle_batch") as batch_span:
+            m_id = batch[0].get("model_id", "default")
+            
+            with tracer.start_as_current_span(f"clock_cycle_batch") as batch_span:
                 batch_span.set_attribute("batch_size", len(batch))
-                models_to_reqs = {}
-                for r in batch:
-                    m_id = r.get("model_id")
-                    if m_id not in models_to_reqs:
-                        models_to_reqs[m_id] = []
-                    models_to_reqs[m_id].append(r)
+                batch_span.set_attribute("model_id", m_id)
+                
+                print(f"\n[CLOCK CYCLE] Popped {len(batch)} requests for tenant: {m_id}")
                     
-                batch_span.set_attribute("num_models", len(models_to_reqs))
-                print(f"\n[CLOCK CYCLE] Popped {len(batch)} requests across {len(models_to_reqs)} distinct model tenant(s).")
+                with tracer.start_as_current_span("process_model_batch") as model_span:
+                    model_span.set_attribute("model_id", m_id)
+                    model_span.set_attribute("model_reqs", len(batch))
+                    print(f"  -> [TENSOR CORE] Hot-swapping to LoRA adapter: {m_id}")
                     
-                for m_id, reqs in models_to_reqs.items():
-                    if len(reqs) == 0:
+                    # Set active adapter
+                    try:
+                        with tracer.start_as_current_span("set_active_adapter"):
+                            await asyncio.to_thread(engine.set_active_adapter, m_id)
+                    except Exception as e:
+                        print(f"Failed to set adapter {m_id}: {e}")
+                        for r in batch:
+                            await store.set_future(r["req_id"], {"type": "RequestFailedResponse", "error_message": str(e)})
                         continue
                         
-                    with tracer.start_as_current_span("process_model_batch") as model_span:
-                        model_span.set_attribute("model_id", m_id)
-                        model_span.set_attribute("model_reqs", len(reqs))
-                        print(f"  -> [TENSOR CORE] Hot-swapping to LoRA adapter: {m_id}")
-                        
-                        # Set active adapter
-                        try:
-                            with tracer.start_as_current_span("set_active_adapter"):
-                                await asyncio.to_thread(engine.set_active_adapter, m_id)
-                        except Exception as e:
-                            print(f"Failed to set adapter {m_id}: {e}")
-                            for r in reqs:
-                                await store.set_future(r["req_id"], {"type": "RequestFailedResponse", "error_message": str(e)})
-                            continue
-                            
-                        print(f"     Executing {len(reqs)} operations for {m_id}...")
-                        # Execute sequentially
-                        for r in reqs:
+                    print(f"     Executing {len(batch)} operations for {m_id}...")
+                    
+                    # Execute sequentially
+                    for r in batch:
                             req_id = r["req_id"]
                             req_type = r["type"]
                             
@@ -421,91 +445,6 @@ async def clock_cycle_loop():
                                     adam_params = r["adam_params"]
                                     result = await asyncio.to_thread(engine.optim_step, adam_params, m_id)
                                     result["type"] = "optim_step"
-                                    await store.set_future(req_id, result)
-                                elif req_type == "save_weights_for_sampler":
-                                    seq_id = r.get("seq_id", 0)
-                                    alias = r.get("alias")
-                                    import os
-                                    import json
-                                    import time
-                                    from datetime import datetime
-                                    
-                                    # Save to disk/ramdisk so vLLM can load it
-                                    tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-                                    ram_path = os.path.join(tmp_dir, "peft", m_id)
-                                    os.makedirs(ram_path, exist_ok=True)
-                                    
-                                    # Because set_active_adapter(m_id) just ran, the engine model is active on this tenant!
-                                    with tracer.start_as_current_span("save_weights_to_disk"):
-                                        with engine._init_lock:
-                                            engine.model.save_pretrained(ram_path, selected_adapters=[m_id])
-                                    
-                                    # Write metadata
-                                    metadata = {
-                                        "model_id": m_id,
-                                        "alias": alias,
-                                        "created_at": datetime.now().isoformat(),
-                                        "timestamp": time.time()
-                                    }
-                                    try:
-                                        with open(os.path.join(ram_path, "metadata.json"), "w") as f:
-                                            json.dump(metadata, f)
-                                    except Exception as e:
-                                        print(f"Failed to write metadata: {e}")
-                                    
-                                    # Use a tinker:// URI that encodes the session ID, satisfying SDK validation
-                                    # and matching what we expect in asample (after stripping prefix)
-                                    session_id = f"{m_id}-samp-{seq_id}"
-                                    
-                                    # Tinkers SDK `save_weights_and_get_sampling_client` expects path=None (ephemeral)
-                                    # Tinkers SDK `save_weights_for_sampler` expects path!=None (named)
-                                    # We use the presence of 'alias' to distinguish.
-                                    result_path = f"tinker://{session_id}" if alias else None
-                                    
-                                    result = {
-                                        "path": result_path,
-                                        "sampling_session_id": session_id,
-                                        "type": "save_weights_for_sampler"
-                                    }
-                                    await store.set_future(req_id, result)
-                                elif req_type == "save_weights":
-                                    # Identical logic to save_weights_for_sampler but returns different type
-                                    seq_id = r.get("seq_id", 0)
-                                    alias = r.get("alias")
-                                    import os
-                                    import json
-                                    import time
-                                    from datetime import datetime
-                                    
-                                    tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-                                    ram_path = os.path.join(tmp_dir, "peft", m_id)
-                                    os.makedirs(ram_path, exist_ok=True)
-                                    
-                                    with tracer.start_as_current_span("save_weights_to_disk"):
-                                        with engine._init_lock:
-                                            engine.model.save_pretrained(ram_path, selected_adapters=[m_id])
-                                    
-                                    metadata = {
-                                        "model_id": m_id,
-                                        "alias": alias,
-                                        "created_at": datetime.now().isoformat(),
-                                        "timestamp": time.time()
-                                    }
-                                    try:
-                                        with open(os.path.join(ram_path, "metadata.json"), "w") as f:
-                                            json.dump(metadata, f)
-                                    except Exception as e:
-                                        print(f"Failed to write metadata: {e}")
-                                    
-                                    session_id = f"{m_id}-samp-{seq_id}"
-                                    # For save_weights (checkpointing), we usually just want the path
-                                    result_path = f"tinker://{session_id}" 
-                                    
-                                    result = {
-                                        "path": result_path, 
-                                        "sampling_session_id": session_id,
-                                        "type": "save_weights" # CORRECT TYPE for validation
-                                    }
                                     await store.set_future(req_id, result)
                                 elif req_type == "asample":
                                     prompt_tokens = r["prompt_tokens"]

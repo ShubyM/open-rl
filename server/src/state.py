@@ -28,23 +28,50 @@ class StateStore(ABC):
 
 class InMemoryStore(StateStore):
     def __init__(self):
-        self.request_queue: asyncio.Queue = asyncio.Queue()
+        # tenant_id -> queue of requests
+        self.queues: Dict[str, asyncio.Queue] = {}
+        # Simple list for round-robin
+        self.active_tenants: List[str] = []
+        self.active_tenants_cv = asyncio.Condition()
+        
         self.futures_store: Dict[str, Dict[str, Any]] = {}
         self.futures_events: Dict[str, asyncio.Event] = {}
 
     async def put_request(self, req_data: Dict[str, Any]) -> None:
-        await self.request_queue.put(req_data)
+        model_id = req_data.get("model_id", "default")
+        
+        async with self.active_tenants_cv:
+            if model_id not in self.queues:
+                self.queues[model_id] = asyncio.Queue()
+            
+            await self.queues[model_id].put(req_data)
+            
+            if model_id not in self.active_tenants:
+                self.active_tenants.append(model_id)
+                self.active_tenants_cv.notify()
 
     async def get_requests(self) -> List[Dict[str, Any]]:
-        # Block until at least one item is available
-        req = await self.request_queue.get()
-        batch = [req]
-        
-        # Drain the rest natively
-        while not self.request_queue.empty():
-            batch.append(self.request_queue.get_nowait())
+        async with self.active_tenants_cv:
+            # Block until at least one tenant is active
+            while not self.active_tenants:
+                await self.active_tenants_cv.wait()
+                
+            # Pop left, push right (Round Robin)
+            model_id = self.active_tenants.pop(0)
+            self.active_tenants.append(model_id)
             
-        return batch
+            queue = self.queues[model_id]
+            batch = [queue.get_nowait()]
+            
+            # Drain the rest of this tenant's queue
+            while not queue.empty():
+                batch.append(queue.get_nowait())
+                
+            # If completely empty, remove from rotation
+            if queue.empty():
+                self.active_tenants.remove(model_id)
+                
+            return batch
 
     async def set_future(self, req_id: str, result: Dict[str, Any]) -> None:
         self.futures_store[req_id] = result
@@ -71,64 +98,76 @@ class InMemoryStore(StateStore):
 class RedisStore(StateStore):
     def __init__(self, redis_url: str):
         self.redis = redis.from_url(redis_url, decode_responses=True, health_check_interval=2)
-        self.queue_key = "open_rl:request_queue"
+        self.active_list = "open_rl:active_tenants"
+        # We also keep a set to guarantee O(1) deduplication before RPushing
+        self.active_set = "open_rl:active_tenants_set"
         
     async def put_request(self, req_data: Dict[str, Any]) -> None:
-        # Pushing to the end of the list
-        await self.redis.rpush(self.queue_key, json.dumps(req_data))
+        model_id = req_data.get("model_id", "default")
+        queue_key = f"open_rl:queue:{model_id}"
+        
+        # 1. Add request to tenant-specific list
+        await self.redis.rpush(queue_key, json.dumps(req_data))
+        
+        # 2. Add tenant to active set and list if not already there
+        # SADD returns 1 if it was newly added, 0 if it already existed
+        is_new = await self.redis.sadd(self.active_set, model_id)
+        if is_new == 1:
+            await self.redis.rpush(self.active_list, model_id)
 
     async def get_requests(self) -> List[Dict[str, Any]]:
-        # BRPOP blocks until an item is available at the head of the list
-        # We use a 5-second timeout instead of 0 (infinity), so that if the connection
-        # silently dies (e.g. pod preempted), the event loop wakes up to realize it's dead.
-        result = await self.redis.blpop(self.queue_key, timeout=5)
+        # BRPOPLPUSH blocks until an item is available.
+        # It atomically pops the rightmost element of src, pushes it to the left of dst, and returns it.
+        # Wait max 5 seconds so we can check for connection death.
+        result = await self.redis.brpoplpush(self.active_list, self.active_list, timeout=5)
+        
         if not result:
             return []
             
-        batch = [json.loads(result[1])]
+        model_id = result
+        queue_key = f"open_rl:queue:{model_id}"
+        batch = []
         
-        # Drain the rest of the queue non-blockingly
+        # Drain the entire queue for this tenant non-blockingly
         while True:
-            # LPOP returns None if empty
-            item = await self.redis.lpop(self.queue_key)
+            item = await self.redis.lpop(queue_key)
             if not item:
                 break
             batch.append(json.loads(item))
+            
+        # If the queue was empty (or we just drained it all but nothing new arrived),
+        # we check the length. If it's truly empty, we scrub it from the rotation.
+        # This requires a tiny Lua script or a quick transaction to ensure we don't 
+        # delete a tenant just as a new request is pushed.
+        
+        # Quick check:
+        q_len = await self.redis.llen(queue_key)
+        if q_len == 0:
+            # We remove it from the list AND set
+            await self.redis.lrem(self.active_list, 0, model_id)
+            await self.redis.srem(self.active_set, model_id)
             
         return batch
 
     async def set_future(self, req_id: str, result: Dict[str, Any]) -> None:
         if result.get("status") == "pending":
-            # Do not push dummy pending states to the Redis List.
-            # blpop in get_future will simply block until a real result is pushed.
             return
             
         key = f"open_rl:future:{req_id}"
         await self.redis.rpush(key, json.dumps(result))
-        # Expire the future key after 5 minutes so we don't leak memory
         await self.redis.expire(key, 300)
 
     async def get_future(self, req_id: str, timeout: float) -> Optional[Dict[str, Any]]:
         key = f"open_rl:future:{req_id}"
         
-        # If we poll and the key entirely does not exist, and we never recorded it,
-        # we face the "Future not found" dilemma. 
-        # In this abstraction, the Gateway creates the UUID, so ideally it should log it.
-        # But for MVP, we just block on it. If it doesn't resolve in timeout, we return try_again.
-        
-        # blpop returns (key, value) or None on timeout
-        # Using int(timeout) since blpop expects integer seconds
         result = await self.redis.blpop(key, timeout=max(1, int(timeout)))
         
         if result:
             payload = json.loads(result[1])
-            # If the future is resolved, we want it to remain available for potential retries
-            # So we push it back. A memory store keeps it forever. Redis should expire it.
             await self.redis.rpush(key, result[1])
             await self.redis.expire(key, 300)
             return payload
             
-        # Timeout occurred
         return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
 
 # Global singleton factory
@@ -139,9 +178,9 @@ def get_store() -> StateStore:
     if _store_instance is None:
         redis_url = os.environ.get("REDIS_URL")
         if redis_url:
-            print(f"[StateStore] Initializing Redis backend at {redis_url}")
+            print(f"[StateStore] Initializing Redis backend at {redis_url} with RR Tenant Queues")
             _store_instance = RedisStore(redis_url)
         else:
-            print("[StateStore] Initializing In-Memory backend")
+            print("[StateStore] Initializing In-Memory backend with RR Tenant Queues")
             _store_instance = InMemoryStore()
     return _store_instance
