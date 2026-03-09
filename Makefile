@@ -200,6 +200,22 @@ logs-tinker-job-2:
 	@echo "--- Fetching Tinker RL Basic Job 2 Logs ---"
 	kubectl logs -f job/tinker-rl-basic-job-2
 
+run-tinker-job-3:
+	@echo "--- Deploying Tinker RL Basic Job 3 to GKE ---"
+	kubectl delete job tinker-rl-basic-job-3 --ignore-not-found=true
+	kubectl apply -f client/kubernetes/tinker-rl-basic-job-3.yaml
+	@echo "Waiting for job to start..."
+	@sleep 4
+	kubectl logs -f job/tinker-rl-basic-job-3
+
+stop-tinker-job-3:
+	@echo "--- Stopping Tinker RL Basic Job 3 ---"
+	kubectl delete job tinker-rl-basic-job-3 --ignore-not-found=true
+
+logs-tinker-job-3:
+	@echo "--- Fetching Tinker RL Basic Job 3 Logs ---"
+	kubectl logs -f job/tinker-rl-basic-job-3
+
 run-client-job-parallel:
 	@echo "--- Deploying Distributed RLVR Client Job Array to GKE ---"
 	kubectl delete job open-rl-client-job-parallel --ignore-not-found=true
