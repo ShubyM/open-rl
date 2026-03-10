@@ -34,6 +34,13 @@ if os.environ.get("ENABLE_GCP_TRACE", "0") == "1":
 else:
     print("OpenTelemetry: No exporter configured (ENABLE_GCP_TRACE=0)")
 
+async def enqueue_traced_request(store, payload: dict) -> None:
+    carrier = {}
+    from opentelemetry import propagate
+    propagate.inject(carrier)
+    payload["trace_context"] = carrier
+    await store.put_request(payload)
+
 class FilterNoisyEndpoints(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
@@ -116,49 +123,39 @@ background_tasks = set()
 async def forward_backward(req: dict):
     req_id = str(uuid.uuid4())
     await store.set_future(req_id, {"status": "pending"})
-    
-    carrier = {}
-    from opentelemetry import propagate
-    propagate.inject(carrier)
-    
+
     fwd_input = req.get("forward_backward_input", {})
     data = fwd_input.get("data", [])
     loss_fn = fwd_input.get("loss_fn", "cross_entropy")
     loss_config = fwd_input.get("loss_fn_config", {})
     model_id = req.get("model_id")
-    
-    await store.put_request({
+
+    await enqueue_traced_request(store, {
         "req_id": req_id,
         "model_id": model_id,
         "type": "forward_backward",
         "data": data,
         "loss_fn": loss_fn,
         "loss_config": loss_config,
-        "trace_context": carrier
     })
-    
+
     return {"request_id": req_id}
 
 @app.post("/api/v1/optim_step")
 async def optim_step(req: dict):
     req_id = str(uuid.uuid4())
     await store.set_future(req_id, {"status": "pending"})
-    
-    carrier = {}
-    from opentelemetry import propagate
-    propagate.inject(carrier)
-    
+
     adam_params = req.get("adam_params", {})
     model_id = req.get("model_id")
-    
-    await store.put_request({
+
+    await enqueue_traced_request(store, {
         "req_id": req_id,
         "model_id": model_id,
         "type": "optim_step",
         "adam_params": adam_params,
-        "trace_context": carrier
     })
-    
+
     return {"request_id": req_id}
 
 @app.post("/api/v1/save_weights_for_sampler")
@@ -199,7 +196,6 @@ async def save_weights_for_sampler(req: dict):
     
     # Instantly resolve the future, bypassing the Redis queue!
     await store.set_future(req_id, result)
-    
     return {"request_id": req_id}
 
 @app.post("/api/v1/save_weights")
@@ -240,7 +236,6 @@ async def save_weights(req: dict):
     
     # Instantly resolve the future, bypassing the Redis queue!
     await store.set_future(req_id, result)
-    
     return {"request_id": req_id}
 
 @app.get("/api/v1/list_adapters")
@@ -330,20 +325,15 @@ async def asample(req: dict):
     # Strip the sequence tag to find the base directory where PyTorch actually wrote the checkpoint
     base_model_id = lora_id.split("-samp-")[0] if lora_id else None
 
-    carrier = {}
-    from opentelemetry import propagate
-    propagate.inject(carrier)
-
     sampler_backend = os.getenv("SAMPLER_BACKEND", "vllm").lower()
     if sampler_backend == "engine":
-        await store.put_request({
+        await enqueue_traced_request(store, {
             "req_id": req_id,
             "model_id": base_model_id or model_id,
             "type": "asample",
             "prompt_tokens": prompt,
             "max_tokens": max_tokens,
             "num_samples": num_samples,
-            "trace_context": carrier
         })
         return {"request_id": req_id}
     
@@ -381,6 +371,7 @@ async def asample(req: dict):
             import httpx
             
             # Use AsyncClient natively to prevent ThreadPool exhaustion from concurrent RL jobs!
+            # Increase timeout significantly since large RL batches will queue up in vLLM for > 60s
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(vllm_generate_endpoint, json=payload, headers=headers)
                 resp.raise_for_status()

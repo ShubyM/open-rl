@@ -249,3 +249,7 @@ start-redis:
 stop-redis:
 	@echo "--- Stopping Redis Server ---"
 	sudo service redis-server stop
+
+# --- Cloud Monitoring Dashboard ---
+dashboard-apply:
+	@scripts/apply_dashboard.sh $(GCP_PROJECT)
