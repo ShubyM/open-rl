@@ -62,9 +62,11 @@ plot-logs:
 
 # Generate diagrams using local mmdc zsh alias
 diagrams:
-	zsh -ic "mmdc -i design_arch.mmd -o design_arch.svg"
-	zsh -ic "mmdc -i rollout_flow.mmd -o rollout_flow.svg"
-	zsh -ic "mmdc -i distributed_arch.mmd -o distributed_arch.svg"
+	zsh -ic "mmdc -i design_arch.mmd -o design_arch.svg -b transparent"
+	zsh -ic "mmdc -i rollout_flow.mmd -o rollout_flow.svg -b transparent"
+	zsh -ic "mmdc -i distributed_arch.mmd -o distributed_arch.svg -b transparent"
+	zsh -ic "mmdc -i architecture.mmd -o openrl_architecture.svg -b transparent"
+	zsh -ic "mmdc -i architecture.mmd -o openrl_architecture.png -s 3 -b transparent"
 
 HOST ?= mars
 
