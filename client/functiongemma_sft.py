@@ -1,59 +1,72 @@
-import argparse
 import asyncio
 import json
-import logging
 import os
 from pathlib import Path
 from typing import Any
 
+import chz
 import matplotlib.pyplot as plt
-from datasets import load_dataset
-from transformers.utils import get_json_schema
+import requests
 import tinker
+from datasets import load_dataset
 from tinker import types
-
-logging.getLogger("tinker").setLevel(logging.WARNING)
+from transformers.utils.chat_template_utils import get_json_schema
 
 BASE_MODEL = "google/functiongemma-270m-it"
-HF_DATASET = "bebechien/SimpleToolCalling"
+BASE_URL = "http://127.0.0.1:9000"
+DATASET = "bebechien/SimpleToolCalling"
+PLOT_PATH = Path(__file__).resolve().parents[1] / "artifacts" / "functiongemma_sft_metrics.png"
+EVAL_MAX_TOKENS = 24
+
+os.environ.setdefault("TINKER_API_KEY", "tml-dummy-key")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+
+@chz.chz
+class Config:
+    base_model: str = BASE_MODEL
+    base_url: str = os.getenv("TINKER_BASE_URL") or os.getenv("OPEN_RL_BASE_URL") or BASE_URL
+    dataset: str = DATASET
+    epochs: int = 10
+    rank: int = 16
+    eval_limit: int = 20
+    plot_path: str = str(PLOT_PATH)
+    assert_loss_drop: bool = False
+    min_loss_drop: float = 0.05
+    ci: bool = False
+
 
 def search_knowledge_base(query: str):
-    """
-    Search the internal knowledge base for information.
+    """Search the internal knowledge base.
     Args:
-        query: The search query string.
+        query: Search query.
     """
     return "Internal Result"
 
+
 def search_google(query: str):
-    """
-    Search the public internet for information.
+    """Search the public internet.
     Args:
-        query: The search query string.
+        query: Search query.
     """
     return "Public Result"
 
+
 TOOLS = [get_json_schema(search_knowledge_base), get_json_schema(search_google)]
+
 
 def build_conversation(sample: dict[str, Any]) -> dict[str, Any]:
     return {
         "messages": [
-            {
-                "role": "developer",
-                "content": "You are a model that can do function calling with the following functions",
-            },
+            {"role": "developer", "content": "You are a model that can do function calling with the following functions"},
             {"role": "user", "content": sample["user_content"]},
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": sample["tool_name"],
-                            "arguments": json.loads(sample["tool_arguments"]),
-                        },
-                    }
-                ],
+            {"role": "assistant", 
+            "tool_calls": [{
+                "type": "function", 
+                "function": {
+                    "name": sample["tool_name"], 
+                    "arguments": json.loads(sample["tool_arguments"])
+                }}]
             },
         ],
         "tools": TOOLS,
@@ -62,238 +75,135 @@ def build_conversation(sample: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def make_datum(tokenizer: Any, example: dict[str, Any]) -> types.Datum:
-    full_text = tokenizer.apply_chat_template(
-        example["messages"],
-        tools=example["tools"],
-        add_generation_prompt=False,
-        tokenize=False,
-    )
-    prompt_text = tokenizer.apply_chat_template(
-        example["messages"][:2],
-        tools=example["tools"],
-        add_generation_prompt=True,
-        tokenize=False,
-    )
-
-    full_tokens = tokenizer.encode(full_text, add_special_tokens=False)
-    prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
-
-    if len(full_tokens) < 2:
-        raise ValueError("Need at least 2 tokens to build a training datum")
-    if len(prompt_tokens) >= len(full_tokens):
-        raise ValueError("Prompt tokens must be shorter than full example tokens")
-
+def make_datum(tokenizer: Any, example: Any) -> types.Datum:
+    prompt = tokenizer.apply_chat_template(example["messages"][:2], tools=example["tools"], add_generation_prompt=True, tokenize=False)
+    full = tokenizer.apply_chat_template(example["messages"], tools=example["tools"], add_generation_prompt=False, tokenize=False)
+    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    full_tokens = tokenizer.encode(full, add_special_tokens=False)
     weights = [0] * len(prompt_tokens) + [1] * (len(full_tokens) - len(prompt_tokens))
-
+    loss_fn_inputs = {"target_tokens": full_tokens[1:], "weights": weights[1:]}
     return types.Datum(
-        model_input=types.ModelInput.from_ints(tokens=full_tokens[:-1]),
-        loss_fn_inputs={
-            "target_tokens": full_tokens[1:],
-            "weights": weights[1:],
-        },
+        model_input=types.ModelInput.from_ints(tokens=full_tokens[:-1]), 
+        loss_fn_inputs=loss_fn_inputs,
     )
 
 
-def make_sampling_client(service_client: tinker.ServiceClient, training_client: Any, alias: str) -> Any:
-    save_result = training_client.save_weights_for_sampler(name=alias).result()
-    return service_client.create_sampling_client(save_result.path)
+def eval_rate(tokenizer: Any, sampler: Any, examples: list[Any]) -> float:
+    hits = 0
+    for ex in examples:
+        prompt = tokenizer.apply_chat_template(ex["messages"][:2], tools=ex["tools"], add_generation_prompt=True, tokenize=False)
+        tokens = tokenizer.encode(prompt, add_special_tokens=False)
 
-
-def evaluate_tool_selection(
-    tokenizer: Any,
-    sampling_client: Any,
-    eval_examples: list[dict[str, Any]],
-    max_tokens: int,
-    temperature: float,
-) -> tuple[float, list[dict[str, Any]]]:
-    rollouts: list[dict[str, Any]] = []
-
-    for idx, example in enumerate(eval_examples, start=1):
-        prompt_text = tokenizer.apply_chat_template(
-            example["messages"][:2],
-            tools=example["tools"],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
-
-        result = sampling_client.sample(
-            prompt=types.ModelInput.from_ints(tokens=prompt_tokens),
+        result = sampler.sample(
+            prompt=types.ModelInput.from_ints(tokens),
             num_samples=1,
-            sampling_params=types.SamplingParams(max_tokens=max_tokens, temperature=temperature),
+            sampling_params=types.SamplingParams(max_tokens=EVAL_MAX_TOKENS, temperature=0.0)
         ).result()
 
-        output_tokens = result.sequences[0].tokens if result.sequences else []
-        output_text = tokenizer.decode(output_tokens, skip_special_tokens=False)
+        result_tokens = result.sequences[0].tokens if result.sequences else []
+        text = tokenizer.decode(result_tokens, skip_special_tokens=False)
+        expected = ex["expected_tool"]
+        other_tool = "search_google" if expected == "search_knowledge_base" else "search_knowledge_base"
+        hits += expected in text and other_tool not in text
 
-        expected_tool = example["expected_tool"]
-        other_tool = "search_google" if expected_tool == "search_knowledge_base" else "search_knowledge_base"
-        passed = expected_tool in output_text and other_tool not in output_text
-
-        rollouts.append(
-            {
-                "idx": idx,
-                "prompt": example["user_content"],
-                "expected_tool": expected_tool,
-                "output": output_text,
-                "passed": passed,
-            }
-        )
-
-    success_count = sum(1 for item in rollouts if item["passed"])
-    for item in rollouts:
-        status = "PASS" if item["passed"] else "FAIL"
-        print(f"[eval {item['idx']:02d}] {status} | expected={item['expected_tool']} | prompt={item['prompt']}")
-        print(f"           output={item['output'].strip()}")
-
-    success_rate = success_count / max(1, len(rollouts))
-    print(f"[eval] success={success_count}/{len(eval_examples)} ({success_rate:.1%})")
-    return success_rate, rollouts
+    return hits / max(1, len(examples))
 
 
-def plot_metrics(losses: list[float], baseline_rate: float | None, tuned_rate: float | None, output_path: str) -> None:
-    figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-
+def plot_metrics(losses: list[float], before: float, after: float, plot_path: Path) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     axes[0].plot(range(1, len(losses) + 1), losses, marker="o", color="#1f77b4")
     axes[0].set_title("Training Loss")
-    axes[0].set_xlabel("Epoch")
+    axes[0].set_xlabel("Step")
     axes[0].set_ylabel("loss:mean")
     axes[0].grid(True, alpha=0.3)
-
-    if baseline_rate is None or tuned_rate is None:
-        axes[1].axis("off")
-        axes[1].text(0.05, 0.5, "Evaluation skipped", fontsize=12)
-    else:
-        axes[1].bar(["before", "after"], [baseline_rate, tuned_rate], color=["#9aa0a6", "#1b9e77"])
-        axes[1].set_ylim(0.0, 1.0)
-        axes[1].set_title("Tool Selection Success Rate")
-        axes[1].set_ylabel("success rate")
-        axes[1].grid(True, axis="y", alpha=0.3)
-
+    axes[1].bar(["before", "after"], [before, after], color=["#9aa0a6", "#1b9e77"])
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].set_title("Tool Selection Success Rate")
+    axes[1].grid(True, axis="y", alpha=0.3)
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close(figure)
+    plt.savefig(plot_path)
+    plt.close(fig)
 
 
-def assert_loss_progress(losses: list[float]) -> float:
-    if len(losses) < 2:
-        raise AssertionError("Need at least 2 epochs to validate loss improvement")
-
-    first = losses[0]
-    last = losses[-1]
-    denom = abs(first) if abs(first) > 1e-8 else 1.0
-    relative_drop = (first - last) / denom
-
-    if relative_drop < 0.05:
-        raise AssertionError(
-            f"Loss did not improve enough: first={first:.6f}, last={last:.6f}, "
-            f"relative_drop={relative_drop:.4f}, required=0.0500"
-        )
-
-    return relative_drop
+def require_server(base_url: str) -> dict[str, Any]:
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/api/v1/get_server_capabilities", timeout=5.0)
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:
+        raise RuntimeError(f"Open-RL server at {base_url} is not reachable. Start it with `make run-function-gemma-server`.") from exc
 
 
-async def run_sft(
-    service_client: tinker.ServiceClient,
-    epochs: int,
-    skip_eval: bool,
-    assert_loss_drop: bool,
-) -> None:
-    print("Initializing FunctionGemma SFT job...")
-    print(f"FunctionGemma reference model: {BASE_MODEL}")
-    print("Model card note: 270M parameter variant is designed for lightweight deployments")
-    print(f"Make sure server VLLM_MODEL matches {BASE_MODEL} for adapter compatibility")
+async def run_training(config: Config) -> None:
+    # 1. Preflight
+    if config.ci and not os.getenv("HF_TOKEN"):
+        raise RuntimeError("CI mode requires HF_TOKEN")
 
-    dataset = load_dataset(HF_DATASET, split="train")
-    print(f"Loaded {len(dataset)} rows from {HF_DATASET}")
+    capabilities = require_server(config.base_url)
+    print(f"Server ready at {config.base_url} | model={capabilities.get('default_model') or 'unset'}")
 
-    # Map conversations over the dataset
-    dataset = dataset.map(build_conversation, remove_columns=dataset.features, batched=False)
-    
-    # Split dataset into 50% training samples and 50% test samples using datasets
-    split_dataset = dataset.train_test_split(test_size=0.5, shuffle=False)
-    train_examples = split_dataset['train']
-    test_examples = split_dataset['test']
-    
-    print(f"Dataset size={len(dataset)} | train={len(train_examples)} | test={len(test_examples)}")
+    # 2. Data
+    dataset = load_dataset(config.dataset, split="train").map(build_conversation, batched=False)
+    split = dataset.train_test_split(test_size=0.5, shuffle=False)
+    train_examples = list(split["train"])
+    eval_dataset = split["test"].select(range(min(config.eval_limit, len(split["test"])))) if config.eval_limit else split["test"]
+    eval_examples = list(eval_dataset)
+    print(f"Loaded {len(dataset)} rows from {config.dataset} | train={len(train_examples)} eval={len(eval_examples)}")
 
-    print(f"Creating training client for base_model={BASE_MODEL!r}, rank=16...")
-    training_client = await service_client.create_lora_training_client_async(base_model=BASE_MODEL, rank=16)
-    tokenizer = training_client.get_tokenizer()
+    # 3. Training setup
+    client = tinker.ServiceClient(api_key=os.getenv("TINKER_API_KEY"), base_url=config.base_url)
+    trainer = await client.create_lora_training_client_async(base_model=config.base_model, rank=config.rank)
+    tokenizer = trainer.get_tokenizer()
+    datums = [make_datum(tokenizer, ex) for ex in train_examples]
+    active_tokens = sum(sum(d.loss_fn_inputs["weights"].tolist()) for d in datums)
 
-    train_datums = []
-    for example in train_examples:
-        train_datums.append(make_datum(tokenizer, example))
-    print(f"Prepared {len(train_datums)} datums for cross-entropy training")
+    print(f"Created LoRA training client | rank={config.rank} | datums={len(datums)}")
 
-    baseline_rate = None
-    if not skip_eval:
-        print("Running baseline evaluation before fine-tuning...")
-        baseline_sampler = make_sampling_client(service_client, training_client, "functiongemma_baseline")
-        baseline_rate, _ = evaluate_tool_selection(
-            tokenizer=tokenizer,
-            sampling_client=baseline_sampler,
-            eval_examples=test_examples,
-            max_tokens=128,
-            temperature=0.0,
-        )
+    # 4. Baseline eval
+    baseline_weights = trainer.save_weights_for_sampler(name="functiongemma_baseline").result()
+    sampler = client.create_sampling_client(baseline_weights.path)
+    before = eval_rate(tokenizer, sampler, eval_examples)
+    print(f"[eval] baseline={before:.1%}")
 
+    # 5. Train
     losses: list[float] = []
-    print("Starting training...")
-    learning_rate = 5e-5
-    total_active_tokens = sum(sum(d.loss_fn_inputs["weights"].tolist()) for d in train_datums)
-    for epoch in range(epochs):
-        fwdbwd_future = await training_client.forward_backward_async(train_datums, "cross_entropy")
-        optim_future = await training_client.optim_step_async(types.AdamParams(learning_rate=learning_rate))
-
-        fwdbwd_result = fwdbwd_future.result()
-        optim_future.result()
-
-        total_loss = float(fwdbwd_result.metrics.get("loss:sum", 0.0))
-        loss_value = total_loss / total_active_tokens if total_active_tokens > 0 else 0.0
-        losses.append(loss_value)
-        print(f"[train] epoch={epoch + 1:02d}/{epochs} loss={loss_value:.6f}")
-
-    tuned_rate = None
-    if not skip_eval:
-        print("Running evaluation after fine-tuning...")
-        tuned_sampler = make_sampling_client(service_client, training_client, "functiongemma_tuned")
-        tuned_rate, _ = evaluate_tool_selection(
-            tokenizer=tokenizer,
-            sampling_client=tuned_sampler,
-            eval_examples=test_examples,
-            max_tokens=128,
-            temperature=0.0,
+    for step in range(config.epochs):
+        fwdbwd, optim = await asyncio.gather(
+            trainer.forward_backward_async(datums, "cross_entropy"),
+            trainer.optim_step_async(types.AdamParams(learning_rate=5e-5)),
         )
+        optim.result()
+        loss = float(fwdbwd.result().metrics.get("loss:sum", 0.0)) / active_tokens
+        losses.append(loss)
+        print(f"[train] step={step + 1:02d}/{config.epochs} loss={loss:.6f}")
 
-    plot_metrics(losses, baseline_rate, tuned_rate, "functiongemma_sft_metrics.png")
-    print("Saved plot to functiongemma_sft_metrics.png")
+    # 6. Post-train eval and artifacts
+    tuned_weights = trainer.save_weights_for_sampler(name="functiongemma_tuned").result()
+    sampler = client.create_sampling_client(tuned_weights.path)
+    after = eval_rate(tokenizer, sampler, eval_examples)
+    print(f"[eval] tuned={after:.1%}")
+    plot_metrics(losses, before, after, Path(config.plot_path))
 
-    if assert_loss_drop:
-        loss_drop = assert_loss_progress(losses)
-        print(f"[assert] loss improved by {loss_drop:.2%} (required 5.00%)")
+    # 7. Success criteria
+    drop = None
+    if config.assert_loss_drop or config.ci:
+        drop = (losses[0] - losses[-1]) / (abs(losses[0]) or 1.0)
+        assert len(losses) >= 2 and drop >= config.min_loss_drop, (
+            f"Loss did not improve enough: first={losses[0]:.6f} last={losses[-1]:.6f} "
+            f"drop={drop:.2%} required={config.min_loss_drop:.2%}"
+        )
+        print(f"[assert] loss improved by {drop:.2%}")
+
+    print(f"Saved plot to {config.plot_path}")
+    print(f"[summary] baseline={before:.1%} tuned={after:.1%} loss_drop={'n/a' if drop is None else f'{drop:.2%}'}")
+    if config.ci:
+        print(f"CI_RESULT plot={config.plot_path} baseline_rate={before:.1%} tuned_rate={after:.1%} loss_drop={drop:.2%}")
 
 
-async def main() -> None:
-    parser = argparse.ArgumentParser(description="FunctionGemma fine-tuning reproduction using Open-RL/Tinker primitives")
-    parser.add_argument("--epochs", type=int, default=8, help="Training epochs")
-    parser.add_argument("--skip-eval", action="store_true", help="Skip pre/post sampling evaluation")
-    parser.add_argument("--assert-loss-drop", action="store_true", help="Fail run if train loss does not drop")
-    args = parser.parse_args()
-
-    service_client = tinker.ServiceClient(
-        api_key=os.getenv("TINKER_API_KEY", "tml-dummy-key"),
-        base_url=os.getenv("TINKER_BASE_URL", "http://localhost:9000"),
-    )
-
-    await run_sft(
-        service_client=service_client,
-        epochs=args.epochs,
-        skip_eval=args.skip_eval,
-        assert_loss_drop=args.assert_loss_drop,
-    )
+def cli() -> None:
+    asyncio.run(run_training(chz.entrypoint(Config, allow_hyphens=True)))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    cli()

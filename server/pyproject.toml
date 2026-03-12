@@ -18,13 +18,11 @@ dependencies = [
 
 [project.optional-dependencies]
 ml = [
-    "accelerate",
     "datasets",
     "numpy",
     "peft",
     "torch",
     "torch-c-dlpack-ext; sys_platform == 'linux'",
     "transformers",
-    "trl",
     "vllm>=0.15.0; sys_platform == 'linux'",
 ]

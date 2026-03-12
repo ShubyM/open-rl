@@ -2,6 +2,37 @@
 
 This directory contains the client-side scripts for interacting with the Open-RL API.
 
+## FunctionGemma Demo
+
+Script: `client/functiongemma_sft.py`
+
+Prereqs:
+
+- accept the FunctionGemma model terms: https://huggingface.co/google/functiongemma-270m-it
+- set `HF_TOKEN` or run `uv run hf auth login`
+
+From the repo root, start the local FunctionGemma server in one terminal:
+
+```bash
+export HF_TOKEN=...
+make run-function-gemma-server
+```
+
+Then run the demo in a second terminal:
+
+```bash
+make run-function-gemma
+```
+
+What it does:
+
+- starts a local Open-RL server on `http://127.0.0.1:9000`
+- runs the gateway and engine loop in one process, so Redis and a separate worker are not required
+- loads `google/functiongemma-270m-it`
+- trains on Hugging Face `bebechien/SimpleToolCalling`
+- runs pre/post evaluation
+- saves `artifacts/functiongemma_sft_metrics.png`
+
 ## RLVR Demo
 
 The RLVR (Reinforcement Learning with Verifiable Rewards) demo showcases training a model to answer questions in a specific format using a reward function that verifies the correctness and format of the answer.
@@ -9,24 +40,3 @@ The RLVR (Reinforcement Learning with Verifiable Rewards) demo showcases trainin
 It supports parallel training jobs, allowing you to train multiple behaviors simultaneously (e.g., answering capital cities vs. just providing the answer).
 
 ![RLVR Result](./rlvr_result.png)
-
-## FunctionGemma SFT
-
-Use `functiongemma_sft.py` to reproduce tool-calling SFT:
-
-```bash
-uv run --python 3.12 python functiongemma_sft.py
-```
-
-To download the functiongemma model you must agree to terms and conditions located here: https://huggingface.co/google/functiongemma-270m-it
-
-After agreeing, log in with Hugging Face:
-
-```bash
-uv run hf auth login
-```
-
-Dataset source:
-- Primary: Hugging Face `bebechien/SimpleToolCalling`
-
-

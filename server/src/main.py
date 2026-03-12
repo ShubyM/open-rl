@@ -1,6 +1,7 @@
 import uuid
 import os
 import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 # Removed direct PyTorch engine import to keep Gateway stateless
@@ -48,7 +49,37 @@ class FilterNoisyEndpoints(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
-app = FastAPI(title="Open-RL Server MVP")
+def get_default_model_name() -> str | None:
+    if os.getenv("OPEN_RL_SINGLE_PROCESS", "0") == "1":
+        from . import engine as trainer_engine
+
+        if trainer_engine.engine.base_model_name:
+            return trainer_engine.engine.base_model_name
+    return os.getenv("OPEN_RL_BASE_MODEL") or os.getenv("VLLM_MODEL")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = None
+    if os.getenv("OPEN_RL_SINGLE_PROCESS", "0") == "1":
+        from . import engine as trainer_engine
+
+        base_model = os.getenv("OPEN_RL_BASE_MODEL")
+        print("\n" + "=" * 50)
+        print(" Open-RL Single-Process Mode")
+        print("=" * 50)
+        print(f"-> Base model: {base_model or 'unset'}")
+        print("-> Backend   : gateway + engine loop in one process\n")
+        if base_model:
+            await asyncio.to_thread(trainer_engine.engine.preload_base_model, base_model)
+        task = asyncio.create_task(trainer_engine.clock_cycle_loop())
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+
+
+app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
 FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
 
 @app.get("/api/v1/healthz")
@@ -57,8 +88,11 @@ async def health_check():
 
 @app.get("/api/v1/get_server_capabilities")
 async def get_server_capabilities():
+    model_name = get_default_model_name()
     return {
-        "supported_models": []
+        "supported_models": [model_name] if model_name else [],
+        "default_model": model_name,
+        "single_process": os.getenv("OPEN_RL_SINGLE_PROCESS", "0") == "1",
     }
 
 @app.post("/api/v1/create_session")
@@ -98,10 +132,9 @@ async def create_model(req: dict):
 
 @app.post("/api/v1/get_info")
 async def get_info(req: dict):
-    # API Gateway is stateless, so it reads the globally deployed model config from Env
-    model_name = os.environ.get("VLLM_MODEL")
+    model_name = get_default_model_name()
     if not model_name:
-         return JSONResponse(status_code=404, content={"error": "VLLM_MODEL environment variable not set in Gateway"})
+         return JSONResponse(status_code=404, content={"error": "No base model is configured for the current server session"})
 
     return {
         "model_data": {
@@ -162,6 +195,8 @@ async def optim_step(req: dict):
 async def save_weights_for_sampler(req: dict):
     req_id = str(uuid.uuid4())
     model_id = req.get("model_id") # Client passes the TrainingClient's model_id
+    if not model_id:
+        return JSONResponse(status_code=400, content={"error": "model_id is required"})
     seq_id = req.get("sampling_session_seq_id", 0)
     if not seq_id:
         seq_id = int(time.time() * 1000)
@@ -202,6 +237,8 @@ async def save_weights_for_sampler(req: dict):
 async def save_weights(req: dict):
     req_id = str(uuid.uuid4())
     model_id = req.get("model_id") 
+    if not model_id:
+        return JSONResponse(status_code=400, content={"error": "model_id is required"})
     seq_id = req.get("seq_id", 0)
     if not seq_id:
         seq_id = int(time.time() * 1000)
@@ -330,9 +367,10 @@ async def asample(req: dict):
         await enqueue_traced_request(store, {
             "req_id": req_id,
             "model_id": base_model_id or model_id,
-            "type": "asample",
+            "type": "sample",
             "prompt_tokens": prompt,
             "max_tokens": max_tokens,
+            "temperature": temperature,
             "num_samples": num_samples,
         })
         return {"request_id": req_id}
@@ -346,7 +384,7 @@ async def asample(req: dict):
             # Engine saves to: tmp_dir/peft/m_id (because adapter_name=m_id)
             lora_path = os.path.join(tmp_dir, "peft", base_model_id, base_model_id) if base_model_id else None
             
-            print(f"[Gateway DEBUG] Routing asample to vLLM. model_id_received={model_id} -> lora_id={lora_id}, lora_path={lora_path}")
+            print(f"[Gateway DEBUG] Routing sample to vLLM. model_id_received={model_id} -> lora_id={lora_id}, lora_path={lora_path}")
             
             payload = {
                 "request_id": req_id,
@@ -388,10 +426,11 @@ async def asample(req: dict):
     task.add_done_callback(background_tasks.discard)
     
     return {"request_id": req_id}
-
 @app.post("/api/v1/retrieve_future")
 async def retrieve_future(req: dict):
     request_id = req.get("request_id")
+    if not request_id:
+        return JSONResponse(status_code=400, content={"error": "request_id is required"})
     
     result = await store.get_future(request_id, timeout=60.0)
     if result is None:

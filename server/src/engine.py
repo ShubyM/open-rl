@@ -40,7 +40,6 @@ class TrainerEngine:
             self.device = "cpu"
             
         self.base_model_name = None
-        self.base_model_name = None
 
     def preload_base_model(self, base_model: str):
         """Eagerly load the massive base model tensors into VRAM."""
@@ -338,11 +337,12 @@ class TrainerEngine:
             "metrics": {"grad_norm:mean": self._sanitize_float(total_norm)}
         }
 
-    def generate(self, prompt_tokens: List[int], max_tokens: int, num_samples: int = 1, model_id: str = None) -> Dict[str, Any]:
+    def generate(self, prompt_tokens: List[int], max_tokens: int, num_samples: int = 1, temperature: float = 0.0, model_id: str = None) -> Dict[str, Any]:
         with self._init_lock:
             assert self.model is not None, "Model not loaded."
             
             input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
+            do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
             
             with torch.no_grad():
                 attention_mask = torch.ones_like(input_tensor)
@@ -351,8 +351,8 @@ class TrainerEngine:
                 attention_mask=attention_mask,
                 max_new_tokens=max_tokens,
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-                do_sample=(num_samples > 1),
-                temperature=0.8 if num_samples > 1 else None, 
+                do_sample=do_sample,
+                temperature=temperature if do_sample else None,
                 top_p=None,
                 top_k=None,
                 num_return_sequences=num_samples,
@@ -471,7 +471,8 @@ async def clock_cycle_loop():
                                     prompt_tokens = r["prompt_tokens"]
                                     max_tokens = r["max_tokens"]
                                     num_samples = r["num_samples"]
-                                    result = await asyncio.to_thread(engine.generate, prompt_tokens, max_tokens, num_samples, m_id)
+                                    temperature = r.get("temperature", 0.0)
+                                    result = await asyncio.to_thread(engine.generate, prompt_tokens, max_tokens, num_samples, temperature, m_id)
                                     result["type"] = "sample"
                                     await store.set_future(req_id, result)
                                 elif req_type == "create_model":

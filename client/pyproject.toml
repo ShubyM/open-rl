@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "client"
 version = "0.1.0"
@@ -5,6 +9,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "chz>=0.4.0",
     "jinja2",
     "matplotlib>=3.10.8",
     "requests>=2.32.5",
@@ -16,6 +21,9 @@ dependencies = [
     "opentelemetry-exporter-gcp-trace>=1.11.0",
     "opentelemetry-sdk>=1.40.0",
 ]
+
+[project.scripts]
+functiongemma-demo = "functiongemma_sft:cli"
 
 [tool.setuptools]
 packages = []
