@@ -69,3 +69,17 @@ def rl_loop(trainer, sampler, env, dataset, num_steps):
 ## Core Constraints & Enablers
 - **LoRA (Low-Rank Adaptation):** Open-RL assumes the use of LoRA fine-tuning, which efficiently retains the quality of full fine-tuning for most domains. By anchoring a frozen base model on shared GPUs, the system leverages LoRA to achieve near-instant memory context switching between multiple time-sliced RL jobs.
 - **Soft Multi-Tenancy:** The initial design assumes that the datasets and weights for multiple RL jobs can safely reside on high-performance shared infrastructural storage layers.
+
+## Contributing
+
+This project is licensed under the [Apache 2.0 License](LICENSE).
+
+We welcome contributions! Please see [docs/contributing.md](docs/contributing.md) for more information.
+
+We follow [Google's Open Source Community Guidelines](https://opensource.google.com/conduct/).
+
+## Disclaimer
+
+This is not an officially supported Google product.
+
+This project is not eligible for the Google Open Source Software Vulnerability Rewards Program.
