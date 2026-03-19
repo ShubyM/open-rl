@@ -57,7 +57,7 @@ class TrainerEngine:
                     device_map=self.device
                 )
                 print(f"[EAGER INIT] {base_model} successfully seated in VRAM.")
-    def load_model(self, base_model: str, rank: int, model_id: str):
+    def load_model(self, base_model: str, rank: int, model_id: str, lora_config: Dict[str, Any] | None = None):
         with self._init_lock:
             # If the user asks for a different base model than what's loaded, we have to swap it.
             # But normally, eager init guarantees this matches.
@@ -72,26 +72,40 @@ class TrainerEngine:
                     torch_dtype=dtype,
                     device_map=self.device
                 )
+            config = lora_config or {}
+            train_attn = config.get("train_attn", True)
+            train_mlp = config.get("train_mlp", True)
+            train_unembed = config.get("train_unembed", True)
+            if not any([train_attn, train_mlp, train_unembed]):
+                raise ValueError("At least one LoRA training target must be enabled.")
+
+            target_modules: str | list[str]
+            if train_attn and train_mlp and train_unembed:
+                target_modules = "all-linear"
+            else:
+                target_modules = []
+                if train_attn:
+                    target_modules.extend(["q_proj", "k_proj", "v_proj", "o_proj"])
+                if train_mlp:
+                    target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=rank,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                bias="none",
+                target_modules=target_modules,
+                modules_to_save=["lm_head", "embed_tokens"] if train_unembed else None,
+            )
                 
             if getattr(self, "model", None) is None:
                 # First time wrapping the base model with PEFT
-                peft_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    r=rank,
-                    lora_alpha=rank * 2,
-                    target_modules=["q_proj", "v_proj"]
-                )
                 self.model = get_peft_model(self.model_obj, peft_config, adapter_name=model_id)
                 self.model.train()
                 print(f"Base model wrapped with initial LoRA adapter '{model_id}'.")
             else:
                 print(f"Adding new LoRA adapter '{model_id}' to existing base model...")
-                peft_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    r=rank,
-                    lora_alpha=rank * 2,
-                    target_modules=["q_proj", "v_proj"]
-                )
                 self.model.add_adapter(model_id, peft_config)
                 self.model.train()
             
@@ -99,10 +113,11 @@ class TrainerEngine:
         if model_id in self.optimizers:
             del self.optimizers[model_id]
             
-        self._auto_save_adapter(model_id)
+        if os.getenv("OPEN_RL_AUTO_SAVE_ADAPTERS", "0").lower() in {"1", "true", "yes", "on"}:
+            print(f"  -> [AUTO-SAVE] Saving weights for tenant: {model_id} to RAM Disk")
+            self.save_adapter(model_id)
 
-    def _auto_save_adapter(self, model_id: str):
-        print(f"  -> [AUTO-SAVE] Saving weights for tenant: {model_id} to RAM Disk")
+    def save_adapter(self, model_id: str):
         try:
             tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
             ram_path = os.path.join(tmp_dir, "peft", model_id)
@@ -145,7 +160,7 @@ class TrainerEngine:
         if model_id and model_id not in self.optimizers:
             # Ensuring optimizer exists is good, but we don't zero_grad here anymore
             pass
-        
+
         total_loss = 0.0
         loss_fn_outputs = []
         
@@ -330,8 +345,9 @@ class TrainerEngine:
         optimizer.step()
         optimizer.zero_grad()
         
-        # Auto-save for Hardware Pipeline bypass
-        self._auto_save_adapter(model_id)
+        if os.getenv("OPEN_RL_AUTO_SAVE_ADAPTERS", "0").lower() in {"1", "true", "yes", "on"}:
+            print(f"  -> [AUTO-SAVE] Saving weights for tenant: {model_id} to RAM Disk")
+            self.save_adapter(model_id)
 
         return {
             "metrics": {"grad_norm:mean": self._sanitize_float(total_norm)}
@@ -478,13 +494,18 @@ async def clock_cycle_loop():
                                 elif req_type == "create_model":
                                     base_model = r["base_model"]
                                     rank = r.get("rank", 16)
-                                    await asyncio.to_thread(engine.load_model, base_model, rank, m_id)
+                                    lora_config = r.get("lora_config", {})
+                                    await asyncio.to_thread(engine.load_model, base_model, rank, m_id, lora_config)
                                     await store.set_future(req_id, {
                                         "model_id": m_id,
                                         "is_lora": True,
                                         "lora_rank": rank,
                                         "type": "create_model"
                                     })
+                                elif req_type == "save_adapter":
+                                    result = r["result"]
+                                    await asyncio.to_thread(engine.save_adapter, m_id)
+                                    await store.set_future(req_id, result)
                             except Exception as e:
                                 traceback.print_exc()
                                 await store.set_future(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})

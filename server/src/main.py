@@ -125,7 +125,8 @@ async def create_model(req: dict):
         "model_id": model_id, # Tenant specific queue
         "type": "create_model",
         "base_model": base_model,
-        "rank": rank
+        "rank": rank,
+        "lora_config": lora_config,
     })
     
     return {"request_id": req_id}
@@ -194,6 +195,7 @@ async def optim_step(req: dict):
 @app.post("/api/v1/save_weights_for_sampler")
 async def save_weights_for_sampler(req: dict):
     req_id = str(uuid.uuid4())
+    await store.set_future(req_id, {"status": "pending"})
     model_id = req.get("model_id") # Client passes the TrainingClient's model_id
     if not model_id:
         return JSONResponse(status_code=400, content={"error": "model_id is required"})
@@ -228,14 +230,19 @@ async def save_weights_for_sampler(req: dict):
         "sampling_session_id": session_id,
         "type": "save_weights_for_sampler"
     }
-    
-    # Instantly resolve the future, bypassing the Redis queue!
-    await store.set_future(req_id, result)
+
+    await enqueue_traced_request(store, {
+        "req_id": req_id,
+        "model_id": model_id,
+        "type": "save_adapter",
+        "result": result,
+    })
     return {"request_id": req_id}
 
 @app.post("/api/v1/save_weights")
 async def save_weights(req: dict):
     req_id = str(uuid.uuid4())
+    await store.set_future(req_id, {"status": "pending"})
     model_id = req.get("model_id") 
     if not model_id:
         return JSONResponse(status_code=400, content={"error": "model_id is required"})
@@ -270,9 +277,13 @@ async def save_weights(req: dict):
         "sampling_session_id": session_id,
         "type": "save_weights"
     }
-    
-    # Instantly resolve the future, bypassing the Redis queue!
-    await store.set_future(req_id, result)
+
+    await enqueue_traced_request(store, {
+        "req_id": req_id,
+        "model_id": model_id,
+        "type": "save_adapter",
+        "result": result,
+    })
     return {"request_id": req_id}
 
 @app.get("/api/v1/list_adapters")
