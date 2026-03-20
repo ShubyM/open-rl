@@ -57,7 +57,7 @@ class TrainerEngine:
                     device_map=self.device
                 )
                 print(f"[EAGER INIT] {base_model} successfully seated in VRAM.")
-    def load_model(self, base_model: str, rank: int, model_id: str, lora_config: Dict[str, Any] | None = None):
+    def load_model(self, base_model: str, model_id: str, lora_config: Dict[str, Any] | None = None):
         with self._init_lock:
             # If the user asks for a different base model than what's loaded, we have to swap it.
             # But normally, eager init guarantees this matches.
@@ -73,12 +73,14 @@ class TrainerEngine:
                     device_map=self.device
                 )
             config = lora_config or {}
+            rank = config.get("rank", 16)
             train_attn = config.get("train_attn", True)
             train_mlp = config.get("train_mlp", True)
             train_unembed = config.get("train_unembed", True)
             if not any([train_attn, train_mlp, train_unembed]):
                 raise ValueError("At least one LoRA training target must be enabled.")
 
+            # Tinker's LoRA config is intentionally coarse; PEFT still expects concrete target names here.
             target_modules: str | list[str]
             if train_attn and train_mlp and train_unembed:
                 target_modules = "all-linear"
@@ -112,10 +114,6 @@ class TrainerEngine:
         # Reset/initialize optimizer for this new adapter
         if model_id in self.optimizers:
             del self.optimizers[model_id]
-            
-        if os.getenv("OPEN_RL_AUTO_SAVE_ADAPTERS", "0").lower() in {"1", "true", "yes", "on"}:
-            print(f"  -> [AUTO-SAVE] Saving weights for tenant: {model_id} to RAM Disk")
-            self.save_adapter(model_id)
 
     def save_adapter(self, model_id: str):
         try:
@@ -345,10 +343,6 @@ class TrainerEngine:
         optimizer.step()
         optimizer.zero_grad()
         
-        if os.getenv("OPEN_RL_AUTO_SAVE_ADAPTERS", "0").lower() in {"1", "true", "yes", "on"}:
-            print(f"  -> [AUTO-SAVE] Saving weights for tenant: {model_id} to RAM Disk")
-            self.save_adapter(model_id)
-
         return {
             "metrics": {"grad_norm:mean": self._sanitize_float(total_norm)}
         }
@@ -493,9 +487,9 @@ async def clock_cycle_loop():
                                     await store.set_future(req_id, result)
                                 elif req_type == "create_model":
                                     base_model = r["base_model"]
-                                    rank = r.get("rank", 16)
-                                    lora_config = r.get("lora_config", {})
-                                    await asyncio.to_thread(engine.load_model, base_model, rank, m_id, lora_config)
+                                    lora_config = r.get("lora_config") or {}
+                                    rank = lora_config.get("rank", 16)
+                                    await asyncio.to_thread(engine.load_model, base_model, m_id, lora_config)
                                     await store.set_future(req_id, {
                                         "model_id": m_id,
                                         "is_lora": True,

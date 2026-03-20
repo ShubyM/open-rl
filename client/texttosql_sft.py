@@ -1,3 +1,6 @@
+import asyncio
+import json
+import logging
 import os
 import random
 import re
@@ -6,18 +9,14 @@ from pathlib import Path
 from typing import Any, cast
 
 import chz
-import matplotlib.pyplot as plt
-import requests
 import tinker
 from datasets import load_dataset
 from tinker import types
-from transformers import AutoTokenizer
 
 BASE_MODEL = "google/gemma-3-1b-it"
-TOKENIZER_MODEL = "google/gemma-3-1b-it"
 BASE_URL = "http://127.0.0.1:9003"
 DATASET = "philschmid/gretel-synthetic-text-to-sql"
-PLOT_PATH = Path(__file__).resolve().parent / "artifacts" / "texttosql_{preset}_metrics.png"
+METRICS_PATH = Path(__file__).resolve().parent / "artifacts" / "texttosql_{preset}_metrics.jsonl"
 MAX_SEQ_LENGTH = 512
 
 USER_PROMPT = """Given the <USER_QUERY> and the <SCHEMA>, generate the corresponding SQL command to retrieve the desired data, considering the query's syntax, semantics, and schema constraints.
@@ -30,6 +29,8 @@ USER_PROMPT = """Given the <USER_QUERY> and the <SCHEMA>, generate the correspon
 {question}
 </USER_QUERY>
 """
+
+logger = logging.getLogger(__name__)
 
 os.environ.setdefault("TINKER_API_KEY", "tml-dummy-key")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -47,6 +48,7 @@ class Config:
     train_limit: int = 2_048
     eval_limit: int = 128
     seed: int = 17
+    metrics_path: str = str(METRICS_PATH)
 
 
 PRESETS = {
@@ -61,17 +63,127 @@ PRESETS = {
 }
 
 
-# ── Helpers ──────────────────────────────────────────────────────────
+async def run_training(config: Config, preset: str) -> dict[str, float | str]:
+    client = tinker.ServiceClient(api_key=os.getenv("TINKER_API_KEY", "tml-dummy-key"), base_url=config.base_url)
+    server_model = require_server(client, config.base_url)
+    logger.info("Server ready at %s | model=%s", config.base_url, server_model or "unset")
+
+    trainer = await client.create_lora_training_client_async(
+        base_model=BASE_MODEL,
+        rank=config.rank,
+        train_mlp=True,
+        train_attn=True,
+        train_unembed=False,
+    )
+    tokenizer = trainer.get_tokenizer()
+
+    dataset = load_dataset(DATASET, split="train").shuffle(seed=config.seed)
+    dataset = dataset.select(range(min(12_500, len(dataset))))
+    split = dataset.train_test_split(test_size=2_500, shuffle=False)
+
+    train_examples = [ex for row in list(split["train"])[:config.train_limit] if (ex := build_example(tokenizer, row)) is not None]
+    eval_examples = [ex for row in list(split["test"])[:config.eval_limit] if (ex := build_example(tokenizer, row)) is not None]
+    if not train_examples:
+        raise RuntimeError("No training examples fit within max_seq_length.")
+
+    batch_size = min(config.batch_size, len(train_examples))
+    metrics_path = Path(config.metrics_path.replace("{preset}", preset))
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text("", encoding="utf-8")
+
+    def append_metric(row: dict[str, Any]) -> None:
+        with metrics_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row) + "\n")
+
+    logger.info(
+        "Data: %s train, %s eval | batch=%s rank=%s lr=%g",
+        len(train_examples),
+        len(eval_examples),
+        batch_size,
+        config.rank,
+        config.learning_rate,
+    )
+
+    before_exact, before_sim = evaluate(client, trainer, tokenizer, "texttosql_before", eval_examples)
+    append_metric({"step": 0, "phase": "eval", "exact_match": before_exact, "similarity": before_sim})
+    logger.info("[before] exact=%.1f%% similarity=%.1f%%", before_exact * 100, before_sim * 100)
+
+    losses: list[float] = []
+    eval_exact = [before_exact]
+    eval_sim = [before_sim]
+    rng = random.Random(config.seed)
+    order = list(range(len(train_examples)))
+    rng.shuffle(order)
+    pos = 0
+
+    for step in range(1, config.steps + 1):
+        if pos + batch_size > len(order):
+            rng.shuffle(order)
+            pos = 0
+        batch = [train_examples[order[i]] for i in range(pos, pos + batch_size)]
+        pos += batch_size
+
+        datums = [row["datum"] for row in batch]
+        active_tokens = sum(row["active_tokens"] for row in batch)
+
+        fwdbwd_future, optim_future = await asyncio.gather(
+            trainer.forward_backward_async(datums, "cross_entropy"),
+            trainer.optim_step_async(
+                types.AdamParams(learning_rate=config.learning_rate, grad_clip_norm=config.grad_clip_norm)
+            ),
+        )
+        fwdbwd = fwdbwd_future.result()
+        optim_future.result()
+
+        loss = float(fwdbwd.metrics.get("loss:sum", 0.0)) / max(1, active_tokens)
+        losses.append(loss)
+        append_metric({"step": step, "phase": "train", "loss": loss})
+        logger.info("[train] step=%04d/%04d loss=%.4f", step, config.steps, loss)
+
+        if step % config.eval_every == 0 or step == config.steps:
+            exact, sim = evaluate(client, trainer, tokenizer, f"texttosql_s{step}", eval_examples)
+            eval_exact.append(exact)
+            eval_sim.append(sim)
+            append_metric({"step": step, "phase": "eval", "exact_match": exact, "similarity": sim})
+            logger.info("[eval]  step=%04d exact=%.1f%% similarity=%.1f%%", step, exact * 100, sim * 100)
+
+    loss_drop = (losses[0] - losses[-1]) / (abs(losses[0]) or 1.0)
+    logger.info("Saved metrics to %s", metrics_path)
+    logger.info(
+        "[summary] exact=%.1f%%->%.1f%% similarity=%.1f%%->%.1f%% loss_drop=%.1f%%",
+        before_exact * 100,
+        eval_exact[-1] * 100,
+        before_sim * 100,
+        eval_sim[-1] * 100,
+        loss_drop * 100,
+    )
+
+    return {
+        "before_exact": before_exact,
+        "after_exact": eval_exact[-1],
+        "before_similarity": before_sim,
+        "after_similarity": eval_sim[-1],
+        "loss_drop": loss_drop,
+        "metrics_path": str(metrics_path),
+    }
 
 
+def require_server(service_client: tinker.ServiceClient, base_url: str) -> str | None:
+    try:
+        capabilities = service_client.get_server_capabilities()
+    except Exception as exc:
+        raise RuntimeError(f"Open-RL server at {base_url} is not reachable. Start it with `make run-text-to-sql-server`.") from exc
+
+    model_names = [model.model_name for model in capabilities.supported_models if getattr(model, "model_name", None)]
+    return model_names[0] if model_names else None
 def normalize_sql(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", " ", text, flags=re.DOTALL)
     text = text.replace("<|im_start|>", " ").replace("<|im_end|>", " ")
     text = text.strip()
-    text = re.sub(r"^```(?:sql)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
     text = re.sub(r"^assistant\s*[:\-]?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^sql\s*[:\-]?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```(?:sql)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
     text = " ".join(text.split()).lower()
     text = re.sub(r"\s+([,;()])", r"\1", text)
     text = re.sub(r"([,(])\s+", r"\1", text)
@@ -106,137 +218,41 @@ def build_example(tokenizer: Any, sample: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
-
-def evaluate(client: Any, trainer: Any, tokenizer: Any, alias: str, examples: list[dict[str, Any]], max_tokens: int = 256) -> tuple[float, float]:
+def evaluate(
+    client: tinker.ServiceClient,
+    trainer: tinker.TrainingClient,
+    tokenizer: Any,
+    alias: str,
+    examples: list[dict[str, Any]],
+    max_tokens: int = 256,
+) -> tuple[float, float]:
     sampler = client.create_sampling_client(trainer.save_weights_for_sampler(name=alias).result().path)
     exact, similarity = 0.0, 0.0
-    for ex in examples:
+    for example in examples:
         result = sampler.sample(
-            prompt=types.ModelInput.from_ints(tokens=ex["prompt_tokens"]),
+            prompt=types.ModelInput.from_ints(tokens=example["prompt_tokens"]),
             num_samples=1,
             sampling_params=types.SamplingParams(max_tokens=max_tokens, temperature=0.0),
         ).result()
         predicted = normalize_sql(tokenizer.decode(result.sequences[0].tokens if result.sequences else [], skip_special_tokens=True))
-        target = normalize_sql(ex["target"])
+        target = normalize_sql(example["target"])
         exact += float(predicted == target)
         similarity += SequenceMatcher(None, predicted, target).ratio()
-    n = max(1, len(examples))
-    return exact / n, similarity / n
-
-
-def plot_metrics(losses: list[float], eval_steps: list[int], eval_exact: list[float], eval_similarity: list[float], plot_path: Path) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    axes[0].plot(range(1, len(losses) + 1), losses, marker="o", markersize=3, color="#1f77b4")
-    axes[0].set_title("Training Loss")
-    axes[0].set_xlabel("Step")
-    axes[0].set_ylabel("loss/token")
-    axes[0].grid(True, alpha=0.3)
-    axes[1].plot(eval_steps, [x * 100 for x in eval_exact], marker="o", label="Exact Match %", color="#1b9e77")
-    axes[1].plot(eval_steps, [x * 100 for x in eval_similarity], marker="o", label="String Similarity %", color="#d95f02")
-    axes[1].set_xticks(eval_steps)
-    axes[1].set_title("Eval Quality")
-    axes[1].set_xlabel("Step")
-    axes[1].set_ylabel("%")
-    axes[1].set_ylim(0, 105)
-    axes[1].legend(loc="lower right")
-    axes[1].grid(True, alpha=0.3)
-    plot_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(plot_path, dpi=150)
-    plt.close(fig)
-
-
-# ── Main ─────────────────────────────────────────────────────────────
-
-
-def run_training(config: Config, preset: str) -> dict[str, float]:
-    # 1. Create training client
-    try:
-        resp = requests.get(f"{config.base_url.rstrip('/')}/api/v1/get_server_capabilities", timeout=5.0)
-        resp.raise_for_status()
-        caps = resp.json()
-    except Exception as exc:
-        raise RuntimeError(f"Open-RL server at {config.base_url} is not reachable. Start it with `make run-text-to-sql-server`.") from exc
-
-    print(f"Server ready at {config.base_url} | model={caps.get('default_model') or 'unset'}")
-
-    client = tinker.ServiceClient(api_key=os.getenv("TINKER_API_KEY", "tml-dummy-key"), base_url=config.base_url)
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL)
-    trainer = client.create_lora_training_client(base_model=BASE_MODEL, rank=config.rank, train_mlp=True, train_attn=True, train_unembed=False)
-
-    # 2. Load & prepare data
-    dataset = load_dataset(DATASET, split="train").shuffle(seed=config.seed)
-    dataset = dataset.select(range(min(12_500, len(dataset))))
-    split = dataset.train_test_split(test_size=2_500, shuffle=False)
-
-    train_examples = [ex for row in list(split["train"])[:config.train_limit] if (ex := build_example(tokenizer, row)) is not None]
-    eval_examples = [ex for row in list(split["test"])[:config.eval_limit] if (ex := build_example(tokenizer, row)) is not None]
-    if not train_examples:
-        raise RuntimeError("No training examples fit within max_seq_length.")
-
-    batch_size = min(config.batch_size, len(train_examples))
-    print(f"Data: {len(train_examples)} train, {len(eval_examples)} eval | batch={batch_size} rank={config.rank} lr={config.learning_rate:g}")
-
-    # 3. Baseline eval
-    before_exact, before_sim = evaluate(client, trainer, tokenizer, "texttosql_before", eval_examples)
-    print(f"[before] exact={before_exact:.1%} similarity={before_sim:.1%}")
-
-    # 4. Training loop
-    losses: list[float] = []
-    eval_steps, eval_exact, eval_sim = [0], [before_exact], [before_sim]
-    rng = random.Random(config.seed)
-    order = list(range(len(train_examples)))
-    rng.shuffle(order)
-    pos = 0
-
-    for step in range(1, config.steps + 1):
-        if pos + batch_size > len(order):
-            rng.shuffle(order)
-            pos = 0
-        batch = [train_examples[order[i]] for i in range(pos, pos + batch_size)]
-        pos += batch_size
-
-        datums = [r["datum"] for r in batch]
-        active = sum(r["active_tokens"] for r in batch)
-
-        # Forward-backward + optimizer step
-        fwdbwd = trainer.forward_backward(datums, "cross_entropy").result()
-        trainer.optim_step(types.AdamParams(learning_rate=config.learning_rate, grad_clip_norm=config.grad_clip_norm)).result()
-
-        loss = float(fwdbwd.metrics.get("loss:sum", 0.0)) / max(1, active)
-        losses.append(loss)
-        print(f"[train] step={step:04d}/{config.steps} loss={loss:.4f}")
-
-        if step % config.eval_every == 0 or step == config.steps:
-            exact, sim = evaluate(client, trainer, tokenizer, f"texttosql_s{step}", eval_examples)
-            eval_steps.append(step)
-            eval_exact.append(exact)
-            eval_sim.append(sim)
-            print(f"[eval]  step={step:04d} exact={exact:.1%} similarity={sim:.1%}")
-
-    # 5. Summary & plot
-    plot_path = Path(str(PLOT_PATH).replace("{preset}", preset))
-    plot_metrics(losses, eval_steps, eval_exact, eval_sim, plot_path)
-    loss_drop = (losses[0] - losses[-1]) / (abs(losses[0]) or 1.0)
-    print(f"Saved plot to {plot_path}")
-    print(f"[summary] exact={before_exact:.1%}->{eval_exact[-1]:.1%} similarity={before_sim:.1%}->{eval_sim[-1]:.1%} loss_drop={loss_drop:.1%}")
-
-    return {"before_exact": before_exact, "after_exact": eval_exact[-1], "before_similarity": before_sim, "after_similarity": eval_sim[-1], "loss_drop": loss_drop}
+    count = max(1, len(examples))
+    return exact / count, similarity / count
 
 
 @chz.blueprint._entrypoint.exit_on_entrypoint_error
 def cli() -> None:
     import sys
 
-    argv = sys.argv[1:]
-    preset = "gemma"
-    if argv and argv[0] in PRESETS:
-        preset = argv[0]
-        argv = argv[1:]
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.getLogger("tinker").setLevel(logging.WARNING)
 
+    preset = sys.argv[1]
     blueprint = PRESETS[preset].clone()
-    config = blueprint.make_from_argv(argv, allow_hyphens=True)
-    run_training(config, preset)
+    config = blueprint.make_from_argv(sys.argv[2:], allow_hyphens=True)
+    asyncio.run(run_training(config, preset))
 
 
 if __name__ == "__main__":

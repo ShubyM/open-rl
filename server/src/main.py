@@ -90,7 +90,7 @@ async def health_check():
 async def get_server_capabilities():
     model_name = get_default_model_name()
     return {
-        "supported_models": [model_name] if model_name else [],
+        "supported_models": [{"model_name": model_name}] if model_name else [],
         "default_model": model_name,
         "single_process": os.getenv("OPEN_RL_SINGLE_PROCESS", "0") == "1",
     }
@@ -112,8 +112,7 @@ async def create_model(req: dict):
     if not base_model:
         return JSONResponse(status_code=400, content={"error": "base_model is required"})
         
-    lora_config = req.get("lora_config", {})
-    rank = lora_config.get("rank", 16)
+    lora_config = req.get("lora_config") or {}
     
     model_id = req_id 
     
@@ -125,7 +124,6 @@ async def create_model(req: dict):
         "model_id": model_id, # Tenant specific queue
         "type": "create_model",
         "base_model": base_model,
-        "rank": rank,
         "lora_config": lora_config,
     })
     
