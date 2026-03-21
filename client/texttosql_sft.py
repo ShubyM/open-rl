@@ -13,7 +13,7 @@ import tinker
 from datasets import load_dataset
 from tinker import types
 
-BASE_MODEL = "google/gemma-3-1b-it"
+BASE_MODEL = "google/gemma-3-1b-pt"
 BASE_URL = "http://127.0.0.1:9003"
 DATASET = "philschmid/gretel-synthetic-text-to-sql"
 METRICS_PATH = Path(__file__).resolve().parent / "artifacts" / "texttosql_{preset}_metrics.jsonl"
@@ -44,16 +44,17 @@ class Config:
     learning_rate: float
     base_url: str = os.getenv("TINKER_BASE_URL") or os.getenv("OPEN_RL_BASE_URL") or BASE_URL
     grad_clip_norm: float = 0.3
-    eval_every: int = 16
+    eval_every: int = 50
     train_limit: int = 2_048
     eval_limit: int = 128
-    seed: int = 17
+    seed: int = 30
     metrics_path: str = str(METRICS_PATH)
+    eval_max_tokens: int = 256
 
 
 PRESETS = {
     "gemma": chz.Blueprint(Config).apply(
-        {"steps": 400, "batch_size": 8, "rank": 16, "learning_rate": 2e-4, "train_limit": 10_000, "eval_limit": 20, "eval_every": 400},
+        {"steps": 400, "batch_size": 32, "rank": 16, "learning_rate": 2e-4, "train_limit": 10_000, "eval_limit": 100, "eval_every": 50},
         layer_name="gemma preset",
     ),
     "notebook": chz.Blueprint(Config).apply(
@@ -65,7 +66,7 @@ PRESETS = {
 
 async def run_training(config: Config, preset: str) -> dict[str, float | str]:
     client = tinker.ServiceClient(api_key=os.getenv("TINKER_API_KEY", "tml-dummy-key"), base_url=config.base_url)
-    server_model = require_server(client, config.base_url)
+    server_model = await require_server(client, config.base_url)
     logger.info("Server ready at %s | model=%s", config.base_url, server_model or "unset")
 
     trainer = await client.create_lora_training_client_async(
@@ -75,7 +76,8 @@ async def run_training(config: Config, preset: str) -> dict[str, float | str]:
         train_attn=True,
         train_unembed=False,
     )
-    tokenizer = trainer.get_tokenizer()
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
 
     dataset = load_dataset(DATASET, split="train").shuffle(seed=config.seed)
     dataset = dataset.select(range(min(12_500, len(dataset))))
@@ -104,7 +106,7 @@ async def run_training(config: Config, preset: str) -> dict[str, float | str]:
         config.learning_rate,
     )
 
-    before_exact, before_sim = evaluate(client, trainer, tokenizer, "texttosql_before", eval_examples)
+    before_exact, before_sim = evaluate(client, trainer, tokenizer, "texttosql_before", eval_examples, max_tokens=config.eval_max_tokens)
     append_metric({"step": 0, "phase": "eval", "exact_match": before_exact, "similarity": before_sim})
     logger.info("[before] exact=%.1f%% similarity=%.1f%%", before_exact * 100, before_sim * 100)
 
@@ -141,7 +143,7 @@ async def run_training(config: Config, preset: str) -> dict[str, float | str]:
         logger.info("[train] step=%04d/%04d loss=%.4f", step, config.steps, loss)
 
         if step % config.eval_every == 0 or step == config.steps:
-            exact, sim = evaluate(client, trainer, tokenizer, f"texttosql_s{step}", eval_examples)
+            exact, sim = evaluate(client, trainer, tokenizer, f"texttosql_s{step}", eval_examples, max_tokens=config.eval_max_tokens)
             eval_exact.append(exact)
             eval_sim.append(sim)
             append_metric({"step": step, "phase": "eval", "exact_match": exact, "similarity": sim})
@@ -168,14 +170,15 @@ async def run_training(config: Config, preset: str) -> dict[str, float | str]:
     }
 
 
-def require_server(service_client: tinker.ServiceClient, base_url: str) -> str | None:
+async def require_server(service_client: tinker.ServiceClient, base_url: str) -> str | None:
     try:
-        capabilities = service_client.get_server_capabilities()
+        capabilities = await service_client.get_server_capabilities_async()
     except Exception as exc:
         raise RuntimeError(f"Open-RL server at {base_url} is not reachable. Start it with `make run-text-to-sql-server`.") from exc
 
     model_names = [model.model_name for model in capabilities.supported_models if getattr(model, "model_name", None)]
     return model_names[0] if model_names else None
+
 def normalize_sql(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", " ", text, flags=re.DOTALL)
     text = text.replace("<|im_start|>", " ").replace("<|im_end|>", " ")
@@ -218,24 +221,36 @@ def build_example(tokenizer: Any, sample: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
-def evaluate(
-    client: tinker.ServiceClient,
-    trainer: tinker.TrainingClient,
-    tokenizer: Any,
-    alias: str,
-    examples: list[dict[str, Any]],
-    max_tokens: int = 256,
-) -> tuple[float, float]:
+def evaluate(client: tinker.ServiceClient, trainer: tinker.TrainingClient, tokenizer: Any, alias: str, examples: list[dict[str, Any]], max_tokens: int = 256) -> tuple[float, float]:
     sampler = client.create_sampling_client(trainer.save_weights_for_sampler(name=alias).result().path)
-    exact, similarity = 0.0, 0.0
+    # Fire all requests concurrently without blocking
+    futures = []
     for example in examples:
-        result = sampler.sample(
+        future = sampler.sample(
             prompt=types.ModelInput.from_ints(tokens=example["prompt_tokens"]),
             num_samples=1,
             sampling_params=types.SamplingParams(max_tokens=max_tokens, temperature=0.0),
-        ).result()
+        )
+        futures.append((example, future))
+
+    exact, similarity = 0.0, 0.0
+    for idx, (example, future) in enumerate(futures):
+        result = future.result()
         predicted = normalize_sql(tokenizer.decode(result.sequences[0].tokens if result.sequences else [], skip_special_tokens=True))
         target = normalize_sql(example["target"])
+
+        # Print visual check for all evaluation items
+        logger.info("\n--- [Visual Check %s Item %d] ---", alias, idx + 1)
+        logger.info("Question: %s", example["question"])
+        logger.info("Predicted: %s", predicted)
+        logger.info("Target:    %s", target)
+
+        if predicted == target:
+            match_str = "\033[92mMATCH\033[0m" # Green
+        else:
+            match_str = "\033[91mNO MATCH\033[0m" # Red
+        logger.info("Match:     %s\n", match_str)
+
         exact += float(predicted == target)
         similarity += SequenceMatcher(None, predicted, target).ratio()
     count = max(1, len(examples))

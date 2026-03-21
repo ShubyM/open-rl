@@ -42,7 +42,7 @@ run-pig-latin-gemma-sft:
 	cd client && uv run --python 3.12 -i https://pypi.org/simple python -u piglatin_sft.py gemma base_url="http://127.0.0.1:9002" $(ARGS)
 
 TEXT_TO_SQL_SERVER_EXTRA ?= cpu
-TEXT_TO_SQL_BASE_MODEL ?= google/gemma-3-1b-it
+TEXT_TO_SQL_BASE_MODEL ?= google/gemma-3-1b-pt
 TEXT_TO_SQL_SAMPLER_BACKEND ?= engine
 TEXT_TO_SQL_VLLM_URL ?= http://127.0.0.1:8001
 
