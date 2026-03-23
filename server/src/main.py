@@ -229,12 +229,8 @@ async def save_weights_for_sampler(req: dict):
         "type": "save_weights_for_sampler"
     }
 
-    await enqueue_traced_request(store, {
-        "req_id": req_id,
-        "model_id": model_id,
-        "type": "save_adapter",
-        "result": result,
-    })
+    # Instantly resolve the future, bypassing the Redis queue!
+    await store.set_future(req_id, result)
     return {"request_id": req_id}
 
 @app.post("/api/v1/save_weights")
@@ -276,12 +272,8 @@ async def save_weights(req: dict):
         "type": "save_weights"
     }
 
-    await enqueue_traced_request(store, {
-        "req_id": req_id,
-        "model_id": model_id,
-        "type": "save_adapter",
-        "result": result,
-    })
+    # Instantly resolve the future, bypassing the Redis queue!
+    await store.set_future(req_id, result)
     return {"request_id": req_id}
 
 @app.get("/api/v1/list_adapters")

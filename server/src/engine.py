@@ -114,15 +114,16 @@ class TrainerEngine:
         # Reset/initialize optimizer for this new adapter
         if model_id in self.optimizers:
             del self.optimizers[model_id]
+            
+        self._auto_save_adapter(model_id)
 
-    def save_adapter(self, model_id: str):
+    def _auto_save_adapter(self, model_id: str):
         try:
             tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
             ram_path = os.path.join(tmp_dir, "peft", model_id)
             os.makedirs(ram_path, exist_ok=True)
             
-            with tracer.start_as_current_span(f"auto_save_weights_{model_id}"):
-                self.model.save_pretrained(ram_path, selected_adapters=[model_id])
+            self.model.save_pretrained(ram_path, selected_adapters=[model_id])
                     
             metadata = {
                 "model_id": model_id,
@@ -343,6 +344,9 @@ class TrainerEngine:
         optimizer.step()
         optimizer.zero_grad()
         
+        # Auto-save for Hardware Pipeline bypass
+        self._auto_save_adapter(model_id)
+        
         return {
             "metrics": {"grad_norm:mean": self._sanitize_float(total_norm)}
         }
@@ -496,10 +500,6 @@ async def clock_cycle_loop():
                                         "lora_rank": rank,
                                         "type": "create_model"
                                     })
-                                elif req_type == "save_adapter":
-                                    result = r["result"]
-                                    await asyncio.to_thread(engine.save_adapter, m_id)
-                                    await store.set_future(req_id, result)
                             except Exception as e:
                                 traceback.print_exc()
                                 await store.set_future(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})

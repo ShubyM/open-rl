@@ -128,14 +128,14 @@ async def run_training(config: Config, preset: str) -> dict[str, float | str]:
         datums = [row["datum"] for row in batch]
         active_tokens = sum(row["active_tokens"] for row in batch)
 
-        fwdbwd_future, optim_future = await asyncio.gather(
-            trainer.forward_backward_async(datums, "cross_entropy"),
-            trainer.optim_step_async(
-                types.AdamParams(learning_rate=config.learning_rate, grad_clip_norm=config.grad_clip_norm)
-            ),
+        # Match Tinker-style dispatch: submit both requests first, then await each future.
+        fwdbwd_future = await trainer.forward_backward_async(datums, "cross_entropy")
+        optim_future = await trainer.optim_step_async(
+            types.AdamParams(learning_rate=config.learning_rate, grad_clip_norm=config.grad_clip_norm)
         )
-        fwdbwd = fwdbwd_future.result()
-        optim_future.result()
+
+        fwdbwd = await fwdbwd_future
+        await optim_future
 
         loss = float(fwdbwd.metrics.get("loss:sum", 0.0)) / max(1, active_tokens)
         losses.append(loss)
