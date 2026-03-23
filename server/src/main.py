@@ -90,7 +90,7 @@ async def health_check():
 async def get_server_capabilities():
     model_name = get_default_model_name()
     return {
-        "supported_models": [model_name] if model_name else [],
+        "supported_models": [{"model_name": model_name}] if model_name else [],
         "default_model": model_name,
         "single_process": os.getenv("OPEN_RL_SINGLE_PROCESS", "0") == "1",
     }
@@ -112,8 +112,7 @@ async def create_model(req: dict):
     if not base_model:
         return JSONResponse(status_code=400, content={"error": "base_model is required"})
         
-    lora_config = req.get("lora_config", {})
-    rank = lora_config.get("rank", 16)
+    lora_config = req.get("lora_config") or {}
     
     model_id = req_id 
     
@@ -125,7 +124,7 @@ async def create_model(req: dict):
         "model_id": model_id, # Tenant specific queue
         "type": "create_model",
         "base_model": base_model,
-        "rank": rank
+        "lora_config": lora_config,
     })
     
     return {"request_id": req_id}
@@ -194,6 +193,7 @@ async def optim_step(req: dict):
 @app.post("/api/v1/save_weights_for_sampler")
 async def save_weights_for_sampler(req: dict):
     req_id = str(uuid.uuid4())
+    await store.set_future(req_id, {"status": "pending"})
     model_id = req.get("model_id") # Client passes the TrainingClient's model_id
     if not model_id:
         return JSONResponse(status_code=400, content={"error": "model_id is required"})
@@ -228,7 +228,7 @@ async def save_weights_for_sampler(req: dict):
         "sampling_session_id": session_id,
         "type": "save_weights_for_sampler"
     }
-    
+
     # Instantly resolve the future, bypassing the Redis queue!
     await store.set_future(req_id, result)
     return {"request_id": req_id}
@@ -236,6 +236,7 @@ async def save_weights_for_sampler(req: dict):
 @app.post("/api/v1/save_weights")
 async def save_weights(req: dict):
     req_id = str(uuid.uuid4())
+    await store.set_future(req_id, {"status": "pending"})
     model_id = req.get("model_id") 
     if not model_id:
         return JSONResponse(status_code=400, content={"error": "model_id is required"})
@@ -270,7 +271,7 @@ async def save_weights(req: dict):
         "sampling_session_id": session_id,
         "type": "save_weights"
     }
-    
+
     # Instantly resolve the future, bypassing the Redis queue!
     await store.set_future(req_id, result)
     return {"request_id": req_id}

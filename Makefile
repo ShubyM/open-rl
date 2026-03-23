@@ -1,4 +1,4 @@
-.PHONY: run-server run-server-engine-sampler run-function-gemma-server run-function-gemma-sft run-pig-latin-server run-pig-latin-sft run-sft run-sft-parallel run-rlvr run-rlvr-parallel test
+.PHONY: run-server run-server-engine-sampler run-function-gemma-server run-function-gemma-sft run-pig-latin-server run-pig-latin-sft run-text-to-sql-server run-text-to-sql-server-gpu run-text-to-sql-vllm run-text-to-sql-sft run-sft run-sft-parallel run-rlvr run-rlvr-parallel test
 
 # Default VLLM model for inference, can be overridden via `make run-vllm VLLM_MODEL=...`
 #VLLM_MODEL ?= Qwen/Qwen2.5-0.5B
@@ -40,6 +40,25 @@ run-pig-latin-gemma-server:
 
 run-pig-latin-gemma-sft:
 	cd client && uv run --python 3.12 -i https://pypi.org/simple python -u piglatin_sft.py gemma base_url="http://127.0.0.1:9002" $(ARGS)
+
+TEXT_TO_SQL_SERVER_EXTRA ?= cpu
+TEXT_TO_SQL_BASE_MODEL ?= google/gemma-3-1b-pt
+TEXT_TO_SQL_SAMPLER_BACKEND ?= engine
+TEXT_TO_SQL_VLLM_URL ?= http://127.0.0.1:8001
+
+run-text-to-sql-server:
+	cd server && ENABLE_GCP_TRACE=$(ENABLE_GCP_TRACE) UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(TRAINER_GPU)" OPEN_RL_SINGLE_PROCESS=1 OPEN_RL_BASE_MODEL="$(TEXT_TO_SQL_BASE_MODEL)" SAMPLER_BACKEND="$(TEXT_TO_SQL_SAMPLER_BACKEND)" VLLM_MODEL="$(TEXT_TO_SQL_BASE_MODEL)" VLLM_URL="$(TEXT_TO_SQL_VLLM_URL)" uv run --extra $(TEXT_TO_SQL_SERVER_EXTRA) uvicorn src.main:app --host 127.0.0.1 --port 9003
+
+run-text-to-sql-server-gpu:
+	$(MAKE) run-text-to-sql-server TEXT_TO_SQL_SERVER_EXTRA=gpu TEXT_TO_SQL_SAMPLER_BACKEND=vllm
+
+run-text-to-sql-vllm:
+	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(TEXT_TO_SQL_BASE_MODEL)" uv run --extra gpu --extra vllm python -m src.vllm_worker
+
+TEXT_TO_SQL_PRESET ?= gemma
+
+run-text-to-sql-sft:
+	cd client && uv run --python 3.12 -i https://pypi.org/simple python -u texttosql_sft.py $(TEXT_TO_SQL_PRESET) base_url="http://127.0.0.1:9003" $(ARGS)
 
 test:
 	cd client && uv run python -m unittest discover tests
