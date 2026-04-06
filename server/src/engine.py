@@ -297,6 +297,34 @@ class TrainerEngine:
       return 0.0
     return val
 
+  def _apply_optimizer_params(self, optimizer: torch.optim.Optimizer, adam_params: dict[str, Any]):
+    if "learning_rate" in adam_params:
+      optimizer.defaults["lr"] = adam_params["learning_rate"]
+    if "weight_decay" in adam_params:
+      optimizer.defaults["weight_decay"] = adam_params["weight_decay"]
+    if "eps" in adam_params:
+      optimizer.defaults["eps"] = adam_params["eps"]
+    if "beta1" in adam_params or "beta2" in adam_params:
+      default_beta1, default_beta2 = optimizer.defaults.get("betas", (0.9, 0.95))
+      optimizer.defaults["betas"] = (
+        adam_params.get("beta1", default_beta1),
+        adam_params.get("beta2", default_beta2),
+      )
+
+    for group in optimizer.param_groups:
+      if "learning_rate" in adam_params:
+        group["lr"] = adam_params["learning_rate"]
+      if "weight_decay" in adam_params:
+        group["weight_decay"] = adam_params["weight_decay"]
+      if "eps" in adam_params:
+        group["eps"] = adam_params["eps"]
+      if "beta1" in adam_params or "beta2" in adam_params:
+        beta1, beta2 = group.get("betas", optimizer.defaults.get("betas", (0.9, 0.95)))
+        group["betas"] = (
+          adam_params.get("beta1", beta1),
+          adam_params.get("beta2", beta2),
+        )
+
   def optim_step(self, adam_params: dict[str, Any], model_id: str = None):
     with tracer.start_as_current_span("optim_step") as span, self._init_lock:
       span.set_attribute("model_id", model_id or "unknown")
@@ -320,6 +348,7 @@ class TrainerEngine:
       self.optimizers[model_id] = torch.optim.AdamW(params, lr=lr, betas=(beta1, beta2), eps=eps, weight_decay=weight_decay)
 
     optimizer = self.optimizers[model_id]
+    self._apply_optimizer_params(optimizer, adam_params)
 
     # Compute grad norm BEFORE stepping
     total_norm = 0.0

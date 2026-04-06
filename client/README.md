@@ -117,6 +117,38 @@ TINKER_BASE_URL="http://127.0.0.1:8000" \
 uv run python rlvr.py --jobs 1 --steps 5 --base-model "Qwen/Qwen3-4B-Instruct-2507"
 ```
 
+Run the Gemma 4 Text-to-SQL SFT + GRPO-style recipe on the local engine backend:
+
+```bash
+make run-text-to-sql-gemma4-server
+make run-text-to-sql-sft-grpo
+```
+
+Run the same recipe with vLLM sampling on GPU:
+
+```bash
+# terminal 1
+make run-text-to-sql-gemma4-vllm
+
+# terminal 2
+make run-text-to-sql-gemma4-server-gpu
+
+# terminal 3
+make run-text-to-sql-sft-grpo
+```
+
+This recipe reuses the existing SQLite execution checks for reward shaping:
+
+- compile reward for any valid SQLite query
+- execution-match reward when the generated query returns the same rows as the target SQL
+
+If you are running against a hosted Tinker backend with checkpoint restore enabled, you can also save and resume state:
+
+```bash
+make run-text-to-sql-sft-grpo ARGS='save_sft_state_name=texttosql-gemma4-sft'
+make run-text-to-sql-sft-grpo ARGS='phase=rl_only resume_state_path=tinker://...'
+```
+
 You can also use the repo Make targets if you prefer:
 
 ```bash
@@ -124,6 +156,7 @@ make run-server
 make run-pig-latin-server
 make run-pig-latin-sft
 make run-rlvr
+make run-text-to-sql-sft-grpo
 ```
 
 Notes:
@@ -133,6 +166,7 @@ Notes:
 - `vllm` is Linux-only here. On a Mac, use the gateway-only or single-process `cpu` flows unless you are running the Linux container story.
 - `tinker-cookbook` is not required for the standard client demos in this repo.
 - FunctionGemma examples require Hugging Face auth and model access.
+- The local Open-RL backend in this repo supports saving sampler/state snapshots, but full checkpoint restore may depend on the backend you point the Tinker SDK at.
 
 ## Available Guides & Examples
 

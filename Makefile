@@ -1,4 +1,4 @@
-.PHONY: run-server run-server-engine-sampler run-function-gemma-server run-function-gemma-sft run-pig-latin-server run-pig-latin-sft run-text-to-sql-server run-text-to-sql-server-gpu run-text-to-sql-vllm run-text-to-sql-sft run-sft run-sft-parallel run-rlvr run-rlvr-parallel test lint fmt
+.PHONY: run-server run-server-engine-sampler run-function-gemma-server run-function-gemma-sft run-pig-latin-server run-pig-latin-sft run-text-to-sql-server run-text-to-sql-server-gpu run-text-to-sql-vllm run-text-to-sql-gemma4-server run-text-to-sql-gemma4-vllm run-text-to-sql-gemma4-server-gpu run-text-to-sql-sft run-text-to-sql-sft-grpo run-sft run-sft-parallel run-rlvr run-rlvr-parallel test lint fmt
 
 # Default VLLM model for inference, can be overridden via `make run-vllm VLLM_MODEL=...`
 #VLLM_MODEL ?= Qwen/Qwen2.5-0.5B
@@ -61,10 +61,24 @@ run-text-to-sql-server-gpu:
 run-text-to-sql-vllm:
 	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(TEXT_TO_SQL_BASE_MODEL)" uv run --extra gpu --extra vllm python -m src.vllm_worker
 
+run-text-to-sql-gemma4-server:
+	$(MAKE) run-text-to-sql-server TEXT_TO_SQL_BASE_MODEL=google/gemma-4-e2b
+
+run-text-to-sql-gemma4-vllm:
+	$(MAKE) run-text-to-sql-vllm TEXT_TO_SQL_BASE_MODEL=google/gemma-4-e2b
+
+run-text-to-sql-gemma4-server-gpu:
+	$(MAKE) run-text-to-sql-server-gpu TEXT_TO_SQL_BASE_MODEL=google/gemma-4-e2b
+
 TEXT_TO_SQL_PRESET ?= gemma
 
 run-text-to-sql-sft:
 	cd client && uv run --python 3.12 -i https://pypi.org/simple python -u texttosql_sft.py $(TEXT_TO_SQL_PRESET) base_url="http://127.0.0.1:9003" $(ARGS)
+
+TEXT_TO_SQL_GRPO_PRESET ?= gemma4_e2b
+
+run-text-to-sql-sft-grpo:
+	cd client && uv run --python 3.12 -i https://pypi.org/simple python -u texttosql_sft_grpo.py $(TEXT_TO_SQL_GRPO_PRESET) base_url="http://127.0.0.1:9003" $(ARGS)
 
 test:
 	cd client && uv run python -m unittest discover tests
