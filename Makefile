@@ -19,7 +19,7 @@ kill-server:
 
 # Run the standalone vLLM inference worker locally
 run-vllm:
-	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(VLLM_MODEL)" uv run --extra gpu --extra vllm python -m src.vllm_worker
+	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(VLLM_MODEL)" uv run --extra gpu --extra vllm python -m src.vllm_sampler
 
 run-server-engine-sampler:
 	@-kill -9 $$(lsof -ti:8000) 2>/dev/null || true
@@ -59,7 +59,7 @@ run-text-to-sql-server-gpu:
 	$(MAKE) run-text-to-sql-server TEXT_TO_SQL_SERVER_EXTRA=gpu TEXT_TO_SQL_SAMPLER_BACKEND=vllm
 
 run-text-to-sql-vllm:
-	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(TEXT_TO_SQL_BASE_MODEL)" uv run --extra gpu --extra vllm python -m src.vllm_worker
+	cd server && UV_INDEX_URL="https://pypi.org/simple" CUDA_VISIBLE_DEVICES="$(VLLM_GPU)" VLLM_MODEL="$(TEXT_TO_SQL_BASE_MODEL)" uv run --extra gpu --extra vllm python -m src.vllm_sampler
 
 TEXT_TO_SQL_PRESET ?= gemma
 

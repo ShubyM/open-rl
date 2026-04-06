@@ -99,7 +99,7 @@ Start the Linux GPU/vLLM worker:
 cd server
 CUDA_VISIBLE_DEVICES=0 \
 VLLM_MODEL="Qwen/Qwen3-4B-Instruct-2507" \
-uv run --extra gpu --extra vllm python -m src.vllm_worker
+uv run --extra gpu --extra vllm python -m src.vllm_sampler
 ```
 
 Run the Pig Latin SFT example:
