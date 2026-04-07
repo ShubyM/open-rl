@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -7,14 +8,20 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 # Removed direct PyTorch engine import to keep Gateway stateless
+from .checkpoints import (
+  STATE_KIND_CHECKPOINT,
+  STATE_KIND_SNAPSHOT,
+  build_artifact_path,
+  decode_tinker_path,
+  encode_tinker_path,
+  get_peft_root,
+)
 from .state import get_store
 
 store = get_store()
-import json
 import logging
 import time
 import traceback
-from datetime import datetime
 
 from opentelemetry import trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -102,11 +109,256 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
-FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
+FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat,/v1/futures")
+
+# Keep strong references to background tasks to prevent GC mid-flight.
+background_tasks = set()
+sampling_sessions: dict[str, dict[str, str | None]] = {}
+
+
+def _extract_lora_config(config: dict) -> dict:
+  lora_config = {}
+  for key in ("rank", "lora_r", "lora_alpha", "lora_dropout", "train_attn", "train_mlp", "train_unembed"):
+    if key in config:
+      lora_config[key] = config[key]
+  if "lora_r" in lora_config and "rank" not in lora_config:
+    lora_config["rank"] = lora_config.pop("lora_r")
+  return lora_config
+
+
+def _register_background_task(task: asyncio.Task) -> None:
+  background_tasks.add(task)
+  task.add_done_callback(background_tasks.discard)
+
+
+def _register_sampling_session(model_id: str, model_path: str | None) -> str:
+  session_id = str(uuid.uuid4())
+  sampling_sessions[session_id] = {"model_id": model_id, "model_path": model_path}
+  return session_id
+
+
+def _resolve_sampling_target(
+  *,
+  sampling_session_id: str | None = None,
+  model_id: str | None = None,
+  model_path: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+  if sampling_session_id:
+    session = sampling_sessions.get(sampling_session_id)
+    if session:
+      return session.get("model_id"), session.get("model_path"), sampling_session_id
+    return sampling_session_id, None, sampling_session_id
+
+  parsed_model_id, parsed_path = decode_tinker_path(model_path)
+  if parsed_model_id:
+    return parsed_model_id, parsed_path, None
+
+  return model_id, model_path, None
+
+
+def _live_adapter_path(model_id: str) -> str:
+  return os.path.join(get_peft_root(), model_id)
+
+
+def _resolve_state_path(state_path: str | None) -> str | None:
+  if state_path is None:
+    return None
+  model_id, decoded_path = decode_tinker_path(state_path)
+  if model_id and decoded_path:
+    return decoded_path
+  return state_path
+
+
+async def _await_resolved_future(req_id: str, timeout: float = 3600.0) -> dict:
+  deadline = time.time() + timeout
+  while True:
+    remaining = max(0.1, min(30.0, deadline - time.time()))
+    if remaining <= 0:
+      return {
+        "type": "RequestFailedResponse",
+        "error_message": f"Timed out waiting for request {req_id}",
+        "category": "timeout",
+      }
+
+    result = await store.get_future(req_id, timeout=remaining)
+    if result is None:
+      return {
+        "type": "RequestFailedResponse",
+        "error_message": f"Future {req_id} not found",
+        "category": "unknown",
+      }
+    if isinstance(result, dict) and result.get("status") == "pending":
+      continue
+    if isinstance(result, dict) and result.get("type") == "try_again":
+      if time.time() >= deadline:
+        return {
+          "type": "RequestFailedResponse",
+          "error_message": f"Timed out waiting for request {req_id}",
+          "category": "timeout",
+        }
+      continue
+    return result
+
+
+async def _enqueue_model_request(model_id: str, req_type: str, **payload) -> str:
+  req_id = str(uuid.uuid4())
+  await store.set_future(req_id, {"status": "pending"})
+  request = {"req_id": req_id, "model_id": model_id, "type": req_type, **payload}
+  await enqueue_traced_request(store, request)
+  return req_id
+
+
+async def _enqueue_create_or_restore_model(
+  *,
+  base_model: str | None,
+  lora_config: dict,
+  state_path: str | None = None,
+  restore_optimizer: bool = False,
+) -> str:
+  model_id = str(uuid.uuid4())
+  await store.set_future(model_id, {"status": "pending"})
+  await enqueue_traced_request(
+    store,
+    {
+      "req_id": model_id,
+      "model_id": model_id,
+      "type": "create_model",
+      "base_model": base_model,
+      "lora_config": lora_config,
+      "state_path": state_path,
+      "restore_optimizer": restore_optimizer,
+    },
+  )
+  return model_id
+
+
+async def _enqueue_sample_request(
+  *,
+  prompt_tokens: list[int],
+  max_tokens: int,
+  temperature: float,
+  num_samples: int,
+  model_id: str | None,
+  model_path: str | None,
+  sampling_session_id: str | None,
+) -> str:
+  if not model_id:
+    raise ValueError("model_id is required for sampling")
+
+  req_id = str(uuid.uuid4())
+  await store.set_future(req_id, {"status": "pending"})
+
+  sampler_backend = get_sampler_backend()
+  if sampler_backend == "engine":
+    await enqueue_traced_request(
+      store,
+      {
+        "req_id": req_id,
+        "model_id": model_id,
+        "type": "sample",
+        "prompt_tokens": prompt_tokens,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "num_samples": num_samples,
+        "adapter_path": model_path,
+      },
+    )
+    return req_id
+
+  async def _route_to_vllm():
+    try:
+      lora_path = model_path
+      if lora_path is None:
+        live_adapter_path = _live_adapter_path(model_id)
+        lora_path = live_adapter_path if os.path.isdir(live_adapter_path) else None
+
+      lora_id = sampling_session_id or model_id
+      payload = {
+        "request_id": req_id,
+        "prompt_token_ids": prompt_tokens,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "num_samples": num_samples,
+        "lora_id": lora_id,
+        "lora_path": lora_path,
+      }
+
+      vllm_url = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
+      vllm_generate_endpoint = f"{vllm_url.rstrip('/')}/generate"
+      headers = {"Content-Type": "application/json"}
+      from opentelemetry import propagate
+
+      propagate.inject(headers)
+
+      import httpx
+
+      async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(vllm_generate_endpoint, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+      if data.get("type") != "RequestFailedResponse":
+        data["type"] = "sample"
+      await store.set_future(req_id, data)
+    except Exception as exc:
+      traceback.print_exc()
+      await store.set_future(
+        req_id,
+        {"type": "RequestFailedResponse", "error_message": str(exc), "category": "server_error"},
+      )
+
+  _register_background_task(asyncio.create_task(_route_to_vllm()))
+  return req_id
+
+
+async def _enqueue_compute_logprobs_request(
+  *,
+  tokens: list[int],
+  model_id: str | None,
+  model_path: str | None,
+  sampling_session_id: str | None,
+) -> str:
+  if not model_id:
+    raise ValueError("model_id is required for compute_logprobs")
+
+  req_id = str(uuid.uuid4())
+  await store.set_future(req_id, {"status": "pending"})
+
+  await enqueue_traced_request(
+    store,
+    {
+      "req_id": req_id,
+      "model_id": model_id,
+      "type": "compute_logprobs",
+      "tokens": tokens,
+      "adapter_path": model_path,
+      "sampling_session_id": sampling_session_id,
+    },
+  )
+  return req_id
+
+
+def _v1_future_response(result: dict | None) -> dict:
+  if result is None:
+    return {"status": "not_found"}
+  if result.get("status") == "pending" or result.get("type") == "try_again":
+    return {"status": "pending"}
+  if result.get("type") == "RequestFailedResponse":
+    return {"status": "error", "error": result.get("error_message", "unknown error")}
+  if result.get("type") == "sample":
+    completions = [sequence.get("tokens", []) for sequence in result.get("sequences", [])]
+    return {"status": "done", "result": {"completions": completions}}
+  if result.get("type") == "compute_logprobs":
+    return {"status": "done", "result": {"logprobs": result.get("logprobs", [])}}
+  return {"status": "done", "result": result}
 
 
 @app.get("/api/v1/healthz")
 async def health_check():
+  return {"status": "ok"}
+
+
+@app.get("/v1/health")
+async def v1_health():
   return {"status": "ok"}
 
 
@@ -118,6 +370,18 @@ async def get_server_capabilities():
     "default_model": model_name,
     "single_process": is_single_process_mode(),
   }
+
+
+@app.get("/v1/server_capabilities")
+async def v1_server_capabilities():
+  return await get_server_capabilities()
+
+
+@app.get("/v1/futures/{future_id}")
+async def get_future_v1(future_id: str, timeout: float = 0.0):
+  wait_timeout = max(0.0, timeout)
+  result = await store.get_future(future_id, timeout=wait_timeout)
+  return _v1_future_response(result)
 
 
 @app.post("/api/v1/create_session")
@@ -132,30 +396,19 @@ async def session_heartbeat(req: dict):
 
 @app.post("/api/v1/create_model")
 async def create_model(req: dict):
-  req_id = str(uuid.uuid4())
-  await store.set_future(req_id, {"status": "pending"})
-
   base_model = req.get("base_model")
-  if not base_model:
+  state_path = _resolve_state_path(req.get("path") or req.get("state_path"))
+  if not base_model and not state_path:
     return JSONResponse(status_code=400, content={"error": "base_model is required"})
 
-  lora_config = req.get("lora_config") or {}
-
-  model_id = req_id
-
-  # Push the creation task globally to the Redis Queue for the decoupled Trainer Engine
-  # Note: We must route this specifically so the Engine instance can pick it up.
-  # Since it's a global operation (not tenant specific yet), we use "default" or model_id
-  await store.put_request(
-    {
-      "req_id": req_id,
-      "model_id": model_id,  # Tenant specific queue
-      "type": "create_model",
-      "base_model": base_model,
-      "lora_config": lora_config,
-    }
+  raw_lora_config = req.get("lora_config")
+  lora_config = _extract_lora_config(raw_lora_config if isinstance(raw_lora_config, dict) else req)
+  req_id = await _enqueue_create_or_restore_model(
+    base_model=base_model,
+    lora_config=lora_config,
+    state_path=state_path,
+    restore_optimizer=bool(req.get("restore_optimizer") or req.get("with_optimizer")),
   )
-
   return {"request_id": req_id}
 
 
@@ -175,8 +428,136 @@ async def get_info(req: dict):
   }
 
 
-# Global set to hold strong references to background tasks to prevent GC
-background_tasks = set()
+@app.post("/v1/training/create_lora", status_code=202)
+async def v1_create_lora_training_client(body: dict):
+  base_model = body.get("base_model")
+  if not base_model:
+    return JSONResponse(status_code=400, content={"error": "base_model is required"})
+
+  future_id = await _enqueue_create_or_restore_model(
+    base_model=base_model,
+    lora_config=_extract_lora_config(body),
+  )
+  return {"future_id": future_id}
+
+
+@app.post("/v1/training/from_state", status_code=202)
+async def v1_create_training_from_state(body: dict):
+  state_path = _resolve_state_path(body.get("path"))
+  if not state_path:
+    return JSONResponse(status_code=400, content={"error": "path is required"})
+
+  future_id = await _enqueue_create_or_restore_model(
+    base_model=body.get("base_model"),
+    lora_config=_extract_lora_config(body),
+    state_path=state_path,
+    restore_optimizer=bool(body.get("restore_optimizer") or body.get("with_optimizer")),
+  )
+  return {"future_id": future_id}
+
+
+@app.post("/v1/training/from_state_with_optimizer", status_code=202)
+async def v1_create_training_from_state_with_optimizer(body: dict):
+  payload = dict(body)
+  payload["restore_optimizer"] = True
+  return await v1_create_training_from_state(payload)
+
+
+@app.post("/v1/training/{model_id}/forward_backward", status_code=202)
+async def v1_forward_backward(model_id: str, body: dict):
+  future_id = await _enqueue_model_request(
+    model_id,
+    "forward_backward",
+    data=body.get("data", []),
+    loss_fn=body.get("loss_fn", "cross_entropy"),
+    loss_config=body.get("loss_fn_config", {}) or {},
+  )
+  return {"future_id": future_id}
+
+
+@app.post("/v1/training/{model_id}/forward", status_code=202)
+async def v1_forward(model_id: str, body: dict):
+  future_id = await _enqueue_model_request(
+    model_id,
+    "forward",
+    data=body.get("data", []),
+    loss_fn=body.get("loss_fn", "cross_entropy"),
+    loss_config=body.get("loss_fn_config", {}) or {},
+  )
+  return {"future_id": future_id}
+
+
+@app.post("/v1/training/{model_id}/optim_step", status_code=202)
+async def v1_optim_step(model_id: str, body: dict):
+  future_id = await _enqueue_model_request(
+    model_id,
+    "optim_step",
+    adam_params=body.get("adam_params", {}),
+  )
+  return {"future_id": future_id}
+
+
+@app.post("/v1/training/{model_id}/save_state", status_code=202)
+async def v1_save_state(model_id: str, body: dict):
+  state_path = build_artifact_path(body.get("name"), STATE_KIND_CHECKPOINT, model_id)
+  future_id = await _enqueue_model_request(
+    model_id,
+    "save_state",
+    state_path=state_path,
+    include_optimizer=True,
+    kind=STATE_KIND_CHECKPOINT,
+  )
+  return {"future_id": future_id}
+
+
+@app.post("/v1/training/{model_id}/load_state", status_code=202)
+async def v1_load_state(model_id: str, body: dict):
+  state_path = _resolve_state_path(body.get("path"))
+  if not state_path:
+    return JSONResponse(status_code=400, content={"error": "path is required"})
+
+  future_id = await _enqueue_model_request(
+    model_id,
+    "load_state",
+    state_path=state_path,
+    restore_optimizer=bool(body.get("restore_optimizer") or body.get("with_optimizer")),
+    base_model=body.get("base_model"),
+  )
+  return {"future_id": future_id}
+
+
+@app.post("/v1/training/{model_id}/save_weights_and_get_sampling_client", status_code=202)
+async def v1_save_weights_and_get_sampling_client(model_id: str, body: dict | None = None):
+  body = body or {}
+  future_id = str(uuid.uuid4())
+  await store.set_future(future_id, {"status": "pending"})
+
+  async def _save_and_register_session():
+    try:
+      snapshot_path = build_artifact_path(body.get("name"), STATE_KIND_SNAPSHOT, model_id)
+      inner_req_id = await _enqueue_model_request(
+        model_id,
+        "save_state",
+        state_path=snapshot_path,
+        include_optimizer=False,
+        kind=STATE_KIND_SNAPSHOT,
+      )
+      inner_result = await _await_resolved_future(inner_req_id)
+      if inner_result.get("type") == "RequestFailedResponse":
+        await store.set_future(future_id, inner_result)
+        return
+
+      resolved_path = inner_result.get("path", snapshot_path)
+      session_id = _register_sampling_session(model_id, resolved_path)
+      await store.set_future(future_id, {"session_id": session_id, "path": resolved_path})
+    except Exception as exc:
+      await store.set_future(
+        future_id,
+        {"type": "RequestFailedResponse", "error_message": str(exc), "category": "server_error"},
+      )
+
+  _register_background_task(asyncio.create_task(_save_and_register_session()))
+  return {"future_id": future_id}
 
 
 @app.post("/api/v1/forward_backward")
@@ -196,6 +577,32 @@ async def forward_backward(req: dict):
       "req_id": req_id,
       "model_id": model_id,
       "type": "forward_backward",
+      "data": data,
+      "loss_fn": loss_fn,
+      "loss_config": loss_config,
+    },
+  )
+
+  return {"request_id": req_id}
+
+
+@app.post("/api/v1/forward")
+async def forward(req: dict):
+  req_id = str(uuid.uuid4())
+  await store.set_future(req_id, {"status": "pending"})
+
+  fwd_input = req.get("forward_input", {})
+  data = fwd_input.get("data", [])
+  loss_fn = fwd_input.get("loss_fn", "cross_entropy")
+  loss_config = fwd_input.get("loss_fn_config", {})
+  model_id = req.get("model_id")
+
+  await enqueue_traced_request(
+    store,
+    {
+      "req_id": req_id,
+      "model_id": model_id,
+      "type": "forward",
       "data": data,
       "loss_fn": loss_fn,
       "loss_config": loss_config,
@@ -233,31 +640,40 @@ async def save_weights_for_sampler(req: dict):
   model_id = req.get("model_id")  # Client passes the TrainingClient's model_id
   if not model_id:
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
-  seq_id = req.get("sampling_session_seq_id", 0)
-  if not seq_id:
-    seq_id = int(time.time() * 1000)
-  # Tinker SDK might send 'name' or 'alias', or 'path' (if using save_weights_for_sampler)
   alias = req.get("name") or req.get("alias") or req.get("path")
 
-  # 1. Update the metadata.json instantly
-  tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-  ram_path = os.path.join(tmp_dir, "peft", model_id)
-  os.makedirs(ram_path, exist_ok=True)
+  async def _save_snapshot():
+    try:
+      snapshot_path = build_artifact_path(alias, STATE_KIND_SNAPSHOT, model_id)
+      inner_req_id = await _enqueue_model_request(
+        model_id,
+        "save_state",
+        state_path=snapshot_path,
+        include_optimizer=False,
+        kind=STATE_KIND_SNAPSHOT,
+      )
+      inner_result = await _await_resolved_future(inner_req_id)
+      if inner_result.get("type") == "RequestFailedResponse":
+        await store.set_future(req_id, inner_result)
+        return
 
-  metadata = {"model_id": model_id, "alias": alias, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
-  try:
-    with open(os.path.join(ram_path, "metadata.json"), "w") as f:
-      json.dump(metadata, f)
-  except Exception as e:
-    print(f"Failed to update alias metadata: {e}")
+      resolved_path = inner_result.get("path", snapshot_path)
+      session_id = _register_sampling_session(model_id, resolved_path)
+      await store.set_future(
+        req_id,
+        {
+          "path": encode_tinker_path(model_id, resolved_path),
+          "sampling_session_id": session_id,
+          "type": "save_weights_for_sampler",
+        },
+      )
+    except Exception as exc:
+      await store.set_future(
+        req_id,
+        {"type": "RequestFailedResponse", "error_message": str(exc), "category": "server_error"},
+      )
 
-  session_id = f"{model_id}-samp-{seq_id}"
-  result_path = f"tinker://{session_id}" if alias else None
-
-  result = {"path": result_path, "sampling_session_id": session_id, "type": "save_weights_for_sampler"}
-
-  # Instantly resolve the future, bypassing the Redis queue!
-  await store.set_future(req_id, result)
+  _register_background_task(asyncio.create_task(_save_snapshot()))
   return {"request_id": req_id}
 
 
@@ -268,32 +684,50 @@ async def save_weights(req: dict):
   model_id = req.get("model_id")
   if not model_id:
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
-  seq_id = req.get("seq_id", 0)
-  if not seq_id:
-    seq_id = int(time.time() * 1000)
-  # in .save(path="..."), the path is the identifier
   alias = req.get("path")
 
-  # 1. Update the metadata.json instantly
-  tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-  ram_path = os.path.join(tmp_dir, "peft", model_id)
-  os.makedirs(ram_path, exist_ok=True)
+  async def _save_weights_only():
+    try:
+      state_path = build_artifact_path(alias, STATE_KIND_CHECKPOINT, model_id)
+      inner_req_id = await _enqueue_model_request(
+        model_id,
+        "save_state",
+        state_path=state_path,
+        include_optimizer=False,
+        kind=STATE_KIND_CHECKPOINT,
+      )
+      inner_result = await _await_resolved_future(inner_req_id)
+      if inner_result.get("type") == "RequestFailedResponse":
+        await store.set_future(req_id, inner_result)
+        return
 
-  metadata = {"model_id": model_id, "alias": alias, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
-  try:
-    with open(os.path.join(ram_path, "metadata.json"), "w") as f:
-      json.dump(metadata, f)
-  except Exception as e:
-    print(f"Failed to update alias metadata: {e}")
+      resolved_path = inner_result.get("path", state_path)
+      await store.set_future(req_id, {"path": resolved_path, "type": "save_weights"})
+    except Exception as exc:
+      await store.set_future(
+        req_id,
+        {"type": "RequestFailedResponse", "error_message": str(exc), "category": "server_error"},
+      )
 
-  session_id = f"{model_id}-samp-{seq_id}"
-  result_path = f"tinker://{session_id}"
-
-  result = {"path": result_path, "sampling_session_id": session_id, "type": "save_weights"}
-
-  # Instantly resolve the future, bypassing the Redis queue!
-  await store.set_future(req_id, result)
+  _register_background_task(asyncio.create_task(_save_weights_only()))
   return {"request_id": req_id}
+
+
+@app.post("/api/v1/load_weights")
+async def load_weights(req: dict):
+  model_id = req.get("model_id")
+  state_path = _resolve_state_path(req.get("path"))
+  if not model_id or not state_path:
+    return JSONResponse(status_code=400, content={"error": "model_id and path are required"})
+
+  request_id = await _enqueue_model_request(
+    model_id,
+    "load_state",
+    state_path=state_path,
+    restore_optimizer=bool(req.get("restore_optimizer") or req.get("with_optimizer")),
+    base_model=req.get("base_model"),
+  )
+  return {"request_id": request_id}
 
 
 @app.get("/api/v1/list_adapters")
@@ -351,105 +785,103 @@ async def list_adapters():
 
 @app.post("/api/v1/create_sampling_session")
 async def create_sampling_session(req: dict):
-  # Support 'model_path' from SDK (e.g. "tinker://uuid-samp-seq")
   model_path = req.get("model_path")
   model_id = req.get("model_id")
+  parsed_model_id, parsed_model_path = decode_tinker_path(model_path)
 
-  if model_path and model_path.startswith("tinker://"):
-    sess_id = model_path[len("tinker://") :]
+  if parsed_model_id and parsed_model_path:
+    session_id = _register_sampling_session(parsed_model_id, parsed_model_path)
+  elif model_path and model_path.startswith("tinker://"):
+    session_id = model_path[len("tinker://") :]
   else:
-    sess_id = model_id or "samp-session-live-123"
+    resolved_model_id = parsed_model_id or model_id
+    if not resolved_model_id:
+      return JSONResponse(status_code=400, content={"error": "model_id is required"})
+    session_id = _register_sampling_session(resolved_model_id, parsed_model_path)
 
-  return {"sampling_session_id": sess_id, "type": "create_sampling_session"}
+  return {"sampling_session_id": session_id, "type": "create_sampling_session"}
+
+
+@app.post("/v1/sampling/create", status_code=202)
+async def v1_create_sampling_client(body: dict):
+  model_id, model_path, _ = _resolve_sampling_target(
+    model_id=body.get("model_id"),
+    model_path=body.get("model_path"),
+  )
+  if not model_id:
+    return JSONResponse(status_code=400, content={"error": "model_id is required"})
+
+  future_id = str(uuid.uuid4())
+  await store.set_future(future_id, {"session_id": _register_sampling_session(model_id, model_path)})
+  return {"future_id": future_id}
+
+
+@app.post("/v1/sampling/{session_id}/sample", status_code=202)
+async def v1_sample(session_id: str, body: dict):
+  prompt = body.get("prompt", {}).get("tokens", [])
+  sampling_params = body.get("sampling_params", {})
+  max_tokens = sampling_params.get("max_tokens", 20)
+  temperature = sampling_params.get("temperature", 1.0)
+  num_samples = body.get("num_samples", 1)
+
+  model_id, model_path, resolved_session_id = _resolve_sampling_target(sampling_session_id=session_id)
+  try:
+    future_id = await _enqueue_sample_request(
+      prompt_tokens=prompt,
+      max_tokens=max_tokens,
+      temperature=temperature,
+      num_samples=num_samples,
+      model_id=model_id,
+      model_path=model_path,
+      sampling_session_id=resolved_session_id,
+    )
+  except ValueError as exc:
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+
+  return {"future_id": future_id}
+
+
+@app.post("/v1/sampling/{session_id}/compute_logprobs", status_code=202)
+async def v1_compute_logprobs(session_id: str, body: dict):
+  tokens = body.get("prompt", {}).get("tokens", [])
+  model_id, model_path, resolved_session_id = _resolve_sampling_target(sampling_session_id=session_id)
+  try:
+    future_id = await _enqueue_compute_logprobs_request(
+      tokens=tokens,
+      model_id=model_id,
+      model_path=model_path,
+      sampling_session_id=resolved_session_id,
+    )
+  except ValueError as exc:
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+
+  return {"future_id": future_id}
 
 
 @app.post("/api/v1/asample")
 async def asample(req: dict):
-  req_id = str(uuid.uuid4())
-  await store.set_future(req_id, {"status": "pending"})
-
   prompt = req.get("prompt", {}).get("chunks", [])[0].get("tokens", [])
   params = req.get("sampling_params", {})
   max_tokens = params.get("max_tokens", 20)
   temperature = params.get("temperature", 1.0)
   num_samples = req.get("num_samples", 1)
-
-  model_id = req.get("model_id") or req.get("sampling_session_id")
-  # Strip potential tinker:// prefix explicitly
-  if model_id and model_id.startswith("tinker://"):
-    model_id = model_id[len("tinker://") :]
-
-  # vLLM caches adapters natively based on the `lora_id` key.
-  # To force vLLM to reload weights after PyTorch trains them, we pass a unique sequential `lora_id`.
-  lora_id = model_id
-  # Strip the sequence tag to find the base directory where PyTorch actually wrote the checkpoint
-  base_model_id = lora_id.split("-samp-")[0] if lora_id else None
-
-  sampler_backend = get_sampler_backend()
-  if sampler_backend == "engine":
-    await enqueue_traced_request(
-      store,
-      {
-        "req_id": req_id,
-        "model_id": base_model_id or model_id,
-        "type": "sample",
-        "prompt_tokens": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "num_samples": num_samples,
-      },
+  model_id, model_path, sampling_session_id = _resolve_sampling_target(
+    sampling_session_id=req.get("sampling_session_id"),
+    model_id=req.get("model_id"),
+    model_path=req.get("model_path"),
+  )
+  try:
+    req_id = await _enqueue_sample_request(
+      prompt_tokens=prompt,
+      max_tokens=max_tokens,
+      temperature=temperature,
+      num_samples=num_samples,
+      model_id=model_id,
+      model_path=model_path,
+      sampling_session_id=sampling_session_id,
     )
-    return {"request_id": req_id}
-
-  # IPC Bridge: Route to vLLM worker on Port 8001 instead of PyTorch Queue
-  async def _route_to_vllm():
-    try:
-      import os
-
-      tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-      # PEFT natively saves adapters into subdirectories named after their adapter ID
-      # Engine saves to: tmp_dir/peft/m_id (because adapter_name=m_id)
-      lora_path = os.path.join(tmp_dir, "peft", base_model_id, base_model_id) if base_model_id else None
-
-      print(f"[Gateway DEBUG] Routing sample to vLLM. model_id_received={model_id} -> lora_id={lora_id}, lora_path={lora_path}")
-
-      payload = {
-        "request_id": req_id,
-        "prompt_token_ids": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "num_samples": num_samples,
-        "lora_id": lora_id,
-        "lora_path": lora_path,
-      }
-
-      # Use VLLM_URL env var instead of hardcoded 127.0.0.1:8001
-      vllm_url = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
-      vllm_generate_endpoint = f"{vllm_url.rstrip('/')}/generate"
-
-      headers = {"Content-Type": "application/json"}
-      from opentelemetry import propagate
-
-      propagate.inject(headers)
-
-      import httpx
-
-      # Use AsyncClient natively to prevent ThreadPool exhaustion from concurrent RL jobs!
-      # Increase timeout significantly since large RL batches will queue up in vLLM for > 60s
-      async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(vllm_generate_endpoint, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-      if data.get("type") != "RequestFailedResponse":
-        data["type"] = "sample"
-      await store.set_future(req_id, data)
-    except Exception as e:
-      traceback.print_exc()
-      await store.set_future(req_id, {"type": "RequestFailedResponse", "error_message": str(e), "category": "server_error"})
-
-  task = asyncio.create_task(_route_to_vllm())
-  background_tasks.add(task)
-  task.add_done_callback(background_tasks.discard)
+  except ValueError as exc:
+    return JSONResponse(status_code=400, content={"error": str(exc)})
 
   return {"request_id": req_id}
 

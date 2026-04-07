@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -11,11 +12,12 @@ from typing import Any
 import torch
 from fastapi import FastAPI
 from opentelemetry import trace
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 tracer = trace.get_tracer(__name__)
 
+from .checkpoints import OPTIMIZER_STATE_FILENAME, read_state_metadata, write_state_metadata
 from .state import get_store
 
 store = get_store()
@@ -29,10 +31,12 @@ MLP_TARGET_SUFFIXES = ["gate_proj", "up_proj", "down_proj"]
 class TrainerEngine:
   def __init__(self):
     self.model = None
+    self.model_obj = None
     self.tokenizer = None
 
     # Store optimizers per model_id
     self.optimizers: dict[str, torch.optim.Optimizer] = {}
+    self.loaded_snapshot_adapters: dict[str, tuple[str, float]] = {}
     self._init_lock = threading.Lock()
 
     # Decide device
@@ -45,30 +49,113 @@ class TrainerEngine:
 
     self.base_model_name = None
 
+  def _ensure_base_model_loaded(self, base_model: str):
+    if getattr(self, "model_obj", None) is not None and self.base_model_name == base_model:
+      return
+
+    if self.base_model_name != base_model:
+      self.model = None
+      self.optimizers.clear()
+      self.loaded_snapshot_adapters.clear()
+
+    self.base_model_name = base_model
+    print(f"Loading base model {base_model} to {self.device}...")
+    self.tokenizer = AutoTokenizer.from_pretrained(base_model)
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    self.model_obj = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype, device_map=self.device)
+
   def preload_base_model(self, base_model: str):
     """Eagerly load the massive base model tensors into VRAM."""
     with self._init_lock:
       if self.model is None or self.base_model_name != base_model:
         print(f"[EAGER INIT] Pre-loading heavy base model {base_model} to {self.device}...")
-        self.base_model_name = base_model
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model)
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-
-        # Load the raw base model graph (no adapters yet)
-        self.model_obj = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype, device_map=self.device)
+        self._ensure_base_model_loaded(base_model)
         print(f"[EAGER INIT] {base_model} successfully seated in VRAM.")
 
-  def load_model(self, base_model: str, model_id: str, lora_config: dict[str, Any] | None = None):
+  def _delete_adapter_if_present(self, model_id: str):
+    if self.model is None:
+      return
+    peft_config = getattr(self.model, "peft_config", {})
+    if model_id in peft_config:
+      self.model.delete_adapter(model_id)
+    self.optimizers.pop(model_id, None)
+
+  def _infer_base_model_from_state(self, state_path: str, explicit_base_model: str | None = None) -> str:
+    if explicit_base_model:
+      return explicit_base_model
+
+    metadata = read_state_metadata(state_path)
+    base_model = metadata.get("base_model")
+    if isinstance(base_model, str) and base_model:
+      return base_model
+
+    adapter_config_path = os.path.join(state_path, "adapter_config.json")
+    if os.path.exists(adapter_config_path):
+      with open(adapter_config_path, encoding="utf-8") as handle:
+        adapter_config = json.load(handle)
+      inferred = adapter_config.get("base_model_name_or_path")
+      if isinstance(inferred, str) and inferred:
+        return inferred
+
+    raise ValueError(f"Unable to infer base model from saved state: {state_path}")
+
+  def _load_optimizer_state(self, model_id: str, state_path: str):
+    optimizer_state_path = os.path.join(state_path, OPTIMIZER_STATE_FILENAME)
+    if not os.path.exists(optimizer_state_path):
+      raise FileNotFoundError(f"No optimizer state found at {optimizer_state_path}")
+
+    params = [p for p in self.model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params)
+    optimizer_state = torch.load(optimizer_state_path, map_location=self.device)
+    optimizer.load_state_dict(optimizer_state)
+
+    for state in optimizer.state.values():
+      for key, value in list(state.items()):
+        if torch.is_tensor(value):
+          state[key] = value.to(self.device)
+
+    self.optimizers[model_id] = optimizer
+
+  def _load_model_from_state(self, base_model: str | None, model_id: str, state_path: str, restore_optimizer: bool):
+    if not os.path.isdir(state_path):
+      raise FileNotFoundError(f"Saved state directory not found: {state_path}")
+
+    resolved_base_model = self._infer_base_model_from_state(state_path, base_model)
+    self._ensure_base_model_loaded(resolved_base_model)
+    self._delete_adapter_if_present(model_id)
+
+    if self.model is None:
+      self.model = PeftModel.from_pretrained(self.model_obj, state_path, adapter_name=model_id, is_trainable=True)
+    else:
+      self.model.load_adapter(state_path, adapter_name=model_id, is_trainable=True)
+
+    self.model.set_adapter(model_id)
+    self.model.train()
+    self.optimizers.pop(model_id, None)
+    if restore_optimizer:
+      self._load_optimizer_state(model_id, state_path)
+
+    self._auto_save_adapter(model_id)
+
+  def load_model(
+    self,
+    base_model: str | None,
+    model_id: str,
+    lora_config: dict[str, Any] | None = None,
+    state_path: str | None = None,
+    restore_optimizer: bool = False,
+  ):
     with self._init_lock:
+      if state_path:
+        self._load_model_from_state(base_model, model_id, state_path, restore_optimizer)
+        return
+
+      if not base_model:
+        raise ValueError("base_model is required when creating a new training client")
+
       # If the user asks for a different base model than what's loaded, we have to swap it.
       # But normally, eager init guarantees this matches.
-      if getattr(self, "model_obj", None) is None or self.base_model_name != base_model:
-        self.base_model_name = base_model
-        print(f"Loading base model {base_model} to {self.device}...")
-
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model)
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-        self.model_obj = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype, device_map=self.device)
+      self._ensure_base_model_loaded(base_model)
       config = lora_config or {}
       rank = config.get("rank", 16)
       train_attn = config.get("train_attn", True)
@@ -134,6 +221,38 @@ class TrainerEngine:
 
     self._auto_save_adapter(model_id)
 
+  def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
+    with tracer.start_as_current_span("save_state") as span, self._init_lock:
+      span.set_attribute("model_id", model_id or "unknown")
+      span.set_attribute("state_path", state_path)
+      if not model_id:
+        raise ValueError("model_id is required for save_state")
+      assert self.model is not None, "Model not loaded."
+
+      self.model.set_adapter(model_id)
+      os.makedirs(state_path, exist_ok=True)
+      self.model.save_pretrained(state_path, selected_adapters=[model_id])
+
+      optimizer_file = None
+      optimizer_state_path = os.path.join(state_path, OPTIMIZER_STATE_FILENAME)
+      optimizer = self.optimizers.get(model_id)
+      if include_optimizer and optimizer is not None:
+        torch.save(optimizer.state_dict(), optimizer_state_path)
+        optimizer_file = OPTIMIZER_STATE_FILENAME
+      elif os.path.exists(optimizer_state_path):
+        os.remove(optimizer_state_path)
+
+      metadata = {
+        "base_model": self.base_model_name,
+        "created_at": datetime.now().isoformat(),
+        "kind": kind,
+        "model_id": model_id,
+        "optimizer_file": optimizer_file,
+        "timestamp": time.time(),
+      }
+      write_state_metadata(state_path, metadata)
+      return {"path": state_path}
+
   def _auto_save_adapter(self, model_id: str):
     try:
       tmp_dir = os.environ.get("OPEN_RL_TMP_DIR", "/tmp/open-rl")
@@ -155,18 +274,35 @@ class TrainerEngine:
       if self.model is not None:
         self.model.set_adapter(model_id)
 
+  def forward(self, data: list[dict[str, Any]], loss_fn: str, loss_fn_config: dict = None, model_id: str = None) -> dict[str, Any]:
+    with tracer.start_as_current_span("forward") as span, self._init_lock:
+      span.set_attribute("model_id", model_id or "unknown")
+      span.set_attribute("batch_size", len(data))
+      span.set_attribute("loss_fn", loss_fn)
+      return self._forward_backward_internal(data, loss_fn, loss_fn_config, model_id, do_backward=False)
+
   def forward_backward(self, data: list[dict[str, Any]], loss_fn: str, loss_fn_config: dict = None, model_id: str = None) -> dict[str, Any]:
     with tracer.start_as_current_span("forward_backward") as span, self._init_lock:
       span.set_attribute("model_id", model_id or "unknown")
       span.set_attribute("batch_size", len(data))
       span.set_attribute("loss_fn", loss_fn)
-      return self._forward_backward_internal(data, loss_fn, loss_fn_config, model_id)
+      return self._forward_backward_internal(data, loss_fn, loss_fn_config, model_id, do_backward=True)
 
-  def _forward_backward_internal(self, data: list[dict[str, Any]], loss_fn: str, loss_fn_config: dict = None, model_id: str = None) -> dict[str, Any]:
+  def _forward_backward_internal(
+    self,
+    data: list[dict[str, Any]],
+    loss_fn: str,
+    loss_fn_config: dict = None,
+    model_id: str = None,
+    do_backward: bool = True,
+  ) -> dict[str, Any]:
     """
     data: List of Datum objects
     """
     assert self.model is not None, "Model not loaded."
+    if model_id:
+      self.model.set_adapter(model_id)
+    self.model.train()
 
     if model_id and model_id not in self.optimizers:
       # Ensuring optimizer exists is good, but we don't zero_grad here anymore
@@ -274,7 +410,8 @@ class TrainerEngine:
       else:
         raise NotImplementedError(f"Loss {loss_fn} not implemented in MVP yet.")
 
-      loss.backward()
+      if do_backward:
+        loss.backward()
       total_loss += loss.item()
 
       logprobs_list = target_logprobs.detach().cpu().tolist()
@@ -333,6 +470,10 @@ class TrainerEngine:
   def _optim_step_internal(self, adam_params: dict[str, Any], model_id: str = None):
     if not model_id:
       raise ValueError("model_id is required for optim_step")
+    assert self.model is not None, "Model not loaded."
+
+    self.model.set_adapter(model_id)
+    self.model.train()
 
     if model_id not in self.optimizers:
       lr = adam_params.get("learning_rate", 1e-4)
@@ -371,11 +512,75 @@ class TrainerEngine:
 
     return {"metrics": {"grad_norm:mean": self._sanitize_float(total_norm)}}
 
+  def _ensure_snapshot_adapter_loaded(self, snapshot_path: str) -> str:
+    snapshot_mtime = os.path.getmtime(snapshot_path)
+    cached = self.loaded_snapshot_adapters.get(snapshot_path)
+    if cached and cached[1] == snapshot_mtime:
+      return cached[0]
+
+    base_model = self._infer_base_model_from_state(snapshot_path)
+    self._ensure_base_model_loaded(base_model)
+
+    if cached and self.model is not None:
+      cached_adapter_name = cached[0]
+      peft_config = getattr(self.model, "peft_config", {})
+      if cached_adapter_name in peft_config:
+        self.model.delete_adapter(cached_adapter_name)
+
+    adapter_name = f"snapshot_{hashlib.md5(f'{snapshot_path}:{snapshot_mtime}'.encode('utf-8')).hexdigest()[:12]}"
+    peft_config = getattr(self.model, "peft_config", {})
+    if self.model is None:
+      self.model = PeftModel.from_pretrained(self.model_obj, snapshot_path, adapter_name=adapter_name, is_trainable=False)
+    elif adapter_name not in peft_config:
+      self.model.load_adapter(snapshot_path, adapter_name=adapter_name, is_trainable=False)
+
+    self.loaded_snapshot_adapters[snapshot_path] = (adapter_name, snapshot_mtime)
+    return adapter_name
+
+  def compute_logprobs(self, tokens: list[int], model_id: str = None, adapter_path: str | None = None) -> list[float | None]:
+    with self._init_lock:
+      if adapter_path:
+        adapter_name = self._ensure_snapshot_adapter_loaded(adapter_path)
+      else:
+        adapter_name = model_id
+      assert self.model is not None, "Model not loaded."
+      if adapter_name:
+        self.model.set_adapter(adapter_name)
+      self.model.eval()
+
+      if not tokens:
+        return []
+      if len(tokens) == 1:
+        return [None]
+
+      input_tensor = torch.tensor([tokens[:-1]], dtype=torch.long, device=self.device)
+      with torch.no_grad():
+        outputs = self.model(input_tensor, use_cache=False)
+        log_probs = torch.nn.functional.log_softmax(outputs.logits[0], dim=-1)
+
+    result: list[float | None] = [None]
+    for idx, token_id in enumerate(tokens[1:], start=0):
+      result.append(self._sanitize_float(log_probs[idx, token_id].item()))
+    return result
+
   def generate(
-    self, prompt_tokens: list[int], max_tokens: int, num_samples: int = 1, temperature: float = 0.0, model_id: str = None
+    self,
+    prompt_tokens: list[int],
+    max_tokens: int,
+    num_samples: int = 1,
+    temperature: float = 0.0,
+    model_id: str = None,
+    adapter_path: str | None = None,
   ) -> dict[str, Any]:
     with self._init_lock:
+      if adapter_path:
+        adapter_name = self._ensure_snapshot_adapter_loaded(adapter_path)
+      else:
+        adapter_name = model_id
       assert self.model is not None, "Model not loaded."
+      if adapter_name:
+        self.model.set_adapter(adapter_name)
+      self.model.eval()
 
       input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
       do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
@@ -498,6 +703,13 @@ async def clock_cycle_loop():
                 result = await asyncio.to_thread(engine.forward_backward, data, loss_fn, loss_config, m_id)
                 result["type"] = "forward_backward"
                 await store.set_future(req_id, result)
+              elif req_type == "forward":
+                data = r["data"]
+                loss_fn = r["loss_fn"]
+                loss_config = r["loss_config"]
+                result = await asyncio.to_thread(engine.forward, data, loss_fn, loss_config, m_id)
+                result["type"] = "forward"
+                await store.set_future(req_id, result)
               elif req_type == "optim_step":
                 adam_params = r["adam_params"]
                 result = await asyncio.to_thread(engine.optim_step, adam_params, m_id)
@@ -508,14 +720,35 @@ async def clock_cycle_loop():
                 max_tokens = r["max_tokens"]
                 num_samples = r["num_samples"]
                 temperature = r.get("temperature", 0.0)
-                result = await asyncio.to_thread(engine.generate, prompt_tokens, max_tokens, num_samples, temperature, m_id)
+                adapter_path = r.get("adapter_path")
+                result = await asyncio.to_thread(engine.generate, prompt_tokens, max_tokens, num_samples, temperature, m_id, adapter_path)
                 result["type"] = "sample"
                 await store.set_future(req_id, result)
+              elif req_type == "compute_logprobs":
+                tokens = r["tokens"]
+                adapter_path = r.get("adapter_path")
+                logprobs = await asyncio.to_thread(engine.compute_logprobs, tokens, m_id, adapter_path)
+                await store.set_future(req_id, {"type": "compute_logprobs", "logprobs": logprobs})
+              elif req_type == "save_state":
+                state_path = r["state_path"]
+                include_optimizer = bool(r.get("include_optimizer", False))
+                kind = r.get("kind", "state")
+                result = await asyncio.to_thread(engine.save_state, m_id, state_path, include_optimizer, kind)
+                result["type"] = "save_state"
+                await store.set_future(req_id, result)
+              elif req_type == "load_state":
+                state_path = r["state_path"]
+                base_model = r.get("base_model")
+                restore_optimizer = bool(r.get("restore_optimizer", False))
+                await asyncio.to_thread(engine.load_model, base_model, m_id, None, state_path, restore_optimizer)
+                await store.set_future(req_id, {"path": state_path, "type": "load_state"})
               elif req_type == "create_model":
                 base_model = r["base_model"]
                 lora_config = r.get("lora_config") or {}
                 rank = lora_config.get("rank", 16)
-                await asyncio.to_thread(engine.load_model, base_model, m_id, lora_config)
+                state_path = r.get("state_path")
+                restore_optimizer = bool(r.get("restore_optimizer", False))
+                await asyncio.to_thread(engine.load_model, base_model, m_id, lora_config, state_path, restore_optimizer)
                 await store.set_future(req_id, {"model_id": m_id, "is_lora": True, "lora_rank": rank, "type": "create_model"})
             except Exception as e:
               traceback.print_exc()
