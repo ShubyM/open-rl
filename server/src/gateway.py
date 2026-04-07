@@ -16,7 +16,7 @@ from .checkpoints import (
   encode_tinker_path,
   get_peft_root,
 )
-from .state import get_store
+from .store import get_store
 
 store = get_store()
 import logging
@@ -74,12 +74,12 @@ def get_sampler_backend() -> str:
   explicit = os.getenv("SAMPLER_BACKEND")
   if explicit:
     return explicit.lower()
-  return "engine" if is_single_process_mode() else "vllm"
+  return "torch" if is_single_process_mode() else "vllm"
 
 
 def get_default_model_name() -> str | None:
   if is_single_process_mode():
-    from . import engine as trainer_engine
+    from . import trainer as trainer_engine
 
     if trainer_engine.engine.base_model_name:
       return trainer_engine.engine.base_model_name
@@ -90,7 +90,7 @@ def get_default_model_name() -> str | None:
 async def lifespan(app: FastAPI):
   task = None
   if is_single_process_mode():
-    from . import engine as trainer_engine
+    from . import trainer as trainer_engine
 
     base_model = os.getenv("OPEN_RL_BASE_MODEL")
     print("\n" + "=" * 50)
