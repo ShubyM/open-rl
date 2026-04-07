@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -59,15 +60,27 @@ async def startup():
     print("[vLLM Subprocess] Error: VLLM_MODEL environment variable is required.")
     sys.exit(1)
 
+  engine_kwargs = {}
+  hf_overrides_json = os.environ.get("VLLM_HF_OVERRIDES")
+  if hf_overrides_json:
+    hf_overrides = json.loads(hf_overrides_json)
+    engine_kwargs["hf_overrides"] = hf_overrides
+    print(f"[vLLM Subprocess] Applying hf_overrides={hf_overrides}")
+
+  max_model_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "8192"))
+  gpu_memory_utilization = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.60"))
+
   engine_args = AsyncEngineArgs(
     model=os.environ.get("VLLM_MODEL"),
+    language_model_only=True,
     enable_lora=True,
     max_loras=8,
     max_lora_rank=64,
-    max_model_len=8192,  # Prevent KV cache OOM on massive context windows
-    gpu_memory_utilization=0.60,  # Leave room for other things if needed
+    max_model_len=max_model_len,  # Prevent KV cache OOM on massive context windows
+    gpu_memory_utilization=gpu_memory_utilization,  # Leave room for other things if needed
     enable_prefix_caching=False,  # Disable prefix caching to test concurrent throughput
     enforce_eager=True,  # Useful for small setups
+    **engine_kwargs,
   )
   engine = AsyncLLMEngine.from_engine_args(engine_args)
   print("[vLLM Subprocess] Engine initialized and ready to serve IPC requests.")
