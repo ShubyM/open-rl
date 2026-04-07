@@ -1,7 +1,11 @@
 import torch
 import threading
 from typing import Dict, Any, List
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoTokenizer,
+)
 from peft import get_peft_model, LoraConfig, TaskType
 import asyncio
 import traceback
@@ -22,6 +26,9 @@ store = get_store()
 
 import math
 
+ATTN_TARGET_SUFFIXES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+MLP_TARGET_SUFFIXES = ["gate_proj", "up_proj", "down_proj"]
+
 class TrainerEngine:
     def __init__(self):
         self.model = None
@@ -41,6 +48,19 @@ class TrainerEngine:
             
         self.base_model_name = None
 
+    def _load_pretrained_model(self, base_model: str, dtype: torch.dtype):
+        model_loader = os.getenv("OPEN_RL_MODEL_AUTO_CLASS", "causal_lm")
+        if model_loader == "image_text_to_text":
+            model_cls = AutoModelForImageTextToText
+        else:
+            model_cls = AutoModelForCausalLM
+        print(f"[engine] Loading {base_model} with {model_cls.__name__}")
+        return model_cls.from_pretrained(
+            base_model,
+            dtype=dtype,
+            device_map=self.device,
+        )
+
     def preload_base_model(self, base_model: str):
         """Eagerly load the massive base model tensors into VRAM."""
         with self._init_lock:
@@ -51,11 +71,7 @@ class TrainerEngine:
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
                 
                 # Load the raw base model graph (no adapters yet)
-                self.model_obj = AutoModelForCausalLM.from_pretrained(
-                    base_model,
-                    torch_dtype=dtype,
-                    device_map=self.device
-                )
+                self.model_obj = self._load_pretrained_model(base_model, dtype)
                 print(f"[EAGER INIT] {base_model} successfully seated in VRAM.")
     def load_model(self, base_model: str, model_id: str, lora_config: Dict[str, Any] | None = None):
         with self._init_lock:
@@ -67,11 +83,7 @@ class TrainerEngine:
                 
                 self.tokenizer = AutoTokenizer.from_pretrained(base_model)
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-                self.model_obj = AutoModelForCausalLM.from_pretrained(
-                    base_model,
-                    torch_dtype=dtype,
-                    device_map=self.device
-                )
+                self.model_obj = self._load_pretrained_model(base_model, dtype)
             config = lora_config or {}
             rank = config.get("rank", 16)
             train_attn = config.get("train_attn", True)
@@ -81,15 +93,33 @@ class TrainerEngine:
                 raise ValueError("At least one LoRA training target must be enabled.")
 
             # Tinker's LoRA config is intentionally coarse; PEFT still expects concrete target names here.
+            # Keep the historical broad behavior by default, but constrain Gemma4 to the language tower.
+            explicit_target_modules = os.getenv("OPEN_RL_TARGET_MODULES")
+            use_text_tower_lora = getattr(self.model_obj.config, "model_type", None) == "gemma4"
             target_modules: str | list[str]
-            if train_attn and train_mlp and train_unembed:
+            layers_to_transform = None
+            layers_pattern = None
+            target_suffixes: list[str] = []
+            if train_attn:
+                target_suffixes.extend(ATTN_TARGET_SUFFIXES)
+            if train_mlp:
+                target_suffixes.extend(MLP_TARGET_SUFFIXES)
+            if explicit_target_modules == "all-linear":
+                target_modules = "all-linear"
+                print("[engine] Forcing PEFT target_modules=all-linear via OPEN_RL_TARGET_MODULES")
+            elif use_text_tower_lora:
+                if target_suffixes:
+                    target_modules = target_suffixes
+                    model_config = getattr(self.model_obj.config, "text_config", self.model_obj.config)
+                    num_hidden_layers = model_config.num_hidden_layers
+                    layers_to_transform = list(range(num_hidden_layers))
+                    layers_pattern = "language_model.layers"
+                else:
+                    target_modules = []
+            elif train_attn and train_mlp and train_unembed:
                 target_modules = "all-linear"
             else:
-                target_modules = []
-                if train_attn:
-                    target_modules.extend(["q_proj", "k_proj", "v_proj", "o_proj"])
-                if train_mlp:
-                    target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+                target_modules = target_suffixes
 
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -98,6 +128,8 @@ class TrainerEngine:
                 lora_dropout=config.get("lora_dropout", 0.05),
                 bias="none",
                 target_modules=target_modules,
+                layers_to_transform=layers_to_transform,
+                layers_pattern=layers_pattern,
                 modules_to_save=["lm_head", "embed_tokens"] if train_unembed else None,
             )
                 
@@ -182,7 +214,6 @@ class TrainerEngine:
             targets_data = loss_inputs.get("target_tokens", {}).get("data", [])
             targets_tensor = torch.tensor(targets_data, dtype=torch.long, device=self.device)
             
-            # Forward pass
             outputs = self.model(inputs_tensor, use_cache=False)
             logits = outputs.logits[0] # Shape: (SeqLen, VocabSize)
             
@@ -298,6 +329,34 @@ class TrainerEngine:
             return 0.0
         return val
 
+    def _apply_optimizer_params(self, optimizer: torch.optim.Optimizer, adam_params: Dict[str, Any]):
+        if "learning_rate" in adam_params:
+            optimizer.defaults["lr"] = adam_params["learning_rate"]
+        if "weight_decay" in adam_params:
+            optimizer.defaults["weight_decay"] = adam_params["weight_decay"]
+        if "eps" in adam_params:
+            optimizer.defaults["eps"] = adam_params["eps"]
+        if "beta1" in adam_params or "beta2" in adam_params:
+            default_beta1, default_beta2 = optimizer.defaults.get("betas", (0.9, 0.95))
+            optimizer.defaults["betas"] = (
+                adam_params.get("beta1", default_beta1),
+                adam_params.get("beta2", default_beta2),
+            )
+
+        for group in optimizer.param_groups:
+            if "learning_rate" in adam_params:
+                group["lr"] = adam_params["learning_rate"]
+            if "weight_decay" in adam_params:
+                group["weight_decay"] = adam_params["weight_decay"]
+            if "eps" in adam_params:
+                group["eps"] = adam_params["eps"]
+            if "beta1" in adam_params or "beta2" in adam_params:
+                beta1, beta2 = group.get("betas", optimizer.defaults.get("betas", (0.9, 0.95)))
+                group["betas"] = (
+                    adam_params.get("beta1", beta1),
+                    adam_params.get("beta2", beta2),
+                )
+
     def optim_step(self, adam_params: Dict[str, Any], model_id: str = None):
         with tracer.start_as_current_span("optim_step") as span:
             with self._init_lock:
@@ -328,6 +387,7 @@ class TrainerEngine:
             )
             
         optimizer = self.optimizers[model_id]
+        self._apply_optimizer_params(optimizer, adam_params)
             
         # Compute grad norm BEFORE stepping
         total_norm = 0.0
@@ -362,18 +422,18 @@ class TrainerEngine:
             with torch.no_grad():
                 attention_mask = torch.ones_like(input_tensor)
                 outputs = self.model.generate(
-                input_tensor, 
-                attention_mask=attention_mask,
-                max_new_tokens=max_tokens,
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-                do_sample=do_sample,
-                temperature=temperature if do_sample else None,
-                top_p=None,
-                top_k=None,
-                num_return_sequences=num_samples,
-                output_scores=True,
-                return_dict_in_generate=True
-            )
+                    input_tensor,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_tokens,
+                    pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                    do_sample=do_sample,
+                    temperature=temperature if do_sample else None,
+                    top_p=None,
+                    top_k=None,
+                    num_return_sequences=num_samples,
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                )
             
         sequences_out = []
         for seq_idx in range(num_samples):
