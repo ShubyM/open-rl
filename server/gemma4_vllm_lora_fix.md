@@ -77,7 +77,16 @@ VLLM_URL=http://127.0.0.1:8001 \
 uv run --extra gpu uvicorn src.main:app --host 127.0.0.1 --port 9003
 ```
 
-Run the SFT + GRPO client in a third shell:
+Run the regular SFT script in a third shell:
+
+```bash
+cd /root/open-rl-gemma4-texttosql-sft-grpo/client
+
+uv run --python 3.12 -i https://pypi.org/simple python -u texttosql_sft.py gemma4_e2b \
+  base_url="http://127.0.0.1:9003"
+```
+
+Run the SFT + GRPO script instead:
 
 ```bash
 cd /root/open-rl-gemma4-texttosql-sft-grpo/client
@@ -94,6 +103,14 @@ cd /root/open-rl-gemma4-texttosql-sft-grpo/client
 uv run --python 3.12 -i https://pypi.org/simple python -u texttosql_sft_grpo.py gemma4_e2b \
   base_url="http://127.0.0.1:9003" \
   phase=sft_only
+```
+
+```bash
+cd /root/open-rl-gemma4-texttosql-sft-grpo
+
+make run-text-to-sql-gemma4-vllm
+make run-text-to-sql-gemma4-server-gpu
+make run-text-to-sql-sft
 ```
 
 ```bash
