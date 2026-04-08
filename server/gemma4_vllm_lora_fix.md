@@ -18,7 +18,7 @@ map onto the text-only vLLM model naming:
 - `...moe.*`
 
 This branch also needs the worker-side Gemma4 override in
-[vllm_worker.py](/root/open-rl-gemma4-texttosql-sft-grpo/server/src/vllm_worker.py),
+[vllm_sampler.py](/root/open-rl-gemma4-texttosql-sft-grpo/server/src/vllm_sampler.py),
 otherwise vLLM tries to boot `Gemma4ForConditionalGeneration`, which does not support
 LoRA in this path.
 
@@ -60,7 +60,7 @@ VLLM_MODEL=google/gemma-4-e2b \
 VLLM_HF_OVERRIDES='{"architectures":["Gemma4ForCausalLM"]}' \
 VLLM_MAX_MODEL_LEN=1024 \
 VLLM_GPU_MEMORY_UTILIZATION=0.85 \
-uv run --extra gpu --extra vllm python -m src.vllm_worker
+uv run --extra gpu --extra vllm python -m src.vllm_sampler
 ```
 
 Start the gateway in a second shell:
@@ -74,7 +74,7 @@ SAMPLER_BACKEND=vllm \
 OPEN_RL_BASE_MODEL=google/gemma-4-e2b \
 VLLM_MODEL=google/gemma-4-e2b \
 VLLM_URL=http://127.0.0.1:8001 \
-uv run --extra gpu uvicorn src.main:app --host 127.0.0.1 --port 9003
+uv run --extra gpu uvicorn src.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 Run the regular SFT script in a third shell:
