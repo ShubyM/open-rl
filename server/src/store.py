@@ -182,7 +182,7 @@ _store_instance = None
 def get_store() -> RequestStore:
   global _store_instance
   if _store_instance is None:
-    redis_url = os.environ.get("REDIS_URL")
+    redis_url = os.getenv("REDIS_URL")
     if redis_url:
       print(f"[RequestStore] Initializing Redis backend at {redis_url} with RR Tenant Queues")
       _store_instance = RedisStore(redis_url)
