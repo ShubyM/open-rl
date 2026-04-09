@@ -144,17 +144,20 @@ def make_rl_datum(
             Any,
             {
                 "target_tokens": target_tokens,
-                "weights": types.TensorData.from_list(
-                    [0.0] * prompt_weight_count + [1.0] * completion_weight_count,
+                "weights": types.TensorData(
+                    data=[0.0] * prompt_weight_count + [1.0] * completion_weight_count,
                     dtype="float32",
+                    shape=[prompt_weight_count + completion_weight_count],
                 ),
-                "logprobs": types.TensorData.from_list(
-                    [0.0] * prompt_weight_count + list(completion_logprobs),
+                "logprobs": types.TensorData(
+                    data=[0.0] * prompt_weight_count + list(completion_logprobs),
                     dtype="float32",
+                    shape=[prompt_weight_count + len(completion_logprobs)],
                 ),
-                "advantages": types.TensorData.from_list(
-                    [0.0] * prompt_weight_count + [advantage] * completion_weight_count,
+                "advantages": types.TensorData(
+                    data=[0.0] * prompt_weight_count + [advantage] * completion_weight_count,
                     dtype="float32",
+                    shape=[prompt_weight_count + completion_weight_count],
                 ),
             },
         ),

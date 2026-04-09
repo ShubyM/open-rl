@@ -192,6 +192,34 @@ async def retrieve_future(req: dict):
   return result
 
 
+@app.post("/api/v1/weights_info")
+async def weights_info(req: dict):
+  """RestClient.get_weights_info_by_tinker_path() — checkpoint metadata for resume."""
+  import json
+
+  tinker_path = req.get("tinker_path", "")
+  # Resolve tinker_path to a checkpoint directory
+  name = tinker_path
+  if not os.path.isabs(name):
+    name = os.path.join(TMP_DIR, "checkpoints", name)
+
+  metadata_path = os.path.join(name, "metadata.json")
+  if not os.path.exists(metadata_path):
+    return JSONResponse(status_code=404, content={"error": f"Checkpoint not found: {tinker_path}"})
+
+  with open(metadata_path) as f:
+    metadata = json.load(f)
+
+  return {
+    "base_model": metadata.get("base_model", ""),
+    "is_lora": True,
+    "lora_rank": 16,
+    "train_unembed": None,
+    "train_mlp": None,
+    "train_attn": None,
+  }
+
+
 # *** TrainingClient endpoints ***
 
 
@@ -246,6 +274,47 @@ async def save_weights_for_sampler(req: dict):
     "path": f"tinker://{session_id}" if alias else None,
     "sampling_session_id": session_id,
     "type": "save_weights_for_sampler",
+  })
+  return {"request_id": req_id}
+
+
+@app.post("/api/v1/save_weights")
+async def save_weights(req: dict):
+  """TrainingClient.save_state() — save adapter + optimizer to a named checkpoint."""
+  model_id = req.get("model_id")
+  if not model_id:
+    return JSONResponse(status_code=400, content={"error": "model_id is required"})
+
+  name = req.get("path") or req.get("name") or f"{model_id}-{int(time.time() * 1000)}"
+  state_path = os.path.join(TMP_DIR, "checkpoints", name)
+
+  req_id = await _enqueue({
+    "model_id": model_id,
+    "type": "save_weights",
+    "state_path": state_path,
+    "include_optimizer": True,
+    "kind": "checkpoint",
+  })
+  return {"request_id": req_id}
+
+
+@app.post("/api/v1/load_weights")
+async def load_weights(req: dict):
+  """TrainingClient.load_state() / load_state_with_optimizer() — restore from a saved checkpoint."""
+  model_id = req.get("model_id")
+  state_path = req.get("path")
+  if not model_id or not state_path:
+    return JSONResponse(status_code=400, content={"error": "model_id and path are required"})
+
+  # Resolve checkpoint name to path if it's not already absolute
+  if not os.path.isabs(state_path):
+    state_path = os.path.join(TMP_DIR, "checkpoints", state_path)
+
+  req_id = await _enqueue({
+    "model_id": model_id,
+    "type": "load_weights",
+    "state_path": state_path,
+    "restore_optimizer": bool(req.get("optimizer", False)),
   })
   return {"request_id": req_id}
 

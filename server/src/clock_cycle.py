@@ -43,7 +43,7 @@ async def clock_cycle_loop() -> None:
 
         print(f"\n[CLOCK CYCLE] Popped {len(batch)} requests for tenant: {m_id}")
 
-        SKIP_ADAPTER_SWITCH = {"create_model", "create_model_from_state"}
+        SKIP_ADAPTER_SWITCH = {"create_model", "create_model_from_state", "load_weights"}
         if not any(r.get("type") in SKIP_ADAPTER_SWITCH for r in batch):
           try:
             await asyncio.to_thread(engine.set_active_adapter, m_id)
@@ -64,19 +64,19 @@ async def clock_cycle_loop() -> None:
           try:
             match req_type:
               case "create_model":
-                base_model = r["base_model"]
-                raw_config = r.get("lora_config") or {}
-                lora_config = LoraConfig(**{k: v for k, v in raw_config.items() if k in LoraConfig.model_fields})
+                state_path = r.get("state_path")
+                if state_path:
+                  restore_optimizer = bool(r.get("restore_optimizer", False))
+                  result = await asyncio.to_thread(engine.load_from_state, m_id, state_path, restore_optimizer)
+                  result["type"] = "create_model"
+                else:
+                  raw_config = r.get("lora_config") or {}
+                  lora_config = LoraConfig(**{k: v for k, v in raw_config.items() if k in LoraConfig.model_fields})
+                  await asyncio.to_thread(engine.load_base_model, r["base_model"])
+                  await asyncio.to_thread(engine.create_adapter, m_id, lora_config)
+                  result = {"model_id": m_id, "is_lora": True, "lora_rank": lora_config.rank, "type": "create_model"}
 
-                await asyncio.to_thread(engine.load_base_model, base_model)
-                await asyncio.to_thread(engine.create_adapter, m_id, lora_config)
-
-                await store.set_future(req_id, {
-                  "model_id": m_id,
-                  "is_lora": True,
-                  "lora_rank": lora_config.rank,
-                  "type": "create_model",
-                })
+                await store.set_future(req_id, result)
 
               case "forward_backward":
                 raw_data = r["data"]
@@ -110,13 +110,21 @@ async def clock_cycle_loop() -> None:
                 result["type"] = "sample"
                 await store.set_future(req_id, result)
 
-              case "save_state":
+              case "save_state" | "save_weights":
                 state_path = r["state_path"]
                 include_optimizer = bool(r.get("include_optimizer", False))
                 kind = r.get("kind", "state")
 
                 result = await asyncio.to_thread(engine.save_state, m_id, state_path, include_optimizer, kind)
-                result["type"] = "save_state"
+                result["type"] = req_type
+                await store.set_future(req_id, result)
+
+              case "load_weights":
+                state_path = r["state_path"]
+                restore_optimizer = bool(r.get("restore_optimizer", False))
+
+                result = await asyncio.to_thread(engine.load_from_state, m_id, state_path, restore_optimizer)
+                result["type"] = "load_weights"
                 await store.set_future(req_id, result)
 
               case "save_weights_for_sampler" | "save_weights":

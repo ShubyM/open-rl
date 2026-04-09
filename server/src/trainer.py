@@ -165,11 +165,16 @@ class TrainerEngine:
     os.makedirs(state_path, exist_ok=True)
     self.peft_model.save_pretrained(state_path, selected_adapters=[model_id])
 
+    optimizer = self.optimizers.get(model_id)
+    if include_optimizer and optimizer is not None:
+      torch.save(optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
+
     metadata = {
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
       "kind": kind,
       "model_id": model_id,
+      "has_optimizer": include_optimizer and optimizer is not None,
       "timestamp": time.time(),
     }
     with open(os.path.join(state_path, "metadata.json"), "w") as f:
@@ -177,6 +182,55 @@ class TrainerEngine:
 
     print(f"Saved state for '{model_id}' to {state_path}")
     return {"path": state_path}
+
+  def load_from_state(self, adapter_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
+    """Restore an adapter from a previously saved state checkpoint."""
+    if not os.path.isdir(state_path):
+      raise FileNotFoundError(f"State directory not found: {state_path}")
+
+    # Read metadata written by save_state
+    metadata_path = os.path.join(state_path, "metadata.json")
+    if not os.path.exists(metadata_path):
+      raise ValueError(f"No metadata.json in state directory: {state_path}")
+    with open(metadata_path) as f:
+      metadata = json.load(f)
+
+    base_model = metadata.get("base_model")
+    if not base_model:
+      raise ValueError(f"Cannot infer base model from state: {state_path}")
+    saved_model_id = metadata.get("model_id")
+
+    # save_pretrained writes adapter files to state_path/<model_id>/
+    adapter_dir = os.path.join(state_path, saved_model_id) if saved_model_id else state_path
+    if not os.path.exists(os.path.join(adapter_dir, "adapter_config.json")):
+      raise FileNotFoundError(f"No adapter_config.json found at {adapter_dir}")
+
+    self.load_base_model(base_model)
+
+    if self.peft_model is None:
+      self.peft_model = PeftModelForCausalLM.from_pretrained(self.base_model, adapter_dir, adapter_name=adapter_id, is_trainable=True)
+    else:
+      self.peft_model.load_adapter(adapter_dir, adapter_name=adapter_id, is_trainable=True)
+
+    self.peft_model.set_adapter(adapter_id)
+    self.peft_model.train()
+    self.optimizers.pop(adapter_id, None)
+
+    if restore_optimizer:
+      opt_path = os.path.join(state_path, "optimizer.pt")
+      if os.path.exists(opt_path):
+        params = [p for p in self.peft_model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(params)
+        optimizer.load_state_dict(torch.load(opt_path, map_location=self.device))
+        for state in optimizer.state.values():
+          for k, v in list(state.items()):
+            if torch.is_tensor(v):
+              state[k] = v.to(self.device)
+        self.optimizers[adapter_id] = optimizer
+
+    self.save_adapter(adapter_id)
+    print(f"Restored adapter '{adapter_id}' from {state_path} (optimizer={restore_optimizer})")
+    return {"model_id": adapter_id, "is_lora": True}
 
   def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
     """Core training step: forward pass, loss computation, and backward pass."""
