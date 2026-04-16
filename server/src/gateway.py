@@ -273,33 +273,31 @@ async def save_weights_for_sampler(req: dict):
 
 @app.post("/api/v1/save_weights")
 async def save_weights(req: dict):
-  """TrainingClient.save_weights()"""
-  req_id = str(uuid.uuid4())
+  """TrainingClient.save_weights() / save_state() — persists adapter to TMP_DIR/checkpoints/<alias>.
+
+  This is the endpoint the tinker SDK hits for both save_weights() and save_state().
+  When `path` is provided we treat it as a named checkpoint alias and resolve to
+  TMP_DIR/checkpoints/<alias> (or leave absolute paths alone), so subsequent
+  `create_training_client_from_state(alias)` calls can find the adapter.
+  """
   model_id = req.get("model_id")
   if not model_id:
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
 
   seq_id = req.get("seq_id") or int(time.time() * 1000)
-  alias = req.get("path")
+  alias = req.get("path") or f"{model_id}-samp-{seq_id}"
+  state_path = alias if os.path.isabs(alias) else os.path.join(TMP_DIR, "checkpoints", alias)
 
-  ram_path = os.path.join(TMP_DIR, "peft", model_id)
-  os.makedirs(ram_path, exist_ok=True)
-  try:
-    import json
-
-    with open(os.path.join(ram_path, "metadata.json"), "w") as f:
-      json.dump({"model_id": model_id, "alias": alias, "created_at": datetime.now().isoformat(), "timestamp": time.time()}, f)
-  except Exception as e:
-    print(f"Failed to update alias metadata: {e}")
-
-  session_id = f"{model_id}-samp-{seq_id}"
-  await store.set_future(
-    req_id,
+  req_id = str(uuid.uuid4())
+  await _enqueue(
     {
-      "path": f"tinker://{session_id}",
-      "sampling_session_id": session_id,
-      "type": "save_weights",
-    },
+      "req_id": req_id,
+      "model_id": model_id,
+      "type": "save_state",
+      "state_path": state_path,
+      "include_optimizer": bool(req.get("include_optimizer", False)),
+      "kind": "weights",
+    }
   )
   return {"request_id": req_id}
 
