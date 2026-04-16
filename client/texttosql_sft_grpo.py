@@ -345,7 +345,9 @@ async def run_rl_step(examples: list[dict[str, Any]], alias: str) -> dict[str, f
     return summarize_rollouts([], 0.0)
 
   loss_fn_config = (
-    {"clip_range": config.rl_clip_range, "kl_coeff": config.rl_kl_coeff} if config.rl_loss_fn == "ppo" else None
+    {"clip_range": config.rl_clip_range, "kl_coeff": config.rl_kl_coeff}
+    if config.rl_loss_fn in {"ppo", "grpo"}
+    else None
   )
   fwdbwd_future = await trainer.forward_backward_async(datums, config.rl_loss_fn, loss_fn_config=loss_fn_config)
   optim_future = await trainer.optim_step_async(
@@ -523,7 +525,7 @@ class Config:
   rl_temperature: float = 0.8
   rl_max_tokens: int = 64
   rl_eval_every: int = 10
-  rl_loss_fn: str = "ppo"
+  rl_loss_fn: str = "grpo"
   rl_clip_range: float = 0.2
 
   # Reward / checkpointing

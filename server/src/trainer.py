@@ -247,6 +247,12 @@ class TrainerEngine:
           loss = self._compute_importance_sampling_loss(target_logprobs, weights_tensor, datum)
         case "ppo":
           loss = self._compute_ppo_loss(target_logprobs, targets_tensor, datum, loss_config)
+        case "grpo":
+          # GRPO is PPO with group-relative advantages (computed client-side) and
+          # a KL penalty against the reference policy. Default kl_coeff>0 so "grpo"
+          # without extra config still behaves like GRPO rather than plain PPO.
+          grpo_config = {"kl_coeff": 0.1, **(loss_config or {})}
+          loss = self._compute_ppo_loss(target_logprobs, targets_tensor, datum, grpo_config)
         case _:
           raise NotImplementedError(f"Loss {loss_fn} not supported")
 
