@@ -161,10 +161,15 @@ class TrainerEngine:
     os.makedirs(state_path, exist_ok=True)
     self.peft_model.save_pretrained(state_path, selected_adapters=[model_id])
 
+    optimizer = self.optimizers.get(model_id)
+    if include_optimizer and optimizer is not None:
+      torch.save(optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
+
     metadata = {
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
       "kind": kind,
+      "has_optimizer": include_optimizer and optimizer is not None,
       "model_id": model_id,
       "timestamp": time.time(),
     }
@@ -173,6 +178,52 @@ class TrainerEngine:
 
     print(f"Saved state for '{model_id}' to {state_path}")
     return {"path": state_path}
+
+  def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
+    """Create an adapter from a saved state directory.
+
+    Expects the directory to contain a metadata.json describing base_model
+    and (optionally) an adapter subdirectory with the saved LoRA weights.
+    """
+    metadata_path = os.path.join(state_path, "metadata.json")
+    if not os.path.exists(metadata_path):
+      raise FileNotFoundError(f"No metadata.json found at {state_path}")
+
+    with open(metadata_path) as f:
+      metadata = json.load(f)
+
+    base_model = metadata.get("base_model")
+    if not base_model:
+      raise ValueError(f"metadata.json at {state_path} missing base_model")
+
+    src_adapter_id = metadata.get("model_id")
+    adapter_dir = state_path
+    if src_adapter_id and os.path.exists(os.path.join(state_path, src_adapter_id)):
+      adapter_dir = os.path.join(state_path, src_adapter_id)
+
+    self.load_base_model(base_model)
+    assert self.base_model is not None
+
+    if self.peft_model is None:
+      self.peft_model = PeftModelForCausalLM.from_pretrained(self.base_model, adapter_dir, adapter_name=model_id, is_trainable=True)
+    else:
+      self.peft_model.load_adapter(adapter_dir, adapter_name=model_id, is_trainable=True)
+
+    self.peft_model.set_adapter(model_id)
+    self.peft_model.train()
+
+    if restore_optimizer and metadata.get("has_optimizer"):
+      optimizer_path = os.path.join(state_path, "optimizer.pt")
+      if os.path.exists(optimizer_path):
+        lr = 1e-4
+        params = [p for p in self.peft_model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(params, lr=lr)
+        optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
+        self.optimizers[model_id] = optimizer
+        print(f"Restored optimizer state for '{model_id}' from {optimizer_path}")
+
+    print(f"Loaded state for '{model_id}' from {state_path}")
+    return {"model_id": model_id, "is_lora": True, "base_model": base_model}
 
   def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
     """Core training step: forward pass, loss computation, and backward pass."""
@@ -303,6 +354,15 @@ class TrainerEngine:
     surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * advantages_tensor
 
     elementwise_objective = torch.min(surr1, surr2)
+
+    # Optional KL penalty (turns PPO into GRPO-style update).
+    # Uses the unbiased estimator (ratio - 1) - log(ratio), which is
+    # non-negative and zero when the policy matches the reference.
+    kl_coeff = loss_config.get("kl_coeff", 0.0) if loss_config else 0.0
+    if kl_coeff > 0:
+      kl = (ratio - 1) - diff
+      elementwise_objective = elementwise_objective - kl_coeff * kl
+
     return -elementwise_objective.sum()
 
   def _sanitize_float(self, val: float) -> float:
