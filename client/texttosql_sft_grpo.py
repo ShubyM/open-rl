@@ -16,7 +16,6 @@ import os
 import random
 import statistics
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,6 +25,7 @@ from datasets import load_dataset
 from tinker import types
 from tinker_cookbook.utils import ml_log
 
+from texttosql_rewards import compute_sql_reward
 from texttosql_sft import (
   BASE_URL,
   DATASET,
@@ -34,7 +34,6 @@ from texttosql_sft import (
   evaluate,
   normalize_sql,
   require_server,
-  sql_results_match,
 )
 
 LOG_DIR = Path(__file__).resolve().parent / "artifacts" / "texttosql_sft_grpo_{preset}"
@@ -170,140 +169,6 @@ def make_rl_datum(
       },
     ),
   )
-
-
-def _schema_linking_reward(predicted_sql: str, target_sql: str, context: str) -> float:
-  """Jaccard similarity of schema items (tables + columns) used in predicted vs gold SQL."""
-  import re
-  schema_items: set[str] = set()
-  for match in re.finditer(r'CREATE TABLE (\w+)', context, re.IGNORECASE):
-    schema_items.add(match.group(1).lower())
-  for match in re.finditer(
-    r'^\s+(\w+)\s+(?:TEXT|INTEGER|REAL|NUMERIC|BLOB|VARCHAR|CHAR|INT|FLOAT|DOUBLE|DECIMAL|BOOLEAN|DATE|TIMESTAMP)',
-    context, re.IGNORECASE | re.MULTILINE,
-  ):
-    schema_items.add(match.group(1).lower())
-
-  def extract_used(sql: str) -> set[str]:
-    return {w.lower() for w in re.findall(r'\b\w+\b', sql)} & schema_items
-
-  pred_items = extract_used(predicted_sql)
-  gold_items = extract_used(target_sql)
-  union = pred_items | gold_items
-  if not union:
-    return 1.0
-  return len(pred_items & gold_items) / len(union)
-
-
-def _ngram_similarity(predicted_sql: str, target_sql: str, n: int = 2) -> float:
-  """Jaccard similarity of n-grams between predicted and gold SQL (like the paper)."""
-  def ngrams(text: str, n: int) -> set[tuple[str, ...]]:
-    tokens = text.lower().split()
-    return {tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)}
-
-  pred_ng = ngrams(predicted_sql, n)
-  gold_ng = ngrams(target_sql, n)
-  union = pred_ng | gold_ng
-  if not union:
-    return 1.0
-  return len(pred_ng & gold_ng) / len(union)
-
-
-def _partial_execution_score(predicted_rows, target_rows) -> float:
-  """Score 0-1 for partial execution match: column count, row count, value overlap."""
-  if not predicted_rows or not target_rows:
-    return 0.0
-
-  score = 0.0
-  # Column count match
-  if len(predicted_rows[0]) == len(target_rows[0]):
-    score += 0.25
-  # Row count closeness
-  ratio = min(len(predicted_rows), len(target_rows)) / max(len(predicted_rows), len(target_rows))
-  score += 0.25 * ratio
-  # Value overlap (flatten and compare)
-  pred_vals = {repr(v) for row in predicted_rows for v in row}
-  target_vals = {repr(v) for row in target_rows for v in row}
-  if target_vals:
-    overlap = len(pred_vals & target_vals) / len(target_vals)
-    score += 0.5 * min(overlap, 1.0)
-  return score
-
-
-def compute_sql_reward(
-  example: dict[str, Any],
-  predicted_sql: str,
-  *,
-  compile_reward: float,
-  match_reward: float,
-  compile_error_penalty: float,
-  similarity_reward: float = 0.0,
-) -> dict[str, Any]:
-  """Composite reward inspired by Reasoning-SQL (Pourreza et al. 2025).
-
-  Components (weighted sum, designed so correct query always scores highest):
-    1. Execution accuracy (binary) — match_reward
-    2. Syntax check (binary) — compile_reward
-    3. Schema linking (Jaccard) — continuous
-    4. N-gram similarity (Jaccard bigrams) — continuous
-    5. Similarity (SequenceMatcher) — continuous
-    6. Partial execution credit — continuous
-  """
-  execution_match, execution_error = sql_results_match(
-    example["context"],
-    predicted_sql,
-    example["target"],
-    target_rows=example["target_rows"],
-  )
-  compiles = execution_error is None
-
-  # 1. Base: syntax check
-  total_reward = compile_error_penalty
-  if compiles:
-    total_reward = compile_reward
-
-  # 2. Execution accuracy (dominant reward)
-  if execution_match:
-    total_reward += match_reward
-
-  # 3. Schema linking — always computed, continuous gradient
-  schema_score = _schema_linking_reward(predicted_sql, example["target"], example["context"])
-
-  # 4. N-gram similarity (bigrams) — continuous
-  ngram_score = _ngram_similarity(predicted_sql, example["target"], n=2)
-
-  # 5. SequenceMatcher similarity
-  normalized_prediction = normalize_sql(predicted_sql)
-  normalized_target = normalize_sql(example["target"])
-  similarity = SequenceMatcher(None, normalized_prediction, normalized_target).ratio()
-
-  # 6. Partial execution credit (only for compiling but non-matching)
-  partial_score = 0.0
-  if compiles and not execution_match:
-    from texttosql_sft import run_sql
-    predicted_rows, _ = run_sql(example["context"], predicted_sql)
-    if predicted_rows is not None and example.get("target_rows") is not None:
-      partial_score = _partial_execution_score(predicted_rows, example["target_rows"])
-
-  # Composite: weighted sum of partial rewards (similarity_reward controls overall weight)
-  partial_weight = similarity_reward
-  total_reward += partial_weight * (
-    0.3 * schema_score +
-    0.2 * ngram_score +
-    0.3 * similarity +
-    0.2 * partial_score
-  )
-
-  return {
-    "total": total_reward,
-    "compile": float(compiles),
-    "execution_match": float(execution_match),
-    "similarity": similarity,
-    "schema_score": schema_score,
-    "ngram_score": ngram_score,
-    "partial_score": partial_score,
-    "sqlite_error": execution_error or "",
-  }
 
 
 def build_rollout_rows(
