@@ -120,18 +120,30 @@ def group_relative_advantages(rewards: list[float]) -> list[float]:
   return [(reward - reward_mean) / reward_std for reward in rewards]
 
 
-def next_batch(
-  examples: list[dict[str, Any]],
-  order: list[int],
-  batch_size: int,
-  position: int,
-  rng: random.Random,
-) -> tuple[list[dict[str, Any]], int]:
-  if position + batch_size > len(order):
-    rng.shuffle(order)
-    position = 0
-  batch = [examples[order[idx]] for idx in range(position, position + batch_size)]
-  return batch, position + batch_size
+class CyclicBatcher:
+  """Yields shuffled mini-batches, reshuffling whenever the pool is exhausted."""
+
+  def __init__(self, examples: list[dict[str, Any]], batch_size: int, seed: int):
+    self.examples = examples
+    self.batch_size = min(batch_size, len(examples))
+    self._rng = random.Random(seed)
+    self._order = list(range(len(examples)))
+    self._rng.shuffle(self._order)
+    self._pos = 0
+
+  def next(self) -> list[dict[str, Any]]:
+    if self._pos + self.batch_size > len(self._order):
+      self._rng.shuffle(self._order)
+      self._pos = 0
+    batch = [self.examples[self._order[i]] for i in range(self._pos, self._pos + self.batch_size)]
+    self._pos += self.batch_size
+    return batch
+
+
+def log_step(ml_logger, step: int, phase: str, message: str, **metrics: float | int) -> None:
+  """Single sink for "log to metrics file + stderr" used in both phases."""
+  ml_logger.log_metrics({"phase": phase, **metrics}, step=step)
+  logging.info(message)
 
 
 def make_rl_datum(
@@ -234,28 +246,15 @@ def build_rl_training_batch(group_rollouts: list[dict[str, Any]]) -> tuple[list[
   return datums, kept_rollouts
 
 
-def empty_rl_metrics() -> dict[str, float | int]:
-  return {
-    "loss": 0.0,
-    "reward": 0.0,
-    "compile_rate": 0.0,
-    "execution_match": 0.0,
-    "similarity": 0.0,
-    "num_rollouts": 0,
-  }
-
-
 def summarize_rollouts(rollout_rows: list[dict[str, Any]], loss: float) -> dict[str, float | int]:
-  if not rollout_rows:
-    return empty_rl_metrics()
-
+  n = len(rollout_rows)
+  if not n:
+    return {"loss": 0.0, "reward": 0.0, "compile_rate": 0.0, "execution_match": 0.0, "similarity": 0.0, "num_rollouts": 0}
+  mean = lambda k: statistics.fmean(float(r[k]) for r in rollout_rows)
   return {
-    "loss": loss,
-    "reward": statistics.fmean(float(row["reward"]) for row in rollout_rows),
-    "compile_rate": statistics.fmean(float(row["compile"]) for row in rollout_rows),
-    "execution_match": statistics.fmean(float(row["execution_match"]) for row in rollout_rows),
-    "similarity": statistics.fmean(float(row["similarity"]) for row in rollout_rows),
-    "num_rollouts": len(rollout_rows),
+    "loss": loss, "num_rollouts": n,
+    "reward": mean("reward"), "compile_rate": mean("compile"),
+    "execution_match": mean("execution_match"), "similarity": mean("similarity"),
   }
 
 
@@ -365,15 +364,6 @@ async def create_or_resume_trainer(client: tinker.ServiceClient, config: Config)
   )
 
 
-async def maybe_save_state(trainer, name: str, label: str) -> str:
-  if not name:
-    return ""
-  save_result = trainer.save_state(name).result()
-  save_path = getattr(save_result, "path", "") or ""
-  logging.info("%s state saved to %s", label, save_path or "<empty path>")
-  return save_path
-
-
 async def run_sft_phase(
   *,
   trainer,
@@ -388,67 +378,43 @@ async def run_sft_phase(
   if config.sft_steps <= 0:
     return await snapshot_eval(trainer, client, tokenizer, "texttosql_sft_skip", eval_examples, config)
 
-  batch_size = min(config.sft_batch_size, len(train_examples))
-  rng = random.Random(config.seed)
-  order = list(range(len(train_examples)))
-  rng.shuffle(order)
-  position = 0
+  batcher = CyclicBatcher(train_examples, config.sft_batch_size, config.seed)
   losses: list[float] = []
-  latest_metrics = EvalSnapshot(execution_match=0.0, similarity=0.0)
+  latest = EvalSnapshot(execution_match=0.0, similarity=0.0)
 
   logging.info(
     "Starting SFT: steps=%s batch=%s lr=%g train_examples=%s",
-    config.sft_steps,
-    batch_size,
-    config.sft_learning_rate,
-    len(train_examples),
+    config.sft_steps, batcher.batch_size, config.sft_learning_rate, len(train_examples),
   )
 
   for local_step in range(1, config.sft_steps + 1):
-    batch, position = next_batch(train_examples, order, batch_size, position, rng)
-    datums = [example["datum"] for example in batch]
-    active_tokens = sum(example["active_tokens"] for example in batch)
+    batch = batcher.next()
+    datums = [ex["datum"] for ex in batch]
+    active_tokens = sum(ex["active_tokens"] for ex in batch)
 
     fwdbwd_future = await trainer.forward_backward_async(datums, "cross_entropy")
     optim_future = await trainer.optim_step_async(
-      types.AdamParams(
-        learning_rate=config.sft_learning_rate,
-        grad_clip_norm=config.grad_clip_norm,
-      )
+      types.AdamParams(learning_rate=config.sft_learning_rate, grad_clip_norm=config.grad_clip_norm)
     )
     fwdbwd = await fwdbwd_future
     await optim_future
 
     loss = float(fwdbwd.metrics.get("loss:sum", 0.0)) / max(1, active_tokens)
-    global_step = step_offset + local_step
     losses.append(loss)
+    global_step = step_offset + local_step
     ml_logger.log_metrics({"phase": "sft_train", "loss": loss}, step=global_step)
 
     if local_step % config.sft_eval_every == 0 or local_step == config.sft_steps:
-      latest_metrics = await snapshot_eval(
-        trainer,
-        client,
-        tokenizer,
-        f"texttosql_sft_s{local_step}",
-        eval_examples,
-        config,
-      )
-      ml_logger.log_metrics(
-        {"phase": "sft_eval", "execution_match": latest_metrics.execution_match, "similarity": latest_metrics.similarity},
-        step=global_step,
-      )
-      logging.info(
-        "[sft step %03d] loss=%.4f eval_exec=%.1f%% eval_similarity=%.1f%%",
-        local_step,
-        loss,
-        latest_metrics.execution_match * 100,
-        latest_metrics.similarity * 100,
+      latest = await snapshot_eval(trainer, client, tokenizer, f"texttosql_sft_s{local_step}", eval_examples, config)
+      log_step(
+        ml_logger, global_step, "sft_eval",
+        f"[sft step {local_step:03d}] loss={loss:.4f} eval_exec={latest.execution_match:.1%} eval_similarity={latest.similarity:.1%}",
+        execution_match=latest.execution_match, similarity=latest.similarity,
       )
 
   if len(losses) >= 2:
-    loss_drop = (losses[0] - losses[-1]) / (abs(losses[0]) or 1.0)
-    logging.info("Completed SFT: loss_drop=%.1f%%", loss_drop * 100)
-  return latest_metrics
+    logging.info("Completed SFT: loss_drop=%.1f%%", (losses[0] - losses[-1]) / (abs(losses[0]) or 1.0) * 100)
+  return latest
 
 
 async def run_rl_step(
@@ -484,7 +450,7 @@ async def run_rl_step(
     rollout_rows.extend(kept_rollouts)
 
   if not datums:
-    return empty_rl_metrics()
+    return summarize_rollouts([], 0.0)
 
   if config.rl_loss_fn == "ppo":
     loss_fn_config = {"clip_range": config.rl_clip_range, "kl_coeff": config.rl_kl_coeff}
@@ -519,64 +485,37 @@ async def run_rl_phase(
   if config.rl_steps <= 0:
     return await snapshot_eval(trainer, client, tokenizer, "texttosql_rl_skip", eval_examples, config)
 
-  batch_size = min(config.rl_prompts_per_step, len(rl_examples))
-  rng = random.Random(config.seed + 1)
-  order = list(range(len(rl_examples)))
-  rng.shuffle(order)
-  position = 0
-  latest_metrics = EvalSnapshot(execution_match=0.0, similarity=0.0)
+  batcher = CyclicBatcher(rl_examples, config.rl_prompts_per_step, config.seed + 1)
+  latest = EvalSnapshot(execution_match=0.0, similarity=0.0)
 
   logging.info(
     "Starting GRPO-style RL: steps=%s prompts_per_step=%s samples_per_prompt=%s lr=%g loss_fn=%s",
-    config.rl_steps,
-    batch_size,
-    config.rl_samples_per_prompt,
-    config.rl_learning_rate,
-    config.rl_loss_fn,
+    config.rl_steps, batcher.batch_size, config.rl_samples_per_prompt, config.rl_learning_rate, config.rl_loss_fn,
   )
 
   for local_step in range(1, config.rl_steps + 1):
-    batch, position = next_batch(rl_examples, order, batch_size, position, rng)
     step_metrics = await run_rl_step(
-      trainer=trainer,
-      client=client,
-      tokenizer=tokenizer,
-      examples=batch,
-      config=config,
-      alias=f"texttosql_rl_rollout_s{local_step}",
+      trainer=trainer, client=client, tokenizer=tokenizer,
+      examples=batcher.next(), config=config, alias=f"texttosql_rl_rollout_s{local_step}",
     )
     global_step = step_offset + local_step
-    ml_logger.log_metrics({"phase": "rl_train", **step_metrics}, step=global_step)
-    logging.info(
-      "[rl step %03d] reward=%.3f compile=%.1f%% exec=%.1f%% rollouts=%s",
-      local_step,
-      float(step_metrics["reward"]),
-      float(step_metrics["compile_rate"]) * 100,
-      float(step_metrics["execution_match"]) * 100,
-      int(step_metrics["num_rollouts"]),
+    log_step(
+      ml_logger, global_step, "rl_train",
+      f"[rl step {local_step:03d}] reward={float(step_metrics['reward']):.3f} "
+      f"compile={float(step_metrics['compile_rate']):.1%} exec={float(step_metrics['execution_match']):.1%} "
+      f"rollouts={int(step_metrics['num_rollouts'])}",
+      **step_metrics,
     )
 
     if local_step % config.rl_eval_every == 0 or local_step == config.rl_steps:
-      latest_metrics = await snapshot_eval(
-        trainer,
-        client,
-        tokenizer,
-        f"texttosql_rl_s{local_step}",
-        eval_examples,
-        config,
-      )
-      ml_logger.log_metrics(
-        {"phase": "rl_eval", "execution_match": latest_metrics.execution_match, "similarity": latest_metrics.similarity},
-        step=global_step,
-      )
-      logging.info(
-        "[rl eval %03d] eval_exec=%.1f%% eval_similarity=%.1f%%",
-        local_step,
-        latest_metrics.execution_match * 100,
-        latest_metrics.similarity * 100,
+      latest = await snapshot_eval(trainer, client, tokenizer, f"texttosql_rl_s{local_step}", eval_examples, config)
+      log_step(
+        ml_logger, global_step, "rl_eval",
+        f"[rl eval {local_step:03d}] eval_exec={latest.execution_match:.1%} eval_similarity={latest.similarity:.1%}",
+        execution_match=latest.execution_match, similarity=latest.similarity,
       )
 
-  return latest_metrics
+  return latest
 
 
 async def run_training(config: Config, preset: str) -> dict[str, float | str]:
@@ -622,7 +561,9 @@ async def run_training(config: Config, preset: str) -> dict[str, float | str]:
       step_offset=step_offset,
     )
     step_offset += config.sft_steps
-    summary.sft_state_path = await maybe_save_state(trainer, config.save_sft_state_name, "Post-SFT")
+    if config.save_sft_state_name:
+      summary.sft_state_path = getattr(trainer.save_state(config.save_sft_state_name).result(), "path", "") or ""
+      logging.info("Post-SFT state saved to %s", summary.sft_state_path or "<empty path>")
   else:
     logging.info("Skipping SFT phase (phase=%s)", config.phase)
 
@@ -642,7 +583,9 @@ async def run_training(config: Config, preset: str) -> dict[str, float | str]:
     logging.info("Skipping RL phase (phase=%s)", config.phase)
     summary.after_rl = summary.after_sft
 
-  summary.final_state_path = await maybe_save_state(trainer, config.save_final_state_name, "Final")
+  if config.save_final_state_name:
+    summary.final_state_path = getattr(trainer.save_state(config.save_final_state_name).result(), "path", "") or ""
+    logging.info("Final state saved to %s", summary.final_state_path or "<empty path>")
 
   logging.info("Saved metrics to %s", metrics_path)
   logging.info(
