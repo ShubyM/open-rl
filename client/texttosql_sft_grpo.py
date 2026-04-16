@@ -46,6 +46,15 @@ VALID_PHASES = {PHASE_FULL, PHASE_SFT_ONLY, PHASE_RL_ONLY}
 os.environ.setdefault("TINKER_API_KEY", "tml-dummy-key")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
+# Runtime handles initialized by `cli()` below. The phase functions read them
+# directly instead of threading the same four-argument bundle through every
+# signature. Assigned-once-per-run, so the "global" isn't really dynamic state.
+service_client: tinker.ServiceClient
+trainer: Any
+tokenizer: Any
+ml_logger: Any
+config: Config
+
 
 @dataclass
 class EvalSnapshot:
@@ -120,28 +129,23 @@ def group_relative_advantages(rewards: list[float]) -> list[float]:
   return [(reward - reward_mean) / reward_std for reward in rewards]
 
 
-class CyclicBatcher:
-  """Yields shuffled mini-batches, reshuffling whenever the pool is exhausted."""
-
-  def __init__(self, examples: list[dict[str, Any]], batch_size: int, seed: int):
-    self.examples = examples
-    self.batch_size = min(batch_size, len(examples))
-    self._rng = random.Random(seed)
-    self._order = list(range(len(examples)))
-    self._rng.shuffle(self._order)
-    self._pos = 0
-
-  def next(self) -> list[dict[str, Any]]:
-    if self._pos + self.batch_size > len(self._order):
-      self._rng.shuffle(self._order)
-      self._pos = 0
-    batch = [self.examples[self._order[i]] for i in range(self._pos, self._pos + self.batch_size)]
-    self._pos += self.batch_size
-    return batch
+def shuffled_batches(examples: list[dict[str, Any]], batch_size: int, seed: int):
+  """Yield shuffled mini-batches forever, reshuffling when the pool is exhausted."""
+  rng = random.Random(seed)
+  order = list(range(len(examples)))
+  rng.shuffle(order)
+  pos = 0
+  batch_size = min(batch_size, len(examples))
+  while True:
+    if pos + batch_size > len(order):
+      rng.shuffle(order)
+      pos = 0
+    yield [examples[order[i]] for i in range(pos, pos + batch_size)]
+    pos += batch_size
 
 
-def log_step(ml_logger, step: int, phase: str, message: str, **metrics: float | int) -> None:
-  """Single sink for "log to metrics file + stderr" used in both phases."""
+def _log(step: int, phase: str, message: str, **metrics: float | int) -> None:
+  """Write one training event to both the metrics file and stderr."""
   ml_logger.log_metrics({"phase": phase, **metrics}, step=step)
   logging.info(message)
 
@@ -183,12 +187,7 @@ def make_rl_datum(
   )
 
 
-def build_rollout_rows(
-  example: dict[str, Any],
-  response: Any,
-  tokenizer,
-  config: Config,
-) -> list[dict[str, Any]]:
+def build_rollout_rows(example: dict[str, Any], response: Any) -> list[dict[str, Any]]:
   rows: list[dict[str, Any]] = []
   for sequence in response.sequences:
     predicted_sql = clean_sql_for_execution(tokenizer.decode(sequence.tokens, skip_special_tokens=True))
@@ -275,7 +274,7 @@ def log_best_rollout(rollout_rows: list[dict[str, Any]]) -> None:
   )
 
 
-def load_example_splits(tokenizer, config: Config) -> ExampleSplits:
+def load_example_splits() -> ExampleSplits:
   dataset = load_dataset(config.dataset_name, split="train").shuffle(seed=config.seed)
   dataset = dataset.select(range(min(config.dataset_limit, len(dataset))))
   if len(dataset) < 10:
@@ -325,70 +324,46 @@ def load_example_splits(tokenizer, config: Config) -> ExampleSplits:
   return ExampleSplits(sft_train=sft_examples, rl_train=rl_examples, eval=eval_examples)
 
 
-async def snapshot_eval(
-  trainer,
-  client: tinker.ServiceClient,
-  tokenizer,
-  alias: str,
-  eval_examples: list[dict[str, Any]],
-  config: Config,
-) -> EvalSnapshot:
+async def snapshot_eval(alias: str, eval_examples: list[dict[str, Any]]) -> EvalSnapshot:
   sampler_path = trainer.save_weights_for_sampler(name=alias).result().path
-  sampler = client.create_sampling_client(sampler_path)
+  sampler = service_client.create_sampling_client(sampler_path)
   execution_match, similarity = await evaluate(sampler, tokenizer, alias, eval_examples, config)
   return EvalSnapshot(execution_match=execution_match, similarity=similarity)
 
 
-async def create_or_resume_trainer(client: tinker.ServiceClient, config: Config):
-  if config.resume_state_path:
+async def load_trainer(resume_from: str | None = None, with_optimizer: bool = False):
+  """Create a fresh LoRA adapter, or resume one from a saved state path."""
+  if resume_from:
     try:
-      if config.resume_with_optimizer:
-        return await client.create_training_client_from_state_with_optimizer_async(config.resume_state_path)
-      return await client.create_training_client_from_state_async(config.resume_state_path)
+      if with_optimizer:
+        return await service_client.create_training_client_from_state_with_optimizer_async(resume_from)
+      return await service_client.create_training_client_from_state_async(resume_from)
     except Exception as exc:
-      raise RuntimeError(
-        "Failed to resume from resume_state_path. The hosted Tinker API supports this, "
-        "but this local Open-RL backend may not have checkpoint restore wired yet."
-      ) from exc
-
-  if config.phase == PHASE_RL_ONLY:
-    logging.info("phase=rl_only without resume_state_path: starting RL from a fresh adapter.")
-
-  return await client.create_lora_training_client_async(
-    base_model=config.base_model,
-    rank=config.rank,
-    seed=config.seed,
-    train_mlp=True,
-    train_attn=True,
-    train_unembed=False,
+      raise RuntimeError(f"Failed to resume trainer from {resume_from!r}") from exc
+  return await service_client.create_lora_training_client_async(
+    base_model=config.base_model, rank=config.rank, seed=config.seed,
+    train_mlp=True, train_attn=True, train_unembed=False,
   )
 
 
 async def run_sft_phase(
-  *,
-  trainer,
-  client: tinker.ServiceClient,
-  tokenizer,
   train_examples: list[dict[str, Any]],
   eval_examples: list[dict[str, Any]],
-  config: Config,
-  ml_logger,
-  step_offset: int,
+  step_offset: int = 0,
 ) -> EvalSnapshot:
   if config.sft_steps <= 0:
-    return await snapshot_eval(trainer, client, tokenizer, "texttosql_sft_skip", eval_examples, config)
+    return await snapshot_eval("texttosql_sft_skip", eval_examples)
 
-  batcher = CyclicBatcher(train_examples, config.sft_batch_size, config.seed)
+  batches = shuffled_batches(train_examples, config.sft_batch_size, config.seed)
   losses: list[float] = []
   latest = EvalSnapshot(execution_match=0.0, similarity=0.0)
-
   logging.info(
     "Starting SFT: steps=%s batch=%s lr=%g train_examples=%s",
-    config.sft_steps, batcher.batch_size, config.sft_learning_rate, len(train_examples),
+    config.sft_steps, min(config.sft_batch_size, len(train_examples)), config.sft_learning_rate, len(train_examples),
   )
 
   for local_step in range(1, config.sft_steps + 1):
-    batch = batcher.next()
+    batch = next(batches)
     datums = [ex["datum"] for ex in batch]
     active_tokens = sum(ex["active_tokens"] for ex in batch)
 
@@ -405,9 +380,9 @@ async def run_sft_phase(
     ml_logger.log_metrics({"phase": "sft_train", "loss": loss}, step=global_step)
 
     if local_step % config.sft_eval_every == 0 or local_step == config.sft_steps:
-      latest = await snapshot_eval(trainer, client, tokenizer, f"texttosql_sft_s{local_step}", eval_examples, config)
-      log_step(
-        ml_logger, global_step, "sft_eval",
+      latest = await snapshot_eval(f"texttosql_sft_s{local_step}", eval_examples)
+      _log(
+        global_step, "sft_eval",
         f"[sft step {local_step:03d}] loss={loss:.4f} eval_exec={latest.execution_match:.1%} eval_similarity={latest.similarity:.1%}",
         execution_match=latest.execution_match, similarity=latest.similarity,
       )
@@ -417,90 +392,75 @@ async def run_sft_phase(
   return latest
 
 
-async def run_rl_step(
-  *,
-  trainer,
-  client: tinker.ServiceClient,
-  tokenizer,
-  examples: list[dict[str, Any]],
-  config: Config,
-  alias: str,
-) -> dict[str, float | int]:
+async def run_rl_step(examples: list[dict[str, Any]], alias: str) -> dict[str, float | int]:
   sampler_path = trainer.save_weights_for_sampler(name=alias).result().path
-  sampler = client.create_sampling_client(sampler_path)
+  sampler = service_client.create_sampling_client(sampler_path)
   futures = [
     sampler.sample_async(
-      prompt=types.ModelInput.from_ints(tokens=example["prompt_tokens"]),
+      prompt=types.ModelInput.from_ints(tokens=ex["prompt_tokens"]),
       num_samples=config.rl_samples_per_prompt,
-      sampling_params=types.SamplingParams(
-        max_tokens=config.rl_max_tokens,
-        temperature=config.rl_temperature,
-      ),
+      sampling_params=types.SamplingParams(max_tokens=config.rl_max_tokens, temperature=config.rl_temperature),
     )
-    for example in examples
+    for ex in examples
   ]
   responses = await asyncio.gather(*futures)
 
   datums: list[types.Datum] = []
   rollout_rows: list[dict[str, Any]] = []
   for example, response in zip(examples, responses):
-    group_rollouts = build_rollout_rows(example, response, tokenizer, config)
-    group_datums, kept_rollouts = build_rl_training_batch(group_rollouts)
+    group_datums, kept = build_rl_training_batch(build_rollout_rows(example, response))
     datums.extend(group_datums)
-    rollout_rows.extend(kept_rollouts)
+    rollout_rows.extend(kept)
 
   if not datums:
     return summarize_rollouts([], 0.0)
 
-  if config.rl_loss_fn == "ppo":
-    loss_fn_config = {"clip_range": config.rl_clip_range, "kl_coeff": config.rl_kl_coeff}
-  else:
-    loss_fn_config = None
+  loss_fn_config = (
+    {"clip_range": config.rl_clip_range, "kl_coeff": config.rl_kl_coeff} if config.rl_loss_fn == "ppo" else None
+  )
   fwdbwd_future = await trainer.forward_backward_async(datums, config.rl_loss_fn, loss_fn_config=loss_fn_config)
   optim_future = await trainer.optim_step_async(
-    types.AdamParams(
-      learning_rate=config.rl_learning_rate,
-      grad_clip_norm=config.grad_clip_norm,
-    )
+    types.AdamParams(learning_rate=config.rl_learning_rate, grad_clip_norm=config.grad_clip_norm)
   )
   fwdbwd = await fwdbwd_future
   await optim_future
 
   log_best_rollout(rollout_rows)
-  loss = float(fwdbwd.metrics.get("loss:mean", 0.0))
-  return summarize_rollouts(rollout_rows, loss)
+  return summarize_rollouts(rollout_rows, float(fwdbwd.metrics.get("loss:mean", 0.0)))
 
 
 async def run_rl_phase(
-  *,
-  trainer,
-  client: tinker.ServiceClient,
-  tokenizer,
   rl_examples: list[dict[str, Any]],
   eval_examples: list[dict[str, Any]],
-  config: Config,
-  ml_logger,
-  step_offset: int,
+  step_offset: int = 0,
+  resume_from: str | None = None,
 ) -> EvalSnapshot:
+  """Run the GRPO-style RL phase.
+
+  If `resume_from` is set, (re)load the trainer from that checkpoint first so
+  you can do `run_rl_phase(..., resume_from="post-sft")` as a standalone RL
+  continuation without running SFT in the same process.
+  """
+  if resume_from:
+    global trainer
+    trainer = await load_trainer(resume_from=resume_from, with_optimizer=config.resume_with_optimizer)
+
   if config.rl_steps <= 0:
-    return await snapshot_eval(trainer, client, tokenizer, "texttosql_rl_skip", eval_examples, config)
+    return await snapshot_eval("texttosql_rl_skip", eval_examples)
 
-  batcher = CyclicBatcher(rl_examples, config.rl_prompts_per_step, config.seed + 1)
+  batches = shuffled_batches(rl_examples, config.rl_prompts_per_step, config.seed + 1)
   latest = EvalSnapshot(execution_match=0.0, similarity=0.0)
-
   logging.info(
     "Starting GRPO-style RL: steps=%s prompts_per_step=%s samples_per_prompt=%s lr=%g loss_fn=%s",
-    config.rl_steps, batcher.batch_size, config.rl_samples_per_prompt, config.rl_learning_rate, config.rl_loss_fn,
+    config.rl_steps, min(config.rl_prompts_per_step, len(rl_examples)),
+    config.rl_samples_per_prompt, config.rl_learning_rate, config.rl_loss_fn,
   )
 
   for local_step in range(1, config.rl_steps + 1):
-    step_metrics = await run_rl_step(
-      trainer=trainer, client=client, tokenizer=tokenizer,
-      examples=batcher.next(), config=config, alias=f"texttosql_rl_rollout_s{local_step}",
-    )
+    step_metrics = await run_rl_step(next(batches), alias=f"texttosql_rl_rollout_s{local_step}")
     global_step = step_offset + local_step
-    log_step(
-      ml_logger, global_step, "rl_train",
+    _log(
+      global_step, "rl_train",
       f"[rl step {local_step:03d}] reward={float(step_metrics['reward']):.3f} "
       f"compile={float(step_metrics['compile_rate']):.1%} exec={float(step_metrics['execution_match']):.1%} "
       f"rollouts={int(step_metrics['num_rollouts'])}",
@@ -508,9 +468,9 @@ async def run_rl_phase(
     )
 
     if local_step % config.rl_eval_every == 0 or local_step == config.rl_steps:
-      latest = await snapshot_eval(trainer, client, tokenizer, f"texttosql_rl_s{local_step}", eval_examples, config)
-      log_step(
-        ml_logger, global_step, "rl_eval",
+      latest = await snapshot_eval(f"texttosql_rl_s{local_step}", eval_examples)
+      _log(
+        global_step, "rl_eval",
         f"[rl eval {local_step:03d}] eval_exec={latest.execution_match:.1%} eval_similarity={latest.similarity:.1%}",
         execution_match=latest.execution_match, similarity=latest.similarity,
       )
@@ -518,66 +478,57 @@ async def run_rl_phase(
   return latest
 
 
-async def run_training(config: Config, preset: str) -> dict[str, float | str]:
+async def run_training(cfg: Config, preset: str) -> dict[str, float | str]:
+  """Wire up globals, run the configured phases, emit the summary."""
+  global service_client, trainer, tokenizer, ml_logger, config
+  config = cfg
   validate_config(config)
 
   log_dir = Path(config.log_dir.replace("{preset}", preset))
   ml_logger = ml_log.setup_logging(log_dir=str(log_dir), config=config, do_configure_logging_module=True)
   metrics_path = log_dir / "metrics.jsonl"
 
-  client = tinker.ServiceClient(
+  service_client = tinker.ServiceClient(
     api_key=os.getenv("TINKER_API_KEY", "tml-dummy-key"),
     base_url=config.base_url,
     timeout=600.0,
   )
-  server_model = await require_server(client, config.base_url)
+  server_model = await require_server(service_client, config.base_url)
   logging.info("Server ready at %s | model=%s", config.base_url, server_model or "unset")
 
-  trainer = await create_or_resume_trainer(client, config)
-
   from transformers import AutoTokenizer
-
   tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
-  examples = load_example_splits(tokenizer, config)
 
-  baseline = await snapshot_eval(trainer, client, tokenizer, "texttosql_before", examples.eval, config)
-  ml_logger.log_metrics(
-    {"phase": "eval_baseline", "execution_match": baseline.execution_match, "similarity": baseline.similarity},
-    step=0,
+  # RL-only resumes lazily inside run_rl_phase so the same code path handles
+  # both "resume from a specific checkpoint" and "just continue the current run".
+  trainer = await load_trainer(
+    resume_from=config.resume_state_path if config.phase != PHASE_RL_ONLY else None,
+    with_optimizer=config.resume_with_optimizer,
   )
-  summary = TrainingSummary(baseline=baseline, after_sft=baseline, after_rl=baseline)
-  step_offset = 0
 
+  examples = load_example_splits()
+  baseline = await snapshot_eval("texttosql_before", examples.eval)
+  _log(0, "eval_baseline", f"baseline exec={baseline.execution_match:.1%} sim={baseline.similarity:.1%}",
+       execution_match=baseline.execution_match, similarity=baseline.similarity)
+  summary = TrainingSummary(baseline=baseline, after_sft=baseline, after_rl=baseline)
+
+  step_offset = 0
   if runs_sft(config.phase):
     log_phase_header("SFT")
-    summary.after_sft = await run_sft_phase(
-      trainer=trainer,
-      client=client,
-      tokenizer=tokenizer,
-      train_examples=examples.sft_train,
-      eval_examples=examples.eval,
-      config=config,
-      ml_logger=ml_logger,
-      step_offset=step_offset,
-    )
+    summary.after_sft = await run_sft_phase(examples.sft_train, examples.eval, step_offset=step_offset)
     step_offset += config.sft_steps
     if config.save_sft_state_name:
       summary.sft_state_path = getattr(trainer.save_state(config.save_sft_state_name).result(), "path", "") or ""
       logging.info("Post-SFT state saved to %s", summary.sft_state_path or "<empty path>")
   else:
     logging.info("Skipping SFT phase (phase=%s)", config.phase)
+    summary.after_sft = baseline
 
   if runs_rl(config.phase):
     log_phase_header("RL")
     summary.after_rl = await run_rl_phase(
-      trainer=trainer,
-      client=client,
-      tokenizer=tokenizer,
-      rl_examples=examples.rl_train,
-      eval_examples=examples.eval,
-      config=config,
-      ml_logger=ml_logger,
-      step_offset=step_offset,
+      examples.rl_train, examples.eval, step_offset=step_offset,
+      resume_from=config.resume_state_path if config.phase == PHASE_RL_ONLY else None,
     )
   else:
     logging.info("Skipping RL phase (phase=%s)", config.phase)
@@ -590,12 +541,8 @@ async def run_training(config: Config, preset: str) -> dict[str, float | str]:
   logging.info("Saved metrics to %s", metrics_path)
   logging.info(
     "[summary] execution=%.1f%%->%.1f%%->%.1f%% similarity=%.1f%%->%.1f%%->%.1f%%",
-    summary.baseline.execution_match * 100,
-    summary.after_sft.execution_match * 100,
-    summary.after_rl.execution_match * 100,
-    summary.baseline.similarity * 100,
-    summary.after_sft.similarity * 100,
-    summary.after_rl.similarity * 100,
+    summary.baseline.execution_match * 100, summary.after_sft.execution_match * 100, summary.after_rl.execution_match * 100,
+    summary.baseline.similarity * 100, summary.after_sft.similarity * 100, summary.after_rl.similarity * 100,
   )
   ml_logger.close()
   return summary.to_dict(metrics_path)
