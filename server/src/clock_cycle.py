@@ -85,6 +85,13 @@ async def clock_cycle_loop() -> None:
                   },
                 )
 
+              case "create_model_from_state":
+                state_path = r["state_path"]
+                restore_optimizer = bool(r.get("restore_optimizer", False))
+                result = await asyncio.to_thread(engine.load_from_state, m_id, state_path, restore_optimizer)
+                result["type"] = "create_model_from_state"
+                await store.set_future(req_id, result)
+
               case "forward_backward":
                 raw_data = r["data"]
                 loss_fn = r["loss_fn"]

@@ -156,6 +156,27 @@ async def create_model(req: dict):
   return {"request_id": req_id}
 
 
+@app.post("/api/v1/create_model_from_state")
+async def create_model_from_state(req: dict):
+  """ServiceClient.create_training_client_from_state_async()"""
+  state_path = req.get("state_path")
+  if not state_path:
+    return JSONResponse(status_code=400, content={"error": "state_path is required"})
+  # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
+  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
+  model_id = str(uuid.uuid4())
+  req_id = await _enqueue(
+    {
+      "req_id": model_id,
+      "model_id": model_id,
+      "type": "create_model_from_state",
+      "state_path": resolved_path,
+      "restore_optimizer": bool(req.get("restore_optimizer", False)),
+    }
+  )
+  return {"request_id": req_id}
+
+
 @app.post("/api/v1/get_info")
 async def get_info(req: dict):
   """ServiceClient — model metadata for the training client."""
