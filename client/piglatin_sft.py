@@ -87,8 +87,7 @@ def require_server(base_url: str, expected_model: str | None = None) -> dict[str
     capabilities = resp.json()
   except Exception as exc:
     raise RuntimeError(
-      f"Open-RL server at {base_url} is not reachable.\n"
-      f"Start it with:  make server BASE_MODEL={expected_model or '<model-id>'}"
+      f"Open-RL server at {base_url} is not reachable.\nStart it with:  make server BASE_MODEL={expected_model or '<model-id>'}"
     ) from exc
 
   server_model = capabilities.get("default_model")
