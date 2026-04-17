@@ -9,7 +9,7 @@ The Makefile wraps the common ones; k8s manifests set them in pod specs.
 | --- | --- | --- |
 | `BASE_MODEL` | *(required in single-process mode)* | The Hugging Face model id to load in the trainer **and** the vLLM sampler. Example: `google/gemma-4-e2b`. |
 | `SAMPLER` | `torch` when single-process, `vllm` otherwise | Which sampling backend to use. `torch` runs in the gateway process (CPU-friendly). `vllm` forwards sampling requests to a separate `python -m src.vllm_sampler` worker. |
-| `SINGLE_PROCESS` | auto-detected | `1` forces gateway + trainer + sampler into one process. Unset falls back to auto-detect: if `BASE_MODEL` is set and `REDIS_URL` is not, assume single-process. Distributed deployments shouldn't set this. |
+| `SINGLE_PROCESS` | auto-detected | `1` forces gateway + trainer into one process (the sampler is separate iff `SAMPLER=vllm`). Unset falls back to auto-detect: if `BASE_MODEL` is set and `REDIS_URL` is not, assume single-process. Distributed deployments shouldn't set this. |
 | `REDIS_URL` | unset | When set, the request store switches to Redis and the system runs in distributed mode (gateway, vLLM worker, and trainer worker as separate pods coordinating via Redis). Used by the k8s manifests in `server/kubernetes/distributed-{shared,lustre}/`. |
 | `VLLM_URL` | `http://127.0.0.1:8001` | Where the gateway looks for the vLLM worker when `SAMPLER=vllm`. The `make vllm` target starts the worker on this port. |
 
