@@ -45,22 +45,21 @@ async def startup():
   print("        Open-RL vLLM Inference Engine")
   print("=" * 50)
   cuda_devs = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
-  model_name = os.environ.get("VLLM_MODEL", "Not Set")
+  model_name = os.environ.get("BASE_MODEL")
   print(f"-> Hardware     : CUDA_VISIBLE_DEVICES={cuda_devs}")
-  print(f"-> Memory Matrix: {model_name}\n")
+  print(f"-> Memory Matrix: {model_name or 'Not Set'}\n")
 
   mock_vllm = os.environ.get("MOCK_VLLM", "0") == "1"
   if mock_vllm or AsyncLLMEngine is None:
     print("[vLLM Subprocess] MOCK_VLLM=1 or vllm not installed, bypassing real engine init for local dev.")
     return
 
-  # Use arguments suitable for the v2 architecture
-  if not os.environ.get("VLLM_MODEL"):
-    print("[vLLM Subprocess] Error: VLLM_MODEL environment variable is required.")
+  if not model_name:
+    print("[vLLM Subprocess] Error: BASE_MODEL environment variable is required.")
     sys.exit(1)
 
   engine_args = AsyncEngineArgs(
-    model=os.environ.get("VLLM_MODEL"),
+    model=model_name,
     enable_lora=True,
     max_loras=8,
     max_lora_rank=64,
