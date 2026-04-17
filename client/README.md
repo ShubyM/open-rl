@@ -90,8 +90,8 @@ Start a standalone vLLM worker (or use `make vllm`):
 
 ```bash
 cd server
-BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" \
-uv run --extra gpu --extra vllm python -m src.vllm_sampler
+BASE_MODEL="Qwen/Qwen3-0.6B" \
+uv run --extra vllm python -m src.vllm_sampler
 ```
 
 Run the Pig Latin SFT example:
