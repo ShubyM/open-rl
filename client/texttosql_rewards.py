@@ -30,7 +30,7 @@ _TABLE_PATTERN = re.compile(r"CREATE TABLE (\w+)", re.IGNORECASE)
 _WORD_PATTERN = re.compile(r"\b\w+\b")
 
 
-def _schema_items(context: str) -> set[str]:
+def schema_items(context: str) -> set[str]:
   items = {m.group(1).lower() for m in _TABLE_PATTERN.finditer(context)}
   items |= {m.group(1).lower() for m in _COLUMN_TYPE_PATTERN.finditer(context)}
   return items
@@ -38,7 +38,7 @@ def _schema_items(context: str) -> set[str]:
 
 def schema_linking_reward(predicted_sql: str, target_sql: str, context: str) -> float:
   """Jaccard similarity of schema items (tables + columns) used in predicted vs gold SQL."""
-  schema = _schema_items(context)
+  schema = schema_items(context)
 
   def used(sql: str) -> set[str]:
     return {w.lower() for w in _WORD_PATTERN.findall(sql)} & schema
@@ -119,9 +119,7 @@ def compute_sql_reward(
     if predicted_rows is not None and example.get("target_rows") is not None:
       partial_score = partial_execution_score(predicted_rows, example["target_rows"])
 
-  total += similarity_reward * (
-    0.3 * schema_score + 0.2 * ngram_score + 0.3 * similarity + 0.2 * partial_score
-  )
+  total += similarity_reward * (0.3 * schema_score + 0.2 * ngram_score + 0.3 * similarity + 0.2 * partial_score)
 
   return {
     "total": total,

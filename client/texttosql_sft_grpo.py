@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import random
 import statistics
 import sys
 from pathlib import Path
@@ -21,12 +20,11 @@ from typing import Any, cast
 
 import chz
 import tinker
-from datasets import load_dataset
+from texttosql_grpo_utils import load_example_splits, shuffled_batches
 from texttosql_rewards import compute_sql_reward
 from texttosql_sft import (
   BASE_URL,
   DATASET,
-  build_examples,
   clean_sql_for_execution,
   evaluate,
   normalize_sql,
@@ -34,7 +32,7 @@ from texttosql_sft import (
 )
 from tinker import types
 from tinker_cookbook.utils import ml_log
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer
 
 LOG_DIR = Path(__file__).resolve().parent / "artifacts" / "texttosql_sft_grpo_{preset}"
 
@@ -202,7 +200,7 @@ async def run_rl_step(examples: list[dict[str, Any]], alias: str) -> dict[str, f
   datums: list[types.Datum] = []
   rollouts: list[dict[str, Any]] = []
   for example, response in zip(examples, responses):
-    group = [_score_rollout(example, seq) for seq in response.sequences]
+    group = [score_rollout(example, seq) for seq in response.sequences]
     advantages = group_relative_advantages([r["reward"] for r in group])
     for rollout, advantage in zip(group, advantages):
       if abs(advantage) < 1e-8:
@@ -211,7 +209,7 @@ async def run_rl_step(examples: list[dict[str, Any]], alias: str) -> dict[str, f
         continue
       rollout["advantage"] = advantage
       rollouts.append(rollout)
-      datums.append(_make_rl_datum(rollout, advantage))
+      datums.append(make_rl_datum(rollout, advantage))
 
   if not datums:
     return {"loss": 0.0, "reward": 0.0, "compile_rate": 0.0, "execution_match": 0.0, "similarity": 0.0, "num_rollouts": 0}
@@ -222,7 +220,7 @@ async def run_rl_step(examples: list[dict[str, Any]], alias: str) -> dict[str, f
   fwdbwd = await fwdbwd_future
   await optim_future
 
-  _log_best_rollout(rollouts)
+  log_best_rollout(rollouts)
 
   def mean(k: str) -> float:
     return statistics.fmean(float(r[k]) for r in rollouts)
@@ -285,8 +283,21 @@ async def run_rl_phase(
   return exec_match, similarity
 
 
-async def run_training(metrics_path: Path) -> dict[str, float | str]:
-  """Orchestrate the configured phases against the already-initialized module globals."""
+async def run_training(config_arg: Config, preset: str) -> dict[str, float | str]:
+  """Initialize recipe globals, orchestrate the configured phases, and return summary metrics."""
+  global config, ml_logger, service_client, tokenizer
+
+  config = config_arg
+  log_dir = Path(config.log_dir.replace("{preset}", preset))
+  ml_logger = ml_log.setup_logging(log_dir=str(log_dir), config=config, do_configure_logging_module=True)
+  service_client = tinker.ServiceClient(
+    api_key=os.getenv("TINKER_API_KEY", "tml-dummy-key"),
+    base_url=config.base_url,
+    timeout=600.0,
+  )
+  tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
+  metrics_path = log_dir / "metrics.jsonl"
+
   server_model = await require_server(service_client, config.base_url)
   logging.info("Server ready at %s | model=%s", config.base_url, server_model or "unset")
 
@@ -308,7 +319,7 @@ async def run_training(metrics_path: Path) -> dict[str, float | str]:
     except Exception as exc:
       raise RuntimeError(f"Failed to resume trainer from {config.resume_state_path!r}") from exc
 
-  sft_train, rl_train, eval_examples = load_example_splits()
+  sft_train, rl_train, eval_examples = load_example_splits(config, tokenizer)
   before_exec, before_sim = await snapshot_eval("texttosql_before", eval_examples)
   ml_logger.log_metrics({"phase": "eval_baseline", "execution_match": before_exec, "similarity": before_sim}, step=0)
   logging.info("baseline exec=%.1f%% sim=%.1f%%", before_exec * 100, before_sim * 100)
@@ -369,9 +380,9 @@ async def run_training(metrics_path: Path) -> dict[str, float | str]:
 
 
 # ---------------------------------------------------------------------------
-# Rollout scoring + datum construction
+# Rollout scoring + datum construction (core RL mechanics)
 # ---------------------------------------------------------------------------
-def _score_rollout(example: dict[str, Any], sequence: Any) -> dict[str, Any]:
+def score_rollout(example: dict[str, Any], sequence: Any) -> dict[str, Any]:
   """Decode one sampled sequence, compute its SQL reward, return a flat rollout dict."""
   predicted_sql = clean_sql_for_execution(tokenizer.decode(sequence.tokens, skip_special_tokens=True))
   reward = compute_sql_reward(
@@ -397,13 +408,13 @@ def _score_rollout(example: dict[str, Any], sequence: Any) -> dict[str, Any]:
   }
 
 
-def _make_rl_datum(rollout: dict[str, Any], advantage: float) -> types.Datum:
+def make_rl_datum(rollout: dict[str, Any], advantage: float) -> types.Datum:
   """Pack one scored rollout into a Datum with prompt-token weights/logprobs/advantages masked to 0."""
   prompt, completion, logprobs = rollout["prompt_tokens"], rollout["completion_tokens"], rollout["completion_logprobs"]
   prompt_pad = max(0, len(prompt) - 1)
   n = prompt_pad + len(completion)
 
-  def _tensor(prompt_fill: float, completion_fill: list[float] | float) -> types.TensorData:
+  def masked_tensor(prompt_fill: float, completion_fill: list[float] | float) -> types.TensorData:
     tail = completion_fill if isinstance(completion_fill, list) else [completion_fill] * len(completion)
     return types.TensorData(data=[prompt_fill] * prompt_pad + tail, dtype="float32", shape=[n])
 
@@ -414,9 +425,9 @@ def _make_rl_datum(rollout: dict[str, Any], advantage: float) -> types.Datum:
       Any,
       {
         "target_tokens": full[1:],
-        "weights": _tensor(0.0, 1.0),
-        "logprobs": _tensor(0.0, logprobs),
-        "advantages": _tensor(0.0, advantage),
+        "weights": masked_tensor(0.0, 1.0),
+        "logprobs": masked_tensor(0.0, logprobs),
+        "advantages": masked_tensor(0.0, advantage),
       },
     ),
   )
@@ -432,7 +443,7 @@ def group_relative_advantages(rewards: list[float]) -> list[float]:
   return [(r - mean) / std for r in rewards]
 
 
-def _log_best_rollout(rollouts: list[dict[str, Any]]) -> None:
+def log_best_rollout(rollouts: list[dict[str, Any]]) -> None:
   if not rollouts:
     return
   best = max(rollouts, key=lambda r: (r["reward"], r["execution_match"], r["compile"]))
@@ -449,72 +460,12 @@ def _log_best_rollout(rollouts: list[dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Batching + eval
+# Eval
 # ---------------------------------------------------------------------------
-def shuffled_batches(examples: list[dict[str, Any]], batch_size: int, seed: int):
-  """Yield shuffled mini-batches forever, reshuffling when the pool is exhausted."""
-  rng = random.Random(seed)
-  order = list(range(len(examples)))
-  rng.shuffle(order)
-  pos = 0
-  batch_size = min(batch_size, len(examples))
-  while True:
-    if pos + batch_size > len(order):
-      rng.shuffle(order)
-      pos = 0
-    yield [examples[order[i]] for i in range(pos, pos + batch_size)]
-    pos += batch_size
-
-
 async def snapshot_eval(alias: str, eval_examples: list[dict[str, Any]]) -> tuple[float, float]:
   """Snapshot current weights to a sampler and run the eval loop against it."""
   sampler = await trainer.save_weights_and_get_sampling_client_async(name=alias)
   return await evaluate(sampler, tokenizer, alias, eval_examples, config)
-
-
-def load_example_splits() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-  """Returns (sft_train, rl_train, eval). Skips the SFT or RL build if that phase is disabled."""
-  do_sft = config.phase in {"full", "sft_only"}
-  do_rl = config.phase in {"full", "rl_only"}
-
-  dataset = load_dataset(config.dataset_name, split="train").shuffle(seed=config.seed)
-  dataset = dataset.select(range(min(config.dataset_limit, len(dataset))))
-  if len(dataset) < 10:
-    raise RuntimeError("dataset_limit is too small to create train/eval splits")
-
-  split = dataset.train_test_split(test_size=min(2_500, max(1, len(dataset) // 5)), shuffle=False)
-
-  sft_examples = build_examples(tokenizer, config.prompt_format, split["train"], config.train_limit) if do_sft else []
-  rl_examples = (
-    build_examples(
-      tokenizer,
-      config.prompt_format,
-      split["train"],
-      config.rl_train_limit,
-      require_seed_data=True,
-      require_target_rows=True,
-    )
-    if do_rl
-    else []
-  )
-  eval_examples = build_examples(
-    tokenizer,
-    config.prompt_format,
-    split["test"],
-    config.eval_limit,
-    require_seed_data=True,
-    require_target_rows=True,
-  )
-
-  if do_sft and not sft_examples:
-    raise RuntimeError("No SFT examples fit within the max sequence length.")
-  if do_rl and not rl_examples:
-    raise RuntimeError("No RL examples with executable target rows were found.")
-  if not eval_examples:
-    raise RuntimeError("No evaluation examples with executable seed data were found.")
-
-  logging.info("Data: %s SFT train, %s RL train, %s eval", len(sft_examples), len(rl_examples), len(eval_examples))
-  return sft_examples, rl_examples, eval_examples
 
 
 # ---------------------------------------------------------------------------
@@ -526,16 +477,4 @@ if __name__ == "__main__":
   preset = sys.argv[1]
   blueprint = PRESETS[preset].clone()
   config: Config = blueprint.make_from_argv(sys.argv[2:], allow_hyphens=True)
-
-  log_dir = Path(config.log_dir.replace("{preset}", preset))
-  ml_logger: ml_log.Logger = ml_log.setup_logging(log_dir=str(log_dir), config=config, do_configure_logging_module=True)
-  metrics_path = log_dir / "metrics.jsonl"
-
-  service_client: tinker.ServiceClient = tinker.ServiceClient(
-    api_key=os.getenv("TINKER_API_KEY", "tml-dummy-key"),
-    base_url=config.base_url,
-    timeout=600.0,
-  )
-  tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(config.tokenizer_name)
-
-  asyncio.run(run_training(metrics_path))
+  asyncio.run(run_training(config, preset))
