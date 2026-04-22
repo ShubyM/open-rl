@@ -78,9 +78,7 @@ async def run_sft_phase(
     active_tokens = sum(ex["active_tokens"] for ex in batch)
 
     fwdbwd_future = await trainer.forward_backward_async(datums, "cross_entropy")
-    optim_future = await trainer.optim_step_async(
-      types.AdamParams(learning_rate=config.sft.learning_rate, grad_clip_norm=config.grad_clip_norm)
-    )
+    optim_future = await trainer.optim_step_async(types.AdamParams(learning_rate=config.sft.learning_rate, grad_clip_norm=config.grad_clip_norm))
 
     fwdbwd = await fwdbwd_future
     await optim_future
@@ -210,8 +208,12 @@ async def run_training(preset: str, metrics_path: Path) -> dict[str, float | str
   sft_state_name = f"{preset}-sft"
   final_state_name = f"{preset}-final"
   training_client = await service_client.create_lora_training_client_async(
-    base_model=config.model.base_model, rank=config.model.rank, seed=config.seed,
-    train_mlp=True, train_attn=True, train_unembed=False,
+    base_model=config.model.base_model,
+    rank=config.model.rank,
+    seed=config.seed,
+    train_mlp=True,
+    train_attn=True,
+    train_unembed=False,
   )
   if config.phase == "rl_only" and config.sft_adapter_name:
     load_future = await training_client.load_state_async(config.sft_adapter_name)

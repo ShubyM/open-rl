@@ -153,8 +153,12 @@ async def run_training(config: Config, preset: str) -> dict[str, float | str]:
   before_sampler_path = trainer.save_weights_for_sampler(name="texttosql_before").result().path
   before_sampler = client.create_sampling_client(before_sampler_path)
   before_exec, before_sim = await evaluate(
-    before_sampler, tokenizer, "texttosql_before", eval_examples,
-    max_tokens=config.eval_max_tokens, seed=config.seed,
+    before_sampler,
+    tokenizer,
+    "texttosql_before",
+    eval_examples,
+    max_tokens=config.eval_max_tokens,
+    seed=config.seed,
   )
   ml_logger.log_metrics({"phase": "eval", "execution_match": before_exec, "similarity": before_sim}, step=0)
 
