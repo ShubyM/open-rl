@@ -23,14 +23,14 @@ cpu = [
     "numpy",
     "peft",
     "torch",
-    "transformers>=5.5.0",
+    "transformers>=5.5.4",
 ]
 gpu = [
     "datasets",
     "numpy",
     "peft",
     "torch; sys_platform == 'linux'",
-    "transformers>=5.5.0",
+    "transformers>=5.5.4",
 ]
 vllm = [
     "torch; sys_platform == 'linux'",
@@ -42,7 +42,7 @@ vllm = [
 override-dependencies = [
     # vLLM still carries an older transformers constraint; keep the project on
     # the newer transformers line declared in our extras.
-    "transformers>=5.5.0",
+    "transformers>=5.5.4",
 ]
 conflicts = [
     [
