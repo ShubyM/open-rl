@@ -35,7 +35,7 @@ gpu = [
 vllm = [
     "torch; sys_platform == 'linux'",
     "torch-c-dlpack-ext; sys_platform == 'linux'",
-    "vllm>=0.18.0; sys_platform == 'linux'",
+    "vllm==0.19.1; sys_platform == 'linux'",
 ]
 
 [tool.uv]

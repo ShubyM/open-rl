@@ -236,7 +236,8 @@ async def run_training(preset: str, metrics_path: Path) -> dict[str, float | str
 
   if config.phase in {"full", "rl_only"}:
     logging.info(">>> Phase: RL")
-    after_rl_metrics = await run_rl_phase(training_client, rl_train, eval_examples, step_offset=config.sft.steps)
+    step_offset = 0 if config.phase == "rl_only" else config.sft.steps
+    after_rl_metrics = await run_rl_phase(training_client, rl_train, eval_examples, step_offset=step_offset)
 
   final_state_path = training_client.save_state(final_state_name).result().path
   logging.info(f"Final state saved to {final_state_path}")

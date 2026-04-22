@@ -30,3 +30,13 @@ expected curves.
 * `plot_ttsql_curves.py`: Metrics plotter for recipe curves.
 * `rl-recipe.md`: Full recipe guide and latest result summary.
 * `texttosql_gemma4_plain_notebook.ipynb`: Gemma 4 plain-completion warmup notebook.
+
+## Results
+
+Here are the curves from the **RL Only** run (starting from a fresh LoRA):
+
+![Text-to-SQL curves RL Only](./texttosql-curves-rl-only.png)
+
+And here are the curves from the **Full Run (SFT + RL)** (for comparison):
+
+![Text-to-SQL curves SFT and RL](./texttosql-curves-sft-and-rl.png)

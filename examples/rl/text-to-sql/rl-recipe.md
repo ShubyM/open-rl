@@ -33,7 +33,7 @@ after RL:     10%
 
 
 
-![Text-to-SQL curves](../../../assets/texttosql-vllm0191-curves.png)
+
 
 The metrics and recipe log for this run are in:
 
@@ -73,7 +73,7 @@ You need to start two components in separate terminals (or `tmux` panes): the vL
 Start the vLLM sampler on GPU 0. By default, it will listen on port 8001.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 make vllm BASE_MODEL=google/gemma-4-e2b
+CUDA_VISIBLE_DEVICES=0 VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make vllm BASE_MODEL=google/gemma-4-e2b
 ```
 
 #### Terminal 2: Gateway + Trainer
@@ -197,3 +197,11 @@ Target:
 select sum(weight) from shipment s join warehouse w
 on s.warehouse_id = w.id where w.city = 'beijing'
 ```
+ 
+Here are the curves from the **RL Only** run (starting from a fresh LoRA):
+ 
+![Text-to-SQL curves RL Only](./texttosql-curves-rl-only.png)
+ 
+And here are the curves from the **Full Run (SFT + RL)** (for comparison):
+ 
+![Text-to-SQL curves SFT and RL](./texttosql-curves-sft-and-rl.png)
