@@ -21,7 +21,7 @@ dependencies = [
     "opentelemetry-instrumentation-httpx>=0.61b0",
     "opentelemetry-exporter-gcp-trace>=1.11.0",
     "opentelemetry-sdk>=1.40.0",
-    "transformers>=5.5.0",
+    "transformers>=5.5.4",
     "ipykernel",
     "torch",
 ]
