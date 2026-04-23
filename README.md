@@ -77,7 +77,7 @@ Detailed guides and runnable examples are structured under `docs/` and `examples
 
 - 🎓 **Guides:**
   - [Pig Latin SFT Notebook](examples/sft/pig-latin/piglatin_sft_notebook.ipynb) | [script guide](docs/guides/supervised/pig-latin.md)
-  - [Text-to-SQL SFT Notebook](examples/sft/text-to-sql/texttosql_sft_notebook.ipynb) | [Text-to-SQL RL Recipe](examples/rl/text-to-sql/rl-recipe.md)
+  - [Text-to-SQL SFT Notebook](examples/sft/text-to-sql/texttosql_sft_notebook.ipynb) | [Text-to-SQL RL Recipe](examples/rl/text-to-sql/README.md)
   - [RLVR (Verifiable Rewards) Demo](examples/rl/rlvr/README.md)
 - 📖 **[Architecture](docs/architecture.md)**
 - 🚀 **[Kubernetes Deployment Guide (GKE)](docs/deployment.md)**

@@ -1,7 +1,7 @@
 """Render the 4-panel text-to-SQL recipe figure from a metrics.jsonl.
 
 Usage:
-  python plot_ttsql_curves.py <metrics.jsonl> [out.png]
+  python -m utils.plot <metrics.jsonl> [out.png]
 """
 
 from __future__ import annotations
@@ -35,6 +35,10 @@ def sma(values: list[float], window: int) -> list[float]:
 
 
 def main() -> int:
+  if len(sys.argv) < 2:
+    print("Usage: python -m utils.plot <metrics.jsonl> [out.png]")
+    return 2
+
   path = Path(sys.argv[1])
   out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else path.with_name("curves.png")
 

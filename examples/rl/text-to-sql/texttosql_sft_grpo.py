@@ -1,6 +1,6 @@
 """Text-to-SQL SFT + RL recipe.
 
-See `rl-recipe.md` for direct `uv run` commands.
+See `README.md` for direct `uv run` commands.
 
 Common phase modes:
 - `phase=full`: run SFT, then RL
@@ -16,31 +16,30 @@ import logging
 import os
 import statistics
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
-
-SFT_TEXT_TO_SQL_DIR = Path(__file__).resolve().parents[2] / "sft" / "text-to-sql"
-if str(SFT_TEXT_TO_SQL_DIR) not in sys.path:
-  sys.path.insert(1, str(SFT_TEXT_TO_SQL_DIR))
+from typing import Any, cast
 
 import chz
 import tinker
-from texttosql_grpo_utils import (
-  load_example_splits,
-  score_rollout,
-  shuffled_batches,
-)
-from texttosql_sft import (
-  BASE_URL,
-  DATASET,
-  evaluate_metrics,
-  normalize_sql,
-  require_server,
-)
 from tinker import types
 from tinker_cookbook.utils import ml_log
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from utils.helpers import (
+  build_examples,
+  require_server,
+  shuffled_batches,
+)
+from utils.rewards import (
+  aggregate_eval_scores,
+  empty_eval_metrics,
+  load_dataset_splits,
+  normalize_sql,
+  score_eval_prediction,
+)
 
+BASE_URL = "http://127.0.0.1:9003"
+DATASET = "philschmid/gretel-synthetic-text-to-sql"
 LOG_DIR = Path(__file__).resolve().parent / "artifacts" / "texttosql_sft_grpo_{preset}"
 
 os.environ.setdefault("TINKER_API_KEY", "tml-dummy-key")
@@ -53,6 +52,7 @@ ml_logger: ml_log.Logger
 service_client: tinker.ServiceClient
 tokenizer: PreTrainedTokenizerBase
 EvalMetrics = dict[str, float]
+LossValue = float | int
 
 
 # *** Training phases (SFT + PPO+KL RL) ***
@@ -117,7 +117,6 @@ async def run_rl_phase(
   )
 
   sampling_params = types.SamplingParams(max_tokens=config.rl.max_tokens, temperature=config.rl.temperature)
-
   for local_step in range(1, config.rl.steps + 1):
     # --- Rollout: save weights, sample N completions per prompt, score them ---
     sampler = await trainer.save_weights_and_get_sampling_client_async(name=f"texttosql_rl_rollout_s{local_step}")
@@ -132,7 +131,7 @@ async def run_rl_phase(
     datums: list[types.Datum] = []
     rollouts: list[dict[str, Any]] = []
     for example, response in zip(examples, responses):
-      group = [score_rollout(example, seq, tokenizer, config.reward) for seq in response.sequences]
+      group = [build_rollout(example, seq, tokenizer) for seq in response.sequences]
       rewards = [rr["reward"] for rr in group]
       # Standardize rewards within each sampled group before the PPO update.
       mean, std = statistics.fmean(rewards), statistics.pstdev(rewards)
@@ -145,7 +144,16 @@ async def run_rl_phase(
           continue
         rollout["advantage"] = advantage
         rollouts.append(rollout)
-        datums.append(make_rl_datum(rollout, advantage))
+        prompt, completion, logprobs = rollout["prompt_tokens"], rollout["completion_tokens"], rollout["completion_logprobs"]
+        prompt_pad = [0.0] * (len(prompt) - 1)
+        datums.append(
+          make_datum(
+            prompt + completion,
+            prompt_pad + [1.0] * len(completion),
+            logprobs=prompt_pad + list(logprobs),
+            advantages=prompt_pad + [advantage] * len(completion),
+          )
+        )
 
     global_step = step_offset + local_step
     if not datums:
@@ -275,7 +283,64 @@ async def run_training(preset: str, metrics_path: Path) -> dict[str, float | str
   return result
 
 
-# *** Helpers used by the training phases above ***
+# *** Data + datum helpers ***
+def load_example_splits(config: Any, tokenizer: PreTrainedTokenizerBase) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+  """Return (sft_train, rl_train, eval), skipping phase-specific builds when disabled."""
+  do_sft = config.phase in {"full", "sft_only"}
+  do_rl = config.phase in {"full", "rl_only"}
+  train_limit = max(config.dataset.train_limit if do_sft else 0, config.dataset.rl_train_limit if do_rl else 0)
+  train_rows, eval_rows = load_dataset_splits(
+    dataset_name=config.dataset.name,
+    dataset_limit=config.dataset.limit,
+    train_limit=train_limit * 2,
+    eval_limit=config.dataset.eval_limit * 2,
+    seed=config.seed,
+  )
+
+  sft_examples = build_examples(tokenizer, train_rows, config.dataset.train_limit) if do_sft else []
+  for example in sft_examples:
+    prompt_tokens, full_tokens = example["prompt_tokens"], example["full_tokens"]
+    weights = [0.0] * (len(prompt_tokens) - 1) + [1.0] * (len(full_tokens) - len(prompt_tokens))
+    example["datum"] = make_datum(full_tokens, weights)
+
+  rl_examples = build_examples(tokenizer, train_rows, config.dataset.rl_train_limit) if do_rl else []
+  eval_examples = build_examples(tokenizer, eval_rows, config.dataset.eval_limit)
+
+  if do_sft and not sft_examples:
+    raise RuntimeError("No SFT examples fit within the max sequence length.")
+  if do_rl and not rl_examples:
+    raise RuntimeError("No RL examples with executable target rows were found.")
+  if not eval_examples:
+    raise RuntimeError("No evaluation examples with executable seed data were found.")
+
+  logging.info("Data: %s SFT train, %s RL train, %s eval", len(sft_examples), len(rl_examples), len(eval_examples))
+  return sft_examples, rl_examples, eval_examples
+
+
+def make_datum(
+  tokens: Sequence[int],
+  weights: Sequence[LossValue],
+  *,
+  logprobs: Sequence[LossValue] | None = None,
+  advantages: Sequence[LossValue] | None = None,
+) -> types.Datum:
+  tokens = list(tokens)
+  loss_fn_inputs: dict[str, Any] = {
+    "target_tokens": tokens[1:],
+    "weights": list(weights),
+  }
+  if logprobs is not None:
+    loss_fn_inputs["logprobs"] = list(logprobs)
+  if advantages is not None:
+    loss_fn_inputs["advantages"] = list(advantages)
+
+  return types.Datum(
+    model_input=types.ModelInput.from_ints(tokens=tokens[:-1]),
+    loss_fn_inputs=cast(Any, loss_fn_inputs),
+  )
+
+
+# *** Logging helpers ***
 def log_step(phase: str, step: int, **metrics: float) -> None:
   """Record one training/eval datapoint to the metrics log."""
   ml_logger.log_metrics({"phase": phase, **metrics}, step=step)
@@ -284,10 +349,6 @@ def log_step(phase: str, step: int, **metrics: float) -> None:
 def log_progress(tag: str, step: int, details: str) -> None:
   """Pretty-print one step of progress to stdout. The JSONL log is the source of truth."""
   logging.info("[%s %03d] %s", tag, step, details)
-
-
-def empty_eval_metrics() -> EvalMetrics:
-  return {"execution_match": 0.0, "exact_match": 0.0, "execution_match_not_exact": 0.0, "similarity": 0.0}
 
 
 def format_eval_metrics(metrics: EvalMetrics) -> str:
@@ -308,34 +369,78 @@ def format_metric_chain(name: str, before: EvalMetrics, after_sft: EvalMetrics, 
     return f"{before[name] * 100:.1f}%->{after_sft[name] * 100:.1f}%->{after_rl[name] * 100:.1f}%"
 
 
+# *** Eval + rollout helpers ***
 async def snapshot_eval(trainer: tinker.TrainingClient, alias: str, eval_examples: list[dict[str, Any]]) -> EvalMetrics:
   """Snapshot current weights to a sampler and run the eval loop against it."""
   sampler = await trainer.save_weights_and_get_sampling_client_async(name=alias)
-  return await evaluate_metrics(sampler, tokenizer, alias, eval_examples, max_tokens=config.dataset.eval_max_tokens, seed=config.seed)
+  return await sample_eval_metrics(sampler, tokenizer, alias, eval_examples, max_tokens=config.dataset.eval_max_tokens, seed=config.seed)
 
 
-def make_rl_datum(rollout: dict[str, Any], advantage: float) -> types.Datum:
-  """Pack one scored rollout into a Datum. Prompt-token positions get 0 weight/advantage/logprob."""
-  prompt, completion, logprobs = rollout["prompt_tokens"], rollout["completion_tokens"], rollout["completion_logprobs"]
-  prompt_pad = max(0, len(prompt) - 1)
-  pad = [0.0] * prompt_pad
+def build_rollout(
+  example: dict[str, Any],
+  sequence: Any,
+  tokenizer: PreTrainedTokenizerBase,
+) -> dict[str, Any]:
+  """Decode one sampled sequence and attach token/logprob fields for PPO."""
+  predicted_sql = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
+  score = score_eval_prediction(predicted_sql, example)
+  return {
+    **score,
+    "prompt_tokens": example["prompt_tokens"],
+    "completion_tokens": list(sequence.tokens),
+    "completion_logprobs": [float(v) for v in (sequence.logprobs or [])],
+  }
 
-  full = prompt + completion
-  # Datum auto-converts 1D lists to TensorData with dtypes inferred from the key.
-  return types.Datum(
-    model_input=types.ModelInput.from_ints(tokens=full[:-1]),
-    loss_fn_inputs={
-      "target_tokens": full[1:],
-      "weights": pad + [1.0] * len(completion),
-      "logprobs": pad + list(logprobs),
-      "advantages": pad + [advantage] * len(completion),
-    },
-  )
+
+async def sample_eval_metrics(
+  sampler: Any,
+  tokenizer: PreTrainedTokenizerBase,
+  alias: str,
+  examples: list[dict[str, Any]],
+  max_tokens: int,
+  seed: int,
+) -> EvalMetrics:
+  """Sample current weights; SQL reward scoring and aggregation live in utils.rewards."""
+  scores: list[dict[str, Any]] = []
+  futures = [
+    sampler.sample_async(
+      prompt=types.ModelInput.from_ints(tokens=example["prompt_tokens"]),
+      num_samples=1,
+      sampling_params=types.SamplingParams(max_tokens=max_tokens, seed=seed + idx, temperature=0.0),
+    )
+    for idx, example in enumerate(examples)
+  ]
+  responses = await asyncio.gather(*futures)
+
+  for idx, (example, response) in enumerate(zip(examples, responses)):
+    predicted_sql = tokenizer.decode(response.sequences[0].tokens if response.sequences else [], skip_special_tokens=True)
+    info = score_eval_prediction(predicted_sql, example)
+    predicted = normalize_sql(info["predicted_sql"])
+    target = normalize_sql(example["target"])
+    matches_execution = bool(info["execution_match"])
+    execution_error = info["sqlite_error"]
+    scores.append(info)
+
+    log_level = logging.INFO if matches_execution else logging.WARNING
+    sqlite_line = f"\nSQLite:    {execution_error}" if execution_error else ""
+    logging.log(
+      log_level,
+      "\n--- [Visual Check %s Item %d] ---\nQuestion: %s\nPredicted: %s\nTarget:    %s%s\nExecution: %s\n",
+      alias,
+      idx + 1,
+      example["question"],
+      predicted,
+      target,
+      sqlite_line,
+      "MATCH" if matches_execution else "NO MATCH",
+    )
+
+  return aggregate_eval_scores(scores)
 
 
 # *** Config + presets ***
 # Every leaf field is reachable on the CLI via dotted paths, e.g.
-#   rl.steps=20 reward.match=2.0 model.rank=16
+#   rl.steps=20 model.rank=16
 @chz.chz
 class ModelConfig:
   base_model: str
@@ -347,7 +452,6 @@ class ModelConfig:
 class DatasetConfig:
   name: str = DATASET
   limit: int = 12_500
-  prompt_format: str = "plain_sql_completion"
   train_limit: int = 100
   rl_train_limit: int = 64
   eval_limit: int = 100
@@ -377,18 +481,10 @@ class RlConfig:
 
 
 @chz.chz
-class RewardConfig:
-  compile: float = 0.25
-  match: float = 1.0
-  error_penalty: float = -0.5
-  similarity: float = 0.0
-
-
-@chz.chz
 class Config:
   model: ModelConfig
   phase: str = "full"  # "full" | "sft_only" | "rl_only"
-  base_url: str = os.getenv("TINKER_BASE_URL") or os.getenv("OPEN_RL_BASE_URL") or BASE_URL
+  base_url: str = os.getenv("TINKER_BASE_URL", BASE_URL)
   seed: int = 30
   grad_clip_norm: float = 0.3
   log_dir: str = str(LOG_DIR)
@@ -396,7 +492,6 @@ class Config:
   dataset: DatasetConfig = chz.field(default_factory=DatasetConfig)
   sft: SftConfig = chz.field(default_factory=SftConfig)
   rl: RlConfig = chz.field(default_factory=RlConfig)
-  reward: RewardConfig = chz.field(default_factory=RewardConfig)
 
 
 GEMMA4_E2B = {"model.base_model": "google/gemma-4-e2b", "model.tokenizer_name": "google/gemma-4-e2b"}
@@ -417,11 +512,6 @@ PRESETS = {
       "rl.learning_rate": 5e-6,
       "rl.samples_per_prompt": 8,
       "rl.prompts_per_step": 8,
-      # Composite reward: compile + match + continuous partial signals at weight 1.0.
-      "reward.compile": 0.25,
-      "reward.match": 2.0,
-      "reward.error_penalty": -0.25,
-      "reward.similarity": 1.0,
       "dataset.train_limit": 100,
       "dataset.rl_train_limit": 5000,
       "dataset.eval_limit": 100,
