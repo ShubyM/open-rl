@@ -7,8 +7,8 @@ This directory contains examples for Supervised Fine-Tuning (SFT) on Text-to-SQL
 1. **Install dependencies**:
    Set up the server and client environments:
    ```bash
-   cd src && uv sync --extra cpu
-   cd ../examples && uv sync
+   uv sync --project src/server --extra cpu
+   uv sync --package open-rl-client
    ```
 
 ## Running the Training Server
@@ -22,8 +22,7 @@ make server BASE_MODEL=google/gemma-3-1b-pt
 
 Execute the training script:
 ```bash
-cd examples/sft/text-to-sql
-uv run python texttosql_sft.py gemma
+uv run --package open-rl-client python examples/sft/text-to-sql/texttosql_sft.py gemma
 ```
 
 ## Contents

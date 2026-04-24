@@ -10,6 +10,13 @@ We love Tinker. Tinker simplifies LLM post-training for developers and researche
 
 ## Quick Start
 
+Install the dependency set you need from the repository root:
+
+```bash
+uv sync --package open-rl-client      # examples and client scripts
+uv sync --project src/server --extra cpu
+```
+
 Follow the [Pig Latin notebook](client/piglatin_sft_notebook.ipynb) or [Text-to-SQL notebook](client/texttosql_sft_notebook.ipynb) to see supervised fine-tuning in action. Follow the [RLVR example](docs/guides/reinforcement-learning/rlvr.md) to see reinforcement learning in action.
 
 Snippet below shows a sample Reinforcement Learning loop like GRPO, where the 4 API primitives are used to create a generate-and-reward-train loop:

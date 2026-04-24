@@ -7,8 +7,8 @@ The RLVR (Reinforcement Learning with Verifiable Rewards) demo showcases trainin
 1. **Install dependencies**:
    Set up the server and client environments:
    ```bash
-   cd src && uv sync --extra cpu
-   cd ../examples && uv sync
+   uv sync --project src/server --extra cpu
+   uv sync --package open-rl-client
    ```
 
 ## Running the Training Server
@@ -22,8 +22,7 @@ make server
 
 Execute the training script:
 ```bash
-cd examples/rl/rlvr
-uv run python rlvr.py --jobs 1 --steps 5 --base-model "Qwen/Qwen3-4B-Instruct-2507"
+uv run --package open-rl-client python examples/rl/rlvr/rlvr.py --jobs 1 --steps 5 --base-model "Qwen/Qwen3-4B-Instruct-2507"
 ```
 
 ## Contents

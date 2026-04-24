@@ -7,8 +7,8 @@ A minimal introductory fine-tuning pipeline to familiarize yourself with basic O
 1. **Install dependencies**:
    Set up the server and client environments:
    ```bash
-   cd src && uv sync --extra cpu
-   cd ../examples && uv sync
+   uv sync --project src/server --extra cpu
+   uv sync --package open-rl-client
    ```
 
 ## Running the Training Server
@@ -22,8 +22,7 @@ make server
 
 Navigate to this recipe and execute the script:
 ```bash
-cd examples/sft/hello-world
-uv run python sft.py --base-model "Qwen/Qwen3-0.6B"
+uv run --package open-rl-client python examples/sft/hello-world/sft.py --base-model "Qwen/Qwen3-0.6B"
 ```
 
 ## Contents

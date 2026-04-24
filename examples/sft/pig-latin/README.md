@@ -7,8 +7,8 @@ This script demonstrates fine-tuning a model to translate English into Pig Latin
 1. **Install dependencies**:
    Set up the server and client environments:
    ```bash
-   cd src && uv sync --extra cpu
-   cd ../examples && uv sync
+   uv sync --project src/server --extra cpu
+   uv sync --package open-rl-client
    ```
 
 ## Running the Training Server
@@ -29,14 +29,12 @@ make server BASE_MODEL=google/gemma-3-1b-it
 
 ### Option 1: Qwen
 ```bash
-cd examples/sft/pig-latin
-uv run python piglatin_sft.py qwen
+uv run --package open-rl-client python examples/sft/pig-latin/piglatin_sft.py qwen
 ```
 
 ### Option 2: Gemma
 ```bash
-cd examples/sft/pig-latin
-uv run python piglatin_sft.py gemma
+uv run --package open-rl-client python examples/sft/pig-latin/piglatin_sft.py gemma
 ```
 
 ## Contents

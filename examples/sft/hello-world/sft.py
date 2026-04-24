@@ -15,10 +15,10 @@ Modes of Operation:
 
 Usage:
     Basic (Single Tenant):
-        uv run python sft.py --base-model "Qwen/Qwen3-0.6B"
+        uv run --package open-rl-client python examples/sft/hello-world/sft.py --base-model "Qwen/Qwen3-0.6B"
 
     Multi-Tenant Parallel:
-        uv run python sft.py --parallel --base-model "Qwen/Qwen3-0.6B"
+        uv run --package open-rl-client python examples/sft/hello-world/sft.py --parallel --base-model "Qwen/Qwen3-0.6B"
 
 Arguments:
     --base-model: The base model to use (must match what the server is running).

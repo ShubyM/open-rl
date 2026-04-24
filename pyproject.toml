@@ -1,9 +1,18 @@
 [project]
-name = "open-rl-dev"
+name = "open-rl"
 version = "0.1.0"
-description = "Development tooling for the Open RL repository."
+description = "Workspace root and development tooling for the Open RL repository."
 requires-python = ">=3.12"
 dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+    "dev/tools",
+    "examples",
+]
 
 [dependency-groups]
 dev = [

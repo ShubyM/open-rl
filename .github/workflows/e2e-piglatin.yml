@@ -35,16 +35,13 @@ jobs:
             hf-hub-${{ runner.os }}-
 
       - name: Install server deps (CPU extra)
-        working-directory: src/server
-        run: uv sync --extra cpu
+        run: uv sync --project src/server --extra cpu
 
       - name: Install client deps
-        working-directory: examples
-        run: uv sync
+        run: uv sync --package open-rl-client
 
       - name: Run pig-latin SFT end-to-end
-        working-directory: examples
-        run: uv run python -m unittest discover -s sft/pig-latin/tests -v
+        run: uv run --package open-rl-client python -m unittest discover -s examples/sft/pig-latin/tests -v
         env:
           TINKER_API_KEY: tml-dummy-key
           TRANSFORMERS_VERBOSITY: error

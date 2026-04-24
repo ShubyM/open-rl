@@ -31,9 +31,10 @@ For other arguments:
 make cli chat --model <id> --temperature 0.9 --system-prompt "You are a pirate."
 ```
 
-Or run directly (after `uv sync`):
+Or run directly after syncing the tools workspace package from the repository root:
 
 ```bash
+uv sync --package open-rl-tools
 open-rl list
 open-rl chat --model <id>
 ```

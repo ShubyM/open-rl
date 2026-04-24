@@ -27,13 +27,13 @@ help:
 # ---------------------------------------------------------------------------
 server:
 	@-kill -9 $$(lsof -ti:$(PORT)) 2>/dev/null || true
-	cd src/server && SINGLE_PROCESS="$(SINGLE_PROCESS)" BASE_MODEL="$(BASE_MODEL)" SAMPLER="$(SAMPLER)" \
-	  uv run --extra $(if $(filter vllm,$(SAMPLER)),gpu,cpu) \
+	SINGLE_PROCESS="$(SINGLE_PROCESS)" BASE_MODEL="$(BASE_MODEL)" SAMPLER="$(SAMPLER)" \
+	  uv run --project src/server --directory src/server --extra $(if $(filter vllm,$(SAMPLER)),gpu,cpu) \
 	  python -m uvicorn gateway:app --host $(HOST) --port $(PORT)
 
 vllm:
-	cd src/server && BASE_MODEL="$(BASE_MODEL)" \
-	  uv run --extra vllm python -m vllm_sampler
+	BASE_MODEL="$(BASE_MODEL)" \
+	  uv run --project src/server --directory src/server --extra vllm python -m vllm_sampler
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -44,13 +44,13 @@ ifeq (cli,$(firstword $(MAKECMDGOALS)))
 endif
 
 cli:
-	@cd dev/tools && BASE_URL="$(BASE_URL)" uv run python cli.py $(CLI_ARGS)
+	@BASE_URL="$(BASE_URL)" uv run --package open-rl-tools open-rl $(CLI_ARGS)
 
 # ---------------------------------------------------------------------------
 # Dev
 # ---------------------------------------------------------------------------
 test:
-	cd examples && uv run python -m unittest discover -s sft/pig-latin/tests
+	uv run --package open-rl-client python -m unittest discover -s examples/sft/pig-latin/tests
 
 lint:
 	uv run --dev ruff check .

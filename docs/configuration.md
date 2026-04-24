@@ -32,7 +32,7 @@ The Makefile wraps the common ones; k8s manifests set them in pod specs.
 | --- | --- | --- |
 | `TINKER_BASE_URL` / `OPEN_RL_BASE_URL` | `http://127.0.0.1:9003` | Where the client scripts point the tinker SDK. |
 | `TINKER_API_KEY` | `tml-dummy-key` | Passed through to the SDK. No real auth on the local server; any value works. |
-| `HF_TOKEN` | unset | Required for gated models (Gemma 3, FunctionGemma). `uv run hf auth login` is the easiest way to set it. |
+| `HF_TOKEN` | unset | Required for gated models (Gemma 3, FunctionGemma). `uv run --package open-rl-client hf auth login` is the easiest way to set it. |
 | `ENABLE_GCP_TRACE` | `0` | `1` exports OpenTelemetry traces to Google Cloud Trace. |
 | `ENABLE_CONSOLE_TRACE` | `0` | `1` prints trace spans to stdout (debugging). |
 

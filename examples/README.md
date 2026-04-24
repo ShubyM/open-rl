@@ -5,10 +5,9 @@ This directory contains examples, demos, and helper scripts for using the Open-R
 ## Prerequisites
 
 * **Install [uv](https://docs.astral.sh/uv/):** Follow the official installation guide to install the fast Python package manager.
-* **Synchronize Dependencies:** Run the following command to set up the environment:
+* **Synchronize Dependencies:** Run the following command from the repository root to set up the examples/client environment:
   ```bash
-  cd examples
-  uv sync
+  uv sync --package open-rl-client
   ```
 
 ---
@@ -27,5 +26,4 @@ This directory contains examples, demos, and helper scripts for using the Open-R
 * **[Tinker RL Basic K8s Jobs](rl/tinker-rl-basic):** Example Kubernetes Job manifests for deploying scalable, distributed RL workloads to a multi-tenant cluster.
 
 ---
-
 

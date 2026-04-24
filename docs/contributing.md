@@ -25,6 +25,25 @@ This project follows
 
 ## Contribution process
 
+### Development environment
+
+This repository uses uv projects for isolated dependency sets:
+
+```bash
+uv sync --only-dev                    # repository formatting and pre-commit tooling
+uv sync --package open-rl-client      # examples and client scripts
+uv sync --project src/server --extra cpu
+uv sync --project src/server --extra vllm
+```
+
+The root workspace lock covers repository tooling, examples, and developer tools. The server keeps its own lockfile because its CPU, GPU, and vLLM extras intentionally select different Torch indexes.
+
+Run formatting before sending a pull request:
+
+```bash
+make fmt
+```
+
 ### Code reviews
 
 All submissions, including submissions by project members, require review. We
