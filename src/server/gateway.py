@@ -1,6 +1,7 @@
 # This file contains the FastAPI server entry point and request handlers for the Open-RL API backend.
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -15,6 +16,7 @@ from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from state_metadata import StateMetadata
 from store import get_store
 
 store = get_store()
@@ -70,6 +72,12 @@ def get_default_model_name() -> str | None:
     if clock_cycle.engine.base_model_name:
       return clock_cycle.engine.base_model_name
   return os.getenv("BASE_MODEL")
+
+
+def resolve_state_path(path: str) -> str:
+  if path.startswith("tinker://") and "/weights/" in path:
+    path = path.rsplit("/weights/", 1)[1]
+  return path if os.path.isabs(path) else os.path.join(TMP_DIR, "checkpoints", path)
 
 
 async def _enqueue(payload: dict) -> str:
@@ -190,22 +198,45 @@ async def create_model(req: dict):
 @app.post("/api/v1/create_model_from_state")
 async def create_model_from_state(req: dict):
   """ServiceClient.create_training_client_from_state_async()"""
-  state_path = req.get("state_path")
+  state_path = req.get("state_path") or req.get("path")
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "state_path is required"})
-  # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
-  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   model_id = str(uuid.uuid4())
   req_id = await _enqueue(
     {
       "req_id": model_id,
       "model_id": model_id,
       "type": "create_model_from_state",
-      "state_path": resolved_path,
+      "state_path": resolve_state_path(state_path),
       "restore_optimizer": bool(req.get("restore_optimizer", False)),
     }
   )
   return {"request_id": req_id}
+
+
+@app.post("/api/v1/weights_info")
+async def weights_info(req: dict):
+  """RestClient.get_weights_info_by_tinker_path()."""
+  tinker_path = req.get("tinker_path") or req.get("path")
+  if not tinker_path:
+    return JSONResponse(status_code=400, content={"error": "tinker_path is required"})
+
+  metadata_path = os.path.join(resolve_state_path(tinker_path), "metadata.json")
+  if not os.path.exists(metadata_path):
+    return JSONResponse(status_code=404, content={"error": f"No metadata.json found at {metadata_path}"})
+
+  with open(metadata_path) as f:
+    metadata = StateMetadata.model_validate(json.load(f))
+  if not metadata.base_model:
+    return JSONResponse(status_code=400, content={"error": f"metadata.json at {metadata_path} missing base_model"})
+  return {
+    "base_model": metadata.base_model,
+    "is_lora": metadata.is_lora,
+    "lora_rank": metadata.lora_rank,
+    "train_attn": metadata.train_attn,
+    "train_mlp": metadata.train_mlp,
+    "train_unembed": metadata.train_unembed,
+  }
 
 
 @app.post("/api/v1/get_info")
@@ -312,7 +343,7 @@ async def save_weights(req: dict):
 
   seq_id = req.get("seq_id") or int(time.time() * 1000)
   alias = req.get("path") or f"{model_id}-samp-{seq_id}"
-  state_path = alias if os.path.isabs(alias) else os.path.join(TMP_DIR, "checkpoints", alias)
+  state_path = resolve_state_path(alias)
 
   req_id = str(uuid.uuid4())
   await _enqueue(
@@ -338,12 +369,11 @@ async def load_weights(req: dict):
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "path is required"})
 
-  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   req_id = await _enqueue(
     {
       "model_id": model_id,
       "type": "load_weights",
-      "state_path": resolved_path,
+      "state_path": resolve_state_path(state_path),
       "restore_optimizer": bool(req.get("optimizer", False)),
     }
   )

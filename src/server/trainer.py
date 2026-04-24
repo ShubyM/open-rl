@@ -12,6 +12,7 @@ import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import PeftModelForCausalLM, get_peft_model
 from pydantic import BaseModel
+from state_metadata import StateMetadata
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 
@@ -50,6 +51,7 @@ class TrainerEngine:
 
     # Store optimizers per model_id (adapter ID)
     self.optimizers: dict[str, torch.optim.Optimizer] = {}
+    self.adapter_configs: dict[str, LoraConfig] = {}
 
     # Decide device
     if torch.cuda.is_available():
@@ -134,6 +136,7 @@ class TrainerEngine:
       self.peft_model.add_adapter(adapter_id, peft_config)
 
     self.peft_model.set_adapter(adapter_id)
+    self.adapter_configs[adapter_id] = config
 
     self.peft_model.train()
     print(f"LoRA adapter '{adapter_id}' created and set to active.")
@@ -174,16 +177,21 @@ class TrainerEngine:
     if include_optimizer and optimizer is not None:
       torch.save(optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
 
-    metadata = {
-      "base_model": self.base_model_name,
-      "created_at": datetime.now().isoformat(),
-      "kind": kind,
-      "has_optimizer": include_optimizer and optimizer is not None,
-      "model_id": model_id,
-      "timestamp": time.time(),
-    }
+    config = self.adapter_configs.get(model_id, LoraConfig())
+    metadata = StateMetadata(
+      base_model=self.base_model_name or "",
+      created_at=datetime.now().isoformat(),
+      kind=kind,
+      has_optimizer=include_optimizer and optimizer is not None,
+      lora_rank=config.rank,
+      model_id=model_id,
+      timestamp=time.time(),
+      train_attn=config.train_attn,
+      train_mlp=config.train_mlp,
+      train_unembed=config.train_unembed,
+    )
     with open(os.path.join(state_path, "metadata.json"), "w") as f:
-      json.dump(metadata, f)
+      json.dump(metadata.model_dump(), f)
 
     print(f"Saved state for '{model_id}' to {state_path}")
     return {"path": state_path}
@@ -199,13 +207,13 @@ class TrainerEngine:
       raise FileNotFoundError(f"No metadata.json found at {state_path}")
 
     with open(metadata_path) as f:
-      metadata = json.load(f)
+      metadata = StateMetadata.model_validate(json.load(f))
 
-    base_model = metadata.get("base_model")
+    base_model = metadata.base_model
     if not base_model:
       raise ValueError(f"metadata.json at {state_path} missing base_model")
 
-    src_adapter_id = metadata.get("model_id")
+    src_adapter_id = metadata.model_id
     adapter_dir = state_path
     if src_adapter_id and os.path.exists(os.path.join(state_path, src_adapter_id)):
       adapter_dir = os.path.join(state_path, src_adapter_id)
@@ -223,8 +231,14 @@ class TrainerEngine:
 
     self.peft_model.set_adapter(model_id)
     self.peft_model.train()
+    self.adapter_configs[model_id] = LoraConfig(
+      rank=metadata.lora_rank,
+      train_attn=metadata.train_attn,
+      train_mlp=metadata.train_mlp,
+      train_unembed=metadata.train_unembed,
+    )
 
-    if restore_optimizer and metadata.get("has_optimizer"):
+    if restore_optimizer and metadata.has_optimizer:
       optimizer_path = os.path.join(state_path, "optimizer.pt")
       if os.path.exists(optimizer_path):
         lr = 1e-4
