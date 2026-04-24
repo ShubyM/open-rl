@@ -15,9 +15,10 @@ from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from store import get_store
+from store import get_artifact_store, get_store
 
 store = get_store()
+artifacts = get_artifact_store()
 
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
@@ -224,6 +225,27 @@ async def get_info(req: dict):
   }
 
 
+@app.post("/api/v1/weights_info")
+async def weights_info(req: dict):
+  adapter_id = artifacts.artifact_id_from_tinker_path(req.get("tinker_path"))
+  if not adapter_id:
+    return JSONResponse(status_code=400, content={"error": "tinker_path is required"})
+
+  metadata = artifacts.read_metadata(adapter_id)
+  base_model = metadata.get("base_model") or get_default_model_name()
+  if not base_model:
+    return JSONResponse(status_code=404, content={"error": "No metadata for checkpoint"})
+
+  return {
+    "base_model": base_model,
+    "is_lora": metadata.get("is_lora", True),
+    "lora_rank": metadata.get("lora_rank") or 16,
+    "train_attn": metadata.get("train_attn", True),
+    "train_mlp": metadata.get("train_mlp", True),
+    "train_unembed": metadata.get("train_unembed", False),
+  }
+
+
 @app.post("/api/v1/retrieve_future")
 async def retrieve_future(req: dict):
   """ServiceClient — poll for async request results."""
@@ -338,7 +360,13 @@ async def load_weights(req: dict):
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "path is required"})
 
-  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
+  if state_path.startswith("tinker://"):
+    resolved_path = artifacts.state_path_from_tinker_path(state_path)
+  else:
+    resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
+  if not resolved_path:
+    return JSONResponse(status_code=400, content={"error": "path is required"})
+
   req_id = await _enqueue(
     {
       "model_id": model_id,
@@ -442,26 +470,7 @@ async def asample(req: dict):
 @app.get("/api/v1/list_adapters")
 async def list_adapters():
   """CLI `list` — scan the peft directory for saved adapters."""
-  import json
-
-  peft_dir = os.path.join(TMP_DIR, "peft")
-  adapters = []
-
-  if os.path.exists(peft_dir):
-    for entry in sorted(os.scandir(peft_dir), key=lambda e: e.stat().st_ctime, reverse=True):
-      if not entry.is_dir():
-        continue
-      info = {"model_id": entry.name, "created_at": entry.stat().st_ctime, "timestamp": entry.stat().st_ctime, "alias": None}
-      metadata_path = os.path.join(entry.path, "metadata.json")
-      if os.path.exists(metadata_path):
-        try:
-          with open(metadata_path) as f:
-            info.update(json.load(f))
-        except Exception:
-          pass
-      adapters.append(info)
-
-  return {"adapters": adapters}
+  return {"adapters": artifacts.list_metadata()}
 
 
 # *** Internal ***

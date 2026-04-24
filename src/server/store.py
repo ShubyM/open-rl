@@ -4,9 +4,62 @@ import asyncio
 import json
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import redis.asyncio as redis
+
+
+@dataclass(frozen=True)
+class ArtifactStore:
+  root: Path
+  default_namespace: str = "peft"
+
+  def _namespace(self, namespace: str | None) -> str:
+    return namespace or self.default_namespace
+
+  def artifact_id_from_tinker_path(self, tinker_path: str | None) -> str | None:
+    if not tinker_path:
+      return None
+    return tinker_path.removeprefix("tinker://").split("-samp-", 1)[0]
+
+  def artifact_dir(self, artifact_id: str, namespace: str | None = None) -> Path:
+    return self.root / self._namespace(namespace) / artifact_id
+
+  def metadata_file(self, artifact_id: str, namespace: str | None = None) -> Path:
+    return self.artifact_dir(artifact_id, namespace) / "metadata.json"
+
+  def read_metadata(self, artifact_id: str, namespace: str | None = None) -> dict[str, Any]:
+    metadata_file = self.metadata_file(artifact_id, namespace)
+    if not metadata_file.exists():
+      return {}
+    return json.loads(metadata_file.read_text())
+
+  def update_metadata(self, artifact_id: str, namespace: str | None = None, **updates: Any) -> None:
+    metadata_file = self.metadata_file(artifact_id, namespace)
+    metadata_file.parent.mkdir(parents=True, exist_ok=True)
+    metadata = self.read_metadata(artifact_id, namespace)
+    metadata.update({key: value for key, value in updates.items() if value is not None})
+    metadata_file.write_text(json.dumps(metadata))
+
+  def list_metadata(self, namespace: str | None = None) -> list[dict[str, Any]]:
+    namespace_dir = self.root / self._namespace(namespace)
+    if not namespace_dir.exists():
+      return []
+
+    artifacts = []
+    for entry in sorted(namespace_dir.iterdir(), key=lambda path: path.stat().st_ctime, reverse=True):
+      if not entry.is_dir():
+        continue
+      metadata = {"model_id": entry.name, "created_at": entry.stat().st_ctime, "timestamp": entry.stat().st_ctime, "alias": None}
+      metadata.update(self.read_metadata(entry.name, namespace))
+      artifacts.append(metadata)
+    return artifacts
+
+  def state_path_from_tinker_path(self, tinker_path: str | None, namespace: str | None = None) -> str | None:
+    artifact_id = self.artifact_id_from_tinker_path(tinker_path)
+    return str(self.artifact_dir(artifact_id, namespace)) if artifact_id else None
 
 
 class RequestStore(ABC):
@@ -179,6 +232,7 @@ class RedisStore(RequestStore):
 
 # Global singleton factory
 _store_instance = None
+_artifact_store_instance = None
 
 
 def get_store() -> RequestStore:
@@ -192,3 +246,10 @@ def get_store() -> RequestStore:
       print("[RequestStore] Initializing In-Memory backend with RR Tenant Queues")
       _store_instance = InMemoryStore()
   return _store_instance
+
+
+def get_artifact_store() -> ArtifactStore:
+  global _artifact_store_instance
+  if _artifact_store_instance is None:
+    _artifact_store_instance = ArtifactStore(Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")))
+  return _artifact_store_instance

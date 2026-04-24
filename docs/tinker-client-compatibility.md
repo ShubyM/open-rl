@@ -10,14 +10,15 @@ discovered method
 with small fixture arguments, and records whether the call succeeds before
 the probe timeout.
 
-- Supported methods: 36
-- Unsupported methods: 43
+- Supported methods: 41
+- Unsupported methods: 38
 
 ## Supported Methods
 
 ### RestClient
 
 - `get_telemetry`
+- `get_weights_info_by_tinker_path`
 
 ### SamplingClient
 
@@ -35,6 +36,10 @@ the probe timeout.
 - `create_rest_client`
 - `create_sampling_client`
 - `create_sampling_client_async`
+- `create_training_client_from_state`
+- `create_training_client_from_state_async`
+- `create_training_client_from_state_with_optimizer`
+- `create_training_client_from_state_with_optimizer_async`
 - `get_server_capabilities`
 - `get_server_capabilities_async`
 - `get_telemetry`
@@ -83,7 +88,6 @@ the probe timeout.
 - `get_training_run_async`
 - `get_training_run_by_tinker_path`
 - `get_training_run_by_tinker_path_async`
-- `get_weights_info_by_tinker_path`
 - `list_checkpoints`
 - `list_checkpoints_async`
 - `list_sessions`
@@ -105,13 +109,6 @@ the probe timeout.
 - `get_base_model`
 - `get_base_model_async`
 - `get_tokenizer`
-
-### ServiceClient
-
-- `create_training_client_from_state`
-- `create_training_client_from_state_async`
-- `create_training_client_from_state_with_optimizer`
-- `create_training_client_from_state_with_optimizer_async`
 
 ### TrainingClient
 

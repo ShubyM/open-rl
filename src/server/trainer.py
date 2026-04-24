@@ -50,6 +50,7 @@ class TrainerEngine:
 
     # Store optimizers per model_id (adapter ID)
     self.optimizers: dict[str, torch.optim.Optimizer] = {}
+    self.adapter_configs: dict[str, LoraConfig] = {}
 
     # Decide device
     if torch.cuda.is_available():
@@ -79,6 +80,7 @@ class TrainerEngine:
 
     if adapter_id in self.optimizers:
       del self.optimizers[adapter_id]
+    self.adapter_configs[adapter_id] = config
 
     if not any([config.train_attn, config.train_mlp, config.train_unembed]):
       raise ValueError("At least one LoRA training target must be enabled.")
@@ -151,9 +153,19 @@ class TrainerEngine:
       self.peft_model.save_pretrained(save_path, selected_adapters=[adapter_id])
 
       # Save minimal metadata
-      metadata = {"model_id": adapter_id, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
-      if alias is not None:
-        metadata["alias"] = alias
+      config = self.adapter_configs.get(adapter_id)
+      metadata = {
+        "alias": alias,
+        "base_model": self.base_model_name,
+        "created_at": datetime.now().isoformat(),
+        "is_lora": True,
+        "lora_rank": config.rank if config else None,
+        "model_id": adapter_id,
+        "timestamp": time.time(),
+        "train_attn": config.train_attn if config else None,
+        "train_mlp": config.train_mlp if config else None,
+        "train_unembed": config.train_unembed if config else None,
+      }
       with open(os.path.join(save_path, "metadata.json"), "w") as f:
         json.dump(metadata, f)
 
@@ -201,14 +213,18 @@ class TrainerEngine:
     with open(metadata_path) as f:
       metadata = json.load(f)
 
-    base_model = metadata.get("base_model")
+    base_model = metadata.get("base_model") or self.base_model_name
     if not base_model:
       raise ValueError(f"metadata.json at {state_path} missing base_model")
 
     src_adapter_id = metadata.get("model_id")
     adapter_dir = state_path
-    if src_adapter_id and os.path.exists(os.path.join(state_path, src_adapter_id)):
-      adapter_dir = os.path.join(state_path, src_adapter_id)
+    src_adapter_dir = os.path.join(state_path, src_adapter_id) if src_adapter_id else None
+    basename_adapter_dir = os.path.join(state_path, os.path.basename(state_path))
+    if src_adapter_dir and os.path.exists(os.path.join(src_adapter_dir, "adapter_config.json")):
+      adapter_dir = src_adapter_dir
+    elif os.path.exists(os.path.join(basename_adapter_dir, "adapter_config.json")):
+      adapter_dir = basename_adapter_dir
 
     self.load_base_model(base_model)
     assert self.base_model is not None
@@ -223,6 +239,12 @@ class TrainerEngine:
 
     self.peft_model.set_adapter(model_id)
     self.peft_model.train()
+    self.adapter_configs[model_id] = LoraConfig(
+      rank=metadata.get("lora_rank") or 16,
+      train_attn=metadata.get("train_attn", True),
+      train_mlp=metadata.get("train_mlp", True),
+      train_unembed=metadata.get("train_unembed", False),
+    )
 
     if restore_optimizer and metadata.get("has_optimizer"):
       optimizer_path = os.path.join(state_path, "optimizer.pt")
