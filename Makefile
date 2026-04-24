@@ -53,12 +53,12 @@ test:
 	cd examples && uv run python -m unittest discover -s sft/pig-latin/tests
 
 lint:
-	uvx ruff check .
-	uvx ruff format --check .
+	uv run --dev ruff check .
+	uv run --dev ruff format --check .
 
 fmt:
-	uvx ruff check --fix .
-	uvx ruff format .
+	uv run --dev ruff check --fix .
+	uv run --dev ruff format .
 
 # ---------------------------------------------------------------------------
 # Deployment (GKE)
