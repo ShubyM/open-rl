@@ -4,9 +4,34 @@ import asyncio
 import json
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import redis.asyncio as redis
+
+
+@dataclass(frozen=True)
+class ArtifactStore:
+  root: Path
+
+  def artifact_id_from_tinker_path(self, tinker_path: str | None) -> str | None:
+    if not tinker_path:
+      return None
+    return tinker_path.removeprefix("tinker://").split("-samp-", 1)[0]
+
+  def artifact_dir(self, artifact_id: str) -> Path:
+    return self.root / "peft" / artifact_id
+
+  def read_metadata(self, artifact_id: str) -> dict[str, Any]:
+    metadata_file = self.artifact_dir(artifact_id) / "metadata.json"
+    if metadata_file.exists():
+      return json.loads(metadata_file.read_text())
+    return {}
+
+  def state_path_from_tinker_path(self, tinker_path: str | None) -> str | None:
+    artifact_id = self.artifact_id_from_tinker_path(tinker_path)
+    return str(self.artifact_dir(artifact_id)) if artifact_id else None
 
 
 class RequestStore(ABC):
@@ -179,6 +204,7 @@ class RedisStore(RequestStore):
 
 # Global singleton factory
 _store_instance = None
+_artifact_store_instance = None
 
 
 def get_store() -> RequestStore:
@@ -192,3 +218,10 @@ def get_store() -> RequestStore:
       print("[RequestStore] Initializing In-Memory backend with RR Tenant Queues")
       _store_instance = InMemoryStore()
   return _store_instance
+
+
+def get_artifact_store() -> ArtifactStore:
+  global _artifact_store_instance
+  if _artifact_store_instance is None:
+    _artifact_store_instance = ArtifactStore(Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")))
+  return _artifact_store_instance
