@@ -50,7 +50,7 @@ cli:
 # Dev
 # ---------------------------------------------------------------------------
 test:
-	cd examples && uv run python -m unittest discover -s sft/pig-latin/tests
+	cd examples && PYTHONPATH=.:sft/pig-latin uv run python -m unittest discover -s tests
 
 lint:
 	uvx ruff check .
