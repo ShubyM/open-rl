@@ -87,7 +87,7 @@ class TrainerEngine:
     if config.train_mlp:
       # TODO: Revisit MLP targets for packed/MoE module names across supported backends.
       target_suffixes.extend(["gate_proj", "up_proj", "down_proj"])
-    if config.train_unembed and not target_suffixes:
+    if config.train_unembed:
       target_suffixes.append("lm_head")
 
     target_names = set(target_suffixes)
@@ -118,7 +118,7 @@ class TrainerEngine:
       lora_dropout=config.lora_dropout,
       bias="none",
       target_modules=self._target_lora_modules(config),
-      modules_to_save=["lm_head", "embed_tokens"] if config.train_unembed else None,
+      modules_to_save=None,
     )
 
     if config.seed is not None:
