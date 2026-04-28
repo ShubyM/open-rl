@@ -51,6 +51,7 @@ class TrainerEngine:
     # Store optimizers per model_id (adapter ID)
     self.optimizers: dict[str, torch.optim.Optimizer] = {}
     self.adapter_configs: dict[str, LoraConfig] = {}
+    self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
 
     # Decide device
     if torch.cuda.is_available():
@@ -74,6 +75,31 @@ class TrainerEngine:
     self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
     print("Successfully loaded.")
 
+  def _target_lora_modules(self, config: LoraConfig) -> list[str]:
+    assert self.base_model is not None
+
+    cache_key = (config.train_attn, config.train_mlp, config.train_unembed)
+    if cache_key in self.lora_target_modules:
+      return self.lora_target_modules[cache_key]
+
+    target_suffixes: list[str] = []
+    if config.train_attn:
+      target_suffixes.extend(["q_proj", "k_proj", "v_proj", "o_proj"])
+    if config.train_mlp:
+      # TODO: Revisit MLP targets for packed/MoE module names across supported backends.
+      target_suffixes.extend(["gate_proj", "up_proj", "down_proj"])
+    if config.train_unembed and not target_suffixes:
+      target_suffixes.append("lm_head")
+
+    target_names = set(target_suffixes)
+    target_modules = [
+      name for name, module in self.base_model.named_modules() if name.rsplit(".", 1)[-1] in target_names and isinstance(module, torch.nn.Linear)
+    ]
+    if not target_modules:
+      raise ValueError(f"No supported LoRA target modules found for suffixes: {target_suffixes}")
+    self.lora_target_modules[cache_key] = target_modules
+    return target_modules
+
   def create_adapter(self, adapter_id: str, config: LoraConfig) -> None:
     """Create a new LoRA adapter on top of the loaded base model."""
     assert self.base_model is not None, "Base model is not loaded. Call load_base_model first."
@@ -87,44 +113,13 @@ class TrainerEngine:
 
     print(f"Creating LoRA adapter '{adapter_id}'...")
 
-    target_suffixes: list[str] = []
-    if config.train_attn:
-      target_suffixes.extend(["q_proj", "k_proj", "v_proj", "o_proj"])
-    if config.train_mlp:
-      target_suffixes.extend(["gate_proj", "up_proj", "down_proj"])
-
-    # Decide target_modules based on model type and config
-    explicit_target_modules = os.getenv("OPEN_RL_TARGET_MODULES")
-    use_text_tower_lora = getattr(self.base_model.config, "model_type", None) == "gemma4"
-    target_modules: str | list[str]
-    layers_to_transform = None
-    layers_pattern = None
-
-    if explicit_target_modules == "all-linear":
-      target_modules = "all-linear"
-      print("[trainer] Forcing PEFT target_modules=all-linear via OPEN_RL_TARGET_MODULES")
-    elif use_text_tower_lora:
-      if target_suffixes:
-        target_modules = target_suffixes
-        model_config = getattr(self.base_model.config, "text_config", self.base_model.config)
-        layers_to_transform = list(range(model_config.num_hidden_layers))
-        layers_pattern = "language_model.layers"
-      else:
-        target_modules = []
-    elif config.train_attn and config.train_mlp and config.train_unembed:
-      target_modules = "all-linear"
-    else:
-      target_modules = target_suffixes
-
     peft_config = PeftLoraConfig(
       task_type="CAUSAL_LM",
       r=config.rank,
       lora_alpha=config.lora_alpha,
       lora_dropout=config.lora_dropout,
       bias="none",
-      target_modules=target_modules,
-      layers_to_transform=layers_to_transform,
-      layers_pattern=layers_pattern,
+      target_modules=self._target_lora_modules(config),
       modules_to_save=["lm_head", "embed_tokens"] if config.train_unembed else None,
     )
 

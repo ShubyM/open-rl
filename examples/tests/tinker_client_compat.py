@@ -205,7 +205,6 @@ def probe_server(methods: list[str]) -> dict[str, str]:
       compat_model_path(),
       single_process=True,
       startup_timeout=STARTUP_TIMEOUT,
-      extra_env={"OPEN_RL_TARGET_MODULES": "all-linear"},
     ) as base_url,
   ):
     service, state_path, clients = make_clients(base_url)

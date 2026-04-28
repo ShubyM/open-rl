@@ -1,13 +1,15 @@
-"""Patch vLLM's LoRA module registration to avoid duplicate Gemma4 modules.
+"""Patch vLLM's LoRA activation to avoid duplicate Gemma4 module aliases.
 
 Gemma4's YOCO decoder split introduces shared module references. Older vLLM
-builds register those duplicates separately with
-`named_modules(remove_duplicate=False)`, which causes LoRA weights to be set on
-one path and then immediately zeroed out on the duplicate path.
+builds register those aliases separately with `named_modules(remove_duplicate=False)`.
+The aliases are needed by vLLM 0.20's torch compile path, but activation then
+iterates those aliases and can set LoRA weights on one path before immediately
+resetting the same wrapper object through an alias with no matching adapter
+weights.
 
-This helper makes the tiny local patch that switches back to the default
-deduping `named_modules()` behavior. Run it after installing or upgrading vLLM
-until the upstream fix lands everywhere we care about.
+This helper keeps the alias registration intact and dedupes only activation by
+wrapper object identity. Run it after installing or upgrading vLLM until the
+upstream fix lands everywhere we care about.
 """
 
 from __future__ import annotations
@@ -17,8 +19,45 @@ import importlib.util
 import sys
 from pathlib import Path
 
-BAD = "self.model.named_modules(remove_duplicate=False)"
-GOOD = "self.model.named_modules()"
+BAD = """        for module_name, module in self.modules.items():
+            module_lora = self._get_lora_layer_weights(lora_model, module_name)
+            if not module_lora:
+                module.reset_lora(index)
+                logger.debug(
+                    "No LoRA weights found for module %s, skipping.", module_name
+                )
+                continue
+
+            module.set_lora(
+                index,
+                module_lora.lora_a,
+                module_lora.lora_b,
+            )
+            logger.debug("Successfully loaded LoRA weights for module %s.", module_name)
+"""
+
+GOOD = """        seen_modules: set[int] = set()
+        for module_name, module in self.modules.items():
+            module_key = id(module)
+            if module_key in seen_modules:
+                continue
+            seen_modules.add(module_key)
+
+            module_lora = self._get_lora_layer_weights(lora_model, module_name)
+            if not module_lora:
+                module.reset_lora(index)
+                logger.debug(
+                    "No LoRA weights found for module %s, skipping.", module_name
+                )
+                continue
+
+            module.set_lora(
+                index,
+                module_lora.lora_a,
+                module_lora.lora_b,
+            )
+            logger.debug("Successfully loaded LoRA weights for module %s.", module_name)
+"""
 
 
 def find_model_manager(venv: str | None = None) -> Path:
@@ -42,14 +81,14 @@ def main() -> int:
   source = path.read_text()
 
   if BAD not in source:
-    if GOOD in source:
+    if "seen_modules: set[int] = set()" in source:
       print(f"OK: {path} is already patched")
       return 0
     print(f"WARN: {path} has neither the buggy nor fixed pattern")
     return 1
 
   if args.check:
-    print(f"NEEDS_PATCH: {path} has the buggy remove_duplicate=False pattern")
+    print(f"NEEDS_PATCH: {path} activates duplicate LoRA module aliases")
     return 2
 
   path.write_text(source.replace(BAD, GOOD, 1))

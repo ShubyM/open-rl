@@ -16,7 +16,7 @@ results all live here.
 
 - Dataset: `philschmid/gretel-synthetic-text-to-sql`
 - Model: `google/gemma-4-e2b`
-- Sampler: vLLM `0.19.1`, no Open-RL BOS prepend shim
+- Sampler: vLLM `0.19.1` with the local LoRA alias activation patch, no Open-RL BOS prepend shim
 - Preset: `gemma4_e2b_rl_recipe`
 - Seed: `42`
 - SFT: `5` steps, `100` examples, lr `5e-5`
@@ -64,7 +64,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 Patch vLLM for Gemma 4 LoRA support. This is a temporary local patch for
-duplicate LoRA module registration, related to
+duplicate LoRA module aliases during adapter activation, related to
 [vllm-project/vllm#39246](https://github.com/vllm-project/vllm/issues/39246).
 
 ```bash

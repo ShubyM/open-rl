@@ -20,6 +20,7 @@ This directory contains examples, demos, and helper scripts for using the Open-R
 * **[Pig Latin Translation](sft/pig-latin):** Teaches a model to perform specialized Pig Latin transformations, demonstrating custom token-level targets and loss masks.
 * **[Text-to-SQL SFT](sft/text-to-sql):** Adapts Gemma 3 into a specialized database query assistant capable of generating SQL statements.
 * **[FunctionGemma](sft/function-gemma):** A recipe specifically targeted at fine-tuning tool-use capabilities, enabling models to reliably select and invoke functions.
+* **[Tinker Cookbook Recipes](tinker-cookbook):** Shows how to run Thinking Machines' `tinker_cookbook` loops against an Open-RL server.
 
 ### Reinforcement Learning (RL)
 * **[PPO Math Verification](rl):** Implements Proximal Policy Optimization (PPO) with advantages to verify step-by-step math reasoning paths.
