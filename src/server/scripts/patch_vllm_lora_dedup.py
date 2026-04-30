@@ -2,7 +2,7 @@
 
 Gemma4's YOCO decoder split introduces shared module references. Older vLLM
 builds register those aliases separately with `named_modules(remove_duplicate=False)`.
-The aliases are needed by vLLM 0.20's torch compile path, but activation then
+The aliases are needed by vLLM 0.20.0's torch compile path, but activation then
 iterates those aliases and can set LoRA weights on one path before immediately
 resetting the same wrapper object through an alias with no matching adapter
 weights.
