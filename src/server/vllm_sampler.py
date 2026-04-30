@@ -132,7 +132,7 @@ async def generate(req: Request):
       n=num_samples,
       temperature=temperature,
       max_tokens=max_tokens,
-      stop=stop,
+      stop_token_ids=stop,
       top_p=top_p,
       top_k=top_k,
       logprobs=1,  # return logprobs for TITO RL
