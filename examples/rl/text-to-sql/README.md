@@ -111,7 +111,7 @@ All commands below assume you are in the **repository root** directory.
 
 ### 1. Patch vLLM
 
-Patch vLLM for Gemma 4 LoRA support. This is a temporary local patch for duplicate LoRA module registration, related to [vllm-project/vllm#39246](https://github.com/vllm-project/vllm/issues/39246).
+Patch vLLM `0.20.0` for Gemma 4 LoRA support. This is a temporary local patch for duplicate LoRA module registration, related to [vllm-project/vllm#39246](https://github.com/vllm-project/vllm/issues/39246).
 
 ```bash
 (cd src/server && \
