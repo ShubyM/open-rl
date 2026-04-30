@@ -8,55 +8,56 @@ coordination, adapter training, sampling, and checkpointing.
 ## System Model
 
 ```mermaid
-flowchart TD
-    classDef client fill:#737373,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef api fill:#326ce5,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef queue fill:#d9822b,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef worker fill:#0f766e,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef state fill:#fff,stroke:#326ce5,stroke-width:2px,color:#326ce5;
+flowchart TB
+    classDef client fill:#888,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef gateway fill:#326ce5,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef cache fill:#d82c20,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef compute_gpu fill:#326ce5,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef compute_pod fill:#fff,stroke:#326ce5,stroke-width:2px,color:#326ce5;
     classDef storage fill:#19a45b,stroke:#fff,stroke-width:2px,color:#fff;
 
-    subgraph Clients["RL client jobs"]
-        job1["RL loop A"]:::client
-        job2["RL loop B"]:::client
-    end
+    job1["RL Loop 1"]:::client
+    job2["RL Loop 2"]:::client
 
-    subgraph Cluster["Compute cluster"]
-    subgraph Backend["Open-RL backend"]
-        api["API server"]:::api
+    subgraph Cluster["Compute Cluster"]
+        api["API server"]:::gateway
 
-        subgraph Queue["Request queue"]
-            q1[("Model A work<br/>train, save, sample")]:::queue
-            q2[("Model B work<br/>train, save, sample")]:::queue
+        subgraph Queue["Request Queue"]
+            queue1[("Queue: Model 1<br/>Training and save work")]:::cache
+            queue2[("Queue: Model 2<br/>Training and save work")]:::cache
         end
 
-        subgraph Execution["Execution layer"]
-            trainer["Trainer<br/>(adapter updates)"]:::worker
-            sampler["Sampler<br/>(rollouts and logprobs)"]:::worker
+        subgraph Compute["Model Workers"]
+            trainer["Trainer<br/>Model state and adapter updates"]:::compute_gpu
+
+            subgraph Sampling["Sampler"]
+                sampler_service["Sampler service"]:::gateway
+                sampler_w1["Sampler Worker 1"]:::compute_pod
+                sampler_w2["Sampler Worker 2"]:::compute_pod
+                sampler_w3["Sampler Worker 3"]:::compute_pod
+                sampler_service --> sampler_w1
+                sampler_service --> sampler_w2
+                sampler_service --> sampler_w3
+            end
         end
 
-        model["Model state<br/>(base model, adapters, optimizers)"]:::state
-        snapshots[("Adapter snapshots<br/>and checkpoints")]:::storage
-    end
+        snapshots[("Adapter Snapshots<br/>and Checkpoints")]:::storage
     end
 
-    job1 -->|"Tinker operations"| api
-    job2 -->|"Tinker operations"| api
+    job1 -- "Tinker API requests" --> api
+    job2 -- "Tinker API requests" --> api
 
-    api -->|"enqueue async work"| q1
-    api -->|"enqueue async work"| q2
-    q1 -. "tenant batch" .-> trainer
-    q2 -. "tenant batch" .-> trainer
+    api -- "1. Enqueue work" --> queue1
+    api -- "1. Enqueue work" --> queue2
+    api -- "Generation requests" --> sampler_service
 
-    trainer <-->|"activate adapter, run loss, step optimizer"| model
-    trainer -->|"save or load weights"| snapshots
+    queue1 -. "2. Dequeue tenant batch" .-> trainer
+    queue2 -. "2. Dequeue tenant batch" .-> trainer
 
-    api -->|"generation request"| sampler
-    model -. "single-machine sampling can share live state" .-> sampler
-    snapshots -. "selected adapter version" .-> sampler
-    sampler -->|"tokens and logprobs"| api
-    api -->|"request ids and resolved futures"| job1
-    api -->|"request ids and resolved futures"| job2
+    trainer -- "3. Save adapter snapshots" --> snapshots
+    snapshots -. "4. Load adapter version" .-> sampler_w1
+    snapshots -.-> sampler_w2
+    snapshots -.-> sampler_w3
 ```
 
 ## Blocks
@@ -148,8 +149,8 @@ sample results, not the backend routing choice.
 
 | Concept | Single-machine run | Cluster run |
 | --- | --- | --- |
-| API server | Gateway process | Gateway service |
+| API server | Server process | API service |
 | Request queue | In-memory queue | Shared queue backing |
 | Trainer | Background worker loop in the server process | Separate trainer worker |
-| Sampler | Training process or optional inference process | Dedicated inference worker |
+| Sampler | Trainer process or optional sampler process | Dedicated sampler workers |
 | Adapter snapshots and checkpoints | Local `OPEN_RL_TMP_DIR` | Shared filesystem mounted by workers |
