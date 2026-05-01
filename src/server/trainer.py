@@ -107,14 +107,12 @@ class TrainerEngine:
     self.lora_target_modules[cache_key] = target_modules
     return target_modules
 
-  def clear_adapter_training_state(self, adapter_id: str) -> None:
-    self.adapter_states.pop(adapter_id, None)
-
   def create_adapter(self, adapter_id: str, config: LoraConfig) -> None:
     """Create a new LoRA adapter on top of the loaded base model."""
     assert self.base_model is not None, "Base model is not loaded. Call load_base_model first."
 
-    self.clear_adapter_training_state(adapter_id)
+    if adapter_id in self.adapter_states:
+      del self.adapter_states[adapter_id]
 
     if not any([config.train_attn, config.train_mlp, config.train_unembed]):
       raise ValueError("At least one LoRA training target must be enabled.")
@@ -223,9 +221,10 @@ class TrainerEngine:
     if self.peft_model is None:
       self.peft_model = PeftModelForCausalLM.from_pretrained(self.base_model, adapter_dir, adapter_name=model_id, is_trainable=True)
     else:
-      if model_id in getattr(self.peft_model, "peft_config", {}):
+      if model_id in self.peft_model.peft_config:
         self.peft_model.delete_adapter(model_id)
-        self.clear_adapter_training_state(model_id)
+        if model_id in self.adapter_states:
+          del self.adapter_states[model_id]
       self.peft_model.load_adapter(adapter_dir, adapter_name=model_id, is_trainable=True)
 
     self.peft_model.set_adapter(model_id)
