@@ -57,8 +57,7 @@ class TrainerEngine:
     self.base_model_name: str | None = None
 
     # Store per-adapter training state by model_id (adapter ID).
-    self.optimizers: dict[str, torch.optim.Optimizer] = {}
-    self.adapter_params: dict[str, list[torch.nn.Parameter]] = {}
+    self.adapter_states: dict[str, dict[str, Any]] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
 
     # Decide device
@@ -109,8 +108,7 @@ class TrainerEngine:
     return target_modules
 
   def clear_adapter_training_state(self, adapter_id: str) -> None:
-    self.optimizers.pop(adapter_id, None)
-    self.adapter_params.pop(adapter_id, None)
+    self.adapter_states.pop(adapter_id, None)
 
   def create_adapter(self, adapter_id: str, config: LoraConfig) -> None:
     """Create a new LoRA adapter on top of the loaded base model."""
@@ -141,7 +139,7 @@ class TrainerEngine:
       self.peft_model.add_adapter(adapter_id, peft_config)
 
     self.peft_model.set_adapter(adapter_id)
-    self.adapter_params[adapter_id] = active_adapter_parameters(self.peft_model, adapter_id)
+    self.adapter_states[adapter_id] = {"trainable_params": active_adapter_parameters(self.peft_model, adapter_id), "optimizer": None}
 
     self.peft_model.train()
     print(f"LoRA adapter '{adapter_id}' created and set to active.")
@@ -178,7 +176,8 @@ class TrainerEngine:
     os.makedirs(state_path, exist_ok=True)
     self.peft_model.save_pretrained(state_path, selected_adapters=[model_id])
 
-    optimizer = self.optimizers.get(model_id)
+    adapter_state = self.adapter_states.get(model_id)
+    optimizer = adapter_state.get("optimizer") if adapter_state is not None else None
     if include_optimizer and optimizer is not None:
       torch.save(optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
 
@@ -231,7 +230,8 @@ class TrainerEngine:
 
     self.peft_model.set_adapter(model_id)
     params = active_adapter_parameters(self.peft_model, model_id)
-    self.adapter_params[model_id] = params
+    adapter_state = {"trainable_params": params, "optimizer": None}
+    self.adapter_states[model_id] = adapter_state
     self.peft_model.train()
 
     if restore_optimizer and metadata.get("has_optimizer"):
@@ -240,7 +240,7 @@ class TrainerEngine:
         lr = 1e-4
         optimizer = torch.optim.AdamW(params, lr=lr)
         optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
-        self.optimizers[model_id] = optimizer
+        adapter_state["optimizer"] = optimizer
         print(f"Restored optimizer state for '{model_id}' from {optimizer_path}")
 
     print(f"Loaded state for '{model_id}' from {state_path}")
@@ -409,11 +409,12 @@ class TrainerEngine:
 
     self.peft_model.set_adapter(model_id)
     try:
-      params = self.adapter_params[model_id]
+      adapter_state = self.adapter_states[model_id]
     except KeyError as e:
       raise ValueError(f"Adapter '{model_id}' has no cached trainable parameters") from e
+    params = adapter_state["trainable_params"]
 
-    if model_id not in self.optimizers:
+    if adapter_state.get("optimizer") is None:
       lr = adam_params.get("learning_rate", 1e-4)
       beta1 = adam_params.get("beta1", 0.9)
       beta2 = adam_params.get("beta2", 0.95)
@@ -421,7 +422,7 @@ class TrainerEngine:
       weight_decay = adam_params.get("weight_decay", 0.0)
 
       print(f"Initializing AdamW optimizer for '{model_id}' with lr={lr}")
-      self.optimizers[model_id] = torch.optim.AdamW(
+      adapter_state["optimizer"] = torch.optim.AdamW(
         params,
         lr=lr,
         betas=(beta1, beta2),
@@ -429,7 +430,7 @@ class TrainerEngine:
         weight_decay=weight_decay,
       )
 
-    optimizer = self.optimizers[model_id]
+    optimizer = adapter_state["optimizer"]
     learning_rate = adam_params.get("learning_rate")
     if learning_rate is not None:
       for param_group in optimizer.param_groups:

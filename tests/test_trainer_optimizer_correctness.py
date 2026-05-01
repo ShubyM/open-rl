@@ -70,8 +70,9 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
         "adapter-b": [other_param],
       }
     )
-    engine.adapter_params = {"adapter-a": trainer_module.active_adapter_parameters(engine.peft_model, "adapter-a")}
-    engine.optimizers = {}
+    engine.adapter_states = {
+      "adapter-a": {"trainable_params": trainer_module.active_adapter_parameters(engine.peft_model, "adapter-a"), "optimizer": None}
+    }
     engine.save_adapter = lambda *_args, **_kwargs: None
 
     result = engine.optim_step(
