@@ -34,6 +34,14 @@ class Datum(BaseModel):
   model_input: list[int]
 
 
+def active_adapter_parameters(model: Any, adapter_id: str) -> list[torch.nn.Parameter]:
+  model.set_adapter(adapter_id)
+  params = [param for param in model.parameters() if param.requires_grad]
+  if not params:
+    raise ValueError(f"No trainable parameters found for adapter '{adapter_id}'")
+  return params
+
+
 class TrainerEngine:
   def __init__(self):
     # The raw pre-trained base model (e.g., Gemma, Qwen) loaded in VRAM
@@ -48,8 +56,9 @@ class TrainerEngine:
     # String identifier of the currently loaded base model
     self.base_model_name: str | None = None
 
-    # Store optimizers per model_id (adapter ID)
+    # Store per-adapter training state by model_id (adapter ID).
     self.optimizers: dict[str, torch.optim.Optimizer] = {}
+    self.adapter_params: dict[str, list[torch.nn.Parameter]] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
 
     # Decide device
@@ -99,12 +108,15 @@ class TrainerEngine:
     self.lora_target_modules[cache_key] = target_modules
     return target_modules
 
+  def clear_adapter_training_state(self, adapter_id: str) -> None:
+    self.optimizers.pop(adapter_id, None)
+    self.adapter_params.pop(adapter_id, None)
+
   def create_adapter(self, adapter_id: str, config: LoraConfig) -> None:
     """Create a new LoRA adapter on top of the loaded base model."""
     assert self.base_model is not None, "Base model is not loaded. Call load_base_model first."
 
-    if adapter_id in self.optimizers:
-      del self.optimizers[adapter_id]
+    self.clear_adapter_training_state(adapter_id)
 
     if not any([config.train_attn, config.train_mlp, config.train_unembed]):
       raise ValueError("At least one LoRA training target must be enabled.")
@@ -129,6 +141,7 @@ class TrainerEngine:
       self.peft_model.add_adapter(adapter_id, peft_config)
 
     self.peft_model.set_adapter(adapter_id)
+    self.adapter_params[adapter_id] = active_adapter_parameters(self.peft_model, adapter_id)
 
     self.peft_model.train()
     print(f"LoRA adapter '{adapter_id}' created and set to active.")
@@ -213,17 +226,18 @@ class TrainerEngine:
     else:
       if model_id in getattr(self.peft_model, "peft_config", {}):
         self.peft_model.delete_adapter(model_id)
-        self.optimizers.pop(model_id, None)
+        self.clear_adapter_training_state(model_id)
       self.peft_model.load_adapter(adapter_dir, adapter_name=model_id, is_trainable=True)
 
     self.peft_model.set_adapter(model_id)
+    params = active_adapter_parameters(self.peft_model, model_id)
+    self.adapter_params[model_id] = params
     self.peft_model.train()
 
     if restore_optimizer and metadata.get("has_optimizer"):
       optimizer_path = os.path.join(state_path, "optimizer.pt")
       if os.path.exists(optimizer_path):
         lr = 1e-4
-        params = [p for p in self.peft_model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=lr)
         optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
         self.optimizers[model_id] = optimizer
@@ -235,6 +249,8 @@ class TrainerEngine:
   def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
     """Core training step: forward pass, loss computation, and backward pass."""
     assert self.peft_model is not None, "Model must be loaded first."
+    if model_id:
+      self.peft_model.set_adapter(model_id)
 
     total_loss = 0.0
     loss_fn_outputs = []
@@ -391,6 +407,12 @@ class TrainerEngine:
     if not model_id:
       raise ValueError("model_id is required for optim_step")
 
+    self.peft_model.set_adapter(model_id)
+    try:
+      params = self.adapter_params[model_id]
+    except KeyError as e:
+      raise ValueError(f"Adapter '{model_id}' has no cached trainable parameters") from e
+
     if model_id not in self.optimizers:
       lr = adam_params.get("learning_rate", 1e-4)
       beta1 = adam_params.get("beta1", 0.9)
@@ -399,7 +421,6 @@ class TrainerEngine:
       weight_decay = adam_params.get("weight_decay", 0.0)
 
       print(f"Initializing AdamW optimizer for '{model_id}' with lr={lr}")
-      params = [p for p in self.peft_model.parameters() if p.requires_grad]
       self.optimizers[model_id] = torch.optim.AdamW(
         params,
         lr=lr,
@@ -414,15 +435,14 @@ class TrainerEngine:
       for param_group in optimizer.param_groups:
         param_group["lr"] = learning_rate
 
-    total_norm = 0.0
-    for param in self.peft_model.parameters():
-      if param.grad is not None:
-        total_norm += param.grad.data.norm(2).item() ** 2
-    total_norm = total_norm**0.5
+    max_grad_norm = adam_params.get("grad_clip_norm") or math.inf
+    if max_grad_norm <= 0.0:
+      max_grad_norm = math.inf
 
-    clip_norm = adam_params.get("grad_clip_norm", 0.0)
-    if clip_norm and clip_norm > 0.0:
-      torch.nn.utils.clip_grad_norm_(self.peft_model.parameters(), clip_norm)
+    total_norm = torch.nn.utils.clip_grad_norm_(
+      params,
+      max_grad_norm,
+    )
 
     optimizer.step()
     optimizer.zero_grad()
@@ -431,7 +451,7 @@ class TrainerEngine:
 
     return {
       "metrics": {
-        "grad_norm:mean": self._sanitize_float(total_norm),
+        "grad_norm:mean": self._sanitize_float(total_norm.item()),
       },
     }
 
