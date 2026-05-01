@@ -1,11 +1,18 @@
-# Open-RL Architecture
+# Open-RL
 
-Open-RL exposes a Tinker-compatible API for running reinforcement learning and
-fine-tuning loops on self-hosted infrastructure. The core design is about
-separating the user-owned RL loop from the backend concerns of request
-coordination, adapter training, sampling, and checkpointing.
+Open-RL implements post-training APIs to fine-tune language models on
+self-hosted infrastructure. These APIs cover common post-training techniques
+such as supervised fine-tuning, reinforcement learning, and related workflows.
 
-## System Model
+Conceptually, Open-RL decouples the researcher-facing training loop from the
+infrastructure that runs it. Researchers own datasets, environments, rewards,
+losses, and optimization logic; Open-RL owns the serving, scheduling, sampling,
+and storage needed to run that loop. This separation lets training methods and
+backend capacity evolve independently.
+
+## System Architecture
+
+Here is an architecture diagram:
 
 ```mermaid
 flowchart TB
@@ -16,8 +23,8 @@ flowchart TB
     classDef compute_pod fill:#fff,stroke:#326ce5,stroke-width:2px,color:#326ce5;
     classDef storage fill:#19a45b,stroke:#fff,stroke-width:2px,color:#fff;
 
-    job1["RL Loop 1"]:::client
-    job2["RL Loop 2"]:::client
+    job1["Training Loop 1"]:::client
+    job2["Training Loop 2"]:::client
 
     subgraph Cluster["Compute Cluster"]
         api["API server"]:::gateway
@@ -44,8 +51,8 @@ flowchart TB
         snapshots[("Adapter Snapshots<br/>and Checkpoints")]:::storage
     end
 
-    job1 -- "Tinker API requests" --> api
-    job2 -- "Tinker API requests" --> api
+    job1 -- "Training requests" --> api
+    job2 -- "Training requests" --> api
 
     api -- "1. Enqueue work" --> queue1
     api -- "1. Enqueue work" --> queue2
@@ -60,25 +67,24 @@ flowchart TB
     snapshots -.-> sampler_w3
 ```
 
-## Blocks
+## Components
 
-### RL loop
+### Training loop
 
-The RL loop is user code written against the Tinker SDK. It owns the algorithm:
-building prompts or batches, calling the environment or reward function,
-computing loss inputs such as advantages, and deciding when to sample, train,
-or save weights.
+The training loop is the user-owned part of the system. It builds prompts or
+batches, calls environments or reward functions, computes loss inputs such as
+advantages, and decides when to sample, train, or save a policy version.
 
-This layer should not depend on where the backend runs. The same client
-workflow can point at a server on one machine during iteration or at a cluster
-when more capacity is needed.
+This code should not have to know where the backend runs. The same workflow can
+target a server on one machine during iteration or a cluster when more capacity
+is needed.
 
 ### API server
 
-The API server accepts Tinker-compatible requests and turns long-running work
-into asynchronous backend jobs. It returns request IDs immediately, resolves
-them through `retrieve_future`, and uses long polling so clients can wait for
-results without constantly retrying.
+The API server is the boundary between training code and model execution. It
+accepts training requests, turns long-running operations into asynchronous
+jobs, returns request IDs immediately, and resolves results through
+`retrieve_future` with long polling.
 
 The API server is also the routing point for sampling. Depending on configuration,
 generation requests can be handled by the trainer process or forwarded to a
@@ -86,13 +92,13 @@ dedicated sampler.
 
 ### Request queue
 
-The request queue is the buffer between API admission and backend execution. It
-tracks pending work and completed futures, and it groups work by `model_id` so
-each adapter can be processed as a coherent tenant batch.
+The request queue buffers work between API admission and backend execution. It
+tracks pending work and completed futures, and groups work by `model_id` so each
+adapter can be processed as a coherent tenant batch.
 
-Conceptually, this is just a queue. A single-machine run can keep it in memory,
-while a cluster run can back the same queue-and-futures abstraction with shared
-state so separate processes can coordinate.
+At this level of the design, it is just a queue. A single-machine run can keep
+it in memory, while a cluster run can back the same queue-and-futures
+abstraction with shared state so separate processes can coordinate.
 
 ### Trainer
 
@@ -119,15 +125,15 @@ training state and must not leak across tenants.
 ### Adapter snapshots and checkpoints
 
 Snapshots persist adapter weights so another component can load an exact policy
-version. They are used for sampler handoff, explicit saves, restore flows, and
-basic durability between operations.
+version. They are the handoff format between trainer and sampler, and they also
+support explicit saves, restore flows, and basic durability between operations.
 
-On one machine, snapshots live under `OPEN_RL_TMP_DIR`. In a cluster, the same
-concept maps to storage shared by the trainer and sampler.
+On one machine, a snapshot can just be a directory on local disk. In a cluster,
+it should live on a filesystem visible to both the trainer and sampler.
 
 ### Sampler
 
-The sampler produces rollouts and token logprobs for the RL loop. On one
+The sampler produces rollouts and token logprobs for the training loop. On one
 machine this can run through the same model state as training; in a cluster it
 can be a separate inference service that loads adapter snapshots.
 
@@ -137,7 +143,7 @@ sample results, not the backend routing choice.
 
 ## Request Lifecycle
 
-1. The client submits a Tinker operation to the API server.
+1. The client submits a training request to the API server.
 2. The API server records a pending future and enqueues the operation.
 3. The trainer drains tenant-specific work and updates model state.
 4. Save operations write adapter snapshots for later sampling or restore.
@@ -153,4 +159,4 @@ sample results, not the backend routing choice.
 | Request queue | In-memory queue | Shared queue backing |
 | Trainer | Background worker loop in the server process | Separate trainer worker |
 | Sampler | Trainer process or optional sampler process | Dedicated sampler workers |
-| Adapter snapshots and checkpoints | Local `OPEN_RL_TMP_DIR` | Shared filesystem mounted by workers |
+| Adapter snapshots and checkpoints | Local filesystem | Network shared filesystem |
