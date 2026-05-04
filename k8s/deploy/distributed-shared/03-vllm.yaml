@@ -39,13 +39,29 @@ spec:
         - containerPort: 8001
         env:
         - name: BASE_MODEL
-          value: "Qwen/Qwen3-4B-Instruct-2507"
+          valueFrom:
+            configMapKeyRef:
+              name: open-rl-config
+              key: BASE_MODEL
+        - name: VLLM_GPU_MEMORY_UTILIZATION
+          valueFrom:
+            configMapKeyRef:
+              name: open-rl-config
+              key: VLLM_GPU_MEMORY_UTILIZATION
+        - name: VLLM_ARCHITECTURE_OVERRIDE
+          valueFrom:
+            configMapKeyRef:
+              name: open-rl-config
+              key: VLLM_ARCHITECTURE_OVERRIDE
         - name: CUDA_VISIBLE_DEVICES
           value: "0"
         - name: OPEN_RL_TMP_DIR
           value: "/mnt/shared/open-rl"
         - name: ENABLE_GCP_TRACE
-          value: "1"
+          valueFrom:
+            configMapKeyRef:
+              name: open-rl-config
+              key: ENABLE_GCP_TRACE
         - name: HF_HOME
           value: "/mnt/shared/open-rl/huggingface"
         readinessProbe:
