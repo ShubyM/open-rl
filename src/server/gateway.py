@@ -69,6 +69,28 @@ def get_default_model_name() -> str | None:
   return os.getenv("BASE_MODEL")
 
 
+def sampler_session_id(model_id: str, seq_id: int | str) -> str:
+  return f"tinker://{model_id}/sampler_weights/sampler-{seq_id}"
+
+
+def sampler_weights_path(model_id: str, name: str) -> str:
+  return f"tinker://{model_id}/sampler_weights/{name}"
+
+
+def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
+  if not model_id:
+    return None
+
+  if model_id.startswith("tinker://"):
+    path = model_id[len("tinker://") :]
+    parts = path.split("/")
+    if len(parts) >= 3 and parts[1] == "sampler_weights":
+      return parts[0]
+    return path
+
+  return model_id.split("-samp-")[0]
+
+
 async def _enqueue(payload: dict) -> str:
   """Create a pending future, inject trace context, push to store. Returns req_id."""
   req_id = payload.get("req_id") or str(uuid.uuid4())
@@ -281,13 +303,13 @@ async def save_weights_for_sampler(req: dict):
   seq_id = req.get("sampling_session_seq_id") or int(time.time() * 1000)
   alias = req.get("name") or req.get("alias") or req.get("path")
 
-  session_id = f"{model_id}-samp-{seq_id}"
+  session_id = sampler_session_id(model_id, seq_id)
   req_id = await _enqueue(
     {
       "model_id": model_id,
       "type": "save_weights_for_sampler",
       "alias": alias,
-      "path": f"tinker://{session_id}" if alias else None,
+      "path": sampler_weights_path(model_id, alias) if alias else None,
       "sampling_session_id": session_id,
     }
   )
@@ -355,7 +377,7 @@ async def create_sampling_session(req: dict):
   model_id = req.get("model_id")
 
   if model_path and model_path.startswith("tinker://"):
-    sess_id = model_path[len("tinker://") :]
+    sess_id = model_path
   else:
     sess_id = model_id or "samp-session-live-123"
 
@@ -375,9 +397,7 @@ async def asample(req: dict):
   num_samples = req.get("num_samples", 1)
 
   model_id = req.get("model_id") or req.get("sampling_session_id")
-  if model_id and model_id.startswith("tinker://"):
-    model_id = model_id[len("tinker://") :]
-  base_model_id = model_id.split("-samp-")[0] if model_id else None
+  base_model_id = base_model_id_from_sampling_ref(model_id)
 
   if get_sampler_backend() == "torch":
     req_id = await _enqueue(
