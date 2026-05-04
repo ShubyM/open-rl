@@ -30,10 +30,12 @@ gpu = [
     "numpy",
     "peft",
     "torch; sys_platform == 'linux'",
+    "torchvision; sys_platform == 'linux'",
     "transformers>=5.5.4",
 ]
 vllm = [
     "torch; sys_platform == 'linux'",
+    "torchvision; sys_platform == 'linux'",
     "torch-c-dlpack-ext; sys_platform == 'linux'",
     "vllm==0.20.0; sys_platform == 'linux'",
 ]
@@ -79,4 +81,7 @@ torch = [
 ]
 vllm = [
     { index = "vllm-cu129", extra = "vllm", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "torch-gpu", marker = "sys_platform == 'linux'" },
 ]
