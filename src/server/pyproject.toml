@@ -79,6 +79,10 @@ torch = [
     { index = "torch-gpu", extra = "gpu", marker = "sys_platform == 'linux'" },
     { index = "torch-gpu", extra = "vllm", marker = "sys_platform == 'linux'" },
 ]
+torchvision = [
+    { index = "torch-gpu", extra = "gpu", marker = "sys_platform == 'linux'" },
+    { index = "torch-gpu", extra = "vllm", marker = "sys_platform == 'linux'" },
+]
 vllm = [
     { index = "vllm-cu129", extra = "vllm", marker = "sys_platform == 'linux'" },
 ]

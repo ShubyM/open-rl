@@ -2,15 +2,24 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - custom-filestore-sc.yaml
   - 01-shared-pvc.yaml
   - 02-redis.yaml
   - 03-vllm.yaml
   - 04-gateway.yaml
   - 05-trainer-worker.yaml
 
+configMapGenerator:
+  - name: open-rl-config
+    literals:
+      - BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507"
+      - VLLM_GPU_MEMORY_UTILIZATION="0.6"
+      - VLLM_ARCHITECTURE_OVERRIDE=""
+      - ENABLE_GCP_TRACE="1"
+
 images:
   - name: gcr.io/cdrollouts-sunilarora/open-rl-gateway
-    newName: <your-gcr-path>/open-rl-gateway
+    newName: ghcr.io/gke-labs/open-rl/gateway
+    newTag: latest
   - name: gcr.io/cdrollouts-sunilarora/open-rl-server
-    newName: <your-gcr-path>/open-rl-gateway
+    newName: ghcr.io/gke-labs/open-rl/server
+    newTag: latest

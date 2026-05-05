@@ -40,6 +40,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Copy source code
 COPY . ./src/
 
+# TODO: this is a hack until vllm is fixed upstream
+# Apply Gemma 4 LoRA deduplication patch
+RUN uv run python /app/src/scripts/patch_vllm_lora_dedup.py
+
 # Expose ports (Gateway: 8000, vLLM Worker: 8001)
 EXPOSE 8000
 EXPOSE 8001
