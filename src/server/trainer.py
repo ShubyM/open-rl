@@ -462,6 +462,7 @@ class TrainerEngine:
     num_samples: int = 1,
     temperature: float = 0.0,
     model_id: str | None = None,
+    include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
     """Generate completions from the current model."""
     assert self.peft_model is not None, "Model must be loaded first."
@@ -472,6 +473,7 @@ class TrainerEngine:
 
     input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
     do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
+    prompt_logprobs = self._prompt_logprobs(input_tensor) if include_prompt_logprobs else None
 
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
@@ -504,7 +506,26 @@ class TrainerEngine:
 
       sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": "stop"})
 
-    return {"sequences": sequences_out}
+    result = {"sequences": sequences_out}
+    if prompt_logprobs is not None:
+      result["prompt_logprobs"] = prompt_logprobs
+    return result
+
+  def _prompt_logprobs(self, input_tensor: torch.Tensor) -> list[float | None]:
+    assert self.peft_model is not None, "Model must be loaded first."
+
+    with torch.no_grad():
+      attention_mask = torch.ones_like(input_tensor)
+      outputs = self.peft_model(input_tensor, attention_mask=attention_mask)
+      logprob_dist = torch.nn.functional.log_softmax(outputs.logits[0, :-1], dim=-1)
+
+    prompt_tokens = input_tensor[0].tolist()
+    prompt_logprobs: list[float | None] = [None]
+    for token_idx, token_id in enumerate(prompt_tokens[1:]):
+      logprob = logprob_dist[token_idx, token_id].item()
+      prompt_logprobs.append(self._sanitize_float(logprob))
+
+    return prompt_logprobs
 
 
 def main() -> None:

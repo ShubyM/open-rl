@@ -14,14 +14,14 @@ dependencies = [
     "matplotlib>=3.10.8",
     "orjson>=3.11.8",
     "requests>=2.32.5",
-    "tinker==0.18.1",
-    "tinker_cookbook",
+    "tinker==0.18.2",
+    "tinker-cookbook[math-rl]==0.3.0",
     "datasets>=4.5.0",
     "huggingface_hub>=0.28.1",
     "opentelemetry-instrumentation-httpx>=0.61b0",
     "opentelemetry-exporter-gcp-trace>=1.11.0",
     "opentelemetry-sdk>=1.40.0",
-    "transformers>=5.5.4",
+    "transformers>=5.7.0",
     "ipykernel",
     "torch",
 ]
@@ -36,6 +36,11 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "torch-cpu" }
+
+[tool.uv]
+override-dependencies = [
+    "transformers>=5.7.0",
+]
 
 [tool.setuptools]
 packages = []

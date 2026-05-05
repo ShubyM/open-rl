@@ -69,6 +69,28 @@ def get_default_model_name() -> str | None:
   return os.getenv("BASE_MODEL")
 
 
+def sampler_session_id(model_id: str, seq_id: int | str) -> str:
+  return f"tinker://{model_id}/sampler_weights/sampler-{seq_id}"
+
+
+def sampler_weights_path(model_id: str, name: str) -> str:
+  return f"tinker://{model_id}/sampler_weights/{name}"
+
+
+def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
+  if not model_id:
+    return None
+
+  if model_id.startswith("tinker://"):
+    path = model_id[len("tinker://") :]
+    parts = path.split("/")
+    if len(parts) >= 3 and parts[1] == "sampler_weights":
+      return parts[0]
+    return path
+
+  return model_id.split("-samp-")[0]
+
+
 async def _enqueue(payload: dict) -> str:
   """Create a pending future, inject trace context, push to store. Returns req_id."""
   req_id = payload.get("req_id") or str(uuid.uuid4())
@@ -281,13 +303,13 @@ async def save_weights_for_sampler(req: dict):
   seq_id = req.get("sampling_session_seq_id") or int(time.time() * 1000)
   alias = req.get("name") or req.get("alias") or req.get("path")
 
-  session_id = f"{model_id}-samp-{seq_id}"
+  session_id = sampler_session_id(model_id, seq_id)
   req_id = await _enqueue(
     {
       "model_id": model_id,
       "type": "save_weights_for_sampler",
       "alias": alias,
-      "path": f"tinker://{session_id}" if alias else None,
+      "path": sampler_weights_path(model_id, alias) if alias else None,
       "sampling_session_id": session_id,
     }
   )
@@ -355,7 +377,7 @@ async def create_sampling_session(req: dict):
   model_id = req.get("model_id")
 
   if model_path and model_path.startswith("tinker://"):
-    sess_id = model_path[len("tinker://") :]
+    sess_id = model_path
   else:
     sess_id = model_id or "samp-session-live-123"
 
@@ -365,7 +387,10 @@ async def create_sampling_session(req: dict):
 @app.post("/api/v1/asample")
 async def asample(req: dict):
   """SamplingClient.sample_async()"""
-  prompt = req.get("prompt", {}).get("chunks", [])[0].get("tokens", [])
+  chunks = req.get("prompt", {}).get("chunks", [])
+  prompt = []
+  for chunk in chunks:
+    prompt.extend(chunk.get("tokens", []))
   params = req.get("sampling_params", {})
   max_tokens = params.get("max_tokens", 20)
   temperature = params.get("temperature", 1.0)
@@ -373,11 +398,10 @@ async def asample(req: dict):
   top_p = params.get("top_p", 1.0)
   top_k = params.get("top_k", -1)
   num_samples = req.get("num_samples", 1)
+  include_prompt_logprobs = req.get("prompt_logprobs", req.get("include_prompt_logprobs", False))
 
   model_id = req.get("model_id") or req.get("sampling_session_id")
-  if model_id and model_id.startswith("tinker://"):
-    model_id = model_id[len("tinker://") :]
-  base_model_id = model_id.split("-samp-")[0] if model_id else None
+  base_model_id = base_model_id_from_sampling_ref(model_id)
 
   if get_sampler_backend() == "torch":
     req_id = await _enqueue(
@@ -391,6 +415,7 @@ async def asample(req: dict):
         "top_p": top_p,
         "top_k": top_k,
         "num_samples": num_samples,
+        "prompt_logprobs": bool(include_prompt_logprobs),
       }
     )
     return {"request_id": req_id}
@@ -404,7 +429,7 @@ async def asample(req: dict):
   propagate.inject(headers)
 
   try:
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
       resp = await client.post(
         f"{VLLM_URL.rstrip('/')}/generate",
         json={
@@ -418,14 +443,15 @@ async def asample(req: dict):
           "num_samples": num_samples,
           "lora_id": model_id,
           "lora_path": lora_path,
+          "include_prompt_logprobs": include_prompt_logprobs,
         },
         headers=headers,
       )
       resp.raise_for_status()
       data = resp.json()
-    if data.get("type") != "RequestFailedResponse":
-      data["type"] = "sample"
-    await store.set_future(req_id, data)
+      if data.get("type") != "RequestFailedResponse":
+        data["type"] = "sample"
+      await store.set_future(req_id, data)
   except Exception as e:
     traceback.print_exc()
     await store.set_future(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})
