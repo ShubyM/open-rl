@@ -1716,7 +1716,7 @@ requires-dist = [
     { name = "opentelemetry-sdk", specifier = ">=1.40.0" },
     { name = "orjson", specifier = ">=3.11.8" },
     { name = "requests", specifier = ">=2.32.5" },
-    { name = "tinker" },
+    { name = "tinker", specifier = "==0.18.2" },
     { name = "tinker-cookbook", extras = ["math-rl"], specifier = "==0.3.0" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = ">=5.7.0" },

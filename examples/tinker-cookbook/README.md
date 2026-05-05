@@ -1,12 +1,12 @@
 # Tinker Cookbook Recipes
 
-The `tinker_cookbook` package ships ready-to-run recipes from Thinking Machines.
-Open-RL exposes the Tinker-compatible API those recipes call, so you can point
-the cookbook at a local Open-RL server.
+Since Open-RL implements Tinker-compatible APIs, you can use
+[`tinker-cookbook`](https://github.com/thinking-machines-lab/tinker-cookbook)
+recipes with Open-RL endpoints.
 
 ## Setup
 
-Install the example dependencies from this repository:
+Assuming you have cloned this repository, install the example dependencies:
 
 ```bash
 cd examples
@@ -17,20 +17,20 @@ If you want to try other recipes, you may need to install other extras or depend
 
 ## Start the Server
 
-From the repository root, start one vLLM sampler and one Open-RL gateway, then
-reuse that server for the cookbook commands below.
+From the repository root, start one vLLM sampler and one Open-RL gateway on
+separate GPUs. These examples are written for two L4 GPUs or better.
 
 ```bash
 cd src/server
-CUDA_VISIBLE_DEVICES=0 BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" uv run --extra vllm python -m vllm_sampler
+CUDA_VISIBLE_DEVICES=0 BASE_MODEL="Qwen/Qwen3-1.7B" uv run --extra vllm python -m vllm_sampler
 ```
 
 In another shell:
 
 ```bash
 cd src/server
-CUDA_VISIBLE_DEVICES=0 \
-BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" \
+CUDA_VISIBLE_DEVICES=1 \
+BASE_MODEL="Qwen/Qwen3-1.7B" \
 SAMPLING_BACKEND=vllm \
 VLLM_URL=http://127.0.0.1:8001 \
 TINKER_API_KEY=tml-dummy-key \
@@ -38,12 +38,11 @@ uv run --extra gpu python -m uvicorn gateway:app --host 127.0.0.1 --port 9003
 ```
 
 CPU mode is useful for tiny model fixtures, but Qwen-sized cookbook runs should
-use GPU/vLLM. The cookbook recipes use pure LoRA adapters; saving and loading
-`train_unembed` modules is still a server-side TODO.
+use GPU/vLLM.
 
 ## Checkpointing Limitation
 
-Set `save_every=0` for cookbook runs so the recipe does not ask the server for periodic durable checkpoints. Sampler refreshes still happen between training steps through `save_weights_and_get_sampling_client`; this setting only disables the cookbook's extra checkpoint saves.
+Open-RL does not yet implement full Tinker-compatible durable checkpoint management. For recipes that expose periodic checkpoint saves, set `save_every=0`; the shorter preference recipe below does not create periodic checkpoints, so it does not need a checkpoint flag. Sampler refreshes through `save_weights_and_get_sampling_client` still work. See [gke-labs/open-rl#83](https://github.com/gke-labs/open-rl/issues/83).
 
 ## Supervised Learning Loop
 
@@ -68,16 +67,15 @@ TINKER_API_KEY=tml-dummy-key uv run python -m tinker_cookbook.recipes.sl_loop \
 cd examples
 TINKER_API_KEY=tml-dummy-key TINKER_BASE_URL=http://127.0.0.1:9003 TINKER_TELEMETRY=0 uv run python -m tinker_cookbook.recipes.preference.shorter.train \
   model_name="Qwen/Qwen3-1.7B" \
-  renderer_name="qwen3_disable_thinking" \
   batch_size=4 \
-  group_size=8 \
-  max_steps=20 \
+  group_size=4 \
+  max_tokens=64 \
+  max_steps=40 \
   log_path=artifacts/tinker-cookbook/shorter_rl \
-  behavior_if_log_dir_exists=delete \
-  save_every=0
+  behavior_if_log_dir_exists=delete
 ```
+
+This recipe does not expose periodic checkpoint saves, so no checkpoint flag is needed.
 
 ![RL Length Curve](plots/rl_length_plot.png)
 ![RL Format Curve](plots/rl_format_plot.png)
-
-

@@ -391,10 +391,8 @@ async def asample(req: dict):
   prompt = []
   for chunk in chunks:
     prompt.extend(chunk.get("tokens", []))
-  print(f"DEBUG prompt length: {len(prompt)}")
   params = req.get("sampling_params", {})
   max_tokens = params.get("max_tokens", 20)
-  print(f"DEBUG max_tokens: {max_tokens}")
   temperature = params.get("temperature", 1.0)
   stop = params.get("stop")
   top_p = params.get("top_p", 1.0)
@@ -417,6 +415,7 @@ async def asample(req: dict):
         "top_p": top_p,
         "top_k": top_k,
         "num_samples": num_samples,
+        "prompt_logprobs": bool(include_prompt_logprobs),
       }
     )
     return {"request_id": req_id}

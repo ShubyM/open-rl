@@ -139,7 +139,7 @@ async def generate(req: Request):
       top_k=top_k,
       logprobs=1,  # return logprobs for TITO RL
       prompt_logprobs=prompt_logprobs_val,
-      output_kind=RequestOutputKind.CUMULATIVE,
+      output_kind=RequestOutputKind.FINAL_ONLY,
     )
 
     lora_request = None
