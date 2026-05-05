@@ -147,6 +147,10 @@ make server
 
 Open a **third terminal session** to run the training script.
 
+If you want to walk through the RL loop interactively, open the notebook:
+
+[`texttosql_grpo_notebook.ipynb`](texttosql_grpo_notebook.ipynb)
+
 ### 1. Common Environment Variables
 
 You can copy and paste these into your training terminal before proceeding.
