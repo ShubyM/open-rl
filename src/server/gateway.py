@@ -387,14 +387,20 @@ async def create_sampling_session(req: dict):
 @app.post("/api/v1/asample")
 async def asample(req: dict):
   """SamplingClient.sample_async()"""
-  prompt = req.get("prompt", {}).get("chunks", [])[0].get("tokens", [])
+  chunks = req.get("prompt", {}).get("chunks", [])
+  prompt = []
+  for chunk in chunks:
+    prompt.extend(chunk.get("tokens", []))
+  print(f"DEBUG prompt length: {len(prompt)}")
   params = req.get("sampling_params", {})
   max_tokens = params.get("max_tokens", 20)
+  print(f"DEBUG max_tokens: {max_tokens}")
   temperature = params.get("temperature", 1.0)
   stop = params.get("stop")
   top_p = params.get("top_p", 1.0)
   top_k = params.get("top_k", -1)
   num_samples = req.get("num_samples", 1)
+  include_prompt_logprobs = req.get("prompt_logprobs", req.get("include_prompt_logprobs", False))
 
   model_id = req.get("model_id") or req.get("sampling_session_id")
   base_model_id = base_model_id_from_sampling_ref(model_id)
@@ -424,7 +430,7 @@ async def asample(req: dict):
   propagate.inject(headers)
 
   try:
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
       resp = await client.post(
         f"{VLLM_URL.rstrip('/')}/generate",
         json={
@@ -438,14 +444,15 @@ async def asample(req: dict):
           "num_samples": num_samples,
           "lora_id": model_id,
           "lora_path": lora_path,
+          "include_prompt_logprobs": include_prompt_logprobs,
         },
         headers=headers,
       )
       resp.raise_for_status()
       data = resp.json()
-    if data.get("type") != "RequestFailedResponse":
-      data["type"] = "sample"
-    await store.set_future(req_id, data)
+      if data.get("type") != "RequestFailedResponse":
+        data["type"] = "sample"
+      await store.set_future(req_id, data)
   except Exception as e:
     traceback.print_exc()
     await store.set_future(req_id, {"type": "RequestFailedResponse", "error_message": str(e)})

@@ -120,6 +120,7 @@ async def generate(req: Request):
 
     lora_id = data.get("lora_id", None)
     lora_path = data.get("lora_path", None)
+    include_prompt_logprobs = data.get("include_prompt_logprobs", False)
 
     current_engine = engine
     if current_engine is None:
@@ -128,6 +129,7 @@ async def generate(req: Request):
       # return dummy tokens locally
       return {"sequences": [{"tokens": [0] * max_tokens, "logprobs": [-0.1] * max_tokens, "stop_reason": "length"}]}
 
+    prompt_logprobs_val = 1 if include_prompt_logprobs else None
     sampling_params = SamplingParams(
       n=num_samples,
       temperature=temperature,
@@ -136,7 +138,8 @@ async def generate(req: Request):
       top_p=top_p,
       top_k=top_k,
       logprobs=1,  # return logprobs for TITO RL
-      output_kind=RequestOutputKind.FINAL_ONLY,
+      prompt_logprobs=prompt_logprobs_val,
+      output_kind=RequestOutputKind.CUMULATIVE,
     )
 
     lora_request = None
@@ -175,7 +178,20 @@ async def generate(req: Request):
           logprobs.append(logprob)
       sequences_out.append({"tokens": generated_token_ids, "logprobs": logprobs, "stop_reason": output.finish_reason})
 
-    return {"sequences": sequences_out}
+    prompt_logprobs_out = None
+    if final_output and final_output.prompt_logprobs:
+      prompt_logprobs_out = []
+      for idx, token_logprobs in enumerate(final_output.prompt_logprobs):
+        if token_logprobs is None:
+          prompt_logprobs_out.append(None)
+        else:
+          token_id = prompt_token_ids[idx]
+          if token_id in token_logprobs:
+            prompt_logprobs_out.append(token_logprobs[token_id].logprob)
+          else:
+            prompt_logprobs_out.append(None)
+
+    return {"sequences": sequences_out, "prompt_logprobs": prompt_logprobs_out}
   except Exception as e:
     import traceback
 

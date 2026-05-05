@@ -31,7 +31,6 @@ In another shell:
 cd src/server
 CUDA_VISIBLE_DEVICES=0 \
 BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" \
-SINGLE_PROCESS=1 \
 SAMPLING_BACKEND=vllm \
 VLLM_URL=http://127.0.0.1:8001 \
 TINKER_API_KEY=tml-dummy-key \
@@ -43,42 +42,42 @@ use GPU/vLLM. The cookbook recipes use pure LoRA adapters; saving and loading
 `train_unembed` modules is still a server-side TODO.
 
 ## Checkpointing Limitation
-Open-RL currently saves local PEFT adapter state, but it does not implement
-Tinker's checkpoint service model: there is no checkpoint registry, no archive
-URL flow, no publish/unpublish lifecycle, and no durable training-run/session
-metadata. Cookbook paths that only need `save_state` and `load_state` can work,
-but workflows that depend on true Tinker checkpoint management are out of scope
-until Open-RL has real checkpointing semantics.
+
+Set `save_every=0` for cookbook runs so the recipe does not ask the server for periodic durable checkpoints. Sampler refreshes still happen between training steps through `save_weights_and_get_sampling_client`; this setting only disables the cookbook's extra checkpoint saves.
 
 ## Supervised Learning Loop
 
-`sl_loop` fine-tunes on the No Robots chat dataset with cross-entropy loss. You can run it directly from the repository root:
+`sl_loop` fine-tunes on the No Robots chat dataset with cross-entropy loss. You can run it by moving into the `examples` directory:
 
 ```bash
-TINKER_API_KEY=tml-dummy-key uv run \
-  --with tinker \
-  --with datasets \
-  --with torch \
-  python -m tinker_cookbook.recipes.sl_loop \
+cd examples
+TINKER_API_KEY=tml-dummy-key uv run python -m tinker_cookbook.recipes.sl_loop \
   base_url=http://127.0.0.1:9003 \
-  model_name="Qwen/Qwen3-4B-Instruct-2507" \
-  log_path=artifacts/tinker-cookbook/sl_loop
+  model_name="Qwen/Qwen3-1.7B" \
+  log_path=artifacts/tinker-cookbook/sl_loop \
+  save_every=0
 ```
 
+![SFT Loss Curve](plots/sl_loss_plot.png)
 
-## RL Training Loop
+## Shorter Response Preference RL Loop
 
-`rl_loop` runs a GRPO-style loop with reward-centered advantages and importance sampling loss. You can run it directly from the repository root:
+`train` runs an ultra-fast GRPO-style reinforcement learning loop that optimizes the policy to generate highly compliant, short responses. You can run it by moving into the `examples` directory:
 
 ```bash
-TINKER_API_KEY=tml-dummy-key uv run \
-  --with tinker \
-  --with datasets \
-  --with torch \
-  python -m tinker_cookbook.recipes.rl_loop \
-  base_url=http://127.0.0.1:9003 \
-  model_name="Qwen/Qwen3-4B-Instruct-2507" \
-  log_path=artifacts/tinker-cookbook/rl_loop
+cd examples
+TINKER_API_KEY=tml-dummy-key TINKER_BASE_URL=http://127.0.0.1:9003 TINKER_TELEMETRY=0 uv run python -m tinker_cookbook.recipes.preference.shorter.train \
+  model_name="Qwen/Qwen3-1.7B" \
+  renderer_name="qwen3_disable_thinking" \
+  batch_size=4 \
+  group_size=8 \
+  max_steps=20 \
+  log_path=artifacts/tinker-cookbook/shorter_rl \
+  behavior_if_log_dir_exists=delete \
+  save_every=0
 ```
+
+![RL Length Curve](plots/rl_length_plot.png)
+![RL Format Curve](plots/rl_format_plot.png)
 
 
