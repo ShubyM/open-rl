@@ -86,6 +86,3 @@ torchvision = [
 vllm = [
     { index = "vllm-cu129", extra = "vllm", marker = "sys_platform == 'linux'" },
 ]
-torchvision = [
-    { index = "torch-gpu", marker = "sys_platform == 'linux'" },
-]
