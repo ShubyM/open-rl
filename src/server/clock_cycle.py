@@ -115,6 +115,7 @@ async def clock_cycle_loop() -> None:
                 max_tokens = r["max_tokens"]
                 num_samples = r["num_samples"]
                 temperature = r.get("temperature", 0.0)
+                prompt_logprobs = bool(r.get("prompt_logprobs", False))
 
                 result = await asyncio.to_thread(
                   engine.generate,
@@ -123,6 +124,7 @@ async def clock_cycle_loop() -> None:
                   num_samples,
                   temperature,
                   m_id,
+                  prompt_logprobs,
                 )
                 result["type"] = "sample"
                 await store.set_future(req_id, result)

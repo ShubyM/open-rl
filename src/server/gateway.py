@@ -387,7 +387,9 @@ async def create_sampling_session(req: dict):
 @app.post("/api/v1/asample")
 async def asample(req: dict):
   """SamplingClient.sample_async()"""
-  prompt = req.get("prompt", {}).get("chunks", [])[0].get("tokens", [])
+  prompt = []
+  for chunk in req.get("prompt", {}).get("chunks", []):
+    prompt.extend(chunk.get("tokens", []))
   params = req.get("sampling_params", {})
   max_tokens = params.get("max_tokens", 20)
   temperature = params.get("temperature", 1.0)
@@ -395,6 +397,7 @@ async def asample(req: dict):
   top_p = params.get("top_p", 1.0)
   top_k = params.get("top_k", -1)
   num_samples = req.get("num_samples", 1)
+  prompt_logprobs = bool(req.get("prompt_logprobs", False))
 
   model_id = req.get("model_id") or req.get("sampling_session_id")
   base_model_id = base_model_id_from_sampling_ref(model_id)
@@ -411,6 +414,7 @@ async def asample(req: dict):
         "top_p": top_p,
         "top_k": top_k,
         "num_samples": num_samples,
+        "prompt_logprobs": prompt_logprobs,
       }
     )
     return {"request_id": req_id}
