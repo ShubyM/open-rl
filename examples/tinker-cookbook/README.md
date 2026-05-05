@@ -42,7 +42,7 @@ use GPU/vLLM.
 
 ## Checkpointing Limitation
 
-Open-RL does not yet implement full Tinker-compatible durable checkpoint management. For recipes that expose periodic checkpoint saves, set `save_every=0`; the shorter preference recipe below does not create periodic checkpoints, so it does not need a checkpoint flag. Sampler refreshes through `save_weights_and_get_sampling_client` still work. See [gke-labs/open-rl#83](https://github.com/gke-labs/open-rl/issues/83).
+Open-RL does not yet implement full Tinker-compatible durable checkpoint management. For recipes that expose periodic checkpoint saves, set `save_every=0`; See [gke-labs/open-rl#83](https://github.com/gke-labs/open-rl/issues/83) for more details.
 
 ## Supervised Learning Loop
 
@@ -74,8 +74,6 @@ TINKER_API_KEY=tml-dummy-key TINKER_BASE_URL=http://127.0.0.1:9003 TINKER_TELEME
   log_path=artifacts/tinker-cookbook/shorter_rl \
   behavior_if_log_dir_exists=delete
 ```
-
-This recipe does not expose periodic checkpoint saves, so no checkpoint flag is needed.
 
 ![RL Length Curve](plots/rl_length_plot.png)
 ![RL Format Curve](plots/rl_format_plot.png)
