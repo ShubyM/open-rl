@@ -39,8 +39,7 @@ Optional quota/capacity sanity check:
 
 ```bash
 gcloud compute accelerator-types list \
-  --zones="${ZONE}" \
-  --filter="name=nvidia-l4"
+  --filter="zone:(${ZONE}) AND name:nvidia-l4"
 ```
 
 ## 2. Create the Cluster
@@ -107,17 +106,13 @@ gcloud container clusters get-credentials "${CLUSTER}" --location="${REGION}"
 kubectl apply -k k8s/deploy/text-to-sql-gke
 ```
 
-Watch the PVC and pods:
+Wait for the shared storage (PVC) to be bound:
 
 ```bash
-kubectl get pvc open-rl-shared-pvc -w
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/open-rl-shared-pvc --timeout=5m
 ```
 
-```bash
-kubectl get pods -l app.kubernetes.io/part-of=text-to-sql -w
-```
-
-Wait for the deployments:
+Wait for the deployments to become ready:
 
 ```bash
 kubectl rollout status deploy/redis-store
