@@ -44,6 +44,26 @@ class _RequestStub:
     return self.data
 
 
+class _FakeOutput:
+  token_ids = [7]
+  logprobs = None
+  finish_reason = "length"
+
+
+class _FakeRequestOutput:
+  outputs = [_FakeOutput()]
+  prompt_logprobs = None
+
+
+class _FakeEngine:
+  def __init__(self):
+    self.lora_request = None
+
+  async def generate(self, prompt, sampling_params, request_id, lora_request):
+    self.lora_request = lora_request
+    yield _FakeRequestOutput()
+
+
 vllm_sampler = _load_vllm_sampler_module()
 
 
@@ -100,6 +120,20 @@ class TestVLLMSamplerWeightSync(unittest.TestCase):
     finally:
       shm.close()
       shm.unlink()
+
+  def test_generate_uses_synced_lora_adapter_without_request_path(self) -> None:
+    fake_engine = _FakeEngine()
+    vllm_sampler.engine = fake_engine
+    vllm_sampler.synced_lora_adapters["adapter-a"] = {"adapter_path": "/tmp/adapter-a-v2", "version": 2}
+    try:
+      response = asyncio.run(vllm_sampler.generate(_RequestStub({"request_id": "req-1", "prompt_token_ids": [1], "lora_id": "adapter-a"})))
+    finally:
+      vllm_sampler.engine = None
+      vllm_sampler.synced_lora_adapters.clear()
+
+    self.assertEqual(response["sequences"], [{"tokens": [7], "logprobs": [], "stop_reason": "length"}])
+    self.assertEqual(fake_engine.lora_request.lora_name, "adapter-a@2")
+    self.assertEqual(fake_engine.lora_request.lora_path, "/tmp/adapter-a-v2")
 
 
 if __name__ == "__main__":

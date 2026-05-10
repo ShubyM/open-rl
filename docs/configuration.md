@@ -68,11 +68,34 @@ make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
 | `OPEN_RL_TMP_DIR` | `/tmp/open-rl` | Root directory for adapter snapshots under `peft/` and saved states under `checkpoints/`. |
 | `CUDA_VISIBLE_DEVICES` | unset | Standard PyTorch GPU selector. Use different devices when the vLLM worker and trainer run on separate GPUs. |
 
+## Weight sync
+
+Most runs do not need weight-sync-specific configuration. When `SAMPLING_BACKEND=vllm`
+or `VLLM_URL` is set, the trainer publishes exact LoRA deltas to the Open-RL
+vLLM worker over shared memory and sends a small HTTP control request.
+
+The practical required variables are:
+
+| Env var | Default | What it does |
+| --- | --- | --- |
+| `VLLM_URL` | `http://127.0.0.1:8001` | Address of the Open-RL vLLM worker. |
+| `OPEN_RL_TMP_DIR` | `/tmp/open-rl` | Shared local or mounted root for checkpoints, adapter snapshots, and vLLM materialized LoRA adapters. |
+
+Advanced/debug-only knobs:
+
+| Env var | Default | What it does |
+| --- | --- | --- |
+| `OPEN_RL_WEIGHT_SYNC_TRANSPORT` | `vllm_lora_tensors_ipc` | Override the hot transport. Use `vllm_lora_tensors_http` only for debugging small payloads. |
+| `OPEN_RL_WEIGHT_SYNC_TIMEOUT` | `30.0` | Timeout, in seconds, for the trainer to notify the vLLM worker. |
+| `OPEN_RL_WEIGHT_SYNC_STRICT` | `0` | `1` makes a failed hot sync fail the sampler save request instead of falling back to adapter checkpoint state. |
+| `OPEN_RL_WEIGHT_SYNC_TENSOR_DTYPE` | unset | Cast tensors before sending, for example `float16` or `bfloat16`, if the inference runtime requires it. |
+| `OPEN_RL_WEIGHT_SYNC_CHECKSUM` | `0` | Computes hot-path tensor checksums. Durable checkpoints keep their own manifest and payload metadata. |
+
 ## vLLM variables
 
 | Env var | Default | What it does |
 | --- | --- | --- |
-| `MOCK_VLLM` | `0` | `1` starts the vLLM worker without a real vLLM engine, useful for local API debugging. |
+| `MOCK_VLLM` | `0` | `1` starts the vLLM worker without initializing the engine, useful for local API debugging. |
 | `VLLM_ARCHITECTURE_OVERRIDE` | unset | Optional architecture override passed to the in-repo vLLM worker. Gemma 4 examples use `Gemma4ForCausalLM`. |
 
 ## Client variables
@@ -100,6 +123,7 @@ uv run uvicorn src.gateway:app --host 0.0.0.0 --port 8000
 ```bash
 # Trainer worker pod
 REDIS_URL=redis://redis-service:6379 \
+VLLM_URL=http://vllm-service:8001 \
 BASE_MODEL=google/gemma-4-e2b \
 uv run python -m src.clock_cycle
 ```

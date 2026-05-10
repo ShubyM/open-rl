@@ -27,6 +27,8 @@ spec:
           value: "1"
         - name: REDIS_URL
           value: "redis://redis-service:6379"
+        - name: VLLM_URL
+          value: "http://vllm-service:8001"
         - name: CUDA_VISIBLE_DEVICES
           value: "0"
         - name: BASE_MODEL

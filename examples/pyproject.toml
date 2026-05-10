@@ -20,12 +20,16 @@ dependencies = [
     "tinker-cookbook[math-rl]==0.3.0",
     "datasets>=4.5.0",
     "huggingface_hub>=0.28.1",
-    "opentelemetry-instrumentation-httpx>=0.61b0",
-    "opentelemetry-exporter-gcp-trace>=1.11.0",
-    "opentelemetry-sdk>=1.40.0",
     "transformers>=5.7.0",
     "ipykernel",
     "torch",
+]
+
+[project.optional-dependencies]
+telemetry = [
+    "opentelemetry-instrumentation-httpx>=0.61b0",
+    "opentelemetry-exporter-gcp-trace>=1.11.0",
+    "opentelemetry-sdk>=1.40.0",
 ]
 
 # Use the CPU torch wheel — the client only needs torch transitively (via

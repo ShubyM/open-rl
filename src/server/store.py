@@ -30,6 +30,16 @@ class RequestStore(ABC):
     """Block until the future resolves or the timeout is reached."""
     pass
 
+  @abstractmethod
+  async def publish_checkpoint(self, model_id: str, checkpoint_ref: str, metadata: dict[str, Any] | None = None) -> None:
+    """Publish the latest durable checkpoint for a model."""
+    pass
+
+  @abstractmethod
+  async def latest_checkpoint(self, model_id: str) -> dict[str, Any] | None:
+    """Return the latest durable checkpoint for a model, if any."""
+    pass
+
 
 class InMemoryStore(RequestStore):
   def __init__(self):
@@ -41,6 +51,7 @@ class InMemoryStore(RequestStore):
 
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, asyncio.Event] = {}
+    self.checkpoints: dict[str, dict[str, Any]] = {}
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -100,6 +111,12 @@ class InMemoryStore(RequestStore):
     finally:
       self.futures_events.pop(req_id, None)
 
+  async def publish_checkpoint(self, model_id: str, checkpoint_ref: str, metadata: dict[str, Any] | None = None) -> None:
+    self.checkpoints[model_id] = {"checkpoint_ref": checkpoint_ref, "metadata": metadata or {}}
+
+  async def latest_checkpoint(self, model_id: str) -> dict[str, Any] | None:
+    return self.checkpoints.get(model_id)
+
 
 class RedisStore(RequestStore):
   def __init__(self, redis_url: str):
@@ -107,6 +124,7 @@ class RedisStore(RequestStore):
     self.active_list = "open_rl:active_tenants"
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
+    self.checkpoint_hash = "open_rl:latest_checkpoints"
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -175,6 +193,13 @@ class RedisStore(RequestStore):
       return payload
 
     return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
+
+  async def publish_checkpoint(self, model_id: str, checkpoint_ref: str, metadata: dict[str, Any] | None = None) -> None:
+    await self.redis.hset(self.checkpoint_hash, model_id, json.dumps({"checkpoint_ref": checkpoint_ref, "metadata": metadata or {}}))
+
+  async def latest_checkpoint(self, model_id: str) -> dict[str, Any] | None:
+    payload = await self.redis.hget(self.checkpoint_hash, model_id)
+    return json.loads(payload) if payload else None
 
 
 # Global singleton factory

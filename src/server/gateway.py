@@ -11,28 +11,12 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from opentelemetry import propagate, trace
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry import propagate
 from store import get_store
+from telemetry import instrument_fastapi, setup_tracing
 
 store = get_store()
-
-provider = TracerProvider()
-trace.set_tracer_provider(provider)
-
-if os.getenv("ENABLE_GCP_TRACE", "0") == "1":
-  try:
-    from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
-
-    exporter = CloudTraceSpanExporter()
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    print("OpenTelemetry: Configured GCP CloudTraceSpanExporter")
-  except ImportError:
-    print("OpenTelemetry: opentelemetry-exporter-gcp-trace is not installed")
-else:
-  print("OpenTelemetry: No exporter configured (ENABLE_GCP_TRACE=0)")
+setup_tracing("openrl.gateway")
 
 
 class _FilterNoisyEndpoints(logging.Filter):
@@ -148,7 +132,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
-FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
+instrument_fastapi(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
 
 
 # *** ServiceClient endpoints ***

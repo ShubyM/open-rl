@@ -8,11 +8,12 @@ import traceback
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from opentelemetry import context as otel_context
-from opentelemetry import propagate, trace
+from opentelemetry import propagate
 from store import get_store
+from telemetry import get_tracer
 from trainer import Datum, LoraConfig, TrainerEngine
 
-tracer = trace.get_tracer(__name__)
+tracer = get_tracer("openrl.trainer_worker")
 
 engine = TrainerEngine()
 
@@ -26,6 +27,18 @@ def _parse_datum(raw: dict) -> Datum:
 
   loss_inputs = raw.get("loss_fn_inputs", {})
   return Datum(model_input=tokens, loss_fn_inputs=loss_inputs)
+
+
+async def ensure_adapter_ready(store, model_id: str) -> None:
+  if engine.has_adapter(model_id):
+    await asyncio.to_thread(engine.set_active_adapter, model_id)
+    return
+
+  checkpoint = await store.latest_checkpoint(model_id)
+  if checkpoint:
+    restore_optimizer = bool(checkpoint.get("metadata", {}).get("restore_optimizer", False))
+    await asyncio.to_thread(engine.load_from_state, model_id, checkpoint["checkpoint_ref"], restore_optimizer)
+  await asyncio.to_thread(engine.set_active_adapter, model_id)
 
 
 async def clock_cycle_loop() -> None:
@@ -51,7 +64,7 @@ async def clock_cycle_loop() -> None:
         SKIP_ADAPTER_SWITCH = {"create_model", "create_model_from_state"}
         if not any(r.get("type") in SKIP_ADAPTER_SWITCH for r in batch):
           try:
-            await asyncio.to_thread(engine.set_active_adapter, m_id)
+            await ensure_adapter_ready(store, m_id)
           except Exception as e:
             print(f"Failed to set adapter {m_id}: {e}")
             for r in batch:
@@ -91,6 +104,7 @@ async def clock_cycle_loop() -> None:
                 restore_optimizer = bool(r.get("restore_optimizer", False))
                 result = await asyncio.to_thread(engine.load_from_state, m_id, state_path, restore_optimizer)
                 result["type"] = "create_model_from_state"
+                await store.publish_checkpoint(m_id, state_path, {"restore_optimizer": restore_optimizer, "source": "create_model_from_state"})
                 await store.set_future(req_id, result)
 
               case "forward_backward":
@@ -137,16 +151,27 @@ async def clock_cycle_loop() -> None:
                 result = await asyncio.to_thread(engine.save_state, m_id, state_path, include_optimizer, kind)
                 # SDK's save_state() returns SaveWeightsResponse which requires type="save_weights".
                 result["type"] = "save_weights"
+                await store.publish_checkpoint(
+                  m_id,
+                  result["path"],
+                  {"restore_optimizer": include_optimizer, "source": "save_state", "state_delta_ref": result.get("state_delta_ref")},
+                )
                 await store.set_future(req_id, result)
 
               case "load_weights":
                 state_path = r["state_path"]
                 restore_optimizer = bool(r.get("restore_optimizer", False))
                 await asyncio.to_thread(engine.load_from_state, m_id, state_path, restore_optimizer)
+                await store.publish_checkpoint(m_id, state_path, {"restore_optimizer": restore_optimizer, "source": "load_weights"})
                 await store.set_future(req_id, {"path": state_path, "type": "load_weights"})
 
               case "save_weights_for_sampler":
-                await asyncio.to_thread(engine.save_adapter, m_id, r.get("alias"))
+                await asyncio.to_thread(
+                  engine.publish_adapter_for_inference,
+                  m_id,
+                  r.get("sampling_session_id"),
+                  r.get("alias"),
+                )
                 await store.set_future(
                   req_id,
                   {
