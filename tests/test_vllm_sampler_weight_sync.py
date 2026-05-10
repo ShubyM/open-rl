@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import json
 import os
@@ -120,6 +121,78 @@ class TestVLLMSamplerWeightSync(unittest.TestCase):
     finally:
       shm.close()
       shm.unlink()
+      vllm_sampler.synced_lora_adapters.clear()
+
+  def test_sync_lora_tensors_rejects_stale_version(self) -> None:
+    state_delta = _load_state_delta_module()
+    tensor_name = "base_model.model.layers.0.self_attn.q_proj.lora_A.adapter-a.weight"
+    tensor = torch.zeros(2, 4)
+    manifest = state_delta.build_lora_delta_manifest(
+      run_id="adapter-a",
+      version=2,
+      apply_target="vllm_lora",
+      adapter_config={"peft_type": "LORA"},
+      tensors=[(tensor_name, tensor)],
+      created_at=1.0,
+    )
+    payload_bytes = save({manifest.tensors[0].normalized_name: tensor})
+    request = _RequestStub(
+      {
+        "run_id": "adapter-a",
+        "version": 2,
+        "adapter_name": "sampler-a",
+        "adapter_config": {"peft_type": "LORA"},
+        "manifest": manifest.to_dict(),
+        "tensors_safetensors_b64": base64.b64encode(payload_bytes).decode("ascii"),
+      }
+    )
+    vllm_sampler.synced_lora_adapters["sampler-a"] = {"adapter_path": "/tmp/adapter-a-v3", "version": 3}
+    try:
+      response = asyncio.run(vllm_sampler.sync_lora_tensors(request))
+    finally:
+      vllm_sampler.synced_lora_adapters.clear()
+
+    self.assertEqual(response["type"], "RequestFailedResponse")
+    self.assertIn("stale adapter version", response["error_message"])
+
+  def test_verify_lora_delta_manifest_rejects_checksum_mismatch(self) -> None:
+    state_delta = _load_state_delta_module()
+    tensor_name = "base_model.model.layers.0.self_attn.q_proj.lora_A.adapter-a.weight"
+    manifest = state_delta.build_lora_delta_manifest(
+      run_id="adapter-a",
+      version=2,
+      apply_target="vllm_lora",
+      adapter_config={"peft_type": "LORA"},
+      tensors=[(tensor_name, torch.zeros(2, 4))],
+      compute_checksums=True,
+      created_at=1.0,
+    )
+    payload = vllm_sampler.LoraTensorSyncRequest.model_validate(
+      {
+        "run_id": "adapter-a",
+        "version": 2,
+        "adapter_name": "sampler-a",
+        "adapter_config": {"peft_type": "LORA"},
+        "manifest": manifest.to_dict(),
+      }
+    )
+
+    with self.assertRaisesRegex(ValueError, "tensor checksum mismatch"):
+      vllm_sampler.verify_lora_delta_manifest(payload, {manifest.tensors[0].normalized_name: torch.ones(2, 4)})
+
+  def test_sync_lora_adapter_rejects_stale_version(self) -> None:
+    vllm_sampler.synced_lora_adapters["sampler-a"] = {"adapter_path": "/tmp/adapter-a-v3", "version": 3}
+    try:
+      response = asyncio.run(
+        vllm_sampler.sync_lora_adapter(
+          _RequestStub({"adapter_name": "sampler-a", "version": 2, "adapter_path": "/tmp/adapter-a-v2", "run_id": "adapter-a"})
+        )
+      )
+    finally:
+      vllm_sampler.synced_lora_adapters.clear()
+
+    self.assertEqual(response["type"], "RequestFailedResponse")
+    self.assertIn("stale adapter version", response["error_message"])
 
   def test_generate_uses_synced_lora_adapter_without_request_path(self) -> None:
     fake_engine = _FakeEngine()

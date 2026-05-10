@@ -71,8 +71,9 @@ make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
 ## Weight sync
 
 Most runs do not need weight-sync-specific configuration. When `SAMPLING_BACKEND=vllm`
-or `VLLM_URL` is set, the trainer publishes exact LoRA deltas to the Open-RL
-vLLM worker over shared memory and sends a small HTTP control request.
+or `VLLM_URL` is set, the trainer publishes a durable PEFT adapter snapshot and
+notifies the Open-RL vLLM worker with a versioned adapter reload request. This
+works with a shared `OPEN_RL_TMP_DIR`, including mounted storage in Kubernetes.
 
 The practical required variables are:
 
@@ -85,11 +86,11 @@ Advanced/debug-only knobs:
 
 | Env var | Default | What it does |
 | --- | --- | --- |
-| `OPEN_RL_WEIGHT_SYNC_TRANSPORT` | `vllm_lora_tensors_ipc` | Override the hot transport. Use `vllm_lora_tensors_http` only for debugging small payloads. |
+| `OPEN_RL_WEIGHT_SYNC_TRANSPORT` | `vllm_lora_adapter_reload` | Override the sync transport. `vllm_lora_tensors_http` sends a safetensors payload in the control body for small/debug payloads; `vllm_lora_tensors_shm` uses POSIX shared memory and requires colocated processes with a shared IPC namespace. |
 | `OPEN_RL_WEIGHT_SYNC_TIMEOUT` | `30.0` | Timeout, in seconds, for the trainer to notify the vLLM worker. |
-| `OPEN_RL_WEIGHT_SYNC_STRICT` | `0` | `1` makes a failed hot sync fail the sampler save request instead of falling back to adapter checkpoint state. |
+| `OPEN_RL_WEIGHT_SYNC_STRICT` | `0` | `1` makes a failed vLLM sync fail the sampler save request instead of falling back to adapter checkpoint state. |
 | `OPEN_RL_WEIGHT_SYNC_TENSOR_DTYPE` | unset | Cast tensors before sending, for example `float16` or `bfloat16`, if the inference runtime requires it. |
-| `OPEN_RL_WEIGHT_SYNC_CHECKSUM` | `0` | Computes hot-path tensor checksums. Durable checkpoints keep their own manifest and payload metadata. |
+| `OPEN_RL_WEIGHT_SYNC_CHECKSUM` | `0` | Computes and verifies hot-path tensor checksums. Durable checkpoints keep their own manifest and payload metadata. |
 
 ## vLLM variables
 

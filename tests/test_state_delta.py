@@ -96,6 +96,16 @@ class TestStateDelta(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "delta does not apply"):
       state_delta.validate_for_apply(manifest, state_delta.ReceiverState(ref="adapter-a:0", version=1))
 
+  def test_build_lora_delta_manifest_rejects_unsupported_selected_tensors(self) -> None:
+    with self.assertRaisesRegex(ValueError, "unsupported LoRA tensor names"):
+      state_delta.build_lora_delta_manifest(
+        run_id="adapter-a",
+        version=1,
+        apply_target="vllm_lora",
+        tensors=[("base_model.model.score.modules_to_save.adapter-a.weight", torch.zeros(2, 4))],
+        created_at=1.0,
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

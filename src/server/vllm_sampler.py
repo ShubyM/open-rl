@@ -16,13 +16,43 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 from safetensors.torch import load as load_safetensors
 from safetensors.torch import save_file as save_safetensors_file
-from state_delta import StateDeltaManifest, hash_adapter_config, validate_delta_manifest
+from state_delta import StateDeltaManifest, hash_adapter_config, tensor_checksum, validate_delta_manifest
 from telemetry import get_tracer, instrument_fastapi
-from vllm import SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.async_llm_engine import AsyncLLMEngine
-from vllm.lora.request import LoRARequest
-from vllm.sampling_params import RequestOutputKind
+
+try:
+  from vllm import SamplingParams
+  from vllm.engine.arg_utils import AsyncEngineArgs
+  from vllm.engine.async_llm_engine import AsyncLLMEngine
+  from vllm.lora.request import LoRARequest
+  from vllm.sampling_params import RequestOutputKind
+
+  VLLM_IMPORT_ERROR: Exception | None = None
+except ImportError as exc:
+  VLLM_IMPORT_ERROR = exc
+
+  class SamplingParams:
+    def __init__(self, **kwargs):
+      self.kwargs = kwargs
+
+  class AsyncEngineArgs:
+    def __init__(self, **kwargs):
+      self.kwargs = kwargs
+
+  class AsyncLLMEngine:
+    @classmethod
+    def from_engine_args(cls, engine_args):
+      raise RuntimeError(f"vLLM is not installed: {VLLM_IMPORT_ERROR}")
+
+  class LoRARequest:
+    def __init__(self, lora_name, lora_int_id, lora_path, load_inplace=False):
+      self.lora_name = lora_name
+      self.lora_int_id = lora_int_id
+      self.lora_path = lora_path
+      self.load_inplace = load_inplace
+
+  class RequestOutputKind:
+    FINAL_ONLY = "final_only"
+
 
 tracer = get_tracer("openrl.vllm_sampler")
 
@@ -72,6 +102,9 @@ async def lifespan(app: FastAPI):
   mock_vllm = os.getenv("MOCK_VLLM", "0") == "1"
   if mock_vllm:
     print("[vLLM Subprocess] MOCK_VLLM=1, bypassing real engine init for local dev.")
+  elif VLLM_IMPORT_ERROR is not None:
+    print(f"[vLLM Subprocess] Error: vLLM import failed: {VLLM_IMPORT_ERROR}")
+    sys.exit(1)
   elif not model_name:
     print("[vLLM Subprocess] Error: BASE_MODEL environment variable is required.")
     sys.exit(1)
@@ -122,14 +155,18 @@ async def sync_lora_adapter(req: Request):
     return {"type": "RequestFailedResponse", "error_message": "adapter_name is required"}
   if version is None:
     return {"type": "RequestFailedResponse", "error_message": "version is required"}
+  version = int(version)
+  current = synced_lora_adapters.get(adapter_name)
+  if current and int(current.get("version", 0)) >= version:
+    return {"type": "RequestFailedResponse", "error_message": f"stale adapter version {version} for {adapter_name}"}
 
   synced_lora_adapters[adapter_name] = {
     "adapter_path": adapter_path,
     "manifest_path": data.get("manifest_path"),
     "run_id": data.get("run_id"),
-    "version": int(version),
+    "version": version,
   }
-  return {"adapter_name": adapter_name, "version": int(version), "type": "sync_lora_adapter"}
+  return {"adapter_name": adapter_name, "version": version, "type": "sync_lora_adapter"}
 
 
 def read_lora_safetensors_bytes(payload: LoraTensorSyncRequest) -> bytes:
@@ -170,6 +207,8 @@ def verify_lora_delta_manifest(payload: LoraTensorSyncRequest, tensors: dict[str
     received_dtype = str(tensor.dtype).removeprefix("torch.")
     if received_dtype != entry.dtype and (received_dtype not in FLOAT_DTYPE_NAMES or entry.dtype not in FLOAT_DTYPE_NAMES):
       raise ValueError(f"tensor dtype mismatch for {entry.normalized_name}")
+    if entry.checksum is not None and tensor_checksum(tensor) != entry.checksum:
+      raise ValueError(f"tensor checksum mismatch for {entry.normalized_name}")
 
   if payload.transport_receipt and (payload.transport_receipt.delta_id != manifest.delta_id or payload.transport_receipt.version != manifest.version):
     raise ValueError("transport_receipt does not match manifest")
@@ -183,6 +222,9 @@ async def sync_lora_tensors(req: Request):
     payload = LoraTensorSyncRequest.model_validate(await req.json())
     tensors = load_safetensors(read_lora_safetensors_bytes(payload))
     manifest = verify_lora_delta_manifest(payload, tensors)
+    current = synced_lora_adapters.get(payload.adapter_name)
+    if current and int(current.get("version", 0)) >= payload.version:
+      raise ValueError(f"stale adapter version {payload.version} for {payload.adapter_name}")
     sync_root = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")) / "vllm_lora_sync"
     adapter_key = hashlib.sha256(f"{payload.adapter_name}@{payload.version}:{manifest.delta_id}".encode()).hexdigest()[:24]
     adapter_dir = sync_root / adapter_key

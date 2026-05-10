@@ -132,9 +132,11 @@ def build_lora_delta_manifest(
   created_at: float | None = None,
 ) -> StateDeltaManifest:
   entries: list[TensorEntry] = []
+  unsupported: list[str] = []
   for name, tensor in tensors:
     normalized_name = normalize_lora_tensor_name(name, run_id)
     if normalized_name is None:
+      unsupported.append(name)
       continue
     storage_key = hashlib.sha256(f"{run_id}:{version}:{normalized_name}".encode()).hexdigest()
     entries.append(
@@ -148,6 +150,9 @@ def build_lora_delta_manifest(
         storage_key,
       )
     )
+
+  if unsupported:
+    raise ValueError(f"unsupported LoRA tensor names: {unsupported}")
 
   entries.sort(key=lambda entry: entry.normalized_name)
   resolved_base_ref = base_ref or f"{run_id}:{version - 1}"
