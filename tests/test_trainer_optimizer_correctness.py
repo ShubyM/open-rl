@@ -11,6 +11,7 @@ from tests._server_fixture import SERVER_DIR
 
 
 def _load_trainer_module():
+  sys.path.insert(0, str(SERVER_DIR))
   stubs = {
     "peft": types.SimpleNamespace(
       LoraConfig=object,
