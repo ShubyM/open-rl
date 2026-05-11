@@ -1,4 +1,9 @@
-"""Semantic state delta manifests for Open-RL runtime synchronization."""
+"""Adapter snapshot manifests for Open-RL runtime synchronization.
+
+The current LoRA path publishes complete adapter snapshots. `StateDeltaManifest`
+is kept as a compatibility alias for older imports; future incremental deltas
+should get a separate manifest once receiver lineage is enforced.
+"""
 
 from __future__ import annotations
 
@@ -42,7 +47,7 @@ class TensorEntry:
 
 
 @dataclass(frozen=True)
-class StateDeltaManifest:
+class AdapterSnapshotManifest:
   schema_version: int
   run_id: str
   version: int
@@ -58,7 +63,7 @@ class StateDeltaManifest:
     return asdict(self)
 
   @classmethod
-  def from_dict(cls, data: Mapping[str, Any]) -> StateDeltaManifest:
+  def from_dict(cls, data: Mapping[str, Any]) -> AdapterSnapshotManifest:
     return cls(
       int(data["schema_version"]),
       str(data["run_id"]),
@@ -120,7 +125,7 @@ def role_for_lora_tensor_name(name: str) -> TensorRole:
   return "unknown"
 
 
-def build_lora_delta_manifest(
+def build_lora_adapter_snapshot_manifest(
   *,
   run_id: str,
   version: int,
@@ -130,7 +135,7 @@ def build_lora_delta_manifest(
   base_ref: str | None = None,
   compute_checksums: bool = False,
   created_at: float | None = None,
-) -> StateDeltaManifest:
+) -> AdapterSnapshotManifest:
   entries: list[TensorEntry] = []
   unsupported: list[str] = []
   for name, tensor in tensors:
@@ -166,7 +171,7 @@ def build_lora_delta_manifest(
   }
   delta_input["storage_keys"] = [entry.storage_key for entry in entries]
   delta_id = hashlib.sha256(json.dumps(delta_input, sort_keys=True).encode("utf-8")).hexdigest()
-  manifest = StateDeltaManifest(
+  manifest = AdapterSnapshotManifest(
     SCHEMA_VERSION,
     run_id,
     version,
@@ -178,18 +183,33 @@ def build_lora_delta_manifest(
     tuple(entries),
     created_at if created_at is not None else time.time(),
   )
-  validate_delta_manifest(manifest)
+  validate_adapter_snapshot_manifest(manifest)
   return manifest
 
 
-def validate_delta_manifest(manifest: StateDeltaManifest) -> None:
+def validate_adapter_snapshot_manifest(manifest: AdapterSnapshotManifest) -> None:
   storage_keys = [entry.storage_key for entry in manifest.tensors]
   normalized_names = [entry.normalized_name for entry in manifest.tensors]
   if len(storage_keys) != len(set(storage_keys)) or len(normalized_names) != len(set(normalized_names)):
     raise ValueError("duplicate tensor entries")
 
 
-def validate_for_apply(manifest: StateDeltaManifest, receiver_state: ReceiverState) -> None:
-  validate_delta_manifest(manifest)
+def validate_adapter_snapshot_for_apply(manifest: AdapterSnapshotManifest, receiver_state: ReceiverState) -> None:
+  validate_adapter_snapshot_manifest(manifest)
   if manifest.version <= receiver_state.version or manifest.base_ref != receiver_state.ref:
     raise ValueError("delta does not apply")
+
+
+StateDeltaManifest = AdapterSnapshotManifest
+
+
+def build_lora_delta_manifest(**kwargs: Any) -> AdapterSnapshotManifest:
+  return build_lora_adapter_snapshot_manifest(**kwargs)
+
+
+def validate_delta_manifest(manifest: AdapterSnapshotManifest) -> None:
+  validate_adapter_snapshot_manifest(manifest)
+
+
+def validate_for_apply(manifest: AdapterSnapshotManifest, receiver_state: ReceiverState) -> None:
+  validate_adapter_snapshot_for_apply(manifest, receiver_state)

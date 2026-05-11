@@ -1,4 +1,4 @@
-"""Hot and durable backing stores for state delta payloads."""
+"""Hot and durable backing stores for adapter snapshot payloads."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Protocol
 
 import torch
 from safetensors.torch import save as save_safetensors
-from state_delta import StateDeltaManifest, TensorEntry
+from state_delta import AdapterSnapshotManifest, TensorEntry
 
 
 @dataclass(frozen=True)
@@ -46,12 +46,12 @@ class DeltaWrite:
 class DeltaStore(Protocol):
   name: str
 
-  def write_delta(self, manifest: StateDeltaManifest, tensors: Iterable[tuple[TensorEntry, torch.Tensor]]) -> DeltaWrite: ...
+  def write_delta(self, manifest: AdapterSnapshotManifest, tensors: Iterable[tuple[TensorEntry, torch.Tensor]]) -> DeltaWrite: ...
 
 
 @dataclass(frozen=True)
 class DeltaRead:
-  manifest: StateDeltaManifest
+  manifest: AdapterSnapshotManifest
   tensor_path: Path
 
 
@@ -71,7 +71,7 @@ class SharedMemoryDeltaStore:
   def __init__(self, tensor_dtype: torch.dtype | None = None):
     self.tensor_dtype = tensor_dtype
 
-  def write_delta(self, manifest: StateDeltaManifest, tensors: Iterable[tuple[TensorEntry, torch.Tensor]]) -> DeltaWrite:
+  def write_delta(self, manifest: AdapterSnapshotManifest, tensors: Iterable[tuple[TensorEntry, torch.Tensor]]) -> DeltaWrite:
     payload_bytes = tensor_bytes(tensors, self.tensor_dtype)
     shm = shared_memory.SharedMemory(create=True, size=len(payload_bytes))
     shm.buf[: len(payload_bytes)] = payload_bytes
@@ -89,7 +89,7 @@ class HttpBodyDeltaStore:
   def __init__(self, tensor_dtype: torch.dtype | None = None):
     self.tensor_dtype = tensor_dtype
 
-  def write_delta(self, manifest: StateDeltaManifest, tensors: Iterable[tuple[TensorEntry, torch.Tensor]]) -> DeltaWrite:
+  def write_delta(self, manifest: AdapterSnapshotManifest, tensors: Iterable[tuple[TensorEntry, torch.Tensor]]) -> DeltaWrite:
     payload_bytes = tensor_bytes(tensors, self.tensor_dtype)
     locations = {entry.storage_key: "http_body" for entry in manifest.tensors}
     return DeltaWrite(
@@ -106,7 +106,7 @@ class FileDeltaStore:
     self.root_dir = Path(root_dir or Path(tmp_dir) / "deltas")
     self.tensor_dtype = tensor_dtype
 
-  def write_delta(self, manifest: StateDeltaManifest, tensors: Iterable[tuple[TensorEntry, torch.Tensor]]) -> DeltaWrite:
+  def write_delta(self, manifest: AdapterSnapshotManifest, tensors: Iterable[tuple[TensorEntry, torch.Tensor]]) -> DeltaWrite:
     delta_dir = self.root_dir / manifest.run_id / str(manifest.version)
     delta_dir.mkdir(parents=True, exist_ok=True)
     tensor_path = delta_dir / "tensors.safetensors"
@@ -123,5 +123,5 @@ class FileDeltaStore:
   def read_delta(self, ref: str | os.PathLike[str]) -> DeltaRead:
     delta_dir = Path(ref)
     with (delta_dir / "manifest.json").open() as f:
-      manifest = StateDeltaManifest.from_dict(json.load(f))
+      manifest = AdapterSnapshotManifest.from_dict(json.load(f))
     return DeltaRead(manifest=manifest, tensor_path=delta_dir / "tensors.safetensors")

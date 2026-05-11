@@ -125,22 +125,23 @@ class TestWeightSync(unittest.TestCase):
         base_model_id="Qwen/Qwen3-0.6B",
       )
 
-      self.assertEqual(state.run_id, "adapter-a")
+      self.assertEqual(state.model_id, "adapter-a")
       self.assertEqual(state.version, 1)
-      self.assertEqual(state.base_model_id, "Qwen/Qwen3-0.6B")
+      self.assertEqual(state.base_model, "Qwen/Qwen3-0.6B")
       self.assertEqual(state.state_id, "tinker://adapter-a/sampler_weights/current")
       self.assertEqual(state.adapter_ref, "/tmp/open-rl/peft/adapter-a/adapter-a")
       self.assertEqual(state.tensor_count, 2)
       self.assertEqual(state.transport, "file_adapter_reload")
-      self.assertIsNotNone(state.manifest_path)
+      self.assertIsNotNone(state.delta_ref)
 
-      with open(state.manifest_path) as f:
+      manifest_path = Path(state.delta_ref) / "manifest.json"
+      with open(manifest_path) as f:
         manifest = json.load(f)
       self.assertEqual(manifest["apply_target"], "vllm_lora")
       self.assertEqual(manifest["run_id"], "adapter-a")
       self.assertTrue(all(entry["checksum"] for entry in manifest["tensors"]))
       self.assertEqual(len(manifest["tensors"]), 2)
-      tensor_path = Path(state.manifest_path).with_name("tensors.safetensors")
+      tensor_path = Path(state.delta_ref) / "tensors.safetensors"
       self.assertEqual(
         set(load_file(tensor_path)),
         {
@@ -313,7 +314,7 @@ class TestWeightSync(unittest.TestCase):
     self.assertEqual(list(sender.sent), [tensor.name for tensor in tensors])
     self.assertEqual(metadata[tensors[0].name], (torch.float32, torch.Size([2, 4])))
     self.assertEqual(state.transport, "torchrl_vllm_nccl")
-    self.assertEqual(state.inference_backend, "vllm")
+    self.assertEqual(state.runtime_backend, "vllm")
     self.assertEqual(state.tensor_count, 2)
 
   def test_checkpoint_delta_sidecar_uses_file_delta_store(self) -> None:

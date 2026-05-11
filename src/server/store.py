@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import redis.asyncio as redis
+from model_state import latest_training_state_alias, state_ref
 
 
 class RequestStore(ABC):
@@ -41,6 +42,16 @@ class RequestStore(ABC):
     pass
 
   @abstractmethod
+  async def publish_model_state_alias(self, alias: str, state_id: str) -> None:
+    """Point an alias at a durable model state."""
+    pass
+
+  @abstractmethod
+  async def resolve_model_state_alias(self, alias: str) -> str | None:
+    """Resolve a model state alias to its concrete state ID."""
+    pass
+
+  @abstractmethod
   async def publish_model_state(self, state_id: str, state: dict[str, Any]) -> None:
     """Publish a durable model state addressable by samplers and trainers."""
     pass
@@ -61,8 +72,8 @@ class InMemoryStore(RequestStore):
 
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, asyncio.Event] = {}
-    self.checkpoints: dict[str, dict[str, Any]] = {}
     self.model_states: dict[str, dict[str, Any]] = {}
+    self.model_state_aliases: dict[str, str] = {}
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -123,16 +134,29 @@ class InMemoryStore(RequestStore):
       self.futures_events.pop(req_id, None)
 
   async def publish_checkpoint(self, model_id: str, checkpoint_ref: str, metadata: dict[str, Any] | None = None) -> None:
-    self.checkpoints[model_id] = {"checkpoint_ref": checkpoint_ref, "metadata": metadata or {}}
+    state = checkpoint_model_state(model_id, checkpoint_ref, metadata)
+    await self.publish_model_state(state["state_id"], state)
+    await self.publish_model_state_alias(latest_training_state_alias(model_id), state["state_id"])
 
   async def latest_checkpoint(self, model_id: str) -> dict[str, Any] | None:
-    return self.checkpoints.get(model_id)
+    state = await self.get_model_state(latest_training_state_alias(model_id))
+    return checkpoint_response(state) if state else None
+
+  async def publish_model_state_alias(self, alias: str, state_id: str) -> None:
+    self.model_state_aliases[alias] = state_id
+
+  async def resolve_model_state_alias(self, alias: str) -> str | None:
+    return self.model_state_aliases.get(alias)
 
   async def publish_model_state(self, state_id: str, state: dict[str, Any]) -> None:
     self.model_states[state_id] = state
 
   async def get_model_state(self, state_id: str) -> dict[str, Any] | None:
-    return self.model_states.get(state_id)
+    state = self.model_states.get(state_id)
+    if state:
+      return state
+    resolved = await self.resolve_model_state_alias(state_id)
+    return self.model_states.get(resolved) if resolved else None
 
 
 class RedisStore(RequestStore):
@@ -141,8 +165,8 @@ class RedisStore(RequestStore):
     self.active_list = "open_rl:active_tenants"
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
-    self.checkpoint_hash = "open_rl:latest_checkpoints"
     self.model_state_hash = "open_rl:model_states"
+    self.model_state_alias_hash = "open_rl:model_state_aliases"
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -213,18 +237,63 @@ class RedisStore(RequestStore):
     return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
 
   async def publish_checkpoint(self, model_id: str, checkpoint_ref: str, metadata: dict[str, Any] | None = None) -> None:
-    await self.redis.hset(self.checkpoint_hash, model_id, json.dumps({"checkpoint_ref": checkpoint_ref, "metadata": metadata or {}}))
+    state = checkpoint_model_state(model_id, checkpoint_ref, metadata)
+    await self.publish_model_state(state["state_id"], state)
+    await self.publish_model_state_alias(latest_training_state_alias(model_id), state["state_id"])
 
   async def latest_checkpoint(self, model_id: str) -> dict[str, Any] | None:
-    payload = await self.redis.hget(self.checkpoint_hash, model_id)
-    return json.loads(payload) if payload else None
+    state = await self.get_model_state(latest_training_state_alias(model_id))
+    return checkpoint_response(state) if state else None
+
+  async def publish_model_state_alias(self, alias: str, state_id: str) -> None:
+    await self.redis.hset(self.model_state_alias_hash, alias, state_id)
+
+  async def resolve_model_state_alias(self, alias: str) -> str | None:
+    return await self.redis.hget(self.model_state_alias_hash, alias)
 
   async def publish_model_state(self, state_id: str, state: dict[str, Any]) -> None:
     await self.redis.hset(self.model_state_hash, state_id, json.dumps(state))
 
   async def get_model_state(self, state_id: str) -> dict[str, Any] | None:
     payload = await self.redis.hget(self.model_state_hash, state_id)
+    if payload:
+      return json.loads(payload)
+    resolved = await self.resolve_model_state_alias(state_id)
+    if not resolved:
+      return None
+    payload = await self.redis.hget(self.model_state_hash, resolved)
     return json.loads(payload) if payload else None
+
+
+def checkpoint_model_state(model_id: str, checkpoint_ref: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+  metadata = metadata or {}
+  training_mode = metadata.get("training_mode", "lora")
+  state = {
+    "state_id": metadata.get("state_id") or checkpoint_ref,
+    "model_id": model_id,
+    "base_model": metadata.get("base_model", ""),
+    "training_mode": training_mode,
+    "version": int(metadata.get("version", 0) or 0),
+    "optimizer_ref": metadata.get("optimizer_ref"),
+    "delta_ref": metadata.get("delta_ref") or metadata.get("state_delta_ref"),
+    "adapter_name": metadata.get("adapter_name"),
+    "runtime_backend": metadata.get("runtime_backend") or metadata.get("inference_backend"),
+    "checkpoint_metadata": metadata,
+  }
+  if training_mode == "lora":
+    state["adapter_ref"] = metadata.get("adapter_ref") or checkpoint_ref
+    state["full_weights_ref"] = metadata.get("full_weights_ref")
+  else:
+    state["adapter_ref"] = metadata.get("adapter_ref")
+    state["full_weights_ref"] = metadata.get("full_weights_ref") or checkpoint_ref
+  return {key: value for key, value in state.items() if value is not None}
+
+
+def checkpoint_response(state: dict[str, Any]) -> dict[str, Any] | None:
+  ref = state_ref(state)
+  if not ref:
+    return None
+  return {"checkpoint_ref": ref, "metadata": state.get("checkpoint_metadata", {})}
 
 
 # Global singleton factory

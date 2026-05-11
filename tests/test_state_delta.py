@@ -63,7 +63,7 @@ class TestStateDelta(unittest.TestCase):
       created_at=1.0,
     )
 
-    restored = state_delta.StateDeltaManifest.from_dict(manifest.to_dict())
+    restored = state_delta.AdapterSnapshotManifest.from_dict(manifest.to_dict())
 
     self.assertEqual(restored, manifest)
 

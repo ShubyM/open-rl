@@ -9,15 +9,15 @@ from datetime import datetime
 from typing import Any
 
 import torch
-from checkpoint_store import FileCheckpointStore, lora_checkpoint_metadata
+from checkpoint_store import FileCheckpointStore
 from delta_store import FileDeltaStore
+from model_state import ModelState, lora_model_state
 from peft import LoraConfig as PeftLoraConfig
 from peft import PeftModelForCausalLM, get_peft_model
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from weight_sync import (
   LoraTensorSelector,
-  PublishedState,
   WeightSyncBridge,
   build_vllm_lora_delta_manifest,
   read_adapter_config,
@@ -183,7 +183,7 @@ class TrainerEngine:
       traceback.print_exc()
       raise
 
-  def publish_adapter_for_inference(self, adapter_id: str, sampler_id: str | None = None, alias: str | None = None) -> PublishedState:
+  def publish_adapter_for_inference(self, adapter_id: str, sampler_id: str | None = None, alias: str | None = None) -> ModelState:
     """Save adapter weights and publish an exact tensor manifest for inference."""
     assert self.peft_model is not None, "Model must be loaded first."
 
@@ -216,19 +216,19 @@ class TrainerEngine:
     if include_optimizer and optimizer is not None:
       torch.save(optimizer.state_dict(), optimizer_ref)
 
-    metadata = lora_checkpoint_metadata(
-      base_model=self.base_model_name,
-      model_id=model_id,
-      checkpoint_dir=state_path,
-      kind=kind,
+    state = lora_model_state(
       state_id=state_path,
+      model_id=model_id,
+      base_model=self.base_model_name or "",
       optimizer_ref=optimizer_ref,
-      state_delta_ref=delta_ref,
+      adapter_ref=state_path,
+      delta_ref=delta_ref,
+      version=int(time.time() * 1000),
     )
-    self.checkpoint_store.write_metadata(state_path, metadata)
+    self.checkpoint_store.write_model_state(state_path, state)
 
     print(f"Saved state for '{model_id}' to {state_path}")
-    return {"path": state_path, "state_delta_ref": delta_ref}
+    return {"path": state_path, "delta_ref": delta_ref, "state_delta_ref": delta_ref, "model_state": state.to_dict(), "kind": kind}
 
   def write_checkpoint_delta(self, model_id: str, state_path: str) -> str:
     tensors = LoraTensorSelector().select(self.peft_model, model_id)
@@ -248,15 +248,15 @@ class TrainerEngine:
     Expects the directory to contain a metadata.json describing base_model
     and (optionally) an adapter subdirectory with the saved LoRA weights.
     """
-    metadata = self.checkpoint_store.read_metadata(state_path)
-    base_model = metadata.base_model
+    state = self.checkpoint_store.read_model_state(state_path)
+    base_model = state.base_model
     if not base_model:
       raise ValueError(f"metadata.json at {state_path} missing base_model")
 
-    src_adapter_id = metadata.model_id
-    adapter_dir = state_path
-    if src_adapter_id and os.path.exists(os.path.join(state_path, src_adapter_id)):
-      adapter_dir = os.path.join(state_path, src_adapter_id)
+    src_adapter_id = state.model_id
+    adapter_dir = state.adapter_ref or state_path
+    if src_adapter_id and os.path.exists(os.path.join(adapter_dir, src_adapter_id)):
+      adapter_dir = os.path.join(adapter_dir, src_adapter_id)
 
     self.load_base_model(base_model)
     assert self.base_model is not None
@@ -276,8 +276,8 @@ class TrainerEngine:
     self.adapter_states[model_id] = adapter_state
     self.peft_model.train()
 
-    if restore_optimizer and metadata.has_optimizer:
-      optimizer_path = metadata.optimizer_ref or os.path.join(state_path, "optimizer.pt")
+    if restore_optimizer and state.optimizer_ref:
+      optimizer_path = state.optimizer_ref
       if os.path.exists(optimizer_path):
         lr = 1e-4
         optimizer = torch.optim.AdamW(params, lr=lr)

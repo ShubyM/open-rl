@@ -12,7 +12,8 @@ from typing import Any, Literal, Protocol
 import httpx
 import torch
 from delta_store import DeltaStore, FileDeltaStore, HttpBodyDeltaStore, SharedMemoryDeltaStore
-from state_delta import StateDeltaManifest, TensorEntry, build_lora_delta_manifest
+from model_state import ModelState, lora_model_state
+from state_delta import AdapterSnapshotManifest, TensorEntry, build_lora_adapter_snapshot_manifest
 from vllm_routing import DEFAULT_VLLM_URL, vllm_url_for_base_model
 
 WeightRole = Literal["lora", "full_weight", "lm_head", "embedding"]
@@ -25,21 +26,6 @@ class WeightTensor:
   dtype: str
   shape: tuple[int, ...]
   role: WeightRole
-
-
-@dataclass(frozen=True)
-class PublishedState:
-  run_id: str
-  version: int
-  adapter_name: str
-  inference_backend: str
-  transport: str
-  tensor_count: int
-  durable_ref: str | None = None
-  manifest_path: str | None = None
-  base_model_id: str | None = None
-  state_id: str | None = None
-  adapter_ref: str | None = None
 
 
 class TensorSelector(Protocol):
@@ -57,7 +43,7 @@ class TransferEngine(Protocol):
     tensors: Sequence[WeightTensor],
     durable_ref: str | None,
     base_model_id: str | None = None,
-  ) -> PublishedState: ...
+  ) -> ModelState: ...
 
 
 class LoraTensorSelector:
@@ -108,8 +94,8 @@ def build_vllm_lora_delta_manifest(
   tensors: Sequence[WeightTensor],
   adapter_config: dict[str, Any] | None,
   checksum: bool = False,
-) -> StateDeltaManifest:
-  return build_lora_delta_manifest(
+) -> AdapterSnapshotManifest:
+  return build_lora_adapter_snapshot_manifest(
     run_id=run_id,
     version=version,
     tensors=((item.name, item.tensor) for item in tensors),
@@ -119,7 +105,7 @@ def build_vllm_lora_delta_manifest(
   )
 
 
-def tensors_for_manifest(tensors: Sequence[WeightTensor], manifest: StateDeltaManifest) -> list[tuple[TensorEntry, torch.Tensor]]:
+def tensors_for_manifest(tensors: Sequence[WeightTensor], manifest: AdapterSnapshotManifest) -> list[tuple[TensorEntry, torch.Tensor]]:
   tensors_by_name = {item.name: item.tensor for item in tensors}
   return [(entry, tensors_by_name[entry.name]) for entry in manifest.tensors]
 
@@ -154,8 +140,38 @@ def read_adapter_config(durable_ref: str | None) -> dict[str, Any] | None:
     return json.load(f)
 
 
+def transfer_model_state(
+  *,
+  run_id: str,
+  version: int,
+  adapter_name: str,
+  inference_backend: str,
+  transport: str,
+  tensor_count: int,
+  adapter_ref: str | None,
+  base_model_id: str | None,
+  delta_ref: str | None = None,
+) -> ModelState:
+  return lora_model_state(
+    state_id=adapter_name,
+    model_id=run_id,
+    base_model=base_model_id or "",
+    version=version,
+    adapter_ref=adapter_ref,
+    adapter_name=adapter_name,
+    delta_ref=delta_ref,
+    runtime_backend=inference_backend,
+    transport=transport,
+    tensor_count=tensor_count,
+  )
+
+
+def manifest_path_for_state(state: ModelState) -> str | None:
+  return str(Path(state.delta_ref) / "manifest.json") if state.delta_ref else None
+
+
 class FileAdapterTransferEngine:
-  """Persist the semantic delta to a durable local file store."""
+  """Persist the adapter snapshot manifest to a durable local file store."""
 
   name = "file_adapter_reload"
 
@@ -170,11 +186,21 @@ class FileAdapterTransferEngine:
     tensors: Sequence[WeightTensor],
     durable_ref: str | None,
     base_model_id: str | None = None,
-  ) -> PublishedState:
+  ) -> ModelState:
     manifest = build_vllm_lora_delta_manifest(run_id, version, tensors, read_adapter_config(durable_ref), checksum=True)
     write = self.store.write_delta(manifest, tensors_for_manifest(tensors, manifest))
 
-    return PublishedState(run_id, version, adapter_name, "file", self.name, len(tensors), durable_ref, write.payload["manifest_path"], base_model_id)
+    return transfer_model_state(
+      run_id=run_id,
+      version=version,
+      adapter_name=adapter_name,
+      inference_backend="file",
+      transport=self.name,
+      tensor_count=len(tensors),
+      adapter_ref=durable_ref,
+      base_model_id=base_model_id,
+      delta_ref=write.payload["delta_ref"],
+    )
 
 
 class TorchRLVLLMTransferEngine:
@@ -197,10 +223,19 @@ class TorchRLVLLMTransferEngine:
     tensors: Sequence[WeightTensor],
     durable_ref: str | None,
     base_model_id: str | None = None,
-  ) -> PublishedState:
+  ) -> ModelState:
     weights = {item.name: item.tensor for item in tensors}
     self.sender.update_weights(weights)
-    return PublishedState(run_id, version, adapter_name, "vllm", self.name, len(tensors), durable_ref, base_model_id=base_model_id)
+    return transfer_model_state(
+      run_id=run_id,
+      version=version,
+      adapter_name=adapter_name,
+      inference_backend="vllm",
+      transport=self.name,
+      tensor_count=len(tensors),
+      adapter_ref=durable_ref,
+      base_model_id=base_model_id,
+    )
 
 
 class VLLMAdapterTransferEngine:
@@ -222,7 +257,7 @@ class VLLMAdapterTransferEngine:
     tensors: Sequence[WeightTensor],
     durable_ref: str | None,
     base_model_id: str | None = None,
-  ) -> PublishedState:
+  ) -> ModelState:
     state = self.fallback.publish(run_id, version, adapter_name, tensors, durable_ref, base_model_id)
     try:
       post_vllm_adapter_sync(
@@ -232,7 +267,7 @@ class VLLMAdapterTransferEngine:
         version,
         adapter_name,
         durable_ref,
-        state.manifest_path,
+        manifest_path_for_state(state),
         base_model_id,
       )
     except Exception:
@@ -240,7 +275,7 @@ class VLLMAdapterTransferEngine:
         raise
       print(f"[weight-sync] vLLM adapter sync skipped for {adapter_name}@{version}; durable adapter was written")
       return state
-    return PublishedState(run_id, version, adapter_name, "vllm", self.name, len(tensors), durable_ref, state.manifest_path, base_model_id)
+    return replace(state, runtime_backend="vllm", transport=self.name)
 
 
 class VLLMLoraTensorTransferEngine:
@@ -271,7 +306,7 @@ class VLLMLoraTensorTransferEngine:
     tensors: Sequence[WeightTensor],
     durable_ref: str | None,
     base_model_id: str | None = None,
-  ) -> PublishedState:
+  ) -> ModelState:
     try:
       adapter_config = read_adapter_config(durable_ref)
       checksum = os.getenv("OPEN_RL_WEIGHT_SYNC_CHECKSUM", "0") == "1"
@@ -283,7 +318,17 @@ class VLLMLoraTensorTransferEngine:
         post_vllm_sync(vllm_url_for_base_model(base_model_id, self.vllm_url), self.timeout, request)
       finally:
         write.close()
-      return PublishedState(run_id, version, adapter_name, "vllm", self.name, len(tensors), durable_ref, base_model_id=base_model_id)
+      return transfer_model_state(
+        run_id=run_id,
+        version=version,
+        adapter_name=adapter_name,
+        inference_backend="vllm",
+        transport=self.name,
+        tensor_count=len(tensors),
+        adapter_ref=durable_ref,
+        base_model_id=base_model_id,
+        delta_ref=write.payload.get("delta_ref"),
+      )
     except Exception:
       if self.strict:
         raise
@@ -297,7 +342,7 @@ class VLLMLoraTensorTransferEngine:
           version,
           adapter_name,
           durable_ref,
-          state.manifest_path,
+          manifest_path_for_state(state),
           base_model_id,
         )
       except Exception:
@@ -323,7 +368,7 @@ def lora_delta_request(
   adapter_name: str,
   durable_ref: str | None,
   adapter_config: dict[str, Any] | None,
-  manifest: StateDeltaManifest,
+  manifest: AdapterSnapshotManifest,
   write: Any,
   base_model_id: str | None = None,
 ) -> dict[str, Any]:
@@ -431,11 +476,11 @@ class WeightSyncBridge:
     adapter_name: str,
     durable_ref: str | None,
     base_model_id: str | None = None,
-  ) -> PublishedState:
+  ) -> ModelState:
     resolved_version = version if version is not None else self.next_version(run_id)
     tensors = self.selector.select(model, run_id)
     state = self.transfer_engine.publish(run_id, resolved_version, adapter_name, tensors, durable_ref, base_model_id)
-    return replace(state, base_model_id=base_model_id, state_id=adapter_name, adapter_ref=durable_ref)
+    return replace(state, state_id=adapter_name, adapter_ref=durable_ref or state.adapter_ref)
 
   def next_version(self, run_id: str) -> int:
     version = self._versions.get(run_id, 0) + 1

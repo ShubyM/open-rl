@@ -49,8 +49,9 @@ def get_default_model_name() -> str | None:
   if is_single_process_mode():
     import clock_cycle
 
-    if clock_cycle.engine.base_model_name:
-      return clock_cycle.engine.base_model_name
+    trainer_engine = clock_cycle.get_engine()
+    if trainer_engine.base_model_name:
+      return trainer_engine.base_model_name
   return os.getenv("BASE_MODEL")
 
 
@@ -125,7 +126,7 @@ async def lifespan(_: FastAPI):
     print("-> Server mode     : API server + worker loop in one process\n")
     await _preflight_vllm()
     if base_model:
-      await asyncio.to_thread(clock_cycle.engine.load_base_model, base_model)
+      await asyncio.to_thread(clock_cycle.get_engine().load_base_model, base_model)
     task = asyncio.create_task(clock_cycle.clock_cycle_loop())
   try:
     yield

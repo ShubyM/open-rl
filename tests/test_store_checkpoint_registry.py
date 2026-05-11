@@ -11,6 +11,7 @@ sys.modules.setdefault("redis", types.SimpleNamespace(asyncio=types.SimpleNamesp
 sys.modules.setdefault("redis.asyncio", types.SimpleNamespace(from_url=lambda *_args, **_kwargs: None))
 sys.path.insert(0, str(SERVER_DIR))
 import store  # noqa: E402
+from model_state import latest_training_state_alias  # noqa: E402
 
 
 class FakeRedis:
@@ -30,17 +31,21 @@ class TestCheckpointRegistry(unittest.TestCase):
       request_store = store.InMemoryStore()
       self.assertIsNone(await request_store.latest_checkpoint("adapter-a"))
 
-      await request_store.publish_checkpoint("adapter-a", "/tmp/open-rl/checkpoints/a-1", {"state_delta_ref": "delta-a-1"})
-      await request_store.publish_checkpoint("adapter-b", "/tmp/open-rl/checkpoints/b-1", {"state_delta_ref": "delta-b-1"})
-      await request_store.publish_checkpoint("adapter-a", "/tmp/open-rl/checkpoints/a-2", {"state_delta_ref": "delta-a-2"})
+      await request_store.publish_checkpoint("adapter-a", "/tmp/open-rl/checkpoints/a-1", {"delta_ref": "delta-a-1"})
+      await request_store.publish_checkpoint("adapter-b", "/tmp/open-rl/checkpoints/b-1", {"delta_ref": "delta-b-1"})
+      await request_store.publish_checkpoint("adapter-a", "/tmp/open-rl/checkpoints/a-2", {"delta_ref": "delta-a-2"})
 
       self.assertEqual(
         await request_store.latest_checkpoint("adapter-a"),
-        {"checkpoint_ref": "/tmp/open-rl/checkpoints/a-2", "metadata": {"state_delta_ref": "delta-a-2"}},
+        {"checkpoint_ref": "/tmp/open-rl/checkpoints/a-2", "metadata": {"delta_ref": "delta-a-2"}},
       )
       self.assertEqual(
         await request_store.latest_checkpoint("adapter-b"),
-        {"checkpoint_ref": "/tmp/open-rl/checkpoints/b-1", "metadata": {"state_delta_ref": "delta-b-1"}},
+        {"checkpoint_ref": "/tmp/open-rl/checkpoints/b-1", "metadata": {"delta_ref": "delta-b-1"}},
+      )
+      self.assertEqual(
+        (await request_store.get_model_state(latest_training_state_alias("adapter-a")))["delta_ref"],
+        "delta-a-2",
       )
 
     asyncio.run(run())
@@ -54,7 +59,6 @@ class TestCheckpointRegistry(unittest.TestCase):
         "base_model": "Qwen/Qwen3-0.6B",
         "training_mode": "lora",
         "version": 2,
-        "checkpoint_ref": "/tmp/open-rl/checkpoints/a-2",
         "adapter_ref": "/tmp/open-rl/checkpoints/a-2",
       }
 
@@ -90,7 +94,6 @@ class TestCheckpointRegistry(unittest.TestCase):
         "base_model": "Qwen/Qwen3-0.6B",
         "training_mode": "lora",
         "version": 2,
-        "checkpoint_ref": "/tmp/open-rl/checkpoints/a-2",
         "adapter_ref": "/tmp/open-rl/checkpoints/a-2",
       }
 

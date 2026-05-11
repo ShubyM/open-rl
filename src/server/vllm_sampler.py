@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 from safetensors.torch import load as load_safetensors
 from safetensors.torch import save_file as save_safetensors_file
-from state_delta import StateDeltaManifest, hash_adapter_config, tensor_checksum, validate_delta_manifest
+from state_delta import AdapterSnapshotManifest, hash_adapter_config, tensor_checksum, validate_adapter_snapshot_manifest
 from telemetry import get_tracer, instrument_fastapi
 
 try:
@@ -203,9 +203,9 @@ def read_lora_safetensors_bytes(payload: LoraTensorSyncRequest) -> bytes:
   raise ValueError("tensors_safetensors_shm or tensors_safetensors_b64 is required")
 
 
-def verify_lora_delta_manifest(payload: LoraTensorSyncRequest, tensors: dict[str, Any]) -> StateDeltaManifest:
-  manifest = StateDeltaManifest.from_dict(payload.manifest)
-  validate_delta_manifest(manifest)
+def verify_lora_delta_manifest(payload: LoraTensorSyncRequest, tensors: dict[str, Any]) -> AdapterSnapshotManifest:
+  manifest = AdapterSnapshotManifest.from_dict(payload.manifest)
+  validate_adapter_snapshot_manifest(manifest)
 
   if manifest.apply_target != "vllm_lora":
     raise ValueError(f"unsupported apply_target for vLLM sampler: {manifest.apply_target}")

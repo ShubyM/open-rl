@@ -29,6 +29,7 @@ class CheckpointMetadata:
   full_weights_ref: str | None = None
   optimizer_ref: str | None = None
   state_delta_ref: str | None = None
+  delta_ref: str | None = None
   adapter_name: str | None = None
   inference_backend: str | None = None
   has_optimizer: bool = False
@@ -55,10 +56,11 @@ class CheckpointMetadata:
       adapter_ref=data.get("adapter_ref"),
       full_weights_ref=data.get("full_weights_ref"),
       optimizer_ref=data.get("optimizer_ref"),
-      state_delta_ref=data.get("state_delta_ref"),
+      state_delta_ref=data.get("state_delta_ref") or data.get("delta_ref"),
+      delta_ref=data.get("delta_ref") or data.get("state_delta_ref"),
       adapter_name=data.get("adapter_name"),
-      inference_backend=data.get("inference_backend"),
-      has_optimizer=bool(data.get("has_optimizer", False)),
+      inference_backend=data.get("inference_backend") or data.get("runtime_backend"),
+      has_optimizer=bool(data.get("has_optimizer", False) or data.get("optimizer_ref")),
       created_at=created_at,
     )
 
@@ -76,12 +78,11 @@ class CheckpointMetadata:
       model_id=self.model_id,
       base_model=self.base_model,
       version=self.version,
-      checkpoint_ref=checkpoint_ref or self.adapter_ref,
       adapter_ref=self.adapter_ref,
       adapter_name=self.adapter_name,
       optimizer_ref=self.optimizer_ref,
-      state_delta_ref=self.state_delta_ref,
-      inference_backend=self.inference_backend,
+      delta_ref=self.delta_ref or self.state_delta_ref,
+      runtime_backend=self.inference_backend,
       created_at=self.created_at,
     )
 
@@ -107,6 +108,22 @@ class FileCheckpointStore:
   def read_metadata(self, checkpoint_dir: str | os.PathLike[str]) -> CheckpointMetadata:
     with (self.resolve(checkpoint_dir) / "metadata.json").open() as f:
       return CheckpointMetadata.from_dict(json.load(f))
+
+  def write_model_state(self, checkpoint_dir: str | os.PathLike[str], state: ModelState) -> str:
+    path = self.resolve(checkpoint_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    metadata_path = path / "metadata.json"
+    tmp_path = metadata_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(state.to_dict(), indent=2, sort_keys=True))
+    tmp_path.replace(metadata_path)
+    return str(metadata_path)
+
+  def read_model_state(self, checkpoint_dir: str | os.PathLike[str]) -> ModelState:
+    with (self.resolve(checkpoint_dir) / "metadata.json").open() as f:
+      data = json.load(f)
+    if "training_mode" in data and ("adapter_ref" in data or "full_weights_ref" in data):
+      return ModelState.from_dict(data)
+    return CheckpointMetadata.from_dict(data).to_model_state(str(self.resolve(checkpoint_dir)))
 
 
 def lora_checkpoint_metadata(
@@ -134,6 +151,7 @@ def lora_checkpoint_metadata(
     inference_backend=inference_backend,
     optimizer_ref=optimizer_ref,
     state_delta_ref=state_delta_ref,
+    delta_ref=state_delta_ref,
     has_optimizer=optimizer_ref is not None,
     created_at=time.time(),
   )

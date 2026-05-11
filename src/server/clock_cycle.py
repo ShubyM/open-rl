@@ -4,23 +4,34 @@ import asyncio
 import os
 import threading
 import traceback
+from dataclasses import replace
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from model_state import lora_model_state
+from model_state import latest_training_state_alias, state_ref
 from opentelemetry import context as otel_context
 from opentelemetry import propagate
 from store import get_store
 from telemetry import get_tracer
-from trainer import Datum, LoraConfig, TrainerEngine
 
 tracer = get_tracer("openrl.trainer_worker")
 
-engine = TrainerEngine()
+engine = None
 
 
-def _parse_datum(raw: dict) -> Datum:
+def get_engine():
+  global engine
+  if engine is None:
+    from trainer import TrainerEngine
+
+    engine = TrainerEngine()
+  return engine
+
+
+def _parse_datum(raw: dict):
   """Convert wire-format datum (with chunks) to our flat Datum type."""
+  from trainer import Datum
+
   chunks = raw.get("model_input", {}).get("chunks", [])
   tokens: list[int] = []
   for chunk in chunks:
@@ -31,19 +42,23 @@ def _parse_datum(raw: dict) -> Datum:
 
 
 async def ensure_adapter_ready(store, model_id: str) -> None:
-  if engine.has_adapter(model_id):
-    await asyncio.to_thread(engine.set_active_adapter, model_id)
+  trainer_engine = get_engine()
+  if trainer_engine.has_adapter(model_id):
+    await asyncio.to_thread(trainer_engine.set_active_adapter, model_id)
     return
 
-  checkpoint = await store.latest_checkpoint(model_id)
-  if checkpoint:
-    restore_optimizer = bool(checkpoint.get("metadata", {}).get("restore_optimizer", False))
-    await asyncio.to_thread(engine.load_from_state, model_id, checkpoint["checkpoint_ref"], restore_optimizer)
-  await asyncio.to_thread(engine.set_active_adapter, model_id)
+  state = await store.get_model_state(latest_training_state_alias(model_id))
+  if state:
+    restore_optimizer = bool(state.get("optimizer_ref") or state.get("checkpoint_metadata", {}).get("restore_optimizer", False))
+    ref = state_ref(state)
+    if ref:
+      await asyncio.to_thread(trainer_engine.load_from_state, model_id, ref, restore_optimizer)
+  await asyncio.to_thread(trainer_engine.set_active_adapter, model_id)
 
 
 async def clock_cycle_loop() -> None:
   store = get_store()
+  trainer_engine = get_engine()
 
   print("[WORKER] Training worker started.")
 
@@ -84,11 +99,13 @@ async def clock_cycle_loop() -> None:
             match req_type:
               case "create_model":
                 base_model = r["base_model"]
+                from trainer import LoraConfig
+
                 raw_config = r.get("lora_config") or {}
                 lora_config = LoraConfig(**{k: v for k, v in raw_config.items() if k in LoraConfig.model_fields})
 
-                await asyncio.to_thread(engine.load_base_model, base_model)
-                await asyncio.to_thread(engine.create_adapter, m_id, lora_config)
+                await asyncio.to_thread(trainer_engine.load_base_model, base_model)
+                await asyncio.to_thread(trainer_engine.create_adapter, m_id, lora_config)
 
                 await store.set_future(
                   req_id,
@@ -103,9 +120,13 @@ async def clock_cycle_loop() -> None:
               case "create_model_from_state":
                 state_path = r["state_path"]
                 restore_optimizer = bool(r.get("restore_optimizer", False))
-                result = await asyncio.to_thread(engine.load_from_state, m_id, state_path, restore_optimizer)
+                result = await asyncio.to_thread(trainer_engine.load_from_state, m_id, state_path, restore_optimizer)
                 result["type"] = "create_model_from_state"
-                await store.publish_checkpoint(m_id, state_path, {"restore_optimizer": restore_optimizer, "source": "create_model_from_state"})
+                await store.publish_checkpoint(
+                  m_id,
+                  state_path,
+                  {"restore_optimizer": restore_optimizer, "source": "create_model_from_state", "base_model": result.get("base_model")},
+                )
                 await store.set_future(req_id, result)
 
               case "forward_backward":
@@ -115,13 +136,13 @@ async def clock_cycle_loop() -> None:
 
                 typed_data = [_parse_datum(item) for item in raw_data]
 
-                result = await asyncio.to_thread(engine.forward_backward, typed_data, loss_fn, loss_config, m_id)
+                result = await asyncio.to_thread(trainer_engine.forward_backward, typed_data, loss_fn, loss_config, m_id)
                 result["type"] = "forward_backward"
                 await store.set_future(req_id, result)
 
               case "optim_step":
                 adam_params = r["adam_params"]
-                result = await asyncio.to_thread(engine.optim_step, adam_params, m_id)
+                result = await asyncio.to_thread(trainer_engine.optim_step, adam_params, m_id)
                 result["type"] = "optim_step"
                 await store.set_future(req_id, result)
 
@@ -133,7 +154,7 @@ async def clock_cycle_loop() -> None:
                 prompt_logprobs = bool(r.get("prompt_logprobs", False))
 
                 result = await asyncio.to_thread(
-                  engine.generate,
+                  trainer_engine.generate,
                   prompt_tokens,
                   max_tokens,
                   num_samples,
@@ -149,45 +170,41 @@ async def clock_cycle_loop() -> None:
                 include_optimizer = bool(r.get("include_optimizer", False))
                 kind = r.get("kind", "state")
 
-                result = await asyncio.to_thread(engine.save_state, m_id, state_path, include_optimizer, kind)
+                result = await asyncio.to_thread(trainer_engine.save_state, m_id, state_path, include_optimizer, kind)
                 # SDK's save_state() returns SaveWeightsResponse which requires type="save_weights".
                 result["type"] = "save_weights"
-                await store.publish_checkpoint(
-                  m_id,
-                  result["path"],
-                  {"restore_optimizer": include_optimizer, "source": "save_state", "state_delta_ref": result.get("state_delta_ref")},
-                )
+                if model_state := result.get("model_state"):
+                  await store.publish_model_state(model_state["state_id"], model_state)
+                  await store.publish_model_state_alias(latest_training_state_alias(m_id), model_state["state_id"])
+                else:
+                  await store.publish_checkpoint(
+                    m_id,
+                    result["path"],
+                    {"restore_optimizer": include_optimizer, "source": "save_state", "delta_ref": result.get("delta_ref")},
+                  )
                 await store.set_future(req_id, result)
 
               case "load_weights":
                 state_path = r["state_path"]
                 restore_optimizer = bool(r.get("restore_optimizer", False))
-                await asyncio.to_thread(engine.load_from_state, m_id, state_path, restore_optimizer)
-                await store.publish_checkpoint(m_id, state_path, {"restore_optimizer": restore_optimizer, "source": "load_weights"})
+                result = await asyncio.to_thread(trainer_engine.load_from_state, m_id, state_path, restore_optimizer)
+                await store.publish_checkpoint(
+                  m_id,
+                  state_path,
+                  {"restore_optimizer": restore_optimizer, "source": "load_weights", "base_model": result.get("base_model")},
+                )
                 await store.set_future(req_id, {"path": state_path, "type": "load_weights"})
 
               case "save_weights_for_sampler":
                 published = await asyncio.to_thread(
-                  engine.publish_adapter_for_inference,
+                  trainer_engine.publish_adapter_for_inference,
                   m_id,
                   r.get("sampling_session_id"),
                   r.get("alias"),
                 )
                 state_ids = {state_id for state_id in (r.get("path"), r.get("sampling_session_id"), published.state_id) if state_id}
-                if published.base_model_id and published.adapter_ref and published.state_id:
-                  for state_id in state_ids:
-                    model_state = lora_model_state(
-                      state_id=state_id,
-                      model_id=m_id,
-                      base_model=published.base_model_id,
-                      version=published.version,
-                      checkpoint_ref=published.adapter_ref,
-                      adapter_ref=published.adapter_ref,
-                      adapter_name=published.adapter_name,
-                      state_delta_ref=published.manifest_path,
-                      inference_backend=published.inference_backend,
-                    )
-                    await store.publish_model_state(state_id, model_state.to_dict())
+                for state_id in state_ids:
+                  await store.publish_model_state(state_id, replace(published, state_id=state_id).to_dict())
                 await store.set_future(
                   req_id,
                   {
@@ -195,13 +212,13 @@ async def clock_cycle_loop() -> None:
                     "sampling_session_id": r.get("sampling_session_id"),
                     "state_id": r.get("path") or r.get("sampling_session_id"),
                     "version": published.version,
-                    "base_model": published.base_model_id,
+                    "base_model": published.base_model,
                     "type": "save_weights_for_sampler",
                   },
                 )
 
               case "save_weights":
-                await asyncio.to_thread(engine.save_adapter, m_id, r.get("alias"))
+                await asyncio.to_thread(trainer_engine.save_adapter, m_id, r.get("alias"))
                 await store.set_future(req_id, {"status": "ok", "type": req_type})
 
               case _:
@@ -243,7 +260,7 @@ def main() -> None:
   preload_target = os.getenv("BASE_MODEL")
   is_ready = False
   if preload_target:
-    engine.load_base_model(preload_target)
+    get_engine().load_base_model(preload_target)
     is_ready = True
   else:
     print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
