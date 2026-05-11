@@ -40,6 +40,16 @@ class RequestStore(ABC):
     """Return the latest durable checkpoint for a model, if any."""
     pass
 
+  @abstractmethod
+  async def publish_model_state(self, state_id: str, state: dict[str, Any]) -> None:
+    """Publish a durable model state addressable by samplers and trainers."""
+    pass
+
+  @abstractmethod
+  async def get_model_state(self, state_id: str) -> dict[str, Any] | None:
+    """Return a durable model state by ID, if one has been published."""
+    pass
+
 
 class InMemoryStore(RequestStore):
   def __init__(self):
@@ -52,6 +62,7 @@ class InMemoryStore(RequestStore):
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, asyncio.Event] = {}
     self.checkpoints: dict[str, dict[str, Any]] = {}
+    self.model_states: dict[str, dict[str, Any]] = {}
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -117,6 +128,12 @@ class InMemoryStore(RequestStore):
   async def latest_checkpoint(self, model_id: str) -> dict[str, Any] | None:
     return self.checkpoints.get(model_id)
 
+  async def publish_model_state(self, state_id: str, state: dict[str, Any]) -> None:
+    self.model_states[state_id] = state
+
+  async def get_model_state(self, state_id: str) -> dict[str, Any] | None:
+    return self.model_states.get(state_id)
+
 
 class RedisStore(RequestStore):
   def __init__(self, redis_url: str):
@@ -125,6 +142,7 @@ class RedisStore(RequestStore):
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
     self.checkpoint_hash = "open_rl:latest_checkpoints"
+    self.model_state_hash = "open_rl:model_states"
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -199,6 +217,13 @@ class RedisStore(RequestStore):
 
   async def latest_checkpoint(self, model_id: str) -> dict[str, Any] | None:
     payload = await self.redis.hget(self.checkpoint_hash, model_id)
+    return json.loads(payload) if payload else None
+
+  async def publish_model_state(self, state_id: str, state: dict[str, Any]) -> None:
+    await self.redis.hset(self.model_state_hash, state_id, json.dumps(state))
+
+  async def get_model_state(self, state_id: str) -> dict[str, Any] | None:
+    payload = await self.redis.hget(self.model_state_hash, state_id)
     return json.loads(payload) if payload else None
 
 

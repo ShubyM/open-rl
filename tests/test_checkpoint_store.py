@@ -21,6 +21,10 @@ class TestCheckpointStore(unittest.TestCase):
         model_id="adapter-a",
         checkpoint_dir=checkpoint_dir,
         kind="weights",
+        state_id="tinker://adapter-a/sampler_weights/current",
+        version=7,
+        adapter_name="adapter-a",
+        inference_backend="vllm",
         optimizer_ref=str(checkpoint_dir / "optimizer.pt"),
         state_delta_ref=str(checkpoint_dir / "delta" / "adapter-a" / "1"),
       )
@@ -30,10 +34,21 @@ class TestCheckpointStore(unittest.TestCase):
 
       self.assertEqual(Path(metadata_path), checkpoint_dir / "metadata.json")
       self.assertEqual(restored.base_model, "Qwen/Qwen3-0.6B")
+      self.assertEqual(restored.state_id, "tinker://adapter-a/sampler_weights/current")
+      self.assertEqual(restored.version, 7)
       self.assertEqual(restored.targets, ("trainer", "inference"))
       self.assertEqual(restored.adapter_ref, str(checkpoint_dir))
       self.assertEqual(restored.optimizer_ref, str(checkpoint_dir / "optimizer.pt"))
       self.assertEqual(restored.state_delta_ref, str(checkpoint_dir / "delta" / "adapter-a" / "1"))
+      self.assertEqual(restored.adapter_name, "adapter-a")
+      self.assertEqual(restored.inference_backend, "vllm")
+
+      model_state = restored.to_model_state(str(checkpoint_dir))
+      self.assertEqual(model_state.state_id, "tinker://adapter-a/sampler_weights/current")
+      self.assertEqual(model_state.base_model, "Qwen/Qwen3-0.6B")
+      self.assertEqual(model_state.training_mode, "lora")
+      self.assertEqual(model_state.version, 7)
+      self.assertEqual(model_state.adapter_ref, str(checkpoint_dir))
 
   def test_checkpoint_metadata_reads_open_rl_checkpoint_baseline_shape(self) -> None:
     metadata = checkpoint_store.CheckpointMetadata.from_dict(

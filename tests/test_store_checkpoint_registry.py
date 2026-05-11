@@ -45,6 +45,26 @@ class TestCheckpointRegistry(unittest.TestCase):
 
     asyncio.run(run())
 
+  def test_in_memory_store_tracks_model_states_by_state_id(self) -> None:
+    async def run() -> None:
+      request_store = store.InMemoryStore()
+      state = {
+        "state_id": "tinker://adapter-a/sampler_weights/current",
+        "model_id": "adapter-a",
+        "base_model": "Qwen/Qwen3-0.6B",
+        "training_mode": "lora",
+        "version": 2,
+        "checkpoint_ref": "/tmp/open-rl/checkpoints/a-2",
+        "adapter_ref": "/tmp/open-rl/checkpoints/a-2",
+      }
+
+      self.assertIsNone(await request_store.get_model_state(state["state_id"]))
+      await request_store.publish_model_state(state["state_id"], state)
+
+      self.assertEqual(await request_store.get_model_state(state["state_id"]), state)
+
+    asyncio.run(run())
+
   def test_redis_store_tracks_latest_checkpoint_by_model(self) -> None:
     async def run() -> None:
       request_store = store.RedisStore("redis://unused")
@@ -57,6 +77,26 @@ class TestCheckpointRegistry(unittest.TestCase):
         {"checkpoint_ref": "/tmp/open-rl/checkpoints/a-1", "metadata": {"restore_optimizer": True}},
       )
       self.assertIsNone(await request_store.latest_checkpoint("adapter-b"))
+
+    asyncio.run(run())
+
+  def test_redis_store_tracks_model_states_by_state_id(self) -> None:
+    async def run() -> None:
+      request_store = store.RedisStore("redis://unused")
+      request_store.redis = FakeRedis()
+      state = {
+        "state_id": "tinker://adapter-a/sampler_weights/current",
+        "model_id": "adapter-a",
+        "base_model": "Qwen/Qwen3-0.6B",
+        "training_mode": "lora",
+        "version": 2,
+        "checkpoint_ref": "/tmp/open-rl/checkpoints/a-2",
+        "adapter_ref": "/tmp/open-rl/checkpoints/a-2",
+      }
+
+      await request_store.publish_model_state(state["state_id"], state)
+
+      self.assertEqual(await request_store.get_model_state(state["state_id"]), state)
 
     asyncio.run(run())
 
