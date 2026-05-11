@@ -1,8 +1,14 @@
-# State Delta Checkpointing Plan
+# Adapter Snapshot and Future State Delta Plan
 
-This plan makes state synchronization transport-independent. Correctness comes
-from a semantic delta and apply verification, not from whether bytes moved
-through shared memory, CUDA IPC, NCCL, HTTP, local disk, or object storage.
+Current LoRA synchronization uses full adapter snapshots. This document keeps
+the future state-delta design, but the implemented primitive is `ModelState`
+plus an `AdapterSnapshotManifest`. A true `StateDeltaManifest` should only be
+reintroduced when receiver lineage and incremental apply rules are enforced.
+
+This plan makes state synchronization transport-independent. Near-term
+correctness comes from a durable state ref, adapter snapshot verification, and
+versioned runtime keys, not from whether bytes moved through shared memory, CUDA
+IPC, NCCL, HTTP, local disk, or object storage.
 
 ## Goal
 
@@ -22,7 +28,7 @@ future runtime materialization:
   clean runtime image for a known state version
 ```
 
-The invariant is:
+The future full delta invariant is:
 
 ```text
 base state B + delta D(version=N) -> semantic state S_N
@@ -32,13 +38,13 @@ This must hold regardless of the transport used to move the bytes.
 
 ## Design Rule
 
-Open-RL state synchronization is defined by semantic deltas, not transports.
+Open-RL state synchronization is defined by state manifests, not transports.
 
-A `StateDeltaManifest` describes the version transition and tensors required to
-reach a target state. Transports move bytes for that manifest. Materializers
-verify and apply the manifest to a runtime. Durable checkpoints store the same
-manifest plus tensor payloads or durable references to those payloads, so hot
-synchronization and restore share one state contract.
+For LoRA today, an `AdapterSnapshotManifest` describes the complete adapter
+tensor set for a target version. Transports move bytes for that manifest.
+Materializers verify and apply the manifest to a runtime. Durable model states
+store refs to the same payloads, so hot synchronization and restore share one
+state contract.
 
 This abstraction covers LoRA now and full fine-tuning later. For LoRA, the delta
 is a small set of adapter tensors. For full fine-tuning, the same manifest can
@@ -46,7 +52,7 @@ point to full-weight tensors, chunks, or shards.
 
 ## Pieces
 
-### StateDeltaManifest
+### AdapterSnapshotManifest
 
 The manifest is the source of truth for correctness.
 
@@ -63,7 +69,7 @@ class TensorEntry:
 
 
 @dataclass(frozen=True)
-class StateDeltaManifest:
+class AdapterSnapshotManifest:
     schema_version: int
     run_id: str
     version: int
@@ -108,7 +114,7 @@ Transport knows how bytes move right now. It does not know LoRA semantics.
 class Transport(Protocol):
     def publish_bytes(
         self,
-        manifest: StateDeltaManifest,
+        manifest: AdapterSnapshotManifest,
         tensors: Iterable[tuple[TensorEntry, torch.Tensor]],
     ) -> TransportReceipt:
         ...
@@ -148,12 +154,12 @@ Materializer owns semantic apply for one runtime.
 
 ```python
 class Materializer(Protocol):
-    def can_apply(self, manifest: StateDeltaManifest) -> bool:
+    def can_apply(self, manifest: AdapterSnapshotManifest) -> bool:
         ...
 
     def apply(
         self,
-        manifest: StateDeltaManifest,
+        manifest: AdapterSnapshotManifest,
         receipt: TransportReceipt,
     ) -> ApplyResult:
         ...
@@ -182,22 +188,26 @@ TrainerLoraMaterializer
 FullWeightMaterializer later
 ```
 
-### CheckpointStore
+### ModelState Store
 
-`CheckpointStore` is the durable Open-RL envelope. It does not define how bytes
-move on the hot path. It records enough metadata to use the same checkpoint for
-trainer resume or inference materialization.
+`ModelState` is the durable Open-RL envelope. It does not define how bytes move
+on the hot path. It records enough metadata to use the same state for trainer
+resume or inference materialization.
 
 ```python
 @dataclass(frozen=True)
-class CheckpointMetadata:
-    base_model: str | None
+class ModelState:
+    state_id: str
     model_id: str
-    kind: str
-    targets: tuple["trainer" | "inference", ...]
+    base_model: str
+    training_mode: str
+    version: int
     adapter_ref: str | None
+    full_weights_ref: str | None
     optimizer_ref: str | None
-    state_delta_ref: str | None
+    delta_ref: str | None
+    runtime_backend: str | None
+    runtime_key: str | None
 ```
 
 For LoRA today, the backing can stay simple:
@@ -211,10 +221,10 @@ checkpoint/
   metadata.json committed last
 ```
 
-The checkpoint is the durable thing a user or scheduler names. The
-`StateDeltaManifest` is the semantic sidecar that lets a runtime verify and
-apply the exact adapter tensors without caring whether the payload came from
-shared memory, HTTP, local disk, or object storage.
+The model state is the durable thing a user or scheduler names. The
+`AdapterSnapshotManifest` is the sidecar that lets a runtime verify and apply
+the exact adapter tensors without caring whether the payload came from shared
+memory, HTTP, local disk, or object storage.
 
 ### DeltaStore
 
@@ -224,12 +234,12 @@ shared memory, HTTP, local disk, or object storage.
 class DeltaStore(Protocol):
     def write_delta(
         self,
-        manifest: StateDeltaManifest,
+        manifest: AdapterSnapshotManifest,
         tensors: Iterable[tuple[TensorEntry, torch.Tensor]],
     ) -> DeltaRef:
         ...
 
-    def read_delta(self, ref: DeltaRef) -> tuple[StateDeltaManifest, TensorReader]:
+    def read_delta(self, ref: DeltaRef) -> tuple[AdapterSnapshotManifest, TensorReader]:
         ...
 ```
 
@@ -424,14 +434,14 @@ Checkpointing should not invent another format.
 
 ```text
 save_weights
-  write StateDeltaManifest + payloads
+  write ModelState + AdapterSnapshotManifest + payloads
   keep existing PEFT files for compatibility
 
 save_weights_for_sampler
-  write hot StateDeltaManifest + payloads
+  write or reference ModelState + AdapterSnapshotManifest payloads
 
 restore
-  read StateDeltaManifest + payloads
+  read ModelState + payload refs
 ```
 
 Hot sync and durable restore should differ only by backing store.
@@ -468,10 +478,11 @@ file snapshot and hot sync as separate state concepts
 ```python
 class WeightPublisher:
     def publish_for_inference(...):
-        manifest, tensors = build_delta(...)
+        state = build_model_state(...)
+        manifest, tensors = build_adapter_snapshot(...)
         delta_ref = hot_store.write_delta(manifest, tensors)
         materializer.apply(delta_ref)
-        return PublishedState(...)
+        return state
 ```
 
 ## Naming Rules

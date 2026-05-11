@@ -129,31 +129,30 @@ policy version. They are the handoff format between trainer and sampler, and
 they also support explicit saves, restore flows, and basic durability between
 operations.
 
-A checkpoint is an Open-RL envelope around payloads: PEFT adapter files,
-optional optimizer state, optional state delta payloads, and metadata describing
-whether the checkpoint can resume a trainer, spawn inference, or both. On one
-machine it can just be a directory on local disk. In a cluster, it should live
-on a filesystem visible to both the trainer and sampler.
+A `ModelState` is the Open-RL envelope around payloads: PEFT adapter files,
+optional optimizer state, optional adapter snapshot payloads, and metadata
+describing whether the state can resume a trainer, spawn inference, or both. On
+one machine it can just be a directory on local disk. In a cluster, it should
+live on a filesystem visible to both the trainer and sampler.
 
 Sampler snapshots also pass through a weight sync bridge. The bridge selects the
 exact LoRA tensors for the active adapter and publishes a version to the
-configured inference backend. Open-RL state synchronization is defined by
-semantic deltas, not transports: a `StateDeltaManifest` describes the version
-transition and tensors required to reach a target state, transports move bytes
-for that manifest, and materializers verify and apply the manifest to a specific
-runtime. Durable checkpoints store the same manifest plus tensor payloads or
-durable references to those payloads, so hot synchronization and restore share
-one state contract.
+configured inference backend. The near-term LoRA implementation publishes full
+adapter snapshots, not incremental deltas: an `AdapterSnapshotManifest`
+describes the tensors in one adapter version, transports move bytes for that
+manifest, and materializers verify and apply the manifest to a specific runtime.
+Durable saves store the same state refs, so hot synchronization and restore
+share one state contract.
 
-The file fallback writes a versioned manifest under `OPEN_RL_TMP_DIR/weight_sync/`.
-With the colocated vLLM backend, the trainer serializes the selected tensors as
-safetensors, normalizes PEFT in-memory adapter names to vLLM's saved-adapter key
-format, places the payload in shared memory, and sends the manifest plus a
-shared-memory transport receipt to the vLLM worker. The worker verifies the
-manifest against the received tensor payload, materializes a small adapter
-directory under `OPEN_RL_TMP_DIR/vllm_lora_sync/`, and uses a versioned LoRA
-cache key so repeated sampler aliases advance to the new weights instead of
-reusing a stale cached LoRA id.
+The default vLLM path writes a durable PEFT adapter snapshot and notifies the
+worker to reload that adapter with a versioned key. Debug hot transports can
+still serialize selected tensors as safetensors, normalize PEFT in-memory
+adapter names to vLLM's saved-adapter key format, and send the manifest plus a
+temporary transport receipt. The worker verifies the manifest against the
+received tensor payload, materializes a small adapter directory under
+`OPEN_RL_TMP_DIR/vllm_lora_sync/`, and uses a versioned LoRA cache key so
+repeated sampler aliases advance to the new weights instead of reusing a stale
+cached LoRA id.
 
 The bridge also has a narrow TorchRL/vLLM transfer adapter for future NCCL
 integration. TorchRL's default vLLM LoRA metadata path merges LoRA adapters into
