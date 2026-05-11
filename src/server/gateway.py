@@ -1,6 +1,7 @@
 # This file contains the FastAPI server entry point and request handlers for the Open-RL API backend.
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -29,6 +30,7 @@ logging.getLogger("uvicorn.access").addFilter(_FilterNoisyEndpoints())
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
+VLLM_ROUTES_ENV = "OPEN_RL_VLLM_ROUTES"
 
 
 # *** Helpers ***
@@ -75,6 +77,38 @@ def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
   return model_id.split("-samp-")[0]
 
 
+def parse_vllm_routes(raw: str | None = None) -> dict[str, str]:
+  raw = raw if raw is not None else os.getenv(VLLM_ROUTES_ENV)
+  if not raw:
+    return {}
+  raw = raw.strip()
+  if not raw:
+    return {}
+  if raw.startswith("{"):
+    routes = json.loads(raw)
+    if not isinstance(routes, dict):
+      raise ValueError(f"{VLLM_ROUTES_ENV} must be a JSON object")
+    return {str(model): str(url) for model, url in routes.items() if url}
+
+  routes: dict[str, str] = {}
+  for item in raw.split(","):
+    if not item.strip():
+      continue
+    model, sep, url = item.partition("=")
+    if not sep or not model.strip() or not url.strip():
+      raise ValueError(f"{VLLM_ROUTES_ENV} entries must use model_id=url")
+    routes[model.strip()] = url.strip()
+  return routes
+
+
+def vllm_url_for_base_model(base_model_id: str | None) -> str:
+  if base_model_id:
+    route = parse_vllm_routes().get(base_model_id)
+    if route:
+      return route
+  return os.getenv("VLLM_URL", VLLM_URL)
+
+
 async def _enqueue(payload: dict) -> str:
   """Create a pending future, inject trace context, push to store. Returns req_id."""
   req_id = payload.get("req_id") or str(uuid.uuid4())
@@ -88,21 +122,23 @@ async def _enqueue(payload: dict) -> str:
 
 
 async def _preflight_vllm() -> None:
-  """If SAMPLING_BACKEND=vllm, verify the vLLM worker is reachable at VLLM_URL.
+  """If SAMPLING_BACKEND=vllm, verify the selected vLLM worker is reachable.
 
   Prints a clear, actionable error instead of letting the first asample
   request fall through with a raw httpx connection refused.
   """
   if get_sampler_backend() != "vllm":
     return
-  healthz = f"{VLLM_URL.rstrip('/')}/healthz"
+  base_model = os.getenv("BASE_MODEL")
+  vllm_url = vllm_url_for_base_model(base_model)
+  healthz = f"{vllm_url.rstrip('/')}/healthz"
   try:
     async with httpx.AsyncClient(timeout=3.0) as client:
       resp = await client.get(healthz)
       resp.raise_for_status()
   except Exception as exc:
     raise RuntimeError(
-      f"SAMPLING_BACKEND=vllm but no vLLM worker is reachable at {VLLM_URL}.\n"
+      f"SAMPLING_BACKEND=vllm but no vLLM worker is reachable at {vllm_url}.\n"
       f"Start it first with:  make vllm BASE_MODEL={os.getenv('BASE_MODEL') or '<model-id>'}"
     ) from exc
 
@@ -386,6 +422,9 @@ async def asample(req: dict):
 
   model_id = req.get("model_id") or req.get("sampling_session_id")
   base_model_id = base_model_id_from_sampling_ref(model_id)
+  model_state = await store.get_model_state(model_id) if model_id else None
+  if model_state:
+    base_model_id = model_state.get("base_model") or base_model_id
 
   if get_sampler_backend() == "torch":
     req_id = await _enqueue(
@@ -408,14 +447,21 @@ async def asample(req: dict):
   req_id = str(uuid.uuid4())
   await store.set_future(req_id, {"status": "pending"})
 
+  lora_id = model_id
   lora_path = os.path.join(TMP_DIR, "peft", base_model_id, base_model_id) if base_model_id else None
+  lora_version = 0
+  if model_state:
+    lora_id = model_state.get("adapter_name") or model_state.get("state_id") or model_id
+    lora_path = model_state.get("adapter_ref") or lora_path
+    lora_version = int(model_state.get("version", 0) or 0)
+  vllm_url = vllm_url_for_base_model(base_model_id)
   headers: dict[str, str] = {"Content-Type": "application/json"}
   propagate.inject(headers)
 
   try:
     async with httpx.AsyncClient(timeout=120.0) as client:
       resp = await client.post(
-        f"{VLLM_URL.rstrip('/')}/generate",
+        f"{vllm_url.rstrip('/')}/generate",
         json={
           "request_id": req_id,
           "prompt_token_ids": prompt,
@@ -425,8 +471,10 @@ async def asample(req: dict):
           "top_p": top_p,
           "top_k": top_k,
           "num_samples": num_samples,
-          "lora_id": model_id,
+          "base_model_id": base_model_id,
+          "lora_id": lora_id,
           "lora_path": lora_path,
+          "lora_version": lora_version,
           "include_prompt_logprobs": include_prompt_logprobs,
         },
         headers=headers,
