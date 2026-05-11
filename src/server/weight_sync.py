@@ -13,6 +13,7 @@ import httpx
 import torch
 from delta_store import DeltaStore, FileDeltaStore, HttpBodyDeltaStore, SharedMemoryDeltaStore
 from state_delta import StateDeltaManifest, TensorEntry, build_lora_delta_manifest
+from vllm_routing import DEFAULT_VLLM_URL, vllm_url_for_base_model
 
 WeightRole = Literal["lora", "full_weight", "lm_head", "embedding"]
 
@@ -224,7 +225,16 @@ class VLLMAdapterTransferEngine:
   ) -> PublishedState:
     state = self.fallback.publish(run_id, version, adapter_name, tensors, durable_ref, base_model_id)
     try:
-      post_vllm_adapter_sync(self.vllm_url, self.timeout, run_id, version, adapter_name, durable_ref, state.manifest_path, base_model_id)
+      post_vllm_adapter_sync(
+        vllm_url_for_base_model(base_model_id, self.vllm_url),
+        self.timeout,
+        run_id,
+        version,
+        adapter_name,
+        durable_ref,
+        state.manifest_path,
+        base_model_id,
+      )
     except Exception:
       if self.strict:
         raise
@@ -270,7 +280,7 @@ class VLLMLoraTensorTransferEngine:
       write = self.store.write_delta(manifest, tensors_for_manifest(payload_tensors, manifest))
       try:
         request = lora_delta_request(run_id, version, adapter_name, durable_ref, adapter_config, manifest, write, base_model_id)
-        post_vllm_sync(self.vllm_url, self.timeout, request)
+        post_vllm_sync(vllm_url_for_base_model(base_model_id, self.vllm_url), self.timeout, request)
       finally:
         write.close()
       return PublishedState(run_id, version, adapter_name, "vllm", self.name, len(tensors), durable_ref, base_model_id=base_model_id)
@@ -280,7 +290,16 @@ class VLLMLoraTensorTransferEngine:
       print(f"[weight-sync] vLLM tensor sync skipped for {adapter_name}@{version}; falling back to file reload")
       state = self.fallback.publish(run_id, version, adapter_name, tensors, durable_ref, base_model_id)
       try:
-        post_vllm_adapter_sync(self.vllm_url, self.timeout, run_id, version, adapter_name, durable_ref, state.manifest_path, base_model_id)
+        post_vllm_adapter_sync(
+          vllm_url_for_base_model(base_model_id, self.vllm_url),
+          self.timeout,
+          run_id,
+          version,
+          adapter_name,
+          durable_ref,
+          state.manifest_path,
+          base_model_id,
+        )
       except Exception:
         print(f"[weight-sync] vLLM adapter fallback sync skipped for {adapter_name}@{version}")
       return state
@@ -384,7 +403,7 @@ class WeightSyncBridge:
   def from_env(cls) -> WeightSyncBridge:
     if os.getenv("SAMPLING_BACKEND", "").lower() == "vllm" or "VLLM_URL" in os.environ:
       transport = os.getenv("OPEN_RL_WEIGHT_SYNC_TRANSPORT", "vllm_lora_adapter_reload")
-      vllm_url = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
+      vllm_url = os.getenv("VLLM_URL", DEFAULT_VLLM_URL)
       kwargs = {
         "timeout": float(os.getenv("OPEN_RL_WEIGHT_SYNC_TIMEOUT", "30.0")),
         "strict": os.getenv("OPEN_RL_WEIGHT_SYNC_STRICT", "0") == "1",

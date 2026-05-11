@@ -77,6 +77,7 @@ class _ResponseStub:
 
 
 class _HttpClientStub:
+  posted_url = None
   posted_json = None
 
   def __init__(self, *args, **kwargs):
@@ -89,6 +90,7 @@ class _HttpClientStub:
     return False
 
   def post(self, url, json):
+    self.__class__.posted_url = url
     self.__class__.posted_json = json
     return _ResponseStub()
 
@@ -202,6 +204,31 @@ class TestWeightSync(unittest.TestCase):
     self.assertEqual(_HttpClientStub.posted_json["manifest"]["apply_target"], "vllm_lora")
     self.assertEqual(_HttpClientStub.posted_json["transport_receipt"]["delta_id"], _HttpClientStub.posted_json["manifest"]["delta_id"])
     self.assertGreater(_HttpClientStub.posted_json["tensors_safetensors_shm"]["size"], 0)
+
+  def test_vllm_transfer_routes_sync_to_base_model_worker(self) -> None:
+    tensors = weight_sync.LoraTensorSelector().select(_ModelStub(), "adapter-a")
+    routes = {
+      "Qwen/Qwen3-0.6B": "http://qwen-vllm:8001",
+      "google/gemma-3-1b-it": "http://gemma-vllm:8001",
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      adapter_dir = Path(tmp_dir)
+      with (adapter_dir / "adapter_config.json").open("w") as f:
+        json.dump({"peft_type": "LORA"}, f)
+
+      with patch.object(weight_sync.httpx, "Client", _HttpClientStub), patch.dict(os.environ, {"OPEN_RL_VLLM_ROUTES": json.dumps(routes)}):
+        engine = weight_sync.VLLMAdapterTransferEngine("http://default-vllm:8001")
+        engine.publish(
+          run_id="adapter-a",
+          version=7,
+          adapter_name="tinker://adapter-a/sampler_weights/current",
+          tensors=tensors,
+          durable_ref=str(adapter_dir),
+          base_model_id="Qwen/Qwen3-0.6B",
+        )
+
+    self.assertEqual(_HttpClientStub.posted_url, "http://qwen-vllm:8001/sync_lora_adapter")
+    self.assertEqual(_HttpClientStub.posted_json["base_model_id"], "Qwen/Qwen3-0.6B")
 
   def test_tensor_dtype_cast_is_reflected_in_manifest(self) -> None:
     tensors = weight_sync.LoraTensorSelector().select(_ModelStub(), "adapter-a")

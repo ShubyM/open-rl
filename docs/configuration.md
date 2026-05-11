@@ -60,6 +60,7 @@ make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
 | `SAMPLING_BACKEND` | `torch` locally, `vllm` when distributed | Sampling backend selector. `torch` samples in the training process. `vllm` forwards sampling requests to a vLLM worker. |
 | `REDIS_URL` | unset | Enables distributed mode by switching the request store to Redis. Leave unset for a single-machine run. |
 | `VLLM_URL` | `http://127.0.0.1:8001` | API server URL for the vLLM worker when `SAMPLING_BACKEND=vllm`. |
+| `OPEN_RL_VLLM_ROUTES` | unset | Optional base-model routing table for multiple vLLM workers. Accepts JSON such as `{"Qwen/Qwen3-0.6B":"http://qwen:8001","google/gemma-3-1b-it":"http://gemma:8001"}` or comma-separated `model_id=url` pairs. |
 
 ## Server paths
 
@@ -74,12 +75,16 @@ Most runs do not need weight-sync-specific configuration. When `SAMPLING_BACKEND
 or `VLLM_URL` is set, the trainer publishes a durable PEFT adapter snapshot and
 notifies the Open-RL vLLM worker with a versioned adapter reload request. This
 works with a shared `OPEN_RL_TMP_DIR`, including mounted storage in Kubernetes.
+The gateway also persists a `ModelState` entry for each sampler path so a
+restarted vLLM worker can rehydrate from the durable adapter path even if its
+in-memory LoRA sync map is empty.
 
 The practical required variables are:
 
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `VLLM_URL` | `http://127.0.0.1:8001` | Address of the Open-RL vLLM worker. |
+| `OPEN_RL_VLLM_ROUTES` | unset | Address map for multi-base deployments. If set, sampling requests are routed by the state entry's `base_model`. |
 | `OPEN_RL_TMP_DIR` | `/tmp/open-rl` | Shared local or mounted root for checkpoints, adapter snapshots, and vLLM materialized LoRA adapters. |
 
 Advanced/debug-only knobs:
@@ -116,7 +121,7 @@ Kubernetes deployment manifests set these variables in pod specs. The important 
 ```bash
 # API server pod
 REDIS_URL=redis://redis-service:6379 \
-VLLM_URL=http://vllm-service:8001 \
+OPEN_RL_VLLM_ROUTES='{"google/gemma-4-e2b":"http://vllm-gemma:8001","Qwen/Qwen3-0.6B":"http://vllm-qwen:8001"}' \
 BASE_MODEL=google/gemma-4-e2b \
 uv run uvicorn src.gateway:app --host 0.0.0.0 --port 8000
 ```
@@ -125,12 +130,19 @@ uv run uvicorn src.gateway:app --host 0.0.0.0 --port 8000
 # Trainer worker pod
 REDIS_URL=redis://redis-service:6379 \
 VLLM_URL=http://vllm-service:8001 \
+OPEN_RL_VLLM_ROUTES='{"google/gemma-4-e2b":"http://vllm-gemma:8001","Qwen/Qwen3-0.6B":"http://vllm-qwen:8001"}' \
 BASE_MODEL=google/gemma-4-e2b \
 uv run python -m src.clock_cycle
 ```
 
 ```bash
-# vLLM worker pod
+# vLLM Gemma worker pod
 BASE_MODEL=google/gemma-4-e2b \
+uv run uvicorn src.vllm_sampler:app --host 0.0.0.0 --port 8001
+```
+
+```bash
+# vLLM Qwen worker pod
+BASE_MODEL=Qwen/Qwen3-0.6B \
 uv run uvicorn src.vllm_sampler:app --host 0.0.0.0 --port 8001
 ```

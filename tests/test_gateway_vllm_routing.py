@@ -22,6 +22,16 @@ def _load_gateway_module():
   return module
 
 
+def _load_vllm_routing_module():
+  sys.path.insert(0, str(SERVER_DIR))
+  spec = importlib.util.spec_from_file_location("vllm_routing_under_test", Path(SERVER_DIR) / "vllm_routing.py")
+  assert spec is not None and spec.loader is not None
+  module = importlib.util.module_from_spec(spec)
+  sys.modules[spec.name] = module
+  spec.loader.exec_module(module)
+  return module
+
+
 class _StoreStub:
   def __init__(self, state: dict | None = None):
     self.state = state
@@ -61,14 +71,14 @@ class _AsyncClientStub:
 
 class TestGatewayVLLMRouting(unittest.TestCase):
   def test_parse_vllm_routes_accepts_json_and_pairs(self) -> None:
-    gateway = _load_gateway_module()
+    vllm_routing = _load_vllm_routing_module()
 
     self.assertEqual(
-      gateway.parse_vllm_routes('{"Qwen/Qwen3-0.6B":"http://qwen:8001"}'),
+      vllm_routing.parse_vllm_routes('{"Qwen/Qwen3-0.6B":"http://qwen:8001"}'),
       {"Qwen/Qwen3-0.6B": "http://qwen:8001"},
     )
     self.assertEqual(
-      gateway.parse_vllm_routes("Qwen/Qwen3-0.6B=http://qwen:8001,google/gemma-3-1b-it=http://gemma:8001"),
+      vllm_routing.parse_vllm_routes("Qwen/Qwen3-0.6B=http://qwen:8001,google/gemma-3-1b-it=http://gemma:8001"),
       {"Qwen/Qwen3-0.6B": "http://qwen:8001", "google/gemma-3-1b-it": "http://gemma:8001"},
     )
 
