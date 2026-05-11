@@ -7,6 +7,7 @@ import traceback
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from model_state import lora_model_state
 from opentelemetry import context as otel_context
 from opentelemetry import propagate
 from store import get_store
@@ -166,17 +167,35 @@ async def clock_cycle_loop() -> None:
                 await store.set_future(req_id, {"path": state_path, "type": "load_weights"})
 
               case "save_weights_for_sampler":
-                await asyncio.to_thread(
+                published = await asyncio.to_thread(
                   engine.publish_adapter_for_inference,
                   m_id,
                   r.get("sampling_session_id"),
                   r.get("alias"),
                 )
+                state_ids = {state_id for state_id in (r.get("path"), r.get("sampling_session_id"), published.state_id) if state_id}
+                if published.base_model_id and published.adapter_ref and published.state_id:
+                  for state_id in state_ids:
+                    model_state = lora_model_state(
+                      state_id=state_id,
+                      model_id=m_id,
+                      base_model=published.base_model_id,
+                      version=published.version,
+                      checkpoint_ref=published.adapter_ref,
+                      adapter_ref=published.adapter_ref,
+                      adapter_name=published.adapter_name,
+                      state_delta_ref=published.manifest_path,
+                      inference_backend=published.inference_backend,
+                    )
+                    await store.publish_model_state(state_id, model_state.to_dict())
                 await store.set_future(
                   req_id,
                   {
                     "path": r.get("path"),
                     "sampling_session_id": r.get("sampling_session_id"),
+                    "state_id": r.get("path") or r.get("sampling_session_id"),
+                    "version": published.version,
+                    "base_model": published.base_model_id,
                     "type": "save_weights_for_sampler",
                   },
                 )

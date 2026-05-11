@@ -198,6 +198,7 @@ class TrainerEngine:
       model=self.peft_model,
       adapter_name=sampler_id or adapter_id,
       durable_ref=adapter_payload_path,
+      base_model_id=self.base_model_name,
     )
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
@@ -220,6 +221,7 @@ class TrainerEngine:
       model_id=model_id,
       checkpoint_dir=state_path,
       kind=kind,
+      state_id=state_path,
       optimizer_ref=optimizer_ref,
       state_delta_ref=delta_ref,
     )

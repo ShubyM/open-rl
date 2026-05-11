@@ -120,10 +120,14 @@ class TestWeightSync(unittest.TestCase):
         model=_ModelStub(),
         adapter_name="tinker://adapter-a/sampler_weights/current",
         durable_ref="/tmp/open-rl/peft/adapter-a/adapter-a",
+        base_model_id="Qwen/Qwen3-0.6B",
       )
 
       self.assertEqual(state.run_id, "adapter-a")
       self.assertEqual(state.version, 1)
+      self.assertEqual(state.base_model_id, "Qwen/Qwen3-0.6B")
+      self.assertEqual(state.state_id, "tinker://adapter-a/sampler_weights/current")
+      self.assertEqual(state.adapter_ref, "/tmp/open-rl/peft/adapter-a/adapter-a")
       self.assertEqual(state.tensor_count, 2)
       self.assertEqual(state.transport, "file_adapter_reload")
       self.assertIsNotNone(state.manifest_path)
@@ -186,9 +190,11 @@ class TestWeightSync(unittest.TestCase):
           adapter_name="tinker://adapter-a/sampler_weights/current",
           tensors=tensors,
           durable_ref=str(adapter_dir),
+          base_model_id="Qwen/Qwen3-0.6B",
         )
 
     self.assertEqual(state.transport, "vllm_lora_tensor_shm")
+    self.assertEqual(_HttpClientStub.posted_json["base_model_id"], "Qwen/Qwen3-0.6B")
     self.assertNotIn("tensors_safetensors_b64", _HttpClientStub.posted_json)
     self.assertIn("tensors_safetensors_shm", _HttpClientStub.posted_json)
     self.assertIn("manifest", _HttpClientStub.posted_json)
@@ -212,9 +218,11 @@ class TestWeightSync(unittest.TestCase):
           adapter_name="tinker://adapter-a/sampler_weights/current",
           tensors=tensors,
           durable_ref=str(adapter_dir),
+          base_model_id="Qwen/Qwen3-0.6B",
         )
 
     entries = _HttpClientStub.posted_json["manifest"]["tensors"]
+    self.assertEqual(_HttpClientStub.posted_json["base_model_id"], "Qwen/Qwen3-0.6B")
     self.assertEqual({entry["dtype"] for entry in entries}, {"float16"})
     self.assertTrue(all(entry["checksum"] for entry in entries))
 
@@ -252,12 +260,14 @@ class TestWeightSync(unittest.TestCase):
           adapter_name="tinker://adapter-a/sampler_weights/current",
           tensors=tensors,
           durable_ref=str(adapter_dir),
+          base_model_id="Qwen/Qwen3-0.6B",
         )
 
     self.assertEqual(state.transport, "file_adapter_reload")
     self.assertEqual(_FailThenCaptureClient.calls[-1][0], "http://vllm-service:8001/sync_lora_adapter")
     self.assertEqual(_FailThenCaptureClient.calls[-1][1]["version"], 9)
     self.assertEqual(_FailThenCaptureClient.calls[-1][1]["adapter_path"], str(adapter_dir))
+    self.assertEqual(_FailThenCaptureClient.calls[-1][1]["base_model_id"], "Qwen/Qwen3-0.6B")
 
   def test_torchrl_transfer_engine_sends_exact_selected_tensors(self) -> None:
     tensors = weight_sync.LoraTensorSelector().select(_ModelStub(), "adapter-a")

@@ -208,6 +208,47 @@ class TestVLLMSamplerWeightSync(unittest.TestCase):
     self.assertEqual(fake_engine.lora_request.lora_name, "adapter-a@2")
     self.assertEqual(fake_engine.lora_request.lora_path, "/tmp/adapter-a-v2")
 
+  def test_generate_uses_base_model_scoped_lora_cache_key(self) -> None:
+    fake_engine = _FakeEngine()
+    vllm_sampler.engine = fake_engine
+    vllm_sampler.synced_lora_adapters["Qwen/Qwen3-0.6B::adapter-a"] = {
+      "adapter_path": "/tmp/adapter-a-v2",
+      "base_model_id": "Qwen/Qwen3-0.6B",
+      "version": 2,
+    }
+    try:
+      response = asyncio.run(
+        vllm_sampler.generate(
+          _RequestStub({"request_id": "req-1", "prompt_token_ids": [1], "base_model_id": "Qwen/Qwen3-0.6B", "lora_id": "adapter-a"})
+        )
+      )
+    finally:
+      vllm_sampler.engine = None
+      vllm_sampler.synced_lora_adapters.clear()
+
+    self.assertEqual(response["sequences"], [{"tokens": [7], "logprobs": [], "stop_reason": "length"}])
+    self.assertEqual(fake_engine.lora_request.lora_name, "Qwen/Qwen3-0.6B::adapter-a@2")
+    self.assertEqual(fake_engine.lora_request.lora_path, "/tmp/adapter-a-v2")
+
+  def test_sync_lora_adapter_rejects_wrong_base_model(self) -> None:
+    with patch.dict(os.environ, {"BASE_MODEL": "Qwen/Qwen3-0.6B"}):
+      response = asyncio.run(
+        vllm_sampler.sync_lora_adapter(
+          _RequestStub(
+            {
+              "adapter_name": "adapter-a",
+              "base_model_id": "google/gemma-3-1b-it",
+              "version": 2,
+              "adapter_path": "/tmp/adapter-a-v2",
+              "run_id": "adapter-a",
+            }
+          )
+        )
+      )
+
+    self.assertEqual(response["type"], "RequestFailedResponse")
+    self.assertIn("cannot apply state", response["error_message"])
+
 
 if __name__ == "__main__":
   unittest.main()

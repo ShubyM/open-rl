@@ -61,6 +61,20 @@ synced_lora_adapters: dict[str, dict[str, Any]] = {}
 FLOAT_DTYPE_NAMES = {"float16", "bfloat16", "float32", "float64"}
 
 
+def loaded_base_model_id() -> str | None:
+  return os.getenv("BASE_MODEL") or os.getenv("VLLM_MODEL")
+
+
+def lora_state_key(base_model_id: str | None, adapter_name: str) -> str:
+  return f"{base_model_id}::{adapter_name}" if base_model_id else adapter_name
+
+
+def assert_base_model_compatible(base_model_id: str | None) -> None:
+  loaded = loaded_base_model_id()
+  if base_model_id and loaded and base_model_id != loaded:
+    raise ValueError(f"vLLM worker loaded {loaded}, cannot apply state for {base_model_id}")
+
+
 class ShmTensorRef(BaseModel):
   name: str
   size: int
@@ -78,6 +92,7 @@ class LoraTensorSyncRequest(BaseModel):
   run_id: str
   version: int
   adapter_name: str
+  base_model_id: str | None = None
   adapter_config: dict[str, Any]
   manifest: dict[str, Any]
   transport_receipt: TransportReceiptPayload | None = None
@@ -149,6 +164,7 @@ async def healthz():
 async def sync_lora_adapter(req: Request):
   data = await req.json()
   adapter_name = data.get("adapter_name")
+  base_model_id = data.get("base_model_id")
   version = data.get("version")
   adapter_path = data.get("adapter_path")
   if not adapter_name:
@@ -156,12 +172,18 @@ async def sync_lora_adapter(req: Request):
   if version is None:
     return {"type": "RequestFailedResponse", "error_message": "version is required"}
   version = int(version)
-  current = synced_lora_adapters.get(adapter_name)
+  try:
+    assert_base_model_compatible(base_model_id)
+  except ValueError as exc:
+    return {"type": "RequestFailedResponse", "error_message": str(exc)}
+  state_key = lora_state_key(base_model_id, adapter_name)
+  current = synced_lora_adapters.get(state_key)
   if current and int(current.get("version", 0)) >= version:
     return {"type": "RequestFailedResponse", "error_message": f"stale adapter version {version} for {adapter_name}"}
 
-  synced_lora_adapters[adapter_name] = {
+  synced_lora_adapters[state_key] = {
     "adapter_path": adapter_path,
+    "base_model_id": base_model_id,
     "manifest_path": data.get("manifest_path"),
     "run_id": data.get("run_id"),
     "version": version,
@@ -220,9 +242,11 @@ def verify_lora_delta_manifest(payload: LoraTensorSyncRequest, tensors: dict[str
 async def sync_lora_tensors(req: Request):
   try:
     payload = LoraTensorSyncRequest.model_validate(await req.json())
+    assert_base_model_compatible(payload.base_model_id)
     tensors = load_safetensors(read_lora_safetensors_bytes(payload))
     manifest = verify_lora_delta_manifest(payload, tensors)
-    current = synced_lora_adapters.get(payload.adapter_name)
+    state_key = lora_state_key(payload.base_model_id, payload.adapter_name)
+    current = synced_lora_adapters.get(state_key)
     if current and int(current.get("version", 0)) >= payload.version:
       raise ValueError(f"stale adapter version {payload.version} for {payload.adapter_name}")
     sync_root = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")) / "vllm_lora_sync"
@@ -235,13 +259,14 @@ async def sync_lora_tensors(req: Request):
 
     current_engine = engine
     if current_engine is not None:
-      lora_cache_key = f"{payload.adapter_name}@{payload.version}"
+      lora_cache_key = f"{state_key}@{payload.version}"
       lora_int_id = int(hashlib.md5(lora_cache_key.encode("utf-8")).hexdigest(), 16) % (2**31 - 1) + 1
       lora_request = LoRARequest(lora_cache_key, lora_int_id, str(adapter_dir), load_inplace=True)
       await current_engine.add_lora(lora_request)
 
-    synced_lora_adapters[payload.adapter_name] = {
+    synced_lora_adapters[state_key] = {
       "adapter_path": str(adapter_dir),
+      "base_model_id": payload.base_model_id,
       "manifest_path": payload.manifest_path,
       "run_id": payload.run_id,
       "version": payload.version,
@@ -277,7 +302,10 @@ async def generate(req: Request):
 
     lora_id = data.get("lora_id", None)
     lora_path = data.get("lora_path", None)
+    base_model_id = data.get("base_model_id")
+    lora_version = int(data.get("lora_version", 0) or 0)
     include_prompt_logprobs = data.get("include_prompt_logprobs", False)
+    assert_base_model_compatible(base_model_id)
 
     current_engine = engine
     if current_engine is None:
@@ -300,15 +328,15 @@ async def generate(req: Request):
     )
 
     lora_request = None
-    lora_version = 0
-    sync_state = synced_lora_adapters.get(lora_id) if lora_id else None
+    state_key = lora_state_key(base_model_id, lora_id) if lora_id else None
+    sync_state = synced_lora_adapters.get(state_key) if state_key else None
     if sync_state and sync_state.get("adapter_path"):
       lora_path = sync_state["adapter_path"]
       lora_version = int(sync_state["version"])
     if lora_id and lora_path:
       # vLLM natively relies on lora_int_id to track cached adapter weights.
       # Include the published version so repeated sampler aliases reload changed files.
-      lora_cache_key = f"{lora_id}@{lora_version}"
+      lora_cache_key = f"{state_key or lora_id}@{lora_version}"
       lora_int_id = int(hashlib.md5(lora_cache_key.encode("utf-8")).hexdigest(), 16) % (2**31 - 1) + 1
       lora_request = LoRARequest(lora_cache_key, lora_int_id, lora_path)
 
