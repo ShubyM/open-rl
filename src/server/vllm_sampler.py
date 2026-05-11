@@ -279,6 +279,8 @@ async def sync_lora_tensors(req: Request):
       "type": "sync_lora_tensors",
       "version": payload.version,
     }
+  except ValueError as e:
+    return {"type": "RequestFailedResponse", "error_message": f"vLLM LoRA tensor sync error: {str(e)}"}
   except Exception as e:
     import traceback
 
