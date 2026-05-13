@@ -124,12 +124,42 @@ training state and must not leak across tenants.
 
 ### Adapter snapshots and checkpoints
 
-Snapshots persist adapter weights so another component can load an exact policy
-version. They are the handoff format between trainer and sampler, and they also
-support explicit saves, restore flows, and basic durability between operations.
+Checkpoints persist adapter weights so another component can load an exact
+policy version. They are the handoff format between trainer and sampler, and
+they also support explicit saves, restore flows, and basic durability between
+operations.
 
-On one machine, a snapshot can just be a directory on local disk. In a cluster,
-it should live on a filesystem visible to both the trainer and sampler.
+A `ModelState` is the Open-RL envelope around payloads: PEFT adapter files,
+optional optimizer state, optional adapter snapshot payloads, and metadata
+describing whether the state can resume a trainer, spawn inference, or both. On
+one machine it can just be a directory on local disk. In a cluster, it should
+live on a filesystem visible to both the trainer and sampler.
+
+Sampler snapshots also pass through a weight sync bridge. The bridge selects the
+exact LoRA tensors for the active adapter and publishes a version to the
+configured inference backend. The near-term LoRA implementation publishes full
+adapter snapshots, not incremental deltas: an `AdapterSnapshotManifest`
+describes the tensors in one adapter version, transports move bytes for that
+manifest, and materializers verify and apply the manifest to a specific runtime.
+Durable saves store the same state refs, so hot synchronization and restore
+share one state contract.
+
+The default vLLM path writes a durable PEFT adapter snapshot and notifies the
+worker to reload that adapter with a versioned key. Debug hot transports can
+still serialize selected tensors as safetensors, normalize PEFT in-memory
+adapter names to vLLM's saved-adapter key format, and send the manifest plus a
+temporary transport receipt. The worker verifies the manifest against the
+received tensor payload, materializes a small adapter directory under
+`OPEN_RL_TMP_DIR/vllm_lora_sync/`, and uses a versioned LoRA cache key so
+repeated sampler aliases advance to the new weights instead of reusing a stale
+cached LoRA id.
+
+The bridge also has a narrow TorchRL/vLLM transfer adapter for future NCCL
+integration. TorchRL's default vLLM LoRA metadata path merges LoRA adapters into
+the full model state, so Open-RL must pass an explicit filtered LoRA tensor dict
+and matching metadata if it wants adapter-only transfer. The vLLM native
+`update_weights` receiver does not apply PEFT LoRA state-dict names directly, so
+Open-RL uses the custom adapter materialization path for LoRA sync.
 
 ### Sampler
 

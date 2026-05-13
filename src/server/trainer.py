@@ -9,10 +9,20 @@ from datetime import datetime
 from typing import Any
 
 import torch
+from checkpoint_store import FileCheckpointStore
+from delta_store import FileDeltaStore
+from model_state import ModelState, lora_model_state
 from peft import LoraConfig as PeftLoraConfig
 from peft import PeftModelForCausalLM, get_peft_model
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from weight_sync import (
+  LoraTensorSelector,
+  WeightSyncBridge,
+  build_vllm_lora_delta_manifest,
+  read_adapter_config,
+  tensors_for_manifest,
+)
 
 
 class TensorData(BaseModel):
@@ -59,6 +69,8 @@ class TrainerEngine:
     # Store per-adapter training state by model_id (adapter ID).
     self.adapter_states: dict[str, dict[str, Any]] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
+    self.weight_sync_bridge = WeightSyncBridge.from_env()
+    self.checkpoint_store = FileCheckpointStore()
 
     # Decide device
     if torch.cuda.is_available():
@@ -81,6 +93,9 @@ class TrainerEngine:
 
     self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
     print("Successfully loaded.")
+
+  def has_adapter(self, adapter_id: str) -> bool:
+    return self.peft_model is not None and adapter_id in self.adapter_states
 
   def _target_lora_modules(self, config: LoraConfig) -> list[str]:
     assert self.base_model is not None
@@ -144,7 +159,7 @@ class TrainerEngine:
 
     self.save_adapter(adapter_id)
 
-  def save_adapter(self, adapter_id: str, alias: str | None = None) -> None:
+  def save_adapter(self, adapter_id: str, alias: str | None = None) -> str:
     """Save adapter weights to disk for reliability and sharing."""
     try:
       tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
@@ -162,9 +177,29 @@ class TrainerEngine:
         json.dump(metadata, f)
 
       print(f"Auto-saved adapter '{adapter_id}' to {save_path}")
+      return save_path
     except Exception as e:
       print(f"[ERROR] Failed to auto-save weights for {adapter_id}: {e}")
       traceback.print_exc()
+      raise
+
+  def publish_adapter_for_inference(self, adapter_id: str, sampler_id: str | None = None, alias: str | None = None) -> ModelState:
+    """Save adapter weights and publish an exact tensor manifest for inference."""
+    assert self.peft_model is not None, "Model must be loaded first."
+
+    self.peft_model.set_adapter(adapter_id)
+    adapter_path = self.save_adapter(adapter_id, alias)
+    adapter_payload_path = os.path.join(adapter_path, adapter_id)
+    if not os.path.exists(adapter_payload_path):
+      adapter_payload_path = adapter_path
+    return self.weight_sync_bridge.publish_for_inference(
+      run_id=adapter_id,
+      version=None,
+      model=self.peft_model,
+      adapter_name=sampler_id or adapter_id,
+      durable_ref=adapter_payload_path,
+      base_model_id=self.base_model_name,
+    )
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     """Save adapter weights (and optionally optimizer state) to a specific path."""
@@ -173,25 +208,39 @@ class TrainerEngine:
     self.peft_model.set_adapter(model_id)
     os.makedirs(state_path, exist_ok=True)
     self.peft_model.save_pretrained(state_path, selected_adapters=[model_id])
+    delta_ref = self.write_checkpoint_delta(model_id, state_path)
 
     adapter_state = self.adapter_states.get(model_id)
     optimizer = adapter_state.get("optimizer") if adapter_state is not None else None
+    optimizer_ref = os.path.join(state_path, "optimizer.pt") if include_optimizer and optimizer is not None else None
     if include_optimizer and optimizer is not None:
-      torch.save(optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
+      torch.save(optimizer.state_dict(), optimizer_ref)
 
-    metadata = {
-      "base_model": self.base_model_name,
-      "created_at": datetime.now().isoformat(),
-      "kind": kind,
-      "has_optimizer": include_optimizer and optimizer is not None,
-      "model_id": model_id,
-      "timestamp": time.time(),
-    }
-    with open(os.path.join(state_path, "metadata.json"), "w") as f:
-      json.dump(metadata, f)
+    state = lora_model_state(
+      state_id=state_path,
+      model_id=model_id,
+      base_model=self.base_model_name or "",
+      optimizer_ref=optimizer_ref,
+      adapter_ref=state_path,
+      delta_ref=delta_ref,
+      version=int(time.time() * 1000),
+    )
+    self.checkpoint_store.write_model_state(state_path, state)
 
     print(f"Saved state for '{model_id}' to {state_path}")
-    return {"path": state_path}
+    return {"path": state_path, "delta_ref": delta_ref, "state_delta_ref": delta_ref, "model_state": state.to_dict(), "kind": kind}
+
+  def write_checkpoint_delta(self, model_id: str, state_path: str) -> str:
+    tensors = LoraTensorSelector().select(self.peft_model, model_id)
+    manifest = build_vllm_lora_delta_manifest(
+      model_id,
+      int(time.time() * 1000),
+      tensors,
+      read_adapter_config(state_path),
+      checksum=True,
+    )
+    write = FileDeltaStore(os.path.join(state_path, "delta")).write_delta(manifest, tensors_for_manifest(tensors, manifest))
+    return write.payload["delta_ref"]
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
     """Create an adapter from a saved state directory.
@@ -199,21 +248,15 @@ class TrainerEngine:
     Expects the directory to contain a metadata.json describing base_model
     and (optionally) an adapter subdirectory with the saved LoRA weights.
     """
-    metadata_path = os.path.join(state_path, "metadata.json")
-    if not os.path.exists(metadata_path):
-      raise FileNotFoundError(f"No metadata.json found at {state_path}")
-
-    with open(metadata_path) as f:
-      metadata = json.load(f)
-
-    base_model = metadata.get("base_model")
+    state = self.checkpoint_store.read_model_state(state_path)
+    base_model = state.base_model
     if not base_model:
       raise ValueError(f"metadata.json at {state_path} missing base_model")
 
-    src_adapter_id = metadata.get("model_id")
-    adapter_dir = state_path
-    if src_adapter_id and os.path.exists(os.path.join(state_path, src_adapter_id)):
-      adapter_dir = os.path.join(state_path, src_adapter_id)
+    src_adapter_id = state.model_id
+    adapter_dir = state.adapter_ref or state_path
+    if src_adapter_id and os.path.exists(os.path.join(adapter_dir, src_adapter_id)):
+      adapter_dir = os.path.join(adapter_dir, src_adapter_id)
 
     self.load_base_model(base_model)
     assert self.base_model is not None
@@ -233,8 +276,8 @@ class TrainerEngine:
     self.adapter_states[model_id] = adapter_state
     self.peft_model.train()
 
-    if restore_optimizer and metadata.get("has_optimizer"):
-      optimizer_path = os.path.join(state_path, "optimizer.pt")
+    if restore_optimizer and state.optimizer_ref:
+      optimizer_path = state.optimizer_ref
       if os.path.exists(optimizer_path):
         lr = 1e-4
         optimizer = torch.optim.AdamW(params, lr=lr)

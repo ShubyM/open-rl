@@ -1752,9 +1752,6 @@ dependencies = [
     { name = "matplotlib" },
     { name = "nbclient" },
     { name = "nbformat" },
-    { name = "opentelemetry-exporter-gcp-trace" },
-    { name = "opentelemetry-instrumentation-httpx" },
-    { name = "opentelemetry-sdk" },
     { name = "orjson" },
     { name = "requests" },
     { name = "tinker" },
@@ -1762,6 +1759,13 @@ dependencies = [
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "transformers" },
+]
+
+[package.optional-dependencies]
+telemetry = [
+    { name = "opentelemetry-exporter-gcp-trace" },
+    { name = "opentelemetry-instrumentation-httpx" },
+    { name = "opentelemetry-sdk" },
 ]
 
 [package.metadata]
@@ -1774,9 +1778,9 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "nbclient", specifier = ">=0.10.2" },
     { name = "nbformat", specifier = ">=5.10.4" },
-    { name = "opentelemetry-exporter-gcp-trace", specifier = ">=1.11.0" },
-    { name = "opentelemetry-instrumentation-httpx", specifier = ">=0.61b0" },
-    { name = "opentelemetry-sdk", specifier = ">=1.40.0" },
+    { name = "opentelemetry-exporter-gcp-trace", marker = "extra == 'telemetry'", specifier = ">=1.11.0" },
+    { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'telemetry'", specifier = ">=0.61b0" },
+    { name = "opentelemetry-sdk", marker = "extra == 'telemetry'", specifier = ">=1.40.0" },
     { name = "orjson", specifier = ">=3.11.8" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "tinker", specifier = "==0.18.2" },
@@ -1784,6 +1788,7 @@ requires-dist = [
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = ">=5.7.0" },
 ]
+provides-extras = ["telemetry"]
 
 [[package]]
 name = "opentelemetry-api"

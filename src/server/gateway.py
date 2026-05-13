@@ -11,28 +11,13 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from opentelemetry import propagate, trace
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry import propagate
 from store import get_store
+from telemetry import instrument_fastapi, setup_tracing
+from vllm_routing import DEFAULT_VLLM_URL, vllm_url_for_base_model
 
 store = get_store()
-
-provider = TracerProvider()
-trace.set_tracer_provider(provider)
-
-if os.getenv("ENABLE_GCP_TRACE", "0") == "1":
-  try:
-    from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
-
-    exporter = CloudTraceSpanExporter()
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    print("OpenTelemetry: Configured GCP CloudTraceSpanExporter")
-  except ImportError:
-    print("OpenTelemetry: opentelemetry-exporter-gcp-trace is not installed")
-else:
-  print("OpenTelemetry: No exporter configured (ENABLE_GCP_TRACE=0)")
+setup_tracing("openrl.gateway")
 
 
 class _FilterNoisyEndpoints(logging.Filter):
@@ -44,7 +29,7 @@ class _FilterNoisyEndpoints(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_FilterNoisyEndpoints())
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
+VLLM_URL = os.getenv("VLLM_URL", DEFAULT_VLLM_URL)
 
 
 # *** Helpers ***
@@ -64,8 +49,9 @@ def get_default_model_name() -> str | None:
   if is_single_process_mode():
     import clock_cycle
 
-    if clock_cycle.engine.base_model_name:
-      return clock_cycle.engine.base_model_name
+    trainer_engine = clock_cycle.get_engine()
+    if trainer_engine.base_model_name:
+      return trainer_engine.base_model_name
   return os.getenv("BASE_MODEL")
 
 
@@ -104,21 +90,23 @@ async def _enqueue(payload: dict) -> str:
 
 
 async def _preflight_vllm() -> None:
-  """If SAMPLING_BACKEND=vllm, verify the vLLM worker is reachable at VLLM_URL.
+  """If SAMPLING_BACKEND=vllm, verify the selected vLLM worker is reachable.
 
   Prints a clear, actionable error instead of letting the first asample
   request fall through with a raw httpx connection refused.
   """
   if get_sampler_backend() != "vllm":
     return
-  healthz = f"{VLLM_URL.rstrip('/')}/healthz"
+  base_model = os.getenv("BASE_MODEL")
+  vllm_url = vllm_url_for_base_model(base_model, VLLM_URL)
+  healthz = f"{vllm_url.rstrip('/')}/healthz"
   try:
     async with httpx.AsyncClient(timeout=3.0) as client:
       resp = await client.get(healthz)
       resp.raise_for_status()
   except Exception as exc:
     raise RuntimeError(
-      f"SAMPLING_BACKEND=vllm but no vLLM worker is reachable at {VLLM_URL}.\n"
+      f"SAMPLING_BACKEND=vllm but no vLLM worker is reachable at {vllm_url}.\n"
       f"Start it first with:  make vllm BASE_MODEL={os.getenv('BASE_MODEL') or '<model-id>'}"
     ) from exc
 
@@ -138,7 +126,7 @@ async def lifespan(_: FastAPI):
     print("-> Server mode     : API server + worker loop in one process\n")
     await _preflight_vllm()
     if base_model:
-      await asyncio.to_thread(clock_cycle.engine.load_base_model, base_model)
+      await asyncio.to_thread(clock_cycle.get_engine().load_base_model, base_model)
     task = asyncio.create_task(clock_cycle.clock_cycle_loop())
   try:
     yield
@@ -148,7 +136,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
-FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
+instrument_fastapi(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
 
 
 # *** ServiceClient endpoints ***
@@ -402,6 +390,9 @@ async def asample(req: dict):
 
   model_id = req.get("model_id") or req.get("sampling_session_id")
   base_model_id = base_model_id_from_sampling_ref(model_id)
+  model_state = await store.get_model_state(model_id) if model_id else None
+  if model_state:
+    base_model_id = model_state.get("base_model") or base_model_id
 
   if get_sampler_backend() == "torch":
     req_id = await _enqueue(
@@ -424,14 +415,21 @@ async def asample(req: dict):
   req_id = str(uuid.uuid4())
   await store.set_future(req_id, {"status": "pending"})
 
+  lora_id = model_id
   lora_path = os.path.join(TMP_DIR, "peft", base_model_id, base_model_id) if base_model_id else None
+  lora_version = 0
+  if model_state:
+    lora_id = model_state.get("adapter_name") or model_state.get("state_id") or model_id
+    lora_path = model_state.get("adapter_ref") or lora_path
+    lora_version = int(model_state.get("version", 0) or 0)
+  vllm_url = vllm_url_for_base_model(base_model_id, VLLM_URL)
   headers: dict[str, str] = {"Content-Type": "application/json"}
   propagate.inject(headers)
 
   try:
     async with httpx.AsyncClient(timeout=120.0) as client:
       resp = await client.post(
-        f"{VLLM_URL.rstrip('/')}/generate",
+        f"{vllm_url.rstrip('/')}/generate",
         json={
           "request_id": req_id,
           "prompt_token_ids": prompt,
@@ -441,8 +439,10 @@ async def asample(req: dict):
           "top_p": top_p,
           "top_k": top_k,
           "num_samples": num_samples,
-          "lora_id": model_id,
+          "base_model_id": base_model_id,
+          "lora_id": lora_id,
           "lora_path": lora_path,
+          "lora_version": lora_version,
           "include_prompt_logprobs": include_prompt_logprobs,
         },
         headers=headers,
