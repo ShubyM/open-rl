@@ -52,7 +52,7 @@ def close_logger() -> None:
   LOGGER.handlers.clear()
 
 
-def train(examples: list[dict[str, Any]], args: RunConfig) -> tuple[dict[str, Any], dict[str, float]]:
+def train(examples: list[dict[str, Any]], args: RunConfig, ml_logger) -> tuple[dict[str, Any], dict[str, float]]:
   state = {"steps": 0}
   deadline = time.monotonic() + args.attempt_timeout_minutes * 60
   start = time.monotonic()
@@ -65,6 +65,7 @@ def train(examples: list[dict[str, Any]], args: RunConfig) -> tuple[dict[str, An
     state["steps"] = step
     if step == 1 or step == TRAIN_STEPS or step % 10 == 0:
       LOGGER.info("train step %s/%s", step, TRAIN_STEPS)
+      ml_logger.log_metrics({"phase": "train", "train/steps": float(step), "progress/done_frac": step / TRAIN_STEPS}, step=step)
   seconds = time.monotonic() - start
   (args.run_dir / "training_state.json").write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
   return state, {"train/steps": float(state["steps"]), "train/seconds": seconds}
@@ -93,7 +94,7 @@ def run(args: RunConfig) -> Path:
     examples = prepare.load_examples(args.cache_root)
     write_train_examples(args.run_dir, examples)
     LOGGER.info("train/dev split: %s/%s rows from %s", prepare.TRAIN_LIMIT, prepare.DEV_LIMIT, prepare.DEFAULT_DATASET)
-    state, train_metrics = train([prepare.public_example(example) for example in examples if example["split"] == "train"], args)
+    state, train_metrics = train([prepare.public_example(example) for example in examples if example["split"] == "train"], args, ml_logger)
     results, metrics = prepare.score_dev(examples, lambda example: generate_sql(example, state))
     for row in results:
       LOGGER.info(result_lines(row))

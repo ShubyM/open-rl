@@ -70,30 +70,32 @@ def validate(config: TrainConfig) -> None:
     raise ValueError("lr must be positive")
 
 
-def summarize_rollouts(run_dir: Path) -> dict[str, float]:
-  rows = []
-  for path in sorted(run_dir.glob("iteration_*/train_rollout_summaries.jsonl")):
-    rows.extend(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
-  if not rows:
-    return {}
-  steps = [step for row in rows for step in row.get("steps", [])]
+def rollout_metrics(row: dict[str, Any]) -> dict[str, float]:
+  steps = row.get("steps", [])
 
   def avg_step_metric(key: str) -> float:
     return sum(float(step.get("metrics", {}).get(key, 0.0)) for step in steps) / max(len(steps), 1)
 
   return {
-    "step": max(float(row.get("iteration", 0)) for row in rows),
-    "env/all/reward/total": sum(float(row.get("total_reward", 0.0)) for row in rows) / len(rows),
+    "step": float(row.get("iteration", 0)),
+    "env/all/reward/total": float(row.get("total_reward", 0.0)),
     "accuracy": avg_step_metric("correct"),
     "env/all/format": avg_step_metric("format"),
   }
 
 
+def summarize_rollouts(run_dir: Path) -> list[dict[str, float]]:
+  rows = []
+  for path in sorted(run_dir.glob("iteration_*/train_rollout_summaries.jsonl")):
+    rows.extend(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+  return [rollout_metrics(row) for row in sorted(rows, key=lambda row: float(row.get("iteration", 0)))]
+
+
 def write_metric_summary(run_dir: Path) -> dict[str, float]:
-  metrics = summarize_rollouts(run_dir)
-  if metrics:
-    (run_dir / "metrics.jsonl").write_text(json.dumps(metrics, sort_keys=True) + "\n", encoding="utf-8")
-  return metrics
+  rows = summarize_rollouts(run_dir)
+  if rows:
+    (run_dir / "metrics.jsonl").write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
+  return rows[-1] if rows else {}
 
 
 def dataset_builder(config: TrainConfig, renderer_name: str):

@@ -85,7 +85,13 @@ function render(options = {}) {
   UI.chart.innerHTML = chart(st.researcher, st.view);
   UI.table.innerHTML = table(st.view, st.rows, st.row);
   if (st.row) {
-    UI.detail.innerHTML = detail(st.row);
+    const tabKey = selectedTab(st.row);
+    const current = UI.detail.querySelector("#experiment-detail");
+    if (current?.dataset.run !== st.row.id || current?.dataset.tab !== tabKey) {
+      UI.detail.innerHTML = detail(st.row, tabKey);
+    } else {
+      current.querySelector(".panel-meta").textContent = st.row.meta || st.row.label || st.row.id;
+    }
     renderViewer(st.row);
   } else {
     UI.detail.innerHTML = "";
@@ -123,7 +129,7 @@ function chart(researcher, view) {
     ${scale.ticks.map(v => line(m.l, m.t + ph - scale.norm(v) * ph, m.l + pw, m.t + ph - scale.norm(v) * ph, "grid-line")).join("")}
     ${Array.from({ length: attempts }, (_, i) => line(x(i + 1), m.t, x(i + 1), m.t + ph, "grid-line")).join("")}
     ${line(m.l, m.t, m.l, m.t + ph, "axis-line")}${line(m.l, m.t + ph, m.l + pw, m.t + ph, "axis-line")}
-    ${scale.ticks.map(v => text(m.l - 16, m.t + ph - scale.norm(v) * ph + 4, fmt(v), "end")).join("")}
+    ${scale.ticks.map(v => text(m.l - 16, m.t + ph - scale.norm(v) * ph + 4, fmtAxis(v, scale.step), "end")).join("")}
     <polyline points="${xy.map(([x, y]) => `${x},${y}`).join(" ")}" fill="none" stroke="var(--accent)" stroke-width="2"/>
     ${Array.from({ length: attempts }, (_, i) => text(x(i + 1), m.t + ph + 24, `E${i + 1}`)).join("")}
     ${xy.map(([x, y, p]) => `<circle class="chart-point" cx="${x}" cy="${y}" r="5" data-action="select" data-run="${H(p.id)}"><title>${H(p.title)}</title></circle>`).join("")}
@@ -138,8 +144,27 @@ function yScale(values) {
     const pad = Math.max(Math.abs(lo) * .1, .01);
     lo -= pad; hi += pad;
   }
-  const span = hi - lo, paddedLo = lo - span * .08, paddedHi = hi + span * .08;
-  return { ticks: [0, .25, .5, .75, 1].map(t => paddedLo + (paddedHi - paddedLo) * t), norm: (v) => (v - paddedLo) / (paddedHi - paddedLo) };
+  const pad = (hi - lo) * .08;
+  lo -= pad; hi += pad;
+  const step = niceStep(hi - lo);
+  const min = Math.floor(lo / step) * step;
+  const max = Math.ceil(hi / step) * step;
+  const ticks = [];
+  for (let v = min; v <= max + step / 2; v += step) ticks.push(Math.abs(v) < step / 1000 ? 0 : v);
+  return { ticks, step, norm: (v) => (v - min) / (max - min || 1) };
+}
+
+function niceStep(span) {
+  const raw = span / 4;
+  const pow = 10 ** Math.floor(Math.log10(raw || 1));
+  const unit = raw / pow;
+  return (unit <= 1 ? 1 : unit <= 2 ? 2 : unit <= 5 ? 5 : 10) * pow;
+}
+
+function fmtAxis(value, step) {
+  if (Math.abs(value) < step / 1000) value = 0;
+  const decimals = Math.max(0, Math.min(6, Math.ceil(-Math.log10(step)) + 1));
+  return Number(value.toFixed(decimals)).toString();
 }
 
 function table(view, rows, selected) {
@@ -159,9 +184,8 @@ function table(view, rows, selected) {
   return `<section class="experiment-index"><div class="table-wrap"><table><thead><tr>${["#", view.metric_label, "What changed"].map(h => `<th>${H(h)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div></section>`;
 }
 
-function detail(row) {
-  const selected = selectedTab(row);
-  return `<section class="experiment-panel detail-panel" id="experiment-detail">
+function detail(row, selected = selectedTab(row)) {
+  return `<section class="experiment-panel detail-panel" id="experiment-detail" data-run="${H(row.id)}" data-tab="${H(selected)}">
     <div class="experiment-viewer"><div class="tabs">${row.tab_order.map(key => `<button class="${key === selected ? "active" : ""}" data-action="tab" data-tab="${key}">${H(row.tabs[key].label)}</button>`).join("")}</div><div class="viewer" id="viewer"></div></div>
     <div class="panel-meta">${H(row.meta || row.label || row.id)}</div>
   </section>`;
@@ -188,15 +212,28 @@ function renderViewer(row) {
     stopStream();
     return v.replaceChildren(diffPanel(row));
   }
+  const existing = v.querySelector("pre.log");
+  if (existing?.dataset.path === tab.path) {
+    const status = v.querySelector(".log-status");
+    if (status) {
+      status.textContent = logStatus(tab);
+      status.className = `log-status ${tab.live ? "live" : ""}`;
+    }
+    hydrateLog(tab, status, existing);
+    return;
+  }
   v.replaceChildren(logPanel(tab));
+}
+
+function logStatus(tab) {
+  return tab.path ? `${tab.label.toLowerCase()}: ${tab.live ? "live" : "tail"}` : `${tab.label.toLowerCase()}: no stream`;
 }
 
 function logPanel(tab) {
   const text = tab.path ? S.logText[tab.path] || tab.tail || "" : tab.tail || "";
   const panel = document.createElement("div");
-  const status = tab.path ? `${tab.label.toLowerCase()}: ${tab.live ? "live" : "tail"}` : `${tab.label.toLowerCase()}: no stream`;
   panel.className = "log-panel";
-  panel.innerHTML = `<div class="log-toolbar"><span class="log-status ${tab.live ? "live" : ""}">${H(status)}</span></div>`;
+  panel.innerHTML = `<div class="log-toolbar"><span class="log-status ${tab.live ? "live" : ""}">${H(logStatus(tab))}</span></div>`;
   if (!tab.path && !text) {
     panel.appendChild(fragment(`<div class="waiting-panel">${waiting(tab.label, `Waiting for ${tab.label.toLowerCase()} output.`)}</div>`));
     return panel;
@@ -204,6 +241,7 @@ function logPanel(tab) {
   const node = document.createElement("pre");
   node.className = "log";
   if (tab.path) node.dataset.path = tab.path;
+  node.addEventListener("scroll", () => { if (tab.path) S.logs[tab.path] = logScroll(node); }, { passive: true });
   panel.append(node);
   colorize(node, esc(text));
   restoreLogScroll(node, tab.path);
@@ -214,7 +252,8 @@ function logPanel(tab) {
 async function hydrateLog(tab, status, node) {
   if (!tab.path) return stopStream();
   if (!S.logLoaded[tab.path]) {
-    if (status) status.textContent = `${tab.label.toLowerCase()}: loading full log`;
+    const hasText = Boolean(S.logText[tab.path] || tab.tail || node.textContent);
+    if (status && !hasText) status.textContent = `${tab.label.toLowerCase()}: loading full log`;
     S.logFetches[tab.path] ||= fetch(`file?path=${encodeURIComponent(tab.path)}`)
       .then(response => {
         if (!response.ok) throw new Error(`log fetch failed: ${response.status}`);
@@ -227,7 +266,14 @@ async function hydrateLog(tab, status, node) {
         return full;
       })
       .finally(() => { delete S.logFetches[tab.path]; });
-    const full = await S.logFetches[tab.path];
+    const full = await S.logFetches[tab.path].catch(err => {
+      if (status) {
+        status.textContent = err.message;
+        status.className = "log-status warn";
+      }
+      return null;
+    });
+    if (full == null) return;
     if (!node.isConnected) return;
     S.logText[tab.path] = full;
     replaceLog(node, tab.path, full);

@@ -192,11 +192,11 @@ def run_logged(command: list[str], log_path: Path, timeout_seconds: float | None
       stop_process(process)
 
 
-def extract_metric(run_dir: Path, metric: str) -> tuple[float, int | float | None] | None:
-  found = None
+def extract_metrics(run_dir: Path, metric: str) -> list[tuple[float, int | float | None]]:
+  found = []
   for row in read_jsonl(run_dir / "metrics.jsonl"):
     if metric in row:
-      found = (float(row[metric]), row.get("step"))
+      found.append((float(row[metric]), row.get("step")))
   return found
 
 
@@ -330,24 +330,26 @@ class AttemptRun:
     path.write_text(str(source.stat().st_size), encoding="utf-8")
 
   def finish(self, code: int) -> None:
-    extracted = extract_metric(self.run_dir, self.recipe.metric)
+    extracted = extract_metrics(self.run_dir, self.recipe.metric)
     status = "completed" if code == 0 and extracted else "timed_out" if code == 124 else "failed"
     with self.logs_path.open("a", encoding="utf-8") as f:
       if not extracted:
         print(f"missing metric={self.recipe.metric}", file=f)
       print(f"status={status}", file=f)
     if extracted:
-      value, step = extracted
       self.events(
-        {
-          "metric": {
-            "name": self.recipe.metric,
-            "label": self.recipe.metric_label,
-            "value": value,
-            "step": step,
-            "mode": self.recipe.metric_mode,
+        *[
+          {
+            "metric": {
+              "name": self.recipe.metric,
+              "label": self.recipe.metric_label,
+              "value": value,
+              "step": step,
+              "mode": self.recipe.metric_mode,
+            }
           }
-        }
+          for value, step in extracted
+        ]
       )
     self.events({"status": status})
 
