@@ -1,0 +1,7 @@
+nameReference:
+- kind: ConfigMap
+  fieldSpecs:
+  - kind: Sandbox
+    path: spec/podTemplate/spec/containers/envFrom/configMapRef/name
+  - kind: Sandbox
+    path: spec/podTemplate/spec/volumes/configMap/name

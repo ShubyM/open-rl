@@ -1,0 +1,5 @@
+resources:
+- resources.yaml
+
+configurations:
+- kustomizeconfig.yaml
