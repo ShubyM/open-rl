@@ -1,0 +1,27 @@
+resources:
+- ../k8s/base
+
+namePrefix: open-rl-
+
+labels:
+- includeSelectors: false
+  pairs:
+    app.kubernetes.io/part-of: open-rl-autoresearch
+    autoresearch.open-rl.dev/task: text-sql
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+- name: autoresearch-program
+  behavior: replace
+  files:
+  - program.md
+- name: autoresearch-settings
+  behavior: merge
+  literals:
+  - RECIPE=rl/autoresearch/text_sql/autoresearch.toml
+  - LOG_ROOT=/mnt/shared/open-rl/autoresearch/text_sql
+  - UI_LOG_ROOT=/mnt/shared/open-rl/autoresearch/text_sql
+  - ATTEMPT_TIMEOUT_MINUTES=5
+  - AGENT_TIMEOUT_MINUTES=10

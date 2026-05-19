@@ -1,0 +1,32 @@
+resources:
+- ../k8s/base
+
+namePrefix: open-rl-
+
+labels:
+- includeSelectors: false
+  pairs:
+    app.kubernetes.io/part-of: open-rl-autoresearch
+    autoresearch.open-rl.dev/task: math-rl
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+- name: autoresearch-program
+  behavior: replace
+  files:
+  - program.md
+- name: autoresearch-settings
+  behavior: merge
+  literals:
+  - RECIPE=rl/autoresearch/math_rl/autoresearch.toml
+  - LOG_ROOT=/mnt/shared/open-rl/autoresearch/math_rl
+  - UI_LOG_ROOT=/mnt/shared/open-rl/autoresearch/math_rl
+  - ATTEMPT_TIMEOUT_MINUTES=5
+  - AGENT_TIMEOUT_MINUTES=10
+  - READY_URLS=http://open-rl-gateway-service:8000/api/v1/healthz
+  - TINKER_BASE_URL=http://open-rl-gateway-service:8000
+  - TINKER_API_KEY=tml-dummy-key
+  - SANDBOX_URL=http://sandbox-fusion-service:8080/run_code
+  - SANDBOX_MAX_CONCURRENCY=8

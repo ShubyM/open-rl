@@ -1,3 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-rl-trainer-worker-service
+  labels:
+    app: open-rl-trainer-worker
+spec:
+  selector:
+    app: open-rl-trainer-worker
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
