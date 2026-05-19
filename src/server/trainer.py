@@ -284,10 +284,15 @@ class TrainerEngine:
         loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
 
     mean_loss = total_loss / max(1, len(data))
+    completed_loss_fn_outputs = []
+    for output in loss_fn_outputs:
+      if output is None:
+        raise RuntimeError("forward_backward did not produce one loss_fn_output per input datum")
+      completed_loss_fn_outputs.append(output)
 
     return {
       "metrics": {"loss:mean": self._sanitize_float(mean_loss), "loss:sum": self._sanitize_float(total_loss)},
-      "loss_fn_outputs": [output for output in loss_fn_outputs if output is not None],
+      "loss_fn_outputs": completed_loss_fn_outputs,
       "loss_fn_output_type": "ArrayRecord",
     }
 

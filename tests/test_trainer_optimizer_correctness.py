@@ -75,6 +75,7 @@ class _LogitModelStub:
     vocab = torch.arange(self.vocab_size, dtype=torch.float32, device=input_tensor.device).view(1, 1, -1)
     positions = torch.arange(input_tensor.shape[1], dtype=torch.float32, device=input_tensor.device).view(1, -1, 1)
     logits = torch.cos(input_tensor.float().unsqueeze(-1) * 0.11 + positions * 0.07 + vocab * 0.13)
+    logits.requires_grad_()
     return types.SimpleNamespace(logits=logits)
 
 
@@ -206,6 +207,20 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     for batch in batches:
       padded_tokens = max(len(datum.model_input) for _idx, datum in batch) * len(batch)
       self.assertTrue(len(batch) == 1 or padded_tokens <= 6)
+
+  def test_forward_backward_padded_batches_preserve_client_output_shape(self) -> None:
+    engine = self._engine()
+    data = self._data()
+
+    with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "12"}):
+      result = engine.forward_backward(data, "cross_entropy")
+
+    self.assertEqual(len(result["loss_fn_outputs"]), len(data))
+    self.assertGreater(len(engine.peft_model.calls), 0)
+    self.assertTrue(any(call[0].shape[0] > 1 for call in engine.peft_model.calls))
+    for datum, output in zip(data, result["loss_fn_outputs"], strict=True):
+      logprobs = output["logprobs"]
+      self.assertEqual(logprobs["shape"], [min(len(datum.model_input), len(datum.loss_fn_inputs["target_tokens"].data))])
 
 
 if __name__ == "__main__":
