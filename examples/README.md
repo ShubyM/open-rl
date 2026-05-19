@@ -22,6 +22,7 @@ This directory contains examples, demos, and helper scripts for using the Open-R
 
 ### Reinforcement Learning (RL)
 * **[Text-to-SQL RL](rl/text-to-sql):** Runs the Gemma 4 SFT+RL recipe with SQL execution rewards and curve plotting.
+* **[Autoresearch Demo](rl/autoresearch):** Runs code-RL researchers against the same Open-RL gateway using cookbook DeepCoder rewards, Sandbox Fusion, and optional Agent Sandbox CRDs.
 
 ### Tinker Cookbook
 * **[Tinker Cookbook Recipes](tinker-cookbook):** Examples showing how to run [Tinker Cookbook](https://github.com/thinking-machines-lab/tinker-cookbook) recipes with Open-RL.
