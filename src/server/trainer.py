@@ -252,141 +252,175 @@ class TrainerEngine:
       self.peft_model.set_adapter(model_id)
 
     total_loss = 0.0
-    loss_fn_outputs = []
+    loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
 
-    # Ensure model is in train mode
     self.peft_model.train()
 
-    for datum in data:
-      # 1. Common Setup: Extract tokens and get logprobs
-      target_logprobs, targets_tensor, weights_tensor = self._get_logprobs(datum)
+    for batch in self._make_training_batches(data):
+      batch_indices = [idx for idx, _ in batch]
+      batch_data = [datum for _, datum in batch]
 
-      # 2. Specialized Loss Calculation
+      target_logprobs, weights, aux_inputs, lengths = self._get_logprobs_batch(batch_data)
       match loss_fn:
         case "cross_entropy":
-          loss = self._compute_cross_entropy_loss(target_logprobs, weights_tensor)
+          elementwise_loss = self._cross_entropy_loss(target_logprobs, weights)
         case "importance_sampling":
-          loss = self._compute_importance_sampling_loss(target_logprobs, weights_tensor, datum)
+          elementwise_loss = self._importance_sampling_loss(target_logprobs, weights, aux_inputs)
         case "ppo":
-          loss = self._compute_ppo_loss(target_logprobs, weights_tensor, datum, loss_config)
+          elementwise_loss = self._ppo_loss(target_logprobs, weights, aux_inputs, loss_config)
         case _:
           raise NotImplementedError(f"Loss {loss_fn} not supported")
 
-      # 3. Common Cleanup: Backward pass
+      per_datum_loss = elementwise_loss.sum(dim=1)
+      loss = per_datum_loss.sum()
       loss.backward()
       total_loss += loss.item()
 
-      # Save logprobs for return
-      logprobs_list = target_logprobs.detach().cpu().tolist()
-      logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
-
-      loss_fn_outputs.append({"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}})
+      detached_logprobs = target_logprobs.detach().cpu()
+      for row, original_idx in enumerate(batch_indices):
+        row_len = lengths[row]
+        logprobs_list = detached_logprobs[row, :row_len].tolist()
+        logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
+        loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
 
     mean_loss = total_loss / max(1, len(data))
+    completed_loss_fn_outputs = []
+    for output in loss_fn_outputs:
+      if output is None:
+        raise RuntimeError("forward_backward did not produce one loss_fn_output per input datum")
+      completed_loss_fn_outputs.append(output)
 
     return {
       "metrics": {"loss:mean": self._sanitize_float(mean_loss), "loss:sum": self._sanitize_float(total_loss)},
-      "loss_fn_outputs": loss_fn_outputs,
+      "loss_fn_outputs": completed_loss_fn_outputs,
       "loss_fn_output_type": "ArrayRecord",
     }
 
-  def _get_logprobs(self, datum: Datum) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns (target_logprobs, targets_tensor, weights_tensor)."""
-    # model_input is now just a flat list of tokens!
-    inputs_tensor = torch.tensor([datum.model_input], dtype=torch.long, device=self.device)
+  def _make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:
+    """Group examples for the single padded forward/backward path."""
+    if len(data) <= 1:
+      return [[(idx, datum)] for idx, datum in enumerate(data)]
 
-    # Extract targets
-    targets_data = datum.loss_fn_inputs["target_tokens"].data
-    targets_tensor = torch.tensor(targets_data, dtype=torch.long, device=self.device)
+    token_budget = int(os.getenv("OPEN_RL_TRAIN_TOKEN_BUDGET", "0"))
 
-    # Extract weights with default fallback to 1.0
-    if "weights" in datum.loss_fn_inputs:
-      weights_data = datum.loss_fn_inputs["weights"].data
-    else:
-      weights_data = [1.0] * len(targets_data)
+    if token_budget <= 0:
+      return [[(idx, datum)] for idx, datum in enumerate(data)]
 
-    weights_tensor = torch.tensor(weights_data, dtype=torch.float32, device=self.device)
+    ordered_data = sorted(enumerate(data), key=lambda item: len(item[1].model_input))
+    batches: list[list[tuple[int, Datum]]] = []
+    batch: list[tuple[int, Datum]] = []
+    batch_max_len = 0
 
-    outputs = self.peft_model(inputs_tensor, use_cache=False)
-    logits = outputs.logits[0]  # Shape: (SeqLen, VocabSize)
+    for item in ordered_data:
+      length = len(item[1].model_input)
+      next_max_len = max(batch_max_len, length)
+      next_size = len(batch) + 1
+      over_token_budget = next_max_len * next_size > token_budget
 
-    seq_len = min(logits.size(0), targets_tensor.size(0))
-    sliced_logits = logits[:seq_len]
-    sliced_targets = targets_tensor[:seq_len]
+      if batch and over_token_budget:
+        batches.append(batch)
+        batch = []
+        batch_max_len = 0
 
-    target_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1).gather(dim=-1, index=sliced_targets.unsqueeze(-1)).squeeze(-1)
+      batch.append(item)
+      batch_max_len = max(batch_max_len, length)
 
-    if weights_tensor.numel() > 0:
-      weights_tensor = weights_tensor[:seq_len]
+    if batch:
+      batches.append(batch)
 
-    return target_logprobs, targets_tensor, weights_tensor
+    return batches
 
-  def _compute_cross_entropy_loss(self, target_logprobs: torch.Tensor, weights_tensor: torch.Tensor) -> torch.Tensor:
-    """Simple cross entropy loss."""
-    elementwise_loss = -target_logprobs * weights_tensor
-    return elementwise_loss.sum()
+  def _get_logprobs_batch(self, data: list[Datum]) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], list[int]]:
+    assert self.peft_model is not None
 
-  def _compute_importance_sampling_loss(self, target_logprobs: torch.Tensor, weights_tensor: torch.Tensor, datum: Datum) -> torch.Tensor:
-    """Importance sampling loss for RL."""
-    if "logprobs" not in datum.loss_fn_inputs or "advantages" not in datum.loss_fn_inputs:
-      raise ValueError("importance_sampling requires 'logprobs' and 'advantages' in loss_fn_inputs")
+    pad_token_id = self.tokenizer.pad_token_id if self.tokenizer and self.tokenizer.pad_token_id is not None else 0
+    batch_size = len(data)
+    input_lengths = [len(datum.model_input) for datum in data]
+    max_input_len = max(input_lengths)
 
-    ref_logprobs = datum.loss_fn_inputs["logprobs"].data
-    advantages = datum.loss_fn_inputs["advantages"].data
-    ref_tensor = torch.tensor(ref_logprobs, dtype=target_logprobs.dtype, device=self.device)
-    advantages_tensor = torch.tensor(advantages, dtype=target_logprobs.dtype, device=self.device)
+    input_tensor = torch.full((batch_size, max_input_len), pad_token_id, dtype=torch.long, device=self.device)
+    attention_mask = torch.zeros((batch_size, max_input_len), dtype=torch.long, device=self.device)
+    for row, datum in enumerate(data):
+      input_len = input_lengths[row]
+      input_tensor[row, :input_len] = torch.tensor(datum.model_input, dtype=torch.long, device=self.device)
+      attention_mask[row, :input_len] = 1
 
-    seq_len = min(target_logprobs.size(0), ref_tensor.size(0), advantages_tensor.size(0), weights_tensor.size(0))
-    target_logprobs = target_logprobs[:seq_len]
-    ref_tensor = ref_tensor[:seq_len]
-    advantages_tensor = advantages_tensor[:seq_len]
-    weights_tensor = weights_tensor[:seq_len]
+    target_lengths = [len(datum.loss_fn_inputs["target_tokens"].data) for datum in data]
+    lengths = [min(input_lengths[row], target_lengths[row]) for row in range(batch_size)]
+    max_target_len = max(lengths)
+    loss_dtype = torch.float32
 
-    diff = target_logprobs - ref_tensor
-    diff = torch.clamp(diff, min=-20.0, max=20.0)
+    targets = torch.zeros((batch_size, max_target_len), dtype=torch.long, device=self.device)
+    weights = torch.zeros((batch_size, max_target_len), dtype=loss_dtype, device=self.device)
+    aux_inputs: dict[str, torch.Tensor] = {}
+
+    aux_keys = set().union(*(datum.loss_fn_inputs.keys() for datum in data)) - {"target_tokens", "weights"}
+    for key in aux_keys:
+      aux_inputs[key] = torch.zeros((batch_size, max_target_len), dtype=loss_dtype, device=self.device)
+
+    for row, datum in enumerate(data):
+      seq_len = lengths[row]
+      targets_data = datum.loss_fn_inputs["target_tokens"].data[:seq_len]
+      targets[row, :seq_len] = torch.tensor(targets_data, dtype=torch.long, device=self.device)
+
+      weights_data = datum.loss_fn_inputs["weights"].data if "weights" in datum.loss_fn_inputs else [1.0] * target_lengths[row]
+      weights[row, :seq_len] = torch.tensor(weights_data[:seq_len], dtype=loss_dtype, device=self.device)
+
+      for key, aux_tensor in aux_inputs.items():
+        if key not in datum.loss_fn_inputs:
+          continue
+        values = datum.loss_fn_inputs[key].data[:seq_len]
+        aux_tensor[row, :seq_len] = torch.tensor(values, dtype=loss_dtype, device=self.device)
+
+    outputs = self.peft_model(input_tensor, attention_mask=attention_mask, use_cache=False, return_dict=True)
+    logits = outputs.logits[:, :max_target_len, :]
+    target_logprobs = torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+
+    return target_logprobs, weights, aux_inputs, lengths
+
+  def _cross_entropy_loss(self, target_logprobs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    return -target_logprobs * weights
+
+  def _importance_sampling_loss(
+    self,
+    target_logprobs: torch.Tensor,
+    weights: torch.Tensor,
+    aux_inputs: dict[str, torch.Tensor],
+  ) -> torch.Tensor:
+    ref, advantages = self._reference_logprobs_and_advantages(aux_inputs, "importance_sampling")
+    ratio = self._policy_ratio(target_logprobs, ref)
+    elementwise_loss = -(ratio * advantages) * weights
+    return torch.nan_to_num(elementwise_loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+  def _ppo_loss(
+    self,
+    target_logprobs: torch.Tensor,
+    weights: torch.Tensor,
+    aux_inputs: dict[str, torch.Tensor],
+    loss_config: dict | None,
+  ) -> torch.Tensor:
+    ref, advantages = self._reference_logprobs_and_advantages(aux_inputs, "ppo")
+    diff = torch.clamp(target_logprobs - ref, min=-20.0, max=20.0)
     ratio = torch.exp(diff)
-
-    elementwise_loss = -(ratio * advantages_tensor) * weights_tensor
-    elementwise_loss = torch.nan_to_num(elementwise_loss, nan=0.0, posinf=0.0, neginf=0.0)
-    return elementwise_loss.sum()
-
-  def _compute_ppo_loss(self, target_logprobs: torch.Tensor, weights_tensor: torch.Tensor, datum: Datum, loss_config: dict | None) -> torch.Tensor:
-    """PPO loss for RL."""
-    if "logprobs" not in datum.loss_fn_inputs or "advantages" not in datum.loss_fn_inputs:
-      raise ValueError("ppo requires 'logprobs' and 'advantages' in loss_fn_inputs")
-
-    ref_logprobs = datum.loss_fn_inputs["logprobs"].data
-    advantages = datum.loss_fn_inputs["advantages"].data
-
-    ref_tensor = torch.tensor(ref_logprobs, dtype=target_logprobs.dtype, device=self.device)
-    advantages_tensor = torch.tensor(advantages, dtype=target_logprobs.dtype, device=self.device)
-
-    seq_len = min(target_logprobs.size(0), ref_tensor.size(0), advantages_tensor.size(0), weights_tensor.size(0))
-    target_logprobs = target_logprobs[:seq_len]
-    ref_tensor = ref_tensor[:seq_len]
-    advantages_tensor = advantages_tensor[:seq_len]
-    weights_tensor = weights_tensor[:seq_len]
-
-    diff = target_logprobs - ref_tensor
-    diff = torch.clamp(diff, min=-20.0, max=20.0)
-    ratio = torch.exp(diff)
-
     epsilon = loss_config.get("clip_range", 0.2) if loss_config else 0.2
-
-    surr1 = ratio * advantages_tensor
-    surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * advantages_tensor
-
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * advantages
     elementwise_objective = torch.min(surr1, surr2)
-
-    # Optional KL penalty against the reference policy.
-    # Uses the unbiased estimator (ratio - 1) - log(ratio), which is
-    # non-negative and zero when the policy matches the reference.
     kl_coeff = loss_config.get("kl_coeff", 0.0) if loss_config else 0.0
     if kl_coeff > 0:
       kl = (ratio - 1) - diff
       elementwise_objective = elementwise_objective - kl_coeff * kl
+    return -(elementwise_objective * weights)
 
-    return -(elementwise_objective * weights_tensor).sum()
+  def _reference_logprobs_and_advantages(self, aux_inputs: dict[str, torch.Tensor], loss_fn: str) -> tuple[torch.Tensor, torch.Tensor]:
+    ref = aux_inputs.get("logprobs")
+    advantages = aux_inputs.get("advantages")
+    if ref is None or advantages is None:
+      raise ValueError(f"{loss_fn} requires 'logprobs' and 'advantages' in loss_fn_inputs")
+    return ref, advantages
+
+  def _policy_ratio(self, target_logprobs: torch.Tensor, ref_logprobs: torch.Tensor) -> torch.Tensor:
+    return torch.exp(torch.clamp(target_logprobs - ref_logprobs, min=-20.0, max=20.0))
 
   def _sanitize_float(self, val: float) -> float:
     if math.isinf(val):
