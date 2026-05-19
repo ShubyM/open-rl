@@ -30,7 +30,6 @@ class AttemptConfig:
   name: str = "attempt"
   log_root: Path = Path("artifacts/autoresearch/runs")
   attempt_timeout_minutes: float = float(os.getenv("ATTEMPT_TIMEOUT_MINUTES", "5"))
-  ui_dir: Path | None = None
   clean: bool = False
 
 
@@ -92,16 +91,15 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def load_recipe(path: Path) -> Recipe:
   raw = tomllib.loads(path.read_text(encoding="utf-8"))
-  editable = raw["editable"]
-  mode = str(raw.get("metric_mode", "max"))
+  mode = str(raw["metric_mode"])
   if mode not in {"max", "min"}:
     raise ValueError("metric_mode must be max or min")
   return Recipe(
     task=str(raw["task"]),
     command=str(raw["command"]),
-    editable=[Path(value) for value in (editable if isinstance(editable, list) else [editable])],
+    editable=[Path(value) for value in raw["editable"]],
     metric=str(raw["metric"]),
-    metric_label=str(raw.get("metric_label") or raw["metric"]),
+    metric_label=str(raw["metric_label"]),
     metric_mode=mode,
   )
 
@@ -112,10 +110,7 @@ def repo_root() -> Path:
 
 def relative_to_repo(path: Path, root: Path) -> str:
   absolute = path if path.is_absolute() else (Path.cwd() / path).resolve()
-  try:
-    return str(absolute.relative_to(root))
-  except ValueError:
-    return str(path)
+  return str(absolute.relative_to(root))
 
 
 def git_paths_diff(root: Path, repo_paths: list[str], context: int) -> str:
@@ -209,6 +204,8 @@ def replayed_attempts(log_root: Path, researcher: str) -> list[dict[str, Any]]:
   rows = {}
   for event_file in sorted(log_root.glob(f"*/{UI_EVENTS_FILE}")):
     for event in read_jsonl(event_file):
+      if event.get("kind") != "attempt":
+        continue
       if event["researcher"] != researcher:
         continue
       row = rows.setdefault(str(event["work_id"]), {"run_dir": event_file.parent, "git": {}, "experiment": {}, "status": "running"})
@@ -311,7 +308,7 @@ class AttemptRun:
     self.events({"tab": "diff", "path": "code.diff"}, {"tab": "diff_full", "path": "code_full.diff"})
 
   def agent_offset_path(self) -> Path:
-    return Path(os.getenv("WORK_DIR") or self.args.log_root.parent / self.researcher) / "agent.offset"
+    return Path(os.getenv("WORK_DIR") or self.args.log_root / f"{self.researcher}-activity") / "agent.offset"
 
   def seed_agent_log(self) -> bool:
     source = Path(agent_log) if (agent_log := os.getenv("RESEARCHER_LOG_PATH")) else None
@@ -364,13 +361,8 @@ class AttemptRun:
     return self.run_dir
 
 
-def clean_artifacts(log_root: Path, ui_dir: Path | None = None) -> None:
+def clean_artifacts(log_root: Path) -> None:
   shutil.rmtree(log_root, ignore_errors=True)
-  for path in log_root.parent.glob("*"):
-    if path.is_dir() and (path / UI_EVENTS_FILE).exists():
-      shutil.rmtree(path)
-  if ui_dir:
-    shutil.rmtree(ui_dir, ignore_errors=True)
 
 
 def run_attempt(args: AttemptConfig) -> Path:
@@ -386,7 +378,7 @@ def run_attempt(args: AttemptConfig) -> Path:
 def main() -> None:
   args = chz.entrypoint(AttemptConfig, allow_hyphens=True)
   if args.clean:
-    clean_artifacts(args.log_root, args.ui_dir)
+    clean_artifacts(args.log_root)
     print(f"cleaned {args.log_root}")
     return
   run_attempt(args)

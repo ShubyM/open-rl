@@ -7,6 +7,7 @@ import http.server
 import json
 import math
 import os
+import re
 import socketserver
 import threading
 import time
@@ -20,13 +21,12 @@ UI_EVENTS_FILE = "ui_events.jsonl"
 AGENT_TAIL_LIMIT = 12000
 RUN_PATHS = {"agent", "logs", "diff", "diff_full"}
 STALE_GRACE_SECONDS = 60
-DONE_STATUSES = {"completed", "complete", "keep", "kept", "discard", "discarded", "crash", "crashed", "failed", "stale", "stopped", "timed_out"}
 
 
 @chz.chz
 class UiConfig:
   log_root: Path = Path("artifacts/autoresearch/text_sql")
-  out_dir: Path = Path("artifacts/autoresearch/ui")
+  out_dir: Path | None = None
   interval_seconds: float = 15
   host: str = "0.0.0.0"
   port: int = 8080
@@ -75,9 +75,12 @@ def title_label(value: str) -> str:
   return " ".join(part.capitalize() for part in str(value or "score").replace("/", " ").replace("_", " ").split())
 
 
+def researcher_id(value: str) -> str:
+  return re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")[:40] or "researcher"
+
+
 def event_paths(log_root: Path) -> list[Path]:
-  roots = [*log_root.parent.glob("*/" + UI_EVENTS_FILE), *log_root.glob("*/" + UI_EVENTS_FILE)]
-  return sorted({path for path in roots if path.is_file()})
+  return sorted(path for path in log_root.glob("*/" + UI_EVENTS_FILE) if path.is_file())
 
 
 def event_file_path(value: str | Path, event_file: Path) -> Path:
@@ -89,7 +92,7 @@ def row_for(event: dict) -> dict:
   time_value = float(event["time"])
   work_id = str(event["work_id"])
   return {
-    "researcher": str(event["researcher"]),
+    "researcher": researcher_id(str(event["researcher"])),
     "run": work_id,
     "kind": str(event["kind"]),
     "status": str(event["status"]),
@@ -115,7 +118,7 @@ def apply_event(row: dict, event: dict, event_file: Path) -> None:
   row["updated_at"] = max(number(row.get("updated_at")), float(event["time"]))
   for key in ("researcher", "kind", "status", "description", "attempt_timeout_minutes", "order"):
     if key in event and event[key] is not None:
-      row[key] = event[key]
+      row[key] = researcher_id(event[key]) if key == "researcher" else event[key]
   for key in ("git", "experiment", "recipe"):
     row[key].update(event.get(key) or {})
   if "tab" in event:
@@ -151,8 +154,7 @@ def mark_stale(row: dict) -> None:
 
 
 def running(row: dict) -> bool:
-  status = str(row.get("status") or "").lower()
-  return status == "running" or (not row.get("metrics") and status not in DONE_STATUSES)
+  return str(row["status"]).lower() == "running"
 
 
 def visible_score(row: dict):
@@ -461,12 +463,13 @@ def serve(log_root: Path, out_dir: Path, host: str, port: int, interval: float) 
 
 def main(argv: list[str] | None = None) -> None:
   args = chz.entrypoint(UiConfig, argv=argv, allow_hyphens=True)
+  out_dir = args.out_dir or args.log_root / "ui"
   if args.serve:
-    serve(args.log_root, args.out_dir, args.host, args.port, args.interval_seconds)
+    serve(args.log_root, out_dir, args.host, args.port, args.interval_seconds)
   else:
-    researchers = write_json(args.log_root, args.out_dir)
+    researchers = write_json(args.log_root, out_dir)
     print(f"Found {len(researchers)} researchers under {args.log_root}")
-    print(f"Wrote {args.out_dir / 'ui.json'}")
+    print(f"Wrote {out_dir / 'ui.json'}")
 
 
 if __name__ == "__main__":

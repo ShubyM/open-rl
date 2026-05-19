@@ -4,10 +4,7 @@ metadata:
   name: autoresearch-settings
 data:
   RECIPE: replace-me/autoresearch.toml
-  ARTIFACT_ROOT: /mnt/shared/open-rl/autoresearch
   LOG_ROOT: /mnt/shared/open-rl/autoresearch/runs
-  UI_LOG_ROOT: /mnt/shared/open-rl/autoresearch/runs
-  UI_OUT_DIR: /mnt/shared/open-rl/autoresearch/ui
   PROGRAM_FILE: /etc/autoresearch/program.md
   AGENT_MODEL: gemini-3.1-pro-preview
   AGENT_FLAGS: "--include-directories /mnt/shared --yolo --output-format stream-json"
@@ -119,8 +116,7 @@ spec:
         args:
         - >
           uv run --no-sync --package open-rl-client python -m rl.autoresearch.ui.observer
-          log_root="${UI_LOG_ROOT}"
-          out_dir="${UI_OUT_DIR}"
+          log_root="${LOG_ROOT}"
           host=0.0.0.0
           port=8080
           interval_seconds=2

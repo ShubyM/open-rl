@@ -3,9 +3,8 @@ set -euo pipefail
 
 RESEARCHER_ID="${RESEARCHER_ID:-researcher-$(date +%Y%m%d-%H%M%S)-$$}"
 REPO_DIR="${REPO_DIR:-$(pwd)}"
-ARTIFACT_ROOT="${ARTIFACT_ROOT:-artifacts/autoresearch}"
-LOG_ROOT="${LOG_ROOT:-${ARTIFACT_ROOT}/runs}"
-WORK_DIR="${WORK_DIR:-${ARTIFACT_ROOT}/${RESEARCHER_ID}}"
+LOG_ROOT="${LOG_ROOT:-artifacts/autoresearch/runs}"
+WORK_DIR="${LOG_ROOT}/${RESEARCHER_ID}-activity"
 RESEARCHER_LOG_PATH="${WORK_DIR}/agent.log"
 LAUNCHER_LOG_PATH="${WORK_DIR}/launcher.log"
 RECIPE="${RECIPE:?Set RECIPE=path/to/autoresearch.toml}"
@@ -20,7 +19,7 @@ READY_TIMEOUT_SECONDS="${READY_TIMEOUT_SECONDS:-1200}"
 RUN_ATTEMPT_COMMAND="uv run --no-sync --package open-rl-client python -m rl.autoresearch.run_attempt recipe=\"${RECIPE}\" researcher=\"${RESEARCHER_ID}\" attempt_timeout_minutes=\"${ATTEMPT_TIMEOUT_MINUTES}\" name=short-slug log_root=\"${LOG_ROOT}\""
 SESSION_STATUS="running"
 
-export RESEARCHER_ID ATTEMPT_TIMEOUT_MINUTES AGENT_TIMEOUT_MINUTES ARTIFACT_ROOT LOG_ROOT WORK_DIR REPO_DIR
+export RESEARCHER_ID ATTEMPT_TIMEOUT_MINUTES AGENT_TIMEOUT_MINUTES LOG_ROOT WORK_DIR REPO_DIR
 export RESEARCHER_LOG_PATH RECIPE PROGRAM_FILE RUN_ATTEMPT_COMMAND READY_URLS READY_TIMEOUT_SECONDS
 export GEMINI_CLI_TRUST_WORKSPACE=true PYTHONDONTWRITEBYTECODE=1
 
@@ -51,18 +50,19 @@ trap 'SESSION_STATUS=stopped; log "Autoresearch session received shutdown signal
 
 exclude_artifacts_from_git() {
   local artifact_path exclude_file git_path repo_path
-  artifact_path="$(readlink -f "${ARTIFACT_ROOT}")"
   repo_path="$(readlink -f "$(git rev-parse --show-toplevel)")"
   exclude_file="$(git rev-parse --git-path info/exclude)"
   mkdir -p "$(dirname "${exclude_file}")"
   for git_path in "__pycache__/" "*.pyc"; do
     grep -Fxq "${git_path}" "${exclude_file}" 2>/dev/null || printf "%s\n" "${git_path}" >>"${exclude_file}"
   done
+  artifact_path="$(readlink -f "${LOG_ROOT}")"
   case "${artifact_path}" in
-    "${repo_path}"/*) git_path="/${artifact_path#"${repo_path}/"}/" ;;
-    *) return 0 ;;
+    "${repo_path}"/*)
+      git_path="/${artifact_path#"${repo_path}/"}/"
+      grep -Fxq "${git_path}" "${exclude_file}" 2>/dev/null || printf "%s\n" "${git_path}" >>"${exclude_file}"
+      ;;
   esac
-  grep -Fxq "${git_path}" "${exclude_file}" 2>/dev/null || printf "%s\n" "${git_path}" >>"${exclude_file}"
 }
 
 prepare_git() {

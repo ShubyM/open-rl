@@ -6,6 +6,8 @@ const S = {
   selected: JSON.parse(sessionStorage.getItem("autoresearch-selected") || "{}"),
   logs: {},
   logText: {},
+  logLoaded: {},
+  logFetches: {},
   stream: null,
   raw: "",
   events: null,
@@ -211,8 +213,21 @@ function logPanel(tab) {
 
 async function hydrateLog(tab, status, node) {
   if (!tab.path) return stopStream();
-  if (!S.logText[tab.path]) {
-    const full = esc(await (await fetch(`file?path=${encodeURIComponent(tab.path)}`)).text());
+  if (!S.logLoaded[tab.path]) {
+    if (status) status.textContent = `${tab.label.toLowerCase()}: loading full log`;
+    S.logFetches[tab.path] ||= fetch(`file?path=${encodeURIComponent(tab.path)}`)
+      .then(response => {
+        if (!response.ok) throw new Error(`log fetch failed: ${response.status}`);
+        return response.text();
+      })
+      .then(text => {
+        const full = esc(text);
+        S.logText[tab.path] = full;
+        S.logLoaded[tab.path] = true;
+        return full;
+      })
+      .finally(() => { delete S.logFetches[tab.path]; });
+    const full = await S.logFetches[tab.path];
     if (!node.isConnected) return;
     S.logText[tab.path] = full;
     replaceLog(node, tab.path, full);

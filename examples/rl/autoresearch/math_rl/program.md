@@ -16,9 +16,9 @@ by `TINKER_BASE_URL`; the model/trainer service handles GPU placement.
 Before starting:
 
 1. Read `rl/autoresearch/math_rl/autoresearch.toml`, `rl/autoresearch/math_rl/train.py`, `rl/autoresearch/math_rl/config.toml`, and this program.
-2. Use `${ARTIFACT_ROOT:-/mnt/shared/open-rl/autoresearch}` as the artifact root.
+2. Use `${LOG_ROOT:-artifacts/autoresearch/runs}` as the artifact root.
 3. Use `${RESEARCHER_ID}` as your researcher id.
-4. Keep concise notes in `${ARTIFACT_ROOT}/${RESEARCHER_ID}/notes.md`.
+4. Keep concise notes in `${WORK_DIR}/notes.md`.
 5. Use a local git branch named `autoresearch/${RESEARCHER_ID}`.
 6. Run all commands from the repository root.
 7. Stop when `AGENT_TIMEOUT_MINUTES` expires.

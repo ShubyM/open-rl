@@ -9,9 +9,9 @@ to improve held-out text-to-SQL execution accuracy by editing
 Before starting:
 
 1. Read `rl/autoresearch/text_sql/autoresearch.toml`, `rl/autoresearch/text_sql/prepare.py`, and `rl/autoresearch/text_sql/train.py`.
-2. Use `${ARTIFACT_ROOT:-/mnt/shared/open-rl/autoresearch}` as the artifact root.
+2. Use `${LOG_ROOT:-artifacts/autoresearch/runs}` as the artifact root.
 3. Use `${RESEARCHER_ID}` as your researcher id.
-4. Keep concise notes in `${ARTIFACT_ROOT}/${RESEARCHER_ID}/notes.md`.
+4. Keep concise notes in `${WORK_DIR}/notes.md`.
 5. Use a local git branch named `autoresearch/${RESEARCHER_ID}`.
 6. Run all commands from the repository root.
 7. Stop when the `AGENT_TIMEOUT_MINUTES` agent timeout expires.
@@ -26,11 +26,12 @@ accuracy
 
 `prepare.py` owns the fixed dataset split and scoring helpers. `train.py` is the
 editable runnable attempt: it samples 5,000 train examples and 50 held-out
-scoring examples, runs the training loop, then scores by checking whether your
-normalized SQL exactly matches the normalized target SQL. During training your
-code gets the question, schema, and its own prediction. It does not get the
-correct SQL or an execution-derived reward. Use `accuracy` for keep/discard
-decisions.
+SQLite-executable scoring examples, runs the training loop, then scores by
+executing your SQL and the target SQL against the same SQLite database. `SELECT`
+queries compare result rows; mutation queries compare the resulting database
+state. During training your code gets the question, schema, and its own
+prediction. It does not get the correct SQL or the held-out execution result.
+Use `accuracy` for keep/discard decisions.
 
 ## Run Command
 

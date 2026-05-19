@@ -17,10 +17,12 @@ Use the parent [autoresearch README](../README.md) for the common cluster run
 flow. This page only covers text-SQL-specific run behavior and settings.
 
 `train.py` samples a fixed Text-SQL dataset slice through `prepare.py`: 5,000
-train examples and 50 held-out scoring examples. It runs the training loop,
-scores `accuracy`, and logs metrics with the cookbook `ml_logger`. During
-training the editable code sees only the question, schema, and its own
-prediction; it does not see the correct SQL or an execution-derived reward.
+train examples and 50 held-out SQLite-executable scoring examples. It runs the
+training loop, scores execution `accuracy`, and logs metrics with the cookbook
+`ml_logger`. During training the editable code sees only the question, schema,
+and its own prediction; it does not see the correct SQL or the held-out
+execution result. `SELECT` queries compare result rows; mutation queries compare
+the resulting database state.
 
 ## Local Run
 
@@ -39,7 +41,6 @@ Serve the UI for local artifacts:
 ```bash
 uv run python -m rl.autoresearch.ui.observer \
   log_root=artifacts/autoresearch/text_sql \
-  out_dir=artifacts/autoresearch/ui \
   port=8080 \
   serve=True
 ```
@@ -55,8 +56,7 @@ Clear local text-SQL artifacts:
 ```bash
 uv run python -m rl.autoresearch.run_attempt \
   clean=True \
-  log_root=artifacts/autoresearch/text_sql \
-  ui_dir=artifacts/autoresearch/ui
+  log_root=artifacts/autoresearch/text_sql
 ```
 
 ## Kubernetes Run
@@ -77,7 +77,6 @@ The text-SQL overlay sets:
 
 - `RECIPE=rl/autoresearch/text_sql/autoresearch.toml`
 - `LOG_ROOT=/mnt/shared/open-rl/autoresearch/text_sql`
-- `UI_LOG_ROOT=/mnt/shared/open-rl/autoresearch/text_sql`
 - `ATTEMPT_TIMEOUT_MINUTES=5`
 - `AGENT_TIMEOUT_MINUTES=10`
 

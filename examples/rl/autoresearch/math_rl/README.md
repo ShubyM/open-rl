@@ -52,7 +52,6 @@ Serve the UI for local artifacts:
 ```bash
 uv run python -m rl.autoresearch.ui.observer \
   log_root=artifacts/autoresearch/math_rl \
-  out_dir=artifacts/autoresearch/ui \
   port=8080 \
   serve=True
 ```
@@ -62,8 +61,7 @@ Clear local artifacts:
 ```bash
 uv run python -m rl.autoresearch.run_attempt \
   clean=True \
-  log_root=artifacts/autoresearch/math_rl \
-  ui_dir=artifacts/autoresearch/ui
+  log_root=artifacts/autoresearch/math_rl
 ```
 
 ## Kubernetes Run
@@ -103,7 +101,6 @@ The math-RL overlay sets:
 
 - `RECIPE=rl/autoresearch/math_rl/autoresearch.toml`
 - `LOG_ROOT=/mnt/shared/open-rl/autoresearch/math_rl`
-- `UI_LOG_ROOT=/mnt/shared/open-rl/autoresearch/math_rl`
 - `ATTEMPT_TIMEOUT_MINUTES=5`
 - `AGENT_TIMEOUT_MINUTES=10`
 - `READY_URLS=http://open-rl-gateway-service:8000/api/v1/healthz`

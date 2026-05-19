@@ -22,7 +22,6 @@ configMapGenerator:
   literals:
   - RECIPE=rl/autoresearch/math_rl/autoresearch.toml
   - LOG_ROOT=/mnt/shared/open-rl/autoresearch/math_rl
-  - UI_LOG_ROOT=/mnt/shared/open-rl/autoresearch/math_rl
   - ATTEMPT_TIMEOUT_MINUTES=5
   - AGENT_TIMEOUT_MINUTES=10
   - READY_URLS=http://open-rl-gateway-service:8000/api/v1/healthz

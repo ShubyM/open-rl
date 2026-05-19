@@ -3,9 +3,9 @@
 This adapts [Karpathy's autoresearch](https://github.com/karpathy/autoresearch)
 to Open-RL: an agent repeatedly edits one allowed target, runs a bounded
 measured attempt, keeps commits that improve the configured metric, and resets
-the rest. The same recipe contract works locally or in Kubernetes; the cluster
-path adds isolated researcher jobs, shared storage, readiness guards, and the
-browser UI.
+the rest. The same recipe contract works locally or in Kubernetes; in a cluster,
+each run can live in its own pod and act as a researcher while sharing the same
+storage and Open-RL backend.
 
 ## Minimal Recipe Shape
 
@@ -112,8 +112,9 @@ ui/observer.py               # read-only UI server over recorded events
 k8s/base/                    # reusable Job/Sandbox/UI resources
 ```
 
-`run_attempt.py` runs recipe code and writes artifacts. `ui/observer.py` only
-replays `ui_events.jsonl` and serves the browser UI.
+`run_attempt.py` runs recipe code and writes artifacts. The UI reads only
+`LOG_ROOT/*/ui_events.jsonl`; clearing `LOG_ROOT` resets attempts, live rows,
+and per-attempt agent-log cursors.
 
 The launcher passes `program.md` to Gemini as the prompt. That program tells the
 agent to edit only the declared target, commit the attempt, run
@@ -128,7 +129,7 @@ Copy one existing recipe directory and update:
 - `autoresearch.toml`
 - the command target, if you keep one
 - the editable target
-- `kustomization.yaml` settings: `RECIPE`, `LOG_ROOT`, `UI_LOG_ROOT`, and
+- `kustomization.yaml` settings: `RECIPE`, `LOG_ROOT`, and
   `ATTEMPT_TIMEOUT_MINUTES`
 - optionally `AGENT_TIMEOUT_MINUTES`, if the researcher pod should stop before
   Kubernetes cleanup does
@@ -159,7 +160,7 @@ To also clear shared run data:
 
 ```bash
 DELETE_ARTIFACTS=1 \
-ARTIFACT_ROOT=/mnt/shared/open-rl/autoresearch/text_sql \
+LOG_ROOT=/mnt/shared/open-rl/autoresearch/text_sql \
 OVERLAY=examples/rl/autoresearch/text_sql \
   examples/rl/autoresearch/cleanup_research_session.sh
 ```

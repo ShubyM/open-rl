@@ -72,7 +72,8 @@ def train(examples: list[dict[str, Any]], args: RunConfig) -> tuple[dict[str, An
 
 def result_lines(row: dict[str, Any]) -> str:
   mark = "PASS" if row["correct"] else "FAIL"
-  return f"[dev] {mark} {row['question']}\n  predicted: {row['predicted']}\n  target:    {row['target']}"
+  error = f"\n  error:     {row['execution_error']}" if row.get("execution_error") else ""
+  return f"[dev] {mark} {row['question']}\n  predicted: {row['predicted']}\n  target:    {row['target']}{error}"
 
 
 def write_train_examples(run_dir: Path, examples: list[dict[str, str]]) -> None:
