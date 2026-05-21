@@ -10,9 +10,14 @@ jobs:
       matrix:
         include:
           - image_name: gateway
+            context: src/server
             dockerfile: src/server/Dockerfile.gateway
           - image_name: server
+            context: src/server
             dockerfile: src/server/Dockerfile
+          - image_name: client
+            context: examples
+            dockerfile: examples/autoresearch/Dockerfile
     permissions:
       contents: read
     steps:
@@ -25,7 +30,7 @@ jobs:
       - name: Build
         uses: docker/build-push-action@v5
         with:
-          context: src/server
+          context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           build-args: |
             VERSION=${{ github.sha }}
