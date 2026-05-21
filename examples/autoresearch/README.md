@@ -62,6 +62,44 @@ Both recipes use the same `program.md` + `autoresearch.toml` contract:
 Use the recipe guides for local one-attempt runs, local UI serving, and
 recipe-specific settings.
 
+## Architecture
+
+Autoresearch runs as a small Kubernetes add-on around the shared Open-RL
+infrastructure. A recipe overlay starts the UI plus one researcher Sandbox per
+researcher. Each Sandbox runs Gemini CLI, edits the recipe, launches attempts,
+and calls the shared Open-RL/Tinker services.
+
+```mermaid
+flowchart LR
+  User["User<br/>kubectl apply -k<br/>examples/autoresearch/..."] --> Cluster
+
+  subgraph Cluster["Kubernetes Cluster"]
+    direction TB
+
+    UI["Autoresearch UI<br/>observer.py + static app"]
+
+    subgraph Sandboxes["Researcher Sandboxes<br/>one sandbox per researcher"]
+      direction LR
+      R1["Researcher Sandbox 1<br/><br/>Gemini CLI"]
+      R2["Researcher Sandbox 2<br/><br/>Gemini CLI"]
+      R3["Researcher Sandbox N<br/><br/>Gemini CLI"]
+    end
+
+    OpenRL["Shared Open-RL Infrastructure<br/>gateway / trainer / model server / Tinker API"]
+
+    R1 <--> OpenRL
+    R2 <--> OpenRL
+    R3 <--> OpenRL
+    R1 --> UI
+    R2 --> UI
+    R3 --> UI
+  end
+
+  R1 --> GeminiAPI["Gemini API"]
+  R2 --> GeminiAPI
+  R3 --> GeminiAPI
+```
+
 ## Cluster Run
 
 Create the API secret for agent-backed researcher pods:
