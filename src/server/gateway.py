@@ -91,6 +91,15 @@ def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
   return model_id.split("-samp-")[0]
 
 
+def is_sampler_weights_ref(model_id: str | None) -> bool:
+  if not model_id or not model_id.startswith("tinker://"):
+    return False
+
+  path = model_id[len("tinker://") :]
+  parts = path.split("/")
+  return len(parts) >= 3 and parts[1] == "sampler_weights"
+
+
 async def _enqueue(payload: dict) -> str:
   """Create a pending future, inject trace context, push to store. Returns req_id."""
   req_id = payload.get("req_id") or str(uuid.uuid4())
@@ -374,10 +383,13 @@ async def load_weights(req: dict):
 async def create_sampling_session(req: dict):
   """ServiceClient.create_sampling_client()"""
   model_path = req.get("model_path")
+  base_model = req.get("base_model")
   model_id = req.get("model_id")
 
   if model_path and model_path.startswith("tinker://"):
     sess_id = model_path
+  elif base_model:
+    sess_id = base_model
   else:
     sess_id = model_id or "samp-session-live-123"
 
@@ -424,7 +436,7 @@ async def asample(req: dict):
   req_id = str(uuid.uuid4())
   await store.set_future(req_id, {"status": "pending"})
 
-  lora_path = os.path.join(TMP_DIR, "peft", base_model_id, base_model_id) if base_model_id else None
+  lora_path = os.path.join(TMP_DIR, "peft", base_model_id, base_model_id) if is_sampler_weights_ref(model_id) else None
   headers: dict[str, str] = {"Content-Type": "application/json"}
   propagate.inject(headers)
 

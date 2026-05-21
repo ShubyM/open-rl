@@ -66,6 +66,14 @@ spec:
           requests:
             memory: "1Gi"
             cpu: "500m"
+        readinessProbe:
+          httpGet:
+            path: /api/v1/healthz
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
         volumeMounts:
         - name: shared-storage
           mountPath: /mnt/shared
