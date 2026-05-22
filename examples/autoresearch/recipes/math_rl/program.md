@@ -38,10 +38,9 @@ metric.
 
 ## Run Command
 
-First, run the unmodified default config with `eval "${DEFAULT_CONFIG_COMMAND}"`.
-This records where the recipe starts as a normal table row. After that, edit
+The launcher records the unmodified default config before Gemini starts. Edit
 `config.toml`, commit that change, then run attempts with `eval "${RUN_ATTEMPT_COMMAND}"`.
-The launcher provides these commands so logs, diffs, metrics, and UI events are
+The launcher provides this command so logs, diffs, metrics, and UI artifacts are
 captured consistently.
 
 Run attempts only in the foreground. Do not append `&`, use `nohup`, use

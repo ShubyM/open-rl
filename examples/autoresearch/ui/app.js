@@ -9,6 +9,7 @@ const S = {
   logLoaded: {},
   logFetches: {},
   diffFetches: {},
+  diffCollapsed: {},
   stream: null,
   raw: "",
   events: null,
@@ -30,6 +31,18 @@ const ansi = new Map([
 const H = (s = "") => String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 const esc = (s = "") => String(s).replaceAll("\\u001b", "\x1b").replaceAll("\\x1b", "\x1b");
 const fmt = (v) => (v == null ? "" : Number.isFinite(v) ? Number(v.toPrecision(4)).toString() : String(v));
+const artifactKey = (tab) => tab?.id || "";
+const PIERRE_DIFFS_URL = "./assets/pierre-diffs.min.js";
+const PIERRE_DIFF_CSS = `
+:host{--diffs-font-family:var(--mono);--diffs-header-font-family:var(--mono);--diffs-font-size:var(--base);--diffs-line-height:1.45}
+::slotted([slot=header-prefix]){display:inline-flex;align-items:center;background:#000}
+[data-diffs-header=default],[data-separator],[data-expand-button]{font-family:var(--mono);font-size:var(--base);letter-spacing:0}
+[data-diffs-header=default]{cursor:pointer}
+`;
+const pierreDiffs = import(PIERRE_DIFFS_URL).catch(err => {
+  console.warn("Pierre diff renderer unavailable; using built-in renderer.", err);
+  return null;
+});
 
 function saveUiSelection() {
   sessionStorage.setItem("autoresearch-active", S.active || "");
@@ -194,7 +207,7 @@ function detail(row, selected = selectedTab(row)) {
 
 function selectedTab(row) {
   const tabs = row.tab_order;
-  const preferred = row.tabs.agent.path ? "agent" : "logs";
+  const preferred = row.tabs.agent.id ? "agent" : "logs";
   const saved = S.tabs.__global;
   if (tabs.includes(saved)) {
     return saved;
@@ -212,11 +225,12 @@ function renderViewer(row) {
   if (!v) return stopStream();
   if (tabKey === "diff") {
     stopStream();
+    cleanUpPierreDiffs(v);
     return v.replaceChildren(diffPanel(row));
   }
   if (tab.format === "markdown") {
     const existing = v.querySelector(".markdown-panel");
-    if (existing?.dataset.path === tab.path) {
+    if (existing?.dataset.path === artifactKey(tab)) {
       const status = v.querySelector(".log-status");
       if (status) {
         status.textContent = logStatus(tab);
@@ -225,10 +239,11 @@ function renderViewer(row) {
       hydrateLog(tab, status, existing);
       return;
     }
+    cleanUpPierreDiffs(v);
     return v.replaceChildren(markdownPanel(tab));
   }
   const existing = v.querySelector("pre.log");
-  if (existing?.dataset.path === tab.path) {
+  if (existing?.dataset.path === artifactKey(tab)) {
     const status = v.querySelector(".log-status");
     if (status) {
       status.textContent = logStatus(tab);
@@ -237,67 +252,76 @@ function renderViewer(row) {
     hydrateLog(tab, status, existing);
     return;
   }
+  cleanUpPierreDiffs(v);
   v.replaceChildren(logPanel(tab));
 }
 
+function cleanUpPierreDiffs(root) {
+  root.querySelectorAll(".diffbox").forEach(box => box.pierreCodeView?.cleanUp());
+}
+
 function logStatus(tab) {
-  return tab.path ? `${tab.label.toLowerCase()}: ${tab.live ? "live" : "tail"}` : `${tab.label.toLowerCase()}: no stream`;
+  const key = artifactKey(tab);
+  if (!key) return `${tab.label.toLowerCase()}: no stream`;
+  if (tab.live) return `${tab.label.toLowerCase()}: ${S.logLoaded[key] ? "live" : "tail loading full log"}`;
+  return `${tab.label.toLowerCase()}: ${S.logLoaded[key] ? "full" : "tail loading full log"}`;
 }
 
 function logPanel(tab) {
-  const text = tab.path ? S.logText[tab.path] || tab.tail || "" : tab.tail || "";
+  const key = artifactKey(tab);
+  const text = key ? S.logText[key] || tab.tail || "" : tab.tail || "";
   const panel = document.createElement("div");
   panel.className = "log-panel";
   panel.innerHTML = `<div class="log-toolbar"><span class="log-status ${tab.live ? "live" : ""}">${H(logStatus(tab))}</span></div>`;
-  if (!tab.path && !text) {
+  if (!key && !text) {
     panel.appendChild(fragment(`<div class="waiting-panel">${waiting(tab.label, `Waiting for ${tab.label.toLowerCase()} output.`)}</div>`));
     return panel;
   }
   const node = document.createElement("pre");
   node.className = "log";
-  if (tab.path) node.dataset.path = tab.path;
-  node.addEventListener("scroll", () => { if (tab.path) S.logs[tab.path] = logScroll(node); }, { passive: true });
+  if (key) bindLogScroll(node, key);
   panel.append(node);
   colorize(node, esc(text));
-  restoreLogScroll(node, tab.path);
+  restoreLogScroll(node, key);
   hydrateLog(tab, panel.querySelector(".log-status"), node);
   return panel;
 }
 
 function markdownPanel(tab) {
-  const text = tab.path ? S.logText[tab.path] || tab.tail || "" : tab.tail || "";
+  const key = artifactKey(tab);
+  const text = key ? S.logText[key] || tab.tail || "" : tab.tail || "";
   const panel = document.createElement("div");
   panel.className = "log-panel";
   panel.innerHTML = `<div class="log-toolbar"><span class="log-status ${tab.live ? "live" : ""}">${H(logStatus(tab))}</span></div>`;
   const node = document.createElement("div");
   node.className = "markdown-panel";
-  if (tab.path) node.dataset.path = tab.path;
-  node.addEventListener("scroll", () => { if (tab.path) S.logs[tab.path] = logScroll(node); }, { passive: true });
+  if (key) bindLogScroll(node, key);
   panel.append(node);
   renderText(node, tab, esc(text));
-  restoreLogScroll(node, tab.path);
+  restoreLogScroll(node, key);
   hydrateLog(tab, panel.querySelector(".log-status"), node);
   return panel;
 }
 
 async function hydrateLog(tab, status, node) {
-  if (!tab.path) return stopStream();
-  if (!S.logLoaded[tab.path]) {
-    const hasText = Boolean(S.logText[tab.path] || tab.tail || node.textContent);
+  const key = artifactKey(tab);
+  if (!key) return stopStream();
+  if (!S.logLoaded[key]) {
+    const hasText = Boolean(S.logText[key] || tab.tail || node.textContent);
     if (status && !hasText) status.textContent = `${tab.label.toLowerCase()}: loading full log`;
-    S.logFetches[tab.path] ||= fetch(`file?path=${encodeURIComponent(tab.path)}`)
+    S.logFetches[key] ||= fetch(`file?id=${encodeURIComponent(key)}`)
       .then(response => {
         if (!response.ok) throw new Error(`log fetch failed: ${response.status}`);
         return response.text();
       })
       .then(text => {
         const full = esc(text);
-        S.logText[tab.path] = full;
-        S.logLoaded[tab.path] = true;
+        S.logText[key] = full;
+        S.logLoaded[key] = true;
         return full;
       })
-      .finally(() => { delete S.logFetches[tab.path]; });
-    const full = await S.logFetches[tab.path].catch(err => {
+      .finally(() => { delete S.logFetches[key]; });
+    const full = await S.logFetches[key].catch(err => {
       if (status) {
         status.textContent = err.message;
         status.className = "log-status warn";
@@ -306,8 +330,12 @@ async function hydrateLog(tab, status, node) {
     });
     if (full == null) return;
     if (!node.isConnected) return;
-    S.logText[tab.path] = full;
+    S.logText[key] = full;
     replaceText(node, tab, full);
+    if (status) {
+      status.textContent = logStatus(tab);
+      status.className = `log-status ${tab.live ? "live" : ""}`;
+    }
   }
   if (tab.live) {
     ensureStream(tab, status, node);
@@ -317,25 +345,26 @@ async function hydrateLog(tab, status, node) {
 }
 
 function ensureStream(tab, status, node) {
-  const key = `${tab.format}:${tab.path}`;
+  const artifact = artifactKey(tab);
+  const key = `${tab.format}:${artifact}`;
   if (S.stream?.key === key) {
     S.stream.status = status;
     S.stream.node = node;
     return;
   }
   stopStream();
-  const offset = byteLength(S.logText[tab.path] || "");
+  const offset = byteLength(S.logText[artifact] || "");
   const mode = tab.format === "markdown" ? "&replace=1" : "";
-  const source = new EventSource(`stream?path=${encodeURIComponent(tab.path)}&offset=${offset}${mode}`);
+  const source = new EventSource(`tail?id=${encodeURIComponent(artifact)}&offset=${offset}${mode}`);
   S.stream = { key, source, status, node };
   source.onmessage = (event) => {
     const data = JSON.parse(event.data);
     const text = esc(data.text || "");
     if (data.replace) {
-      S.logText[tab.path] = text;
+      S.logText[artifact] = text;
       replaceText(S.stream?.node, tab, text);
     } else {
-      S.logText[tab.path] = (S.logText[tab.path] || "") + text;
+      S.logText[artifact] = (S.logText[artifact] || "") + text;
       appendText(S.stream?.node, tab, text);
     }
     if (S.stream?.status) {
@@ -365,17 +394,36 @@ function renderText(node, tab, text) {
 }
 
 function replaceText(node, tab, text) {
-  const scroll = logScroll(node);
+  const scroll = savedOrCurrentScroll(node, artifactKey(tab));
   renderText(node, tab, text);
-  restoreLogScroll(node, tab.path, scroll);
+  restoreLogScroll(node, artifactKey(tab), scroll);
 }
 
 function appendText(node, tab, text) {
   if (!node?.isConnected) return;
-  const scroll = logScroll(node);
-  if (tab.format === "markdown") renderText(node, tab, S.logText[tab.path] || text);
+  const key = artifactKey(tab);
+  const scroll = savedOrCurrentScroll(node, key);
+  if (tab.format === "markdown") renderText(node, tab, S.logText[key] || text);
   else node.insertAdjacentHTML("beforeend", text.split("\n").map(logLine).join("\n"));
-  restoreLogScroll(node, tab.path, scroll);
+  restoreLogScroll(node, key, scroll);
+}
+
+function bindLogScroll(node, path) {
+  node.dataset.path = path;
+  node.tabIndex = 0;
+  node.addEventListener("scroll", () => { S.logs[path] = logScroll(node); }, { passive: true });
+  node.addEventListener("wheel", event => {
+    if (event.deltaY < 0) S.logs[path] = { ...logScroll(node), pinned: false };
+  }, { passive: true });
+  node.addEventListener("touchstart", () => { S.logs[path] = { ...logScroll(node), pinned: false }; }, { passive: true });
+  node.addEventListener("keydown", event => {
+    if (["ArrowUp", "PageUp", "Home"].includes(event.key)) S.logs[path] = { ...logScroll(node), pinned: false };
+  });
+}
+
+function savedOrCurrentScroll(node, path) {
+  const saved = S.logs[path];
+  return saved && !saved.pinned ? saved : logScroll(node);
 }
 
 function rememberLogScroll() {
@@ -500,111 +548,115 @@ function diffPanel(row) {
   const panel = document.createElement("div");
   panel.className = "diff-panel";
   if (!compact) {
-    panel.append(fragment(`<div class="waiting-panel">${waiting("Diff", diff.path ? "Loading captured code diff." : row.live ? "Waiting for the first captured code diff." : "No code diff.")}</div>`));
+    panel.append(fragment(`<div class="waiting-panel">${waiting("Diff", diff.id ? "Loading captured code diff." : row.live ? "Waiting for the first captured code diff." : "No code diff.")}</div>`));
     hydrateDiff(row, panel);
     return panel;
   }
   const box = document.createElement("div");
   box.className = "diffbox";
   box.dataset.full = "0";
-  box.innerHTML = diffHtml(compact, hasFullDiff(row));
+  box.innerHTML = rawDiff(compact);
+  renderPierreDiff(row.tabs.diff, box, row.id);
   panel.append(box);
+  hydrateDiff(row, panel);
   return panel;
 }
 
 async function hydrateDiff(row, panel) {
   const diff = row.tabs.diff;
-  if (!diff?.path) return;
-  const key = `${row.id}:${diff.path}:${diff.full_path || ""}`;
+  if (!diff?.id) return;
+  if (diff.files || !diff.files_id && diff.compact) return;
+  const key = `${row.id}:${diff.id}:${diff.files_id || ""}`;
   S.diffFetches[key] ||= Promise.all([
-    fetch(`file?path=${encodeURIComponent(diff.path)}`).then(response => response.ok ? response.text() : ""),
-    diff.full_path ? fetch(`file?path=${encodeURIComponent(diff.full_path)}`).then(response => response.ok ? response.text() : "") : Promise.resolve(""),
+    fetch(`file?id=${encodeURIComponent(diff.id)}`).then(response => response.ok ? response.text() : ""),
+    diff.files_id ? fetch(`file?id=${encodeURIComponent(diff.files_id)}`).then(response => response.ok ? response.json() : []) : Promise.resolve([]),
   ]).finally(() => { delete S.diffFetches[key]; });
-  const [compact, full] = await S.diffFetches[key];
+  const [compact, files] = await S.diffFetches[key];
   if (!panel.isConnected || !compact) return;
   row.tabs.diff.compact = compact;
-  row.tabs.diff.full = full || compact;
+  row.tabs.diff.files = files;
   const rendered = diffPanel(row);
   panel.replaceChildren(...rendered.childNodes);
 }
 
-const hasFullDiff = (row) => !!row.tabs.diff.full && row.tabs.diff.full !== row.tabs.diff.compact;
 const rawDiff = (text) => `<pre class="raw-diff">${H(text)}</pre>`;
 
-function diffHtml(text, toggle = false) {
-  if (!text.includes("diff --git ")) return rawDiff(text);
-  return parseDiff(text).map(file => diffFileHtml(file, toggle)).join("") || rawDiff(text);
-}
-
-function parseDiff(text) {
-  const files = [];
-  let file, hunk, oldLine = 0, newLine = 0;
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith("diff --git ")) {
-      const match = /^diff --git\s+(?:a\/)?(.+?)\s+(?:b\/)?(.+)$/.exec(line);
-      file = { old: cleanDiffPath(match?.[1] || "file"), new: cleanDiffPath(match?.[2] || "file"), hunks: [] };
-      files.push(file);
-      continue;
-    }
-    if (!file) continue;
-    if (line.startsWith("--- ")) file.old = cleanDiffPath(line.slice(4));
-    else if (line.startsWith("+++ ")) file.new = cleanDiffPath(line.slice(4));
-    else if (line.startsWith("@@")) {
-      const match = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)?/.exec(line);
-      [oldLine, newLine] = match ? [Number(match[1]), Number(match[2])] : [0, 0];
-      file.hunks.push(hunk = { content: line, changes: [] });
-    } else if (hunk && [" ", "+", "-"].includes(line[0])) {
-      const mark = line[0], body = line.slice(1);
-      if (mark === " ") hunk.changes.push({ kind: "ctx", old: oldLine++, new: newLine++, text: body });
-      if (mark === "+") hunk.changes.push({ kind: "add", new: newLine++, text: body });
-      if (mark === "-") hunk.changes.push({ kind: "del", old: oldLine++, text: body });
-    }
+async function renderPierreDiff(diff, box, rowId) {
+  const text = diff.compact || "";
+  if (!text.includes("diff --git ")) return;
+  const key = `${text.length}:${text.slice(0, 80)}`;
+  box.dataset.pierreKey = key;
+  try {
+    const module = await pierreDiffs;
+    if (!module) return;
+    const { CodeView, parseDiffFromFile } = module;
+    const files = Array.isArray(diff.files) ? diff.files : [];
+    const items = files.map(file => ({
+      id: file.name,
+      type: "diff",
+      collapsed: !!S.diffCollapsed[`${rowId}:${file.name}`],
+      fileDiff: parseDiffFromFile(
+        { name: file.name, contents: file.old_text || "", cacheKey: `${key}:${file.name}:old` },
+        { name: file.name, contents: file.new_text || "", cacheKey: `${key}:${file.name}:new` },
+        { context: 3 },
+      ),
+      version: text.length,
+    }));
+    if (!box.isConnected || box.dataset.pierreKey !== key || !items.length) return;
+    box.pierreCodeView?.cleanUp();
+    box.replaceChildren();
+    box.classList.add("pierre-diffbox");
+    const viewer = new CodeView({
+      theme: "vitesse-black",
+      themeType: "dark",
+      diffStyle: "split",
+      overflow: "wrap",
+      lineDiffType: "word",
+      diffIndicators: "bars",
+      hunkSeparators: "line-info",
+      expansionLineCount: 25,
+      unsafeCSS: PIERRE_DIFF_CSS,
+      stickyHeaders: true,
+      renderHeaderPrefix: (_file, context) => {
+        const collapsed = !!context.item.collapsed;
+        const toggle = document.createElement("button");
+        toggle.className = "diff-toggle";
+        toggle.type = "button";
+        toggle.setAttribute("aria-label", collapsed ? "Expand diff" : "Collapse diff");
+        toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+        toggle.innerHTML = collapsed
+          ? `<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M6.5 3.5 11 8l-4.5 4.5-1-1L9 8 5.5 4.5z"/></svg>`
+          : `<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="m3.5 6.5 1-1L8 9l3.5-3.5 1 1L8 11z"/></svg>`;
+        return toggle;
+      },
+      onPostRender: () => bindPierreHeaderClicks(viewer, rowId),
+    });
+    viewer.setup(box);
+    viewer.setItems(items);
+    viewer.render(true);
+    box.pierreCodeView = viewer;
+    bindPierreHeaderClicks(viewer, rowId);
+  } catch (err) {
+    console.warn("Pierre diff rendering failed; using built-in renderer.", err);
   }
-  return files;
 }
 
-function cleanDiffPath(path) {
-  const value = path.trim().split("\t")[0];
-  return value === "/dev/null" ? value : value.replace(/^[ab]\//, "");
-}
-
-function diffFileHtml(file, toggle) {
-  const changes = file.hunks.flatMap(h => h.changes);
-  const deleted = changes.filter(c => c.kind === "del").length, added = changes.filter(c => c.kind === "add").length;
-  const name = file.new !== "/dev/null" ? file.new : file.old;
-  const action = toggle ? ` data-action="diff-context" title="Toggle full diff context"` : "";
-  return `<div class="diff-file"><div class="diff-file-toolbar">
-    <button class="diff-toggle" data-action="collapse" aria-label="Collapse file" title="Collapse file"></button>
-    <span class="diff-name"${action}>${H(name)}</span>
-    <span class="diff-counts"><span class="del">-${deleted}</span> <span class="add">+${added}</span></span>
-  </div><div class="diff-file-body"><div class="split-diff">${file.hunks.map(diffHunkHtml).join("")}</div></div></div>`;
-}
-
-function diffHunkHtml(hunk) {
-  return `<div class="diff-hunk"><span>${H(hunk.content)}</span><span>${H(hunk.content)}</span></div>` + pairedChanges(hunk.changes).map(diffRowHtml).join("");
-}
-
-function pairedChanges(changes) {
-  const rows = [];
-  for (let i = 0; i < changes.length;) {
-    const change = changes[i];
-    if (change.kind === "ctx") {
-      rows.push([change.old, change.text, "ctx", change.new, change.text, "ctx"]);
-      i++;
-      continue;
-    }
-    const dels = [], adds = [];
-    while (i < changes.length && changes[i].kind !== "ctx") (changes[i].kind === "add" ? adds : dels).push(changes[i++]);
-    for (let j = 0; j < Math.max(dels.length, adds.length); j++) {
-      const left = dels[j], right = adds[j];
-      rows.push([left?.old || "", left?.text || "", left ? "del" : "empty", right?.new || "", right?.text || "", right ? "add" : "empty"]);
-    }
+function bindPierreHeaderClicks(viewer, rowId) {
+  for (const item of viewer.getRenderedItems()) {
+    const header = item.element.shadowRoot?.querySelector("[data-diffs-header]");
+    if (!header || header.dataset.boundCollapse) continue;
+    header.dataset.boundCollapse = "1";
+    header.setAttribute("role", "button");
+    header.setAttribute("aria-expanded", item.item.collapsed ? "false" : "true");
+    header.addEventListener("click", () => {
+      const current = viewer.getItem(item.id) || item.item;
+      const collapsed = !current.collapsed;
+      S.diffCollapsed[`${rowId}:${item.id}`] = collapsed;
+      viewer.updateItem({ ...current, collapsed, version: Number(current.version || 0) + 1 });
+      viewer.render(true);
+      bindPierreHeaderClicks(viewer, rowId);
+    });
   }
-  return rows;
-}
-
-function diffRowHtml([leftNo, left, leftKind, rightNo, right, rightKind]) {
-  return `<div class="diff-row"><span class="diff-line-no ${leftKind}">${H(leftNo)}</span><span class="diff-code ${leftKind}">${H(left)}</span><span class="diff-line-no ${rightKind}">${H(rightNo)}</span><span class="diff-code ${rightKind}">${H(right)}</span></div>`;
 }
 
 function waiting(title, text) {
@@ -636,23 +688,6 @@ document.addEventListener("click", (event) => {
       if (row) updateUiSelection({ tabs: { ...S.tabs, __global: target.dataset.tab } });
       break;
     }
-    case "collapse": {
-      const file = target.closest(".diff-file");
-      const collapsed = file.classList.toggle("collapsed");
-      target.classList.toggle("collapsed", collapsed);
-      target.title = collapsed ? "Expand file" : "Collapse file";
-      break;
-    }
-    case "diff-context": {
-      const row = selectedPayloadView().row;
-      const diff = row?.tabs?.diff;
-      if (!diff) break;
-      const box = target.closest(".diffbox");
-      const full = box.dataset.full !== "1";
-      box.dataset.full = full ? "1" : "0";
-      box.innerHTML = diffHtml(full ? (diff.full || diff.compact) : diff.compact, hasFullDiff(row));
-      break;
-    }
   }
 });
 
@@ -662,26 +697,18 @@ function applyData(raw) {
   updateUiSelection({ raw: key, data });
 }
 
-async function refresh() {
-  try {
-    applyData(await (await fetch(`ui.json?${Date.now()}`)).text());
-  } catch (err) {
-    UI.empty.hidden = false;
-    UI.empty.innerHTML = waiting("UI error", err.message);
-  }
-}
-
 function connect() {
   S.events?.close();
   S.events = new EventSource("events");
-  S.events.onopen = () => refresh();
   S.events.onmessage = (event) => applyData(event.data);
-  S.events.onerror = () => setTimeout(refresh, 1000);
+  S.events.onerror = () => {
+    UI.empty.hidden = false;
+    UI.empty.innerHTML = waiting("UI error", "Lost connection to observer.");
+  };
 }
 
 addEventListener("beforeunload", () => {
   stopStream();
   S.events?.close();
 });
-refresh();
 connect();

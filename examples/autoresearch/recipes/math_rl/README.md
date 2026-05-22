@@ -39,7 +39,7 @@ From `examples`, with an Open-RL gateway reachable on a port:
 
 ```bash
 export TINKER_BASE_URL=http://127.0.0.1:9003
-uv run --no-sync --package open-rl-client python -m run_attempt \
+uv run --no-sync --package open-rl-client python -m harness.attempt \
   recipe=recipes/math_rl/autoresearch.toml \
   researcher=local-math \
   attempt_timeout_minutes=5 \
@@ -50,7 +50,7 @@ uv run --no-sync --package open-rl-client python -m run_attempt \
 Serve the UI for local artifacts:
 
 ```bash
-uv run python -m ui.observer \
+uv run python -m harness.ui \
   log_root=artifacts/autoresearch/math_rl \
   port=8080 \
   serve=True
@@ -59,7 +59,7 @@ uv run python -m ui.observer \
 Clear local artifacts:
 
 ```bash
-uv run python -m run_attempt \
+uv run python -m harness.attempt \
   clean=True \
   log_root=artifacts/autoresearch/math_rl
 ```

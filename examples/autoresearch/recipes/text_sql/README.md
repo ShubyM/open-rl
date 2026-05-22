@@ -33,7 +33,7 @@ From `examples`:
 export TINKER_BASE_URL=http://127.0.0.1:9003
 export BASE_MODEL=google/gemma-4-e2b
 
-uv run python -m run_attempt \
+uv run python -m harness.attempt \
   recipe=recipes/text_sql/autoresearch.toml \
   researcher=local-text-sql \
   name=default-config \
@@ -43,7 +43,7 @@ uv run python -m run_attempt \
 Serve the UI for local artifacts:
 
 ```bash
-uv run python -m ui.observer \
+uv run python -m harness.ui \
   log_root=artifacts/autoresearch/text_sql \
   port=8080 \
   serve=True
@@ -58,7 +58,7 @@ http://localhost:8080/experiments.html
 Clear local text-SQL artifacts:
 
 ```bash
-uv run python -m run_attempt \
+uv run python -m harness.attempt \
   clean=True \
   log_root=artifacts/autoresearch/text_sql
 ```

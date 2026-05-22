@@ -36,4 +36,4 @@ RUN git init \
     && git add . \
     && git commit -m "Initial autoresearch workspace"
 
-CMD ["./run_research_agent.sh"]
+CMD ["uv", "run", "--no-sync", "--package", "open-rl-client", "python", "-m", "harness.agent"]

@@ -9,24 +9,28 @@ import math
 import os
 import re
 import socketserver
-import threading
+import sys
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import chz
 
-UI_DIR = Path(__file__).parent
-UI_EVENTS_FILE = "ui_events.jsonl"
+UI_DIR = Path(__file__).parents[1] / "ui"
 AGENT_TAIL_LIMIT = 12000
-RUN_PATHS = {"agent", "logs", "notes", "diff", "diff_full"}
 STALE_GRACE_SECONDS = 60
+STATIC_FILES = {
+  "/": "experiments.html",
+  "/experiments.html": "experiments.html",
+  "/app.js": "app.js",
+  "/style.css": "style.css",
+  "/assets/pierre-diffs.min.js": "assets/pierre-diffs.min.js",
+}
 
 
 @chz.chz
 class UiConfig:
   log_root: Path = Path("artifacts/autoresearch/text_sql")
-  out_dir: Path | None = None
   interval_seconds: float = 15
   host: str = "0.0.0.0"
   port: int = 8080
@@ -47,16 +51,12 @@ def read_text(path: Path | str, limit: int | None = None) -> str:
   return text
 
 
-def read_jsonl(path: Path) -> list[dict]:
-  return [json.loads(line) for line in read_text(path).splitlines() if line.strip()]
+def read_json(path: Path) -> dict:
+  return json.loads(path.read_text(encoding="utf-8"))
 
 
 def size(path: Path | str) -> int:
   return path.stat().st_size if path and (path := Path(path)).exists() else 0
-
-
-def rel(path: Path | str, root: Path) -> str:
-  return os.path.relpath(Path(path).resolve(), Path(root).resolve()) if path else ""
 
 
 def clean(value):
@@ -79,28 +79,38 @@ def researcher_id(value: str) -> str:
   return re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")[:40] or "researcher"
 
 
-def event_paths(log_root: Path) -> list[Path]:
-  return sorted(path for path in log_root.glob("*/" + UI_EVENTS_FILE) if path.is_file())
-
-
-def event_file_path(value: str | Path, event_file: Path) -> Path:
+def artifact_path(root: Path, boundary: Path, value: str | Path | None) -> Path | str:
+  if not value:
+    return ""
   path = Path(value)
-  return path if path.is_absolute() else event_file.parent / path
+  path = (path if path.is_absolute() else root / path).resolve()
+  try:
+    path.relative_to(boundary.resolve())
+  except ValueError:
+    return ""
+  return path
 
 
-def row_for(event: dict) -> dict:
-  time_value = float(event["time"])
-  work_id = str(event["work_id"])
+def artifact_id(row: dict, name: str) -> str:
+  return f"{row['researcher']}:{name}" if row["kind"] == "activity" else f"{row['researcher']}:{row['run']}:{name}"
+
+
+def researcher_row(path: Path) -> dict:
+  data = read_json(path)
+  root = path.parent
+  boundary = root.parents[1]
+  artifacts = data.get("artifacts") or {}
+  researcher = researcher_id(str(data["researcher"]))
   return {
-    "researcher": researcher_id(str(event["researcher"])),
-    "run": work_id,
-    "kind": str(event["kind"]),
-    "status": str(event["status"]),
-    "git": event.get("git") or {},
-    "experiment": event.get("experiment") or {},
-    "description": str(event.get("description") or ""),
-    "recipe": event.get("recipe") or {},
-    "attempt_timeout_minutes": event.get("attempt_timeout_minutes"),
+    "researcher": researcher,
+    "run": f"{researcher}-activity",
+    "kind": "activity",
+    "status": str(data["status"]),
+    "git": {},
+    "experiment": {},
+    "description": "",
+    "recipe": {},
+    "attempt_timeout_minutes": data.get("agent_timeout_minutes"),
     "score": None,
     "score_metric": "missing_metric",
     "score_label": "score",
@@ -108,34 +118,48 @@ def row_for(event: dict) -> dict:
     "history": [],
     "step": None,
     "metrics": 0,
-    "updated_at": time_value,
-    "order": event.get("order", time_value),
-    "paths": {"agent": "", "logs": "", "notes": "", "diff": "", "diff_full": ""},
+    "updated_at": number(data.get("updated_at")),
+    "order": data.get("started_at", 0),
+    "paths": {name: artifact_path(root, boundary, artifacts.get(name)) for name in ("agent", "launcher", "notes")},
   }
 
 
-def apply_event(row: dict, event: dict, event_file: Path) -> None:
-  row["updated_at"] = max(number(row.get("updated_at")), float(event["time"]))
-  for key in ("researcher", "kind", "status", "description", "attempt_timeout_minutes", "order"):
-    if key in event and event[key] is not None:
-      row[key] = researcher_id(event[key]) if key == "researcher" else event[key]
-  for key in ("git", "experiment", "recipe"):
-    row[key].update(event.get(key) or {})
-  if "tab" in event:
-    tab = str(event["tab"])
-    if tab not in RUN_PATHS:
-      raise ValueError(f"unknown UI tab: {tab}")
-    row["paths"][tab] = event_file_path(event["path"], event_file)
-  if metric := event.get("metric"):
-    value = clean(number(metric["value"]))
-    name = str(metric["name"])
-    row["score"] = value
-    row["score_metric"] = name
-    row["score_label"] = str(metric.get("label", name.rsplit("/", 1)[-1].replace("_", " ")))
-    row["score_mode"] = str(metric.get("mode") or row.get("score_mode") or "max")
-    row["step"] = metric.get("step", row["step"])
-    row["history"].append({"step": row["step"] if row["step"] is not None else len(row["history"]), "score": value})
-    row["metrics"] = len(row["history"])
+def attempt_row(path: Path) -> dict:
+  data = read_json(path)
+  root = path.parent
+  boundary = root.parents[3]
+  recipe = data.get("recipe") or {}
+  metric = data.get("metric") or {}
+  git = data.get("git") or {}
+  artifacts = data.get("artifacts") or {}
+  metric_name = str(metric.get("name") or recipe.get("metric") or "missing_metric")
+  metric_value = clean(number(metric["value"])) if "value" in metric and metric["value"] is not None else None
+  return {
+    "researcher": researcher_id(str(data["researcher"])),
+    "run": str(data["id"]),
+    "kind": "attempt",
+    "status": str(data["status"]),
+    "git": git,
+    "experiment": {
+      "name": "default-config" if data.get("baseline") else data.get("name"),
+      "task": recipe.get("task"),
+      "attempt": data.get("order"),
+      "attempt_timeout_minutes": data.get("attempt_timeout_minutes"),
+    },
+    "description": str(git.get("description") or data.get("name") or ""),
+    "recipe": {"name": recipe.get("task"), "editable": recipe.get("editable") or [], "metric": recipe.get("metric")},
+    "attempt_timeout_minutes": data.get("attempt_timeout_minutes"),
+    "score": metric_value,
+    "score_metric": metric_name,
+    "score_label": str(metric.get("label") or recipe.get("metric_label") or metric_name.rsplit("/", 1)[-1].replace("_", " ")),
+    "score_mode": str(metric.get("mode") or recipe.get("metric_mode") or "max"),
+    "history": [{"step": metric.get("step", 0), "score": metric_value}] if metric_value is not None else [],
+    "step": metric.get("step"),
+    "metrics": 1 if metric_value is not None else 0,
+    "updated_at": number(data.get("updated_at")),
+    "order": data.get("order", data.get("started_at", 0)),
+    "paths": {name: artifact_path(root, boundary, artifacts.get(name)) for name in ("agent", "logs", "notes", "diff", "diff_full", "diff_files", "metrics")},
+  }
 
 
 def mark_stale(row: dict) -> None:
@@ -168,56 +192,56 @@ def score_rank(row: dict) -> float:
   return -float(score) if row.get("score_mode") == "min" else float(score)
 
 
-def event_runs(log_root: Path) -> list[dict]:
-  rows = {}
-  for path in event_paths(log_root):
-    for event in read_jsonl(path):
-      work_id = str(event["work_id"])
-      if work_id not in rows:
-        rows[work_id] = row_for(event)
-      row = rows[work_id]
-      apply_event(row, event, path)
-  return list(rows.values())
+def manifest_runs(log_root: Path) -> list[dict]:
+  rows = []
+  for path in sorted(log_root.glob("researchers/*/researcher.json")):
+    try:
+      rows.append(researcher_row(path))
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+      print(f"skipping invalid researcher manifest {path}: {exc}", file=sys.stderr, flush=True)
+  for path in sorted(log_root.glob("researchers/*/attempts/*/attempt.json")):
+    try:
+      rows.append(attempt_row(path))
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+      print(f"skipping invalid attempt manifest {path}: {exc}", file=sys.stderr, flush=True)
+  return rows
 
 
-def write_if_changed(path: Path, text: str) -> None:
-  if path.exists() and path.read_text(encoding="utf-8", errors="replace") == text:
-    return
-  path.parent.mkdir(parents=True, exist_ok=True)
-  path.write_text(text, encoding="utf-8")
+def tab(path: Path | str, label: str, fmt_name: str, live: bool, limit: int) -> dict:
+  return {"label": label, "format": fmt_name, "tail": read_text(path, limit), "size": size(path), "live": live}
 
 
-def tab(path: Path | str, out_dir: Path, label: str, fmt_name: str, live: bool, limit: int) -> dict:
-  return {"label": label, "format": fmt_name, "path": rel(path, out_dir), "tail": read_text(path, limit), "size": size(path), "live": live}
+def artifact_tab(row: dict, name: str, label: str, fmt_name: str, live: bool, limit: int) -> dict:
+  path = row["paths"].get(name)
+  value = tab(path, label, fmt_name, live, limit)
+  value["id"] = artifact_id(row, name) if path else ""
+  return value
 
 
-def diff_tab(row: dict, out_dir: Path) -> dict:
-  compact = read_text(row["paths"]["diff"])
-  full = read_text(row["paths"]["diff_full"]) or compact
+def diff_tab(row: dict) -> dict:
+  compact = read_text(row["paths"].get("diff", ""))
   return {
     "label": "Diff",
-    "path": rel(row["paths"]["diff"], out_dir),
-    "full_path": rel(row["paths"]["diff_full"], out_dir),
+    "id": artifact_id(row, "diff") if row["paths"].get("diff") else "",
+    "files_id": artifact_id(row, "diff_files") if row["paths"].get("diff_files") else "",
     "compact": compact,
-    "full": full,
   }
 
 
-def row_tabs(row: dict, out_dir: Path, latest_attempt: dict | None = None, notes_path: Path | str = "") -> dict:
+def row_tabs(row: dict, latest_attempt: dict | None = None, notes_path: Path | str = "") -> dict:
   live = running(row)
-  logs_path = row["paths"]["logs"] or (latest_attempt or {}).get("paths", {}).get("logs", "")
   notes_path = row["paths"]["notes"] or notes_path
+  logs_row = row if row["paths"].get("logs") or not latest_attempt else latest_attempt
   return {
-    "agent": tab(row["paths"]["agent"], out_dir, "Agent", "agent", live, AGENT_TAIL_LIMIT),
-    "logs": tab(logs_path, out_dir, "Logs", "logs", live or bool(latest_attempt and running(latest_attempt)), 12000),
-    "notes": tab(notes_path, out_dir, "Notes", "markdown", live or bool(latest_attempt and running(latest_attempt)), 20000),
-    "diff": diff_tab(row, out_dir),
+    "agent": artifact_tab(row, "agent", "Agent", "agent", live, AGENT_TAIL_LIMIT),
+    "logs": artifact_tab(logs_row, "logs", "Logs", "logs", live or bool(latest_attempt and running(latest_attempt)), 12000),
+    "notes": artifact_tab(row, "notes", "Notes", "markdown", live or bool(latest_attempt and running(latest_attempt)), 20000),
+    "diff": diff_tab(row),
   }
 
 
 def ui_row(
   row: dict,
-  out_dir: Path,
   researcher_label: str,
   number_value: int | None = None,
   latest_attempt: dict | None = None,
@@ -227,7 +251,7 @@ def ui_row(
   kind = "live" if live_row else "attempt"
   label = "Live" if live_row else f"Attempt {number_value}"
   experiment_name = row.get("experiment", {}).get("name")
-  tabs = row_tabs(row, out_dir, latest_attempt, notes_path)
+  tabs = row_tabs(row, latest_attempt, notes_path)
   tab_order = ["agent", "notes", "logs"] if live_row or experiment_name == "default-config" else ["agent", "notes", "logs", "diff"]
   score = visible_score(row)
   score_label = title_label(row.get("score_label") or row.get("score_metric") or "score")
@@ -283,12 +307,12 @@ def axis_label(rows: list[dict]) -> str:
   return str(row.get("score_metric") or row.get("score_label") or "score").split("/")[-1].replace("_", " ").lower()
 
 
-def view(name: str, attempts: list[dict], live_row: dict | None, out_dir: Path, researcher_label: str, notes_path: Path | str = "") -> dict:
+def view(name: str, attempts: list[dict], live_row: dict | None, researcher_label: str, notes_path: Path | str = "") -> dict:
   visible_attempts = attempts if name == "all" else improved(attempts)
   numbered = {row["run"]: idx for idx, row in enumerate(attempts, 1)}
   latest_attempt = next((row for row in reversed(attempts) if running(row)), None) or (attempts[-1] if attempts else None)
-  table_rows = ([ui_row(live_row, out_dir, researcher_label, latest_attempt=latest_attempt, notes_path=notes_path)] if live_row else []) + [
-    ui_row(row, out_dir, researcher_label, numbered[row["run"]], notes_path=notes_path) for row in visible_attempts
+  table_rows = ([ui_row(live_row, researcher_label, latest_attempt=latest_attempt, notes_path=notes_path)] if live_row else []) + [
+    ui_row(row, researcher_label, numbered[row["run"]], notes_path=notes_path) for row in visible_attempts
   ]
   chart_rows = [(row, visible_score(row)) for row in visible_attempts if visible_score(row) is not None]
   return {
@@ -318,60 +342,52 @@ def researcher_path(rows: list[dict], name: str) -> Path | str:
   return next((row["paths"][name] for row in rows if row["paths"].get(name)), "")
 
 
-def researcher_payload(name: str, rows: list[dict], index: int, out_dir: Path) -> dict:
+def researcher_payload(name: str, rows: list[dict], index: int) -> dict:
   ordered_rows = sorted(rows, key=lambda row: (number(row.get("order")), number(row.get("updated_at")), row["run"]))
   for row in ordered_rows:
     mark_stale(row)
   attempts = [row for row in ordered_rows if row["kind"] != "activity"]
-  activity = next((row for row in ordered_rows if row["kind"] == "activity" and running(row)), None)
+  activity = next((row for row in ordered_rows if row["kind"] == "activity" and row["status"] != "completed"), None)
   notes_path = researcher_path(ordered_rows, "notes")
   label = f"Researcher {index}"
-  live = bool(activity or any(running(row) for row in attempts))
+  live = bool(any(running(row) for row in ([activity] if activity else []) + attempts))
   attempt_label = "attempt" if len(attempts) == 1 else "attempts"
   meta = "running" if live else f"{len(attempts)} {attempt_label}"
   return {
     "id": name,
     "label": label,
-    "status": "running" if live else "complete",
+    "status": activity["status"] if activity and not live else "running" if live else "complete",
     "live": live,
     "meta": meta,
     "views": {
-      "all": view("all", attempts, activity, out_dir, label, notes_path),
-      "improvements": view("improvements", attempts, activity, out_dir, label, notes_path),
+      "all": view("all", attempts, activity, label, notes_path),
+      "improvements": view("improvements", attempts, activity, label, notes_path),
     },
   }
 
 
-def payload(log_root: Path, out_dir: Path) -> dict:
+def payload(log_root: Path) -> dict:
   log_root.mkdir(parents=True, exist_ok=True)
-  runs = event_runs(log_root)
+  runs = manifest_runs(log_root)
   groups = {}
   for run in runs:
     groups.setdefault(run["researcher"], []).append(run)
   names = sorted(groups, key=lambda name: (first_seen(groups[name]), name))
-  return {"researchers": [researcher_payload(name, groups[name], idx, out_dir) for idx, name in enumerate(names, 1)]}
+  return {"researchers": [researcher_payload(name, groups[name], idx) for idx, name in enumerate(names, 1)]}
 
 
-def write_json(log_root: Path, out_dir: Path) -> list[dict]:
-  out_dir.mkdir(parents=True, exist_ok=True)
-  data = payload(log_root, out_dir)
-  write_if_changed(out_dir / "ui.json", json.dumps(data, indent=2, allow_nan=False) + "\n")
-  return data["researchers"]
-
-
-def rebuild_loop(log_root: Path, out_dir: Path, interval: float) -> None:
-  while True:
-    try:
-      researchers = write_json(log_root, out_dir)
-      attempts = sum(len(researcher["views"]["all"]["chart_points"]) for researcher in researchers)
-      print(f"ui updated: researchers={len(researchers)} scored_attempts={attempts}", flush=True)
-    except Exception as exc:
-      print(f"ui update failed: {exc}", flush=True)
-    time.sleep(interval)
+def artifact_index(log_root: Path) -> dict[str, Path]:
+  index = {}
+  for row in manifest_runs(log_root):
+    for name, path in row.get("paths", {}).items():
+      if path:
+        index[artifact_id(row, name)] = Path(path)
+  return index
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
-  out_dir: Path
+  log_root: Path
+  interval_seconds: float
 
   def end_headers(self) -> None:
     self.send_header("Cache-Control", "no-store, max-age=0")
@@ -401,38 +417,47 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     path = urlsplit(self.path).path
     if path == "/events":
       return self.events()
-    if path == "/stream":
-      return self.stream()
+    if path == "/tail":
+      return self.tail()
     if path == "/file":
       return self.send_file()
-    return super().do_GET()
+    return self.send_static(path)
 
-  def translate_path(self, path: str) -> str:
-    path = unquote(path.split("?", 1)[0])
-    if path in {"", "/", "/experiments.html", "/app.js", "/style.css"}:
-      return str(UI_DIR / ("experiments.html" if path in {"", "/"} else path[1:]))
-    return str(self.out_dir / path.lstrip("/"))
+  def send_static(self, path: str) -> None:
+    filename = STATIC_FILES.get(unquote(path))
+    if not filename:
+      return self.send_error(404, "file not found")
+    target = UI_DIR / filename
+    if not target.is_file():
+      return self.send_error(404, "file not found")
+    return self.send_data(target.read_bytes(), self.guess_type(str(target)))
 
   def target(self) -> Path | None:
-    value = parse_qs(urlsplit(self.path).query).get("path", [""])[0]
+    value = parse_qs(urlsplit(self.path).query).get("id", [""])[0]
     if not value:
-      self.send_error(400, "missing path")
+      self.send_error(400, "missing artifact id")
       return None
-    target = (self.out_dir / value).resolve()
+    target = artifact_index(self.log_root).get(value)
+    if not target:
+      self.send_error(404, "unknown artifact id")
+      return None
+    target = target.resolve()
     try:
-      target.relative_to(self.out_dir.resolve().parent)
+      target.relative_to(self.log_root.resolve())
     except ValueError:
-      self.send_error(403, "path outside ui root")
+      self.send_error(403, "artifact outside log root")
       return None
     return target
 
   def send_file(self) -> None:
     target = self.target()
-    if not target or not target.is_file():
+    if target is None:
+      return
+    if not target.is_file():
       return self.send_error(404, "file not found")
     self.send_data(target.read_bytes(), "text/plain; charset=utf-8")
 
-  def stream(self) -> None:
+  def tail(self) -> None:
     target = self.target()
     if not target:
       return
@@ -469,13 +494,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def source():
       last = ""
       while True:
-        text = read_text(self.out_dir / "ui.json")
-        if text and text != last:
+        text = json.dumps(payload(self.log_root), sort_keys=True, allow_nan=False)
+        if text != last:
           last = text
           yield json.loads(text)
         else:
           yield None
-        time.sleep(1)
+        time.sleep(self.interval_seconds)
 
     self.stream_json(source())
 
@@ -485,22 +510,19 @@ class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
   daemon_threads = True
 
 
-def serve(log_root: Path, out_dir: Path, host: str, port: int, interval: float) -> None:
-  Handler.out_dir = out_dir
-  threading.Thread(target=rebuild_loop, args=(log_root, out_dir, interval), daemon=True).start()
+def serve(log_root: Path, host: str, port: int, interval: float) -> None:
+  Handler.log_root = log_root
+  Handler.interval_seconds = interval
   print(f"serving UI at http://{host}:{port}/experiments.html", flush=True)
   ThreadingTCPServer((host, port), Handler).serve_forever()
 
 
 def main(argv: list[str] | None = None) -> None:
   args = chz.entrypoint(UiConfig, argv=argv, allow_hyphens=True)
-  out_dir = args.out_dir or args.log_root / "ui"
   if args.serve:
-    serve(args.log_root, out_dir, args.host, args.port, args.interval_seconds)
+    serve(args.log_root, args.host, args.port, args.interval_seconds)
   else:
-    researchers = write_json(args.log_root, out_dir)
-    print(f"Found {len(researchers)} researchers under {args.log_root}")
-    print(f"Wrote {out_dir / 'ui.json'}")
+    print(json.dumps(payload(args.log_root), indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

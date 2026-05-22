@@ -120,20 +120,22 @@ convenience Math-RL stack sets those URLs for vLLM, trainer, and gateway health.
 ## Shared Pieces
 
 ```text
-run_research_agent.sh  # launches one timeout-bounded agent
-run_attempt.py         # runs one measured attempt and records UI events
-ui/observer.py         # read-only UI server over recorded events
+harness/agent.py       # prepares git, records baseline, launches Gemini
+harness/attempt.py     # runs one measured attempt and writes attempt.json
+harness/ui.py          # read-only UI server over researcher/attempt manifests
 k8s/base/              # reusable Sandbox/UI resources
 ```
 
-`run_attempt.py` runs recipe code and writes artifacts. The UI reads only
-`LOG_ROOT/*/ui_events.jsonl`; clearing `LOG_ROOT` resets attempts, live rows,
-and per-attempt agent-log cursors.
+`harness.attempt` runs recipe code and writes artifacts. The UI reads only
+`LOG_ROOT/researchers/*/researcher.json` and
+`LOG_ROOT/researchers/*/attempts/*/attempt.json`; clearing `LOG_ROOT` resets
+researchers, attempts, and per-attempt agent-log cursors.
 
-The launcher passes the recipe-adjacent `program.md` to Gemini as the prompt.
-That program tells the agent to edit only the declared target, commit the
-attempt, run `eval "${RUN_ATTEMPT_COMMAND}"`, record the metric, and reset if
-the metric did not improve.
+The launcher records the unmodified default config as `000-baseline`, then
+passes the recipe-adjacent `program.md` to Gemini as the prompt. That program
+tells the agent to edit only the declared target, commit the attempt, run
+`eval "${RUN_ATTEMPT_COMMAND}"`, record the metric, and reset if the metric did
+not improve.
 
 ## Adding A Recipe
 
@@ -150,9 +152,9 @@ Copy one existing recipe directory and update:
 - optionally `READY_URLS`, if attempts need external services to be healthy
   before the agent starts
 
-The shared wrapper handles logs, diffs, metrics, status, and UI events. Recipe
-code should focus on running the benchmark or training loop and emitting the
-metric.
+The shared wrapper handles logs, diffs, metrics, status, and UI manifests.
+Recipe code should focus on running the benchmark or training loop and emitting
+the metric.
 
 ## Timeouts And Cleanup
 

@@ -12,13 +12,14 @@ import signal
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+import time
 from pathlib import Path
 from typing import Any
 
 import chz
-import tomllib
-from event_log import UI_EVENTS_FILE, append_ui_events
+from harness.git import git_commit_subject, git_snapshot, git_text, repo_root
+from harness.io import read_json, write_json_atomic
+from harness.recipe import Recipe, load_recipe
 
 
 @chz.chz
@@ -29,16 +30,6 @@ class AttemptConfig:
   log_root: Path = Path("artifacts/autoresearch/runs")
   attempt_timeout_minutes: float = float(os.getenv("ATTEMPT_TIMEOUT_MINUTES", "5"))
   clean: bool = False
-
-
-@dataclass(frozen=True)
-class Recipe:
-  task: str
-  command: str
-  editable: list[Path]
-  metric: str
-  metric_label: str
-  metric_mode: str
 
 
 def slug(text: str) -> str:
@@ -52,49 +43,14 @@ def researcher_name(researcher: str) -> str:
   return researcher
 
 
-def git_text(*args: str, cwd: Path | None = None) -> str:
-  result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
-  return result.stdout if result.returncode == 0 else ""
-
-
-def git_snapshot() -> dict[str, str | None]:
-  def value(*args: str) -> str | None:
-    return git_text(*args).strip() or None
-
-  return {
-    "branch": value("branch", "--show-current"),
-    "commit": value("rev-parse", "--short=7", "HEAD"),
-    "parent": value("rev-parse", "--short=7", "HEAD^"),
-  }
-
-
-def git_commit_subject() -> str:
-  return git_text("log", "-1", "--pretty=%s").strip()
-
-
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
   if not path.exists():
     return []
   return [json.loads(line) for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
 
 
-def load_recipe(path: Path) -> Recipe:
-  raw = tomllib.loads(path.read_text(encoding="utf-8"))
-  mode = str(raw["metric_mode"])
-  if mode not in {"max", "min"}:
-    raise ValueError("metric_mode must be max or min")
-  return Recipe(
-    task=str(raw["task"]),
-    command=str(raw["command"]),
-    editable=[Path(value) for value in raw["editable"]],
-    metric=str(raw["metric"]),
-    metric_label=str(raw["metric_label"]),
-    metric_mode=mode,
-  )
-
-
-def repo_root() -> Path:
-  return Path(git_text("rev-parse", "--show-toplevel").strip() or Path.cwd()).resolve()
+def now() -> float:
+  return time.time()
 
 
 def repo_paths_for_editables(paths: list[Path], root: Path) -> list[str]:
@@ -105,6 +61,10 @@ def repo_paths_for_editables(paths: list[Path], root: Path) -> list[str]:
     else:
       resolved.append(str(path))
   return resolved
+
+
+def git_diff_names(root: Path, *revs: str) -> set[str]:
+  return set(path for path in git_text("diff", "--name-only", *revs, cwd=root).splitlines() if path)
 
 
 def git_paths_diff(root: Path, repo_paths: list[str], context: int) -> str:
@@ -125,6 +85,29 @@ def git_paths_diff(root: Path, repo_paths: list[str], context: int) -> str:
       )
       chunks.append(result.stdout)
   return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def diff_files(root: Path, repo_paths: list[str]) -> list[dict[str, str]]:
+  def blob(rev: str, path: str) -> str:
+    return git_text("show", f"{rev}:{path}", cwd=root)
+
+  def changed(*revs: str) -> list[str]:
+    return git_text("diff", "--name-only", *revs, "--", *repo_paths, cwd=root).splitlines()
+
+  files = [{"name": path, "old_text": blob("HEAD^", path), "new_text": blob("HEAD", path)} for path in changed("HEAD^", "HEAD")]
+  if files:
+    return files
+
+  paths = changed("HEAD")
+  paths += git_text("ls-files", "--others", "--exclude-standard", "--", *repo_paths, cwd=root).splitlines()
+  return [
+    {
+      "name": path,
+      "old_text": blob("HEAD", path),
+      "new_text": (root / path).read_text(encoding="utf-8", errors="replace") if (root / path).exists() else "",
+    }
+    for path in dict.fromkeys(path for path in paths if path)
+  ]
 
 
 def stop_process(process: subprocess.Popen, sig: signal.Signals = signal.SIGTERM) -> None:
@@ -194,54 +177,61 @@ def extract_metrics(run_dir: Path, metric: str) -> list[tuple[float, int | float
   return found
 
 
-def replayed_attempts(log_root: Path, researcher: str) -> list[dict[str, Any]]:
-  rows = {}
-  for event_file in sorted(log_root.glob(f"*/{UI_EVENTS_FILE}")):
-    for event in read_jsonl(event_file):
-      if event.get("kind") != "attempt":
-        continue
-      if event["researcher"] != researcher:
-        continue
-      row = rows.setdefault(str(event["work_id"]), {"run_dir": event_file.parent, "git": {}, "experiment": {}, "status": "running"})
-      for key in ("status", "order", "description"):
-        if key in event:
-          row[key] = event[key]
-      row["git"].update(event.get("git") or {})
-      row["experiment"].update(event.get("experiment") or {})
-  return list(rows.values())
+def manifest_attempts(log_root: Path, researcher: str) -> list[dict[str, Any]]:
+  root = log_root / "researchers" / researcher / "attempts"
+  attempts = []
+  for path in sorted(root.glob("*/attempt.json")):
+    try:
+      data = read_json(path)
+    except (OSError, json.JSONDecodeError):
+      continue
+    attempts.append({**data, "run_dir": path.parent})
+  return attempts
 
 
 def ensure_attempt_is_new(args: AttemptConfig, recipe: Recipe, researcher: str, git: dict[str, str | None]) -> Path | None:
-  attempts = replayed_attempts(args.log_root, researcher)
+  attempts = manifest_attempts(args.log_root, researcher)
   if args.name == "default-config":
-    existing = next((row for row in attempts if row.get("status") == "completed" and row.get("experiment", {}).get("name") == "default-config"), None)
+    existing = next((row for row in attempts if row.get("baseline") or row.get("experiment", {}).get("name") == "default-config"), None)
     return Path(existing["run_dir"]) if existing else None
   root = repo_root()
-  if git_text("status", "--porcelain", "--", *repo_paths_for_editables(recipe.editable, root), cwd=root).strip():
-    raise SystemExit("Agent-edited attempts must commit the declared editable files before running. Commit the edit, then rerun RUN_ATTEMPT_COMMAND.")
+  dirty = git_text("status", "--porcelain", cwd=root).strip()
+  if dirty:
+    raise SystemExit("Working tree must be clean before running an attempt. Commit the edit, then rerun RUN_ATTEMPT_COMMAND.")
   commit = git.get("commit")
   existing = next(
-    (row for row in attempts if commit and row.get("status") in {"completed", "timed_out"} and row.get("git", {}).get("commit") == commit),
+    (row for row in attempts if commit and row.get("git", {}).get("commit") == commit),
     None,
   )
   if existing:
     raise SystemExit(f"Commit {commit} was already evaluated for {researcher}: {existing['run_dir']}. Commit a new change before rerunning.")
+  if not git.get("parent"):
+    raise SystemExit("Agent-edited attempts need a parent commit so the attempted diff can be evaluated.")
+  allowed = set(repo_paths_for_editables(recipe.editable, root))
+  changed = git_diff_names(root, "HEAD^", "HEAD")
+  extra = changed - allowed
+  if extra:
+    raise SystemExit("Attempt commit changes files outside recipe.editable:\n" + "\n".join(sorted(extra)))
+  if not changed:
+    raise SystemExit("Attempt commit does not change any recipe.editable files.")
   return None
 
 
 def new_run_dir(args: AttemptConfig, researcher: str) -> tuple[int, Path]:
-  attempt = 1 + sum(1 for path in args.log_root.glob(f"{researcher}-attempt-*") if path.is_dir())
-  run_dir = args.log_root / f"{researcher}-attempt-{attempt}-{slug(args.name)}"
+  attempts_root = args.log_root / "researchers" / researcher / "attempts"
+  attempts_root.mkdir(parents=True, exist_ok=True)
+  if args.name == "default-config":
+    run_dir = attempts_root / "000-baseline"
+    attempt = 0
+  else:
+    attempt = 1 + sum(1 for path in attempts_root.iterdir() if path.is_dir() and path.name != "000-baseline")
+    run_dir = attempts_root / f"{attempt:03d}-{slug(args.name)}"
   run_dir.mkdir(parents=True, exist_ok=False)
   return attempt, run_dir
 
 
 def activity_dir(args: AttemptConfig, researcher: str) -> Path:
-  return Path(os.getenv("WORK_DIR") or args.log_root / f"{researcher}-activity")
-
-
-def attempt_events(run_dir: Path, researcher: str, *events: dict[str, Any]) -> None:
-  append_ui_events(run_dir, [{"work_id": run_dir.name, "researcher": researcher, **event} for event in events])
+  return Path(os.getenv("WORK_DIR") or args.log_root / "researchers" / researcher)
 
 
 def command_for_attempt(args: AttemptConfig, recipe: Recipe, researcher: str, attempt: int, run_dir: Path) -> list[str]:
@@ -257,6 +247,62 @@ def command_for_attempt(args: AttemptConfig, recipe: Recipe, researcher: str, at
   if parts and parts[0] in {"python", "python3"}:
     parts[0] = sys.executable
   return parts
+
+
+def attempt_manifest(
+  args: AttemptConfig,
+  recipe: Recipe,
+  researcher: str,
+  attempt: int,
+  run_dir: Path,
+  status: str,
+  git: dict[str, str | None],
+  metric: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+  name = "baseline" if args.name == "default-config" else slug(args.name)
+  return {
+    "schema_version": 1,
+    "id": run_dir.name,
+    "researcher": researcher,
+    "name": name,
+    "baseline": args.name == "default-config",
+    "status": status,
+    "started_at": run_dir.stat().st_ctime if run_dir.exists() else now(),
+    "updated_at": now(),
+    "attempt_timeout_minutes": args.attempt_timeout_minutes,
+    "git": {**git, "description": git_commit_subject()},
+    "recipe": {
+      "task": recipe.task,
+      "editable": [str(path) for path in recipe.editable],
+      "metric": recipe.metric,
+      "metric_label": recipe.metric_label,
+      "metric_mode": recipe.metric_mode,
+    },
+    "metric": metric,
+    "order": attempt,
+    "artifacts": {
+      "logs": "logs.log",
+      "metrics": "metrics.jsonl",
+      "diff": "code.diff",
+      "diff_full": "code_full.diff",
+      "diff_files": "diff_files.json",
+      "agent": "agent.log" if (run_dir / "agent.log").exists() else "",
+      "notes": os.path.relpath(notes_path(args, researcher), run_dir),
+    },
+  }
+
+
+def write_attempt_manifest(
+  args: AttemptConfig,
+  recipe: Recipe,
+  researcher: str,
+  attempt: int,
+  run_dir: Path,
+  status: str,
+  git: dict[str, str | None],
+  metric: dict[str, Any] | None = None,
+) -> None:
+  write_json_atomic(run_dir / "attempt.json", attempt_manifest(args, recipe, researcher, attempt, run_dir, status, git, metric))
 
 
 def notes_path(args: AttemptConfig, researcher: str) -> Path:
@@ -292,13 +338,12 @@ def capture_diffs(recipe: Recipe, run_dir: Path, researcher: str) -> None:
   root = repo_root()
   paths = repo_paths_for_editables(recipe.editable, root)
   diff = git_paths_diff(root, paths, 3)
-  full = git_paths_diff(root, paths, 1000000)
   (run_dir / "code.diff").write_text(diff, encoding="utf-8")
-  (run_dir / "code_full.diff").write_text(full or diff, encoding="utf-8")
-  attempt_events(run_dir, researcher, {"tab": "diff", "path": "code.diff"}, {"tab": "diff_full", "path": "code_full.diff"})
+  (run_dir / "code_full.diff").write_text(git_paths_diff(root, paths, 100_000), encoding="utf-8")
+  (run_dir / "diff_files.json").write_text(json.dumps(diff_files(root, paths)), encoding="utf-8")
 
 
-def finish_attempt(recipe: Recipe, run_dir: Path, researcher: str, code: int) -> None:
+def finish_attempt(recipe: Recipe, run_dir: Path, researcher: str, code: int) -> tuple[str, dict[str, Any] | None]:
   extracted = extract_metrics(run_dir, recipe.metric)
   status = "completed" if code == 0 and extracted else "timed_out" if code == 124 else "failed"
   with (run_dir / "logs.log").open("a", encoding="utf-8") as f:
@@ -306,23 +351,18 @@ def finish_attempt(recipe: Recipe, run_dir: Path, researcher: str, code: int) ->
       print(f"missing metric={recipe.metric}", file=f)
     print(f"status={status}", file=f)
   if extracted:
-    attempt_events(
-      run_dir,
-      researcher,
-      *[
-        {
-          "metric": {
-            "name": recipe.metric,
-            "label": recipe.metric_label,
-            "value": value,
-            "step": step,
-            "mode": recipe.metric_mode,
-          }
-        }
-        for value, step in extracted
-      ],
-    )
-  attempt_events(run_dir, researcher, {"status": status})
+    final_value, final_step = extracted[-1]
+  return status, (
+    {
+      "name": recipe.metric,
+      "label": recipe.metric_label,
+      "value": final_value,
+      "step": final_step,
+      "mode": recipe.metric_mode,
+    }
+    if extracted
+    else None
+  )
 
 
 def clean_artifacts(log_root: Path) -> None:
@@ -339,36 +379,15 @@ def run_attempt(args: AttemptConfig) -> Path:
 
   attempt, run_dir = new_run_dir(args, researcher)
   logs_path = run_dir / "logs.log"
-  attempt_events(
-    run_dir,
-    researcher,
-    {
-      "kind": "attempt",
-      "status": "running",
-      "order": attempt,
-      "description": git_commit_subject(),
-      "attempt_timeout_minutes": args.attempt_timeout_minutes,
-      "git": git,
-      "experiment": {
-        "name": args.name,
-        "task": recipe.task,
-        "attempt": attempt,
-        "attempt_timeout_minutes": args.attempt_timeout_minutes,
-      },
-      "recipe": {"name": recipe.task, "editable": [str(path) for path in recipe.editable], "metric": recipe.metric},
-      "tab": "logs",
-      "path": "logs.log",
-    },
-    {"tab": "notes", "path": str(notes_path(args, researcher))},
-  )
-  if seed_agent_log(args, researcher, run_dir):
-    attempt_events(run_dir, researcher, {"tab": "agent", "path": "agent.log"})
+  seed_agent_log(args, researcher, run_dir)
+  write_attempt_manifest(args, recipe, researcher, attempt, run_dir, "running", git)
 
   capture_diffs(recipe, run_dir, researcher)
   code = run_logged(command_for_attempt(args, recipe, researcher, attempt, run_dir), logs_path, args.attempt_timeout_minutes * 60)
   mark_agent_boundary(args, researcher)
   capture_diffs(recipe, run_dir, researcher)
-  finish_attempt(recipe, run_dir, researcher, code)
+  status, metric = finish_attempt(recipe, run_dir, researcher, code)
+  write_attempt_manifest(args, recipe, researcher, attempt, run_dir, status, git, metric)
   return run_dir
 
 
