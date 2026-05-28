@@ -351,6 +351,7 @@ def run_attempt(args: AttemptConfig) -> Path:
       "git": git,
       "experiment": {
         "name": args.name,
+        "run_name": run_dir.name,
         "task": recipe.task,
         "attempt": attempt,
         "attempt_timeout_minutes": args.attempt_timeout_minutes,

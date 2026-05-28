@@ -227,6 +227,7 @@ def ui_row(
   kind = "live" if live_row else "attempt"
   label = "Live" if live_row else f"Attempt {number_value}"
   experiment_name = row.get("experiment", {}).get("name")
+  run_name = row.get("experiment", {}).get("run_name") or row["run"]
   tabs = row_tabs(row, out_dir, latest_attempt, notes_path)
   tab_order = ["agent", "notes", "logs"] if live_row or experiment_name == "default-config" else ["agent", "notes", "logs", "diff"]
   score = visible_score(row)
@@ -248,11 +249,12 @@ def ui_row(
     "score_label": score_label,
     "score_mode": row.get("score_mode") or "max",
     "description": description,
+    "run_name": run_name,
     "git": row.get("git") or {},
     "history": row.get("history") if score is not None else [],
     "tab_order": tab_order,
     "tabs": tabs,
-    "meta": f"{label} · {researcher_label} · {meta_status}{score_text}{commit}",
+    "meta": f"{label} · {researcher_label} · {run_name} · {meta_status}{score_text}{commit}",
     "order": row.get("order"),
     "updated_at": row.get("updated_at"),
   }
@@ -302,7 +304,7 @@ def view(name: str, attempts: list[dict], live_row: dict | None, out_dir: Path, 
         "id": row["run"],
         "number": numbered[row["run"]],
         "label": f"A{numbered[row['run']]}",
-        "title": f"Attempt {numbered[row['run']]} · {metric_label([row])} {fmt(score)}",
+        "title": f"Attempt {numbered[row['run']]} · {row.get('experiment', {}).get('run_name') or row['run']} · {metric_label([row])} {fmt(score)}",
         "score": score,
       }
       for row, score in chart_rows
