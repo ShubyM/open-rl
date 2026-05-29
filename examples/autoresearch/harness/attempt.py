@@ -20,6 +20,7 @@ from harness.utils import (
   METADATA,
   AgentPaths,
   agent_id,
+  close_attempt_agent_logs,
   git_text,
   recipe_spec_hash,
   run_id,
@@ -167,6 +168,8 @@ def attempt_manifest(
   commit: dict[str, str | None],
   started_at: float,
   exit_code: int | None,
+  agent_log_start: int = 0,
+  agent_log_end: int | None = None,
   metric: dict[str, Any] | None = None,
   spec_hash: str = "",
 ) -> dict[str, Any]:
@@ -183,6 +186,8 @@ def attempt_manifest(
     "started_at": started_at,
     "finished_at": finished_at,
     "attempt_timeout_minutes": args.attempt_timeout_minutes,
+    "agent_log_start": agent_log_start,
+    "agent_log_end": agent_log_end,
     "branch": commit["branch"],
     "commit": commit["commit"],
     "parent": commit["parent"],
@@ -281,8 +286,10 @@ def run_attempt(args: AttemptConfig) -> tuple[Path, str]:
         "agent_timeout_minutes": 0,
       },
     )
+  agent_start = paths.agent_log.stat().st_size if paths.agent_log.exists() else 0
+  close_attempt_agent_logs(paths.root, agent_start)
   capture_diffs(recipe, run_dir)
-  manifest = attempt_manifest(args, "running", commit, started_at, None, spec_hash=spec_hash)
+  manifest = attempt_manifest(args, "running", commit, started_at, None, agent_start, spec_hash=spec_hash)
   write_json_atomic(run_dir / METADATA, manifest)
 
   command = command_for_attempt(args, paths, recipe, agent, attempt, run_dir)
@@ -290,7 +297,7 @@ def run_attempt(args: AttemptConfig) -> tuple[Path, str]:
   code = run_logged(command, logs_path, args.attempt_timeout_minutes * 60, idle_message=idle_message, echo=args.echo)
   capture_diffs(recipe, run_dir)
   status, metric = finish_attempt(recipe, run_dir, code)
-  manifest = attempt_manifest(args, status, commit, started_at, code, metric=metric, spec_hash=spec_hash)
+  manifest = attempt_manifest(args, status, commit, started_at, code, agent_start, metric=metric, spec_hash=spec_hash)
   write_json_atomic(run_dir / METADATA, manifest)
   print(f"attempt {run_dir.name}: {status}", flush=True)
   if metric:

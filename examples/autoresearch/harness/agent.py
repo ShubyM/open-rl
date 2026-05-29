@@ -12,7 +12,7 @@ from pathlib import Path
 
 import chz
 
-from harness.utils import AgentPaths, agent_id, recipe_spec_hash, run_id, run_logged, write_json_atomic
+from harness.utils import AgentPaths, agent_id, close_attempt_agent_logs, recipe_spec_hash, run_id, run_logged, write_json_atomic
 
 IGNORED_RECIPE_DIRS = {".git", "__pycache__", "gke"}
 IGNORED_RECIPE_FILES = {".DS_Store", "kustomization.yaml"}
@@ -174,6 +174,8 @@ def main(argv: list[str] | None = None) -> None:
     spec_hash = str(json.loads(manifest.read_text(encoding="utf-8"))["spec_hash"]) if manifest.exists() else ""
     write_agent_manifest(paths, args, status, spec_hash, code)
     log(paths, f"Autoresearch session exiting with code {code}.")
+    if paths.agent_log.exists():
+      close_attempt_agent_logs(paths.root, paths.agent_log.stat().st_size)
   raise SystemExit(code)
 
 

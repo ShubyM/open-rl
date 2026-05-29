@@ -7,6 +7,7 @@ import http.server
 import json
 import socketserver
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
@@ -17,6 +18,13 @@ from harness.utils import AGENT_ARTIFACTS, ATTEMPT_ARTIFACTS, AgentPaths, agent_
 UI_DIR = Path(__file__).parents[1] / "ui"
 STALE_GRACE_SECONDS = 60
 TAIL_CHUNK_BYTES = 256 * 1024
+
+
+@dataclass(frozen=True)
+class FileTarget:
+  path: Path
+  start: int = 0
+  end: int | None = None
 
 
 def checked_name(value: str, field: str) -> str:
@@ -38,13 +46,25 @@ def agent_paths(log_root: Path, run: str, agent: str) -> AgentPaths:
   return AgentPaths.from_run(log_root, checked_name(run, "run"), agent)
 
 
-def read_bytes(target: Path, offset: int = 0, tail_bytes: int = 0, max_bytes: int = 0) -> tuple[int, int, bytes]:
+def read_bytes(
+  target: Path,
+  offset: int = 0,
+  tail_bytes: int = 0,
+  max_bytes: int = 0,
+  start_offset: int = 0,
+  end_offset: int | None = None,
+) -> tuple[int, int, bytes]:
   """Read `target` from `offset` (or its last `tail_bytes`) to EOF; returns (start, end, data)."""
   size = target.stat().st_size
-  start = max(0, size - tail_bytes) if tail_bytes else min(max(0, offset), size)
+  limit = min(size, end_offset) if end_offset is not None else size
+  floor = min(max(0, start_offset), limit)
+  start = max(floor, limit - tail_bytes) if tail_bytes else min(max(floor, offset), limit)
   with target.open("rb") as f:
     f.seek(start)
-    data = f.read(max_bytes) if max_bytes else f.read()
+    length = limit - start
+    if max_bytes:
+      length = min(length, max_bytes)
+    data = f.read(length)
   return start, start + len(data), data
 
 
@@ -111,6 +131,8 @@ def attempt_record(path: Path, run: str = "") -> dict:
     "started_at": started_at,
     "finished_at": data["finished_at"],
     "attempt_timeout_minutes": data["attempt_timeout_minutes"],
+    "agent_log_start": int(data.get("agent_log_start", 0) or 0),
+    "agent_log_end": data.get("agent_log_end"),
     "spec_hash": data["spec_hash"],
     "branch": data["branch"],
     "commit": data["commit"],
@@ -156,12 +178,12 @@ def artifact_url(route: str, run: str, agent: str, artifact: str, attempt: str =
 
 def artifact_ref(run: str, agent: str, attempt: str, artifact: str, live: bool = False) -> dict:
   ref = {
-    "label": {"logs": "Logs", "diff": "Diff"}[artifact],
+    "label": {"agent": "Agent", "logs": "Logs", "diff": "Diff"}[artifact],
     "format": artifact,
     "url": artifact_url("file", run, agent, artifact, attempt),
     "live": live,
   }
-  if artifact == "logs":
+  if artifact in {"agent", "logs"}:
     ref["tail_url"] = artifact_url("tail", run, agent, artifact, attempt)
   return ref
 
@@ -243,8 +265,16 @@ def snapshot(log_root: Path, run: str = "", include_text: bool = True) -> dict:
       metric_label = metric_title(metric_name)
       commit = f" · {attempt['commit']}" if attempt.get("commit") else ""
       score_text = f" · {metric_label} {score:.4g}" if isinstance(score, int | float) else ""
-      tab_order = ["logs"] if attempt["baseline"] else ["logs", "diff"]
-      artifacts = {"logs": artifact_ref(attempt["run"], attempt["artifact_agent"], attempt["id"], "logs", attempt["status"] == "running")}
+      tab_order = ["agent", "logs"] if attempt["baseline"] else ["agent", "logs", "diff"]
+      next_attempt = attempts[index] if index < len(attempts) else None
+      agent_log_end = attempt.get("agent_log_end")
+      if agent_log_end is None and next_attempt and next_attempt.get("agent_log_start") is not None:
+        agent_log_end = next_attempt["agent_log_start"]
+      agent_live = agent["status"] == "running" and index == len(attempts) and agent_log_end is None
+      artifacts = {
+        "agent": artifact_ref(attempt["run"], attempt["artifact_agent"], attempt["id"], "agent", agent_live),
+        "logs": artifact_ref(attempt["run"], attempt["artifact_agent"], attempt["id"], "logs", attempt["status"] == "running"),
+      }
       if not attempt["baseline"]:
         artifacts["diff"] = artifact_ref(attempt["run"], attempt["artifact_agent"], attempt["id"], "diff")
       rows.append(
@@ -264,6 +294,8 @@ def snapshot(log_root: Path, run: str = "", include_text: bool = True) -> dict:
           "axis_label": metric_axis(metric_name),
           "tab_order": tab_order,
           "artifacts": artifacts,
+          "agent_log_start": attempt.get("agent_log_start"),
+          "agent_log_end": agent_log_end,
           "meta": f"Attempt {index} · {agent['label']} · {attempt['status']}{score_text}{commit}",
           "started_at": attempt["started_at"],
         }
@@ -351,7 +383,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
       return self.send_error(404, "file not found")
     return self.send_data(target.read_bytes(), self.guess_type(str(target)))
 
-  def target(self) -> Path | None:
+  def attempt_agent_target(self, paths: AgentPaths, attempt: str) -> FileTarget:
+    attempt_dir = paths.attempt_dir(checked_name(attempt, "attempt"))
+    manifest_path = attempt_dir / "metadata.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    start = int(data.get("agent_log_start", 0) or 0)
+    end = data.get("agent_log_end")
+    if end is None:
+      current = (float(data.get("started_at", 0) or 0), attempt)
+      for path in sorted(paths.attempts.glob("*/metadata.json")):
+        if path.parent.name == attempt:
+          continue
+        row = json.loads(path.read_text(encoding="utf-8"))
+        next_start = row.get("agent_log_start")
+        if next_start is None:
+          continue
+        if (float(row.get("started_at", 0) or 0), path.parent.name) > current:
+          end = int(next_start)
+          break
+    return FileTarget(paths.agent_log, start, int(end) if end is not None else None)
+
+  def target(self) -> FileTarget | None:
     query = parse_qs(urlsplit(self.path).query)
     run = self.run_name or query.get("run", [""])[0]
     agent = query.get("agent", query.get("researcher", [""]))[0]
@@ -363,10 +415,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     try:
       paths = agent_paths(self.log_root, run, agent)
       if attempt:
+        if artifact == "agent":
+          return self.attempt_agent_target(paths, attempt)
         attempt_dir = paths.attempt_dir(checked_name(attempt, "attempt"))
-        return attempt_dir / ATTEMPT_ARTIFACTS[artifact]
-      return paths.root / AGENT_ARTIFACTS[artifact]
-    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return FileTarget(attempt_dir / ATTEMPT_ARTIFACTS[artifact])
+      return FileTarget(paths.root / AGENT_ARTIFACTS[artifact])
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
       self.send_error(404, "unknown artifact")
       return None
 
@@ -374,24 +428,26 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     target = self.target()
     if target is None:
       return
-    if not target.is_file():
+    if not target.path.is_file():
       return self.send_error(404, "file not found")
     tail_bytes = query_int(parse_qs(urlsplit(self.path).query), "tail_bytes")
-    start, end, data = read_bytes(target, tail_bytes=tail_bytes)
+    start, end, data = read_bytes(target.path, tail_bytes=tail_bytes, start_offset=target.start, end_offset=target.end)
     self.send_data(data, "text/plain; charset=utf-8", headers={"X-OpenRL-Start": str(start), "X-OpenRL-End": str(end)})
 
   def tail(self) -> None:
     target = self.target()
     if target is None:
       return
-    offset = query_int(parse_qs(urlsplit(self.path).query), "offset")
+    offset = query_int(parse_qs(urlsplit(self.path).query), "offset", target.start)
 
     def source():
       nonlocal offset
       while True:
         payload = None
-        if target.is_file():
-          chunk_start, offset, data = read_bytes(target, offset=offset, max_bytes=TAIL_CHUNK_BYTES)
+        if target.path.is_file():
+          chunk_start, offset, data = read_bytes(
+            target.path, offset=offset, max_bytes=TAIL_CHUNK_BYTES, start_offset=target.start, end_offset=target.end
+          )
           if data:
             payload = json.dumps({"start": chunk_start, "end": offset, "text": data.decode("utf-8", errors="replace")}, separators=(",", ":"))
         yield payload

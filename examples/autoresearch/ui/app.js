@@ -232,30 +232,41 @@ function renderViewer(row, tab) {
   const selector = tab === "notes" ? ".markdown-panel" : tab === "diff" ? ".diff-panel" : "pre.log";
   const existing = v.querySelector(selector);
   if (existing?.dataset.key === key) {
-    updateViewerNode(existing, row, tab);
+    if (tab === "diff") fetchDiff(row, existing, key);
+    else updateViewerNode(existing, row, tab);
     return;
   }
   stopStream();
-  v.replaceChildren(viewerPanel(row, tab, key));
+  const panel = viewerPanel(row, tab, key);
+  v.replaceChildren(panel);
+  if (tab === "diff") {
+    fetchDiff(row, panel, key);
+    return;
+  }
+  updateViewerNode(v.querySelector(selector), row, tab);
 }
 
 function viewerPanel(row, tab, key) {
   if (tab === "diff") return diffPanel(row, key);
   const panel = document.createElement("div");
   panel.className = "log-panel";
-  panel.innerHTML = `<div class="log-toolbar"><span class="log-status ${row.live ? "live" : ""}">${H(statusText(row, tab))}</span></div>`;
+  panel.innerHTML = `<div class="log-toolbar"><span class="log-status ${tabLive(row, tab) ? "live" : ""}">${H(statusText(row, tab))}</span></div>`;
   const node = document.createElement(tab === "notes" ? "div" : "pre");
   node.className = tab === "notes" ? "markdown-panel" : "log";
   node.dataset.key = key;
   bindScroll(node, key);
   panel.append(node);
-  updateViewerNode(node, row, tab);
   return panel;
 }
 
 function updateViewerNode(node, row, tab) {
+  if (!node) return;
   const key = `${row.id}:${tab}`;
   if (tab === "agent") {
+    if (row.artifacts?.agent) {
+      hydrateArtifact(row, tab, node);
+      return;
+    }
     replaceText(node, key, "agent", esc(row.agent || ""));
     updateStatus(node, row, tab);
     return;
@@ -271,18 +282,26 @@ function updateViewerNode(node, row, tab) {
 }
 
 function statusText(row, tab) {
-  if (tab === "agent") return `agent: ${row.live ? "live" : "full"}`;
+  if (tab === "agent") {
+    const state = textState(`${row.id}:${tab}`);
+    if (state.error) return state.error;
+    return `agent: ${row.artifacts?.agent && !state.loaded ? "loading" : tabLive(row, tab) ? "live" : "full"}`;
+  }
   if (tab === "notes") return "notes";
   const state = textState(`${row.id}:${tab}`);
   if (state.error) return state.error;
-  return `${tab}: ${state.loaded ? row.live ? "live" : "full" : "loading"}`;
+  return `${tab}: ${state.loaded ? tabLive(row, tab) ? "live" : "full" : "loading"}`;
+}
+
+function tabLive(row, tab) {
+  return Boolean(row.artifacts?.[tab]?.live || (tab === "agent" && !row.artifacts?.agent && row.live));
 }
 
 function updateStatus(node, row, tab, extra = "") {
   const status = node.closest(".log-panel")?.querySelector(".log-status");
   if (!status) return;
   status.textContent = extra || statusText(row, tab);
-  status.className = `log-status ${row.live ? "live" : ""}`;
+  status.className = `log-status ${tabLive(row, tab) ? "live" : ""}`;
 }
 
 async function hydrateArtifact(row, tab, node) {
@@ -370,7 +389,6 @@ function diffPanel(row, key) {
     return panel;
   }
   panel.append(fragment(`<div class="waiting-panel">${waiting("Diff", row.artifacts?.diff ? "Loading captured code diff." : "No code diff.")}</div>`));
-  fetchDiff(row, panel, key);
   return panel;
 }
 
@@ -378,6 +396,7 @@ async function fetchDiff(row, panel, key) {
   const artifact = row.artifacts?.diff;
   if (!artifact) return;
   const state = textState(key);
+  if (state.loaded) return;
   if (!state.pending) {
     state.error = "";
     state.pending = fetch(artifact.url).then(async response => {

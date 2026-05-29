@@ -57,6 +57,17 @@ class AgentPaths:
     return self.attempts / name
 
 
+def close_attempt_agent_logs(agent_dir: Path, end: int) -> None:
+  for path in sorted((agent_dir / "attempts").glob(f"*/{METADATA}")):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("agent_log_end") is not None:
+      continue
+    start = int(data.get("agent_log_start", 0) or 0)
+    data["agent_log_start"] = start
+    data["agent_log_end"] = max(start, end)
+    write_json_atomic(path, data)
+
+
 def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
   path.parent.mkdir(parents=True, exist_ok=True)
   tmp = path.with_suffix(path.suffix + ".tmp")
