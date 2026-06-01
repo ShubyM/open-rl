@@ -10,7 +10,6 @@ import signal
 import subprocess
 import sys
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,8 +17,6 @@ from typing import Any
 SPEC_HASH_IGNORED_DIRS = {".git", "__pycache__"}
 SPEC_HASH_IGNORED_FILES = {".DS_Store", "kustomization.yaml"}
 SPEC_HASH_IGNORED_PREFIXES = ("..",)
-LOG_FLUSH_BYTES = 256 * 1024
-LOG_FLUSH_SECONDS = 1.0
 
 # Single source of truth for the on-disk layout. The keys are the artifact names
 # used in UI/HTTP requests; the values are the filenames the harness writes.
@@ -129,48 +126,46 @@ def run_logged(
   timeout_seconds: float | None = None,
   cwd: Path | None = None,
   env: dict[str, str] | None = None,
-  idle_message: str = "",
-  idle_seconds: float = 60.0,
   echo: bool = True,
 ) -> int:
   log_path.parent.mkdir(parents=True, exist_ok=True)
   with log_path.open("ab") as file:
     lock = threading.Lock()
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    flush_state = {"pending": 0, "last_flush": time.monotonic()}
-    last_output = [time.monotonic()]
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace") if echo else None
 
-    def flush(final: bool = False) -> None:
-      if echo:
-        tail = decoder.decode(b"", final=final)
-        if tail:
-          sys.stdout.write(tail)
-      file.flush()
-      if echo:
+    def echo_child(data: bytes) -> None:
+      if not echo or decoder is None:
+        return
+      text = decoder.decode(data)
+      if text:
+        sys.stdout.write(text)
         sys.stdout.flush()
-      flush_state["pending"] = 0
-      flush_state["last_flush"] = time.monotonic()
-
-    def maybe_flush(nbytes: int) -> None:
-      flush_state["pending"] += nbytes
-      now = time.monotonic()
-      if flush_state["pending"] >= LOG_FLUSH_BYTES or now - flush_state["last_flush"] >= LOG_FLUSH_SECONDS:
-        flush()
 
     def write_control(text: str) -> None:
-      data = text.encode("utf-8")
       with lock:
-        file.write(data)
+        file.write(text.encode())
+        file.flush()
         if echo:
           sys.stdout.write(text)
-        maybe_flush(len(data))
+          sys.stdout.flush()
 
     def write_child(data: bytes) -> None:
       with lock:
         file.write(data)
-        if echo:
-          sys.stdout.write(decoder.decode(data))
-        maybe_flush(len(data))
+        file.flush()
+        echo_child(data)
+
+    def flush_echo_unlocked() -> None:
+      if decoder is None:
+        return
+      tail = decoder.decode(b"", final=True)
+      if tail:
+        sys.stdout.write(tail)
+        sys.stdout.flush()
+
+    def flush_echo() -> None:
+      with lock:
+        flush_echo_unlocked()
 
     write_control(f"$ {shlex.join(command)}\n")
     process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
@@ -179,33 +174,16 @@ def run_logged(
 
     def copy_output() -> None:
       while chunk := process.stdout.read1(65536):
-        last_output[0] = time.monotonic()
         write_child(chunk)
-      with lock:
-        flush(final=True)
+      flush_echo()
 
     reader = threading.Thread(target=copy_output, daemon=True)
     reader.start()
+    timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
     try:
-      timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
-      deadline = time.monotonic() + timeout if timeout else None
-      while process.poll() is None:
-        now = time.monotonic()
-        if deadline and now >= deadline:
-          break
-        if idle_message and now - last_output[0] >= idle_seconds:
-          write_control(f"{idle_message}\n")
-          last_output[0] = now
-        wait = 1.0
-        if deadline:
-          wait = min(wait, max(0, deadline - now))
-        if idle_message:
-          wait = min(wait, max(0, idle_seconds - (now - last_output[0])))
-        try:
-          process.wait(timeout=wait)
-        except subprocess.TimeoutExpired:
-          pass
-      if process.poll() is None:
+      try:
+        process.wait(timeout=timeout)
+      except subprocess.TimeoutExpired:
         stop_process(process)
         try:
           process.wait(timeout=10)
@@ -213,17 +191,11 @@ def run_logged(
           stop_process(process, signal.SIGKILL)
           process.wait()
         reader.join(timeout=1)
-        write_control(f"timed out after {timeout_seconds:.1f}s\n")
-        with lock:
-          flush()
         return 124
       reader.join(timeout=1)
-      with lock:
-        flush()
       return process.returncode
     finally:
       if process.poll() is None:
         stop_process(process)
       reader.join(timeout=1)
-      with lock:
-        flush()
+      file.flush()

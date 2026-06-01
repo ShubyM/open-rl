@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import signal
 from pathlib import Path
 from typing import Any
 
@@ -28,10 +27,6 @@ NUM_GROUPS_TO_LOG = 0
 RENDERER_OVERRIDES = {
   "Qwen/Qwen2.5-0.5B-Instruct": "qwen3_instruct",
 }
-
-
-class AttemptTimeoutError(TimeoutError):
-  pass
 
 
 @chz.chz
@@ -203,16 +198,12 @@ async def run_training(args: RunConfig) -> None:
 def main() -> None:
   force_rich_log_colors()
   args = chz.entrypoint(RunConfig, allow_hyphens=True)
-  signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(AttemptTimeoutError))
-  signal.setitimer(signal.ITIMER_REAL, max(args.attempt_timeout_minutes * 60, 0.1))
   try:
     asyncio.run(asyncio.wait_for(run_training(args), timeout=args.attempt_timeout_minutes * 60))
-  except (AttemptTimeoutError, TimeoutError) as exc:
+  except TimeoutError as exc:
     write_metric_summary(args.run_dir)
     print(f"Timed out after {args.attempt_timeout_minutes} minutes; partial metrics remain in {args.run_dir}")
     raise SystemExit(124) from exc
-  finally:
-    signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 if __name__ == "__main__":

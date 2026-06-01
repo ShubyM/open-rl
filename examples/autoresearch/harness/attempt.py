@@ -175,7 +175,7 @@ def attempt_manifest(
 ) -> dict[str, Any]:
   finished_at = None if status == "running" else time.time()
   error = None
-  if status != "running" and exit_code != 0:
+  if status not in {"running", "timed_out"} and exit_code != 0:
     error = f"exit_code={exit_code}"
   if status == "failed" and metric is None:
     error = "metric missing"
@@ -293,8 +293,7 @@ def run_attempt(args: AttemptConfig) -> tuple[Path, str]:
   write_json_atomic(run_dir / METADATA, manifest)
 
   command = command_for_attempt(args, paths, recipe, agent, attempt, run_dir)
-  idle_message = f"attempt {run_dir.name} still running; logs={logs_path}"
-  code = run_logged(command, logs_path, args.attempt_timeout_minutes * 60, idle_message=idle_message, echo=args.echo)
+  code = run_logged(command, logs_path, args.attempt_timeout_minutes * 60, echo=args.echo)
   capture_diffs(recipe, run_dir)
   status, metric = finish_attempt(recipe, run_dir, code)
   manifest = attempt_manifest(args, status, commit, started_at, code, agent_start, metric=metric, spec_hash=spec_hash)
