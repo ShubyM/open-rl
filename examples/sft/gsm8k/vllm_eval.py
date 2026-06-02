@@ -19,18 +19,20 @@ def extract(t):
 
 
 def main():
-  ap = argparse.ArgumentParser()
-  ap.add_argument("--path", required=True)
-  ap.add_argument("--data", default="gsm8k_test.json")
-  a = ap.parse_args()
-  data = json.load(open(a.data))
-  llm = LLM(model=a.path, dtype="bfloat16", gpu_memory_utilization=0.85, max_model_len=1024, enforce_eager=True)
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--path", required=True)
+  parser.add_argument("--data", default="gsm8k_test.json")
+  args = parser.parse_args()
+  data = json.load(open(args.data))
+  llm = LLM(model=args.path, dtype="bfloat16", gpu_memory_utilization=0.85, max_model_len=1024, enforce_eager=True)
   sp = SamplingParams(temperature=0.0, max_tokens=256, stop=["\nQuestion:"])
   t0 = time.time()
   outs = llm.generate([d["prompt"] for d in data], sp)
   dt = time.time() - t0
   correct = sum(int(extract(o.outputs[0].text) == d["gold"]) for d, o in zip(data, outs))
-  print(f"[VLLM] {a.path} 0-shot GSM8K acc = {correct / len(data):.1%} on {len(data)} problems in {dt:.1f}s")
+  print("***************************************************************")
+  print(f"[VLLM] {args.path} 0-shot GSM8K acc = {correct / len(data):.1%} on {len(data)} problems in {dt:.1f}s")
+  print("***************************************************************")
 
 
 if __name__ == "__main__":
