@@ -6,6 +6,7 @@ import chz
 import tinker
 from datasets import load_dataset
 from tinker import types
+from tinker_cookbook import cli_utils
 from tinker_cookbook.supervised.data import SupervisedDatasetFromHFDataset
 from tinker_cookbook.supervised.train import Config as TrainConfig
 from tinker_cookbook.supervised.train import main as train
@@ -52,9 +53,11 @@ class Config:
   seed: int = 0
   max_steps: int | None = None
   save_every: int = 0
+  behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "resume"
 
 
 def main(config: Config) -> None:
+  cli_utils.check_log_dir(config.log_path, behavior_if_exists=config.behavior_if_log_dir_exists)
   asyncio.run(
     train(
       TrainConfig(

@@ -151,6 +151,32 @@ Later:
 - Tune heartbeat timeout behavior so long legitimate idle gaps do not kill active clients.
 - Add a max-hold/acquire deadline for hung-but-alive workers.
 
+## Full-FT Resume Compatibility
+
+This prototype treats full fine-tuning as a server-side mode selected by `OPEN_RL_TRAINING_MODE=full`.
+That keeps the stock Tinker client and cookbook training loop unchanged for creating a run.
+
+The resume path is different. `tinker_cookbook.supervised.train` checks `log_path/checkpoints.jsonl`
+on startup. If it finds a `state_path`, it calls the stock Tinker
+`create_training_client_from_state*` flow. That SDK flow asks `/api/v1/weights_info` for LoRA-shaped
+metadata, creates a LoRA training client, then calls `load_state`.
+
+OpenRL now records model-scoped checkpoint paths so aliases do not collide across runs, and the
+gateway can answer `weights_info` from checkpoint metadata. When `OPEN_RL_TRAINING_MODE=full`, a full
+checkpoint intentionally reports a LoRA-shaped `weights_info` response because the stock SDK asserts
+that `create_training_client_from_state*` is LoRA-shaped before it calls `load_state`.
+
+That response is a compatibility shim, not the source of truth. In full mode the gateway ignores the
+LoRA shape and creates a full-FT worker; `load_state` then loads the full HuggingFace checkpoint.
+
+Current user-facing behavior:
+
+- Start the gateway with `OPEN_RL_TRAINING_MODE=full` for both the original run and resume.
+- Use a fresh `log_path`, or delete the previous artifacts directory, when a clean run is desired.
+
+The cleaner long-term version is a client/helper that can create a full-FT training client from state
+without the `weights_info` lie.
+
 ## Tests
 
 The tests are meant to cover behavior, not tiny implementation details.

@@ -133,11 +133,13 @@ async def process_batch(store, batch: list[dict]) -> None:
 
           case "save_state":
             state_path = r["state_path"]
+            response_path = r.get("response_path")
             include_optimizer = bool(r.get("include_optimizer", False))
             kind = r.get("kind", "state")
 
             result = await asyncio.to_thread(engine.save_state, m_id, state_path, include_optimizer, kind)
-            # SDK's save_state() returns SaveWeightsResponse which requires type="save_weights".
+            if response_path is not None:
+              result["path"] = response_path
             result["type"] = "save_weights"
             await store.set_future(req_id, result)
 
@@ -148,20 +150,18 @@ async def process_batch(store, batch: list[dict]) -> None:
             await store.set_future(req_id, {"path": state_path, "type": "load_weights"})
 
           case "save_weights_for_sampler":
-            saved_path = r.get("path")
+            response_path = r.get("path")
             if engine.is_full_model(m_id):
-              # Full fine-tuning has no adapter; persist the whole HF model dir. Map the
-              # tinker://<model>/sampler_weights/<name> ref to a real filesystem path.
-              ref = saved_path or ""
+              ref = response_path or ""
               rel = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
-              saved_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel)
-              await asyncio.to_thread(engine.save_state, m_id, saved_path, False, "sampler")
+              local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel)
+              await asyncio.to_thread(engine.save_state, m_id, local_path, False, "sampler")
             else:
               await asyncio.to_thread(engine.save_adapter, m_id, r.get("alias"))
             await store.set_future(
               req_id,
               {
-                "path": saved_path,
+                "path": response_path,
                 "sampling_session_id": r.get("sampling_session_id"),
                 "type": "save_weights_for_sampler",
               },

@@ -28,6 +28,23 @@ final checkpoint export are handled by the cookbook loop. The final checkpoint i
 `artifacts/gsm8k_sft/checkpoints.jsonl`; for full-FT the sampler checkpoint path points at a
 standard HF model directory.
 
+## Current resume behavior
+
+Full-FT resume from a saved `state_path` requires starting the gateway in full mode again.
+
+The cookbook trainer automatically checks `<log_path>/checkpoints.jsonl` on startup. If it finds a
+previous `state_path`, it tries to resume through the stock Tinker `create_training_client_from_state`
+path, which is still LoRA-shaped. This prototype uses `OPEN_RL_TRAINING_MODE=full` as a server-side
+knob so the normal client can create full-FT runs. The gateway also uses that same knob when answering
+the SDK's resume metadata request.
+
+If you want a clean run instead of resuming, rerun with a fresh `log_path` or let the cookbook
+helper delete the existing log dir before training starts:
+
+```bash
+python examples/sft/gsm8k/gsm8k_sft.py behavior_if_log_dir_exists=delete
+```
+
 ## Eval
 
 Eval is decoupled (point a server at the saved dir). With vLLM:

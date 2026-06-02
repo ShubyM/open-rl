@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -79,6 +81,34 @@ class _LogitModelStub:
     return types.SimpleNamespace(logits=logits)
 
 
+class _FullModelLoadStub:
+  loaded_from = None
+
+  def __init__(self):
+    self.param = torch.nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+    self.trained = False
+
+  @classmethod
+  def from_pretrained(cls, path, **kwargs):
+    cls.loaded_from = (path, kwargs)
+    return cls()
+
+  def parameters(self):
+    return [self.param]
+
+  def train(self):
+    self.trained = True
+
+
+class _TokenizerLoadStub:
+  loaded_from = None
+
+  @classmethod
+  def from_pretrained(cls, path):
+    cls.loaded_from = path
+    return cls()
+
+
 def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantages=None):
   loss_fn_inputs = {"target_tokens": trainer_module.TensorData(data=target_tokens)}
   if weights is not None:
@@ -154,6 +184,33 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     self.assertFalse(torch.allclose(full_param.detach(), torch.tensor([1.0])))
     if full_param.grad is not None:
       self.assertTrue(torch.allclose(full_param.grad, torch.zeros_like(full_param.grad)))
+
+  def test_load_from_state_restores_full_model_checkpoint(self) -> None:
+    with tempfile.TemporaryDirectory() as state_path:
+      with open(os.path.join(state_path, "metadata.json"), "w") as f:
+        json.dump({"base_model": "Qwen/test", "training_mode": "full", "has_optimizer": False}, f)
+
+      engine = TrainerEngine()
+      engine.device = torch.device("cpu")
+      with (
+        patch.object(trainer_module, "AutoModelForCausalLM", _FullModelLoadStub),
+        patch.object(
+          trainer_module,
+          "AutoTokenizer",
+          _TokenizerLoadStub,
+        ),
+      ):
+        result = engine.load_from_state("full-run", state_path)
+
+    self.assertEqual(result, {"model_id": "full-run", "is_lora": False, "base_model": "Qwen/test"})
+    self.assertEqual(engine.full_model_id, "full-run")
+    self.assertEqual(engine.base_model_name, "Qwen/test")
+    self.assertIsInstance(engine.tokenizer, _TokenizerLoadStub)
+    self.assertEqual(_TokenizerLoadStub.loaded_from, state_path)
+    self.assertEqual(_FullModelLoadStub.loaded_from[0], state_path)
+    self.assertTrue(engine.base_model.trained)
+    self.assertTrue(all(param.requires_grad for param in engine.adapter_states["full-run"]["trainable_params"]))
+    self.assertEqual(engine.adapter_states["full-run"]["training_mode"], "full")
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):

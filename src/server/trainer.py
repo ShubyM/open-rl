@@ -166,7 +166,12 @@ class TrainerEngine:
       self.peft_model.add_adapter(adapter_id, peft_config)
 
     self.peft_model.set_adapter(adapter_id)
-    self.adapter_states[adapter_id] = {"trainable_params": active_adapter_parameters(self.peft_model, adapter_id), "optimizer": None}
+    self.adapter_states[adapter_id] = {
+      "trainable_params": active_adapter_parameters(self.peft_model, adapter_id),
+      "optimizer": None,
+      "lora_config": config.model_dump(),
+      "training_mode": "lora",
+    }
 
     if ENABLE_GRADIENT_CHECKPOINTING:
       try:
@@ -205,11 +210,6 @@ class TrainerEngine:
       traceback.print_exc()
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
-    """Save weights (and optionally optimizer state) to a specific path.
-
-    Full fine-tuning writes a standard HuggingFace model directory (config + safetensors +
-    tokenizer) that any loader (transformers, vLLM) can serve directly. LoRA writes the adapter.
-    """
     if self.is_full_model(model_id):
       assert self.base_model is not None, "Model must be loaded first."
       os.makedirs(state_path, exist_ok=True)
@@ -256,6 +256,17 @@ class TrainerEngine:
       "model_id": model_id,
       "timestamp": time.time(),
     }
+    lora_config = adapter_state.get("lora_config") if adapter_state is not None else None
+    if lora_config is not None:
+      metadata.update(
+        {
+          "lora_rank": lora_config.get("rank"),
+          "train_attn": lora_config.get("train_attn"),
+          "train_mlp": lora_config.get("train_mlp"),
+          "train_unembed": lora_config.get("train_unembed"),
+          "training_mode": "lora",
+        }
+      )
     with open(os.path.join(state_path, "metadata.json"), "w") as f:
       json.dump(metadata, f)
 
@@ -263,11 +274,6 @@ class TrainerEngine:
     return {"path": state_path}
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
-    """Create an adapter from a saved state directory.
-
-    Expects the directory to contain a metadata.json describing base_model
-    and (optionally) an adapter subdirectory with the saved LoRA weights.
-    """
     metadata_path = os.path.join(state_path, "metadata.json")
     if not os.path.exists(metadata_path):
       raise FileNotFoundError(f"No metadata.json found at {state_path}")
@@ -278,6 +284,44 @@ class TrainerEngine:
     base_model = metadata.get("base_model")
     if not base_model:
       raise ValueError(f"metadata.json at {state_path} missing base_model")
+
+    if metadata.get("training_mode") == "full":
+      if self.peft_model is not None:
+        raise ValueError("Cannot load full fine-tuning state into a PEFT worker")
+      if self.full_model_id is not None and self.full_model_id != model_id:
+        raise ValueError(f"Full fine-tuning worker already owns run '{self.full_model_id}'")
+
+      self.base_model = None
+      self.tokenizer = None
+      if self.device.type == "cuda":
+        torch.cuda.empty_cache()
+
+      self.base_model_name = base_model
+      self.tokenizer = AutoTokenizer.from_pretrained(state_path)
+      dtype = torch.bfloat16 if self.device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+      self.base_model = AutoModelForCausalLM.from_pretrained(state_path, dtype=dtype, device_map=self.device)
+      for param in self.base_model.parameters():
+        param.requires_grad_(True)
+
+      params = [param for param in self.base_model.parameters() if param.requires_grad]
+      if not params:
+        raise ValueError("No trainable parameters found for full fine-tuning")
+
+      self.base_model.train()
+      adapter_state = {"trainable_params": params, "optimizer": None, "training_mode": "full"}
+      self.adapter_states[model_id] = adapter_state
+      self.full_model_id = model_id
+
+      if restore_optimizer and metadata.get("has_optimizer"):
+        optimizer_path = os.path.join(state_path, "optimizer.pt")
+        if os.path.exists(optimizer_path):
+          optimizer = torch.optim.AdamW(params, lr=1e-4)
+          optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
+          adapter_state["optimizer"] = optimizer
+          print(f"Restored optimizer state for '{model_id}' from {optimizer_path}")
+
+      print(f"Loaded full state for '{model_id}' from {state_path}")
+      return {"model_id": model_id, "is_lora": False, "base_model": base_model}
 
     src_adapter_id = metadata.get("model_id")
     adapter_dir = state_path
@@ -298,7 +342,14 @@ class TrainerEngine:
 
     self.peft_model.set_adapter(model_id)
     params = active_adapter_parameters(self.peft_model, model_id)
-    adapter_state = {"trainable_params": params, "optimizer": None}
+    adapter_state = {"trainable_params": params, "optimizer": None, "training_mode": "lora"}
+    if metadata.get("lora_rank") is not None:
+      adapter_state["lora_config"] = {
+        "rank": metadata.get("lora_rank"),
+        "train_attn": metadata.get("train_attn", True),
+        "train_mlp": metadata.get("train_mlp", True),
+        "train_unembed": metadata.get("train_unembed", True),
+      }
     self.adapter_states[model_id] = adapter_state
 
     if ENABLE_GRADIENT_CHECKPOINTING:

@@ -1,6 +1,7 @@
 # This file contains the FastAPI server entry point and request handlers for the Open-RL API backend.
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -77,6 +78,43 @@ def sampler_session_id(model_id: str, seq_id: int | str) -> str:
 
 def sampler_weights_path(model_id: str, name: str) -> str:
   return f"tinker://{model_id}/sampler_weights/{name}"
+
+
+def weights_path(model_id: str, name: str) -> str:
+  return f"tinker://{model_id}/weights/{name}"
+
+
+def parse_tinker_path(path: str) -> tuple[str, str, str] | None:
+  if not path.startswith("tinker://"):
+    return None
+  parts = path[len("tinker://") :].split("/", 2)
+  if len(parts) != 3 or not all(parts):
+    return None
+  return parts[0], parts[1], parts[2]
+
+
+def local_weights_path(model_id: str, name: str) -> str:
+  return os.path.join(TMP_DIR, "checkpoints", model_id, "weights", name)
+
+
+def resolve_weights_path(path: str, model_id: str | None = None) -> str:
+  if os.path.isabs(path):
+    return path
+
+  parsed = parse_tinker_path(path)
+  if parsed is not None and parsed[1] == "weights":
+    return local_weights_path(parsed[0], parsed[2])
+
+  if model_id is not None:
+    return local_weights_path(model_id, path)
+
+  return os.path.join(TMP_DIR, "checkpoints", path)
+
+
+def weights_response_path(path: str, model_id: str) -> str:
+  if os.path.isabs(path) or path.startswith("tinker://"):
+    return path
+  return weights_path(model_id, path)
 
 
 def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
@@ -241,8 +279,7 @@ async def create_model_from_state(req: dict):
   state_path = req.get("state_path")
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "state_path is required"})
-  # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
-  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
+  resolved_path = resolve_weights_path(state_path)
   model_id = str(uuid.uuid4())
   req_id = await _enqueue(
     {
@@ -269,6 +306,39 @@ async def get_info(req: dict):
     "lora_rank": 16,
     "model_name": model_name,
     "type": "get_info",
+  }
+
+
+@app.post("/api/v1/weights_info")
+async def weights_info(req: dict):
+  path = req.get("tinker_path") or req.get("path")
+  if not path:
+    return JSONResponse(status_code=400, content={"error": "tinker_path is required"})
+
+  metadata_path = os.path.join(resolve_weights_path(path), "metadata.json")
+  if not os.path.exists(metadata_path):
+    return JSONResponse(status_code=404, content={"error": f"No checkpoint metadata found for {path}"})
+
+  with open(metadata_path) as f:
+    metadata = json.load(f)
+
+  base_model = metadata.get("base_model")
+  if not base_model:
+    return JSONResponse(status_code=400, content={"error": f"metadata.json at {metadata_path} missing base_model"})
+
+  is_lora = metadata.get("training_mode") != "full"
+  if not is_lora and os.getenv("OPEN_RL_TRAINING_MODE", "").lower() == "full":
+    # The stock SDK asserts that create_training_client_from_state is LoRA-shaped.
+    # In full-mode the server ignores the LoRA shape and creates/loads a full worker.
+    is_lora = True
+
+  return {
+    "base_model": base_model,
+    "is_lora": is_lora,
+    "lora_rank": metadata.get("lora_rank", 16) if is_lora else None,
+    "train_unembed": metadata.get("train_unembed") if "train_unembed" in metadata else (True if is_lora else None),
+    "train_mlp": metadata.get("train_mlp") if "train_mlp" in metadata else (True if is_lora else None),
+    "train_attn": metadata.get("train_attn") if "train_attn" in metadata else (True if is_lora else None),
   }
 
 
@@ -319,12 +389,6 @@ async def optim_step(req: dict):
 
 @app.post("/api/v1/save_weights_for_sampler")
 async def save_weights_for_sampler(req: dict):
-  """TrainingClient.save_weights_for_sampler().
-
-  The SDK uses this for both named sampler checkpoints and ephemeral
-  save_weights_and_get_sampling_client() snapshots. Route it through the trainer
-  queue so the sampler always sees weights saved after prior training requests.
-  """
   model_id = req.get("model_id")
   if not model_id:
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
@@ -333,12 +397,13 @@ async def save_weights_for_sampler(req: dict):
   alias = req.get("name") or req.get("alias") or req.get("path")
 
   session_id = sampler_session_id(model_id, seq_id)
+  path = sampler_weights_path(model_id, alias) if alias else session_id
   req_id = await _enqueue(
     {
       "model_id": model_id,
       "type": "save_weights_for_sampler",
       "alias": alias,
-      "path": sampler_weights_path(model_id, alias) if alias else None,
+      "path": path,
       "sampling_session_id": session_id,
     }
   )
@@ -347,20 +412,14 @@ async def save_weights_for_sampler(req: dict):
 
 @app.post("/api/v1/save_weights")
 async def save_weights(req: dict):
-  """TrainingClient.save_weights() / save_state() — persists adapter to TMP_DIR/checkpoints/<alias>.
-
-  This is the endpoint the tinker SDK hits for both save_weights() and save_state().
-  When `path` is provided we treat it as a named checkpoint alias and resolve to
-  TMP_DIR/checkpoints/<alias> (or leave absolute paths alone), so subsequent
-  `create_training_client_from_state(alias)` calls can find the adapter.
-  """
   model_id = req.get("model_id")
   if not model_id:
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
 
   seq_id = req.get("seq_id") or int(time.time() * 1000)
   alias = req.get("path") or f"{model_id}-samp-{seq_id}"
-  state_path = alias if os.path.isabs(alias) else os.path.join(TMP_DIR, "checkpoints", alias)
+  state_path = resolve_weights_path(alias, model_id)
+  response_path = weights_response_path(alias, model_id)
 
   req_id = str(uuid.uuid4())
   await _enqueue(
@@ -369,6 +428,7 @@ async def save_weights(req: dict):
       "model_id": model_id,
       "type": "save_state",
       "state_path": state_path,
+      "response_path": response_path,
       "include_optimizer": bool(req.get("include_optimizer", False)),
       "kind": "weights",
     }
@@ -378,7 +438,6 @@ async def save_weights(req: dict):
 
 @app.post("/api/v1/load_weights")
 async def load_weights(req: dict):
-  """TrainingClient.load_state() / load_state_with_optimizer()."""
   model_id = req.get("model_id")
   state_path = req.get("path")
   if not model_id:
@@ -386,7 +445,7 @@ async def load_weights(req: dict):
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "path is required"})
 
-  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
+  resolved_path = resolve_weights_path(state_path, model_id)
   req_id = await _enqueue(
     {
       "model_id": model_id,
