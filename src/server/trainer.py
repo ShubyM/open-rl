@@ -17,6 +17,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
 
 
+def defer_cuda_probe() -> bool:
+  return bool(os.getenv("OPEN_RL_SCHEDULER_SOCKET") and os.getenv("OPEN_RL_WORKER_RUN_ID"))
+
+
 class TensorData(BaseModel):
   data: list[int] | list[float]
 
@@ -60,10 +64,11 @@ class TrainerEngine:
 
     # Store per-adapter training state by model_id (adapter ID).
     self.adapter_states: dict[str, dict[str, Any]] = {}
+    self.full_model_id: str | None = None
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
 
     # Decide device
-    if torch.cuda.is_available():
+    if defer_cuda_probe() or torch.cuda.is_available():
       self.device = torch.device("cuda")
     elif torch.backends.mps.is_available():
       self.device = torch.device("mps")
@@ -79,10 +84,32 @@ class TrainerEngine:
     print(f"Loading base model {base_model_name} to {self.device}...")
     self.base_model_name = base_model_name
     self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    dtype = torch.bfloat16 if self.device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
     self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
     print("Successfully loaded.")
+
+  def create_full_model(self, model_id: str, base_model_name: str) -> None:
+    """Materialize one full-parameter fine-tuning model for this worker."""
+    if self.peft_model is not None:
+      raise ValueError("Full fine-tuning workers cannot share a process with LoRA adapters")
+    if self.full_model_id is not None and self.full_model_id != model_id:
+      raise ValueError(f"Full fine-tuning worker already owns run '{self.full_model_id}'")
+
+    self.load_base_model(base_model_name)
+    assert self.base_model is not None
+
+    for param in self.base_model.parameters():
+      param.requires_grad_(True)
+
+    params = [param for param in self.base_model.parameters() if param.requires_grad]
+    if not params:
+      raise ValueError("No trainable parameters found for full fine-tuning")
+
+    self.base_model.train()
+    self.full_model_id = model_id
+    self.adapter_states[model_id] = {"trainable_params": params, "optimizer": None, "training_mode": "full"}
+    print(f"Full fine-tuning model '{model_id}' created.")
 
   def _target_lora_modules(self, config: LoraConfig) -> list[str]:
     assert self.base_model is not None
@@ -157,6 +184,7 @@ class TrainerEngine:
   def save_adapter(self, adapter_id: str, alias: str | None = None) -> None:
     """Save adapter weights to disk for reliability and sharing."""
     try:
+      assert self.peft_model is not None, "PEFT model must be loaded first."
       tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
       save_path = os.path.join(tmp_dir, "peft", adapter_id)
       os.makedirs(save_path, exist_ok=True)
@@ -177,7 +205,38 @@ class TrainerEngine:
       traceback.print_exc()
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
-    """Save adapter weights (and optionally optimizer state) to a specific path."""
+    """Save weights (and optionally optimizer state) to a specific path.
+
+    Full fine-tuning writes a standard HuggingFace model directory (config + safetensors +
+    tokenizer) that any loader (transformers, vLLM) can serve directly. LoRA writes the adapter.
+    """
+    if self.is_full_model(model_id):
+      assert self.base_model is not None, "Model must be loaded first."
+      os.makedirs(state_path, exist_ok=True)
+      self.base_model.save_pretrained(state_path)
+      if self.tokenizer is not None:
+        self.tokenizer.save_pretrained(state_path)
+
+      adapter_state = self.adapter_states.get(model_id)
+      optimizer = adapter_state.get("optimizer") if adapter_state is not None else None
+      if include_optimizer and optimizer is not None:
+        torch.save(optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
+
+      metadata = {
+        "base_model": self.base_model_name,
+        "created_at": datetime.now().isoformat(),
+        "kind": kind,
+        "training_mode": "full",
+        "has_optimizer": include_optimizer and optimizer is not None,
+        "model_id": model_id,
+        "timestamp": time.time(),
+      }
+      with open(os.path.join(state_path, "metadata.json"), "w") as f:
+        json.dump(metadata, f)
+
+      print(f"Saved full model for '{model_id}' to {state_path}")
+      return {"path": state_path}
+
     assert self.peft_model is not None, "Model must be loaded first."
 
     self.peft_model.set_adapter(model_id)
@@ -264,22 +323,36 @@ class TrainerEngine:
     print(f"Loaded state for '{model_id}' from {state_path}")
     return {"model_id": model_id, "is_lora": True, "base_model": base_model}
 
-  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
-    """Core training step: forward pass, loss computation, and backward pass."""
+  def is_full_model(self, model_id: str | None) -> bool:
+    if not model_id:
+      return False
+    adapter_state = self.adapter_states.get(model_id)
+    return adapter_state is not None and adapter_state.get("training_mode") == "full"
+
+  def training_model(self, model_id: str | None = None) -> Any:
+    if self.is_full_model(model_id):
+      assert self.base_model is not None, "Model must be loaded first."
+      return self.base_model
+
     assert self.peft_model is not None, "Model must be loaded first."
     if model_id:
       self.peft_model.set_adapter(model_id)
+    return self.peft_model
+
+  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
+    """Core training step: forward pass, loss computation, and backward pass."""
+    model = self.training_model(model_id)
 
     total_loss = 0.0
     loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
 
-    self.peft_model.train()
+    model.train()
 
     for batch in self._make_training_batches(data):
       batch_indices = [idx for idx, _ in batch]
       batch_data = [datum for _, datum in batch]
 
-      target_logprobs, weights, aux_inputs, lengths = self._get_logprobs_batch(batch_data)
+      target_logprobs, weights, aux_inputs, lengths = self._get_logprobs_batch(batch_data, model)
       match loss_fn:
         case "cross_entropy":
           elementwise_loss = self._cross_entropy_loss(target_logprobs, weights)
@@ -349,8 +422,9 @@ class TrainerEngine:
 
     return batches
 
-  def _get_logprobs_batch(self, data: list[Datum]) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], list[int]]:
-    assert self.peft_model is not None
+  def _get_logprobs_batch(self, data: list[Datum], model: Any | None = None) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], list[int]]:
+    model = model or self.peft_model
+    assert model is not None
 
     pad_token_id = self.tokenizer.pad_token_id if self.tokenizer and self.tokenizer.pad_token_id is not None else 0
     batch_size = len(data)
@@ -391,7 +465,7 @@ class TrainerEngine:
         values = datum.loss_fn_inputs[key].data[:seq_len]
         aux_tensor[row, :seq_len] = torch.tensor(values, dtype=loss_dtype, device=self.device)
 
-    outputs = self.peft_model(input_tensor, attention_mask=attention_mask, use_cache=False, return_dict=True)
+    outputs = model(input_tensor, attention_mask=attention_mask, use_cache=False, return_dict=True)
     logits = outputs.logits[:, :max_target_len, :]
     target_logprobs = torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
 
@@ -450,20 +524,23 @@ class TrainerEngine:
 
   def set_active_adapter(self, adapter_id: str) -> None:
     """Switch which LoRA adapter is active."""
+    if self.is_full_model(adapter_id):
+      return
     if self.peft_model is not None:
       self.peft_model.set_adapter(adapter_id)
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str) -> dict[str, Any]:
     """Apply accumulated gradients and update model weights."""
-    assert self.peft_model is not None, "Model must be loaded first."
     if not model_id:
       raise ValueError("model_id is required for optim_step")
 
-    self.peft_model.set_adapter(model_id)
+    if not self.is_full_model(model_id):
+      assert self.peft_model is not None, "Model must be loaded first."
+      self.peft_model.set_adapter(model_id)
     try:
       adapter_state = self.adapter_states[model_id]
     except KeyError as e:
-      raise ValueError(f"Adapter '{model_id}' has no cached trainable parameters") from e
+      raise ValueError(f"Model '{model_id}' has no cached trainable parameters") from e
     params = adapter_state["trainable_params"]
 
     if adapter_state.get("optimizer") is None:
@@ -500,7 +577,8 @@ class TrainerEngine:
     optimizer.step()
     optimizer.zero_grad()
 
-    self.save_adapter(model_id)
+    if not self.is_full_model(model_id):
+      self.save_adapter(model_id)
 
     return {
       "metrics": {
@@ -518,19 +596,16 @@ class TrainerEngine:
     include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
     """Generate completions from the current model."""
-    assert self.peft_model is not None, "Model must be loaded first."
-
-    if model_id:
-      self.peft_model.set_adapter(model_id)
-    self.peft_model.eval()
+    model = self.training_model(model_id)
+    model.eval()
 
     input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
     do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
-    prompt_logprobs = self._prompt_logprobs(input_tensor) if include_prompt_logprobs else None
+    prompt_logprobs = self._prompt_logprobs(input_tensor, model) if include_prompt_logprobs else None
 
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
-      outputs = self.peft_model.generate(
+      outputs = model.generate(
         input_tensor,
         attention_mask=attention_mask,
         max_new_tokens=max_tokens,
@@ -564,12 +639,10 @@ class TrainerEngine:
       result["prompt_logprobs"] = prompt_logprobs
     return result
 
-  def _prompt_logprobs(self, input_tensor: torch.Tensor) -> list[float | None]:
-    assert self.peft_model is not None, "Model must be loaded first."
-
+  def _prompt_logprobs(self, input_tensor: torch.Tensor, model: Any) -> list[float | None]:
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
-      outputs = self.peft_model(input_tensor, attention_mask=attention_mask)
+      outputs = model(input_tensor, attention_mask=attention_mask)
       logprob_dist = torch.nn.functional.log_softmax(outputs.logits[0, :-1], dim=-1)
 
     prompt_tokens = input_tensor[0].tolist()

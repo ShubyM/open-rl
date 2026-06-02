@@ -16,6 +16,7 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from store import get_store
+from worker_launcher import launch_worker
 
 store = get_store()
 
@@ -51,7 +52,8 @@ VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
 
 
 def is_single_process_mode() -> bool:
-  return bool(os.getenv("BASE_MODEL")) and not bool(os.getenv("REDIS_URL"))
+  # A shared store (Redis or a file-backed dir) means workers run as separate processes.
+  return bool(os.getenv("BASE_MODEL")) and not (os.getenv("REDIS_URL") or os.getenv("OPEN_RL_STORE_DIR"))
 
 
 def get_sampler_backend() -> str:
@@ -188,7 +190,7 @@ async def client_config(_: dict):
 
 @app.post("/api/v1/create_session")
 async def create_session(_: dict):
-  return {"session_id": "sess-real-123", "type": "create_session"}
+  return {"session_id": str(uuid.uuid4()), "type": "create_session"}
 
 
 @app.post("/api/v1/session_heartbeat")
@@ -202,7 +204,24 @@ async def create_model(req: dict):
   base_model = req.get("base_model")
   if not base_model:
     return JSONResponse(status_code=400, content={"error": "base_model is required"})
-  model_id = str(uuid.uuid4())
+  # OPEN_RL_TRAINING_MODE=full forces every job to full fine-tuning, so the stock (LoRA-only)
+  # tinker SDK create_lora_training_client() yields a full-FT model with no client changes.
+  force_full = os.getenv("OPEN_RL_TRAINING_MODE", "").lower() == "full"
+  training_mode = "full" if force_full or req.get("training_mode") == "full" or req.get("full_finetune") or req.get("is_lora") is False else "lora"
+  session_id = req.get("session_id")
+  model_seq_id = req.get("model_seq_id")
+  if not session_id:
+    return JSONResponse(status_code=400, content={"error": "session_id is required"})
+  if model_seq_id is None:
+    return JSONResponse(status_code=400, content={"error": "model_seq_id is required"})
+  model_id = f"{session_id}-{model_seq_id}"
+  if training_mode == "full" and (scheduler_socket := os.getenv("OPEN_RL_SCHEDULER_SOCKET")):
+    try:
+      process = launch_worker(model_id, scheduler_socket)
+    except Exception as exc:
+      return JSONResponse(status_code=500, content={"error": f"failed to launch trainer worker: {exc}"})
+    print(f"[GATEWAY] Launched full fine-tuning worker pid={process.pid} run_id={model_id}.")
+
   req_id = await _enqueue(
     {
       "req_id": model_id,
@@ -210,6 +229,7 @@ async def create_model(req: dict):
       "type": "create_model",
       "base_model": base_model,
       "lora_config": req.get("lora_config") or {},
+      "training_mode": training_mode,
     }
   )
   return {"request_id": req_id}

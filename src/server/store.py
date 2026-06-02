@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -18,6 +19,11 @@ class RequestStore(ABC):
   @abstractmethod
   async def get_requests(self) -> list[dict[str, Any]]:
     """Block until at least 1 request is available, then return all currently queued requests."""
+    pass
+
+  @abstractmethod
+  async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
+    """Block for one model queue, then drain only that model's currently queued requests."""
     pass
 
   @abstractmethod
@@ -74,6 +80,21 @@ class InMemoryStore(RequestStore):
 
       # If completely empty, remove from rotation
       if queue.empty():
+        self.active_tenants.remove(model_id)
+
+      return batch
+
+  async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
+    async with self.active_tenants_cv:
+      while model_id not in self.queues or self.queues[model_id].empty():
+        await self.active_tenants_cv.wait()
+
+      queue = self.queues[model_id]
+      batch = [queue.get_nowait()]
+      while not queue.empty():
+        batch.append(queue.get_nowait())
+
+      if queue.empty() and model_id in self.active_tenants:
         self.active_tenants.remove(model_id)
 
       return batch
@@ -155,6 +176,26 @@ class RedisStore(RequestStore):
 
     return batch
 
+  async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
+    queue_key = f"open_rl:queue:{model_id}"
+    result = await self.redis.blpop(queue_key, timeout=5)
+    if not result:
+      return []
+
+    batch = [json.loads(result[1])]
+    while True:
+      item = await self.redis.lpop(queue_key)
+      if not item:
+        break
+      batch.append(json.loads(item))
+
+    q_len = await self.redis.llen(queue_key)
+    if q_len == 0:
+      await self.redis.lrem(self.active_list, 0, model_id)
+      await self.redis.srem(self.active_set, model_id)
+
+    return batch
+
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
       return
@@ -177,6 +218,90 @@ class RedisStore(RequestStore):
     return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
 
 
+class FileStore(RequestStore):
+  """Cross-process store backed by a shared directory — no external server (Redis) needed.
+
+  Works across separately-launched worker subprocesses on the same machine via the filesystem,
+  so it's the local-dev/no-Redis option for the dynamic-worker path. Requests and futures are
+  written as atomic JSON files (write-temp + rename); consumers poll and drain.
+  """
+
+  def __init__(self, root: str):
+    self.root = root
+    self.qroot = os.path.join(root, "queue")
+    self.froot = os.path.join(root, "future")
+    os.makedirs(self.qroot, exist_ok=True)
+    os.makedirs(self.froot, exist_ok=True)
+
+  def _qdir(self, model_id: str) -> str:
+    return os.path.join(self.qroot, model_id.replace("/", "__"))
+
+  def _write_atomic(self, path: str, data: dict[str, Any]) -> None:
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+      json.dump(data, f)
+    os.rename(tmp, path)
+
+  def _drain_dir(self, d: str) -> list[dict[str, Any]]:
+    if not os.path.isdir(d):
+      return []
+    batch = []
+    for fn in sorted(fn for fn in os.listdir(d) if fn.endswith(".json")):
+      p = os.path.join(d, fn)
+      try:
+        with open(p) as f:
+          data = json.load(f)
+        os.unlink(p)
+        batch.append(data)
+      except (FileNotFoundError, json.JSONDecodeError):
+        continue
+    return batch
+
+  async def put_request(self, req_data: dict[str, Any]) -> None:
+    d = self._qdir(req_data.get("model_id", "default"))
+    os.makedirs(d, exist_ok=True)
+    name = f"{time.time_ns()}_{req_data.get('req_id', '')}.json"
+    await asyncio.to_thread(self._write_atomic, os.path.join(d, name), req_data)
+
+  async def get_requests(self) -> list[dict[str, Any]]:
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+      for model_dir in sorted(os.listdir(self.qroot)) if os.path.isdir(self.qroot) else []:
+        batch = await asyncio.to_thread(self._drain_dir, os.path.join(self.qroot, model_dir))
+        if batch:
+          return batch
+      await asyncio.sleep(0.1)
+    return []
+
+  async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
+    d = self._qdir(model_id)
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+      batch = await asyncio.to_thread(self._drain_dir, d)
+      if batch:
+        return batch
+      await asyncio.sleep(0.1)
+    return []
+
+  async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
+    if result.get("status") == "pending":
+      return
+    await asyncio.to_thread(self._write_atomic, os.path.join(self.froot, f"{req_id}.json"), result)
+
+  async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
+    p = os.path.join(self.froot, f"{req_id}.json")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+      if os.path.exists(p):
+        try:
+          with open(p) as f:
+            return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+          pass
+      await asyncio.sleep(0.05)
+    return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
+
+
 # Global singleton factory
 _store_instance = None
 
@@ -185,9 +310,13 @@ def get_store() -> RequestStore:
   global _store_instance
   if _store_instance is None:
     redis_url = os.environ.get("REDIS_URL")
+    store_dir = os.environ.get("OPEN_RL_STORE_DIR")
     if redis_url:
       print(f"[RequestStore] Initializing Redis backend at {redis_url} with RR Tenant Queues")
       _store_instance = RedisStore(redis_url)
+    elif store_dir:
+      print(f"[RequestStore] Initializing File backend at {store_dir} (cross-process, no Redis)")
+      _store_instance = FileStore(store_dir)
     else:
       print("[RequestStore] Initializing In-Memory backend with RR Tenant Queues")
       _store_instance = InMemoryStore()
