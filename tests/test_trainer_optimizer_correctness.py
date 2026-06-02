@@ -128,6 +128,33 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
       self.assertTrue(torch.allclose(active_param.grad, torch.zeros_like(active_param.grad)))
     self.assertIsNotNone(other_param.grad)
 
+  def test_optim_step_updates_full_model_params_without_adapter(self) -> None:
+    full_param = torch.nn.Parameter(torch.tensor([1.0]))
+    full_param.grad = torch.tensor([1.0])
+
+    engine = TrainerEngine()
+    engine.base_model = types.SimpleNamespace()
+    engine.peft_model = None
+    engine.full_model_id = "full-run"
+    engine.adapter_states = {"full-run": {"trainable_params": [full_param], "optimizer": None, "training_mode": "full"}}
+    engine.save_adapter = lambda *_args, **_kwargs: self.fail("full fine-tuning optim_step must not save a LoRA adapter")
+
+    result = engine.optim_step(
+      {
+        "learning_rate": 0.1,
+        "beta1": 0.0,
+        "beta2": 0.0,
+        "eps": 1e-8,
+        "weight_decay": 0.0,
+      },
+      "full-run",
+    )
+
+    self.assertAlmostEqual(result["metrics"]["grad_norm:mean"], 1.0)
+    self.assertFalse(torch.allclose(full_param.detach(), torch.tensor([1.0])))
+    if full_param.grad is not None:
+      self.assertTrue(torch.allclose(full_param.grad, torch.zeros_like(full_param.grad)))
+
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
   def _engine(self) -> TrainerEngine:
@@ -221,6 +248,18 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     for datum, output in zip(data, result["loss_fn_outputs"], strict=True):
       logprobs = output["logprobs"]
       self.assertEqual(logprobs["shape"], [min(len(datum.model_input), len(datum.loss_fn_inputs["target_tokens"].data))])
+
+  def test_forward_backward_supports_full_model_without_peft_adapter(self) -> None:
+    engine = self._engine()
+    engine.base_model = engine.peft_model
+    engine.peft_model = None
+    engine.full_model_id = "full-run"
+    engine.adapter_states = {"full-run": {"trainable_params": [], "optimizer": None, "training_mode": "full"}}
+
+    result = engine.forward_backward(self._data()[:1], "cross_entropy", model_id="full-run")
+
+    self.assertEqual(len(result["loss_fn_outputs"]), 1)
+    self.assertGreater(result["metrics"]["loss:sum"], 0.0)
 
 
 if __name__ == "__main__":
