@@ -26,7 +26,8 @@ python examples/sft/gsm8k/gsm8k_sft.py base_model=Qwen/Qwen2.5-0.5B epochs=1 lr=
 Training uses `tinker_cookbook.supervised.train`, so batching, LR scheduling, metric logging, and
 final checkpoint export are handled by the cookbook loop. The final checkpoint is recorded under
 `artifacts/gsm8k_sft/checkpoints.jsonl`; for full-FT the sampler checkpoint path points at a
-standard HF model directory.
+standard HF model directory. Since this prototype runs training and eval on the same machine, the
+script also prints `eval_model_path=<local_dir>` after training.
 
 ## Current resume behavior
 
@@ -51,7 +52,7 @@ Eval is decoupled (point a server at the saved dir). With vLLM:
 
 ```bash
 VLLM_USE_FLASHINFER_SAMPLER=0 python examples/sft/gsm8k/vllm_eval.py \
-  --path <saved_dir> --data gsm8k_test.json   # ~5s for 250 problems
+  --path <eval_model_path> --data gsm8k_test.json   # ~5s for 250 problems
 ```
 
 ## Results (Qwen2.5-0.5B, 1 epoch, lr 2e-5, 0-shot exact-match on 250 test problems)

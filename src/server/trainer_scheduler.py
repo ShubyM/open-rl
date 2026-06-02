@@ -248,7 +248,7 @@ async def main_async() -> None:
 
 
 def main() -> None:
-  logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+  logging.basicConfig(level=logging.INFO, format="[SCHEDULER] %(levelname)s %(message)s")
   asyncio.run(main_async())
 
 

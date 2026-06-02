@@ -6,7 +6,7 @@ import chz
 import tinker
 from datasets import load_dataset
 from tinker import types
-from tinker_cookbook import cli_utils
+from tinker_cookbook import checkpoint_utils, cli_utils
 from tinker_cookbook.supervised.data import SupervisedDatasetFromHFDataset
 from tinker_cookbook.supervised.train import Config as TrainConfig
 from tinker_cookbook.supervised.train import main as train
@@ -81,6 +81,12 @@ def main(config: Config) -> None:
       )
     )
   )
+  checkpoint = checkpoint_utils.get_last_checkpoint(config.log_path, required_key="sampler_path")
+  if checkpoint and checkpoint.sampler_path:
+    path = checkpoint.sampler_path
+    if path.startswith("tinker://"):
+      path = str(Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")) / "sampler_full" / path.removeprefix("tinker://"))
+    print(f"eval_model_path={path}")
 
 
 if __name__ == "__main__":
