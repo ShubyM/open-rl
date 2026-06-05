@@ -1,4 +1,4 @@
-# This file contains the core training engine logic for Open-RL, handling forward/backward passes and optimization steps.
+# LoRA trainer worker lifecycle and adapter management.
 
 import json
 import math
@@ -12,15 +12,11 @@ import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import PeftModelForCausalLM, get_peft_model
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
-from training import losses
+from training.trainer_worker import BaseTrainerWorker, Datum
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
-
-
-class TensorData(BaseModel):
-  data: list[int] | list[float]
 
 
 class LoraConfig(BaseModel):
@@ -33,12 +29,7 @@ class LoraConfig(BaseModel):
   train_unembed: bool = False
 
 
-class Datum(BaseModel):
-  loss_fn_inputs: dict[str, TensorData]
-  model_input: list[int]
-
-
-def active_adapter_parameters(model: Any, adapter_id: str) -> list[torch.nn.Parameter]:
+def active_adapter_parameters(model: PeftModelForCausalLM, adapter_id: str) -> list[torch.nn.Parameter]:
   model.set_adapter(adapter_id)
   params = [param for param in model.parameters() if param.requires_grad]
   if not params:
@@ -46,31 +37,14 @@ def active_adapter_parameters(model: Any, adapter_id: str) -> list[torch.nn.Para
   return params
 
 
-class TrainerEngine:
+class LoraTrainingWorker(BaseTrainerWorker):
   def __init__(self):
-    # The raw pre-trained base model (e.g., Gemma, Qwen) loaded in VRAM
+    super().__init__()
     self.base_model: PreTrainedModel | None = None
-
-    # The model wrapped with PEFT/LoRA adapters that we actually train
     self.peft_model: PeftModelForCausalLM | None = None
-
-    # The tokenizer associated with the base model
-    self.tokenizer: PreTrainedTokenizerBase | None = None
-
-    # String identifier of the currently loaded base model
     self.base_model_name: str | None = None
-
-    # Store per-adapter training state by model_id (adapter ID).
     self.adapter_states: dict[str, dict[str, Any]] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
-
-    # Decide device
-    if torch.cuda.is_available():
-      self.device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-      self.device = torch.device("mps")
-    else:
-      self.device = torch.device("cpu")
 
   def load_base_model(self, base_model_name: str) -> None:
     """Eagerly load the massive base model tensors into VRAM."""
@@ -86,7 +60,7 @@ class TrainerEngine:
     self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
     print("Successfully loaded.")
 
-  def _target_lora_modules(self, config: LoraConfig) -> list[str]:
+  def target_lora_modules(self, config: LoraConfig) -> list[str]:
     assert self.base_model is not None
 
     cache_key = (config.train_attn, config.train_mlp, config.train_unembed)
@@ -129,7 +103,7 @@ class TrainerEngine:
       lora_alpha=config.lora_alpha,
       lora_dropout=config.lora_dropout,
       bias="none",
-      target_modules=self._target_lora_modules(config),
+      target_modules=self.target_lora_modules(config),
       modules_to_save=None,
     )
 
@@ -267,175 +241,10 @@ class TrainerEngine:
     return {"model_id": model_id, "is_lora": True, "base_model": base_model}
 
   def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
-    """Core training step: forward pass, loss computation, and backward pass."""
     assert self.peft_model is not None, "Model must be loaded first."
     if model_id:
       self.peft_model.set_adapter(model_id)
-
-    total_loss = 0.0
-    loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
-
-    self.peft_model.train()
-
-    for batch in self.make_training_batches(data):
-      batch_indices = [idx for idx, _ in batch]
-      batch_data = [datum for _, datum in batch]
-
-      input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
-      target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
-      target_logprobs = self.compute_target_logprobs(input_ids, attention_mask, target_token_ids)
-
-      match loss_fn:
-        case "cross_entropy":
-          elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
-        case "importance_sampling":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
-          elementwise_loss = losses.importance_sampling_loss(
-            target_logprobs,
-            weights,
-            old_logprobs,
-            advantages,
-          )
-        case "ppo":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
-          elementwise_loss = losses.ppo_loss(
-            target_logprobs,
-            weights,
-            old_logprobs,
-            advantages,
-            loss_config,
-          )
-        case _:
-          raise NotImplementedError(f"Loss {loss_fn} not supported")
-
-      per_datum_loss = elementwise_loss.sum(dim=1)
-      loss = per_datum_loss.sum()
-      loss.backward()
-      total_loss += loss.item()
-
-      detached_logprobs = target_logprobs.detach().cpu()
-      for row, original_idx in enumerate(batch_indices):
-        row_len = lengths[row]
-        logprobs_list = detached_logprobs[row, :row_len].tolist()
-        logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
-        loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
-
-    mean_loss = total_loss / max(1, len(data))
-    completed_loss_fn_outputs = []
-    for output in loss_fn_outputs:
-      if output is None:
-        raise RuntimeError("forward_backward did not produce one loss_fn_output per input datum")
-      completed_loss_fn_outputs.append(output)
-
-    return {
-      "metrics": {"loss:mean": self._sanitize_float(mean_loss), "loss:sum": self._sanitize_float(total_loss)},
-      "loss_fn_outputs": completed_loss_fn_outputs,
-      "loss_fn_output_type": "ArrayRecord",
-    }
-
-  def make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:
-    """Group examples for the single padded forward/backward path."""
-    if len(data) <= 1:
-      return [[(idx, datum)] for idx, datum in enumerate(data)]
-
-    token_budget = int(os.getenv("OPEN_RL_TRAIN_TOKEN_BUDGET", "0"))
-
-    if token_budget <= 0:
-      return [[(idx, datum)] for idx, datum in enumerate(data)]
-
-    ordered_data = sorted(enumerate(data), key=lambda item: len(item[1].model_input))
-    batches: list[list[tuple[int, Datum]]] = []
-    batch: list[tuple[int, Datum]] = []
-    batch_max_len = 0
-
-    for item in ordered_data:
-      length = len(item[1].model_input)
-      next_max_len = max(batch_max_len, length)
-      next_size = len(batch) + 1
-      over_token_budget = next_max_len * next_size > token_budget
-
-      if batch and over_token_budget:
-        batches.append(batch)
-        batch = []
-        batch_max_len = 0
-
-      batch.append(item)
-      batch_max_len = max(batch_max_len, length)
-
-    if batch:
-      batches.append(batch)
-
-    return batches
-
-  def pad_sequences(
-    self,
-    sequences: list[list[int] | list[float]],
-    lengths: list[int],
-    dtype: torch.dtype,
-    pad_value: int | float = 0,
-  ) -> torch.Tensor:
-    """Return padded values with shape [batch, max(lengths)]."""
-    padded = torch.full((len(sequences), max(lengths)), pad_value, dtype=dtype, device=self.device)
-    for row, sequence in enumerate(sequences):
-      length = lengths[row]
-      padded[row, :length] = padded.new_tensor(sequence[:length])
-    return padded
-
-  def pad_model_inputs(
-    self,
-    data: list[Datum],
-  ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """Return input_ids and attention_mask with shape [batch, max_input_len]."""
-    pad_token_id = self.tokenizer.pad_token_id if self.tokenizer and self.tokenizer.pad_token_id is not None else 0
-    batch_size = len(data)
-    input_lengths = [len(datum.model_input) for datum in data]
-    max_input_len = max(input_lengths)
-
-    input_ids = self.pad_sequences([datum.model_input for datum in data], input_lengths, torch.long, pad_token_id)
-    attention_mask = input_ids.new_zeros((batch_size, max_input_len))
-    for row, input_len in enumerate(input_lengths):
-      attention_mask[row, :input_len] = 1
-
-    return input_ids, attention_mask, input_lengths
-
-  def pad_targets_and_weights(
-    self,
-    data: list[Datum],
-    input_lengths: list[int],
-  ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """Return target_token_ids and weights with shape [batch, max_target_len]."""
-    batch_size = len(data)
-    target_lengths = [len(datum.loss_fn_inputs["target_tokens"].data) for datum in data]
-    lengths = [min(input_lengths[row], target_lengths[row]) for row in range(batch_size)]
-    target_token_ids = self.pad_sequences([datum.loss_fn_inputs["target_tokens"].data for datum in data], lengths, torch.long)
-    weight_sequences = [
-      datum.loss_fn_inputs["weights"].data if "weights" in datum.loss_fn_inputs else [1.0] * target_lengths[row] for row, datum in enumerate(data)
-    ]
-    weights = self.pad_sequences(weight_sequences, lengths, torch.float32)
-
-    return target_token_ids, weights, lengths
-
-  def compute_target_logprobs(
-    self,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    target_token_ids: torch.Tensor,
-  ) -> torch.Tensor:
-    """Return selected target logprobs with shape [batch, max_target_len]."""
-    assert self.peft_model is not None
-
-    outputs = self.peft_model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
-    logits = outputs.logits[:, : target_token_ids.shape[1], :]
-    return torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
-
-  def _sanitize_float(self, val: float) -> float:
-    if math.isinf(val):
-      return -9999.0 if val < 0 else 9999.0
-    if math.isnan(val):
-      return 0.0
-    return val
+    return super().forward_backward(self.peft_model, data, loss_fn, loss_config)
 
   def set_active_adapter(self, adapter_id: str) -> None:
     """Switch which LoRA adapter is active."""
@@ -493,7 +302,7 @@ class TrainerEngine:
 
     return {
       "metrics": {
-        "grad_norm:mean": self._sanitize_float(total_norm.item()),
+        "grad_norm:mean": self.sanitize_float(total_norm.item()),
       },
     }
 
@@ -506,68 +315,9 @@ class TrainerEngine:
     model_id: str | None = None,
     include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
-    """Generate completions from the current model."""
-    assert self.peft_model is not None, "Model must be loaded first."
-
     if model_id:
       self.peft_model.set_adapter(model_id)
-    self.peft_model.eval()
-
-    input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
-    do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
-    prompt_logprobs = self._prompt_logprobs(input_tensor) if include_prompt_logprobs else None
-
-    with torch.no_grad():
-      attention_mask = torch.ones_like(input_tensor)
-      outputs = self.peft_model.generate(
-        input_tensor,
-        attention_mask=attention_mask,
-        max_new_tokens=max_tokens,
-        pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-        do_sample=do_sample,
-        temperature=temperature if do_sample else None,
-        top_p=None,
-        top_k=None,
-        num_return_sequences=num_samples,
-        output_scores=True,
-        return_dict_in_generate=True,
-      )
-
-    sequences_out = []
-    for seq_idx in range(num_samples):
-      gen_sequences = outputs.sequences[seq_idx]
-      generated_tokens = gen_sequences[len(prompt_tokens) :].cpu().tolist()
-
-      logprobs = []
-      for token_step_idx in range(len(generated_tokens)):
-        score_tensor = outputs.scores[token_step_idx]
-        logprob_dist = torch.nn.functional.log_softmax(score_tensor[seq_idx], dim=-1)
-        token_id = generated_tokens[token_step_idx]
-        logprob = logprob_dist[token_id].item()
-        logprobs.append(self._sanitize_float(logprob))
-
-      sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": "stop"})
-
-    result = {"sequences": sequences_out}
-    if prompt_logprobs is not None:
-      result["prompt_logprobs"] = prompt_logprobs
-    return result
-
-  def _prompt_logprobs(self, input_tensor: torch.Tensor) -> list[float | None]:
-    assert self.peft_model is not None, "Model must be loaded first."
-
-    with torch.no_grad():
-      attention_mask = torch.ones_like(input_tensor)
-      outputs = self.peft_model(input_tensor, attention_mask=attention_mask)
-      logprob_dist = torch.nn.functional.log_softmax(outputs.logits[0, :-1], dim=-1)
-
-    prompt_tokens = input_tensor[0].tolist()
-    prompt_logprobs: list[float | None] = [None]
-    for token_idx, token_id in enumerate(prompt_tokens[1:]):
-      logprob = logprob_dist[token_idx, token_id].item()
-      prompt_logprobs.append(self._sanitize_float(logprob))
-
-    return prompt_logprobs
+    return super().generate(self.peft_model, prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
 
 
 def main() -> None:

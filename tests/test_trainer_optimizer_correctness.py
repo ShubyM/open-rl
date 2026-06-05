@@ -10,7 +10,7 @@ import torch
 from tests._server_fixture import SERVER_DIR
 
 
-def _load_trainer_module():
+def _load_trainer_modules():
   stubs = {
     "peft": types.SimpleNamespace(
       LoraConfig=object,
@@ -30,14 +30,16 @@ def _load_trainer_module():
     for module_name in list(sys.modules):
       if module_name == "training" or module_name.startswith("training."):
         del sys.modules[module_name]
-    module = importlib.import_module("training.trainer")
-    module.losses = importlib.import_module("training.losses")
+    trainer_worker = importlib.import_module("training.trainer_worker")
+    lora_trainer_worker = importlib.import_module("training.lora_trainer_worker")
+    losses = importlib.import_module("training.losses")
   sys.path = old_path
-  return module
+  return trainer_worker, lora_trainer_worker, losses
 
 
-trainer_module = _load_trainer_module()
-TrainerEngine = trainer_module.TrainerEngine
+trainer_worker_module, lora_trainer_worker_module, losses_module = _load_trainer_modules()
+BaseTrainerWorker = trainer_worker_module.BaseTrainerWorker
+LoraTrainingWorker = lora_trainer_worker_module.LoraTrainingWorker
 
 
 class _PeftModelStub:
@@ -83,14 +85,14 @@ class _LogitModelStub:
 
 
 def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantages=None):
-  loss_fn_inputs = {"target_tokens": trainer_module.TensorData(data=target_tokens)}
+  loss_fn_inputs = {"target_tokens": trainer_worker_module.TensorData(data=target_tokens)}
   if weights is not None:
-    loss_fn_inputs["weights"] = trainer_module.TensorData(data=weights)
+    loss_fn_inputs["weights"] = trainer_worker_module.TensorData(data=weights)
   if logprobs is not None:
-    loss_fn_inputs["logprobs"] = trainer_module.TensorData(data=logprobs)
+    loss_fn_inputs["logprobs"] = trainer_worker_module.TensorData(data=logprobs)
   if advantages is not None:
-    loss_fn_inputs["advantages"] = trainer_module.TensorData(data=advantages)
-  return trainer_module.Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs)
+    loss_fn_inputs["advantages"] = trainer_worker_module.TensorData(data=advantages)
+  return trainer_worker_module.Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs)
 
 
 class TestTrainerOptimizerCorrectness(unittest.TestCase):
@@ -100,7 +102,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     active_param.grad = torch.tensor([1.0])
     other_param.grad = torch.tensor([10.0])
 
-    engine = TrainerEngine()
+    engine = LoraTrainingWorker()
     engine.peft_model = _PeftModelStub(
       {
         "adapter-a": [active_param],
@@ -108,7 +110,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
       }
     )
     engine.adapter_states = {
-      "adapter-a": {"trainable_params": trainer_module.active_adapter_parameters(engine.peft_model, "adapter-a"), "optimizer": None}
+      "adapter-a": {"trainable_params": lora_trainer_worker_module.active_adapter_parameters(engine.peft_model, "adapter-a"), "optimizer": None}
     }
     engine.save_adapter = lambda *_args, **_kwargs: None
 
@@ -133,12 +135,11 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
-  def _engine(self) -> TrainerEngine:
-    engine = TrainerEngine()
-    engine.device = torch.device("cpu")
-    engine.tokenizer = _TokenizerStub()
-    engine.peft_model = _LogitModelStub()
-    return engine
+  def _worker(self) -> BaseTrainerWorker:
+    worker = BaseTrainerWorker()
+    worker.device = torch.device("cpu")
+    worker.tokenizer = _TokenizerStub()
+    return worker
 
   def _data(self):
     return [
@@ -164,20 +165,21 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       ),
     ]
 
-  def training_tensors(self, engine, data):
-    input_ids, attention_mask, input_lengths = engine.pad_model_inputs(data)
-    target_token_ids, weights, lengths = engine.pad_targets_and_weights(data, input_lengths)
-    logprobs = engine.compute_target_logprobs(input_ids, attention_mask, target_token_ids)
-    old_logprobs = engine.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in data], lengths, torch.float32)
-    advantages = engine.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in data], lengths, torch.float32)
+  def training_tensors(self, worker, model, data):
+    input_ids, attention_mask, input_lengths = worker.pad_model_inputs(data)
+    target_token_ids, weights, lengths = worker.pad_targets_and_weights(data, input_lengths)
+    logprobs = worker.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+    old_logprobs = worker.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in data], lengths, torch.float32)
+    advantages = worker.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in data], lengths, torch.float32)
     return logprobs, weights, old_logprobs, advantages, lengths
 
   def test_padded_batch_logprobs_and_losses_match_per_example_math(self) -> None:
-    engine = self._engine()
+    worker = self._worker()
+    model = _LogitModelStub()
     data = self._data()
 
-    batch_logprobs, batch_weights, batch_old_logprobs, batch_advantages, batch_lengths = self.training_tensors(engine, data)
-    single_results = [self.training_tensors(engine, [datum]) for datum in data]
+    batch_logprobs, batch_weights, batch_old_logprobs, batch_advantages, batch_lengths = self.training_tensors(worker, model, data)
+    single_results = [self.training_tensors(worker, model, [datum]) for datum in data]
 
     for row, (single_logprobs, single_weights, single_old_logprobs, single_advantages, single_lengths) in enumerate(single_results):
       length = batch_lengths[row]
@@ -195,18 +197,18 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       return torch.stack(losses).sum()
 
     torch.testing.assert_close(
-      trainer_module.losses.cross_entropy_loss(batch_logprobs, batch_weights).sum(),
-      single_sum(lambda logprobs, weights, _old_logprobs, _advantages: trainer_module.losses.cross_entropy_loss(logprobs, weights)),
+      losses_module.cross_entropy_loss(batch_logprobs, batch_weights).sum(),
+      single_sum(lambda logprobs, weights, _old_logprobs, _advantages: losses_module.cross_entropy_loss(logprobs, weights)),
     )
     torch.testing.assert_close(
-      trainer_module.losses.importance_sampling_loss(
+      losses_module.importance_sampling_loss(
         batch_logprobs,
         batch_weights,
         batch_old_logprobs,
         batch_advantages,
       ).sum(),
       single_sum(
-        lambda logprobs, weights, old_logprobs, advantages: trainer_module.losses.importance_sampling_loss(
+        lambda logprobs, weights, old_logprobs, advantages: losses_module.importance_sampling_loss(
           logprobs,
           weights,
           old_logprobs,
@@ -216,7 +218,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     )
     ppo_config = {"clip_range": 0.2, "kl_coeff": 0.03}
     torch.testing.assert_close(
-      trainer_module.losses.ppo_loss(
+      losses_module.ppo_loss(
         batch_logprobs,
         batch_weights,
         batch_old_logprobs,
@@ -224,7 +226,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
         ppo_config,
       ).sum(),
       single_sum(
-        lambda logprobs, weights, old_logprobs, advantages: trainer_module.losses.ppo_loss(
+        lambda logprobs, weights, old_logprobs, advantages: losses_module.ppo_loss(
           logprobs,
           weights,
           old_logprobs,
@@ -235,7 +237,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     )
 
   def test_token_budget_batches_preserve_examples(self) -> None:
-    engine = self._engine()
+    engine = self._worker()
     data = self._data()
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "6"}):
       batches = engine.make_training_batches(data)
@@ -247,15 +249,16 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       self.assertTrue(len(batch) == 1 or padded_tokens <= 6)
 
   def test_forward_backward_padded_batches_preserve_client_output_shape(self) -> None:
-    engine = self._engine()
+    worker = self._worker()
+    model = _LogitModelStub()
     data = self._data()
 
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "12"}):
-      result = engine.forward_backward(data, "cross_entropy")
+      result = worker.forward_backward(model, data, "cross_entropy")
 
     self.assertEqual(len(result["loss_fn_outputs"]), len(data))
-    self.assertGreater(len(engine.peft_model.calls), 0)
-    self.assertTrue(any(call[0].shape[0] > 1 for call in engine.peft_model.calls))
+    self.assertGreater(len(model.calls), 0)
+    self.assertTrue(any(call[0].shape[0] > 1 for call in model.calls))
     for datum, output in zip(data, result["loss_fn_outputs"], strict=True):
       logprobs = output["logprobs"]
       self.assertEqual(logprobs["shape"], [min(len(datum.model_input), len(datum.loss_fn_inputs["target_tokens"].data))])
