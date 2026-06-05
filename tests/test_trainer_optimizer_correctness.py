@@ -32,13 +32,15 @@ def _load_trainer_modules():
         del sys.modules[module_name]
     trainer_worker = importlib.import_module("training.trainer_worker")
     lora_trainer_worker = importlib.import_module("training.lora_trainer_worker")
+    fft_trainer_worker = importlib.import_module("training.fft_trainer_worker")
     losses = importlib.import_module("training.losses")
   sys.path = old_path
-  return trainer_worker, lora_trainer_worker, losses
+  return trainer_worker, lora_trainer_worker, fft_trainer_worker, losses
 
 
-trainer_worker_module, lora_trainer_worker_module, losses_module = _load_trainer_modules()
+trainer_worker_module, lora_trainer_worker_module, fft_trainer_worker_module, losses_module = _load_trainer_modules()
 BaseTrainerWorker = trainer_worker_module.BaseTrainerWorker
+FFTTrainingWorker = fft_trainer_worker_module.FFTTrainingWorker
 LoraTrainingWorker = lora_trainer_worker_module.LoraTrainingWorker
 
 
@@ -82,6 +84,17 @@ class _LogitModelStub:
     logits = torch.cos(input_tensor.float().unsqueeze(-1) * 0.11 + positions * 0.07 + vocab * 0.13)
     logits.requires_grad_()
     return types.SimpleNamespace(logits=logits)
+
+
+class _FullModelStub:
+  def __init__(self, params):
+    self.params = params
+
+  def train(self):
+    return None
+
+  def parameters(self):
+    yield from self.params
 
 
 def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantages=None):
@@ -132,6 +145,33 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     if active_param.grad is not None:
       self.assertTrue(torch.allclose(active_param.grad, torch.zeros_like(active_param.grad)))
     self.assertIsNotNone(other_param.grad)
+
+  def test_fft_optim_step_updates_full_model_trainable_params(self) -> None:
+    trainable_param = torch.nn.Parameter(torch.tensor([1.0]))
+    frozen_param = torch.nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+    trainable_param.grad = torch.tensor([1.0])
+    frozen_param.grad = torch.tensor([10.0])
+
+    engine = FFTTrainingWorker()
+    engine.model = _FullModelStub([trainable_param, frozen_param])
+    engine.trainable_params = fft_trainer_worker_module.trainable_model_parameters(engine.model)
+
+    result = engine.optim_step(
+      {
+        "learning_rate": 0.1,
+        "beta1": 0.0,
+        "beta2": 0.0,
+        "eps": 1e-8,
+        "weight_decay": 0.0,
+      }
+    )
+
+    self.assertAlmostEqual(result["metrics"]["grad_norm:mean"], 1.0)
+    self.assertFalse(torch.allclose(trainable_param.detach(), torch.tensor([1.0])))
+    self.assertTrue(torch.allclose(frozen_param.detach(), torch.tensor([1.0])))
+    if trainable_param.grad is not None:
+      self.assertTrue(torch.allclose(trainable_param.grad, torch.zeros_like(trainable_param.grad)))
+    self.assertIsNotNone(frozen_param.grad)
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
@@ -262,6 +302,18 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     for datum, output in zip(data, result["loss_fn_outputs"], strict=True):
       logprobs = output["logprobs"]
       self.assertEqual(logprobs["shape"], [min(len(datum.model_input), len(datum.loss_fn_inputs["target_tokens"].data))])
+
+  def test_fft_forward_backward_uses_single_process_model(self) -> None:
+    worker = FFTTrainingWorker()
+    worker.device = torch.device("cpu")
+    worker.tokenizer = _TokenizerStub()
+    worker.model = _LogitModelStub()
+    data = self._data()
+
+    result = worker.forward_backward(data, "cross_entropy")
+
+    self.assertEqual(len(result["loss_fn_outputs"]), len(data))
+    self.assertGreater(len(worker.model.calls), 0)
 
 
 if __name__ == "__main__":
