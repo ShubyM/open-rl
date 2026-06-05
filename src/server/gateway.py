@@ -16,6 +16,13 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from store import get_store
+from worker_launch_processor import (
+  CreateModelFromStateWorkerLaunchRequest,
+  CreateModelWorkerLaunchRequest,
+  FFTWorkerManager,
+  WorkerLaunchProcessor,
+  WorkerLaunchRequest,
+)
 
 store = get_store()
 
@@ -35,13 +42,13 @@ else:
   print("OpenTelemetry: No exporter configured (ENABLE_GCP_TRACE=0)")
 
 
-class _FilterNoisyEndpoints(logging.Filter):
+class FilterNoisyEndpoints(logging.Filter):
   def filter(self, record: logging.LogRecord) -> bool:
     msg = record.getMessage()
     return "retrieve_future" not in msg and "session_heartbeat" not in msg
 
 
-logging.getLogger("uvicorn.access").addFilter(_FilterNoisyEndpoints())
+logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
@@ -61,12 +68,11 @@ def get_sampler_backend() -> str:
 
 
 def get_default_model_name() -> str | None:
-  if is_single_process_mode():
-    import clock_cycle
-
-    if clock_cycle.engine.base_model_name:
-      return clock_cycle.engine.base_model_name
   return os.getenv("BASE_MODEL")
+
+
+def is_fft_enabled() -> bool:
+  return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
 def sampler_session_id(model_id: str, seq_id: int | str) -> str:
@@ -75,6 +81,12 @@ def sampler_session_id(model_id: str, seq_id: int | str) -> str:
 
 def sampler_weights_path(model_id: str, name: str) -> str:
   return f"tinker://{model_id}/sampler_weights/{name}"
+
+
+def checkpoint_state_path(model_id: str, name: str) -> str:
+  if os.path.isabs(name):
+    return name
+  return os.path.join(TMP_DIR, "checkpoints", model_id, "weights", name)
 
 
 def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
@@ -100,19 +112,32 @@ def is_sampler_weights_ref(model_id: str | None) -> bool:
   return len(parts) >= 3 and parts[1] == "sampler_weights"
 
 
-async def _enqueue(payload: dict) -> str:
-  """Create a pending future, inject trace context, push to store. Returns req_id."""
+async def prepare_enqueue(payload: dict) -> str:
   req_id = payload.get("req_id") or str(uuid.uuid4())
   payload["req_id"] = req_id
   carrier: dict = {}
   propagate.inject(carrier)
   payload["trace_context"] = carrier
   await store.set_future(req_id, {"status": "pending"})
+  return req_id
+
+
+async def enqueue(payload: dict) -> str:
+  """Create a pending future, inject trace context, push to store. Returns req_id."""
+  req_id = await prepare_enqueue(payload)
   await store.put_request(payload)
   return req_id
 
 
-async def _preflight_vllm() -> None:
+async def enqueue_worker_launch(payload: WorkerLaunchRequest) -> str:
+  """Create a pending future and push a create-model request to the worker launch queue."""
+  payload_data = payload.model_dump()
+  req_id = await prepare_enqueue(payload_data)
+  await store.put_worker_launch_request(payload_data)
+  return req_id
+
+
+async def preflight_vllm() -> None:
   """If SAMPLING_BACKEND=vllm, verify the vLLM worker is reachable at VLLM_URL.
 
   Prints a clear, actionable error instead of letting the first asample
@@ -132,28 +157,60 @@ async def _preflight_vllm() -> None:
     ) from exc
 
 
+def translate_future_result(result: dict) -> dict:
+  result_type = result.get("type")
+  if result_type not in {"create_model_result", "create_model_from_state_result"}:
+    return result
+
+  # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
+  # even for full fine-tuning jobs.
+  response = {
+    "model_id": result["model_id"],
+    "is_lora": True,
+    "type": "create_model" if result_type == "create_model_result" else "create_model_from_state",
+  }
+  if "lora_rank" in result:
+    response["lora_rank"] = result["lora_rank"]
+  if result.get("base_model"):
+    response["base_model"] = result["base_model"]
+  return response
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
   task = None
+  fft_worker_manager = None
+  worker_launch_task = None
+  if is_fft_enabled():
+    fft_worker_manager = FFTWorkerManager()
+    worker_launch_processor = WorkerLaunchProcessor(store, fft_worker_manager)
+    worker_launch_task = asyncio.create_task(worker_launch_processor.run())
   if is_single_process_mode():
-    import clock_cycle
-
     base_model = os.getenv("BASE_MODEL")
     print("\n" + "=" * 50)
     print(" Open-RL Single-Process Mode")
     print("=" * 50)
     print(f"-> Base model: {base_model or 'unset'}")
     print(f"-> Sampling backend: {get_sampler_backend()}")
+    print(f"-> FFT enabled     : {is_fft_enabled()}")
     print("-> Server mode     : API server + worker loop in one process\n")
-    await _preflight_vllm()
-    if base_model:
-      await asyncio.to_thread(clock_cycle.engine.load_base_model, base_model)
-    task = asyncio.create_task(clock_cycle.clock_cycle_loop())
+    await preflight_vllm()
+    if not is_fft_enabled():
+      import clock_cycle
+
+      worker = clock_cycle.create_training_worker()
+      if base_model:
+        await asyncio.to_thread(worker.load_base_model, base_model)
+      task = asyncio.create_task(clock_cycle.clock_cycle_loop(worker))
   try:
     yield
   finally:
     if task is not None:
       task.cancel()
+    if worker_launch_task is not None:
+      worker_launch_task.cancel()
+    if fft_worker_manager is not None:
+      fft_worker_manager.shutdown_all()
 
 
 app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
@@ -203,15 +260,15 @@ async def create_model(req: dict):
   if not base_model:
     return JSONResponse(status_code=400, content={"error": "base_model is required"})
   model_id = str(uuid.uuid4())
-  req_id = await _enqueue(
-    {
-      "req_id": model_id,
-      "model_id": model_id,
-      "type": "create_model",
-      "base_model": base_model,
-      "lora_config": req.get("lora_config") or {},
-    }
-  )
+  payload = {
+    "req_id": model_id,
+    "model_id": model_id,
+    "type": "create_model",
+    "base_model": base_model,
+    "lora_config": req.get("lora_config") or {},
+    "full_config": req.get("full_config") or {},
+  }
+  req_id = await enqueue_worker_launch(CreateModelWorkerLaunchRequest(**payload)) if is_fft_enabled() else await enqueue(payload)
   return {"request_id": req_id}
 
 
@@ -224,15 +281,14 @@ async def create_model_from_state(req: dict):
   # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
   resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   model_id = str(uuid.uuid4())
-  req_id = await _enqueue(
-    {
-      "req_id": model_id,
-      "model_id": model_id,
-      "type": "create_model_from_state",
-      "state_path": resolved_path,
-      "restore_optimizer": bool(req.get("restore_optimizer", False)),
-    }
-  )
+  payload = {
+    "req_id": model_id,
+    "model_id": model_id,
+    "type": "create_model_from_state",
+    "state_path": resolved_path,
+    "restore_optimizer": bool(req.get("restore_optimizer", False)),
+  }
+  req_id = await enqueue_worker_launch(CreateModelFromStateWorkerLaunchRequest(**payload)) if is_fft_enabled() else await enqueue(payload)
   return {"request_id": req_id}
 
 
@@ -242,7 +298,9 @@ async def get_info(req: dict):
   model_name = get_default_model_name()
   if not model_name:
     return JSONResponse(status_code=404, content={"error": "No base model is configured"})
-  return {
+  # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
+  # even when this process is running a full fine-tuning worker.
+  result = {
     "model_data": {"arch": "unknown", "model_name": model_name, "tokenizer_id": model_name},
     "model_id": req.get("model_id", "model-live-123"),
     "is_lora": True,
@@ -250,6 +308,7 @@ async def get_info(req: dict):
     "model_name": model_name,
     "type": "get_info",
   }
+  return result
 
 
 @app.post("/api/v1/retrieve_future")
@@ -264,6 +323,8 @@ async def retrieve_future(req: dict):
     return JSONResponse(status_code=400, content={"type": "RequestFailedResponse", "error_message": "Future not found"})
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
     return JSONResponse(status_code=400, content=result)
+  if isinstance(result, dict):
+    return translate_future_result(result)
   return result
 
 
@@ -272,7 +333,7 @@ async def retrieve_future(req: dict):
 async def forward_backward(req: dict):
   """TrainingClient.forward_backward_async()"""
   fwd_input = req.get("forward_backward_input", {})
-  req_id = await _enqueue(
+  req_id = await enqueue(
     {
       "model_id": req.get("model_id"),
       "type": "forward_backward",
@@ -287,7 +348,7 @@ async def forward_backward(req: dict):
 @app.post("/api/v1/optim_step")
 async def optim_step(req: dict):
   """TrainingClient.optim_step_async()"""
-  req_id = await _enqueue(
+  req_id = await enqueue(
     {
       "model_id": req.get("model_id"),
       "type": "optim_step",
@@ -313,7 +374,7 @@ async def save_weights_for_sampler(req: dict):
   alias = req.get("name") or req.get("alias") or req.get("path")
 
   session_id = sampler_session_id(model_id, seq_id)
-  req_id = await _enqueue(
+  req_id = await enqueue(
     {
       "model_id": model_id,
       "type": "save_weights_for_sampler",
@@ -327,12 +388,12 @@ async def save_weights_for_sampler(req: dict):
 
 @app.post("/api/v1/save_weights")
 async def save_weights(req: dict):
-  """TrainingClient.save_weights() / save_state() — persists adapter to TMP_DIR/checkpoints/<alias>.
+  """TrainingClient.save_weights() / save_state().
 
   This is the endpoint the tinker SDK hits for both save_weights() and save_state().
-  When `path` is provided we treat it as a named checkpoint alias and resolve to
-  TMP_DIR/checkpoints/<alias> (or leave absolute paths alone), so subsequent
-  `create_training_client_from_state(alias)` calls can find the adapter.
+  The SDK sends save_state(name) as `path`; we resolve that checkpoint name to
+  TMP_DIR/checkpoints/<model_id>/weights/<path> so separate training jobs do not
+  overwrite each other's named checkpoints.
   """
   model_id = req.get("model_id")
   if not model_id:
@@ -340,10 +401,10 @@ async def save_weights(req: dict):
 
   seq_id = req.get("seq_id") or int(time.time() * 1000)
   alias = req.get("path") or f"{model_id}-samp-{seq_id}"
-  state_path = alias if os.path.isabs(alias) else os.path.join(TMP_DIR, "checkpoints", alias)
+  state_path = checkpoint_state_path(model_id, alias)
 
   req_id = str(uuid.uuid4())
-  await _enqueue(
+  await enqueue(
     {
       "req_id": req_id,
       "model_id": model_id,
@@ -366,8 +427,8 @@ async def load_weights(req: dict):
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "path is required"})
 
-  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
-  req_id = await _enqueue(
+  resolved_path = checkpoint_state_path(model_id, state_path)
+  req_id = await enqueue(
     {
       "model_id": model_id,
       "type": "load_weights",
@@ -416,7 +477,7 @@ async def asample(req: dict):
   base_model_id = base_model_id_from_sampling_ref(model_id)
 
   if get_sampler_backend() == "torch":
-    req_id = await _enqueue(
+    req_id = await enqueue(
       {
         "model_id": base_model_id or model_id,
         "type": "sample",

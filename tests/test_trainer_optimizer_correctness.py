@@ -1,6 +1,7 @@
 import importlib
 import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -38,7 +39,37 @@ def _load_trainer_modules():
   return trainer_worker, lora_trainer_worker, fft_trainer_worker, losses
 
 
+def _load_clock_cycle_module():
+  stubs = {
+    "peft": types.SimpleNamespace(
+      LoraConfig=object,
+      PeftModelForCausalLM=object,
+      get_peft_model=lambda *_args, **_kwargs: None,
+    ),
+    "transformers": types.SimpleNamespace(
+      AutoModelForCausalLM=object,
+      AutoTokenizer=object,
+      PreTrainedModel=object,
+      PreTrainedTokenizerBase=object,
+    ),
+  }
+  old_path = list(sys.path)
+  sys.path.insert(0, str(SERVER_DIR))
+  env = {
+    "OPEN_RL_ENABLE_FFT": "true",
+    "REDIS_URL": "redis://localhost:6379",
+  }
+  with patch.dict(sys.modules, stubs), patch.dict(os.environ, env):
+    for module_name in list(sys.modules):
+      if module_name == "clock_cycle":
+        del sys.modules[module_name]
+    clock_cycle = importlib.import_module("clock_cycle")
+  sys.path = old_path
+  return clock_cycle
+
+
 trainer_worker_module, lora_trainer_worker_module, fft_trainer_worker_module, losses_module = _load_trainer_modules()
+clock_cycle_module = _load_clock_cycle_module()
 BaseTrainerWorker = trainer_worker_module.BaseTrainerWorker
 FFTTrainingWorker = fft_trainer_worker_module.FFTTrainingWorker
 LoraTrainingWorker = lora_trainer_worker_module.LoraTrainingWorker
@@ -97,6 +128,48 @@ class _FullModelStub:
     yield from self.params
 
 
+class _RecordingFullWorker:
+  def __init__(self):
+    self.base_model_name = None
+    self.loaded_base_models = []
+    self.created_models = []
+    self.saved_states = []
+
+  def load_base_model(self, base_model_name):
+    self.base_model_name = base_model_name
+    self.loaded_base_models.append(base_model_name)
+
+  def create_model(self, base_model_name, model_id, config):
+    self.created_models.append((base_model_name, model_id, config))
+
+  def forward_backward(self, data, loss_fn, loss_config=None, model_id=None):
+    return {"model_id": model_id, "loss_fn": loss_fn, "loss_config": loss_config, "data": data}
+
+  def save_state(self, model_id, state_path, include_optimizer=False, kind="state"):
+    self.saved_states.append((model_id, state_path, include_optimizer, kind))
+    return {"path": state_path}
+
+
+class _RecordingLoraWorker:
+  def __init__(self):
+    self.loaded_base_models = []
+    self.created_models = []
+
+  def load_base_model(self, base_model_name):
+    self.loaded_base_models.append(base_model_name)
+
+  def create_model(self, base_model_name, model_id, config):
+    self.created_models.append((base_model_name, model_id, config))
+
+
+class _FutureStoreStub:
+  def __init__(self):
+    self.results = {}
+
+  async def set_future(self, req_id, result):
+    self.results[req_id] = result
+
+
 def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantages=None):
   loss_fn_inputs = {"target_tokens": trainer_worker_module.TensorData(data=target_tokens)}
   if weights is not None:
@@ -109,25 +182,70 @@ def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantage
 
 
 class TestTrainerOptimizerCorrectness(unittest.TestCase):
+  def test_lora_create_model_loads_base_then_creates_adapter(self) -> None:
+    worker = LoraTrainingWorker()
+    config = lora_trainer_worker_module.LoraConfig(rank=2, seed=123)
+    calls = []
+
+    worker.load_base_model = lambda base_model_name: calls.append(("load", base_model_name))
+    worker.create_adapter = lambda model_id, adapter_config: calls.append(("adapter", model_id, adapter_config))
+
+    worker.create_model("base-model", "adapter-a", config)
+
+    self.assertEqual(calls[0], ("load", "base-model"))
+    self.assertEqual(calls[1][0], "adapter")
+    self.assertEqual(calls[1][1], "adapter-a")
+    self.assertIs(calls[1][2], config)
+
+  def test_save_adapter_selects_adapter_it_saves(self) -> None:
+    adapter_a_param = torch.nn.Parameter(torch.tensor([1.0]))
+    adapter_b_param = torch.nn.Parameter(torch.tensor([1.0]))
+    worker = LoraTrainingWorker()
+    worker.peft_model = _PeftModelStub(
+      {
+        "adapter-a": [adapter_a_param],
+        "adapter-b": [adapter_b_param],
+      }
+    )
+    worker.peft_model.set_adapter("adapter-b")
+
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(os.environ, {"OPEN_RL_TMP_DIR": tmp_dir}):
+      worker.save_adapter("adapter-a")
+      self.assertTrue(os.path.exists(os.path.join(tmp_dir, "peft", "adapter-a", "metadata.json")))
+
+    self.assertEqual(worker.peft_model.active_adapter, "adapter-a")
+
+  def test_fft_create_model_loads_base_then_prepares_model(self) -> None:
+    worker = FFTTrainingWorker()
+    config = fft_trainer_worker_module.FFTConfig(seed=123)
+    calls = []
+
+    worker.load_base_model = lambda base_model_name: calls.append(("load", base_model_name))
+    worker.prepare_model_for_training = lambda: calls.append(("prepare", None))
+
+    worker.create_model("base-model", "model-a", config)
+
+    self.assertEqual(calls, [("load", "base-model"), ("prepare", None)])
+
   def test_optim_step_only_updates_active_adapter_params(self) -> None:
     active_param = torch.nn.Parameter(torch.tensor([1.0]))
     other_param = torch.nn.Parameter(torch.tensor([1.0]))
     active_param.grad = torch.tensor([1.0])
     other_param.grad = torch.tensor([10.0])
 
-    engine = LoraTrainingWorker()
-    engine.peft_model = _PeftModelStub(
+    worker = LoraTrainingWorker()
+    worker.peft_model = _PeftModelStub(
       {
         "adapter-a": [active_param],
         "adapter-b": [other_param],
       }
     )
-    engine.adapter_states = {
-      "adapter-a": {"trainable_params": lora_trainer_worker_module.active_adapter_parameters(engine.peft_model, "adapter-a"), "optimizer": None}
+    worker.adapter_states = {
+      "adapter-a": {"trainable_params": lora_trainer_worker_module.active_adapter_parameters(worker.peft_model, "adapter-a"), "optimizer": None}
     }
-    engine.save_adapter = lambda *_args, **_kwargs: None
+    worker.save_adapter = lambda *_args, **_kwargs: None
 
-    result = engine.optim_step(
+    result = worker.optim_step(
       {
         "learning_rate": 0.1,
         "beta1": 0.0,
@@ -138,7 +256,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
       "adapter-a",
     )
 
-    self.assertEqual(engine.peft_model.active_adapter, "adapter-a")
+    self.assertEqual(worker.peft_model.active_adapter, "adapter-a")
     self.assertAlmostEqual(result["metrics"]["grad_norm:mean"], 1.0)
     self.assertFalse(torch.allclose(active_param.detach(), torch.tensor([1.0])))
     self.assertTrue(torch.allclose(other_param.detach(), torch.tensor([1.0])))
@@ -152,11 +270,11 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     trainable_param.grad = torch.tensor([1.0])
     frozen_param.grad = torch.tensor([10.0])
 
-    engine = FFTTrainingWorker()
-    engine.model = _FullModelStub([trainable_param, frozen_param])
-    engine.trainable_params = fft_trainer_worker_module.trainable_model_parameters(engine.model)
+    worker = FFTTrainingWorker()
+    worker.model = _FullModelStub([trainable_param, frozen_param])
+    worker.trainable_params = fft_trainer_worker_module.trainable_model_parameters(worker.model)
 
-    result = engine.optim_step(
+    result = worker.optim_step(
       {
         "learning_rate": 0.1,
         "beta1": 0.0,
@@ -172,6 +290,105 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     if trainable_param.grad is not None:
       self.assertTrue(torch.allclose(trainable_param.grad, torch.zeros_like(trainable_param.grad)))
     self.assertIsNotNone(frozen_param.grad)
+
+
+class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
+  async def test_importing_clock_cycle_does_not_create_worker(self) -> None:
+    self.assertFalse(hasattr(clock_cycle_module, "worker"))
+
+  async def test_clock_cycle_lora_mode_create_model_uses_worker_create_model(self) -> None:
+    worker = _RecordingLoraWorker()
+    store = _FutureStoreStub()
+
+    await clock_cycle_module.handle_request(
+      store,
+      {
+        "req_id": "req-a",
+        "model_id": "adapter-a",
+        "type": "create_model",
+        "base_model": "base-model",
+        "lora_config": {"seed": 123, "rank": 2},
+      },
+      "adapter-a",
+      worker,
+      fft_enabled=False,
+    )
+
+    self.assertEqual(worker.loaded_base_models, [])
+    base_model, model_id, config = worker.created_models[0]
+    self.assertEqual(base_model, "base-model")
+    self.assertEqual(model_id, "adapter-a")
+    self.assertEqual(config.seed, 123)
+    self.assertEqual(config.rank, 2)
+    result = store.results["req-a"]
+    self.assertEqual(result["model_id"], "adapter-a")
+    self.assertEqual(result["lora_rank"], 2)
+    self.assertEqual(result["type"], "create_model_result")
+
+  async def test_clock_cycle_full_mode_create_model_uses_model_worker(self) -> None:
+    worker = _RecordingFullWorker()
+    store = _FutureStoreStub()
+
+    await clock_cycle_module.handle_request(
+      store,
+      {
+        "req_id": "req-a",
+        "model_id": "model-a",
+        "type": "create_model",
+        "base_model": "base-model",
+        "full_config": {"seed": 123, "rank": 8},
+      },
+      "model-a",
+      worker,
+      fft_enabled=True,
+    )
+
+    self.assertEqual(worker.loaded_base_models, [])
+    base_model, model_id, config = worker.created_models[0]
+    self.assertEqual(base_model, "base-model")
+    self.assertEqual(model_id, "model-a")
+    self.assertEqual(config.seed, 123)
+    result = store.results["req-a"]
+    self.assertEqual(result["model_id"], "model-a")
+    self.assertEqual(result["lora_rank"], 16)
+    self.assertEqual(result["base_model"], "base-model")
+    self.assertEqual(result["type"], "create_model_result")
+
+  async def test_clock_cycle_full_mode_saves_sampler_checkpoint_as_full_state(self) -> None:
+    worker = _RecordingFullWorker()
+    store = _FutureStoreStub()
+
+    with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test"}):
+      await clock_cycle_module.handle_request(
+        store,
+        {
+          "req_id": "req-a",
+          "model_id": "model-a",
+          "type": "save_weights_for_sampler",
+          "path": "tinker://model-a/sampler_weights/final",
+          "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
+        },
+        "model-a",
+        worker,
+        fft_enabled=True,
+      )
+
+    self.assertEqual(
+      worker.saved_states,
+      [("model-a", "/tmp/open-rl-test/sampler_full/model-a/sampler_weights/final", False, "sampler")],
+    )
+    self.assertEqual(
+      store.results["req-a"],
+      {
+        "path": "tinker://model-a/sampler_weights/final",
+        "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
+        "type": "save_weights_for_sampler",
+      },
+    )
+
+  async def test_clock_cycle_full_mode_requires_redis(self) -> None:
+    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
+      await clock_cycle_module.clock_cycle_loop(_RecordingFullWorker(), "model-a")
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
@@ -277,10 +494,10 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     )
 
   def test_token_budget_batches_preserve_examples(self) -> None:
-    engine = self._worker()
+    worker = self._worker()
     data = self._data()
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "6"}):
-      batches = engine.make_training_batches(data)
+      batches = worker.make_training_batches(data)
 
     seen = [idx for batch in batches for idx, _datum in batch]
     self.assertCountEqual(seen, range(len(data)))

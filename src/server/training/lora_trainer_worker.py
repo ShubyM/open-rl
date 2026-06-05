@@ -130,6 +130,11 @@ class LoraTrainingWorker(BaseTrainerWorker):
 
     self.save_adapter(adapter_id)
 
+  def create_model(self, base_model_name: str, model_id: str, config: LoraConfig) -> None:
+    """Load the shared base model if needed, then create a trainable LoRA adapter."""
+    self.load_base_model(base_model_name)
+    self.create_adapter(model_id, config)
+
   def save_adapter(self, adapter_id: str, alias: str | None = None) -> None:
     """Save adapter weights to disk for reliability and sharing."""
     try:
@@ -138,6 +143,7 @@ class LoraTrainingWorker(BaseTrainerWorker):
       os.makedirs(save_path, exist_ok=True)
 
       # Save the adapter weights
+      self.peft_model.set_adapter(adapter_id)
       self.peft_model.save_pretrained(save_path, selected_adapters=[adapter_id])
 
       # Save minimal metadata
@@ -245,11 +251,6 @@ class LoraTrainingWorker(BaseTrainerWorker):
     if model_id:
       self.peft_model.set_adapter(model_id)
     return super().forward_backward(self.peft_model, data, loss_fn, loss_config)
-
-  def set_active_adapter(self, adapter_id: str) -> None:
-    """Switch which LoRA adapter is active."""
-    if self.peft_model is not None:
-      self.peft_model.set_adapter(adapter_id)
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str) -> dict[str, Any]:
     """Apply accumulated gradients and update model weights."""
