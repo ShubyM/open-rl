@@ -3,10 +3,13 @@
 import asyncio
 import logging
 import os
+import subprocess
+import sys
 import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
@@ -45,6 +48,8 @@ logging.getLogger("uvicorn.access").addFilter(_FilterNoisyEndpoints())
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
+WORKER_MODE = os.getenv("OPEN_RL_WORKER_MODE")
+SERVER_DIR = Path(__file__).resolve().parent
 
 
 # *** Helpers ***
@@ -61,12 +66,16 @@ def get_sampler_backend() -> str:
 
 
 def get_default_model_name() -> str | None:
-  if is_single_process_mode():
+  if is_single_process_mode() and not is_full_worker_mode():
     import clock_cycle
 
-    if clock_cycle.engine.base_model_name:
-      return clock_cycle.engine.base_model_name
+    if model_name := clock_cycle.worker.base_model_name:
+      return model_name
   return os.getenv("BASE_MODEL")
+
+
+def is_full_worker_mode() -> bool:
+  return WORKER_MODE == "full"
 
 
 def sampler_session_id(model_id: str, seq_id: int | str) -> str:
@@ -75,6 +84,12 @@ def sampler_session_id(model_id: str, seq_id: int | str) -> str:
 
 def sampler_weights_path(model_id: str, name: str) -> str:
   return f"tinker://{model_id}/sampler_weights/{name}"
+
+
+def checkpoint_state_path(model_id: str, name: str) -> str:
+  if os.path.isabs(name):
+    return name
+  return os.path.join(TMP_DIR, "checkpoints", model_id, "weights", name)
 
 
 def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
@@ -132,28 +147,59 @@ async def _preflight_vllm() -> None:
     ) from exc
 
 
+class FFTWorkerLauncher:
+  def __init__(self):
+    self.processes: dict[str, subprocess.Popen] = {}
+
+  def launch(self, model_id: str) -> None:
+    if not os.getenv("REDIS_URL"):
+      raise RuntimeError("OPEN_RL_WORKER_MODE=full requires REDIS_URL so launched workers can share queues and futures")
+
+    proc = self.processes.get(model_id)
+    if proc is not None and proc.poll() is None:
+      return
+
+    env = {**os.environ, "OPEN_RL_WORKER_MODE": "full", "OPEN_RL_WORKER_MODEL_ID": model_id}
+    self.processes[model_id] = subprocess.Popen(
+      [sys.executable, "-m", "clock_cycle"],
+      cwd=SERVER_DIR,
+      env=env,
+    )
+
+  def shutdown_all(self) -> None:
+    for proc in self.processes.values():
+      if proc.poll() is None:
+        proc.terminate()
+
+
+fft_worker_launcher = FFTWorkerLauncher()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
   task = None
   if is_single_process_mode():
-    import clock_cycle
-
     base_model = os.getenv("BASE_MODEL")
     print("\n" + "=" * 50)
     print(" Open-RL Single-Process Mode")
     print("=" * 50)
     print(f"-> Base model: {base_model or 'unset'}")
     print(f"-> Sampling backend: {get_sampler_backend()}")
+    print(f"-> Worker mode     : {WORKER_MODE}")
     print("-> Server mode     : API server + worker loop in one process\n")
     await _preflight_vllm()
-    if base_model:
-      await asyncio.to_thread(clock_cycle.engine.load_base_model, base_model)
-    task = asyncio.create_task(clock_cycle.clock_cycle_loop())
+    if not is_full_worker_mode():
+      import clock_cycle
+
+      if base_model:
+        await asyncio.to_thread(clock_cycle.worker.load_base_model, base_model)
+      task = asyncio.create_task(clock_cycle.clock_cycle_loop())
   try:
     yield
   finally:
     if task is not None:
       task.cancel()
+    fft_worker_launcher.shutdown_all()
 
 
 app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
@@ -203,6 +249,8 @@ async def create_model(req: dict):
   if not base_model:
     return JSONResponse(status_code=400, content={"error": "base_model is required"})
   model_id = str(uuid.uuid4())
+  if is_full_worker_mode():
+    fft_worker_launcher.launch(model_id)
   req_id = await _enqueue(
     {
       "req_id": model_id,
@@ -210,6 +258,7 @@ async def create_model(req: dict):
       "type": "create_model",
       "base_model": base_model,
       "lora_config": req.get("lora_config") or {},
+      "full_config": req.get("full_config") or {},
     }
   )
   return {"request_id": req_id}
@@ -224,6 +273,8 @@ async def create_model_from_state(req: dict):
   # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
   resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   model_id = str(uuid.uuid4())
+  if is_full_worker_mode():
+    fft_worker_launcher.launch(model_id)
   req_id = await _enqueue(
     {
       "req_id": model_id,
@@ -242,7 +293,9 @@ async def get_info(req: dict):
   model_name = get_default_model_name()
   if not model_name:
     return JSONResponse(status_code=404, content={"error": "No base model is configured"})
-  return {
+  # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
+  # even when this process is running a full fine-tuning worker.
+  result = {
     "model_data": {"arch": "unknown", "model_name": model_name, "tokenizer_id": model_name},
     "model_id": req.get("model_id", "model-live-123"),
     "is_lora": True,
@@ -250,6 +303,7 @@ async def get_info(req: dict):
     "model_name": model_name,
     "type": "get_info",
   }
+  return result
 
 
 @app.post("/api/v1/retrieve_future")
@@ -327,12 +381,12 @@ async def save_weights_for_sampler(req: dict):
 
 @app.post("/api/v1/save_weights")
 async def save_weights(req: dict):
-  """TrainingClient.save_weights() / save_state() — persists adapter to TMP_DIR/checkpoints/<alias>.
+  """TrainingClient.save_weights() / save_state().
 
   This is the endpoint the tinker SDK hits for both save_weights() and save_state().
-  When `path` is provided we treat it as a named checkpoint alias and resolve to
-  TMP_DIR/checkpoints/<alias> (or leave absolute paths alone), so subsequent
-  `create_training_client_from_state(alias)` calls can find the adapter.
+  The SDK sends save_state(name) as `path`; we resolve that checkpoint name to
+  TMP_DIR/checkpoints/<model_id>/weights/<path> so separate training jobs do not
+  overwrite each other's named checkpoints.
   """
   model_id = req.get("model_id")
   if not model_id:
@@ -340,7 +394,7 @@ async def save_weights(req: dict):
 
   seq_id = req.get("seq_id") or int(time.time() * 1000)
   alias = req.get("path") or f"{model_id}-samp-{seq_id}"
-  state_path = alias if os.path.isabs(alias) else os.path.join(TMP_DIR, "checkpoints", alias)
+  state_path = checkpoint_state_path(model_id, alias)
 
   req_id = str(uuid.uuid4())
   await _enqueue(
@@ -366,7 +420,7 @@ async def load_weights(req: dict):
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "path is required"})
 
-  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
+  resolved_path = checkpoint_state_path(model_id, state_path)
   req_id = await _enqueue(
     {
       "model_id": model_id,

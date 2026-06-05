@@ -47,11 +47,11 @@ class FFTTrainingWorker(BaseTrainerWorker):
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
     self.model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
-    self.prepare_model_for_training()
     print("Successfully loaded full fine-tuning model.")
 
-  def create_model(self, model_id: str | None = None, config: FFTConfig | None = None) -> None:
-    """Prepare the loaded model for full fine-tuning."""
+  def create_model(self, base_model_name: str, model_id: str | None = None, config: FFTConfig | None = None) -> None:
+    """Load the per-job model if needed, then prepare it for full fine-tuning."""
+    self.load_base_model(base_model_name)
     if config is not None and config.seed is not None:
       torch.manual_seed(config.seed)
     self.prepare_model_for_training()
@@ -149,7 +149,9 @@ class FFTTrainingWorker(BaseTrainerWorker):
         print(f"Restored optimizer state from {optimizer_path}")
 
     print(f"Loaded full fine-tuning state from {state_path}")
-    return {"model_id": model_id, "is_lora": False, "base_model": base_model}
+    # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
+    # even when this worker loaded full fine-tuned weights.
+    return {"model_id": model_id, "is_lora": True, "lora_rank": 16, "base_model": base_model}
 
   def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."

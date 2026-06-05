@@ -21,6 +21,11 @@ class RequestStore(ABC):
     pass
 
   @abstractmethod
+  async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
+    """Block until this model has at least 1 request, then return all queued requests for it."""
+    pass
+
+  @abstractmethod
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
     """Resolve a future by its request ID."""
     pass
@@ -77,6 +82,9 @@ class InMemoryStore(RequestStore):
         self.active_tenants.remove(model_id)
 
       return batch
+
+  async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
+    raise RuntimeError("Per-model full fine-tuning workers require REDIS_URL; in-memory queues cannot be shared across processes")
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
     self.futures_store[req_id] = result
@@ -150,6 +158,28 @@ class RedisStore(RequestStore):
     q_len = await self.redis.llen(queue_key)
     if q_len == 0:
       # We remove it from the list AND set
+      await self.redis.lrem(self.active_list, 0, model_id)
+      await self.redis.srem(self.active_set, model_id)
+
+    return batch
+
+  async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
+    queue_key = f"open_rl:queue:{model_id}"
+    result = await self.redis.blpop(queue_key, timeout=5)
+
+    if not result:
+      return []
+
+    batch = [json.loads(result[1])]
+
+    while True:
+      item = await self.redis.lpop(queue_key)
+      if not item:
+        break
+      batch.append(json.loads(item))
+
+    q_len = await self.redis.llen(queue_key)
+    if q_len == 0:
       await self.redis.lrem(self.active_list, 0, model_id)
       await self.redis.srem(self.active_set, model_id)
 
