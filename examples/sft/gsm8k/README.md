@@ -3,11 +3,11 @@
 Full-parameter SFT of a small model on GSM8K, driven through the OpenRL gateway
 with the Tinker SDK.
 
-## Why full fine-tuning goes through worker mode
+## Why full fine-tuning goes through dedicated workers
 
 The public Tinker SDK entrypoint is still `create_lora_training_client()`. For
 now, OpenRL routes that same client flow to a full fine-tuning worker when the
-gateway is started with `OPEN_RL_WORKER_MODE=full`.
+gateway is started with `OPEN_RL_ENABLE_FFT=true`.
 
 ## Run
 
@@ -27,7 +27,7 @@ redis-server --port 6379 --save "" --appendonly no
 ```bash
 cd src/server
 REDIS_URL=redis://127.0.0.1:6379 \
-OPEN_RL_WORKER_MODE=full \
+OPEN_RL_ENABLE_FFT=true \
 BASE_MODEL=Qwen/Qwen2.5-0.5B \
 SAMPLING_BACKEND=torch \
 uv run --extra gpu python -m uvicorn gateway:app --host 127.0.0.1 --port 9003

@@ -149,9 +149,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
         print(f"Restored optimizer state from {optimizer_path}")
 
     print(f"Loaded full fine-tuning state from {state_path}")
-    # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
-    # even when this worker loaded full fine-tuned weights.
-    return {"model_id": model_id, "is_lora": True, "lora_rank": 16, "base_model": base_model}
+    return {"model_id": model_id, "base_model": base_model}
 
   def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."

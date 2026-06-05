@@ -1,5 +1,6 @@
 # This file contains the clock cycle loop implementation for orchestrating training requests in Open-RL.
 
+import argparse
 import asyncio
 import os
 import threading
@@ -16,13 +17,16 @@ from training.trainer_worker import Datum
 
 tracer = trace.get_tracer(__name__)
 
-WORKER_MODE = os.getenv("OPEN_RL_WORKER_MODE")
 
-worker = FFTTrainingWorker() if WORKER_MODE == "full" else LoraTrainingWorker()
+TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
 
 
-def is_full_worker_mode() -> bool:
-  return WORKER_MODE == "full"
+def is_fft_enabled() -> bool:
+  return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
+
+
+def create_training_worker() -> TrainingWorker:
+  return FFTTrainingWorker() if is_fft_enabled() else LoraTrainingWorker()
 
 
 def parse_datum(raw: dict) -> Datum:
@@ -36,7 +40,7 @@ def parse_datum(raw: dict) -> Datum:
   return Datum(model_input=tokens, loss_fn_inputs=loss_inputs)
 
 
-async def handle_request(store, request: dict, model_id: str) -> None:
+async def handle_request(store, request: dict, model_id: str, worker: TrainingWorker, fft_enabled: bool) -> None:
   req_id = request["req_id"]
   req_type = request["type"]
 
@@ -45,27 +49,24 @@ async def handle_request(store, request: dict, model_id: str) -> None:
   token = otel_context.attach(ctx) if ctx else None
 
   try:
-    if is_full_worker_mode() and request.get("model_id") != model_id:
+    if fft_enabled and request.get("model_id") != model_id:
       raise ValueError(f"Full worker for {model_id!r} received request for {request.get('model_id')!r}")
 
     match req_type:
       case "create_model":
         base_model = request["base_model"]
 
-        if is_full_worker_mode():
+        if fft_enabled:
           raw_config = request.get("full_config") or {}
           full_config = FFTConfig(**{k: v for k, v in raw_config.items() if k in FFTConfig.model_fields})
           await asyncio.to_thread(worker.create_model, base_model, model_id, full_config)
-          # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
-          # even when this process is running a full fine-tuning worker.
           await store.set_future(
             req_id,
             {
               "model_id": model_id,
-              "is_lora": True,
               "lora_rank": 16,
               "base_model": base_model,
-              "type": "create_model",
+              "type": "create_model_result",
             },
           )
         else:
@@ -76,9 +77,8 @@ async def handle_request(store, request: dict, model_id: str) -> None:
             req_id,
             {
               "model_id": model_id,
-              "is_lora": True,
               "lora_rank": lora_config.rank,
-              "type": "create_model",
+              "type": "create_model_result",
             },
           )
 
@@ -86,8 +86,14 @@ async def handle_request(store, request: dict, model_id: str) -> None:
         state_path = request["state_path"]
         restore_optimizer = bool(request.get("restore_optimizer", False))
         result = await asyncio.to_thread(worker.load_from_state, model_id, state_path, restore_optimizer)
-        result["type"] = "create_model_from_state"
-        await store.set_future(req_id, result)
+        internal_result = {
+          "model_id": result.get("model_id", model_id),
+          "base_model": result.get("base_model"),
+          "type": "create_model_from_state_result",
+        }
+        if fft_enabled:
+          internal_result["lora_rank"] = 16
+        await store.set_future(req_id, internal_result)
 
       case "forward_backward":
         raw_data = request["data"]
@@ -141,7 +147,7 @@ async def handle_request(store, request: dict, model_id: str) -> None:
         await store.set_future(req_id, {"path": state_path, "type": "load_weights"})
 
       case "save_weights_for_sampler":
-        if is_full_worker_mode():
+        if fft_enabled:
           ref = request.get("path") or request.get("sampling_session_id")
           if not ref:
             raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
@@ -160,7 +166,7 @@ async def handle_request(store, request: dict, model_id: str) -> None:
         )
 
       case "save_weights":
-        if is_full_worker_mode():
+        if fft_enabled:
           await asyncio.to_thread(worker.save_model, request.get("alias") or model_id)
         else:
           await asyncio.to_thread(worker.save_adapter, model_id, request.get("alias"))
@@ -178,25 +184,25 @@ async def handle_request(store, request: dict, model_id: str) -> None:
       otel_context.detach(token)
 
 
-async def clock_cycle_loop() -> None:
-  if is_full_worker_mode() and not os.getenv("REDIS_URL"):
+async def clock_cycle_loop(worker: TrainingWorker, model_id: str | None = None) -> None:
+  fft_enabled = is_fft_enabled()
+  if fft_enabled and not os.getenv("REDIS_URL"):
     raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
+  if fft_enabled and not model_id:
+    raise RuntimeError("A dedicated FFT worker needs --model-id so it knows which per-model queue to drain")
 
   store = get_store()
-  worker_model_id = os.getenv("OPEN_RL_WORKER_MODEL_ID") if is_full_worker_mode() else None
-  if is_full_worker_mode() and not worker_model_id:
-    raise RuntimeError("OPEN_RL_WORKER_MODEL_ID is required when OPEN_RL_WORKER_MODE=full")
 
-  print(f"[WORKER] Training worker started in {WORKER_MODE} mode.")
+  print(f"[WORKER] Training worker started. FFT enabled: {fft_enabled}.")
 
   while True:
     try:
-      batch = await store.get_requests_for_model(worker_model_id) if worker_model_id else await store.get_requests()
+      batch = await store.get_requests_for_model(model_id) if fft_enabled else await store.get_requests()
       if not batch:
         await asyncio.sleep(0.1)
         continue
 
-      m_id = worker_model_id or batch[0].get("model_id", "default")
+      m_id = model_id or batch[0].get("model_id", "default")
 
       with tracer.start_as_current_span("clock_cycle_batch") as batch_span:
         batch_span.set_attribute("batch_size", len(batch))
@@ -205,7 +211,7 @@ async def clock_cycle_loop() -> None:
         print(f"\n[CLOCK CYCLE] Popped {len(batch)} requests for tenant: {m_id}")
 
         for r in batch:
-          await handle_request(store, r, m_id)
+          await handle_request(store, r, m_id, worker, fft_enabled=fft_enabled)
 
     except asyncio.CancelledError:
       break
@@ -226,26 +232,31 @@ async def clock_cycle_loop() -> None:
 
 
 def main() -> None:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated FFT worker drains.")
+  args = parser.parse_args()
+
   print("\n" + "=" * 50)
   print("      Open-RL PyTorch Training Worker")
   print("=" * 50)
   cuda_devs = os.getenv("CUDA_VISIBLE_DEVICES", "ALL")
   print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
-  print(f"-> Worker mode: {WORKER_MODE}\n")
+  print(f"-> FFT enabled: {is_fft_enabled()}\n")
 
+  worker = create_training_worker()
   preload_target = os.getenv("BASE_MODEL")
   is_ready = False
-  if preload_target and not is_full_worker_mode():
+  if preload_target and not is_fft_enabled():
     worker.load_base_model(preload_target)
     is_ready = True
   else:
-    if is_full_worker_mode():
+    if is_fft_enabled():
       print("[WORKER] Full fine-tuning mode loads its model from the create_model request.")
     else:
       print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
     is_ready = True
 
-  if not is_full_worker_mode():
+  if not is_fft_enabled():
     probe_app = FastAPI()
 
     @probe_app.get("/healthz")
@@ -258,7 +269,7 @@ def main() -> None:
       uvicorn.run(probe_app, host="0.0.0.0", port=8000, log_level="warning")
 
     threading.Thread(target=run_probe_server, daemon=True).start()
-  asyncio.run(clock_cycle_loop())
+  asyncio.run(clock_cycle_loop(worker, args.model_id))
 
 
 if __name__ == "__main__":

@@ -56,8 +56,7 @@ def _load_clock_cycle_module():
   old_path = list(sys.path)
   sys.path.insert(0, str(SERVER_DIR))
   env = {
-    "OPEN_RL_WORKER_MODE": "full",
-    "OPEN_RL_WORKER_MODEL_ID": "model-a",
+    "OPEN_RL_ENABLE_FFT": "true",
     "REDIS_URL": "redis://localhost:6379",
   }
   with patch.dict(sys.modules, stubs), patch.dict(os.environ, env):
@@ -294,29 +293,26 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
 
 
 class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
+  async def test_importing_clock_cycle_does_not_create_worker(self) -> None:
+    self.assertFalse(hasattr(clock_cycle_module, "worker"))
+
   async def test_clock_cycle_lora_mode_create_model_uses_worker_create_model(self) -> None:
     worker = _RecordingLoraWorker()
     store = _FutureStoreStub()
-    old_worker = clock_cycle_module.worker
-    old_is_full_worker_mode = clock_cycle_module.is_full_worker_mode
-    clock_cycle_module.worker = worker
-    clock_cycle_module.is_full_worker_mode = lambda: False
 
-    try:
-      await clock_cycle_module.handle_request(
-        store,
-        {
-          "req_id": "req-a",
-          "model_id": "adapter-a",
-          "type": "create_model",
-          "base_model": "base-model",
-          "lora_config": {"seed": 123, "rank": 2},
-        },
-        "adapter-a",
-      )
-    finally:
-      clock_cycle_module.worker = old_worker
-      clock_cycle_module.is_full_worker_mode = old_is_full_worker_mode
+    await clock_cycle_module.handle_request(
+      store,
+      {
+        "req_id": "req-a",
+        "model_id": "adapter-a",
+        "type": "create_model",
+        "base_model": "base-model",
+        "lora_config": {"seed": 123, "rank": 2},
+      },
+      "adapter-a",
+      worker,
+      fft_enabled=False,
+    )
 
     self.assertEqual(worker.loaded_base_models, [])
     base_model, model_id, config = worker.created_models[0]
@@ -326,29 +322,26 @@ class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(config.rank, 2)
     result = store.results["req-a"]
     self.assertEqual(result["model_id"], "adapter-a")
-    self.assertTrue(result["is_lora"])
     self.assertEqual(result["lora_rank"], 2)
+    self.assertEqual(result["type"], "create_model_result")
 
   async def test_clock_cycle_full_mode_create_model_uses_model_worker(self) -> None:
     worker = _RecordingFullWorker()
     store = _FutureStoreStub()
-    old_worker = clock_cycle_module.worker
-    clock_cycle_module.worker = worker
 
-    try:
-      await clock_cycle_module.handle_request(
-        store,
-        {
-          "req_id": "req-a",
-          "model_id": "model-a",
-          "type": "create_model",
-          "base_model": "base-model",
-          "full_config": {"seed": 123, "rank": 8},
-        },
-        "model-a",
-      )
-    finally:
-      clock_cycle_module.worker = old_worker
+    await clock_cycle_module.handle_request(
+      store,
+      {
+        "req_id": "req-a",
+        "model_id": "model-a",
+        "type": "create_model",
+        "base_model": "base-model",
+        "full_config": {"seed": 123, "rank": 8},
+      },
+      "model-a",
+      worker,
+      fft_enabled=True,
+    )
 
     self.assertEqual(worker.loaded_base_models, [])
     base_model, model_id, config = worker.created_models[0]
@@ -357,31 +350,28 @@ class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(config.seed, 123)
     result = store.results["req-a"]
     self.assertEqual(result["model_id"], "model-a")
-    self.assertTrue(result["is_lora"])
     self.assertEqual(result["lora_rank"], 16)
     self.assertEqual(result["base_model"], "base-model")
+    self.assertEqual(result["type"], "create_model_result")
 
   async def test_clock_cycle_full_mode_saves_sampler_checkpoint_as_full_state(self) -> None:
     worker = _RecordingFullWorker()
     store = _FutureStoreStub()
-    old_worker = clock_cycle_module.worker
-    clock_cycle_module.worker = worker
 
-    try:
-      with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test"}):
-        await clock_cycle_module.handle_request(
-          store,
-          {
-            "req_id": "req-a",
-            "model_id": "model-a",
-            "type": "save_weights_for_sampler",
-            "path": "tinker://model-a/sampler_weights/final",
-            "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
-          },
-          "model-a",
-        )
-    finally:
-      clock_cycle_module.worker = old_worker
+    with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test"}):
+      await clock_cycle_module.handle_request(
+        store,
+        {
+          "req_id": "req-a",
+          "model_id": "model-a",
+          "type": "save_weights_for_sampler",
+          "path": "tinker://model-a/sampler_weights/final",
+          "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
+        },
+        "model-a",
+        worker,
+        fft_enabled=True,
+      )
 
     self.assertEqual(
       worker.saved_states,
@@ -397,8 +387,8 @@ class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
     )
 
   async def test_clock_cycle_full_mode_requires_redis(self) -> None:
-    with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
-      await clock_cycle_module.clock_cycle_loop()
+    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
+      await clock_cycle_module.clock_cycle_loop(_RecordingFullWorker(), "model-a")
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
