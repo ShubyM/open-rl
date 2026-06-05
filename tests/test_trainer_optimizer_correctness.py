@@ -1,9 +1,8 @@
-import importlib.util
+import importlib
 import os
 import sys
 import types
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -25,11 +24,15 @@ def _load_trainer_module():
       PreTrainedTokenizerBase=object,
     ),
   }
-  spec = importlib.util.spec_from_file_location("trainer_under_test", Path(SERVER_DIR) / "trainer.py")
-  assert spec is not None and spec.loader is not None
-  module = importlib.util.module_from_spec(spec)
+  old_path = list(sys.path)
+  sys.path.insert(0, str(SERVER_DIR))
   with patch.dict(sys.modules, stubs):
-    spec.loader.exec_module(module)
+    for module_name in list(sys.modules):
+      if module_name == "training" or module_name.startswith("training."):
+        del sys.modules[module_name]
+    module = importlib.import_module("training.trainer")
+    module.losses = importlib.import_module("training.losses")
+  sys.path = old_path
   return module
 
 
@@ -161,46 +164,81 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       ),
     ]
 
+  def training_tensors(self, engine, data):
+    input_ids, attention_mask, input_lengths = engine.pad_model_inputs(data)
+    target_token_ids, weights, lengths = engine.pad_targets_and_weights(data, input_lengths)
+    logprobs = engine.compute_target_logprobs(input_ids, attention_mask, target_token_ids)
+    old_logprobs = engine.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in data], lengths, torch.float32)
+    advantages = engine.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in data], lengths, torch.float32)
+    return logprobs, weights, old_logprobs, advantages, lengths
+
   def test_padded_batch_logprobs_and_losses_match_per_example_math(self) -> None:
     engine = self._engine()
     data = self._data()
 
-    batch_logprobs, batch_weights, batch_aux, batch_lengths = engine._get_logprobs_batch(data)
-    single_results = [engine._get_logprobs_batch([datum]) for datum in data]
+    batch_logprobs, batch_weights, batch_old_logprobs, batch_advantages, batch_lengths = self.training_tensors(engine, data)
+    single_results = [self.training_tensors(engine, [datum]) for datum in data]
 
-    for row, (single_logprobs, single_weights, single_aux, single_lengths) in enumerate(single_results):
+    for row, (single_logprobs, single_weights, single_old_logprobs, single_advantages, single_lengths) in enumerate(single_results):
       length = batch_lengths[row]
       self.assertEqual(length, single_lengths[0])
       torch.testing.assert_close(batch_logprobs[row, :length], single_logprobs[0, :length])
       torch.testing.assert_close(batch_weights[row, :length], single_weights[0, :length])
       torch.testing.assert_close(batch_weights[row, length:], torch.zeros_like(batch_weights[row, length:]))
-      for key in ("logprobs", "advantages"):
-        torch.testing.assert_close(batch_aux[key][row, :length], single_aux[key][0, :length])
-        torch.testing.assert_close(batch_aux[key][row, length:], torch.zeros_like(batch_aux[key][row, length:]))
+      torch.testing.assert_close(batch_old_logprobs[row, :length], single_old_logprobs[0, :length])
+      torch.testing.assert_close(batch_old_logprobs[row, length:], torch.zeros_like(batch_old_logprobs[row, length:]))
+      torch.testing.assert_close(batch_advantages[row, :length], single_advantages[0, :length])
+      torch.testing.assert_close(batch_advantages[row, length:], torch.zeros_like(batch_advantages[row, length:]))
 
     def single_sum(fn):
-      losses = [fn(logprobs, weights, aux).sum() for logprobs, weights, aux, _lengths in single_results]
+      losses = [fn(logprobs, weights, old_logprobs, advantages).sum() for logprobs, weights, old_logprobs, advantages, _lengths in single_results]
       return torch.stack(losses).sum()
 
     torch.testing.assert_close(
-      engine._cross_entropy_loss(batch_logprobs, batch_weights).sum(),
-      single_sum(lambda logprobs, weights, _aux: engine._cross_entropy_loss(logprobs, weights)),
+      trainer_module.losses.cross_entropy_loss(batch_logprobs, batch_weights).sum(),
+      single_sum(lambda logprobs, weights, _old_logprobs, _advantages: trainer_module.losses.cross_entropy_loss(logprobs, weights)),
     )
     torch.testing.assert_close(
-      engine._importance_sampling_loss(batch_logprobs, batch_weights, batch_aux).sum(),
-      single_sum(lambda logprobs, weights, aux: engine._importance_sampling_loss(logprobs, weights, aux)),
+      trainer_module.losses.importance_sampling_loss(
+        batch_logprobs,
+        batch_weights,
+        batch_old_logprobs,
+        batch_advantages,
+      ).sum(),
+      single_sum(
+        lambda logprobs, weights, old_logprobs, advantages: trainer_module.losses.importance_sampling_loss(
+          logprobs,
+          weights,
+          old_logprobs,
+          advantages,
+        )
+      ),
     )
     ppo_config = {"clip_range": 0.2, "kl_coeff": 0.03}
     torch.testing.assert_close(
-      engine._ppo_loss(batch_logprobs, batch_weights, batch_aux, ppo_config).sum(),
-      single_sum(lambda logprobs, weights, aux: engine._ppo_loss(logprobs, weights, aux, ppo_config)),
+      trainer_module.losses.ppo_loss(
+        batch_logprobs,
+        batch_weights,
+        batch_old_logprobs,
+        batch_advantages,
+        ppo_config,
+      ).sum(),
+      single_sum(
+        lambda logprobs, weights, old_logprobs, advantages: trainer_module.losses.ppo_loss(
+          logprobs,
+          weights,
+          old_logprobs,
+          advantages,
+          ppo_config,
+        )
+      ),
     )
 
   def test_token_budget_batches_preserve_examples(self) -> None:
     engine = self._engine()
     data = self._data()
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "6"}):
-      batches = engine._make_training_batches(data)
+      batches = engine.make_training_batches(data)
 
     seen = [idx for batch in batches for idx, _datum in batch]
     self.assertCountEqual(seen, range(len(data)))

@@ -14,6 +14,8 @@ from peft import PeftModelForCausalLM, get_peft_model
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
+from training import losses
+
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
 
 
@@ -275,18 +277,36 @@ class TrainerEngine:
 
     self.peft_model.train()
 
-    for batch in self._make_training_batches(data):
+    for batch in self.make_training_batches(data):
       batch_indices = [idx for idx, _ in batch]
       batch_data = [datum for _, datum in batch]
 
-      target_logprobs, weights, aux_inputs, lengths = self._get_logprobs_batch(batch_data)
+      input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
+      target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
+      target_logprobs = self.compute_target_logprobs(input_ids, attention_mask, target_token_ids)
+
       match loss_fn:
         case "cross_entropy":
-          elementwise_loss = self._cross_entropy_loss(target_logprobs, weights)
+          elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
         case "importance_sampling":
-          elementwise_loss = self._importance_sampling_loss(target_logprobs, weights, aux_inputs)
+          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
+          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
+          elementwise_loss = losses.importance_sampling_loss(
+            target_logprobs,
+            weights,
+            old_logprobs,
+            advantages,
+          )
         case "ppo":
-          elementwise_loss = self._ppo_loss(target_logprobs, weights, aux_inputs, loss_config)
+          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
+          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
+          elementwise_loss = losses.ppo_loss(
+            target_logprobs,
+            weights,
+            old_logprobs,
+            advantages,
+            loss_config,
+          )
         case _:
           raise NotImplementedError(f"Loss {loss_fn} not supported")
 
@@ -315,7 +335,7 @@ class TrainerEngine:
       "loss_fn_output_type": "ArrayRecord",
     }
 
-  def _make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:
+  def make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:
     """Group examples for the single padded forward/backward path."""
     if len(data) <= 1:
       return [[(idx, datum)] for idx, datum in enumerate(data)]
@@ -349,97 +369,66 @@ class TrainerEngine:
 
     return batches
 
-  def _get_logprobs_batch(self, data: list[Datum]) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], list[int]]:
-    assert self.peft_model is not None
+  def pad_sequences(
+    self,
+    sequences: list[list[int] | list[float]],
+    lengths: list[int],
+    dtype: torch.dtype,
+    pad_value: int | float = 0,
+  ) -> torch.Tensor:
+    """Return padded values with shape [batch, max(lengths)]."""
+    padded = torch.full((len(sequences), max(lengths)), pad_value, dtype=dtype, device=self.device)
+    for row, sequence in enumerate(sequences):
+      length = lengths[row]
+      padded[row, :length] = padded.new_tensor(sequence[:length])
+    return padded
 
+  def pad_model_inputs(
+    self,
+    data: list[Datum],
+  ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Return input_ids and attention_mask with shape [batch, max_input_len]."""
     pad_token_id = self.tokenizer.pad_token_id if self.tokenizer and self.tokenizer.pad_token_id is not None else 0
     batch_size = len(data)
     input_lengths = [len(datum.model_input) for datum in data]
     max_input_len = max(input_lengths)
 
-    input_tensor = torch.full((batch_size, max_input_len), pad_token_id, dtype=torch.long, device=self.device)
-    attention_mask = torch.zeros((batch_size, max_input_len), dtype=torch.long, device=self.device)
-    for row, datum in enumerate(data):
-      input_len = input_lengths[row]
-      input_tensor[row, :input_len] = torch.tensor(datum.model_input, dtype=torch.long, device=self.device)
+    input_ids = self.pad_sequences([datum.model_input for datum in data], input_lengths, torch.long, pad_token_id)
+    attention_mask = input_ids.new_zeros((batch_size, max_input_len))
+    for row, input_len in enumerate(input_lengths):
       attention_mask[row, :input_len] = 1
 
+    return input_ids, attention_mask, input_lengths
+
+  def pad_targets_and_weights(
+    self,
+    data: list[Datum],
+    input_lengths: list[int],
+  ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Return target_token_ids and weights with shape [batch, max_target_len]."""
+    batch_size = len(data)
     target_lengths = [len(datum.loss_fn_inputs["target_tokens"].data) for datum in data]
     lengths = [min(input_lengths[row], target_lengths[row]) for row in range(batch_size)]
-    max_target_len = max(lengths)
-    loss_dtype = torch.float32
+    target_token_ids = self.pad_sequences([datum.loss_fn_inputs["target_tokens"].data for datum in data], lengths, torch.long)
+    weight_sequences = [
+      datum.loss_fn_inputs["weights"].data if "weights" in datum.loss_fn_inputs else [1.0] * target_lengths[row] for row, datum in enumerate(data)
+    ]
+    weights = self.pad_sequences(weight_sequences, lengths, torch.float32)
 
-    targets = torch.zeros((batch_size, max_target_len), dtype=torch.long, device=self.device)
-    weights = torch.zeros((batch_size, max_target_len), dtype=loss_dtype, device=self.device)
-    aux_inputs: dict[str, torch.Tensor] = {}
+    return target_token_ids, weights, lengths
 
-    aux_keys = set().union(*(datum.loss_fn_inputs.keys() for datum in data)) - {"target_tokens", "weights"}
-    for key in aux_keys:
-      aux_inputs[key] = torch.zeros((batch_size, max_target_len), dtype=loss_dtype, device=self.device)
-
-    for row, datum in enumerate(data):
-      seq_len = lengths[row]
-      targets_data = datum.loss_fn_inputs["target_tokens"].data[:seq_len]
-      targets[row, :seq_len] = torch.tensor(targets_data, dtype=torch.long, device=self.device)
-
-      weights_data = datum.loss_fn_inputs["weights"].data if "weights" in datum.loss_fn_inputs else [1.0] * target_lengths[row]
-      weights[row, :seq_len] = torch.tensor(weights_data[:seq_len], dtype=loss_dtype, device=self.device)
-
-      for key, aux_tensor in aux_inputs.items():
-        if key not in datum.loss_fn_inputs:
-          continue
-        values = datum.loss_fn_inputs[key].data[:seq_len]
-        aux_tensor[row, :seq_len] = torch.tensor(values, dtype=loss_dtype, device=self.device)
-
-    outputs = self.peft_model(input_tensor, attention_mask=attention_mask, use_cache=False, return_dict=True)
-    logits = outputs.logits[:, :max_target_len, :]
-    target_logprobs = torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
-
-    return target_logprobs, weights, aux_inputs, lengths
-
-  def _cross_entropy_loss(self, target_logprobs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    return -target_logprobs * weights
-
-  def _importance_sampling_loss(
+  def compute_target_logprobs(
     self,
-    target_logprobs: torch.Tensor,
-    weights: torch.Tensor,
-    aux_inputs: dict[str, torch.Tensor],
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    target_token_ids: torch.Tensor,
   ) -> torch.Tensor:
-    ref, advantages = self._reference_logprobs_and_advantages(aux_inputs, "importance_sampling")
-    ratio = self._policy_ratio(target_logprobs, ref)
-    elementwise_loss = -(ratio * advantages) * weights
-    return torch.nan_to_num(elementwise_loss, nan=0.0, posinf=0.0, neginf=0.0)
+    """Return selected target logprobs with shape [batch, max_target_len]."""
+    assert self.peft_model is not None
 
-  def _ppo_loss(
-    self,
-    target_logprobs: torch.Tensor,
-    weights: torch.Tensor,
-    aux_inputs: dict[str, torch.Tensor],
-    loss_config: dict | None,
-  ) -> torch.Tensor:
-    ref, advantages = self._reference_logprobs_and_advantages(aux_inputs, "ppo")
-    diff = torch.clamp(target_logprobs - ref, min=-20.0, max=20.0)
-    ratio = torch.exp(diff)
-    epsilon = loss_config.get("clip_range", 0.2) if loss_config else 0.2
-    surr1 = ratio * advantages
-    surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * advantages
-    elementwise_objective = torch.min(surr1, surr2)
-    kl_coeff = loss_config.get("kl_coeff", 0.0) if loss_config else 0.0
-    if kl_coeff > 0:
-      kl = (ratio - 1) - diff
-      elementwise_objective = elementwise_objective - kl_coeff * kl
-    return -(elementwise_objective * weights)
-
-  def _reference_logprobs_and_advantages(self, aux_inputs: dict[str, torch.Tensor], loss_fn: str) -> tuple[torch.Tensor, torch.Tensor]:
-    ref = aux_inputs.get("logprobs")
-    advantages = aux_inputs.get("advantages")
-    if ref is None or advantages is None:
-      raise ValueError(f"{loss_fn} requires 'logprobs' and 'advantages' in loss_fn_inputs")
-    return ref, advantages
-
-  def _policy_ratio(self, target_logprobs: torch.Tensor, ref_logprobs: torch.Tensor) -> torch.Tensor:
-    return torch.exp(torch.clamp(target_logprobs - ref_logprobs, min=-20.0, max=20.0))
+    outputs = self.peft_model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+    logits = outputs.logits[:, : target_token_ids.shape[1], :]
+    return torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
 
   def _sanitize_float(self, val: float) -> float:
     if math.isinf(val):

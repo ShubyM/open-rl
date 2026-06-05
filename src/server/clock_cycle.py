@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 from store import get_store
-from trainer import Datum, LoraConfig, TrainerEngine
+from training.trainer import Datum, LoraConfig, TrainerEngine
 
 tracer = trace.get_tracer(__name__)
 
