@@ -1,9 +1,8 @@
-import importlib.util
+import importlib
 import os
 import sys
 import types
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -11,7 +10,7 @@ import torch
 from tests._server_fixture import SERVER_DIR
 
 
-def _load_trainer_module():
+def _load_trainer_modules():
   stubs = {
     "peft": types.SimpleNamespace(
       LoraConfig=object,
@@ -25,16 +24,24 @@ def _load_trainer_module():
       PreTrainedTokenizerBase=object,
     ),
   }
-  spec = importlib.util.spec_from_file_location("trainer_under_test", Path(SERVER_DIR) / "trainer.py")
-  assert spec is not None and spec.loader is not None
-  module = importlib.util.module_from_spec(spec)
+  old_path = list(sys.path)
+  sys.path.insert(0, str(SERVER_DIR))
   with patch.dict(sys.modules, stubs):
-    spec.loader.exec_module(module)
-  return module
+    for module_name in list(sys.modules):
+      if module_name == "training" or module_name.startswith("training."):
+        del sys.modules[module_name]
+    trainer_worker = importlib.import_module("training.trainer_worker")
+    lora_trainer_worker = importlib.import_module("training.lora_trainer_worker")
+    fft_trainer_worker = importlib.import_module("training.fft_trainer_worker")
+    losses = importlib.import_module("training.losses")
+  sys.path = old_path
+  return trainer_worker, lora_trainer_worker, fft_trainer_worker, losses
 
 
-trainer_module = _load_trainer_module()
-TrainerEngine = trainer_module.TrainerEngine
+trainer_worker_module, lora_trainer_worker_module, fft_trainer_worker_module, losses_module = _load_trainer_modules()
+BaseTrainerWorker = trainer_worker_module.BaseTrainerWorker
+FFTTrainingWorker = fft_trainer_worker_module.FFTTrainingWorker
+LoraTrainingWorker = lora_trainer_worker_module.LoraTrainingWorker
 
 
 class _PeftModelStub:
@@ -79,15 +86,26 @@ class _LogitModelStub:
     return types.SimpleNamespace(logits=logits)
 
 
+class _FullModelStub:
+  def __init__(self, params):
+    self.params = params
+
+  def train(self):
+    return None
+
+  def parameters(self):
+    yield from self.params
+
+
 def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantages=None):
-  loss_fn_inputs = {"target_tokens": trainer_module.TensorData(data=target_tokens)}
+  loss_fn_inputs = {"target_tokens": trainer_worker_module.TensorData(data=target_tokens)}
   if weights is not None:
-    loss_fn_inputs["weights"] = trainer_module.TensorData(data=weights)
+    loss_fn_inputs["weights"] = trainer_worker_module.TensorData(data=weights)
   if logprobs is not None:
-    loss_fn_inputs["logprobs"] = trainer_module.TensorData(data=logprobs)
+    loss_fn_inputs["logprobs"] = trainer_worker_module.TensorData(data=logprobs)
   if advantages is not None:
-    loss_fn_inputs["advantages"] = trainer_module.TensorData(data=advantages)
-  return trainer_module.Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs)
+    loss_fn_inputs["advantages"] = trainer_worker_module.TensorData(data=advantages)
+  return trainer_worker_module.Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs)
 
 
 class TestTrainerOptimizerCorrectness(unittest.TestCase):
@@ -97,7 +115,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     active_param.grad = torch.tensor([1.0])
     other_param.grad = torch.tensor([10.0])
 
-    engine = TrainerEngine()
+    engine = LoraTrainingWorker()
     engine.peft_model = _PeftModelStub(
       {
         "adapter-a": [active_param],
@@ -105,7 +123,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
       }
     )
     engine.adapter_states = {
-      "adapter-a": {"trainable_params": trainer_module.active_adapter_parameters(engine.peft_model, "adapter-a"), "optimizer": None}
+      "adapter-a": {"trainable_params": lora_trainer_worker_module.active_adapter_parameters(engine.peft_model, "adapter-a"), "optimizer": None}
     }
     engine.save_adapter = lambda *_args, **_kwargs: None
 
@@ -128,14 +146,40 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
       self.assertTrue(torch.allclose(active_param.grad, torch.zeros_like(active_param.grad)))
     self.assertIsNotNone(other_param.grad)
 
+  def test_fft_optim_step_updates_full_model_trainable_params(self) -> None:
+    trainable_param = torch.nn.Parameter(torch.tensor([1.0]))
+    frozen_param = torch.nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+    trainable_param.grad = torch.tensor([1.0])
+    frozen_param.grad = torch.tensor([10.0])
+
+    engine = FFTTrainingWorker()
+    engine.model = _FullModelStub([trainable_param, frozen_param])
+    engine.trainable_params = fft_trainer_worker_module.trainable_model_parameters(engine.model)
+
+    result = engine.optim_step(
+      {
+        "learning_rate": 0.1,
+        "beta1": 0.0,
+        "beta2": 0.0,
+        "eps": 1e-8,
+        "weight_decay": 0.0,
+      }
+    )
+
+    self.assertAlmostEqual(result["metrics"]["grad_norm:mean"], 1.0)
+    self.assertFalse(torch.allclose(trainable_param.detach(), torch.tensor([1.0])))
+    self.assertTrue(torch.allclose(frozen_param.detach(), torch.tensor([1.0])))
+    if trainable_param.grad is not None:
+      self.assertTrue(torch.allclose(trainable_param.grad, torch.zeros_like(trainable_param.grad)))
+    self.assertIsNotNone(frozen_param.grad)
+
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
-  def _engine(self) -> TrainerEngine:
-    engine = TrainerEngine()
-    engine.device = torch.device("cpu")
-    engine.tokenizer = _TokenizerStub()
-    engine.peft_model = _LogitModelStub()
-    return engine
+  def _worker(self) -> BaseTrainerWorker:
+    worker = BaseTrainerWorker()
+    worker.device = torch.device("cpu")
+    worker.tokenizer = _TokenizerStub()
+    return worker
 
   def _data(self):
     return [
@@ -161,46 +205,82 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       ),
     ]
 
+  def training_tensors(self, worker, model, data):
+    input_ids, attention_mask, input_lengths = worker.pad_model_inputs(data)
+    target_token_ids, weights, lengths = worker.pad_targets_and_weights(data, input_lengths)
+    logprobs = worker.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+    old_logprobs = worker.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in data], lengths, torch.float32)
+    advantages = worker.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in data], lengths, torch.float32)
+    return logprobs, weights, old_logprobs, advantages, lengths
+
   def test_padded_batch_logprobs_and_losses_match_per_example_math(self) -> None:
-    engine = self._engine()
+    worker = self._worker()
+    model = _LogitModelStub()
     data = self._data()
 
-    batch_logprobs, batch_weights, batch_aux, batch_lengths = engine._get_logprobs_batch(data)
-    single_results = [engine._get_logprobs_batch([datum]) for datum in data]
+    batch_logprobs, batch_weights, batch_old_logprobs, batch_advantages, batch_lengths = self.training_tensors(worker, model, data)
+    single_results = [self.training_tensors(worker, model, [datum]) for datum in data]
 
-    for row, (single_logprobs, single_weights, single_aux, single_lengths) in enumerate(single_results):
+    for row, (single_logprobs, single_weights, single_old_logprobs, single_advantages, single_lengths) in enumerate(single_results):
       length = batch_lengths[row]
       self.assertEqual(length, single_lengths[0])
       torch.testing.assert_close(batch_logprobs[row, :length], single_logprobs[0, :length])
       torch.testing.assert_close(batch_weights[row, :length], single_weights[0, :length])
       torch.testing.assert_close(batch_weights[row, length:], torch.zeros_like(batch_weights[row, length:]))
-      for key in ("logprobs", "advantages"):
-        torch.testing.assert_close(batch_aux[key][row, :length], single_aux[key][0, :length])
-        torch.testing.assert_close(batch_aux[key][row, length:], torch.zeros_like(batch_aux[key][row, length:]))
+      torch.testing.assert_close(batch_old_logprobs[row, :length], single_old_logprobs[0, :length])
+      torch.testing.assert_close(batch_old_logprobs[row, length:], torch.zeros_like(batch_old_logprobs[row, length:]))
+      torch.testing.assert_close(batch_advantages[row, :length], single_advantages[0, :length])
+      torch.testing.assert_close(batch_advantages[row, length:], torch.zeros_like(batch_advantages[row, length:]))
 
     def single_sum(fn):
-      losses = [fn(logprobs, weights, aux).sum() for logprobs, weights, aux, _lengths in single_results]
+      losses = [fn(logprobs, weights, old_logprobs, advantages).sum() for logprobs, weights, old_logprobs, advantages, _lengths in single_results]
       return torch.stack(losses).sum()
 
     torch.testing.assert_close(
-      engine._cross_entropy_loss(batch_logprobs, batch_weights).sum(),
-      single_sum(lambda logprobs, weights, _aux: engine._cross_entropy_loss(logprobs, weights)),
+      losses_module.cross_entropy_loss(batch_logprobs, batch_weights).sum(),
+      single_sum(lambda logprobs, weights, _old_logprobs, _advantages: losses_module.cross_entropy_loss(logprobs, weights)),
     )
     torch.testing.assert_close(
-      engine._importance_sampling_loss(batch_logprobs, batch_weights, batch_aux).sum(),
-      single_sum(lambda logprobs, weights, aux: engine._importance_sampling_loss(logprobs, weights, aux)),
+      losses_module.importance_sampling_loss(
+        batch_logprobs,
+        batch_weights,
+        batch_old_logprobs,
+        batch_advantages,
+      ).sum(),
+      single_sum(
+        lambda logprobs, weights, old_logprobs, advantages: losses_module.importance_sampling_loss(
+          logprobs,
+          weights,
+          old_logprobs,
+          advantages,
+        )
+      ),
     )
     ppo_config = {"clip_range": 0.2, "kl_coeff": 0.03}
     torch.testing.assert_close(
-      engine._ppo_loss(batch_logprobs, batch_weights, batch_aux, ppo_config).sum(),
-      single_sum(lambda logprobs, weights, aux: engine._ppo_loss(logprobs, weights, aux, ppo_config)),
+      losses_module.ppo_loss(
+        batch_logprobs,
+        batch_weights,
+        batch_old_logprobs,
+        batch_advantages,
+        ppo_config,
+      ).sum(),
+      single_sum(
+        lambda logprobs, weights, old_logprobs, advantages: losses_module.ppo_loss(
+          logprobs,
+          weights,
+          old_logprobs,
+          advantages,
+          ppo_config,
+        )
+      ),
     )
 
   def test_token_budget_batches_preserve_examples(self) -> None:
-    engine = self._engine()
+    engine = self._worker()
     data = self._data()
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "6"}):
-      batches = engine._make_training_batches(data)
+      batches = engine.make_training_batches(data)
 
     seen = [idx for batch in batches for idx, _datum in batch]
     self.assertCountEqual(seen, range(len(data)))
@@ -209,18 +289,31 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       self.assertTrue(len(batch) == 1 or padded_tokens <= 6)
 
   def test_forward_backward_padded_batches_preserve_client_output_shape(self) -> None:
-    engine = self._engine()
+    worker = self._worker()
+    model = _LogitModelStub()
     data = self._data()
 
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "12"}):
-      result = engine.forward_backward(data, "cross_entropy")
+      result = worker.forward_backward(model, data, "cross_entropy")
 
     self.assertEqual(len(result["loss_fn_outputs"]), len(data))
-    self.assertGreater(len(engine.peft_model.calls), 0)
-    self.assertTrue(any(call[0].shape[0] > 1 for call in engine.peft_model.calls))
+    self.assertGreater(len(model.calls), 0)
+    self.assertTrue(any(call[0].shape[0] > 1 for call in model.calls))
     for datum, output in zip(data, result["loss_fn_outputs"], strict=True):
       logprobs = output["logprobs"]
       self.assertEqual(logprobs["shape"], [min(len(datum.model_input), len(datum.loss_fn_inputs["target_tokens"].data))])
+
+  def test_fft_forward_backward_uses_single_process_model(self) -> None:
+    worker = FFTTrainingWorker()
+    worker.device = torch.device("cpu")
+    worker.tokenizer = _TokenizerStub()
+    worker.model = _LogitModelStub()
+    data = self._data()
+
+    result = worker.forward_backward(data, "cross_entropy")
+
+    self.assertEqual(len(result["loss_fn_outputs"]), len(data))
+    self.assertGreater(len(worker.model.calls), 0)
 
 
 if __name__ == "__main__":

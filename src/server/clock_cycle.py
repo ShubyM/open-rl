@@ -10,14 +10,15 @@ from fastapi import FastAPI, HTTPException
 from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 from store import get_store
-from trainer import Datum, LoraConfig, TrainerEngine
+from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
+from training.trainer_worker import Datum
 
 tracer = trace.get_tracer(__name__)
 
-engine = TrainerEngine()
+engine = LoraTrainingWorker()
 
 
-def _parse_datum(raw: dict) -> Datum:
+def parse_datum(raw: dict) -> Datum:
   """Convert wire-format datum (with chunks) to our flat Datum type."""
   chunks = raw.get("model_input", {}).get("chunks", [])
   tokens: list[int] = []
@@ -98,7 +99,7 @@ async def clock_cycle_loop() -> None:
                 loss_fn = r["loss_fn"]
                 loss_config = r.get("loss_config")
 
-                typed_data = [_parse_datum(item) for item in raw_data]
+                typed_data = [parse_datum(item) for item in raw_data]
 
                 result = await asyncio.to_thread(engine.forward_backward, typed_data, loss_fn, loss_config, m_id)
                 result["type"] = "forward_backward"
