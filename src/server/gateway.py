@@ -1,6 +1,7 @@
 # This file contains the FastAPI server entry point and request handlers for the Open-RL API backend.
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -16,6 +17,7 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from store import get_store
+from training_requests_processor import TrainingRequestsProcessor, create_training_worker
 from worker_launch_processor import (
   CreateModelFromStateWorkerLaunchRequest,
   CreateModelWorkerLaunchRequest,
@@ -196,12 +198,11 @@ async def lifespan(_: FastAPI):
     print("-> Server mode     : API server + worker loop in one process\n")
     await preflight_vllm()
     if not is_fft_enabled():
-      import clock_cycle
-
-      worker = clock_cycle.create_training_worker()
+      worker = create_training_worker()
       if base_model:
         await asyncio.to_thread(worker.load_base_model, base_model)
-      task = asyncio.create_task(clock_cycle.clock_cycle_loop(worker))
+      processor = TrainingRequestsProcessor(store, worker)
+      task = asyncio.create_task(processor.run())
   try:
     yield
   finally:
@@ -538,8 +539,6 @@ async def asample(req: dict):
 @app.get("/api/v1/list_adapters")
 async def list_adapters():
   """CLI `list` — scan the peft directory for saved adapters."""
-  import json
-
   peft_dir = os.path.join(TMP_DIR, "peft")
   adapters = []
 

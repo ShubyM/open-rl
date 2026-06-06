@@ -102,7 +102,7 @@ uv run uvicorn src.gateway:app --host 0.0.0.0 --port 8000
 # Trainer worker pod
 REDIS_URL=redis://redis-service:6379 \
 BASE_MODEL=google/gemma-4-e2b \
-uv run python -m src.clock_cycle
+uv run python -m src.training_requests_processor
 ```
 
 ```bash

@@ -49,7 +49,7 @@ class FFTWorkerManager:
 
     env = {**os.environ, "OPEN_RL_ENABLE_FFT": "true"}
     self.processes[model_id] = subprocess.Popen(
-      [sys.executable, "-m", "clock_cycle", "--model-id", model_id],
+      [sys.executable, "-m", "training_requests_processor", "--model-id", model_id],
       cwd=self.server_dir,
       env=env,
     )

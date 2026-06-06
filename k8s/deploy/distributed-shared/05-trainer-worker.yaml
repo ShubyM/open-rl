@@ -34,7 +34,7 @@ spec:
       - name: trainer-worker
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: Always
-        command: ["uv", "run", "python", "-m", "src.clock_cycle"]
+        command: ["uv", "run", "python", "-m", "src.training_requests_processor"]
         env:
         - name: ENABLE_GCP_TRACE
           valueFrom:

@@ -321,11 +321,5 @@ class LoraTrainingWorker(BaseTrainerWorker):
     return super().generate(self.peft_model, prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
 
 
-def main() -> None:
-  from clock_cycle import main as clock_cycle_main
-
-  clock_cycle_main()
-
-
 if __name__ == "__main__":
-  main()
+  raise SystemExit("Run the training worker with `python -m training_requests_processor`.")
