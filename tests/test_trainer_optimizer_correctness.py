@@ -1,14 +1,16 @@
+import asyncio
 import importlib
 import os
 import sys
 import tempfile
 import types
 import unittest
+from contextlib import asynccontextmanager
 from unittest.mock import patch
 
 import torch
 
-from tests._server_fixture import SERVER_DIR
+from tests._server_fixture import SERVER_DIR, SRC_DIR
 
 
 def _load_trainer_modules():
@@ -54,6 +56,7 @@ def _load_clock_cycle_module():
     ),
   }
   old_path = list(sys.path)
+  sys.path.insert(0, str(SRC_DIR))
   sys.path.insert(0, str(SERVER_DIR))
   env = {
     "OPEN_RL_ENABLE_FFT": "true",
@@ -168,6 +171,43 @@ class _FutureStoreStub:
 
   async def set_future(self, req_id, result):
     self.results[req_id] = result
+
+
+class _ClockCycleStoreStub(_FutureStoreStub):
+  def __init__(self, batches):
+    super().__init__()
+    self.batches = list(batches)
+    self.queried_model_ids = []
+
+  async def get_requests_for_model(self, model_id):
+    self.queried_model_ids.append(model_id)
+    if self.batches:
+      return self.batches.pop(0)
+    raise asyncio.CancelledError()
+
+
+class _SnapshotClientStub:
+  def __init__(self):
+    self.events = []
+
+  async def register(self, pid):
+    self.events.append(("register", pid))
+    return {"ok": True}
+
+  @asynccontextmanager
+  async def acquire(self, pid):
+    self.events.append(("acquire", pid))
+    try:
+      yield
+    finally:
+      self.events.append(("release", pid))
+
+  async def unregister(self, pid):
+    self.events.append(("unregister", pid))
+    return {"ok": True}
+
+  async def close(self):
+    self.events.append(("close",))
 
 
 def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantages=None):
@@ -389,6 +429,64 @@ class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
   async def test_clock_cycle_full_mode_requires_redis(self) -> None:
     with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
       await clock_cycle_module.clock_cycle_loop(_RecordingFullWorker(), "model-a")
+
+  async def test_clock_cycle_full_mode_uses_default_snapshot_socket(self) -> None:
+    store = _ClockCycleStoreStub([])
+    snapshot_client = _SnapshotClientStub()
+
+    with (
+      patch.dict(
+        os.environ,
+        {
+          "OPEN_RL_ENABLE_FFT": "true",
+          "REDIS_URL": "redis://localhost:6379",
+        },
+        clear=True,
+      ),
+      patch.object(clock_cycle_module, "get_store", return_value=store),
+      patch.object(clock_cycle_module, "create_snapshot_agent_client", return_value=snapshot_client) as create_snapshot_agent_client,
+    ):
+      await clock_cycle_module.clock_cycle_loop(_RecordingFullWorker(), "model-a")
+
+    create_snapshot_agent_client.assert_called_once_with("/tmp/open-rl/snapshot-agent.sock")
+    self.assertEqual([event[0] for event in snapshot_client.events], ["register", "unregister", "close"])
+
+  async def test_clock_cycle_full_mode_uses_injected_snapshot_client(self) -> None:
+    worker = _RecordingFullWorker()
+    store = _ClockCycleStoreStub(
+      [
+        [
+          {
+            "req_id": "req-a",
+            "model_id": "model-a",
+            "type": "create_model",
+            "base_model": "base-model",
+            "full_config": {"seed": 123},
+          }
+        ]
+      ]
+    )
+    snapshot_client = _SnapshotClientStub()
+
+    with (
+      patch.dict(
+        os.environ,
+        {
+          "OPEN_RL_ENABLE_FFT": "true",
+          "REDIS_URL": "redis://localhost:6379",
+        },
+      ),
+      patch.object(clock_cycle_module, "get_store", return_value=store),
+    ):
+      await clock_cycle_module.clock_cycle_loop(worker, "model-a", snapshot_client=snapshot_client)
+
+    self.assertEqual(store.queried_model_ids, ["model-a", "model-a"])
+    self.assertEqual([event[0] for event in snapshot_client.events], ["register", "acquire", "release", "unregister", "close"])
+    for event in snapshot_client.events:
+      if len(event) == 2:
+        self.assertEqual(event[1], os.getpid())
+    self.assertEqual(worker.created_models[0][0], "base-model")
+    self.assertEqual(store.results["req-a"]["model_id"], "model-a")
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):

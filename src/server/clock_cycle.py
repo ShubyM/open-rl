@@ -15,6 +15,8 @@ from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
 from training.trainer_worker import Datum
 
+from snapshot_agent.client import SnapshotAgentClient
+
 tracer = trace.get_tracer(__name__)
 
 
@@ -27,6 +29,10 @@ def is_fft_enabled() -> bool:
 
 def create_training_worker() -> TrainingWorker:
   return FFTTrainingWorker() if is_fft_enabled() else LoraTrainingWorker()
+
+
+def create_snapshot_agent_client(socket_path: str) -> SnapshotAgentClient:
+  return SnapshotAgentClient(socket_path)
 
 
 def parse_datum(raw: dict) -> Datum:
@@ -184,7 +190,11 @@ async def handle_request(store, request: dict, model_id: str, worker: TrainingWo
       otel_context.detach(token)
 
 
-async def clock_cycle_loop(worker: TrainingWorker, model_id: str | None = None) -> None:
+async def clock_cycle_loop(
+  worker: TrainingWorker,
+  model_id: str | None = None,
+  snapshot_client: SnapshotAgentClient | None = None,
+) -> None:
   fft_enabled = is_fft_enabled()
   if fft_enabled and not os.getenv("REDIS_URL"):
     raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
@@ -192,43 +202,65 @@ async def clock_cycle_loop(worker: TrainingWorker, model_id: str | None = None) 
     raise RuntimeError("A dedicated FFT worker needs --model-id so it knows which per-model queue to drain")
 
   store = get_store()
+  pid = os.getpid()
+  if fft_enabled:
+    snapshot_socket = os.getenv("OPEN_RL_SNAPSHOT_AGENT_SOCKET", "/tmp/open-rl/snapshot-agent.sock")
+    fft_snapshot_client = snapshot_client or create_snapshot_agent_client(snapshot_socket)
+  snapshot_registered = False
 
   print(f"[WORKER] Training worker started. FFT enabled: {fft_enabled}.")
 
-  while True:
-    try:
-      batch = await store.get_requests_for_model(model_id) if fft_enabled else await store.get_requests()
-      if not batch:
-        await asyncio.sleep(0.1)
-        continue
+  try:
+    if fft_enabled:
+      await fft_snapshot_client.register(pid)
+      snapshot_registered = True
 
-      m_id = model_id or batch[0].get("model_id", "default")
+    while True:
+      try:
+        batch = await store.get_requests_for_model(model_id) if fft_enabled else await store.get_requests()
+        if not batch:
+          await asyncio.sleep(0.1)
+          continue
 
-      with tracer.start_as_current_span("clock_cycle_batch") as batch_span:
-        batch_span.set_attribute("batch_size", len(batch))
-        batch_span.set_attribute("model_id", m_id)
+        m_id = model_id or batch[0].get("model_id", "default")
 
-        print(f"\n[CLOCK CYCLE] Popped {len(batch)} requests for tenant: {m_id}")
+        with tracer.start_as_current_span("clock_cycle_batch") as batch_span:
+          batch_span.set_attribute("batch_size", len(batch))
+          batch_span.set_attribute("model_id", m_id)
 
-        for r in batch:
-          await handle_request(store, r, m_id, worker, fft_enabled=fft_enabled)
+          print(f"\n[CLOCK CYCLE] Popped {len(batch)} requests for tenant: {m_id}")
 
-    except asyncio.CancelledError:
-      break
-    except Exception as e:
-      print(f"Error in clock cycle loop: {e}")
-      traceback.print_exc()
+          if fft_enabled:
+            async with fft_snapshot_client.acquire(pid):
+              for r in batch:
+                await handle_request(store, r, m_id, worker, fft_enabled=fft_enabled)
+          else:
+            for r in batch:
+              await handle_request(store, r, m_id, worker, fft_enabled=fft_enabled)
 
-      import redis
+      except asyncio.CancelledError:
+        break
+      except Exception as e:
+        print(f"Error in clock cycle loop: {e}")
+        traceback.print_exc()
 
-      if isinstance(e, redis.exceptions.ConnectionError):
-        print("[worker] Destroying StateStore singleton to force Redis reconnection...")
-        import store as store_mod
+        import redis
 
-        store_mod._store_instance = None
-        store = store_mod.get_store()
+        if isinstance(e, redis.exceptions.ConnectionError):
+          print("[worker] Destroying StateStore singleton to force Redis reconnection...")
+          import store as store_mod
 
-      await asyncio.sleep(1)
+          store_mod._store_instance = None
+          store = store_mod.get_store()
+
+        await asyncio.sleep(1)
+  finally:
+    if fft_enabled:
+      try:
+        if snapshot_registered:
+          await fft_snapshot_client.unregister(pid)
+      finally:
+        await fft_snapshot_client.close()
 
 
 def main() -> None:
