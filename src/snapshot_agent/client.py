@@ -24,19 +24,19 @@ class SnapshotAgentClient:
     self.reader = None
     self.writer = None
 
-  async def register(self, run_id: str, pid: int) -> dict[str, Any]:
-    return await self.request({"command": "REGISTER", "run_id": run_id, "pid": pid})
+  async def register(self, pid: int) -> dict[str, Any]:
+    return await self.request({"command": "REGISTER", "pid": pid})
 
-  async def unregister(self, run_id: str) -> dict[str, Any]:
-    return await self.request({"command": "UNREGISTER", "run_id": run_id})
+  async def unregister(self, pid: int) -> dict[str, Any]:
+    return await self.request({"command": "UNREGISTER", "pid": pid})
 
   @asynccontextmanager
-  async def acquire(self, run_id: str) -> AsyncIterator[None]:
-    await self.request({"command": "ACQUIRE", "run_id": run_id})
+  async def acquire(self, pid: int) -> AsyncIterator[None]:
+    await self.request({"command": "ACQUIRE", "pid": pid})
     try:
       yield
     finally:
-      await self.request({"command": "RELEASE", "run_id": run_id})
+      await self.request({"command": "RELEASE", "pid": pid})
 
   async def request(self, payload: dict[str, Any]) -> dict[str, Any]:
     await self.connect()
