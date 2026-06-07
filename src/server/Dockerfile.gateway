@@ -25,12 +25,15 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 # Install ONLY core dependencies using uv (ignoring massive ML extras)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-install-project
+    uv sync --frozen --no-install-project
 
 # Copy source code
-COPY . ./src/
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen
 
 EXPOSE 8000
 
 # Start the Gateway
-CMD ["uv", "run", "uvicorn", "src.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]

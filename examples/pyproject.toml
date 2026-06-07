@@ -25,12 +25,10 @@ dependencies = [
     "opentelemetry-sdk>=1.40.0",
     "transformers>=5.7.0",
     "ipykernel",
-    "torch",
 ]
 
-# Use the CPU torch wheel — the client only needs torch transitively (via
-# transformers' AutoTokenizer) and never runs model code, so the ~2 GB CUDA
-# build is wasted download time.
+# tinker-cookbook pulls in torch, but examples only need CPU-side client/data
+# utilities. Force the CPU wheel to avoid downloading a CUDA build.
 [[tool.uv.index]]
 name = "torch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
@@ -42,6 +40,7 @@ torch = { index = "torch-cpu" }
 [tool.uv]
 override-dependencies = [
     "transformers>=5.7.0",
+    "torch",
 ]
 
 [tool.setuptools.package-dir]

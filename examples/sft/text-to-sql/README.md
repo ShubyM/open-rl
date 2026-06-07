@@ -9,8 +9,8 @@ Text-to-SQL tasks using OpenRL. The Gemma 4 SFT+RL recipe lives under
 1. **Install dependencies**:
    Set up the server and client environments:
    ```bash
-   cd src/server && uv sync --extra cpu
-   cd ../../examples && uv sync
+   uv sync --extra cpu
+   uv --project examples sync
    ```
 
 ## Running the Training Server

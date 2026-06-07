@@ -38,15 +38,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --extra gpu --extra vllm
 
 # Copy source code
-COPY . ./src/
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --extra gpu --extra vllm
 
 # TODO: this is a hack until vllm is fixed upstream
 # Apply Gemma 4 LoRA deduplication patch
-RUN uv run python /app/src/scripts/patch_vllm_lora_dedup.py
+RUN uv run python /app/src/server/scripts/patch_vllm_lora_dedup.py
 
 # Expose ports (Gateway: 8000, vLLM Worker: 8001)
 EXPOSE 8000
 EXPOSE 8001
 
 # Start the Gateway using uv run to ensure the venv is active
-CMD ["uv", "run", "uvicorn", "src.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]

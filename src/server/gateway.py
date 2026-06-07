@@ -15,8 +15,9 @@ from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from store import get_store
-from worker_launch_processor import (
+
+from server.store import get_store
+from server.worker_launch_processor import (
   FFTWorkerManager,
   WorkerLaunchProcessor,
 )
@@ -220,7 +221,7 @@ async def lifespan(_: FastAPI):
     print("-> Server mode     : API server + worker loop in one process\n")
     await preflight_vllm()
     if not is_fft_enabled():
-      import training_requests_processor
+      from server import training_requests_processor
 
       worker = training_requests_processor.LoraTrainingWorker()
       if base_model:

@@ -12,12 +12,12 @@ import signal
 import subprocess
 import sys
 import threading
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import chz
-import tomllib
 from event_log import UI_EVENTS_FILE, append_ui_events
 
 

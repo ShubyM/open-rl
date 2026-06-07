@@ -10,8 +10,6 @@ from unittest.mock import patch
 
 import torch
 
-from tests._server_fixture import SERVER_DIR, SRC_DIR
-
 
 def _load_trainer_modules():
   stubs = {
@@ -27,17 +25,12 @@ def _load_trainer_modules():
       PreTrainedTokenizerBase=object,
     ),
   }
-  old_path = list(sys.path)
-  sys.path.insert(0, str(SERVER_DIR))
   with patch.dict(sys.modules, stubs):
     for module_name in list(sys.modules):
       if module_name == "training" or module_name.startswith("training."):
         del sys.modules[module_name]
-    trainer_worker = importlib.import_module("training.trainer_worker")
-    lora_trainer_worker = importlib.import_module("training.lora_trainer_worker")
-    fft_trainer_worker = importlib.import_module("training.fft_trainer_worker")
-    losses = importlib.import_module("training.losses")
-  sys.path = old_path
+    from training import fft_trainer_worker, lora_trainer_worker, losses, trainer_worker
+
   return trainer_worker, lora_trainer_worker, fft_trainer_worker, losses
 
 
@@ -55,19 +48,15 @@ def _load_training_requests_processor_module():
       PreTrainedTokenizerBase=object,
     ),
   }
-  old_path = list(sys.path)
-  sys.path.insert(0, str(SRC_DIR))
-  sys.path.insert(0, str(SERVER_DIR))
   env = {
     "OPEN_RL_ENABLE_FFT": "true",
     "REDIS_URL": "redis://localhost:6379",
   }
   with patch.dict(sys.modules, stubs), patch.dict(os.environ, env):
     for module_name in list(sys.modules):
-      if module_name == "training_requests_processor":
+      if module_name == "server.training_requests_processor":
         del sys.modules[module_name]
-    training_requests_processor = importlib.import_module("training_requests_processor")
-  sys.path = old_path
+    training_requests_processor = importlib.import_module("server.training_requests_processor")
   return training_requests_processor
 
 

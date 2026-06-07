@@ -188,7 +188,7 @@
   <text x="808" y="228" font-family="ui-monospace, SFMono-Regular, monospace" font-size="6.5" fill="#475569">-> bwd() -> optim()</text>
 
   <!-- Description -->
-  <text x="476" y="258" font-family="ui-sans-serif, system-ui, sans-serif" font-size="7" fill="#475569">Drains Redis each clock cycle. Adapter swap = pointer flip. Per-tenant optimizer state.</text>
+  <text x="476" y="258" font-family="ui-sans-serif, system-ui, sans-serif" font-size="7" fill="#475569">Drains Redis by request batch. Adapter swap = pointer flip. Per-tenant optimizer state.</text>
   <text x="476" y="272" font-family="ui-sans-serif, system-ui, sans-serif" font-size="7" fill="#475569">Results pushed to Redis. At eval steps: saves weights to shared storage for vLLM inference.</text>
 
   <!-- Results inside trainer -->

@@ -26,13 +26,13 @@ help:
 # ---------------------------------------------------------------------------
 server:
 	@-kill -9 $$(lsof -ti:$(PORT)) 2>/dev/null || true
-	cd src/server && BASE_MODEL="$(BASE_MODEL)" SAMPLING_BACKEND="$(SAMPLING_BACKEND)" \
+	BASE_MODEL="$(BASE_MODEL)" SAMPLING_BACKEND="$(SAMPLING_BACKEND)" \
 	  uv run --extra $(if $(filter vllm,$(SAMPLING_BACKEND)),gpu,cpu) \
-	  python -m uvicorn gateway:app --host $(HOST) --port $(PORT)
+	  python -m uvicorn server.gateway:app --host $(HOST) --port $(PORT)
 
 vllm:
-	cd src/server && BASE_MODEL="$(BASE_MODEL)" \
-	  uv run --extra vllm python -m vllm_sampler
+	BASE_MODEL="$(BASE_MODEL)" \
+	  uv run --extra vllm python -m server.vllm_sampler
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -66,8 +66,8 @@ GCP_PROJECT ?= cdrollouts-sunilarora
 IMAGE_TAG   ?= latest
 
 build-images:
-	cd src/server && DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) -f Dockerfile .
-	cd src/server && DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) -f Dockerfile.gateway .
+	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) -f src/server/Dockerfile .
+	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) -f src/server/Dockerfile.gateway .
 
 push-images:
 	docker push gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG)
@@ -106,4 +106,3 @@ push-vm:
 # Pull changes from the remote VM back to the local workspace
 pull-vm:
 	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' $(REMOTE_HOST):~/open-rl/ ./
-

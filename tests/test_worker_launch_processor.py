@@ -1,14 +1,9 @@
-import sys
 import unittest
 from unittest.mock import patch
 
-from tests._server_fixture import SERVER_DIR
-
-sys.path.insert(0, str(SERVER_DIR))
-
-import gateway  # noqa: E402
-from store import InMemoryStore  # noqa: E402
-from worker_launch_processor import WorkerLaunchProcessor  # noqa: E402
+from server import gateway
+from server.store import InMemoryStore
+from server.worker_launch_processor import WorkerLaunchProcessor
 
 
 class StoreStub:
@@ -65,7 +60,7 @@ class WorkerLaunchProcessorTest(unittest.IsolatedAsyncioTestCase):
       "payload": {"base_model": "base-model"},
     }
 
-    with patch("worker_launch_processor.traceback.print_exc"):
+    with patch("server.worker_launch_processor.traceback.print_exc"):
       await processor.process_request(request)
 
     self.assertEqual(worker_manager.launched_model_ids, ["model-a"])
@@ -85,7 +80,7 @@ class WorkerLaunchProcessorTest(unittest.IsolatedAsyncioTestCase):
       "payload": {"base_model": "base-model"},
     }
 
-    with patch("worker_launch_processor.traceback.print_exc"):
+    with patch("server.worker_launch_processor.traceback.print_exc"):
       await processor.process_request(request)
 
     self.assertEqual(worker_manager.launched_model_ids, [])

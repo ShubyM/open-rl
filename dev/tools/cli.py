@@ -44,7 +44,7 @@ def list_adapters(args):
       # Format timestamp if possible
       try:
         # If it's a float timestamp
-        if isinstance(created_at, (int, float)):
+        if isinstance(created_at, int | float):
           dt = datetime.fromtimestamp(created_at)
           created_at = dt.strftime("%Y-%m-%d %H:%M:%S")
         # If it's an ISO string (from metadata.json)

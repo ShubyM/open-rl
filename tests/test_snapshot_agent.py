@@ -1,16 +1,11 @@
 import asyncio
-import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
-from tests._server_fixture import REPO_ROOT
-
-sys.path.insert(0, str(REPO_ROOT / "src"))
-
-from snapshot_agent.client import SnapshotAgentClient  # noqa: E402
-from snapshot_agent.serve import SnapshotAgent, start_snapshot_agent  # noqa: E402
+from snapshot_agent.client import SnapshotAgentClient
+from snapshot_agent.serve import SnapshotAgent, start_snapshot_agent
 
 
 class RecordingRestorer:

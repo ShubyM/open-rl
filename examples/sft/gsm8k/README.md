@@ -25,12 +25,11 @@ redis-server --port 6379 --save "" --appendonly no
 ### Terminal 2: Gateway
 
 ```bash
-cd src/server
 REDIS_URL=redis://127.0.0.1:6379 \
 OPEN_RL_ENABLE_FFT=true \
 BASE_MODEL=Qwen/Qwen2.5-0.5B \
 SAMPLING_BACKEND=torch \
-uv run --extra gpu python -m uvicorn gateway:app --host 127.0.0.1 --port 9003
+uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 ### Terminal 3: SFT Job

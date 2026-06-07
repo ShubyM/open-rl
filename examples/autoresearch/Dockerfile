@@ -21,8 +21,8 @@ RUN npm install -g @google/gemini-cli
 
 WORKDIR /app
 
-COPY pyproject.toml uv.lock README.md ./
-COPY autoresearch ./autoresearch
+COPY examples/pyproject.toml examples/uv.lock examples/README.md ./
+COPY examples/autoresearch ./autoresearch
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen

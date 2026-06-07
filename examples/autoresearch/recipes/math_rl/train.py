@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tomllib
 from pathlib import Path
 from typing import Any
 
 import chz
-import tomllib
 from tinker_cookbook import model_info
 from tinker_cookbook.recipes.math_rl.train import get_dataset_builder as get_math_dataset_builder
 from tinker_cookbook.rl import train as rl_train

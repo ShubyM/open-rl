@@ -7,9 +7,3 @@ resources:
   - 03-vllm.yaml
   - 04-gateway.yaml
   - 05-trainer-worker.yaml
-
-images:
-  - name: gcr.io/cdrollouts-sunilarora/open-rl-gateway
-    newName: <your-gcr-path>/open-rl-gateway
-  - name: gcr.io/cdrollouts-sunilarora/open-rl-server
-    newName: <your-gcr-path>/open-rl-gateway

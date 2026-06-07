@@ -118,7 +118,7 @@ class InMemoryStore(RequestStore):
     try:
       await asyncio.wait_for(event.wait(), timeout=timeout)
       return self.futures_store.get(req_id)
-    except asyncio.TimeoutError:
+    except TimeoutError:
       return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
     finally:
       self.futures_events.pop(req_id, None)

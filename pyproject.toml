@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "server"
+name = "open-rl"
 version = "0.1.0"
-description = "Add your description here"
+description = "Open-RL server and training runtime."
 readme = "README.md"
 requires-python = ">=3.12, <3.13"
 dependencies = [
@@ -39,6 +43,13 @@ vllm = [
     "torch-c-dlpack-ext; sys_platform == 'linux'",
     "vllm==0.20.0; sys_platform == 'linux'",
 ]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["server*", "training*", "snapshot_agent*"]
 
 [tool.uv]
 override-dependencies = [
