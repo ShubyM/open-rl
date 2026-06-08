@@ -8,7 +8,7 @@ sys.path.insert(0, str(SERVER_DIR))
 
 import gateway  # noqa: E402
 from store import InMemoryStore  # noqa: E402
-from worker_launch_processor import CreateModelFromStateWorkerLaunchRequest, WorkerLaunchProcessor  # noqa: E402
+from worker_launch_processor import WorkerLaunchProcessor  # noqa: E402
 
 
 class StoreStub:
@@ -39,21 +39,31 @@ class WorkerLaunchProcessorTest(unittest.IsolatedAsyncioTestCase):
     store = StoreStub()
     worker_manager = WorkerManagerStub()
     processor = WorkerLaunchProcessor(store, worker_manager)
-    request = {"req_id": "model-a", "model_id": "model-a", "type": "create_model", "base_model": "base-model"}
+    request = {
+      "request_id": "model-a",
+      "model_id": "model-a",
+      "op": "create_model",
+      "payload": {"base_model": "base-model"},
+    }
 
     await processor.process_request(request)
 
     self.assertEqual(worker_manager.launched_model_ids, ["model-a"])
     self.assertEqual(len(store.forwarded_requests), 1)
-    self.assertEqual(store.forwarded_requests[0]["type"], "create_model")
-    self.assertEqual(store.forwarded_requests[0]["base_model"], "base-model")
+    self.assertEqual(store.forwarded_requests[0]["op"], "create_model")
+    self.assertEqual(store.forwarded_requests[0]["payload"]["base_model"], "base-model")
     self.assertEqual(store.futures, {})
 
   async def test_process_request_sets_future_failure_when_launch_fails(self) -> None:
     store = StoreStub()
     worker_manager = WorkerManagerStub(RuntimeError("boom"))
     processor = WorkerLaunchProcessor(store, worker_manager)
-    request = {"req_id": "model-a", "model_id": "model-a", "type": "create_model", "base_model": "base-model"}
+    request = {
+      "request_id": "model-a",
+      "model_id": "model-a",
+      "op": "create_model",
+      "payload": {"base_model": "base-model"},
+    }
 
     with patch("worker_launch_processor.traceback.print_exc"):
       await processor.process_request(request)
@@ -69,7 +79,11 @@ class WorkerLaunchProcessorTest(unittest.IsolatedAsyncioTestCase):
     store = StoreStub()
     worker_manager = WorkerManagerStub()
     processor = WorkerLaunchProcessor(store, worker_manager)
-    request = {"req_id": "model-a", "type": "create_model", "base_model": "base-model"}
+    request = {
+      "request_id": "model-a",
+      "op": "create_model",
+      "payload": {"base_model": "base-model"},
+    }
 
     with patch("worker_launch_processor.traceback.print_exc"):
       await processor.process_request(request)
@@ -78,15 +92,21 @@ class WorkerLaunchProcessorTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(store.forwarded_requests, [])
     self.assertEqual(store.futures["model-a"]["type"], "RequestFailedResponse")
 
-  def test_create_model_from_state_launch_payload_defaults_restore_optimizer(self) -> None:
-    request = CreateModelFromStateWorkerLaunchRequest(
-      req_id="model-a",
-      model_id="model-a",
-      type="create_model_from_state",
-      state_path="/tmp/checkpoint",
-    )
+  async def test_process_request_forwards_create_model_from_state_request(self) -> None:
+    store = StoreStub()
+    worker_manager = WorkerManagerStub()
+    processor = WorkerLaunchProcessor(store, worker_manager)
+    request = {
+      "request_id": "model-a",
+      "model_id": "model-a",
+      "op": "create_model_from_state",
+      "payload": {"state_path": "/tmp/checkpoint"},
+    }
 
-    self.assertEqual(request.model_dump()["restore_optimizer"], False)
+    await processor.process_request(request)
+
+    self.assertEqual(worker_manager.launched_model_ids, ["model-a"])
+    self.assertEqual(store.forwarded_requests, [request])
 
 
 class WorkerLaunchQueueTest(unittest.IsolatedAsyncioTestCase):
@@ -121,8 +141,8 @@ class GatewayWorkerLaunchQueueTest(unittest.IsolatedAsyncioTestCase):
       gateway.store = old_store
 
     self.assertEqual(result["request_id"], store.worker_launch_requests[0]["model_id"])
-    self.assertEqual(store.worker_launch_requests[0]["type"], "create_model")
-    self.assertEqual(store.worker_launch_requests[0]["base_model"], "base-model")
+    self.assertEqual(store.worker_launch_requests[0]["op"], "create_model")
+    self.assertEqual(store.worker_launch_requests[0]["payload"]["base_model"], "base-model")
     self.assertEqual(store.forwarded_requests, [])
 
 
@@ -131,10 +151,10 @@ class GatewayFutureTranslationTest(unittest.TestCase):
     self.assertEqual(
       gateway.translate_future_result(
         {
-          "type": "create_model_result",
+          "type": "model_created",
           "model_id": "model-a",
           "base_model": "base-model",
-          "lora_rank": 16,
+          "training_kind": "full",
         }
       ),
       {
@@ -150,10 +170,10 @@ class GatewayFutureTranslationTest(unittest.TestCase):
     self.assertEqual(
       gateway.translate_future_result(
         {
-          "type": "create_model_from_state_result",
+          "type": "model_loaded_from_state",
           "model_id": "model-a",
           "base_model": "base-model",
-          "lora_rank": 16,
+          "training_kind": "full",
         }
       ),
       {
@@ -164,6 +184,44 @@ class GatewayFutureTranslationTest(unittest.TestCase):
         "lora_rank": 16,
       },
     )
+
+  def test_lora_create_model_result_translates_rank_to_tinker_shape(self) -> None:
+    self.assertEqual(
+      gateway.translate_future_result(
+        {
+          "type": "model_created",
+          "model_id": "model-a",
+          "base_model": "base-model",
+          "rank": 4,
+          "training_kind": "lora",
+        }
+      ),
+      {
+        "type": "create_model",
+        "model_id": "model-a",
+        "base_model": "base-model",
+        "is_lora": True,
+        "lora_rank": 4,
+      },
+    )
+
+  def test_internal_future_result_types_translate_to_tinker_types(self) -> None:
+    cases = [
+      ("forward_backward_completed", "forward_backward"),
+      ("optim_step_completed", "optim_step"),
+      ("sample_completed", "sample"),
+      ("state_saved", "save_weights"),
+      ("weights_loaded", "load_weights"),
+      ("sampler_weights_saved", "save_weights_for_sampler"),
+      ("weights_saved", "save_weights"),
+    ]
+
+    for internal_type, public_type in cases:
+      with self.subTest(internal_type=internal_type):
+        self.assertEqual(
+          gateway.translate_future_result({"type": internal_type, "path": "/tmp/x"}),
+          {"type": public_type, "path": "/tmp/x"},
+        )
 
 
 if __name__ == "__main__":

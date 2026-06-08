@@ -319,13 +319,3 @@ class LoraTrainingWorker(BaseTrainerWorker):
     if model_id:
       self.peft_model.set_adapter(model_id)
     return super().generate(self.peft_model, prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
-
-
-def main() -> None:
-  from clock_cycle import main as clock_cycle_main
-
-  clock_cycle_main()
-
-
-if __name__ == "__main__":
-  main()

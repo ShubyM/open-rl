@@ -16,6 +16,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
 SERVER_DIR = REPO_ROOT / "src" / "server"
 
 
@@ -52,6 +53,8 @@ def openrl_server(
   }
   if extra_env:
     env.update(extra_env)
+  existing_pythonpath = env.get("PYTHONPATH")
+  env["PYTHONPATH"] = os.pathsep.join([str(SRC_DIR), existing_pythonpath]) if existing_pythonpath else str(SRC_DIR)
   env.pop("REDIS_URL", None)
 
   command = [
