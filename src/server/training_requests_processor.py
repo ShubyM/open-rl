@@ -47,6 +47,53 @@ def parse_datum(raw: dict[str, Any]) -> Datum:
 class TrainingRequestsProcessor(Protocol):
   store: RequestStore
 
+  async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
+    request_id = raw_request.get("request_id")
+    token = None
+
+    try:
+      op = raw_request["op"]
+      request_id = raw_request["request_id"]
+      resolved_model_id = model_id or raw_request.get("model_id") or "default"
+
+      carrier = raw_request.get("trace_context")
+      ctx = propagate.extract(carrier) if carrier else None
+      token = otel_context.attach(ctx) if ctx else None
+
+      result = await self.dispatch_operation(op, raw_request.get("payload", {}), resolved_model_id)
+      await self.store.set_future(request_id, result)
+    except Exception as exc:
+      traceback.print_exc()
+      if request_id is None:
+        raise
+      await self.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
+    finally:
+      if token:
+        otel_context.detach(token)
+
+  async def dispatch_operation(self, op: str, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
+    match op:
+      case "create_model":
+        return await self.create_model(payload, model_id)
+      case "create_model_from_state":
+        return await self.create_model_from_state(payload, model_id)
+      case "forward_backward":
+        return await self.forward_backward(payload, model_id)
+      case "optim_step":
+        return await self.optim_step(payload, model_id)
+      case "sample":
+        return await self.sample(payload, model_id)
+      case "save_state":
+        return await self.save_state(payload, model_id)
+      case "load_weights":
+        return await self.load_weights(payload, model_id)
+      case "save_weights_for_sampler":
+        return await self.save_weights_for_sampler(payload, model_id)
+      case "save_weights":
+        return await self.save_weights(payload, model_id)
+      case _:
+        raise NotImplementedError(f"Training request op {op!r} is not supported")
+
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
 
   async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
@@ -66,71 +113,10 @@ class TrainingRequestsProcessor(Protocol):
   async def save_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
 
 
-async def dispatch_training_request(
-  processor: TrainingRequestsProcessor,
-  raw_request: dict[str, Any],
-  model_id: str | None = None,
-) -> None:
-  request_id = raw_request.get("request_id")
-  token = None
-
-  try:
-    op = raw_request["op"]
-    request_id = raw_request["request_id"]
-    resolved_model_id = model_id or raw_request.get("model_id") or "default"
-
-    carrier = raw_request.get("trace_context")
-    ctx = propagate.extract(carrier) if carrier else None
-    token = otel_context.attach(ctx) if ctx else None
-
-    result = await dispatch_training_operation(processor, op, raw_request.get("payload", {}), resolved_model_id)
-    await processor.store.set_future(request_id, result)
-  except Exception as exc:
-    traceback.print_exc()
-    if request_id is None:
-      raise
-    await processor.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
-  finally:
-    if token:
-      otel_context.detach(token)
-
-
-async def dispatch_training_operation(
-  processor: TrainingRequestsProcessor,
-  op: str,
-  payload: dict[str, Any],
-  model_id: str,
-) -> dict[str, Any]:
-  match op:
-    case "create_model":
-      return await processor.create_model(payload, model_id)
-    case "create_model_from_state":
-      return await processor.create_model_from_state(payload, model_id)
-    case "forward_backward":
-      return await processor.forward_backward(payload, model_id)
-    case "optim_step":
-      return await processor.optim_step(payload, model_id)
-    case "sample":
-      return await processor.sample(payload, model_id)
-    case "save_state":
-      return await processor.save_state(payload, model_id)
-    case "load_weights":
-      return await processor.load_weights(payload, model_id)
-    case "save_weights_for_sampler":
-      return await processor.save_weights_for_sampler(payload, model_id)
-    case "save_weights":
-      return await processor.save_weights(payload, model_id)
-    case _:
-      raise NotImplementedError(f"Training request op {op!r} is not supported")
-
-
-class LoraTrainingRequestsProcessor:
+class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(self, store: RequestStore, worker: LoraTrainingWorker):
     self.store = store
     self.worker = worker
-
-  async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
-    await dispatch_training_request(self, raw_request, model_id)
 
   async def run(self) -> None:
     print("[WORKER] LoRA training requests processor started.")
@@ -249,7 +235,7 @@ class LoraTrainingRequestsProcessor:
     return {"status": "ok", "type": "weights_saved"}
 
 
-class FFTTrainingRequestsProcessor:
+class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
@@ -305,9 +291,6 @@ class FFTTrainingRequestsProcessor:
       async with self.snapshot_client.acquire(self.pid):
         for request in batch:
           await self.process_request(request, self.model_id)
-
-  async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
-    await dispatch_training_request(self, raw_request, model_id or self.model_id)
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     raw_config = payload.get("full_config") or {}
