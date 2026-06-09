@@ -1,14 +1,16 @@
+import asyncio
 import importlib
 import os
 import sys
 import tempfile
 import types
 import unittest
+from contextlib import asynccontextmanager
 from unittest.mock import patch
 
 import torch
 
-from tests._server_fixture import SERVER_DIR
+from tests._server_fixture import SERVER_DIR, SRC_DIR
 
 
 def _load_trainer_modules():
@@ -39,7 +41,7 @@ def _load_trainer_modules():
   return trainer_worker, lora_trainer_worker, fft_trainer_worker, losses
 
 
-def _load_clock_cycle_module():
+def _load_training_requests_processor_module():
   stubs = {
     "peft": types.SimpleNamespace(
       LoraConfig=object,
@@ -54,6 +56,7 @@ def _load_clock_cycle_module():
     ),
   }
   old_path = list(sys.path)
+  sys.path.insert(0, str(SRC_DIR))
   sys.path.insert(0, str(SERVER_DIR))
   env = {
     "OPEN_RL_ENABLE_FFT": "true",
@@ -61,15 +64,15 @@ def _load_clock_cycle_module():
   }
   with patch.dict(sys.modules, stubs), patch.dict(os.environ, env):
     for module_name in list(sys.modules):
-      if module_name == "clock_cycle":
+      if module_name == "training_requests_processor":
         del sys.modules[module_name]
-    clock_cycle = importlib.import_module("clock_cycle")
+    training_requests_processor = importlib.import_module("training_requests_processor")
   sys.path = old_path
-  return clock_cycle
+  return training_requests_processor
 
 
 trainer_worker_module, lora_trainer_worker_module, fft_trainer_worker_module, losses_module = _load_trainer_modules()
-clock_cycle_module = _load_clock_cycle_module()
+training_requests_processor_module = _load_training_requests_processor_module()
 BaseTrainerWorker = trainer_worker_module.BaseTrainerWorker
 FFTTrainingWorker = fft_trainer_worker_module.FFTTrainingWorker
 LoraTrainingWorker = lora_trainer_worker_module.LoraTrainingWorker
@@ -128,7 +131,7 @@ class _FullModelStub:
     yield from self.params
 
 
-class _RecordingFullWorker:
+class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker):
   def __init__(self):
     self.base_model_name = None
     self.loaded_base_models = []
@@ -150,7 +153,7 @@ class _RecordingFullWorker:
     return {"path": state_path}
 
 
-class _RecordingLoraWorker:
+class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker):
   def __init__(self):
     self.loaded_base_models = []
     self.created_models = []
@@ -168,6 +171,43 @@ class _FutureStoreStub:
 
   async def set_future(self, req_id, result):
     self.results[req_id] = result
+
+
+class _TrainingRequestsStoreStub(_FutureStoreStub):
+  def __init__(self, batches):
+    super().__init__()
+    self.batches = list(batches)
+    self.queried_model_ids = []
+
+  async def get_requests_for_model(self, model_id):
+    self.queried_model_ids.append(model_id)
+    if self.batches:
+      return self.batches.pop(0)
+    raise asyncio.CancelledError()
+
+
+class _SnapshotClientStub:
+  def __init__(self):
+    self.events = []
+
+  async def register(self, pid):
+    self.events.append(("register", pid))
+    return {"ok": True}
+
+  @asynccontextmanager
+  async def acquire(self, pid):
+    self.events.append(("acquire", pid))
+    try:
+      yield
+    finally:
+      self.events.append(("release", pid))
+
+  async def unregister(self, pid):
+    self.events.append(("unregister", pid))
+    return {"ok": True}
+
+  async def close(self):
+    self.events.append(("close",))
 
 
 def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantages=None):
@@ -292,26 +332,26 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     self.assertIsNotNone(frozen_param.grad)
 
 
-class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
-  async def test_importing_clock_cycle_does_not_create_worker(self) -> None:
-    self.assertFalse(hasattr(clock_cycle_module, "worker"))
+class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
+  async def test_importing_training_requests_processor_does_not_create_worker(self) -> None:
+    self.assertFalse(hasattr(training_requests_processor_module, "worker"))
 
-  async def test_clock_cycle_lora_mode_create_model_uses_worker_create_model(self) -> None:
+  async def test_lora_processor_create_model_uses_worker_create_model(self) -> None:
     worker = _RecordingLoraWorker()
     store = _FutureStoreStub()
+    processor = training_requests_processor_module.LoraTrainingRequestsProcessor(store, worker)
 
-    await clock_cycle_module.handle_request(
-      store,
+    await processor.process_request(
       {
-        "req_id": "req-a",
+        "request_id": "req-a",
         "model_id": "adapter-a",
-        "type": "create_model",
-        "base_model": "base-model",
-        "lora_config": {"seed": 123, "rank": 2},
+        "op": "create_model",
+        "payload": {
+          "base_model": "base-model",
+          "lora_config": {"seed": 123, "rank": 2},
+        },
       },
       "adapter-a",
-      worker,
-      fft_enabled=False,
     )
 
     self.assertEqual(worker.loaded_base_models, [])
@@ -322,26 +362,44 @@ class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(config.rank, 2)
     result = store.results["req-a"]
     self.assertEqual(result["model_id"], "adapter-a")
-    self.assertEqual(result["lora_rank"], 2)
-    self.assertEqual(result["type"], "create_model_result")
+    self.assertEqual(result["rank"], 2)
+    self.assertEqual(result["training_kind"], "lora")
+    self.assertEqual(result["type"], "model_created")
 
-  async def test_clock_cycle_full_mode_create_model_uses_model_worker(self) -> None:
+  def test_parse_datum_flattens_chunked_model_input(self) -> None:
+    datum = training_requests_processor_module.parse_datum(
+      {
+        "model_input": {"chunks": [{"tokens": [1, 2]}, {"tokens": [3]}]},
+        "loss_fn_inputs": {
+          "target_tokens": [2, 3, 4],
+          "weights": {"data": [1.0, 0.5, 0.25]},
+        },
+      }
+    )
+
+    self.assertEqual(datum.model_input, [1, 2, 3])
+    self.assertEqual(datum.loss_fn_inputs["target_tokens"].data, [2, 3, 4])
+    self.assertEqual(datum.loss_fn_inputs["weights"].data, [1.0, 0.5, 0.25])
+
+  async def test_full_processor_create_model_uses_model_worker(self) -> None:
     worker = _RecordingFullWorker()
     store = _FutureStoreStub()
+    snapshot_client = _SnapshotClientStub()
 
-    await clock_cycle_module.handle_request(
-      store,
-      {
-        "req_id": "req-a",
-        "model_id": "model-a",
-        "type": "create_model",
-        "base_model": "base-model",
-        "full_config": {"seed": 123, "rank": 8},
-      },
-      "model-a",
-      worker,
-      fft_enabled=True,
-    )
+    with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", snapshot_client=snapshot_client)
+      await processor.process_request(
+        {
+          "request_id": "req-a",
+          "model_id": "model-a",
+          "op": "create_model",
+          "payload": {
+            "base_model": "base-model",
+            "full_config": {"seed": 123, "rank": 8},
+          },
+        },
+        "model-a",
+      )
 
     self.assertEqual(worker.loaded_base_models, [])
     base_model, model_id, config = worker.created_models[0]
@@ -350,27 +408,28 @@ class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(config.seed, 123)
     result = store.results["req-a"]
     self.assertEqual(result["model_id"], "model-a")
-    self.assertEqual(result["lora_rank"], 16)
     self.assertEqual(result["base_model"], "base-model")
-    self.assertEqual(result["type"], "create_model_result")
+    self.assertEqual(result["training_kind"], "full")
+    self.assertEqual(result["type"], "model_created")
 
-  async def test_clock_cycle_full_mode_saves_sampler_checkpoint_as_full_state(self) -> None:
+  async def test_full_processor_saves_sampler_checkpoint_as_full_state(self) -> None:
     worker = _RecordingFullWorker()
     store = _FutureStoreStub()
+    snapshot_client = _SnapshotClientStub()
 
-    with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test"}):
-      await clock_cycle_module.handle_request(
-        store,
+    with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test", "REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", snapshot_client=snapshot_client)
+      await processor.process_request(
         {
-          "req_id": "req-a",
+          "request_id": "req-a",
           "model_id": "model-a",
-          "type": "save_weights_for_sampler",
-          "path": "tinker://model-a/sampler_weights/final",
-          "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
+          "op": "save_weights_for_sampler",
+          "payload": {
+            "path": "tinker://model-a/sampler_weights/final",
+            "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
+          },
         },
         "model-a",
-        worker,
-        fft_enabled=True,
       )
 
     self.assertEqual(
@@ -382,13 +441,73 @@ class TestClockCycleFullMode(unittest.IsolatedAsyncioTestCase):
       {
         "path": "tinker://model-a/sampler_weights/final",
         "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
-        "type": "save_weights_for_sampler",
+        "type": "sampler_weights_saved",
       },
     )
 
-  async def test_clock_cycle_full_mode_requires_redis(self) -> None:
+  async def test_full_processor_requires_redis(self) -> None:
     with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
-      await clock_cycle_module.clock_cycle_loop(_RecordingFullWorker(), "model-a")
+      await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
+
+  async def test_full_processor_uses_default_snapshot_socket(self) -> None:
+    store = _TrainingRequestsStoreStub([])
+    snapshot_client = _SnapshotClientStub()
+
+    with (
+      patch.dict(
+        os.environ,
+        {
+          "OPEN_RL_ENABLE_FFT": "true",
+          "REDIS_URL": "redis://localhost:6379",
+        },
+        clear=True,
+      ),
+      patch.object(training_requests_processor_module, "get_store", return_value=store),
+      patch.object(training_requests_processor_module, "create_snapshot_agent_client", return_value=snapshot_client) as create_snapshot_agent_client,
+    ):
+      await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
+
+    create_snapshot_agent_client.assert_called_once_with("/tmp/open-rl/snapshot-agent.sock")
+    self.assertEqual([event[0] for event in snapshot_client.events], ["register", "unregister", "close"])
+
+  async def test_full_processor_uses_injected_snapshot_client(self) -> None:
+    worker = _RecordingFullWorker()
+    store = _TrainingRequestsStoreStub(
+      [
+        [
+          {
+            "request_id": "req-a",
+            "model_id": "model-a",
+            "op": "create_model",
+            "payload": {
+              "base_model": "base-model",
+              "full_config": {"seed": 123},
+            },
+          }
+        ]
+      ]
+    )
+    snapshot_client = _SnapshotClientStub()
+
+    with (
+      patch.dict(
+        os.environ,
+        {
+          "OPEN_RL_ENABLE_FFT": "true",
+          "REDIS_URL": "redis://localhost:6379",
+        },
+      ),
+      patch.object(training_requests_processor_module, "get_store", return_value=store),
+    ):
+      await training_requests_processor_module.run_training_requests_processor(worker, "model-a", snapshot_client=snapshot_client)
+
+    self.assertEqual(store.queried_model_ids, ["model-a", "model-a"])
+    self.assertEqual([event[0] for event in snapshot_client.events], ["register", "acquire", "release", "unregister", "close"])
+    for event in snapshot_client.events:
+      if len(event) == 2:
+        self.assertEqual(event[1], os.getpid())
+    self.assertEqual(worker.created_models[0][0], "base-model")
+    self.assertEqual(store.results["req-a"]["model_id"], "model-a")
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):

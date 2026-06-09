@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ProcessRegistration:
-  pid: int
   connection_id: int | None
   checkpointed: bool = False
   failed: bool = False
@@ -24,93 +23,93 @@ class ProcessRegistration:
 class SnapshotAgent:
   def __init__(self, restorer: CheckpointRestorer):
     self.restorer = restorer
-    self.processes: dict[str, ProcessRegistration] = {}
-    self.waiting_run_ids: deque[str] = deque()
-    self.active_run_id: str | None = None
+    self.processes: dict[int, ProcessRegistration] = {}
+    self.waiting_pids: deque[int] = deque()
+    self.active_pid: int | None = None
     self.condition = asyncio.Condition()
 
-  def clear_run(self, run_id: str) -> None:
-    if run_id in self.waiting_run_ids:
-      self.waiting_run_ids.remove(run_id)
-    if self.active_run_id == run_id:
-      self.active_run_id = None
+  def clear_process(self, pid: int) -> None:
+    if pid in self.waiting_pids:
+      self.waiting_pids.remove(pid)
+    if self.active_pid == pid:
+      self.active_pid = None
 
-  async def register(self, run_id: str, pid: int, connection_id: int | None = None) -> dict[str, Any]:
+  async def register(self, pid: int, connection_id: int | None = None) -> dict[str, Any]:
     async with self.condition:
-      process = self.processes.get(run_id)
+      process = self.processes.get(pid)
 
       if process is not None:
-        return {"ok": False, "error": f"run '{run_id}' is already registered"}
+        return {"ok": False, "error": f"pid {pid} is already registered"}
 
-      self.processes[run_id] = ProcessRegistration(pid=pid, connection_id=connection_id)
+      self.processes[pid] = ProcessRegistration(connection_id=connection_id)
       self.condition.notify_all()
       return {"ok": True}
 
-  async def acquire(self, run_id: str) -> dict[str, Any]:
+  async def acquire(self, pid: int) -> dict[str, Any]:
     async with self.condition:
-      process = self.processes.get(run_id)
+      process = self.processes.get(pid)
       if process is None:
-        return {"ok": False, "error": f"run '{run_id}' is not registered"}
+        return {"ok": False, "error": f"pid {pid} is not registered"}
       if process.failed:
-        return {"ok": False, "error": f"run '{run_id}' is failed"}
-      if run_id in self.waiting_run_ids or self.active_run_id == run_id:
-        return {"ok": False, "error": f"run '{run_id}' already has a pending or active acquire"}
+        return {"ok": False, "error": f"pid {pid} is failed"}
+      if pid in self.waiting_pids or self.active_pid == pid:
+        return {"ok": False, "error": f"pid {pid} already has a pending or active acquire"}
 
-      self.waiting_run_ids.append(run_id)
+      self.waiting_pids.append(pid)
       try:
-        while self.active_run_id is not None or (run_id in self.waiting_run_ids and self.waiting_run_ids[0] != run_id):
+        while self.active_pid is not None or (pid in self.waiting_pids and self.waiting_pids[0] != pid):
           await self.condition.wait()
       except BaseException:
-        if run_id in self.waiting_run_ids:
-          self.waiting_run_ids.remove(run_id)
+        if pid in self.waiting_pids:
+          self.waiting_pids.remove(pid)
         self.condition.notify_all()
         raise
 
-      process = self.processes.get(run_id)
-      if process is None or process.failed or run_id not in self.waiting_run_ids:
-        self.clear_run(run_id)
+      process = self.processes.get(pid)
+      if process is None or process.failed or pid not in self.waiting_pids:
+        self.clear_process(pid)
         self.condition.notify_all()
-        return {"ok": False, "error": f"run '{run_id}' is not available"}
+        return {"ok": False, "error": f"pid {pid} is not available"}
 
-      self.waiting_run_ids.popleft()
-      self.active_run_id = run_id
+      self.waiting_pids.popleft()
+      self.active_pid = pid
       if process.checkpointed:
-        await self.run_restore(process.pid)
+        await self.run_restore(pid)
         process.checkpointed = False
 
       self.condition.notify_all()
       return {"ok": True}
 
-  async def release(self, run_id: str) -> dict[str, Any]:
+  async def release(self, pid: int) -> dict[str, Any]:
     async with self.condition:
-      process = self.processes.get(run_id)
+      process = self.processes.get(pid)
       if process is None:
-        return {"ok": False, "error": f"run '{run_id}' is not registered"}
-      if self.active_run_id != run_id:
-        return {"ok": False, "error": f"run '{run_id}' does not hold an active acquire"}
+        return {"ok": False, "error": f"pid {pid} is not registered"}
+      if self.active_pid != pid:
+        return {"ok": False, "error": f"pid {pid} does not hold an active acquire"}
 
-      await self.run_checkpoint(process.pid)
+      await self.run_checkpoint(pid)
       process.checkpointed = True
-      self.clear_run(run_id)
+      self.clear_process(pid)
       self.condition.notify_all()
       return {"ok": True}
 
-  async def unregister(self, run_id: str) -> dict[str, Any]:
+  async def unregister(self, pid: int) -> dict[str, Any]:
     async with self.condition:
-      if run_id not in self.processes:
-        return {"ok": False, "error": f"run '{run_id}' is not registered"}
+      if pid not in self.processes:
+        return {"ok": False, "error": f"pid {pid} is not registered"}
 
-      self.clear_run(run_id)
-      del self.processes[run_id]
+      self.clear_process(pid)
+      del self.processes[pid]
       self.condition.notify_all()
       return {"ok": True}
 
   async def connection_closed(self, connection_id: int) -> None:
     async with self.condition:
-      for run_id, process in self.processes.items():
+      for pid, process in self.processes.items():
         if process.connection_id != connection_id:
           continue
-        self.clear_run(run_id)
+        self.clear_process(pid)
         process.failed = True
         process.checkpointed = False
         process.connection_id = None
@@ -155,19 +154,20 @@ async def dispatch(agent: SnapshotAgent, line: bytes, connection_id: int) -> dic
   payload = json.loads(line.decode("utf-8"))
 
   command = payload.get("command", "").upper()
-  run_id = payload.get("run_id")
+  pid = payload.get("pid")
 
-  assert run_id is not None, "run_id is required"
+  assert pid is not None, "pid is required"
+  pid = int(pid)
 
   match command:
     case "REGISTER":
-      return await agent.register(run_id, payload["pid"], connection_id=connection_id)
+      return await agent.register(pid, connection_id=connection_id)
     case "ACQUIRE":
-      return await agent.acquire(run_id)
+      return await agent.acquire(pid)
     case "RELEASE":
-      return await agent.release(run_id)
+      return await agent.release(pid)
     case "UNREGISTER":
-      return await agent.unregister(run_id)
+      return await agent.unregister(pid)
     case _:
       return {"ok": False, "error": f"unknown command '{command}'"}
 

@@ -17,11 +17,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from store import get_store
 from worker_launch_processor import (
-  CreateModelFromStateWorkerLaunchRequest,
-  CreateModelWorkerLaunchRequest,
   FFTWorkerManager,
   WorkerLaunchProcessor,
-  WorkerLaunchRequest,
 )
 
 store = get_store()
@@ -112,29 +109,40 @@ def is_sampler_weights_ref(model_id: str | None) -> bool:
   return len(parts) >= 3 and parts[1] == "sampler_weights"
 
 
-async def prepare_enqueue(payload: dict) -> str:
-  req_id = payload.get("req_id") or str(uuid.uuid4())
-  payload["req_id"] = req_id
+def make_training_request(
+  op: str,
+  model_id: str | None,
+  payload: dict,
+  request_id: str | None = None,
+) -> dict:
+  request = {
+    "request_id": request_id or str(uuid.uuid4()),
+    "op": op,
+    "payload": payload,
+  }
+  if model_id is not None:
+    request["model_id"] = model_id
+  return request
+
+
+async def enqueue(request: dict) -> str:
+  """Create a pending future, inject trace context, push to store. Returns req_id."""
+  request_id = request["request_id"]
   carrier: dict = {}
   propagate.inject(carrier)
-  payload["trace_context"] = carrier
-  await store.set_future(req_id, {"status": "pending"})
-  return req_id
+  await store.set_future(request_id, {"status": "pending"})
+  await store.put_request({**request, "trace_context": carrier})
+  return request_id
 
 
-async def enqueue(payload: dict) -> str:
-  """Create a pending future, inject trace context, push to store. Returns req_id."""
-  req_id = await prepare_enqueue(payload)
-  await store.put_request(payload)
-  return req_id
-
-
-async def enqueue_worker_launch(payload: WorkerLaunchRequest) -> str:
+async def enqueue_worker_launch(request: dict) -> str:
   """Create a pending future and push a create-model request to the worker launch queue."""
-  payload_data = payload.model_dump()
-  req_id = await prepare_enqueue(payload_data)
-  await store.put_worker_launch_request(payload_data)
-  return req_id
+  request_id = request["request_id"]
+  carrier: dict = {}
+  propagate.inject(carrier)
+  await store.set_future(request_id, {"status": "pending"})
+  await store.put_worker_launch_request({**request, "trace_context": carrier})
+  return request_id
 
 
 async def preflight_vllm() -> None:
@@ -159,21 +167,37 @@ async def preflight_vllm() -> None:
 
 def translate_future_result(result: dict) -> dict:
   result_type = result.get("type")
-  if result_type not in {"create_model_result", "create_model_from_state_result"}:
-    return result
+  if result_type in {"model_created", "model_loaded_from_state"}:
+    # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
+    # even for full fine-tuning jobs.
+    response = {
+      "model_id": result["model_id"],
+      "is_lora": True,
+      "type": "create_model" if result_type == "model_created" else "create_model_from_state",
+    }
+    if "rank" in result:
+      response["lora_rank"] = result["rank"]
+    elif result.get("training_kind") == "full":
+      response["lora_rank"] = 16
+    if result.get("base_model"):
+      response["base_model"] = result["base_model"]
+    return response
 
-  # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
-  # even for full fine-tuning jobs.
-  response = {
-    "model_id": result["model_id"],
-    "is_lora": True,
-    "type": "create_model" if result_type == "create_model_result" else "create_model_from_state",
+  public_type_by_internal_type = {
+    "forward_backward_completed": "forward_backward",
+    "optim_step_completed": "optim_step",
+    "sample_completed": "sample",
+    "state_saved": "save_weights",
+    "weights_loaded": "load_weights",
+    "sampler_weights_saved": "save_weights_for_sampler",
+    "weights_saved": "save_weights",
   }
-  if "lora_rank" in result:
-    response["lora_rank"] = result["lora_rank"]
-  if result.get("base_model"):
-    response["base_model"] = result["base_model"]
-  return response
+  if result_type in public_type_by_internal_type:
+    response = dict(result)
+    response["type"] = public_type_by_internal_type[result_type]
+    return response
+
+  return result
 
 
 @asynccontextmanager
@@ -196,12 +220,12 @@ async def lifespan(_: FastAPI):
     print("-> Server mode     : API server + worker loop in one process\n")
     await preflight_vllm()
     if not is_fft_enabled():
-      import clock_cycle
+      import training_requests_processor
 
-      worker = clock_cycle.create_training_worker()
+      worker = training_requests_processor.LoraTrainingWorker()
       if base_model:
         await asyncio.to_thread(worker.load_base_model, base_model)
-      task = asyncio.create_task(clock_cycle.clock_cycle_loop(worker))
+      task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
   try:
     yield
   finally:
@@ -260,15 +284,17 @@ async def create_model(req: dict):
   if not base_model:
     return JSONResponse(status_code=400, content={"error": "base_model is required"})
   model_id = str(uuid.uuid4())
-  payload = {
-    "req_id": model_id,
-    "model_id": model_id,
-    "type": "create_model",
-    "base_model": base_model,
-    "lora_config": req.get("lora_config") or {},
-    "full_config": req.get("full_config") or {},
-  }
-  req_id = await enqueue_worker_launch(CreateModelWorkerLaunchRequest(**payload)) if is_fft_enabled() else await enqueue(payload)
+  command = make_training_request(
+    "create_model",
+    model_id,
+    {
+      "base_model": base_model,
+      "lora_config": req.get("lora_config") or {},
+      "full_config": req.get("full_config") or {},
+    },
+    request_id=model_id,
+  )
+  req_id = await enqueue_worker_launch(command) if is_fft_enabled() else await enqueue(command)
   return {"request_id": req_id}
 
 
@@ -281,14 +307,16 @@ async def create_model_from_state(req: dict):
   # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
   resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   model_id = str(uuid.uuid4())
-  payload = {
-    "req_id": model_id,
-    "model_id": model_id,
-    "type": "create_model_from_state",
-    "state_path": resolved_path,
-    "restore_optimizer": bool(req.get("restore_optimizer", False)),
-  }
-  req_id = await enqueue_worker_launch(CreateModelFromStateWorkerLaunchRequest(**payload)) if is_fft_enabled() else await enqueue(payload)
+  command = make_training_request(
+    "create_model_from_state",
+    model_id,
+    {
+      "state_path": resolved_path,
+      "restore_optimizer": bool(req.get("restore_optimizer", False)),
+    },
+    request_id=model_id,
+  )
+  req_id = await enqueue_worker_launch(command) if is_fft_enabled() else await enqueue(command)
   return {"request_id": req_id}
 
 
@@ -334,13 +362,15 @@ async def forward_backward(req: dict):
   """TrainingClient.forward_backward_async()"""
   fwd_input = req.get("forward_backward_input", {})
   req_id = await enqueue(
-    {
-      "model_id": req.get("model_id"),
-      "type": "forward_backward",
-      "data": fwd_input.get("data", []),
-      "loss_fn": fwd_input.get("loss_fn", "cross_entropy"),
-      "loss_config": fwd_input.get("loss_fn_config", {}),
-    }
+    make_training_request(
+      "forward_backward",
+      req.get("model_id"),
+      {
+        "data": fwd_input.get("data", []),
+        "loss_fn": fwd_input.get("loss_fn", "cross_entropy"),
+        "loss_config": fwd_input.get("loss_fn_config", {}),
+      },
+    )
   )
   return {"request_id": req_id}
 
@@ -349,11 +379,11 @@ async def forward_backward(req: dict):
 async def optim_step(req: dict):
   """TrainingClient.optim_step_async()"""
   req_id = await enqueue(
-    {
-      "model_id": req.get("model_id"),
-      "type": "optim_step",
-      "adam_params": req.get("adam_params", {}),
-    }
+    make_training_request(
+      "optim_step",
+      req.get("model_id"),
+      {"adam_params": req.get("adam_params", {})},
+    )
   )
   return {"request_id": req_id}
 
@@ -363,7 +393,7 @@ async def save_weights_for_sampler(req: dict):
   """TrainingClient.save_weights_for_sampler().
 
   The SDK uses this for both named sampler checkpoints and ephemeral
-  save_weights_and_get_sampling_client() snapshots. Route it through the trainer
+  save_weights_and_get_sampling_client() snapshots. Route it through the training
   queue so the sampler always sees weights saved after prior training requests.
   """
   model_id = req.get("model_id")
@@ -375,13 +405,15 @@ async def save_weights_for_sampler(req: dict):
 
   session_id = sampler_session_id(model_id, seq_id)
   req_id = await enqueue(
-    {
-      "model_id": model_id,
-      "type": "save_weights_for_sampler",
-      "alias": alias,
-      "path": sampler_weights_path(model_id, alias) if alias else None,
-      "sampling_session_id": session_id,
-    }
+    make_training_request(
+      "save_weights_for_sampler",
+      model_id,
+      {
+        "alias": alias,
+        "path": sampler_weights_path(model_id, alias) if alias else None,
+        "sampling_session_id": session_id,
+      },
+    )
   )
   return {"request_id": req_id}
 
@@ -405,14 +437,16 @@ async def save_weights(req: dict):
 
   req_id = str(uuid.uuid4())
   await enqueue(
-    {
-      "req_id": req_id,
-      "model_id": model_id,
-      "type": "save_state",
-      "state_path": state_path,
-      "include_optimizer": bool(req.get("include_optimizer", False)),
-      "kind": "weights",
-    }
+    make_training_request(
+      "save_state",
+      model_id,
+      {
+        "state_path": state_path,
+        "include_optimizer": bool(req.get("include_optimizer", False)),
+        "kind": "weights",
+      },
+      request_id=req_id,
+    )
   )
   return {"request_id": req_id}
 
@@ -429,12 +463,14 @@ async def load_weights(req: dict):
 
   resolved_path = checkpoint_state_path(model_id, state_path)
   req_id = await enqueue(
-    {
-      "model_id": model_id,
-      "type": "load_weights",
-      "state_path": resolved_path,
-      "restore_optimizer": bool(req.get("optimizer", False)),
-    }
+    make_training_request(
+      "load_weights",
+      model_id,
+      {
+        "state_path": resolved_path,
+        "restore_optimizer": bool(req.get("optimizer", False)),
+      },
+    )
   )
   return {"request_id": req_id}
 
@@ -478,18 +514,17 @@ async def asample(req: dict):
 
   if get_sampler_backend() == "torch":
     req_id = await enqueue(
-      {
-        "model_id": base_model_id or model_id,
-        "type": "sample",
-        "prompt_tokens": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stop": stop,
-        "top_p": top_p,
-        "top_k": top_k,
-        "num_samples": num_samples,
-        "prompt_logprobs": bool(include_prompt_logprobs),
-      }
+      make_training_request(
+        "sample",
+        base_model_id or model_id,
+        {
+          "prompt_tokens": prompt,
+          "max_tokens": max_tokens,
+          "temperature": temperature,
+          "num_samples": num_samples,
+          "prompt_logprobs": bool(include_prompt_logprobs),
+        },
+      )
     )
     return {"request_id": req_id}
 

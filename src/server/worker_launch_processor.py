@@ -4,34 +4,11 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Literal
 
-from pydantic import BaseModel, Field
 from store import RequestStore
 
 SERVER_DIR = Path(__file__).resolve().parent
-
-
-class CreateModelWorkerLaunchRequest(BaseModel):
-  req_id: str
-  model_id: str
-  type: Literal["create_model"]
-  base_model: str
-  lora_config: dict[str, Any] = Field(default_factory=dict)
-  full_config: dict[str, Any] = Field(default_factory=dict)
-  trace_context: dict[str, str] = Field(default_factory=dict)
-
-
-class CreateModelFromStateWorkerLaunchRequest(BaseModel):
-  req_id: str
-  model_id: str
-  type: Literal["create_model_from_state"]
-  state_path: str
-  restore_optimizer: bool = False
-  trace_context: dict[str, str] = Field(default_factory=dict)
-
-
-WorkerLaunchRequest = CreateModelWorkerLaunchRequest | CreateModelFromStateWorkerLaunchRequest
+WORKER_LAUNCH_OPS = {"create_model", "create_model_from_state"}
 
 
 class FFTWorkerManager:
@@ -49,7 +26,7 @@ class FFTWorkerManager:
 
     env = {**os.environ, "OPEN_RL_ENABLE_FFT": "true"}
     self.processes[model_id] = subprocess.Popen(
-      [sys.executable, "-m", "clock_cycle", "--model-id", model_id],
+      [sys.executable, "-m", "training_requests_processor", "--model-id", model_id],
       cwd=self.server_dir,
       env=env,
     )
@@ -68,7 +45,12 @@ class WorkerLaunchProcessor:
     self.worker_manager = worker_manager
 
   async def process_request(self, request: dict) -> None:
+    request_id = request.get("request_id")
     try:
+      op = request.get("op")
+      if op not in WORKER_LAUNCH_OPS:
+        raise ValueError(f"worker launch request cannot handle op {op!r}")
+
       model_id = request.get("model_id")
       if not model_id:
         raise ValueError("worker launch request requires model_id")
@@ -77,7 +59,9 @@ class WorkerLaunchProcessor:
       await self.store.put_request(request)
     except Exception as exc:
       traceback.print_exc()
-      await self.store.set_future(request["req_id"], {"type": "RequestFailedResponse", "error_message": str(exc)})
+      if request_id is None:
+        raise
+      await self.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
 
   async def process_batch(self, requests: list[dict]) -> None:
     for request in requests:
