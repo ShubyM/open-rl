@@ -44,6 +44,13 @@ vllm = [
     "torch-c-dlpack-ext; sys_platform == 'linux'",
     "vllm==0.20.0; sys_platform == 'linux'",
 ]
+# Kubernetes cluster mode: gRPC client for the llm-d accelerator orchestrator
+# and the k8s API client used to launch FFT worker pods.
+cluster = [
+    "grpcio>=1.81.0",
+    "protobuf>=6.33.5",
+    "kubernetes>=29",
+]
 
 [tool.setuptools.package-dir]
 "" = "src"

@@ -13,7 +13,7 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_gateway_paths tests.test_lora_targets tests.test_snapshot_agent tests.test_trainer_optimizer_correctness tests.test_worker_launch_processor
+UNIT_TESTS ?= tests.test_gateway_paths tests.test_k8s_worker_manager tests.test_lora_targets tests.test_orchestrator_client tests.test_snapshot_agent tests.test_trainer_optimizer_correctness tests.test_worker_manager
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -80,7 +80,7 @@ test:
 	@mode="$(TEST_MODE)"; \
 	scenario="$(TEST_SCENARIO)"; \
 	if [ -z "$$mode" ] || [ "$$mode" = "unit" ]; then \
-	  uv run --frozen --exact --extra cpu python -m unittest $(UNIT_TESTS); \
+	  uv run --frozen --exact --extra cpu --extra cluster python -m unittest $(UNIT_TESTS); \
 	elif [ "$$mode" = "e2e" ]; then \
 	  if [ -z "$$scenario" ]; then \
 	    echo "Missing e2e scenario. Expected tiny-lora, tiny-fft, tiny-rl, lora-textsql, fft-gsm8k, or fft-gsm8k-x2."; \
@@ -99,6 +99,13 @@ test:
 lint:
 	uvx ruff check .
 	uvx ruff format --check .
+
+# Regenerate the vendored llm-d accelerator-orchestrator gRPC stubs after
+# updating src/snapshot_agent/orchestrator/accelerator_orchestrator.proto.
+gen-proto:
+	uv run --no-project --with "grpcio-tools==1.81.0" python -m grpc_tools.protoc \
+	  -I src --python_out=src --grpc_python_out=src \
+	  src/snapshot_agent/orchestrator/accelerator_orchestrator.proto
 
 fmt:
 	uvx ruff check --fix .
@@ -120,6 +127,11 @@ push-images:
 
 deploy:
 	kubectl apply -k k8s/deploy/distributed-lustre/
+
+# FFT time-slicing variant: dynamic worker pods + llm-d-rl-time-slicing
+# (install its Helm chart first; see docs/setup/gke-fft-timeslice.md).
+deploy-fft-timeslice:
+	kubectl apply -k k8s/deploy/distributed-fft-timeslice/
 
 rollout:
 	kubectl rollout restart deployment redis-store open-rl-gateway open-rl-trainer-worker vllm-worker

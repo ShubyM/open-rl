@@ -160,3 +160,8 @@ sample results, not the backend routing choice.
 | Trainer | Background worker loop in the server process | Separate trainer worker |
 | Sampler | Trainer process or optional sampler process | Dedicated sampler workers |
 | Adapter snapshots and checkpoints | Local filesystem | Network shared filesystem |
+| FFT worker per model | Subprocess launched by the gateway | Worker pod created by the gateway |
+| GPU time-slicing (FFT) | Local snapshot agent (unix socket + cuda-checkpoint) | [llm-d-rl-time-slicing](https://github.com/llm-d-incubation/llm-d-rl-time-slicing) orchestrator + snapshot-agent DaemonSet |
+
+For the cluster FFT time-slicing deployment, see
+[setup/gke-fft-timeslice.md](setup/gke-fft-timeslice.md).

@@ -1,6 +1,7 @@
 line-length = 150
 indent-width = 2
-extend-exclude = ["*.ipynb"]
+# *_pb2*.py are generated gRPC stubs (make gen-proto) — don't lint or format them.
+extend-exclude = ["*.ipynb", "*_pb2.py", "*_pb2_grpc.py"]
 
 [lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]

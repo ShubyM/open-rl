@@ -1,8 +1,24 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from typing import Any
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import Any, Protocol
+
+
+class SnapshotClient(Protocol):
+  """GPU-exclusivity client used by FFT workers around each request batch.
+
+  Implementations: SnapshotAgentClient (local unix-socket agent) and
+  OrchestratorSnapshotClient (llm-d accelerator orchestrator, cluster mode).
+  """
+
+  async def register(self, pid: int) -> dict[str, Any]: ...
+
+  async def unregister(self, pid: int) -> dict[str, Any]: ...
+
+  def acquire(self, pid: int) -> AbstractAsyncContextManager[None]: ...
+
+  async def close(self) -> None: ...
 
 
 class SnapshotAgentClient:

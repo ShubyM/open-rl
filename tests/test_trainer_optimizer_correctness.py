@@ -438,7 +438,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
       await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
 
-  async def test_full_processor_uses_default_snapshot_socket(self) -> None:
+  async def test_full_processor_creates_snapshot_client_for_model(self) -> None:
     store = _TrainingRequestsStoreStub([])
     snapshot_client = _SnapshotClientStub()
 
@@ -452,11 +452,11 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         clear=True,
       ),
       patch.object(training_requests_processor_module, "get_store", return_value=store),
-      patch.object(training_requests_processor_module, "create_snapshot_agent_client", return_value=snapshot_client) as create_snapshot_agent_client,
+      patch.object(training_requests_processor_module, "create_snapshot_client", return_value=snapshot_client) as create_snapshot_client,
     ):
       await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
 
-    create_snapshot_agent_client.assert_called_once_with("/tmp/open-rl/snapshot-agent.sock")
+    create_snapshot_client.assert_called_once_with("model-a")
     self.assertEqual([event[0] for event in snapshot_client.events], ["register", "unregister", "close"])
 
   async def test_full_processor_uses_injected_snapshot_client(self) -> None:

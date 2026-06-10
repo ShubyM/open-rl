@@ -23,15 +23,16 @@ COPY uv.lock .
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
-# Install ONLY core dependencies using uv (ignoring massive ML extras)
+# Install core dependencies plus the cluster extra (kubernetes worker launcher
+# + orchestrator gRPC client), ignoring the massive ML extras.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project
+    uv sync --frozen --no-install-project --extra cluster
 
 # Copy source code
 COPY . .
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen
+    uv sync --frozen --extra cluster
 
 EXPOSE 8000
 

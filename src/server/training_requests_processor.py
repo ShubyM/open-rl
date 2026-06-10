@@ -13,7 +13,8 @@ from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 
 from server.store import RequestStore, get_store
-from snapshot_agent.client import SnapshotAgentClient
+from snapshot_agent.client import SnapshotAgentClient, SnapshotClient
+from snapshot_agent.orchestrator_client import OrchestratorSnapshotClient
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
 from training.trainer_worker import Datum
@@ -28,7 +29,15 @@ def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
-def create_snapshot_agent_client(socket_path: str) -> SnapshotAgentClient:
+def create_snapshot_client(model_id: str | None) -> SnapshotClient:
+  orchestrator_addr = os.getenv("OPEN_RL_TIME_SLICE_ORCHESTRATOR_ADDR")
+  if orchestrator_addr:
+    job_id = os.getenv("OPEN_RL_TIME_SLICE_JOB_ID") or model_id
+    if not job_id:
+      raise RuntimeError("OPEN_RL_TIME_SLICE_ORCHESTRATOR_ADDR requires --model-id or OPEN_RL_TIME_SLICE_JOB_ID for the job id")
+    group_id = os.getenv("OPEN_RL_TIME_SLICE_GROUP", "trainers")
+    return OrchestratorSnapshotClient(orchestrator_addr, job_id=job_id, group_id=group_id)
+  socket_path = os.getenv("OPEN_RL_SNAPSHOT_AGENT_SOCKET", "/tmp/open-rl/snapshot-agent.sock")
   return SnapshotAgentClient(socket_path)
 
 
@@ -241,7 +250,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     store: RequestStore,
     worker: FFTTrainingWorker,
     model_id: str | None,
-    snapshot_client: SnapshotAgentClient,
+    snapshot_client: SnapshotClient,
   ):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
@@ -288,9 +297,24 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       batch_span.set_attribute("model_id", self.model_id)
 
       print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {self.model_id}")
-      async with self.snapshot_client.acquire(self.pid):
-        for request in batch:
-          await self.process_request(request, self.model_id)
+      processed = 0
+      try:
+        async with self.snapshot_client.acquire(self.pid):
+          for request in batch:
+            await self.process_request(request, self.model_id)
+            processed += 1
+      except Exception as exc:
+        # process_request resolves its own failures, so an exception here means
+        # acquire failed and the remaining requests never ran. They were already
+        # popped from the queue — fail their futures so clients don't wait out
+        # the long-poll window on silently dropped work.
+        for request in batch[processed:]:
+          if request_id := request.get("request_id"):
+            await self.store.set_future(
+              request_id,
+              {"type": "RequestFailedResponse", "error_message": f"snapshot acquire failed: {exc}"},
+            )
+        raise
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     raw_config = payload.get("full_config") or {}
@@ -387,13 +411,12 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 async def run_training_requests_processor(
   worker: TrainingWorker,
   model_id: str | None = None,
-  snapshot_client: SnapshotAgentClient | None = None,
+  snapshot_client: SnapshotClient | None = None,
 ) -> None:
   store = get_store()
   if isinstance(worker, FFTTrainingWorker):
     if snapshot_client is None:
-      snapshot_socket = os.getenv("OPEN_RL_SNAPSHOT_AGENT_SOCKET", "/tmp/open-rl/snapshot-agent.sock")
-      snapshot_client = create_snapshot_agent_client(snapshot_socket)
+      snapshot_client = create_snapshot_client(model_id)
     processor = FFTTrainingRequestsProcessor(store, worker, model_id, snapshot_client)
   else:
     processor = LoraTrainingRequestsProcessor(store, worker)
