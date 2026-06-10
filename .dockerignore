@@ -1,6 +1,5 @@
 .git
-.venv
-examples/.venv
+**/.venv
 **/__pycache__
 **/*.pyc
 .ruff_cache

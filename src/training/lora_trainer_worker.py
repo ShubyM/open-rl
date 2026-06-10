@@ -74,7 +74,22 @@ class LoraTrainingWorker(BaseTrainerWorker):
       # TODO: Revisit MLP targets for packed/MoE module names across supported backends.
       target_suffixes.extend(["gate_proj", "up_proj", "down_proj"])
     if config.train_unembed:
-      target_suffixes.append("lm_head")
+      # getattr because not every config defines tie_word_embeddings (transformers
+      # v5 dropped it from the PretrainedConfig base class). When absent,
+      # transformers performs no tying, so False matches the loaded model.
+      if getattr(self.base_model.config, "tie_word_embeddings", False):
+        # An adapter on a tied lm_head shares the embedding tensor: PEFT warns,
+        # merging would corrupt embed_tokens, and vLLM refuses lm_head adapter
+        # weights for tied models. Keep every produced adapter vLLM-loadable.
+        print(
+          f"[LoRA] Ignoring train_unembed=True: {self.base_model_name} ties lm_head to embed_tokens, "
+          "and the resulting adapter could not be loaded by vLLM."
+        )
+      else:
+        target_suffixes.append("lm_head")
+
+    if not target_suffixes:
+      raise ValueError("No trainable LoRA targets remain (train_unembed is ignored on tied-embeddings models; enable train_attn or train_mlp)")
 
     target_names = set(target_suffixes)
     target_modules = [

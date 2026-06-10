@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,17 +117,25 @@ class SnapshotAgent:
       self.condition.notify_all()
 
   async def run_checkpoint(self, pid: int) -> None:
+    start = time.monotonic()
     try:
       await asyncio.to_thread(self.restorer.checkpoint, pid)
+      logger.info("checkpointed pid %s in %.2fs", pid, time.monotonic() - start)
     except Exception:
-      logger.critical("checkpoint failed for pid %s; GPU state is unknown, killing snapshot agent", pid, exc_info=True)
+      logger.critical(
+        "checkpoint failed for pid %s after %.2fs; GPU state is unknown, killing snapshot agent", pid, time.monotonic() - start, exc_info=True
+      )
       os._exit(1)
 
   async def run_restore(self, pid: int) -> None:
+    start = time.monotonic()
     try:
       await asyncio.to_thread(self.restorer.restore, pid)
+      logger.info("restored pid %s in %.2fs", pid, time.monotonic() - start)
     except Exception:
-      logger.critical("restore failed for pid %s; GPU state is unknown, killing snapshot agent", pid, exc_info=True)
+      logger.critical(
+        "restore failed for pid %s after %.2fs; GPU state is unknown, killing snapshot agent", pid, time.monotonic() - start, exc_info=True
+      )
       os._exit(1)
 
 

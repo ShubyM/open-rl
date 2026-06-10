@@ -1,8 +1,10 @@
 import unittest
 from unittest.mock import patch
 
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 from server import gateway
-from server.store import InMemoryStore
+from server.store import InMemoryStore, RedisStore
 from server.worker_launch_processor import WorkerLaunchProcessor
 
 
@@ -217,6 +219,19 @@ class GatewayFutureTranslationTest(unittest.TestCase):
           gateway.translate_future_result({"type": internal_type, "path": "/tmp/x"}),
           {"type": public_type, "path": "/tmp/x"},
         )
+
+
+class RedisStoreTimeoutTest(unittest.IsolatedAsyncioTestCase):
+  async def test_worker_launch_queue_timeout_returns_empty_batch(self) -> None:
+    store = RedisStore("redis://unused")
+
+    class RedisStub:
+      async def blpop(self, *_args, **_kwargs):
+        raise RedisTimeoutError("idle timeout")
+
+    store.redis = RedisStub()
+
+    self.assertEqual(await store.get_worker_launch_requests(), [])
 
 
 if __name__ == "__main__":
