@@ -1,13 +1,8 @@
 import os
-import sys
 import tempfile
 import unittest
 
-from tests._server_fixture import SERVER_DIR
-
-sys.path.insert(0, str(SERVER_DIR))
-
-import gateway  # noqa: E402
+from server import gateway
 
 
 class GatewayPathTest(unittest.TestCase):

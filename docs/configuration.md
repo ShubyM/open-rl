@@ -15,10 +15,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Start the API server and trainer with the default torch sampling backend:
 
 ```bash
-cd src/server
 BASE_MODEL=google/gemma-4-e2b \
 SAMPLING_BACKEND=torch \
-uv run --extra cpu python -m uvicorn gateway:app --host 127.0.0.1 --port 9003
+uv run --extra cpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 Because `REDIS_URL` is unset, this starts the API server and trainer loop in one
@@ -28,20 +27,18 @@ For a separate vLLM sampler, use two terminals:
 
 ```bash
 # Terminal 1: vLLM sampler
-cd src/server
 BASE_MODEL=google/gemma-4-e2b \
 VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM \
 CUDA_VISIBLE_DEVICES=0 \
-uv run --extra vllm python -m vllm_sampler
+uv run --extra vllm python -m server.vllm_sampler
 ```
 
 ```bash
 # Terminal 2: API server and trainer
-cd src/server
 BASE_MODEL=google/gemma-4-e2b \
 SAMPLING_BACKEND=vllm \
 CUDA_VISIBLE_DEVICES=1 \
-uv run --extra gpu python -m uvicorn gateway:app --host 127.0.0.1 --port 9003
+uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 The equivalent Makefile shortcuts are:
@@ -95,18 +92,18 @@ Kubernetes deployment manifests set these variables in pod specs. The important 
 REDIS_URL=redis://redis-service:6379 \
 VLLM_URL=http://vllm-service:8001 \
 BASE_MODEL=google/gemma-4-e2b \
-uv run uvicorn src.gateway:app --host 0.0.0.0 --port 8000
+uv run uvicorn server.gateway:app --host 0.0.0.0 --port 8000
 ```
 
 ```bash
 # Trainer worker pod
 REDIS_URL=redis://redis-service:6379 \
 BASE_MODEL=google/gemma-4-e2b \
-uv run python -m src.clock_cycle
+uv run python -m server.training_requests_processor
 ```
 
 ```bash
 # vLLM worker pod
 BASE_MODEL=google/gemma-4-e2b \
-uv run uvicorn src.vllm_sampler:app --host 0.0.0.0 --port 8001
+uv run uvicorn server.vllm_sampler:app --host 0.0.0.0 --port 8001
 ```

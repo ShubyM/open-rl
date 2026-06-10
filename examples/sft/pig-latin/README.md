@@ -7,8 +7,8 @@ This script demonstrates fine-tuning a model to translate English into Pig Latin
 1. **Install dependencies**:
    Set up the server and client environments:
    ```bash
-   cd src && uv sync --extra cpu
-   cd ../examples && uv sync
+   uv sync --extra cpu
+   uv --project examples sync
    ```
 
 ## Running the Training Server

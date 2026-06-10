@@ -13,13 +13,13 @@ jobs:
       matrix:
         include:
           - image_name: gateway
-            context: src/server
+            context: .
             dockerfile: src/server/Dockerfile.gateway
           - image_name: server
-            context: src/server
+            context: .
             dockerfile: src/server/Dockerfile
           - image_name: client
-            context: examples
+            context: .
             dockerfile: examples/autoresearch/Dockerfile
     permissions:
       contents: read

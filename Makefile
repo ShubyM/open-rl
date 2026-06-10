@@ -13,26 +13,45 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-TEST_PYTHONPATH ?= examples/sft/pig-latin
+UNIT_TESTS ?= tests.test_gateway_paths tests.test_snapshot_agent tests.test_trainer_optimizer_correctness tests.test_worker_launch_processor
+# Only forward BASE_URL to e2e when the user supplied it. The Makefile default
+# is for local CLI usage; e2e should start its own backend by default.
+TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
+TRAINING_TEST_EXTRA ?= gpu
+TRAINING_TEST_ARGS ?=
+PIGLATIN_TEST_PYTHONPATH ?= examples/sft/pig-latin
+
+# CUDA_VISIBLE_DEVICES can be provided either as an environment variable or as a
+# Make variable, and is inherited by the backend/eval subprocesses.
+ifneq ($(origin CUDA_VISIBLE_DEVICES),undefined)
+  export CUDA_VISIBLE_DEVICES
+endif
 
 help:
 	@echo "make server                              # $(BASE_MODEL), SAMPLING_BACKEND=$(SAMPLING_BACKEND), port $(PORT)"
 	@echo "make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm"
 	@echo "VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make vllm BASE_MODEL=google/gemma-4-e2b"
-	@echo "make test | lint | fmt"
+	@echo "make test                               # fast unit tests"
+	@echo "make test e2e tiny-lora|tiny-fft|tiny-rl|lora-textsql|fft-gsm8k|fft-gsm8k-x2  # tiny-* = fast overfit smoke tests"
+	@echo "make test e2e tiny-lora BASE_URL=http://host:9003"
+	@echo "CUDA_VISIBLE_DEVICES=0 make test e2e tiny-fft"
+	@echo "make test e2e tiny-fft TRAINING_TEST_ARGS='steps=20'"
+	@echo "make test e2e fft-gsm8k TRAINING_TEST_ARGS='steps=10 eval_examples=8 extra=\"batch=2\"'"
+	@echo "make test piglatin                      # pig-latin example end-to-end tests"
+	@echo "make lint | fmt"
 
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
 server:
 	@-kill -9 $$(lsof -ti:$(PORT)) 2>/dev/null || true
-	cd src/server && BASE_MODEL="$(BASE_MODEL)" SAMPLING_BACKEND="$(SAMPLING_BACKEND)" \
+	BASE_MODEL="$(BASE_MODEL)" SAMPLING_BACKEND="$(SAMPLING_BACKEND)" \
 	  uv run --extra $(if $(filter vllm,$(SAMPLING_BACKEND)),gpu,cpu) \
-	  python -m uvicorn gateway:app --host $(HOST) --port $(PORT)
+	  python -m uvicorn server.gateway:app --host $(HOST) --port $(PORT)
 
 vllm:
-	cd src/server && BASE_MODEL="$(BASE_MODEL)" \
-	  uv run --extra vllm python -m vllm_sampler
+	BASE_MODEL="$(BASE_MODEL)" \
+	  uv run --extra vllm python -m server.vllm_sampler
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -42,6 +61,15 @@ ifeq (cli,$(firstword $(MAKECMDGOALS)))
   $(eval $(CLI_ARGS):;@:)
 endif
 
+ifeq (test,$(firstword $(MAKECMDGOALS)))
+  TEST_MODE := $(word 2,$(MAKECMDGOALS))
+  TEST_SCENARIO := $(word 3,$(MAKECMDGOALS))
+  TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+  ifneq ($(TEST_ARGS),)
+    $(eval $(TEST_ARGS):;@:)
+  endif
+endif
+
 cli:
 	@cd dev/tools && BASE_URL="$(BASE_URL)" uv run python cli.py $(CLI_ARGS)
 
@@ -49,7 +77,24 @@ cli:
 # Dev
 # ---------------------------------------------------------------------------
 test:
-	PYTHONPATH="$(TEST_PYTHONPATH)" uv --project examples run python -m unittest discover -s tests
+	@mode="$(TEST_MODE)"; \
+	scenario="$(TEST_SCENARIO)"; \
+	if [ -z "$$mode" ] || [ "$$mode" = "unit" ]; then \
+	  uv run --frozen --exact --extra cpu python -m unittest $(UNIT_TESTS); \
+	elif [ "$$mode" = "e2e" ]; then \
+	  if [ -z "$$scenario" ]; then \
+	    echo "Missing e2e scenario. Expected tiny-lora, tiny-fft, tiny-rl, lora-textsql, fft-gsm8k, or fft-gsm8k-x2."; \
+	    exit 2; \
+	  fi; \
+	  set -- "scenario=$$scenario" "uv_extra=$(TRAINING_TEST_EXTRA)"; \
+	  if [ -n "$(TRAINING_TEST_BASE_URL)" ]; then set -- "$$@" "base_url=$(TRAINING_TEST_BASE_URL)"; fi; \
+	  uv run --extra "$(TRAINING_TEST_EXTRA)" python scripts/run_training_e2e.py "$$@" $(TRAINING_TEST_ARGS); \
+	elif [ "$$mode" = "piglatin" ]; then \
+	  PYTHONPATH="$(PIGLATIN_TEST_PYTHONPATH)" uv --project examples run python -m unittest discover -s tests; \
+	else \
+	  echo "Unknown test mode '$$mode'. Expected unit, e2e, or piglatin."; \
+	  exit 2; \
+	fi
 
 lint:
 	uvx ruff check .
@@ -66,8 +111,8 @@ GCP_PROJECT ?= cdrollouts-sunilarora
 IMAGE_TAG   ?= latest
 
 build-images:
-	cd src/server && DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) -f Dockerfile .
-	cd src/server && DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) -f Dockerfile.gateway .
+	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) -f src/server/Dockerfile .
+	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) -f src/server/Dockerfile.gateway .
 
 push-images:
 	docker push gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG)
@@ -106,4 +151,3 @@ push-vm:
 # Pull changes from the remote VM back to the local workspace
 pull-vm:
 	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' $(REMOTE_HOST):~/open-rl/ ./
-

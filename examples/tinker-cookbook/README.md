@@ -21,20 +21,18 @@ From the repository root, start one vLLM sampler and one OpenRL gateway on
 separate GPUs. These examples are written for two L4 GPUs or better.
 
 ```bash
-cd src/server
-CUDA_VISIBLE_DEVICES=0 BASE_MODEL="Qwen/Qwen3-1.7B" uv run --extra vllm python -m vllm_sampler
+CUDA_VISIBLE_DEVICES=0 BASE_MODEL="Qwen/Qwen3-1.7B" uv run --extra vllm python -m server.vllm_sampler
 ```
 
 In another shell:
 
 ```bash
-cd src/server
 CUDA_VISIBLE_DEVICES=1 \
 BASE_MODEL="Qwen/Qwen3-1.7B" \
 SAMPLING_BACKEND=vllm \
 VLLM_URL=http://127.0.0.1:8001 \
 TINKER_API_KEY=tml-dummy-key \
-uv run --extra gpu python -m uvicorn gateway:app --host 127.0.0.1 --port 9003
+uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 CPU mode is useful for tiny model fixtures, but Qwen-sized cookbook runs should

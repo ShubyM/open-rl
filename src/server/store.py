@@ -3,10 +3,12 @@
 import asyncio
 import json
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
 import redis.asyncio as redis
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 
 class RequestStore(ABC):
@@ -118,7 +120,7 @@ class InMemoryStore(RequestStore):
     try:
       await asyncio.wait_for(event.wait(), timeout=timeout)
       return self.futures_store.get(req_id)
-    except asyncio.TimeoutError:
+    except TimeoutError:
       return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
     finally:
       self.futures_events.pop(req_id, None)
@@ -152,7 +154,10 @@ class RedisStore(RequestStore):
     # BRPOPLPUSH blocks until an item is available.
     # It atomically pops the rightmost element of src, pushes it to the left of dst, and returns it.
     # Wait max 5 seconds so we can check for connection death.
-    result = await self.redis.brpoplpush(self.active_list, self.active_list, timeout=5)
+    try:
+      result = await self.redis.brpoplpush(self.active_list, self.active_list, timeout=5)
+    except RedisTimeoutError:
+      return []
 
     if not result:
       return []
@@ -183,7 +188,10 @@ class RedisStore(RequestStore):
     return batch
 
   async def get_worker_launch_requests(self) -> list[dict[str, Any]]:
-    result = await self.redis.blpop(self.worker_launch_queue, timeout=5)
+    try:
+      result = await self.redis.blpop(self.worker_launch_queue, timeout=5)
+    except RedisTimeoutError:
+      return []
 
     if not result:
       return []
@@ -200,7 +208,10 @@ class RedisStore(RequestStore):
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     queue_key = f"open_rl:queue:{model_id}"
-    result = await self.redis.blpop(queue_key, timeout=5)
+    try:
+      result = await self.redis.blpop(queue_key, timeout=5)
+    except RedisTimeoutError:
+      return []
 
     if not result:
       return []
@@ -231,15 +242,24 @@ class RedisStore(RequestStore):
   async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     key = f"open_rl:future:{req_id}"
 
-    result = await self.redis.blpop(key, timeout=max(1, int(timeout)))
-
-    if result:
-      payload = json.loads(result[1])
-      await self.redis.rpush(key, result[1])
-      await self.redis.expire(key, 300)
-      return payload
-
-    return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
+    # redis-py 8 defaults the client socket timeout to 5s, so a single BLPOP can
+    # never block for the full long-poll window. Poll in slices shorter than the
+    # socket timeout until the deadline so clients only see try_again when the
+    # request genuinely outlived the window.
+    deadline = time.monotonic() + timeout
+    while True:
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
+      try:
+        result = await self.redis.blpop(key, timeout=min(3, max(1, int(remaining))))
+      except RedisTimeoutError:
+        result = None
+      if result:
+        payload = json.loads(result[1])
+        await self.redis.rpush(key, result[1])
+        await self.redis.expire(key, 300)
+        return payload
 
 
 # Global singleton factory

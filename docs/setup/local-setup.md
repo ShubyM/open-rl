@@ -67,8 +67,7 @@ All commands below assume you are in the **repository root** directory.
 Patch vLLM `0.20.0` for Gemma 4 LoRA support.
 
 ```bash
-(cd src/server && \
- uv run --extra vllm python scripts/patch_vllm_lora_dedup.py)
+uv run --extra vllm python src/server/scripts/patch_vllm_lora_dedup.py
 ```
 
 ### 2. Start the vLLM Sampler

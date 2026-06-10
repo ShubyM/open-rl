@@ -32,9 +32,9 @@ spec:
       serviceAccountName: open-rl-sa
       containers:
       - name: vllm
-        image: gcr.io/cdrollouts-sunilarora/open-rl-server:latest
+        image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: Always
-        command: ["uv", "run", "uvicorn", "src.vllm_sampler:app", "--host", "0.0.0.0", "--port", "8001"]
+        command: ["uv", "run", "uvicorn", "server.vllm_sampler:app", "--host", "0.0.0.0", "--port", "8001"]
         ports:
         - containerPort: 8001
         env:

@@ -16,8 +16,6 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = REPO_ROOT / "src"
-SERVER_DIR = REPO_ROOT / "src" / "server"
 
 
 def unused_tcp_port() -> int:
@@ -53,8 +51,6 @@ def openrl_server(
   }
   if extra_env:
     env.update(extra_env)
-  existing_pythonpath = env.get("PYTHONPATH")
-  env["PYTHONPATH"] = os.pathsep.join([str(SRC_DIR), existing_pythonpath]) if existing_pythonpath else str(SRC_DIR)
   env.pop("REDIS_URL", None)
 
   command = [
@@ -64,7 +60,7 @@ def openrl_server(
     "python",
     "-m",
     "uvicorn",
-    "gateway:app",
+    "server.gateway:app",
     "--host",
     "127.0.0.1",
     "--port",
@@ -72,7 +68,7 @@ def openrl_server(
     "--log-level",
     "warning",
   ]
-  proc = subprocess.Popen(command, cwd=SERVER_DIR, env=env, stdout=stdout, stderr=stderr, text=True, preexec_fn=os.setsid)
+  proc = subprocess.Popen(command, cwd=REPO_ROOT, env=env, stdout=stdout, stderr=stderr, text=True, preexec_fn=os.setsid)
   try:
     wait_until_healthy(proc, f"{base_url}{health_path}", startup_timeout)
     yield base_url

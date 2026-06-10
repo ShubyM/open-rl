@@ -5,18 +5,18 @@ import sys
 import traceback
 from pathlib import Path
 
-from store import RequestStore
+from server.store import RequestStore
 
-SERVER_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[2]
 WORKER_LAUNCH_OPS = {"create_model", "create_model_from_state"}
 
 
 class FFTWorkerManager:
-  def __init__(self, server_dir: Path = SERVER_DIR):
+  def __init__(self, project_dir: Path = PROJECT_DIR):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("OPEN_RL_ENABLE_FFT=true requires REDIS_URL so launched workers can share queues and futures")
 
-    self.server_dir = server_dir
+    self.project_dir = project_dir
     self.processes: dict[str, subprocess.Popen] = {}
 
   def launch(self, model_id: str) -> None:
@@ -26,8 +26,8 @@ class FFTWorkerManager:
 
     env = {**os.environ, "OPEN_RL_ENABLE_FFT": "true"}
     self.processes[model_id] = subprocess.Popen(
-      [sys.executable, "-m", "training_requests_processor", "--model-id", model_id],
-      cwd=self.server_dir,
+      [sys.executable, "-m", "server.training_requests_processor", "--model-id", model_id],
+      cwd=self.project_dir,
       env=env,
     )
 

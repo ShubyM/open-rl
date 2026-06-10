@@ -7,8 +7,8 @@ This guide shows how to run the local FunctionGemma SFT demo.
 1. **Install dependencies**:
    Set up the server and client environments:
    ```bash
-   cd src && uv sync --extra cpu
-   cd ../examples && uv sync
+   uv sync --extra cpu
+   uv --project examples sync
    ```
 2. **Accept the model terms**: [google/functiongemma-270m-it](https://huggingface.co/google/functiongemma-270m-it)
 3. **Authenticate with Hugging Face** (required for gated models):
