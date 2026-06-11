@@ -289,6 +289,9 @@ async def create_model(req: dict):
   if not base_model:
     return JSONResponse(status_code=400, content={"error": "base_model is required"})
   model_id = str(uuid.uuid4())
+  # Recorded so get_info can answer per-model instead of relying on a
+  # gateway-wide BASE_MODEL env var (which a multi-model gateway can't have).
+  await store.set_model_base(model_id, base_model)
   command = make_training_request(
     "create_model",
     model_id,
@@ -328,7 +331,11 @@ async def create_model_from_state(req: dict):
 @app.post("/api/v1/get_info")
 async def get_info(req: dict):
   """ServiceClient — model metadata for the training client."""
-  model_name = get_default_model_name()
+  model_id = req.get("model_id")
+  model_name = await store.get_model_base(model_id) if model_id else None
+  # Models created by create_model_from_state (base model only known to the
+  # worker) or predating this gateway fall back to the BASE_MODEL env var.
+  model_name = model_name or get_default_model_name()
   if not model_name:
     return JSONResponse(status_code=404, content={"error": "No base model is configured"})
   # SDK compatibility: the public client currently expects LoRA-shaped training metadata,

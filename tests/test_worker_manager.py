@@ -9,12 +9,19 @@ class StoreStub:
   def __init__(self):
     self.forwarded_requests = []
     self.futures = {}
+    self.model_bases = {}
 
   async def put_request(self, req_data: dict) -> None:
     self.forwarded_requests.append(req_data)
 
   async def set_future(self, req_id: str, result: dict) -> None:
     self.futures[req_id] = result
+
+  async def set_model_base(self, model_id: str, base_model: str) -> None:
+    self.model_bases[model_id] = base_model
+
+  async def get_model_base(self, model_id: str) -> str | None:
+    return self.model_bases.get(model_id)
 
 
 class WorkerManagerStub:

@@ -28,6 +28,16 @@ class RequestStore(ABC):
     pass
 
   @abstractmethod
+  async def set_model_base(self, model_id: str, base_model: str) -> None:
+    """Record which base model a model_id was created from (serves get_info)."""
+    pass
+
+  @abstractmethod
+  async def get_model_base(self, model_id: str) -> str | None:
+    """Return the base model recorded for model_id, or None if unknown."""
+    pass
+
+  @abstractmethod
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
     """Resolve a future by its request ID."""
     pass
@@ -47,6 +57,13 @@ class InMemoryStore(RequestStore):
     self.active_tenants_cv = asyncio.Condition()
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, asyncio.Event] = {}
+    self.model_bases: dict[str, str] = {}
+
+  async def set_model_base(self, model_id: str, base_model: str) -> None:
+    self.model_bases[model_id] = base_model
+
+  async def get_model_base(self, model_id: str) -> str | None:
+    return self.model_bases.get(model_id)
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -116,6 +133,13 @@ class RedisStore(RequestStore):
     self.active_list = "open_rl:active_tenants"
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
+    self.model_base_hash = "open_rl:model_base"
+
+  async def set_model_base(self, model_id: str, base_model: str) -> None:
+    await self.redis.hset(self.model_base_hash, model_id, base_model)
+
+  async def get_model_base(self, model_id: str) -> str | None:
+    return await self.redis.hget(self.model_base_hash, model_id)
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")

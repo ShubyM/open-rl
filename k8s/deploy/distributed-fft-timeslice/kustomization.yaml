@@ -16,5 +16,4 @@ resources:
 configMapGenerator:
   - name: open-rl-config
     literals:
-      - BASE_MODEL="Qwen/Qwen3-0.6B"
       - ENABLE_GCP_TRACE="1"
