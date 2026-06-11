@@ -1,0 +1,27 @@
+# The gateway launches one FFT worker pod per model, so its service account
+# needs pod CRUD in the workload namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: open-rl-sa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: open-rl-worker-launcher
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: open-rl-worker-launcher
+subjects:
+- kind: ServiceAccount
+  name: open-rl-sa
+roleRef:
+  kind: Role
+  name: open-rl-worker-launcher
+  apiGroup: rbac.authorization.k8s.io

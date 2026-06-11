@@ -1,0 +1,64 @@
+# Pod template the gateway uses to launch one FFT worker per model
+# (server/k8s_worker_manager.py). The launcher stamps metadata.name, the
+# time-slicing labels (snapshot-agent, timeslice.io/group, timeslice.io/job-id),
+# the OPEN_RL_TIME_SLICE_JOB_ID env var, and appends --model-id to args.
+#
+# All worker pods of a time-slice group share one GPU through the single DRA
+# ResourceClaim open-rl-shared-gpu (06-gpu-resourceclaim.yaml), which pins them
+# to the same physical device — the llm-d orchestrator serializes the actual
+# GPU usage with cuda-checkpoint (driver r570+ required). See
+# docs/setup/gke-fft-timeslice.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: open-rl-fft-worker-pod-template
+data:
+  fft-worker-pod.yaml: |
+    apiVersion: v1
+    kind: Pod
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: fft-worker
+        image: ghcr.io/gke-labs/open-rl/server:latest
+        imagePullPolicy: Always
+        command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
+        env:
+        - name: REDIS_URL
+          value: "redis://redis-service:6379"
+        - name: OPEN_RL_ENABLE_FFT
+          value: "true"
+        - name: OPEN_RL_TMP_DIR
+          value: "/mnt/shared/open-rl"
+        - name: HF_HOME
+          value: "/mnt/shared/open-rl/huggingface"
+        - name: OPEN_RL_TIME_SLICE_ORCHESTRATOR_ADDR
+          value: "acceleratororchestrator.timeslice-system.svc.cluster.local:50051"
+        - name: OPEN_RL_TIME_SLICE_GROUP
+          value: "trainers"
+        resources:
+          claims:
+          - name: shared-gpu
+          limits:
+            memory: "48Gi"
+          requests:
+            # Sized generously: while a worker is checkpointed, its entire GPU
+            # state (weights, optimizer, activations) lives in host RAM.
+            memory: "48Gi"
+            cpu: "2"
+        volumeMounts:
+        - name: shared-storage
+          mountPath: /mnt/shared
+      resourceClaims:
+      - name: shared-gpu
+        resourceClaimName: open-rl-shared-gpu
+      volumes:
+      - name: shared-storage
+        persistentVolumeClaim:
+          claimName: open-rl-shared-pvc
+      nodeSelector:
+        group.timeslice.io/trainers: "true"
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"

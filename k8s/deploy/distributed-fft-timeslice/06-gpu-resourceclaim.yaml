@@ -1,0 +1,18 @@
+# One DRA ResourceClaim for the time-sliced GPU, shared by every FFT worker
+# pod (each references it by name in spec.resourceClaims). Sharing one claim
+# guarantees all workers land on the same physical GPU; the llm-d orchestrator
+# serializes the actual usage with cuda-checkpoint.
+#
+# The claim itself does not bound how many workers may share the GPU — host
+# RAM is the real capacity limit, since each suspended job's full GPU state is
+# parked there (see the memory request in 05-worker-pod-template.yaml).
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: open-rl-shared-gpu
+spec:
+  devices:
+    requests:
+    - name: gpu
+      exactly:
+        deviceClassName: gpu.nvidia.com

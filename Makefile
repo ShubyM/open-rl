@@ -121,6 +121,12 @@ push-images:
 deploy:
 	kubectl apply -k k8s/deploy/distributed-lustre/
 
+# FFT time-slicing variant: the gateway launches one worker pod per FFT model,
+# all pinned to one GPU via a shared DRA ResourceClaim.
+# See docs/setup/gke-fft-timeslice.md.
+deploy-fft-timeslice:
+	kubectl apply -k k8s/deploy/distributed-fft-timeslice/
+
 rollout:
 	kubectl rollout restart deployment redis-store open-rl-gateway open-rl-trainer-worker vllm-worker
 

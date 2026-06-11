@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# FFT time-slicing deployment: the gateway launches one worker pod per FFT model
+# and the llm-d-rl-time-slicing stack (installed separately via its Helm chart,
+# see docs/setup/gke-fft-timeslice.md) serializes their GPU access with
+# cuda-checkpoint. There is no static trainer worker in this variant.
+resources:
+  - 01-shared-pvc.yaml
+  - 02-redis.yaml
+  - 03-rbac.yaml
+  - 04-gateway.yaml
+  - 05-worker-pod-template.yaml
+  - 06-gpu-resourceclaim.yaml
+
+configMapGenerator:
+  - name: open-rl-config
+    literals:
+      - BASE_MODEL="Qwen/Qwen3-0.6B"
+      - ENABLE_GCP_TRACE="1"
