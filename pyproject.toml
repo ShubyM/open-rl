@@ -44,6 +44,11 @@ vllm = [
     "torch-c-dlpack-ext; sys_platform == 'linux'",
     "vllm==0.20.0; sys_platform == 'linux'",
 ]
+# Kubernetes cluster mode: the k8s API client used to launch FFT worker pods
+# (OPEN_RL_WORKER_LAUNCHER=kubernetes).
+cluster = [
+    "kubernetes>=29",
+]
 
 [tool.setuptools.package-dir]
 "" = "src"

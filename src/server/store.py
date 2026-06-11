@@ -18,18 +18,8 @@ class RequestStore(ABC):
     pass
 
   @abstractmethod
-  async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
-    """Push a create-model request onto the queue that starts dedicated FFT workers."""
-    pass
-
-  @abstractmethod
   async def get_requests(self) -> list[dict[str, Any]]:
     """Block until at least 1 request is available, then return all currently queued requests."""
-    pass
-
-  @abstractmethod
-  async def get_worker_launch_requests(self) -> list[dict[str, Any]]:
-    """Block until at least 1 worker-launch request is available, then drain that queue."""
     pass
 
   @abstractmethod
@@ -71,9 +61,6 @@ class InMemoryStore(RequestStore):
         self.active_tenants.append(model_id)
         self.active_tenants_cv.notify()
 
-  async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
-    raise RuntimeError("Worker launch requests require REDIS_URL; in-memory queues cannot be shared across processes")
-
   async def get_requests(self) -> list[dict[str, Any]]:
     async with self.active_tenants_cv:
       # Block until at least one tenant is active
@@ -96,9 +83,6 @@ class InMemoryStore(RequestStore):
         self.active_tenants.remove(model_id)
 
       return batch
-
-  async def get_worker_launch_requests(self) -> list[dict[str, Any]]:
-    raise RuntimeError("Worker launch requests require REDIS_URL; in-memory queues cannot be shared across processes")
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     raise RuntimeError("Per-model full fine-tuning workers require REDIS_URL; in-memory queues cannot be shared across processes")
@@ -132,7 +116,6 @@ class RedisStore(RequestStore):
     self.active_list = "open_rl:active_tenants"
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
-    self.worker_launch_queue = "open_rl:worker_launch_queue"
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -146,9 +129,6 @@ class RedisStore(RequestStore):
     is_new = await self.redis.sadd(self.active_set, model_id)
     if is_new == 1:
       await self.redis.rpush(self.active_list, model_id)
-
-  async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
-    await self.redis.rpush(self.worker_launch_queue, json.dumps(req_data))
 
   async def get_requests(self) -> list[dict[str, Any]]:
     # BRPOPLPUSH blocks until an item is available.
@@ -184,25 +164,6 @@ class RedisStore(RequestStore):
       # We remove it from the list AND set
       await self.redis.lrem(self.active_list, 0, model_id)
       await self.redis.srem(self.active_set, model_id)
-
-    return batch
-
-  async def get_worker_launch_requests(self) -> list[dict[str, Any]]:
-    try:
-      result = await self.redis.blpop(self.worker_launch_queue, timeout=5)
-    except RedisTimeoutError:
-      return []
-
-    if not result:
-      return []
-
-    batch = [json.loads(result[1])]
-
-    while True:
-      item = await self.redis.lpop(self.worker_launch_queue)
-      if not item:
-        break
-      batch.append(json.loads(item))
 
     return batch
 
