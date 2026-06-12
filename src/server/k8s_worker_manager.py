@@ -60,17 +60,25 @@ class KubernetesFFTWorkerManager:
     job_id = sanitize_job_id(model_id)
     pod_name = POD_NAME_PREFIX + job_id
 
-    existing = self._read_pod(pod_name)
+    existing = self.read_pod(pod_name)
     if existing is not None:
       if existing.status.phase not in TERMINAL_POD_PHASES:
         return
-      self._delete_pod_and_wait(pod_name)
+      self.delete_pod_and_wait(pod_name)
 
     try:
       self.core_api.create_namespaced_pod(namespace=self.namespace, body=self.render_pod(pod_name, model_id, job_id))
     except Exception as exc:
       # Another gateway replica created it between our read and create.
       if getattr(exc, "status", None) != 409:
+        raise
+
+  def shutdown(self, model_id: str) -> None:
+    pod_name = POD_NAME_PREFIX + sanitize_job_id(model_id)
+    try:
+      self.core_api.delete_namespaced_pod(name=pod_name, namespace=self.namespace)
+    except Exception as exc:
+      if getattr(exc, "status", None) != 404:
         raise
 
   def shutdown_all(self) -> None:
@@ -97,7 +105,7 @@ class KubernetesFFTWorkerManager:
     container.setdefault("env", []).append({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": job_id})
     return pod
 
-  def _read_pod(self, pod_name: str) -> Any | None:
+  def read_pod(self, pod_name: str) -> Any | None:
     try:
       return self.core_api.read_namespaced_pod(name=pod_name, namespace=self.namespace)
     except Exception as exc:
@@ -105,10 +113,10 @@ class KubernetesFFTWorkerManager:
         return None
       raise
 
-  def _delete_pod_and_wait(self, pod_name: str, timeout: float = 60.0) -> None:
+  def delete_pod_and_wait(self, pod_name: str, timeout: float = 60.0) -> None:
     self.core_api.delete_namespaced_pod(name=pod_name, namespace=self.namespace)
     deadline = time.monotonic() + timeout
-    while self._read_pod(pod_name) is not None:
+    while self.read_pod(pod_name) is not None:
       if time.monotonic() > deadline:
         raise RuntimeError(f"pod {pod_name} did not terminate within {timeout:.0f}s; cannot relaunch worker")
       time.sleep(0.5)

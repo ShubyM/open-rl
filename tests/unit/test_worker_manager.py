@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from server import gateway
+from server.lifecycle_store import InMemoryLifecycleStore
 from server.worker_manager import FFTWorkerManager
 
 
@@ -28,11 +29,15 @@ class WorkerManagerStub:
   def __init__(self, error: Exception | None = None):
     self.error = error
     self.launched_model_ids = []
+    self.shutdown_model_ids = []
 
   def launch(self, model_id: str) -> None:
     self.launched_model_ids.append(model_id)
     if self.error is not None:
       raise self.error
+
+  def shutdown(self, model_id: str) -> None:
+    self.shutdown_model_ids.append(model_id)
 
   def shutdown_all(self) -> None:
     pass
@@ -44,15 +49,19 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
 
   def setUp(self) -> None:
     self.store = StoreStub()
+    self.lifecycle = InMemoryLifecycleStore()
     self.worker_manager = WorkerManagerStub()
     self.old_store = gateway.store
+    self.old_lifecycle = gateway.lifecycle
     self.old_manager = gateway.fft_worker_manager
     gateway.store = self.store
+    gateway.lifecycle = self.lifecycle
     gateway.fft_worker_manager = self.worker_manager
     self.addCleanup(self._restore)
 
   def _restore(self) -> None:
     gateway.store = self.old_store
+    gateway.lifecycle = self.old_lifecycle
     gateway.fft_worker_manager = self.old_manager
 
   async def test_create_model_launches_worker_then_enqueues(self) -> None:

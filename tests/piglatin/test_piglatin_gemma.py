@@ -10,7 +10,7 @@ import unittest
 from piglatin_sft import PRESETS, run_training
 
 from tests._server_fixture import REPO_ROOT, OpenRlServerCase
-from tests.test_piglatin_qwen import PIGLATIN_EVAL_EXAMPLES
+from tests.piglatin.test_piglatin_qwen import PIGLATIN_EVAL_EXAMPLES
 
 CLIENT_DIR = REPO_ROOT / "examples" / "sft" / "pig-latin"
 

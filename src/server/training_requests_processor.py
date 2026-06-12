@@ -28,6 +28,12 @@ def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
+def sampler_full_local_path(ref: str) -> str:
+  """Local checkpoint directory for a tinker://.../sampler_weights/... ref."""
+  rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
+  return os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
+
+
 def create_snapshot_agent_client(socket_path: str) -> SnapshotAgentClient:
   return SnapshotAgentClient(socket_path)
 
@@ -335,6 +341,20 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     return result
 
   async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
+    if self.worker.model is None:
+      # This worker was relaunched (crash, reap) after the model was created, so
+      # the training weights are gone. Evals can still be served: reload the
+      # sampler checkpoint the request points at.
+      ref = payload.get("sampler_weights_ref")
+      if not ref:
+        raise RuntimeError(
+          f"Worker for model {model_id} has no weights loaded (it restarted after create_model). "
+          "Sample from a tinker://.../sampler_weights/... path so the worker can reload them, "
+          "or recreate the training client from its last checkpoint."
+        )
+      state_path = sampler_full_local_path(ref)
+      print(f"[WORKER] No weights in memory for {model_id}; reloading sampler checkpoint {state_path}")
+      await asyncio.to_thread(self.worker.load_from_state, model_id, state_path)
     result = await asyncio.to_thread(
       self.worker.generate,
       payload.get("prompt_tokens", []),
@@ -370,8 +390,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     ref = payload.get("path") or payload.get("sampling_session_id")
     if not ref:
       raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
-    rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
-    local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
+    local_path = sampler_full_local_path(ref)
     await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
     return {
       "path": payload.get("path"),

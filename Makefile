@@ -13,7 +13,6 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_gateway_paths tests.test_k8s_worker_manager tests.test_snapshot_agent tests.test_trainer_optimizer_correctness tests.test_worker_manager
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -80,7 +79,7 @@ test:
 	@mode="$(TEST_MODE)"; \
 	scenario="$(TEST_SCENARIO)"; \
 	if [ -z "$$mode" ] || [ "$$mode" = "unit" ]; then \
-	  uv run --frozen --exact --extra cpu python -m unittest $(UNIT_TESTS); \
+	  uv run --frozen --exact --extra cpu python -m unittest discover -s tests/unit -t .; \
 	elif [ "$$mode" = "e2e" ]; then \
 	  if [ -z "$$scenario" ]; then \
 	    echo "Missing e2e scenario. Expected tiny-lora, tiny-fft, tiny-rl, lora-textsql, fft-gsm8k, or fft-gsm8k-x2."; \
@@ -90,7 +89,7 @@ test:
 	  if [ -n "$(TRAINING_TEST_BASE_URL)" ]; then set -- "$$@" "base_url=$(TRAINING_TEST_BASE_URL)"; fi; \
 	  uv run --extra "$(TRAINING_TEST_EXTRA)" python scripts/run_training_e2e.py "$$@" $(TRAINING_TEST_ARGS); \
 	elif [ "$$mode" = "piglatin" ]; then \
-	  PYTHONPATH="$(PIGLATIN_TEST_PYTHONPATH)" uv --project examples run python -m unittest discover -s tests; \
+	  PYTHONPATH="$(PIGLATIN_TEST_PYTHONPATH)" uv --project examples run python -m unittest discover -s tests/piglatin -t .; \
 	else \
 	  echo "Unknown test mode '$$mode'. Expected unit, e2e, or piglatin."; \
 	  exit 2; \

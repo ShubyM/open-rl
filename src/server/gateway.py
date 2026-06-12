@@ -16,10 +16,12 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from server.lifecycle_store import get_lifecycle_store
 from server.store import get_store
 from server.worker_manager import WorkerManager, create_fft_worker_manager
 
 store = get_store()
+lifecycle = get_lifecycle_store()
 fft_worker_manager: WorkerManager | None = None
 
 provider = TracerProvider()
@@ -48,6 +50,10 @@ logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
+# The tinker SDK heartbeats every 10s; a session is considered gone after this
+# many seconds without one, and workers used only by gone sessions get reaped.
+SESSION_TTL_S = float(os.getenv("OPEN_RL_SESSION_TTL_S", "60"))
+REAP_INTERVAL_S = float(os.getenv("OPEN_RL_REAP_INTERVAL_S", "5"))
 
 
 # *** Helpers ***
@@ -146,12 +152,45 @@ async def launch_worker_and_enqueue(request: dict) -> str:
   request_id = request["request_id"]
   await store.set_future(request_id, {"status": "pending"})
   try:
+    # Registered unconditionally (not only on creation) so the supervisor can
+    # reap workers that predate whatever registry state survived a redis flush.
+    await lifecycle.register_fft_model(request["model_id"])
     await asyncio.to_thread(fft_worker_manager.launch, request["model_id"])
   except Exception as exc:
     traceback.print_exc()
     await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
     return request_id
   return await enqueue(request)
+
+
+async def reap_idle_workers_once() -> None:
+  """Shut down FFT workers whose client sessions have all expired.
+
+  Heartbeats arrive as session TTL refreshes (session_heartbeat below); this just
+  asks, per watched model, "is anyone still here?" once the queue is drained.
+  Models never bound to a session (clients predating session support) are exempt.
+  The idempotent launch revives a reaped worker if its traffic returns. Worker
+  health is deliberately not monitored: a crashed container restarts in place and
+  reports its own request failures, and eval traffic relaunches missing workers.
+  """
+  assert fft_worker_manager is not None, "the reaper only runs when FFT is enabled"
+  for model_id in await lifecycle.list_fft_models():
+    has_sessions, has_live_session = await lifecycle.model_session_state(model_id)
+    if has_sessions and not has_live_session and await store.queue_length(model_id) == 0:
+      print(f"[REAPER] All sessions for {model_id} expired; shutting its worker down.")
+      await asyncio.to_thread(fft_worker_manager.shutdown, model_id)
+      await lifecycle.unregister_fft_model(model_id)
+
+
+async def reap_idle_workers_loop() -> None:
+  while True:
+    try:
+      await reap_idle_workers_once()
+    except asyncio.CancelledError:
+      raise
+    except Exception:
+      traceback.print_exc()
+    await asyncio.sleep(REAP_INTERVAL_S)
 
 
 async def preflight_vllm() -> None:
@@ -213,8 +252,10 @@ def translate_future_result(result: dict) -> dict:
 async def lifespan(_: FastAPI):
   global fft_worker_manager
   task = None
+  reaper_task = None
   if is_fft_enabled():
     fft_worker_manager = create_fft_worker_manager()
+    reaper_task = asyncio.create_task(reap_idle_workers_loop())
   if is_single_process_mode():
     base_model = os.getenv("BASE_MODEL")
     print("\n" + "=" * 50)
@@ -237,6 +278,8 @@ async def lifespan(_: FastAPI):
   finally:
     if task is not None:
       task.cancel()
+    if reaper_task is not None:
+      reaper_task.cancel()
     if fft_worker_manager is not None:
       fft_worker_manager.shutdown_all()
       fft_worker_manager = None
@@ -274,11 +317,15 @@ async def client_config(_: dict):
 
 @app.post("/api/v1/create_session")
 async def create_session(_: dict):
-  return {"session_id": "sess-real-123", "type": "create_session"}
+  session_id = f"sess-{uuid.uuid4()}"
+  await lifecycle.touch_session(session_id, SESSION_TTL_S)
+  return {"session_id": session_id, "type": "create_session"}
 
 
 @app.post("/api/v1/session_heartbeat")
-async def session_heartbeat(_: dict):
+async def session_heartbeat(req: dict):
+  if session_id := req.get("session_id"):
+    await lifecycle.touch_session(session_id, SESSION_TTL_S)
   return {"type": "session_heartbeat"}
 
 
@@ -292,6 +339,8 @@ async def create_model(req: dict):
   # Recorded so get_info can answer per-model instead of relying on a
   # gateway-wide BASE_MODEL env var (which a multi-model gateway can't have).
   await store.set_model_base(model_id, base_model)
+  if session_id := req.get("session_id"):
+    await lifecycle.bind_session_model(session_id, model_id)
   command = make_training_request(
     "create_model",
     model_id,
@@ -315,6 +364,8 @@ async def create_model_from_state(req: dict):
   # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
   resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   model_id = str(uuid.uuid4())
+  if session_id := req.get("session_id"):
+    await lifecycle.bind_session_model(session_id, model_id)
   command = make_training_request(
     "create_model_from_state",
     model_id,
@@ -502,6 +553,13 @@ async def create_sampling_session(req: dict):
   else:
     sess_id = model_id or "samp-session-live-123"
 
+  # An eval-only client never calls create_model, so this binding is what keeps
+  # the sampled model's worker from being reaped while the eval session lives.
+  session_id = req.get("session_id")
+  sampled_model_id = base_model_id_from_sampling_ref(model_path or model_id)
+  if session_id and sampled_model_id:
+    await lifecycle.bind_session_model(session_id, sampled_model_id)
+
   return {"sampling_session_id": sess_id, "type": "create_sampling_session"}
 
 
@@ -525,19 +583,23 @@ async def asample(req: dict):
   base_model_id = base_model_id_from_sampling_ref(model_id)
 
   if get_sampler_backend() == "torch":
-    req_id = await enqueue(
-      make_training_request(
-        "sample",
-        base_model_id or model_id,
-        {
-          "prompt_tokens": prompt,
-          "max_tokens": max_tokens,
-          "temperature": temperature,
-          "num_samples": num_samples,
-          "prompt_logprobs": bool(include_prompt_logprobs),
-        },
-      )
+    request = make_training_request(
+      "sample",
+      base_model_id or model_id,
+      {
+        "prompt_tokens": prompt,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "num_samples": num_samples,
+        "prompt_logprobs": bool(include_prompt_logprobs),
+        # Lets a freshly (re)launched worker load these weights before sampling,
+        # so evals survive worker restarts and reaps.
+        "sampler_weights_ref": model_id if is_sampler_weights_ref(model_id) else None,
+      },
     )
+    # Launching here (not just at create_model) revives reaped or crashed workers
+    # for eval traffic; the launcher is an idempotent no-op when the worker runs.
+    req_id = await launch_worker_and_enqueue(request) if is_fft_enabled() else await enqueue(request)
     return {"request_id": req_id}
 
   # vLLM backend
