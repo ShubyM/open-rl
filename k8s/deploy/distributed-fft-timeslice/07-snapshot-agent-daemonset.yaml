@@ -1,0 +1,44 @@
+# Node-local OpenRL snapshot agent. This mirrors the llm-d shape: one agent runs
+# on each GPU node, sees host PIDs, and coordinates checkpoint/restore for all
+# FFT worker pods placed on that node.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: open-rl-snapshot-agent
+  labels:
+    app: open-rl-snapshot-agent
+spec:
+  selector:
+    matchLabels:
+      app: open-rl-snapshot-agent
+  template:
+    metadata:
+      labels:
+        app: open-rl-snapshot-agent
+    spec:
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        group.timeslice.io/trainers: "true"
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      - name: snapshot-agent
+        image: ghcr.io/gke-labs/open-rl/server:latest
+        imagePullPolicy: Always
+        command: ["uv", "run", "python", "-m", "snapshot_agent.serve"]
+        args: ["--listen-host", "0.0.0.0", "--port", "9753"]
+        ports:
+        - name: snapshot
+          containerPort: 9753
+        securityContext:
+          privileged: true
+        resources:
+          limits:
+            memory: "1Gi"
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
