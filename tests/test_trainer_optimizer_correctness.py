@@ -452,11 +452,11 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         clear=True,
       ),
       patch.object(training_requests_processor_module, "get_store", return_value=store),
-      patch.object(training_requests_processor_module, "create_snapshot_agent_client", return_value=snapshot_client) as create_snapshot_agent_client,
+      patch.object(training_requests_processor_module, "snapshot_client_from_env", return_value=snapshot_client) as snapshot_client_from_env,
     ):
       await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
 
-    create_snapshot_agent_client.assert_called_once_with("/tmp/open-rl/snapshot-agent.sock")
+    snapshot_client_from_env.assert_called_once_with()
     self.assertEqual([event[0] for event in snapshot_client.events], ["register", "unregister", "close"])
 
   async def test_full_processor_uses_injected_snapshot_client(self) -> None:
