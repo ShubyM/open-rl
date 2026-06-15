@@ -21,6 +21,7 @@ data:
     apiVersion: v1
     kind: Pod
     spec:
+      hostPID: true
       restartPolicy: OnFailure
       # The node-local snapshot agent runs hostPID=true. This keeps the PID that
       # the worker registers meaningful to that host-level agent without adding
@@ -59,11 +60,11 @@ data:
           claims:
           - name: shared-gpu
           limits:
-            memory: "48Gi"
+            memory: "24Gi"
           requests:
             # Sized generously for model load and optimizer state; increase this
             # if a future coordination layer checkpoints GPU state to host RAM.
-            memory: "48Gi"
+            memory: "24Gi"
             cpu: "2"
         volumeMounts:
         - name: shared-storage
