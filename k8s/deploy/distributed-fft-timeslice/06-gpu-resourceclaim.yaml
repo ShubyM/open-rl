@@ -1,4 +1,4 @@
-# One DRA ResourceClaim for the shared GPU allocation. Every worker or eval pod
+# One DRA ResourceClaim for the trainer GPU allocation. Every trainer worker pod
 # that references this claim is scheduled onto a node that can access the same
 # allocated physical GPU.
 #
@@ -8,7 +8,7 @@
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
-  name: open-rl-shared-gpu
+  name: open-rl-trainer-gpu-1
 spec:
   devices:
     requests:

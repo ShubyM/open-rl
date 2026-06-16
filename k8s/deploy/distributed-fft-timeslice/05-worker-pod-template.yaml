@@ -1,34 +1,31 @@
-# Pod template the gateway uses to launch one FFT worker per model
+# Pod template the gateway uses to launch one trainer worker per model
 # (server/k8s_worker_manager.py). The launcher stamps metadata.name, the
 # time-slicing coordination labels (snapshot-agent, timeslice.io/group,
 # timeslice.io/job-id), the OPEN_RL_TIME_SLICE_JOB_ID env var, and appends
-# --model-id to args. The labels preserve the llm-d-style integration shape.
-# The current OpenRL snapshot client registers worker PIDs directly; a future
-# llm-d-backed client can use these same job-id labels to map OpenRL
-# acquire/release onto llm-d Restore/Snapshot RPCs.
+# --model-id to args. The current OpenRL snapshot client registers worker PIDs
+# directly; the labels provide a stable per-model identity for coordination.
 #
-# All worker pods in this group share one GPU through the single DRA
-# ResourceClaim open-rl-shared-gpu (06-gpu-resourceclaim.yaml), which pins them
+# All trainer worker pods in this group share one GPU through the single DRA
+# ResourceClaim open-rl-trainer-gpu-1 (06-gpu-resourceclaim.yaml), which pins them
 # to the same physical device. DRA does not serialize CUDA execution; OpenRL's
 # node-local snapshot agent coordinates GPU windows. See
 # docs/setup/gke-fft-timeslice.md.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: open-rl-fft-worker-pod-template
+  name: open-rl-trainer-worker-pod-template
 data:
-  fft-worker-pod.yaml: |
+  trainer-worker-pod.yaml: |
     apiVersion: v1
     kind: Pod
     spec:
-      hostPID: true
       restartPolicy: OnFailure
       # The node-local snapshot agent runs hostPID=true. This keeps the PID that
       # the worker registers meaningful to that host-level agent without adding
       # Kubernetes PID discovery in this PR.
       hostPID: true
       containers:
-      - name: fft-worker
+      - name: trainer-worker
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: Always
         command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
@@ -58,7 +55,7 @@ data:
           value: "trainers"
         resources:
           claims:
-          - name: shared-gpu
+          - name: trainer-gpu
           limits:
             memory: "24Gi"
           requests:
@@ -70,8 +67,8 @@ data:
         - name: shared-storage
           mountPath: /mnt/shared
       resourceClaims:
-      - name: shared-gpu
-        resourceClaimName: open-rl-shared-gpu
+      - name: trainer-gpu
+        resourceClaimName: open-rl-trainer-gpu-1
       volumes:
       - name: shared-storage
         persistentVolumeClaim:

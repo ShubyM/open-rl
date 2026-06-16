@@ -1,4 +1,4 @@
-"""Launchers for dedicated per-model FFT workers.
+"""Worker managers for dedicated per-model trainer workers.
 
 The gateway ensures a model's worker exists before enqueueing its create request:
 locally by spawning a subprocess, on Kubernetes by creating a pod. There is no
@@ -28,7 +28,7 @@ class WorkerManager(Protocol):
 
 
 class FFTWorkerManager:
-  """Runs one local worker subprocess per FFT model."""
+  """Runs one local trainer subprocess per FFT model."""
 
   def __init__(self, project_dir: Path = PROJECT_DIR):
     if not os.getenv("REDIS_URL"):
@@ -60,7 +60,8 @@ class FFTWorkerManager:
 
 
 def create_fft_worker_manager() -> WorkerManager:
-  if os.getenv("OPEN_RL_WORKER_LAUNCHER", "subprocess").lower() == "kubernetes":
+  mode = os.getenv("OPEN_RL_WORKER_MANAGER", "local").lower()
+  if mode in {"kubernetes", "k8s"}:
     from server.k8s_worker_manager import KubernetesFFTWorkerManager
 
     return KubernetesFFTWorkerManager()

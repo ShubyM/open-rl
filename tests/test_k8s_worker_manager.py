@@ -13,7 +13,7 @@ kind: Pod
 spec:
   restartPolicy: OnFailure
   containers:
-  - name: fft-worker
+  - name: trainer-worker
     image: example/server:latest
     command: ["python", "-m", "server.training_requests_processor"]
     env:
@@ -74,11 +74,11 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
     self.assertEqual(len(api.created), 1)
     namespace, body = api.created[0]
     self.assertEqual(namespace, "training")
-    self.assertEqual(body["metadata"]["name"], "open-rl-fft-model-a-1")
+    self.assertEqual(body["metadata"]["name"], "open-rl-trainer-model-a-1")
     self.assertEqual(
       body["metadata"]["labels"],
       {
-        "app": "open-rl-fft-worker",
+        "app": "open-rl-trainer-worker",
         "snapshot-agent": "true",
         "timeslice.io/group": "trainers",
         "timeslice.io/job-id": "model-a-1",
@@ -89,17 +89,17 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
     self.assertIn({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": "model-a-1"}, container["env"])
 
   def test_launch_is_idempotent_while_pod_is_live(self) -> None:
-    api = _FakeCoreApi(pod_phases={"open-rl-fft-model-a": "Running"})
+    api = _FakeCoreApi(pod_phases={"open-rl-trainer-model-a": "Running"})
     self._manager(api).launch("model-a")
 
     self.assertEqual(api.created, [])
     self.assertEqual(api.deleted, [])
 
   def test_launch_replaces_terminal_pod(self) -> None:
-    api = _FakeCoreApi(pod_phases={"open-rl-fft-model-a": "Failed"})
+    api = _FakeCoreApi(pod_phases={"open-rl-trainer-model-a": "Failed"})
     self._manager(api).launch("model-a")
 
-    self.assertEqual(api.deleted, ["open-rl-fft-model-a"])
+    self.assertEqual(api.deleted, ["open-rl-trainer-model-a"])
     self.assertEqual(len(api.created), 1)
 
   def test_launch_tolerates_conflict_on_create(self) -> None:
@@ -136,7 +136,7 @@ class CreateFFTWorkerManagerTest(unittest.TestCase):
     self.assertIsInstance(manager, FFTWorkerManager)
 
   def test_kubernetes_launcher_is_selected_by_env(self) -> None:
-    env = {"REDIS_URL": "redis://r:6379", "OPEN_RL_WORKER_LAUNCHER": "kubernetes"}
+    env = {"REDIS_URL": "redis://r:6379", "OPEN_RL_WORKER_MANAGER": "kubernetes"}
     with (
       patch.dict(os.environ, env, clear=True),
       patch("server.k8s_worker_manager.KubernetesFFTWorkerManager") as manager_cls,

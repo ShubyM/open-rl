@@ -1,8 +1,8 @@
-"""Kubernetes launcher for dedicated per-model FFT workers.
+"""Kubernetes manager for dedicated per-model trainer workers.
 
 Cluster-mode counterpart of FFTWorkerManager: instead of a local subprocess, each
-FFT model gets its own pod, labeled with a stable per-model identity. The pod
-spec comes from a ConfigMap-mounted YAML template; this class only stamps the
+FFT model gets its own trainer worker pod, labeled with a stable per-model identity.
+The pod spec comes from a ConfigMap-mounted YAML template; this class only stamps the
 per-model name, labels, job-id env, and --model-id argument. The labels follow
 the time-slicing convention used by the node-local snapshot agent. DRA pinning
 is handled by the shared ResourceClaim in the pod template; the snapshot agent
@@ -20,7 +20,7 @@ from typing import Any
 
 import yaml
 
-POD_NAME_PREFIX = "open-rl-fft-"
+POD_NAME_PREFIX = "open-rl-trainer-"
 TERMINAL_POD_PHASES = {"Succeeded", "Failed"}
 # Label values allow at most 63 chars of [a-z0-9A-Z-_.]; we also reuse the
 # sanitized id in the pod name, which is stricter (lowercase DNS).
@@ -35,7 +35,7 @@ def sanitize_job_id(model_id: str) -> str:
 
 
 class KubernetesFFTWorkerManager:
-  """Runs one worker pod per FFT model."""
+  """Runs one trainer worker pod per FFT model."""
 
   def __init__(self, core_api: Any = None):
     if not os.getenv("REDIS_URL"):
@@ -43,7 +43,7 @@ class KubernetesFFTWorkerManager:
 
     template_path = os.getenv("OPEN_RL_WORKER_POD_TEMPLATE")
     if not template_path:
-      raise RuntimeError("OPEN_RL_WORKER_LAUNCHER=kubernetes requires OPEN_RL_WORKER_POD_TEMPLATE pointing at the worker pod YAML")
+      raise RuntimeError("OPEN_RL_WORKER_MANAGER=kubernetes requires OPEN_RL_WORKER_POD_TEMPLATE pointing at the worker pod YAML")
     with open(template_path, encoding="utf-8") as f:
       self.pod_template: dict[str, Any] = yaml.safe_load(f)
 
@@ -83,7 +83,7 @@ class KubernetesFFTWorkerManager:
         raise
 
   def shutdown_all(self) -> None:
-    # Worker pods deliberately outlive gateway restarts; Kubernetes owns them.
+    # Trainer worker pods deliberately outlive gateway restarts; Kubernetes owns them.
     pass
 
   def render_pod(self, pod_name: str, model_id: str, job_id: str) -> dict[str, Any]:
@@ -92,7 +92,7 @@ class KubernetesFFTWorkerManager:
     metadata["name"] = pod_name
     metadata.setdefault("labels", {}).update(
       {
-        "app": "open-rl-fft-worker",
+        "app": "open-rl-trainer-worker",
         "snapshot-agent": "true",
         "timeslice.io/group": self.group_id,
         "timeslice.io/job-id": job_id,

@@ -1,6 +1,6 @@
-# Node-local OpenRL snapshot agent. This mirrors the llm-d shape: one agent runs
-# on each GPU node, sees host PIDs, and coordinates checkpoint/restore for all
-# FFT worker pods placed on that node.
+# Node-local OpenRL snapshot agent. One agent runs on each GPU node, sees host
+# PIDs, and coordinates checkpoint/restore for all trainer worker pods placed on
+# that node.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

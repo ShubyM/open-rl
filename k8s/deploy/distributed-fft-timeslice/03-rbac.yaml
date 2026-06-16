@@ -1,4 +1,4 @@
-# The gateway launches one FFT worker pod per model, so its service account
+# The gateway launches one trainer worker pod per model, so its service account
 # needs pod CRUD in the workload namespace.
 apiVersion: v1
 kind: ServiceAccount

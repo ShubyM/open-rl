@@ -16,7 +16,7 @@
 # set, are also written as JSON on the PVC.
 #
 # GPU: defaults to the fft-timeslice cluster's shared DRA ResourceClaim
-# (open-rl-shared-gpu): the device plugin is disabled on that node pool, so a
+# (open-rl-trainer-gpu-1): the device plugin is disabled on that node pool, so a
 # plain nvidia.com/gpu request would never schedule there. CAVEAT: this job does
 # not speak the snapshot-agent protocol, so it does not wait its turn on the
 # slice; run it while training is quiet, or it can OOM-collide with a trainer
@@ -55,7 +55,7 @@ spec:
           value: "/mnt/shared/open-rl/huggingface"
         resources:
           claims:
-          - name: shared-gpu
+          - name: trainer-gpu
           limits:
             memory: "32Gi"
           requests:
@@ -68,8 +68,8 @@ spec:
         - name: shared-storage
           mountPath: /mnt/shared
       resourceClaims:
-      - name: shared-gpu
-        resourceClaimName: open-rl-shared-gpu
+      - name: trainer-gpu
+        resourceClaimName: open-rl-trainer-gpu-1
       nodeSelector:
         group.timeslice.io/trainers: "true"
       volumes:

@@ -242,7 +242,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
     if not model_id:
-      raise RuntimeError("A dedicated FFT worker needs --model-id so it knows which per-model queue to drain")
+      raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
 
     self.store = store
     self.worker = worker
@@ -396,7 +396,7 @@ async def run_training_requests_processor(
 
 def start_request_processing_loop() -> None:
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated FFT worker drains.")
+  parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated trainer worker drains.")
   args = parser.parse_args()
 
   print("\n" + "=" * 50)

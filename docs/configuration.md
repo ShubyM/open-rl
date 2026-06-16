@@ -67,11 +67,11 @@ make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
 | `OPEN_RL_TRAIN_TOKEN_BUDGET` | `0` | Maximum `batch_size * max_sequence_length` for padded trainer chunks inside one `forward_backward` request. `0` keeps the previous one-datum-at-a-time execution path. |
 | `CUDA_VISIBLE_DEVICES` | unset | Standard PyTorch GPU selector. Use different devices when the vLLM worker and trainer run on separate GPUs. |
 
-## Worker launch
+## Worker manager
 
 | Env var | Default | What it does |
 | --- | --- | --- |
-| `OPEN_RL_WORKER_LAUNCHER` | `subprocess` | FFT worker launcher. Use `kubernetes` for the DRA worker-manager deployment. |
+| `OPEN_RL_WORKER_MANAGER` | `local` | Trainer worker manager mode. Use `local` for subprocess workers or `kubernetes` for the DRA worker-manager deployment. |
 | `OPEN_RL_SNAPSHOT_AGENT_MODE` | unset | Optional debug override. Set to `noop` to bypass snapshot-agent acquire/release and let colocated jobs run without checkpoint/restore coordination. |
 | `OPEN_RL_SNAPSHOT_AGENT_SOCKET` | `/tmp/open-rl/snapshot-agent.sock` | Unix socket path for a local snapshot agent. Used when `OPEN_RL_SNAPSHOT_AGENT_HOST` is unset. |
 | `OPEN_RL_SNAPSHOT_AGENT_HOST` | unset | Node-local snapshot-agent host for Kubernetes workers. When set, the worker uses TCP instead of the Unix socket; Kubernetes sets this from `status.hostIP`. |

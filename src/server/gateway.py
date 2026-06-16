@@ -135,7 +135,7 @@ async def enqueue(request: dict) -> str:
 
 
 async def launch_worker_and_enqueue(request: dict) -> str:
-  """Ensure the model's dedicated FFT worker exists, then enqueue onto its queue.
+  """Ensure the model's dedicated trainer worker exists, then enqueue onto its queue.
 
   The launcher is idempotent per model_id, and Kubernetes (or the local process
   table) owns the worker's lifecycle from here; there is no separate launch
