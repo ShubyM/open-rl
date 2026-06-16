@@ -30,6 +30,11 @@ dependencies = [
 # tinker-cookbook pulls in torch, but examples only need CPU-side client/data
 # utilities. Force the CPU wheel to avoid downloading a CUDA build.
 [[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
 name = "torch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true

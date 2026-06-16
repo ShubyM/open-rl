@@ -71,6 +71,9 @@ class RunConfig:
   startup_timeout: float = 300.0
   train_token_budget: int = 65_536
   vllm_gpu_memory_utilization: float = 0.70
+  # Where OPEN_RL_TMP_DIR lives on the cluster's shared PVC; used to print the
+  # scripts/run_cluster_eval.py command when the checkpoint is not visible locally.
+  cluster_tmp_dir: str = "/mnt/shared/open-rl"
 
 
 @dataclass
@@ -339,11 +342,11 @@ def write_gsm8k_eval_data(config: RunConfig) -> Path:
   return data_path
 
 
-def resolve_eval_model_path(output: str) -> str:
+def resolve_eval_model_path(output: str, must_exist: bool = True) -> str:
   for line in reversed(output.splitlines()):
     if line.startswith("eval_model_path="):
       path = line.removeprefix("eval_model_path=").strip()
-      if not Path(path).exists():
+      if must_exist and not Path(path).exists():
         raise RuntimeError(f"Eval model path does not exist: {path}")
       return path
   raise RuntimeError("GSM8K SFT finished without printing eval_model_path=...")
@@ -382,9 +385,36 @@ def run_gsm8k_eval(config: RunConfig, model_path: str) -> None:
   )
 
 
+def cluster_model_path(model_path: str, cluster_tmp_dir: str) -> str:
+  """Re-root a shared OpenRL artifact path onto the cluster's OPEN_RL_TMP_DIR.
+
+  gsm8k_sft prints eval_model_path using the *client's* OPEN_RL_TMP_DIR; against
+  a remote backend the checkpoint actually lives under the cluster's tmp dir on
+  the shared PVC, so swap the prefix while keeping the OpenRL artifact tail.
+  """
+  for marker in ("/sampler_full/", "/checkpoints/"):
+    if marker in model_path:
+      return cluster_tmp_dir.rstrip("/") + marker + model_path.split(marker, 1)[1]
+  return model_path
+
+
+def run_or_print_gsm8k_eval(config: RunConfig, model_path: str, label: str = "") -> None:
+  """Eval locally when the checkpoint is reachable; otherwise print the exact
+  command that runs the same eval as a job on the cluster (the checkpoint lives
+  on the cluster's PVC when the backend was remote)."""
+  if Path(model_path).exists():
+    run_gsm8k_eval(config, model_path)
+    return
+  remote_path = cluster_model_path(model_path, config.cluster_tmp_dir)
+  tag = f" {label}" if label else ""
+  print(f"[training-e2e]{tag} checkpoint {model_path} is not visible locally (remote backend at {config.base_url}).")
+  print(f"[training-e2e]{tag} run the GSM8K eval on the cluster with:")
+  print(f"    make cluster-eval EVAL_MODEL_PATH={shlex.quote(remote_path)} EVAL_EXAMPLES={config.eval_examples}")
+
+
 def run_gsm8k(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
   output = run_gsm8k_train(config, base_url, watch, "fft_gsm8k")
-  run_gsm8k_eval(config, resolve_eval_model_path(output))
+  run_or_print_gsm8k_eval(config, resolve_eval_model_path(output, must_exist=not config.base_url))
 
 
 def check_snapshot_interleaving(config: RunConfig) -> None:
@@ -428,7 +458,7 @@ def run_gsm8k_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) 
   for job, result in sorted(results.items()):
     assert isinstance(result, str)
     print(f"[training-e2e] evaluating {job}")
-    run_gsm8k_eval(config, resolve_eval_model_path(result))
+    run_or_print_gsm8k_eval(config, resolve_eval_model_path(result, must_exist=not config.base_url), label=job)
 
 
 def read_jsonl(path: Path) -> list[dict]:

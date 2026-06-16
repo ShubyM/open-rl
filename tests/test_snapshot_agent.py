@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from snapshot_agent.client import SnapshotAgentClient
-from snapshot_agent.serve import SnapshotAgent, start_snapshot_agent
+from snapshot_agent.serve import SnapshotAgent, start_snapshot_agent, start_tcp_snapshot_agent
 
 
 class RecordingRestorer:
@@ -233,6 +233,30 @@ class SnapshotAgentSocketTest(unittest.IsolatedAsyncioTestCase):
       finally:
         server.close()
         await server.wait_closed()
+
+  async def test_tcp_clients_share_node_local_agent(self) -> None:
+    restorer = RecordingRestorer()
+    agent = SnapshotAgent(restorer)
+    server = await start_tcp_snapshot_agent(agent, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client_a = SnapshotAgentClient(host="127.0.0.1", port=port)
+    client_b = SnapshotAgentClient(host="127.0.0.1", port=port)
+    try:
+      await client_a.register(101)
+      await client_b.register(202)
+
+      async with client_a.acquire(101):
+        blocked = asyncio.create_task(acquire_once(client_b, 202))
+        await asyncio.sleep(0.05)
+        self.assertFalse(blocked.done())
+
+      self.assertEqual(await asyncio.wait_for(blocked, timeout=1.0), 202)
+      self.assertEqual(restorer.calls, [("checkpoint", 101), ("checkpoint", 202)])
+    finally:
+      await client_a.close()
+      await client_b.close()
+      server.close()
+      await server.wait_closed()
 
 
 async def acquire_once(client: SnapshotAgentClient, pid: int) -> int:

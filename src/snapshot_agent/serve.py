@@ -6,6 +6,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -144,19 +145,24 @@ async def start_snapshot_agent(agent: SnapshotAgent, socket_path: str) -> asynci
   socket.parent.mkdir(parents=True, exist_ok=True)
   socket.unlink(missing_ok=True)
 
-  async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    connection_id = id(writer)
-    try:
-      while line := await reader.readline():
-        response = await dispatch(agent, line, connection_id)
-        writer.write(json.dumps(response).encode("utf-8") + b"\n")
-        await writer.drain()
-    finally:
-      await agent.connection_closed(connection_id)
-      writer.close()
-      await writer.wait_closed()
+  return await asyncio.start_unix_server(partial(handle_connection, agent), path=socket_path)
 
-  return await asyncio.start_unix_server(handle_connection, path=socket_path)
+
+async def start_tcp_snapshot_agent(agent: SnapshotAgent, host: str, port: int) -> asyncio.Server:
+  return await asyncio.start_server(partial(handle_connection, agent), host=host, port=port)
+
+
+async def handle_connection(agent: SnapshotAgent, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+  connection_id = id(writer)
+  try:
+    while line := await reader.readline():
+      response = await dispatch(agent, line, connection_id)
+      writer.write(json.dumps(response).encode("utf-8") + b"\n")
+      await writer.drain()
+  finally:
+    await agent.connection_closed(connection_id)
+    writer.close()
+    await writer.wait_closed()
 
 
 async def dispatch(agent: SnapshotAgent, line: bytes, connection_id: int) -> dict[str, Any]:
@@ -184,6 +190,8 @@ async def dispatch(agent: SnapshotAgent, line: bytes, connection_id: int) -> dic
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="Run the OpenRL snapshot agent.")
   parser.add_argument("--socket", default=os.getenv("OPEN_RL_SNAPSHOT_AGENT_SOCKET", "/tmp/open-rl/snapshot-agent.sock"))
+  parser.add_argument("--listen-host", default=None)
+  parser.add_argument("--port", type=int, default=None)
   parser.add_argument("--cuda-checkpoint-bin", default=os.getenv("CUDA_CHECKPOINT_BIN", "cuda-checkpoint"))
   parser.add_argument("--cuda-checkpoint-timeout-ms", type=int, default=None)
   return parser.parse_args()
@@ -193,8 +201,13 @@ async def main_async() -> None:
   args = parse_args()
   restorer = CudaCheckpointRestorer(args.cuda_checkpoint_bin, args.cuda_checkpoint_timeout_ms)
   agent = SnapshotAgent(restorer)
-  server = await start_snapshot_agent(agent, args.socket)
-  logger.info("listening on %s", args.socket)
+  if args.port is None:
+    server = await start_snapshot_agent(agent, args.socket)
+    logger.info("listening on unix://%s", args.socket)
+  else:
+    host = args.listen_host or "0.0.0.0"
+    server = await start_tcp_snapshot_agent(agent, host, args.port)
+    logger.info("listening on tcp://%s:%s", host, args.port)
   async with server:
     await server.serve_forever()
 

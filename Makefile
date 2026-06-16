@@ -1,4 +1,4 @@
-.PHONY: server vllm test lint fmt help push-vm pull-vm
+.PHONY: server vllm test lint fmt help push-vm pull-vm cluster-eval
 
 # ---------------------------------------------------------------------------
 # Knobs (override on the command line: make server BASE_MODEL=... SAMPLING_BACKEND=...)
@@ -13,13 +13,17 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_gateway_paths tests.test_snapshot_agent tests.test_trainer_optimizer_correctness tests.test_worker_launch_processor
+UNIT_TESTS ?= tests.test_gateway_paths tests.test_snapshot_agent tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_k8s_worker_manager tests.test_redis_store tests.test_cluster_eval_script
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
 TRAINING_TEST_EXTRA ?= gpu
 TRAINING_TEST_ARGS ?=
 PIGLATIN_TEST_PYTHONPATH ?= examples/sft/pig-latin
+EVAL_MODEL_PATH ?=
+EVAL_EXAMPLES ?= 100
+EVAL_DATA_PATH ?=
+EVAL_NAMESPACE ?=
 
 # CUDA_VISIBLE_DEVICES can be provided either as an environment variable or as a
 # Make variable, and is inherited by the backend/eval subprocesses.
@@ -38,6 +42,7 @@ help:
 	@echo "make test e2e tiny-fft TRAINING_TEST_ARGS='steps=20'"
 	@echo "make test e2e fft-gsm8k TRAINING_TEST_ARGS='steps=10 eval_examples=8 extra=\"batch=2\"'"
 	@echo "make test piglatin                      # pig-latin example end-to-end tests"
+	@echo "make cluster-eval EVAL_MODEL_PATH=/mnt/shared/open-rl/checkpoints/...  # one-off vLLM eval job on the cluster"
 	@echo "make lint | fmt"
 
 # ---------------------------------------------------------------------------
@@ -90,7 +95,7 @@ test:
 	  if [ -n "$(TRAINING_TEST_BASE_URL)" ]; then set -- "$$@" "base_url=$(TRAINING_TEST_BASE_URL)"; fi; \
 	  uv run --extra "$(TRAINING_TEST_EXTRA)" python scripts/run_training_e2e.py "$$@" $(TRAINING_TEST_ARGS); \
 	elif [ "$$mode" = "piglatin" ]; then \
-	  PYTHONPATH="$(PIGLATIN_TEST_PYTHONPATH)" uv --project examples run python -m unittest discover -s tests; \
+	  PYTHONPATH="$(PIGLATIN_TEST_PYTHONPATH)" uv --project examples run python -m unittest tests.test_piglatin_qwen tests.test_piglatin_gemma; \
 	else \
 	  echo "Unknown test mode '$$mode'. Expected unit, e2e, or piglatin."; \
 	  exit 2; \
@@ -121,8 +126,26 @@ push-images:
 deploy:
 	kubectl apply -k k8s/deploy/distributed-lustre/
 
+# FFT DRA variant: the gateway launches one worker pod per FFT model, all pinned
+# to one physical GPU allocation via a shared DRA ResourceClaim.
+# See docs/setup/gke-fft-timeslice.md.
+deploy-fft-timeslice:
+	kubectl apply -k k8s/deploy/distributed-fft-timeslice/
+
 rollout:
 	kubectl rollout restart deployment redis-store open-rl-gateway open-rl-trainer-worker vllm-worker
+
+# One-off vLLM eval of a checkpoint on the shared PVC:
+cluster-eval:
+	@if [ -z "$(EVAL_MODEL_PATH)" ]; then \
+	  echo "Missing EVAL_MODEL_PATH. Example:"; \
+	  echo "  make cluster-eval EVAL_MODEL_PATH=/mnt/shared/open-rl/checkpoints/<model-id>/weights/final"; \
+	  exit 2; \
+	fi; \
+	set -- --model-path "$(EVAL_MODEL_PATH)" --examples "$(EVAL_EXAMPLES)"; \
+	if [ -n "$(EVAL_DATA_PATH)" ]; then set -- "$$@" --data-path "$(EVAL_DATA_PATH)"; fi; \
+	if [ -n "$(EVAL_NAMESPACE)" ]; then set -- "$$@" --namespace "$(EVAL_NAMESPACE)"; fi; \
+	python3 scripts/run_cluster_eval.py "$$@"
 
 # Local Redis (for testing distributed mode):
 #   sudo apt install redis-server && sudo service redis-server start

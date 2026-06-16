@@ -13,7 +13,7 @@ from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 
 from server.store import RequestStore, get_store
-from snapshot_agent.client import SnapshotAgentClient
+from snapshot_agent.client import SnapshotClient, snapshot_client_from_env
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
 from training.trainer_worker import Datum
@@ -26,10 +26,6 @@ TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
 
 def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
-
-
-def create_snapshot_agent_client(socket_path: str) -> SnapshotAgentClient:
-  return SnapshotAgentClient(socket_path)
 
 
 def parse_datum(raw: dict[str, Any]) -> Datum:
@@ -241,12 +237,12 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     store: RequestStore,
     worker: FFTTrainingWorker,
     model_id: str | None,
-    snapshot_client: SnapshotAgentClient,
+    snapshot_client: SnapshotClient,
   ):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
     if not model_id:
-      raise RuntimeError("A dedicated FFT worker needs --model-id so it knows which per-model queue to drain")
+      raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
 
     self.store = store
     self.worker = worker
@@ -387,13 +383,11 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 async def run_training_requests_processor(
   worker: TrainingWorker,
   model_id: str | None = None,
-  snapshot_client: SnapshotAgentClient | None = None,
+  snapshot_client: SnapshotClient | None = None,
 ) -> None:
   store = get_store()
   if isinstance(worker, FFTTrainingWorker):
-    if snapshot_client is None:
-      snapshot_socket = os.getenv("OPEN_RL_SNAPSHOT_AGENT_SOCKET", "/tmp/open-rl/snapshot-agent.sock")
-      snapshot_client = create_snapshot_agent_client(snapshot_socket)
+    snapshot_client = snapshot_client or snapshot_client_from_env()
     processor = FFTTrainingRequestsProcessor(store, worker, model_id, snapshot_client)
   else:
     processor = LoraTrainingRequestsProcessor(store, worker)
@@ -402,7 +396,7 @@ async def run_training_requests_processor(
 
 def start_request_processing_loop() -> None:
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated FFT worker drains.")
+  parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated trainer worker drains.")
   args = parser.parse_args()
 
   print("\n" + "=" * 50)

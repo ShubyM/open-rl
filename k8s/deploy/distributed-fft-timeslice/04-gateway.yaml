@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-rl-gateway-service
+  labels:
+    app: open-rl-gateway
+spec:
+  selector:
+    app: open-rl-gateway
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-rl-gateway
+  labels:
+    app: open-rl-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: open-rl-gateway
+  template:
+    metadata:
+      labels:
+        app: open-rl-gateway
+    spec:
+      serviceAccountName: open-rl-sa
+      containers:
+      - name: gateway
+        image: ghcr.io/gke-labs/open-rl/gateway:latest
+        imagePullPolicy: Always
+        command: ["uv", "run", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+        ports:
+        - containerPort: 8000
+        env:
+        - name: ENABLE_GCP_TRACE
+          valueFrom:
+            configMapKeyRef:
+              name: open-rl-config
+              key: ENABLE_GCP_TRACE
+        - name: REDIS_URL
+          value: "redis://redis-service:6379"
+        # This cluster path assumes one base model per deployment.
+        - name: BASE_MODEL
+          valueFrom:
+            configMapKeyRef:
+              name: open-rl-config
+              key: BASE_MODEL
+        - name: OPEN_RL_TMP_DIR
+          value: "/mnt/shared/open-rl"
+        # Trainer workers sample in-process, so this variant runs no vLLM worker.
+        - name: SAMPLING_BACKEND
+          value: "torch"
+        - name: OPEN_RL_ENABLE_FFT
+          value: "true"
+        - name: OPEN_RL_WORKER_MANAGER
+          value: "kubernetes"
+        - name: OPEN_RL_WORKER_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: OPEN_RL_WORKER_POD_TEMPLATE
+          value: "/etc/open-rl/trainer-worker-pod.yaml"
+        # Logical OpenRL snapshot group. It intentionally matches the
+        # timeslice.io/group label convention stamped onto trainer worker pods.
+        - name: OPEN_RL_TIME_SLICE_GROUP
+          value: "trainers"
+        resources:
+          limits:
+            memory: "2Gi"
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+        readinessProbe:
+          httpGet:
+            path: /api/v1/healthz
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+        volumeMounts:
+        - name: shared-storage
+          mountPath: /mnt/shared
+        - name: trainer-worker-pod-template
+          mountPath: /etc/open-rl
+          readOnly: true
+      volumes:
+      - name: shared-storage
+        persistentVolumeClaim:
+          claimName: open-rl-shared-pvc
+      - name: trainer-worker-pod-template
+        configMap:
+          name: open-rl-trainer-worker-pod-template

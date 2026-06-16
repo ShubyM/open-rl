@@ -17,12 +17,10 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from server.store import get_store
-from server.worker_launch_processor import (
-  FFTWorkerManager,
-  WorkerLaunchProcessor,
-)
+from server.worker_manager import WorkerManager, create_fft_worker_manager
 
 store = get_store()
+fft_worker_manager: WorkerManager | None = None
 
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
@@ -136,14 +134,24 @@ async def enqueue(request: dict) -> str:
   return request_id
 
 
-async def enqueue_worker_launch(request: dict) -> str:
-  """Create a pending future and push a create-model request to the worker launch queue."""
+async def launch_worker_and_enqueue(request: dict) -> str:
+  """Ensure the model's dedicated trainer worker exists, then enqueue onto its queue.
+
+  The launcher is idempotent per model_id, and Kubernetes (or the local process
+  table) owns the worker's lifecycle from here; there is no separate launch
+  queue. Launch failures resolve the future immediately so clients don't long-poll
+  a request that can never be served.
+  """
+  assert fft_worker_manager is not None, "FFT worker manager is initialized by the app lifespan when FFT is enabled"
   request_id = request["request_id"]
-  carrier: dict = {}
-  propagate.inject(carrier)
   await store.set_future(request_id, {"status": "pending"})
-  await store.put_worker_launch_request({**request, "trace_context": carrier})
-  return request_id
+  try:
+    await asyncio.to_thread(fft_worker_manager.launch, request["model_id"])
+  except Exception as exc:
+    traceback.print_exc()
+    await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
+    return request_id
+  return await enqueue(request)
 
 
 async def preflight_vllm() -> None:
@@ -203,13 +211,10 @@ def translate_future_result(result: dict) -> dict:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+  global fft_worker_manager
   task = None
-  fft_worker_manager = None
-  worker_launch_task = None
   if is_fft_enabled():
-    fft_worker_manager = FFTWorkerManager()
-    worker_launch_processor = WorkerLaunchProcessor(store, fft_worker_manager)
-    worker_launch_task = asyncio.create_task(worker_launch_processor.run())
+    fft_worker_manager = create_fft_worker_manager()
   if is_single_process_mode():
     base_model = os.getenv("BASE_MODEL")
     print("\n" + "=" * 50)
@@ -232,10 +237,9 @@ async def lifespan(_: FastAPI):
   finally:
     if task is not None:
       task.cancel()
-    if worker_launch_task is not None:
-      worker_launch_task.cancel()
     if fft_worker_manager is not None:
       fft_worker_manager.shutdown_all()
+      fft_worker_manager = None
 
 
 app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
@@ -281,7 +285,11 @@ async def session_heartbeat(_: dict):
 @app.post("/api/v1/create_model")
 async def create_model(req: dict):
   """ServiceClient.create_lora_training_client_async()"""
-  base_model = req.get("base_model")
+  configured_base_model = get_default_model_name()
+  requested_base_model = req.get("base_model")
+  if configured_base_model and requested_base_model and requested_base_model != configured_base_model:
+    return JSONResponse(status_code=400, content={"error": f"base_model must match configured BASE_MODEL {configured_base_model}"})
+  base_model = configured_base_model or requested_base_model
   if not base_model:
     return JSONResponse(status_code=400, content={"error": "base_model is required"})
   model_id = str(uuid.uuid4())
@@ -295,7 +303,7 @@ async def create_model(req: dict):
     },
     request_id=model_id,
   )
-  req_id = await enqueue_worker_launch(command) if is_fft_enabled() else await enqueue(command)
+  req_id = await launch_worker_and_enqueue(command) if is_fft_enabled() else await enqueue(command)
   return {"request_id": req_id}
 
 
@@ -317,7 +325,7 @@ async def create_model_from_state(req: dict):
     },
     request_id=model_id,
   )
-  req_id = await enqueue_worker_launch(command) if is_fft_enabled() else await enqueue(command)
+  req_id = await launch_worker_and_enqueue(command) if is_fft_enabled() else await enqueue(command)
   return {"request_id": req_id}
 
 

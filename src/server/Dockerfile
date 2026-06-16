@@ -21,6 +21,12 @@ ENV PATH="/uv/bin:$PATH"
 # Install Python 3.12 via uv
 RUN uv python install 3.12
 
+# Install the NVIDIA CUDA checkpoint/restore utility used by the in-repo
+# snapshot agent. The utility is driver-backed; keep the node driver compatible.
+RUN curl -fsSL https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/main/bin/x86_64_Linux/cuda-checkpoint \
+    -o /usr/local/bin/cuda-checkpoint \
+    && chmod +x /usr/local/bin/cuda-checkpoint
+
 WORKDIR /app
 
 # Copy dependency files
@@ -33,7 +39,6 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 # Install dependencies using uv with BuildKit cache
 # --frozen ensures it uses the uv.lock exactly
-# --all-extras ensures the optional train/gpu stacks are installed for the worker image
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --extra gpu --extra vllm
 
