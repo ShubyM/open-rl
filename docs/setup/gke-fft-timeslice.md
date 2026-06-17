@@ -4,13 +4,14 @@ This guide describes the core cluster shape introduced by this PR. It separates
 three ideas that build on each other:
 
 1. **DRA pinning:** one manually created `ResourceClaim` allocates one physical
-   GPU, and every trainer worker pod that references that claim is scheduled onto
-   the node that can access that same device.
+   GPU per role, and every worker pod that references that claim is scheduled
+   onto the node that can access that same device.
 2. **Kubernetes worker manager:** the gateway creates one trainer worker pod per
    `model_id`, instead of relying on a static trainer Deployment.
-3. **OpenRL GPU coordination:** a node-local snapshot-agent DaemonSet
-   coordinates checkpoint/restore so only one trainer worker enters a CUDA batch at
-   a time on that node.
+3. **OpenRL GPU coordination:** a node-local time-slicer DaemonSet serializes
+   acquire/release so only one workload in a role group enters a CUDA batch at
+   a time on that node, and delegates physical checkpoint/restore to llm-d's
+   snapshot agent.
 
 ## Architecture at a glance
 
@@ -24,14 +25,17 @@ the gateway process today. When the gateway receives `create_model` in FFT mode,
 on the model-specific Redis queue. It is idempotent: if the trainer worker pod
 for a model is already running, it reuses it.
 
-Third, the OpenRL snapshot agent is the runtime GPU coordinator. It runs as a
-node-local DaemonSet on GPU nodes, with `hostPID` and `hostNetwork` enabled.
-Trainer worker pods connect to the agent on their node with
+Third, the OpenRL time slicer is the runtime GPU coordinator. It runs as a
+node-local DaemonSet on GPU nodes with `hostNetwork` enabled. Trainer and
+sampler worker pods connect to the agent on their node with
 `OPEN_RL_SNAPSHOT_AGENT_HOST=status.hostIP` and
-`OPEN_RL_SNAPSHOT_AGENT_PORT=9753`. The training processor registers its PID
-with the agent and wraps GPU work in acquire/release calls. The agent keeps a
-FIFO queue, allows one active process at a time, checkpoints on release, and
-restores on acquire.
+`OPEN_RL_SNAPSHOT_AGENT_PORT=9753`. The training processor registers its
+workload identity with the agent and wraps GPU work in acquire/release calls.
+The agent keeps a FIFO queue per node-local process, allows one active workload
+at a time within that process, checkpoints on release, and restores on acquire.
+In the cluster deployment, the OpenRL time slicer runs with `--backend llmd`;
+llm-d's snapshot agent performs the actual pod/PID discovery and CUDA
+checkpoint/restore.
 
 The request flow is:
 
@@ -42,7 +46,7 @@ The request flow is:
 4. The trainer worker pod references `open-rl-trainer-gpu-1`, so Kubernetes
    places it on the DRA GPU node.
 5. The gateway enqueues the create request on the model's Redis queue.
-6. The trainer worker drains that queue and uses the node-local snapshot agent
+6. The trainer worker drains that queue and uses the node-local time slicer
    before entering CUDA sections.
 
 The whole shape has two layers. The top layer creates pods, places them, and
@@ -62,7 +66,8 @@ flowchart TD
     subgraph node["Layer 2: node-local GPU coordination"]
         workerA["trainer worker pod\nmodel A"]
         workerB["trainer worker pod\nmodel B"]
-        agent["snapshot-agent DaemonSet\none per GPU node"]
+        agent["OpenRL time-slicer DaemonSet\none per GPU node"]
+        llmd["llm-d snapshot-agent\nnode-local"]
         gpu["Physical GPU"]
     end
 
@@ -77,15 +82,16 @@ flowchart TD
 
     workerA <-->|"pop request / write result"| redis
     workerB <-->|"pop request / write result"| redis
-    workerA -->|"acquire / release PID"| agent
-    workerB -->|"acquire / release PID"| agent
-    agent -->|"checkpoint / restore"| workerA
-    agent -->|"checkpoint / restore"| workerB
+    workerA -->|"acquire / release workload"| agent
+    workerB -->|"acquire / release workload"| agent
+    agent -->|"snapshot / restore request"| llmd
+    llmd -->|"checkpoint / restore"| workerA
+    llmd -->|"checkpoint / restore"| workerB
     agent -->|"one active CUDA section"| gpu
 ```
 
 The orchestration is currently cooperative: worker code calls acquire/release,
-and the OpenRL snapshot agent serializes those calls with a FIFO lock. The
+and the OpenRL time slicer serializes those calls with a FIFO lock. The
 Kubernetes worker manager only launches pods; it is not the runtime time-slice
 scheduler.
 
@@ -150,24 +156,25 @@ template in `05-worker-pod-template.yaml`. It stamps:
 - the pod name, derived from the model id
 - trainer worker labels, including `app=open-rl-trainer-worker`
 - time-slicing labels (`snapshot-agent=true`, `timeslice.io/group`,
-  `timeslice.io/job-id`) that preserve the shape of a future coordinator
-  integration
+  `timeslice.io/job-id`) used by llm-d pod discovery
 - `OPEN_RL_TIME_SLICE_JOB_ID`, aligned with the `timeslice.io/job-id` label
+- `OPEN_RL_TIME_SLICE_GROUP`, aligned with the `timeslice.io/group` label
 - `--model-id <model_id>`, so the worker drains only its own queue
 
 The gateway still has a local subprocess launcher for VM development. Select the
 cluster launcher with `OPEN_RL_WORKER_MANAGER=kubernetes`.
 
-## 3. A node-local snapshot agent coordinates GPU windows
+## 3. A node-local time slicer coordinates GPU windows
 
 The deployment includes `07-snapshot-agent-daemonset.yaml`, which runs one
-OpenRL snapshot agent on each trainer GPU node:
+OpenRL time slicer on each trainer or sampler GPU node:
 
 ```yaml
-hostPID: true
 hostNetwork: true
 command: ["uv", "run", "python", "-m", "snapshot_agent.serve"]
-args: ["--listen-host", "0.0.0.0", "--port", "9753"]
+args:
+  ["--listen-host", "0.0.0.0", "--port", "9753",
+   "--backend", "llmd", "--llmd-snapshot-endpoint", "127.0.0.1:9001"]
 ```
 
 The dynamically launched trainer worker pods run the normal training processor:
@@ -180,23 +187,24 @@ The training processor uses:
 
 - `OPEN_RL_SNAPSHOT_AGENT_HOST` from the pod's `status.hostIP`
 - `OPEN_RL_SNAPSHOT_AGENT_PORT=9753`
-- `cuda-checkpoint` from the server image for process-level CUDA
-  checkpoint/restore inside the node-local agent
+- `OPEN_RL_TIME_SLICE_JOB_ID`, aligned with the `timeslice.io/job-id` label
+- `OPEN_RL_TIME_SLICE_GROUP`, aligned with the `timeslice.io/group` label
 
-Trainer workers talk to a host-level agent on their node, and that agent owns the
-in-memory queue and checkpoint/restore state for processes sharing the physical
-GPU. The trainer worker pod currently sets `hostPID: true` so the PID it
-registers is valid from the node-local agent's host PID namespace; replacing that with
-Kubernetes PID discovery is a later hardening step.
+Trainer workers talk to the OpenRL coordinator on their node. OpenRL owns the
+in-memory queue and active/checkpointed state for workloads sharing the physical
+GPU. The worker pod labels provide the workload identity llm-d uses to discover
+the relevant pod and process set.
 
 ## Requirements
 
 - GKE Standard cluster on **1.35 or newer** ([DRA for GPUs](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/set-up-dra)
   needs it) with the Filestore CSI driver enabled (see
   [gke-setup.md](gke-setup.md) for the base cluster, CPU pool, and PVC details).
-- A working NVIDIA GPU driver on the DRA node. The OpenRL snapshot path uses
-  `cuda-checkpoint --action lock/checkpoint/restore/unlock`, so use driver
-  **r570 or newer**.
+- llm-d's snapshot-agent running on each trainer GPU node and reachable from the
+  OpenRL time slicer at `127.0.0.1:9001`. OpenRL owns acquire/release ordering;
+  llm-d owns physical snapshot/restore.
+- A working NVIDIA GPU driver on the DRA node. The llm-d snapshot path uses
+  CUDA checkpointing under the hood, so use driver **r570 or newer**.
 - The **NVIDIA DRA GPU driver** (Helm chart `nvidia-dra-driver-gpu` >= 25.8.0)
   so all trainer worker pods can share one GPU through a single `ResourceClaim`.
 - Helm v3 for the DRA-driver chart.
@@ -219,8 +227,8 @@ gcloud container node-pools create gpu-dra \
   --num-nodes 2
 ```
 
-Install the GPU driver manually. Use the `latest` installer so the
-`cuda-checkpoint` command set is available:
+Install the GPU driver manually. Use the `latest` installer so the driver has
+the CUDA checkpoint support needed by llm-d:
 
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/nvidia-driver-installer/cos/daemonset-preloaded-latest.yaml
@@ -238,12 +246,12 @@ helm install nvidia-dra-driver-gpu nvidia/nvidia-dra-driver-gpu \
 
 Notes:
 
-- `group.timeslice.io/trainers=true` is the node label used by these manifests
-  for the `trainers` group. It also matches the trainer worker pod template's
-  `OPEN_RL_TIME_SLICE_GROUP` value.
+- `group.timeslice.io/trainers=true` and `group.timeslice.io/samplers=true`
+  are the node labels used by these manifests to select the role-specific GPU
+  nodes. The runtime time-slicing groups are `trainers` and `samplers`.
 - The trainer GPU claim does not bound how many trainer jobs reference the GPU.
-  The node-local OpenRL snapshot agent decides which trainer worker may run a
-  CUDA batch at a time.
+  The node-local OpenRL time slicer decides which trainer worker may run a CUDA
+  batch at a time.
 - Upstream caveat: DRA for GPUs is a supported GKE path on 1.35+, but GPU
   allocation is still marked experimental in the upstream
   [k8s-dra-driver-gpu](https://github.com/NVIDIA/k8s-dra-driver-gpu) repo. If
@@ -265,7 +273,7 @@ make deploy-fft-timeslice
 ```
 
 `k8s/deploy/distributed-fft-timeslice/` deploys Redis, the shared PVC, the
-shared GPU `ResourceClaim`, the node-local snapshot-agent DaemonSet, and the
+shared GPU `ResourceClaim`, the node-local OpenRL time-slicer DaemonSet, and the
 gateway with `OPEN_RL_ENABLE_FFT=true` and
 `OPEN_RL_WORKER_MANAGER=kubernetes`.
 The deployment assumes one base model per rollout: set `BASE_MODEL` in
@@ -276,8 +284,8 @@ There are no static worker deployments. Every `create_model` call makes the gate
 
 ```yaml
 snapshot-agent: "true"          # OpenRL coordinator marker
-timeslice.io/group: trainers    # (or samplers for vLLM rollout workers)
-timeslice.io/job-id: <model-id> # per-worker identity
+timeslice.io/group: trainers    # or samplers
+timeslice.io/job-id: trainer-<model-id> # or sampler-<model-id>
 ```
 
 The gateway's `open-rl-sa` service account has a Role allowing pod CRUD in the workload namespace (`03-rbac.yaml`). When weight updates occur during FFT training, Trainers write checkpoints to NFS `/mnt/shared`, and Samplers dynamically reload those checkpoint safetensors in-place in ~1.1 seconds while yielding GPU VRAM via cooperative sleep.
@@ -300,10 +308,12 @@ make test e2e fft-gsm8k BASE_URL=http://127.0.0.1:8000
   claim. If only later pods are pending, check pod events for PVC attach limits,
   node selectors, taints, image pull errors, or an unallocated claim.
 - **Trainer worker fails on first CUDA batch with snapshot errors**: check the
-  trainer worker pod logs and the `open-rl-snapshot-agent` DaemonSet logs. The
-  worker should connect to `OPEN_RL_SNAPSHOT_AGENT_HOST:OPEN_RL_SNAPSHOT_AGENT_PORT`,
-  `cuda-checkpoint` must be on the agent `PATH`, and the node driver must support
-  the requested checkpoint operations.
+  trainer worker pod logs, the `open-rl-snapshot-agent` DaemonSet logs, and the
+  llm-d snapshot-agent logs. The worker should connect to
+  `OPEN_RL_SNAPSHOT_AGENT_HOST:OPEN_RL_SNAPSHOT_AGENT_PORT`, the OpenRL
+  DaemonSet should reach llm-d at `127.0.0.1:9001`, and the worker pod should
+  carry a role-prefixed `timeslice.io/job-id` such as
+  `trainer-<model-id>` or `sampler-<model-id>`.
 - **`create_model` future fails with a pod-create error**: check gateway logs and
   RBAC; the error message is propagated into the `RequestFailedResponse`.
 - **First request after `create_model` is slow**: pod scheduling, image pull, and

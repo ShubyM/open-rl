@@ -96,7 +96,7 @@ To prevent cross-role contamination, nodes in the `gpu-dra` node pool are tagged
 
 Pod specs enforce strict landing boundaries:
 - **Trainers**: Enforce `nodeSelector: { group.timeslice.io/trainers: "true" }` and set `OPEN_RL_TIME_SLICE_GROUP=trainers`.
-- **Samplers**: Enforce `nodeSelector: { group.timeslice.io/samplers: "true" }` and set `OPEN_RL_TIMESLICE_GROUP=samplers`.
+- **Samplers**: Enforce `nodeSelector: { group.timeslice.io/samplers: "true" }` and set `OPEN_RL_TIME_SLICE_GROUP=samplers`.
 
 ---
 
