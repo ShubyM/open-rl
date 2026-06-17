@@ -72,8 +72,6 @@ spec:
           value: "/etc/open-rl/trainer/trainer-worker-pod.yaml"
         - name: OPEN_RL_WORKER_IMAGE
           value: "gcr.io/cdrollouts-sunilarora/open-rl-server:latest"
-        - name: OPEN_RL_TIME_SLICE_GROUP
-          value: "trainers"
         resources:
           limits:
             memory: "2Gi"

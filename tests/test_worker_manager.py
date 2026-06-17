@@ -110,6 +110,35 @@ class FFTWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
     with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
       FFTWorkerManager()
 
+  async def test_local_launch_stamps_workload_tags_and_process_group(self) -> None:
+    with (
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True),
+      patch("server.worker_manager.subprocess.Popen") as popen,
+    ):
+      manager = FFTWorkerManager()
+      manager.launch("Model_A.1")
+
+    _, kwargs = popen.call_args
+    self.assertTrue(kwargs["start_new_session"])
+    self.assertEqual(kwargs["env"]["OPEN_RL_ENABLE_FFT"], "true")
+    self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "trainer-Model_A.1")
+    self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "trainers")
+
+  async def test_local_sampler_launch_stamps_workload_tags_and_process_group(self) -> None:
+    with (
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm"}, clear=True),
+      patch("server.worker_manager.subprocess.Popen") as popen,
+    ):
+      manager = FFTWorkerManager()
+      manager.launch_sampler("Model_A.1")
+
+    _, kwargs = popen.call_args
+    self.assertTrue(kwargs["start_new_session"])
+    self.assertEqual(kwargs["env"]["OPEN_RL_ENABLE_FFT"], "true")
+    self.assertEqual(kwargs["env"]["OPEN_RL_MODEL_ID"], "Model_A.1")
+    self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "sampler-Model_A.1")
+    self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "samplers")
+
 
 class GatewayFutureTranslationTest(unittest.TestCase):
   def test_create_model_result_translates_to_tinker_shape(self) -> None:
