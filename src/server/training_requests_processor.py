@@ -13,7 +13,8 @@ from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 
 from server.store import RequestStore, get_store
-from snapshot_agent.client import SnapshotClient, snapshot_client_from_env
+from snapshot_agent.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
+from snapshot_agent.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
 from training.trainer_worker import Datum
@@ -44,6 +45,11 @@ class TrainingRequestsProcessor(Protocol):
   store: RequestStore
 
   async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
+    request_id, result = await self.handle_request(raw_request, model_id)
+    if request_id is not None:
+      await self.store.set_future(request_id, result)
+
+  async def handle_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> tuple[str | None, dict[str, Any]]:
     request_id = raw_request.get("request_id")
     token = None
 
@@ -57,12 +63,12 @@ class TrainingRequestsProcessor(Protocol):
       token = otel_context.attach(ctx) if ctx else None
 
       result = await self.dispatch_operation(op, raw_request.get("payload", {}), resolved_model_id)
-      await self.store.set_future(request_id, result)
+      return request_id, result
     except Exception as exc:
       traceback.print_exc()
       if request_id is None:
         raise
-      await self.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
+      return request_id, {"type": "RequestFailedResponse", "error_message": str(exc)}
     finally:
       if token:
         otel_context.detach(token)
@@ -237,7 +243,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     store: RequestStore,
     worker: FFTTrainingWorker,
     model_id: str | None,
-    snapshot_client: SnapshotClient,
+    time_slicer: TimeSlicerClient,
   ):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
@@ -247,21 +253,20 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     self.store = store
     self.worker = worker
     self.model_id = model_id
-    self.pid = os.getpid()
-    self.group = os.getenv("OPEN_RL_TIMESLICE_GROUP", "trainers")
-    self.snapshot_client = snapshot_client
+    self.workload = workload_from_env(os.getpid(), job_id=workload_job_id("trainer", model_id), group=TRAINER_TIME_SLICE_GROUP)
+    self.time_slicer = time_slicer
     self.snapshot_registered = False
 
   async def exit_gracefully(self) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
     if self.snapshot_registered:
       try:
-        await self.snapshot_client.unregister(self.pid, group=self.group)
+        await self.time_slicer.unregister(self.workload)
         self.snapshot_registered = False
       except Exception as exc:
         print(f"[WORKER] Failed to unregister: {exc}")
     try:
-      await self.snapshot_client.close()
+      await self.time_slicer.close()
     except Exception:
       pass
     os._exit(0)
@@ -270,7 +275,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     print("[WORKER] Full fine-tuning training requests processor started.")
 
     try:
-      await self.snapshot_client.register(self.pid, group=self.group)
+      await self.time_slicer.register(self.workload)
       self.snapshot_registered = True
       while True:
         try:
@@ -284,9 +289,9 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     finally:
       try:
         if self.snapshot_registered:
-          await self.snapshot_client.unregister(self.pid, group=self.group)
+          await self.time_slicer.unregister(self.workload)
       finally:
-        await self.snapshot_client.close()
+        await self.time_slicer.close()
 
   async def run_once(self) -> None:
     batch = await self.store.get_requests_for_model(self.model_id)
@@ -308,9 +313,14 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
       if training_reqs:
         print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}")
-        async with self.snapshot_client.acquire(self.pid, group=self.group):
+        results = []
+        async with self.time_slicer.acquire(self.workload):
           for request in training_reqs:
-            await self.process_request(request, self.model_id)
+            results.append(await self.handle_request(request, self.model_id))
+
+        for request_id, result in results:
+          if request_id is not None:
+            await self.store.set_future(request_id, result)
 
     if has_shutdown:
       await self.exit_gracefully()
@@ -410,12 +420,12 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 async def run_training_requests_processor(
   worker: TrainingWorker,
   model_id: str | None = None,
-  snapshot_client: SnapshotClient | None = None,
+  time_slicer: TimeSlicerClient | None = None,
 ) -> None:
   store = get_store()
   if isinstance(worker, FFTTrainingWorker):
-    snapshot_client = snapshot_client or snapshot_client_from_env()
-    processor = FFTTrainingRequestsProcessor(store, worker, model_id, snapshot_client)
+    time_slicer = time_slicer or time_slicer_client_from_env()
+    processor = FFTTrainingRequestsProcessor(store, worker, model_id, time_slicer)
   else:
     processor = LoraTrainingRequestsProcessor(store, worker)
   await processor.run()
