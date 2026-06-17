@@ -52,12 +52,12 @@ def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
-snapshot_client: Any = None
-socket_path = os.getenv("OPEN_RL_SNAPSHOT_AGENT_SOCKET")
-if is_fft_enabled() and socket_path:
-  from snapshot_agent.client import SnapshotAgentClient
+time_slicer: Any = None
+if is_fft_enabled():
+  from snapshot_agent.time_slicer import time_slicer_client_from_env, workload_from_env
+  from snapshot_agent.workload import SAMPLER_TIME_SLICE_GROUP, workload_job_id
 
-  snapshot_client = SnapshotAgentClient(socket_path)
+  time_slicer = time_slicer_client_from_env()
 
 
 def init_engine():
@@ -267,15 +267,17 @@ async def run_sampling_worker(model_id: str) -> None:
 
   store = get_store()
   snapshot_registered = False
-  worker_pid = os.getpid()
-  group = os.getenv("OPEN_RL_TIMESLICE_GROUP", "samplers")
+  workload = None
+  if time_slicer is not None:
+    workload = workload_from_env(os.getpid(), job_id=workload_job_id("sampler", model_id), group=SAMPLER_TIME_SLICE_GROUP)
 
-  if snapshot_client is not None:
+  if time_slicer is not None:
+    assert workload is not None
     try:
-      print(f"[vLLM Worker] Registering parent PID {worker_pid} (group {group}) for initialization lock...")
-      await snapshot_client.register(worker_pid, group=group)
+      print(f"[vLLM Worker] Registering workload {workload.key} for initialization lock...")
+      await time_slicer.register(workload)
       snapshot_registered = True
-      async with snapshot_client.acquire(worker_pid, group=group):
+      async with time_slicer.acquire(workload):
         print("[vLLM Worker] Initializing vLLM engine under parent lock...")
         init_engine()
         print("[vLLM Worker] Engine initialized successfully.")
@@ -290,20 +292,21 @@ async def run_sampling_worker(model_id: str) -> None:
   async def exit_gracefully() -> None:
     print(f"[vLLM Worker] Initiating immediate exit for model {model_id} sampler worker...")
     nonlocal snapshot_registered
-    if snapshot_registered and snapshot_client is not None:
+    if snapshot_registered and time_slicer is not None:
+      assert workload is not None
       try:
-        await snapshot_client.unregister(worker_pid)
+        await time_slicer.unregister(workload)
         snapshot_registered = False
       except Exception as exc:
         print(f"[vLLM Worker] Failed to unregister: {exc}")
-    if snapshot_client is not None:
+    if time_slicer is not None:
       try:
-        await snapshot_client.close()
+        await time_slicer.close()
       except Exception:
         pass
     os._exit(0)
 
-  if snapshot_client is not None:
+  if time_slicer is not None:
     import signal
 
     async def handle_shutdown():
@@ -339,8 +342,9 @@ async def run_sampling_worker(model_id: str) -> None:
             sampling_reqs.append(req)
 
         if sampling_reqs:
-          if snapshot_client is not None:
-            async with snapshot_client.acquire(worker_pid):
+          if time_slicer is not None:
+            assert workload is not None
+            async with time_slicer.acquire(workload):
               tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
               await asyncio.gather(*tasks)
               if has_shutdown:
@@ -363,12 +367,13 @@ async def run_sampling_worker(model_id: str) -> None:
         traceback.print_exc()
         await asyncio.sleep(1)
   finally:
-    if snapshot_client is not None:
+    if time_slicer is not None:
+      assert workload is not None
       try:
         if snapshot_registered:
-          await snapshot_client.unregister(worker_pid)
+          await time_slicer.unregister(workload)
       finally:
-        await snapshot_client.close()
+        await time_slicer.close()
         os._exit(0)
 
 

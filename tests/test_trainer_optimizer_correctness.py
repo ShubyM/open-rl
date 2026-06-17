@@ -155,16 +155,19 @@ class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker
 
 
 class _FutureStoreStub:
-  def __init__(self):
+  def __init__(self, events=None):
     self.results = {}
+    self.events = events
 
   async def set_future(self, req_id, result):
+    if self.events is not None:
+      self.events.append(("set_future", req_id))
     self.results[req_id] = result
 
 
 class _TrainingRequestsStoreStub(_FutureStoreStub):
-  def __init__(self, batches):
-    super().__init__()
+  def __init__(self, batches, events=None):
+    super().__init__(events=events)
     self.batches = list(batches)
     self.queried_model_ids = []
 
@@ -175,24 +178,24 @@ class _TrainingRequestsStoreStub(_FutureStoreStub):
     raise asyncio.CancelledError()
 
 
-class _SnapshotClientStub:
-  def __init__(self):
-    self.events = []
+class _TimeSlicerStub:
+  def __init__(self, events=None):
+    self.events = events if events is not None else []
 
-  async def register(self, pid, group="default"):
-    self.events.append(("register", pid, group))
+  async def register(self, workload):
+    self.events.append(("register", workload))
     return {"ok": True}
 
   @asynccontextmanager
-  async def acquire(self, pid, group="default"):
-    self.events.append(("acquire", pid, group))
+  async def acquire(self, workload):
+    self.events.append(("acquire", workload))
     try:
       yield
     finally:
-      self.events.append(("release", pid, group))
+      self.events.append(("release", workload))
 
-  async def unregister(self, pid, group="default"):
-    self.events.append(("unregister", pid, group))
+  async def unregister(self, workload):
+    self.events.append(("unregister", workload))
     return {"ok": True}
 
   async def close(self):
@@ -373,10 +376,10 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
   async def test_full_processor_create_model_uses_model_worker(self) -> None:
     worker = _RecordingFullWorker()
     store = _FutureStoreStub()
-    snapshot_client = _SnapshotClientStub()
+    time_slicer = _TimeSlicerStub()
 
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
-      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", snapshot_client=snapshot_client)
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
       await processor.process_request(
         {
           "request_id": "req-a",
@@ -404,10 +407,10 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
   async def test_full_processor_saves_sampler_checkpoint_as_full_state(self) -> None:
     worker = _RecordingFullWorker()
     store = _FutureStoreStub()
-    snapshot_client = _SnapshotClientStub()
+    time_slicer = _TimeSlicerStub()
 
     with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test", "REDIS_URL": "redis://localhost:6379"}):
-      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", snapshot_client=snapshot_client)
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
       await processor.process_request(
         {
           "request_id": "req-a",
@@ -438,9 +441,9 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
       await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
 
-  async def test_full_processor_uses_default_snapshot_socket(self) -> None:
+  async def test_full_processor_uses_default_time_slicer_client(self) -> None:
     store = _TrainingRequestsStoreStub([])
-    snapshot_client = _SnapshotClientStub()
+    time_slicer = _TimeSlicerStub()
 
     with (
       patch.dict(
@@ -452,14 +455,14 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         clear=True,
       ),
       patch.object(training_requests_processor_module, "get_store", return_value=store),
-      patch.object(training_requests_processor_module, "snapshot_client_from_env", return_value=snapshot_client) as snapshot_client_from_env,
+      patch.object(training_requests_processor_module, "time_slicer_client_from_env", return_value=time_slicer) as time_slicer_client_from_env,
     ):
       await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
 
-    snapshot_client_from_env.assert_called_once_with()
-    self.assertEqual([event[0] for event in snapshot_client.events], ["register", "unregister", "close"])
+    time_slicer_client_from_env.assert_called_once_with()
+    self.assertEqual([event[0] for event in time_slicer.events], ["register", "unregister", "close"])
 
-  async def test_full_processor_uses_injected_snapshot_client(self) -> None:
+  async def test_full_processor_uses_injected_time_slicer(self) -> None:
     worker = _RecordingFullWorker()
     store = _TrainingRequestsStoreStub(
       [
@@ -476,7 +479,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         ]
       ]
     )
-    snapshot_client = _SnapshotClientStub()
+    time_slicer = _TimeSlicerStub()
 
     with (
       patch.dict(
@@ -488,15 +491,44 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       ),
       patch.object(training_requests_processor_module, "get_store", return_value=store),
     ):
-      await training_requests_processor_module.run_training_requests_processor(worker, "model-a", snapshot_client=snapshot_client)
+      await training_requests_processor_module.run_training_requests_processor(worker, "model-a", time_slicer=time_slicer)
 
     self.assertEqual(store.queried_model_ids, ["model-a", "model-a"])
-    self.assertEqual([event[0] for event in snapshot_client.events], ["register", "acquire", "release", "unregister", "close"])
-    for event in snapshot_client.events:
-      if len(event) == 2:
-        self.assertEqual(event[1], os.getpid())
+    self.assertEqual([event[0] for event in time_slicer.events], ["register", "acquire", "release", "unregister", "close"])
+    for event in time_slicer.events:
+      if len(event) >= 2 and event[0] != "close":
+        self.assertEqual(event[1].job_id, "model-a")
+        self.assertEqual(event[1].group, "shared-accelerator")
     self.assertEqual(worker.created_models[0][0], "base-model")
     self.assertEqual(store.results["req-a"]["model_id"], "model-a")
+
+  async def test_full_processor_publishes_result_after_release(self) -> None:
+    events = []
+    worker = _RecordingFullWorker()
+    store = _TrainingRequestsStoreStub(
+      [
+        [
+          {
+            "request_id": "req-a",
+            "model_id": "model-a",
+            "op": "create_model",
+            "payload": {
+              "base_model": "base-model",
+              "full_config": {"seed": 123},
+            },
+          }
+        ]
+      ],
+      events=events,
+    )
+    time_slicer = _TimeSlicerStub(events=events)
+
+    with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
+      await processor.run_once()
+
+    self.assertEqual([event[0] for event in events], ["acquire", "release", "set_future"])
+    self.assertEqual(store.results["req-a"]["type"], "model_created")
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
