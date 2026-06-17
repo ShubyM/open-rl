@@ -72,15 +72,16 @@ make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `OPEN_RL_WORKER_MANAGER` | `local` | Trainer worker manager mode. Use `local` for subprocess workers or `kubernetes` for the DRA worker-manager deployment. |
-| `OPEN_RL_SNAPSHOT_AGENT_MODE` | unset | Optional debug override. Set to `noop` to bypass snapshot-agent acquire/release and let colocated jobs run without checkpoint/restore coordination. |
 | `OPEN_RL_SNAPSHOT_AGENT_SOCKET` | `/tmp/open-rl/snapshot-agent.sock` | Unix socket path for a local snapshot agent. Used when `OPEN_RL_SNAPSHOT_AGENT_HOST` is unset. |
 | `OPEN_RL_SNAPSHOT_AGENT_HOST` | unset | Node-local snapshot-agent host for Kubernetes workers. When set, the worker uses TCP instead of the Unix socket; Kubernetes sets this from `status.hostIP`. |
 | `OPEN_RL_SNAPSHOT_AGENT_PORT` | `9753` | Node-local snapshot-agent TCP port for Kubernetes workers. |
-| `OPEN_RL_TIME_SLICE_GROUP` | `trainers` | Logical group name used for time-slicing labels. |
 
 For local FFT subprocess mode, start `python -m snapshot_agent.serve` before the
-workers run. Kubernetes deploys the equivalent process with the
-`open-rl-snapshot-agent` DaemonSet.
+workers run. The local launcher tags each worker with a time-slice job id and
+starts it in its own process group so the CUDA checkpoint backend can discover
+the active GPU PIDs. Kubernetes deploys the equivalent process with the
+`open-rl-snapshot-agent` DaemonSet, which uses the llm-d snapshot backend by
+default.
 
 ## vLLM variables
 
