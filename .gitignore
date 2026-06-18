@@ -7,6 +7,8 @@ env/
 **/venv/
 
 # Training Logs & Plots
+scratch/
+docs/scratch/
 *.txt
 *.png
 *.log

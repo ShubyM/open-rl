@@ -12,9 +12,22 @@ resources:
   - 05-worker-pod-template.yaml
   - 06-gpu-resourceclaim.yaml
   - 07-snapshot-agent-daemonset.yaml
+  - 08-sampler-resourceclaim.yaml
+  - 09-sampler-pod-template.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
 
 configMapGenerator:
   - name: open-rl-config
     literals:
       - BASE_MODEL="Qwen/Qwen2.5-0.5B"
       - ENABLE_GCP_TRACE="1"
+
+images:
+  - name: ghcr.io/gke-labs/open-rl/server
+    newName: gcr.io/cdrollouts-sunilarora/open-rl-server
+    newTag: latest
+  - name: ghcr.io/gke-labs/open-rl/gateway
+    newName: gcr.io/cdrollouts-sunilarora/open-rl-gateway
+    newTag: latest
