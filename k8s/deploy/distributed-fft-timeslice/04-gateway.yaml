@@ -32,7 +32,7 @@ spec:
       serviceAccountName: open-rl-sa
       containers:
       - name: gateway
-        image: ghcr.io/gke-labs/open-rl/gateway:latest
+        image: gcr.io/open-rl/open-rl-gateway:latest
         imagePullPolicy: Always
         command: ["uv", "run", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
         ports:
@@ -71,7 +71,7 @@ spec:
         - name: OPEN_RL_WORKER_POD_TEMPLATE
           value: "/etc/open-rl/trainer/trainer-worker-pod.yaml"
         - name: OPEN_RL_WORKER_IMAGE
-          value: "gcr.io/cdrollouts-sunilarora/open-rl-server:latest"
+          value: "gcr.io/open-rl/open-rl-server:latest"
         resources:
           limits:
             memory: "2Gi"
@@ -95,6 +95,15 @@ spec:
         - name: sampler-tmpl
           mountPath: /etc/open-rl/sampler
           readOnly: true
+        - name: store-patch-vol
+          mountPath: /app/src/server/store.py
+          subPath: store.py
+        - name: gateway-patch-vol
+          mountPath: /app/src/server/gateway.py
+          subPath: gateway.py
+        - name: worker-mgr-patch-vol
+          mountPath: /app/src/server/k8s_worker_manager.py
+          subPath: k8s_worker_manager.py
       volumes:
       - name: shared-storage
         persistentVolumeClaim:
@@ -105,3 +114,12 @@ spec:
       - name: sampler-tmpl
         configMap:
           name: open-rl-sampler-worker-pod-template
+      - name: store-patch-vol
+        configMap:
+          name: open-rl-store-patch
+      - name: gateway-patch-vol
+        configMap:
+          name: open-rl-gateway-patch
+      - name: worker-mgr-patch-vol
+        configMap:
+          name: open-rl-worker-mgr-patch

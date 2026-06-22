@@ -8,6 +8,8 @@ env/
 
 # Training Logs & Plots
 scratch/
+artifacts/
+**/artifacts/
 docs/scratch/
 *.txt
 *.png

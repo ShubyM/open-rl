@@ -59,7 +59,7 @@ class RunConfig:
   trainer_gpu: str = "0"
   sampler_gpu: str = "1"
   base_url: str = ""
-  base_model: str = "Qwen/Qwen2.5-0.5B"
+  base_model: str = "Qwen/Qwen3-0.6B"
   steps: int | None = None
   # Calibration (A100, 50 FFT steps on Qwen2.5-0.5B): measured 15.6% accuracy.
   # 100 examples + 5% floor keeps healthy-run flake risk below ~0.1% while
@@ -349,38 +349,16 @@ def run_tiny(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> N
   run_example(config, [f"examples/tiny/{script}.py"], defaults, watch=watch)
 
 
-def extract_gsm8k_gold(answer: str) -> str:
-  tail = answer.split("####")[-1]
-  match = GSM8K_ANSWER_RE.search(tail)
-  if match is None:
-    raise ValueError(f"Could not extract GSM8K gold answer from {answer!r}")
-  return match.group(0).replace(",", "")
-
-
-def write_gsm8k_eval_data(config: RunConfig) -> Path:
-  from datasets import load_dataset
-
-  data_path = Path(config.log_dir) / "gsm8k_eval.json"
-  dataset = load_dataset("openai/gsm8k", "main", split=f"test[:{config.eval_examples}]")
-  data = [
-    {
-      "prompt": f"Question: {row['question']}\nAnswer:",
-      "gold": extract_gsm8k_gold(row["answer"]),
-    }
-    for row in dataset
-  ]
-  data_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-  return data_path
-
-
-def resolve_eval_model_path(output: str) -> str:
-  for line in reversed(output.splitlines()):
-    if line.startswith("eval_model_path="):
-      path = line.removeprefix("eval_model_path=").strip()
-      if not Path(path).exists():
-        raise RuntimeError(f"Eval model path does not exist: {path}")
-      return path
-  raise RuntimeError("GSM8K SFT finished without printing eval_model_path=...")
+def check_gsm8k_accuracy(config: RunConfig, log_subdir: str) -> None:
+  log_dir = Path(config.log_dir) / log_subdir
+  rows = read_jsonl(log_dir / "metrics.jsonl")
+  scores = [row["eval/gsm8k/score"] for row in rows if "eval/gsm8k/score" in row]
+  if not scores:
+    raise RuntimeError(f"No GSM8K eval scores found in {log_dir / 'metrics.jsonl'}")
+  final_score = scores[-1]
+  print(f"[training-e2e] final gsm8k score = {final_score:.1%}")
+  if final_score < config.min_accuracy:
+    raise RuntimeError(f"GSM8K accuracy {final_score:.1%} is below the required {config.min_accuracy:.1%}")
 
 
 def run_gsm8k_train(config: RunConfig, base_url: str, watch: list[ManagedProcess], log_subdir: str, prefix: str = "") -> str:
@@ -398,27 +376,9 @@ def run_gsm8k_train(config: RunConfig, base_url: str, watch: list[ManagedProcess
   return run_example(config, ["examples/sft/gsm8k/gsm8k_sft.py"], defaults, watch=watch, prefix=prefix)
 
 
-def run_gsm8k_eval(config: RunConfig, model_path: str) -> None:
-  run_command(
-    uv_run(config.eval_uv_extra)
-    + [
-      "python",
-      "examples/sft/gsm8k/vllm_eval.py",
-      "--path",
-      model_path,
-      "--data",
-      str(write_gsm8k_eval_data(config)),
-      "--gpu-memory-utilization",
-      str(config.vllm_gpu_memory_utilization),
-      "--min-accuracy",
-      str(config.min_accuracy),
-    ]
-  )
-
-
 def run_gsm8k(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
-  output = run_gsm8k_train(config, base_url, watch, "fft_gsm8k")
-  run_gsm8k_eval(config, resolve_eval_model_path(output))
+  run_gsm8k_train(config, base_url, watch, "fft_gsm8k")
+  check_gsm8k_accuracy(config, "fft_gsm8k")
 
 
 def check_snapshot_interleaving(config: RunConfig) -> None:
@@ -477,7 +437,7 @@ def run_gsm8k_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) 
   for job, result in sorted(results.items()):
     assert isinstance(result, str)
     print(f"[training-e2e] evaluating {job}")
-    run_gsm8k_eval(config, resolve_eval_model_path(result))
+    check_gsm8k_accuracy(config, f"fft_gsm8k_{job}")
 
 
 def run_tiny_fft_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:

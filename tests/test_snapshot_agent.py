@@ -7,12 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from snapshot_agent.time_slicer import SocketTimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from snapshot_agent.checkpoint import CudaCheckpointRestorer
-from snapshot_agent.workload import WorkloadRef
 from snapshot_agent.llmd import LlmDCheckpointRestorer
-from snapshot_agent.single_node import SingleNodeTimeSlicer
 from snapshot_agent.serve import start_tcp_time_slicer, start_time_slicer
+from snapshot_agent.single_node import SingleNodeTimeSlicer
+from snapshot_agent.time_slicer import SocketTimeSlicerClient, time_slicer_client_from_env, workload_from_env
+from snapshot_agent.workload import WorkloadRef
 
 
 class RecordingRestorer:
@@ -447,9 +447,10 @@ class LlmDCheckpointRestorerTest(unittest.TestCase):
       )
       self.assertEqual(parameters["poll_interval_sec"].default, 1.0)
 
-    self.assertTrue(callable(getattr(SnapshotAgentClient, "close")))
+    self.assertTrue(callable(SnapshotAgentClient.close))
     self.assertEqual(GetOperationResponse.__annotations__["status"], str)
     self.assertIn("error", GetOperationResponse.__annotations__)
+
   def test_checkpoint_and_restore_wait_for_llmd_operations_by_job_id(self) -> None:
     class Client:
       def __init__(self):

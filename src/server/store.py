@@ -57,6 +57,14 @@ class RequestStore(ABC):
     """Block until the future resolves or the timeout is reached."""
     pass
 
+  async def start(self) -> None:
+    """Initialize any background tasks/connections required by the store."""
+    pass
+
+  async def stop(self) -> None:
+    """Clean up background tasks/connections."""
+    pass
+
 
 class InMemoryStore(RequestStore):
   def __init__(self):
@@ -144,11 +152,18 @@ class InMemoryStore(RequestStore):
 
 class RedisStore(RequestStore):
   def __init__(self, redis_url: str):
-    self.redis = redis.from_url(redis_url, decode_responses=True, health_check_interval=2)
+    self.redis = redis.from_url(
+      redis_url,
+      decode_responses=True,
+      health_check_interval=2,
+      max_connections=1000,
+    )
     self.active_list = "open_rl:active_tenants"
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
     self.worker_launch_queue = "open_rl:worker_launch_queue"
+    self.futures_events = {}
+    self._listener_task = None
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -272,6 +287,38 @@ class RedisStore(RequestStore):
 
     return batch
 
+  async def start(self) -> None:
+    self._listener_task = asyncio.create_task(self._pubsub_listener())
+
+  async def stop(self) -> None:
+    if self._listener_task:
+      self._listener_task.cancel()
+      try:
+        await self._listener_task
+      except asyncio.CancelledError:
+        pass
+
+  async def _pubsub_listener(self) -> None:
+    ps = self.redis.pubsub()
+    await ps.subscribe("open_rl:completed_futures")
+    try:
+      async for message in ps.listen():
+        if message["type"] == "message":
+          try:
+            data = json.loads(message["data"])
+            req_id = data["req_id"]
+            result = data["result"]
+            if req_id in self.futures_events:
+              event, _ = self.futures_events[req_id]
+              self.futures_events[req_id] = (event, result)
+              event.set()
+          except Exception:
+            import traceback
+            traceback.print_exc()
+    finally:
+      await ps.unsubscribe("open_rl:completed_futures")
+      await ps.close()
+
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
       return
@@ -279,28 +326,28 @@ class RedisStore(RequestStore):
     key = f"open_rl:future:{req_id}"
     await self.redis.rpush(key, json.dumps(result))
     await self.redis.expire(key, 300)
+    await self.redis.publish("open_rl:completed_futures", json.dumps({
+        "req_id": req_id,
+        "result": result
+    }))
 
   async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
-    key = f"open_rl:future:{req_id}"
+    event = asyncio.Event()
+    self.futures_events[req_id] = (event, None)
 
-    # redis-py 8 defaults the client socket timeout to 5s, so a single BLPOP can
-    # never block for the full long-poll window. Poll in slices shorter than the
-    # socket timeout until the deadline so clients only see try_again when the
-    # request genuinely outlived the window.
-    deadline = time.monotonic() + timeout
-    while True:
-      remaining = deadline - time.monotonic()
-      if remaining <= 0:
-        return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
+    try:
+      key = f"open_rl:future:{req_id}"
+      item = await self.redis.lindex(key, 0)
+      if item:
+        return json.loads(item)
+
       try:
-        result = await self.redis.blpop(key, timeout=min(3, max(1, int(remaining))))
-      except RedisTimeoutError:
-        result = None
-      if result:
-        payload = json.loads(result[1])
-        await self.redis.rpush(key, result[1])
-        await self.redis.expire(key, 300)
-        return payload
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+        return self.futures_events[req_id][1]
+      except asyncio.TimeoutError:
+        return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
+    finally:
+      self.futures_events.pop(req_id, None)
 
 
 # Global singleton factory

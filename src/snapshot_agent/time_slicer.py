@@ -76,20 +76,24 @@ class SocketTimeSlicerClient:
       await self.request({"command": "RELEASE", **payload})
 
   async def request(self, payload: dict[str, Any]) -> dict[str, Any]:
-    await self.connect()
-    assert self.reader is not None
-    assert self.writer is not None
+    try:
+      await self.connect()
+      assert self.reader is not None
+      assert self.writer is not None
 
-    self.writer.write(json.dumps(payload).encode("utf-8") + b"\n")
-    await self.writer.drain()
-    line = await self.reader.readline()
-    if not line:
-      raise RuntimeError("time slicer connection closed")
+      self.writer.write(json.dumps(payload).encode("utf-8") + b"\n")
+      await self.writer.drain()
+      line = await self.reader.readline()
+      if not line:
+        raise RuntimeError("time slicer connection closed")
 
-    response = json.loads(line.decode("utf-8"))
-    if not response.get("ok"):
-      raise RuntimeError(response.get("error", "time slicer command failed"))
-    return response
+      response = json.loads(line.decode("utf-8"))
+      if not response.get("ok"):
+        raise RuntimeError(response.get("error", "time slicer command failed"))
+      return response
+    except Exception:
+      await self.close()
+      raise
 
 
 def workload_from_env(pid: int | None = None, job_id: str | None = None, group: str = DEFAULT_TIME_SLICE_GROUP) -> WorkloadRef:

@@ -7,7 +7,10 @@ import chz
 import tinker
 from datasets import load_dataset
 from tinker import types
-from tinker_cookbook import checkpoint_utils, cli_utils
+from tinker_cookbook import cli_utils
+from tinker_cookbook.checkpoint_utils import resolve_renderer_name_from_checkpoint_or_default
+from tinker_cookbook.eval import BenchmarkEvaluator
+from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.supervised.data import SupervisedDatasetFromHFDataset
 from tinker_cookbook.supervised.train import Config as TrainConfig
 from tinker_cookbook.supervised.train import main as train
@@ -43,7 +46,7 @@ class GSM8KDataset(SupervisedDatasetBuilder):
 
 @chz.chz
 class Config:
-  base_model: str = "Qwen/Qwen2.5-0.5B"
+  base_model: str = "Qwen/Qwen3-0.6B"
   base_url: str = os.getenv("TINKER_BASE_URL", os.getenv("BASE_URL", "http://127.0.0.1:9003"))
   log_path: str = str(Path(__file__).with_name("artifacts") / "gsm8k_sft")
   epochs: int = 1
@@ -55,10 +58,30 @@ class Config:
   max_steps: int | None = None
   save_every: int = 0
   behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "delete"
+  eval_every: int = 10
+  eval_examples: int = 100
 
 
 def main(config: Config) -> None:
   cli_utils.check_log_dir(config.log_path, behavior_if_exists=config.behavior_if_log_dir_exists)
+
+  renderer_name = resolve_renderer_name_from_checkpoint_or_default(
+    model_name=config.base_model,
+    explicit_renderer_name=None,
+    load_checkpoint_path=None,
+    base_url=config.base_url,
+  )
+
+  evaluator_builders = []
+  if config.eval_every > 0:
+
+    def build_eval():
+      tokenizer = get_tokenizer(config.base_model)
+      renderer = get_renderer(renderer_name, tokenizer)
+      return BenchmarkEvaluator("gsm8k", renderer, max_examples=config.eval_examples)
+
+    evaluator_builders.append(build_eval)
+
   asyncio.run(
     train(
       TrainConfig(
@@ -76,21 +99,13 @@ def main(config: Config) -> None:
         lora_rank=config.rank,
         base_url=config.base_url,
         save_every=config.save_every,
-        eval_every=0,
+        eval_every=config.eval_every,
         infrequent_eval_every=0,
         max_steps=config.max_steps,
+        evaluator_builders=evaluator_builders,
       )
     )
   )
-  checkpoint = checkpoint_utils.get_last_checkpoint(config.log_path, required_key="sampler_path")
-  if checkpoint is None:
-    checkpoint = checkpoint_utils.get_last_checkpoint(config.log_path, required_key="state_path")
-  if checkpoint is not None:
-    path = checkpoint.sampler_path or checkpoint.state_path
-    if path and path.startswith("tinker://"):
-      path = str(Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")) / "sampler_full" / path.removeprefix("tinker://"))
-    if path:
-      print(f"eval_model_path={path}")
 
 
 if __name__ == "__main__":

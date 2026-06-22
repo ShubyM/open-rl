@@ -127,11 +127,16 @@ async def run_generation_backend(
       return {"sequences": [{"tokens": [0] * max_tokens, "logprobs": [-0.1] * max_tokens, "stop_reason": "length"}]}
 
     prompt_logprobs_val = 1 if include_prompt_logprobs else None
+    # Map stop strings and stop token IDs correctly to their respective parameters
+    stop_strs = stop if (stop and isinstance(stop[0], str)) else None
+    stop_ids = stop if (stop and isinstance(stop[0], int)) else None
+
     sampling_params = SamplingParams(
       n=num_samples,
       temperature=temperature,
       max_tokens=max_tokens,
-      stop_token_ids=stop,
+      stop=stop_strs,
+      stop_token_ids=stop_ids,
       top_p=top_p,
       top_k=top_k,
       logprobs=1,  # return logprobs for TITO RL
@@ -342,11 +347,17 @@ async def run_sampling_worker(model_id: str) -> None:
             sampling_reqs.append(req)
 
         if sampling_reqs:
+          from collections import defaultdict
+          grouped_reqs = defaultdict(list)
+          for req in sampling_reqs:
+            grouped_reqs[req.get("weights_path")].append(req)
+
           if time_slicer is not None:
             assert workload is not None
             async with time_slicer.acquire(workload):
-              tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
-              await asyncio.gather(*tasks)
+              for w_path, reqs in grouped_reqs.items():
+                tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in reqs]
+                await asyncio.gather(*tasks)
               if has_shutdown:
                 await exit_gracefully()
               if engine is not None:
@@ -354,8 +365,9 @@ async def run_sampling_worker(model_id: str) -> None:
                 await engine.sleep(level=2)
                 CURRENT_LOADED_SAMPLER_WEIGHTS = None
           else:
-            tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
-            await asyncio.gather(*tasks)
+            for w_path, reqs in grouped_reqs.items():
+              tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in reqs]
+              await asyncio.gather(*tasks)
 
         if has_shutdown:
           print("[vLLM Worker] Shutdown sentinel popped from queue. Initiating clean exit...")

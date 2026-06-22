@@ -20,8 +20,8 @@ data:
     spec:
       restartPolicy: OnFailure
       containers:
-      - name: trainer-worker
-        image: gcr.io/cdrollouts-sunilarora/open-rl-server:latest
+      - name: fft-worker
+        image: gcr.io/open-rl/open-rl-server:latest
         imagePullPolicy: Always
         command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
         env:
@@ -57,6 +57,12 @@ data:
         volumeMounts:
         - name: shared-storage
           mountPath: /mnt/shared
+        - name: store-patch-vol
+          mountPath: /app/src/server/store.py
+          subPath: store.py
+        - name: time-slicer-patch-vol
+          mountPath: /app/src/snapshot_agent/time_slicer.py
+          subPath: time_slicer.py
       resourceClaims:
       - name: trainer-gpu
         resourceClaimName: open-rl-trainer-gpu-1
@@ -64,6 +70,12 @@ data:
       - name: shared-storage
         persistentVolumeClaim:
           claimName: open-rl-shared-pvc
+      - name: store-patch-vol
+        configMap:
+          name: open-rl-store-patch
+      - name: time-slicer-patch-vol
+        configMap:
+          name: open-rl-time-slicer-patch
       nodeSelector:
         group.timeslice.io/trainers: "true"
       tolerations:

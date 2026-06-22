@@ -221,6 +221,7 @@ def translate_future_result(result: dict) -> dict:
 async def lifespan(_: FastAPI):
   global fft_worker_manager
   task = None
+  await store.start()
   if is_fft_enabled():
     fft_worker_manager = create_fft_worker_manager()
   if is_single_process_mode():
@@ -243,6 +244,7 @@ async def lifespan(_: FastAPI):
   try:
     yield
   finally:
+    await store.stop()
     if task is not None:
       task.cancel()
     if fft_worker_manager is not None:
@@ -429,7 +431,8 @@ async def save_weights_for_sampler(req: dict):
   if not model_id:
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
 
-  await ensure_sampler_launched(model_id)
+  sampler_id = "shared" if is_fft_enabled() else model_id
+  await ensure_sampler_launched(sampler_id)
   seq_id = req.get("sampling_session_seq_id") or int(time.time() * 1000)
   alias = req.get("name") or req.get("alias") or req.get("path")
 
@@ -525,15 +528,17 @@ async def create_sampling_session(req: dict):
     sess_id = model_id or "samp-session-live-123"
     target_model_id = sess_id
 
+  sampler_id = "shared" if is_fft_enabled() else target_model_id
+
   if get_sampler_backend() == "vllm" and target_model_id:
     if is_fft_enabled():
-      await ensure_sampler_launched(target_model_id)
+      await ensure_sampler_launched(sampler_id)
     s = get_store()
     if hasattr(s, "redis"):
-      print(f"[GATEWAY] Waiting for dynamic vLLM sampler worker to be ready for model {target_model_id}...")
+      print(f"[GATEWAY] Waiting for dynamic vLLM sampler worker to be ready for model {sampler_id}...")
       start_time = time.monotonic()
       while True:
-        is_ready = await s.redis.get(f"open_rl:sampler_ready:{target_model_id}")
+        is_ready = await s.redis.get(f"open_rl:sampler_ready:{sampler_id}")
         if is_ready == "1" or is_ready == b"1":
           print(f"[GATEWAY] Dynamic vLLM sampler worker is ready! (took {time.monotonic() - start_time:.2f}s)")
           break
@@ -609,7 +614,7 @@ async def asample(req: dict):
     "lora_path": lora_path,
     "weights_path": weights_path,
     "include_prompt_logprobs": include_prompt_logprobs,
-    "model_id": base_model_id or model_id,
+    "model_id": "shared" if is_fft_enabled() else (base_model_id or model_id),
     "trace_context": carrier,
   }
 

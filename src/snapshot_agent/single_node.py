@@ -33,7 +33,10 @@ class SingleNodeTimeSlicer(TimeSlicer):
     async with self.condition:
       key = workload.key
       if key in self.workloads:
-        return {"ok": False, "error": f"workload {key} is already registered"}
+        existing = self.workloads[key]
+        if not existing.failed:
+          return {"ok": False, "error": f"workload {key} is already registered"}
+        logger.info("Overwriting failed workload registration for %s", key)
 
       self.workloads[key] = WorkloadState(connection_id=connection_id, workload=workload)
       self.condition.notify_all()

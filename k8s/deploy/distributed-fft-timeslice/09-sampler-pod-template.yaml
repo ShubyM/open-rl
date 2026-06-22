@@ -15,7 +15,7 @@ data:
       restartPolicy: OnFailure
       containers:
       - name: sampler-worker
-        image: gcr.io/cdrollouts-sunilarora/open-rl-server:latest
+        image: gcr.io/open-rl/open-rl-server:latest
         imagePullPolicy: Always
         command: ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"]
         env:
@@ -27,7 +27,7 @@ data:
               name: open-rl-config
               key: BASE_MODEL
         - name: OPEN_RL_ENABLE_FFT
-          value: "true"
+          value: "false"
         - name: OPEN_RL_TMP_DIR
           value: "/mnt/shared/open-rl"
         - name: HF_HOME
@@ -42,13 +42,22 @@ data:
           claims:
           - name: sampler-gpu
           limits:
-            memory: "20Gi"
+            memory: "40Gi"
           requests:
-            memory: "16Gi"
+            memory: "24Gi"
             cpu: "4"
         volumeMounts:
         - name: shared-storage
           mountPath: /mnt/shared
+        - name: sampler-vllm-patch-vol
+          mountPath: /app/src/server/vllm_sampler.py
+          subPath: vllm_sampler.py
+        - name: store-patch-vol
+          mountPath: /app/src/server/store.py
+          subPath: store.py
+        - name: time-slicer-patch-vol
+          mountPath: /app/src/snapshot_agent/time_slicer.py
+          subPath: time_slicer.py
       resourceClaims:
       - name: sampler-gpu
         resourceClaimName: open-rl-sampler-gpu-1
@@ -56,6 +65,15 @@ data:
       - name: shared-storage
         persistentVolumeClaim:
           claimName: open-rl-shared-pvc
+      - name: sampler-vllm-patch-vol
+        configMap:
+          name: sampler-vllm-patch
+      - name: store-patch-vol
+        configMap:
+          name: open-rl-store-patch
+      - name: time-slicer-patch-vol
+        configMap:
+          name: open-rl-time-slicer-patch
       nodeSelector:
         group.timeslice.io/samplers: "true"
       tolerations:

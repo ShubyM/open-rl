@@ -73,6 +73,7 @@ def workload_from_payload(payload: dict[str, Any]) -> WorkloadRef:
     group=payload.get("group") or DEFAULT_TIME_SLICE_GROUP,
   )
 
+
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="Run the OpenRL snapshot agent.")
   parser.add_argument("--socket", default=os.getenv("OPEN_RL_SNAPSHOT_AGENT_SOCKET", "/tmp/open-rl/snapshot-agent.sock"))
