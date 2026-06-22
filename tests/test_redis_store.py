@@ -10,6 +10,7 @@ import socket
 import subprocess
 import time
 import unittest
+from unittest.mock import patch
 
 from server.store import RedisStore
 
@@ -63,7 +64,7 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     await self.store.redis.flushdb()
 
   async def asyncTearDown(self) -> None:
-    await self.store.redis.aclose()
+    await self.store.aclose()
 
   async def test_get_future_returns_already_resolved_result(self) -> None:
     await self.store.set_future("req-1", {"type": "sample", "ok": True})
@@ -91,6 +92,16 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     for result in await asyncio.gather(*waiters):
       self.assertEqual(result, {"type": "sample"})
     self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample"})
+
+  async def test_concurrent_waiters_do_not_use_per_waiter_blocking_connections(self) -> None:
+    with patch.object(self.store.redis, "blpop", side_effect=AssertionError("get_future should not use BLPOP")):
+      waiters = [asyncio.create_task(self.store.get_future(f"req-{idx}", timeout=10.0)) for idx in range(25)]
+      await asyncio.sleep(0.2)
+      for idx in range(25):
+        await self.store.set_future(f"req-{idx}", {"type": "sample", "idx": idx})
+
+      results = await asyncio.gather(*waiters)
+    self.assertEqual([result["idx"] for result in results], list(range(25)))
 
   async def test_unresolved_future_times_out_with_try_again(self) -> None:
     result = await self.store.get_future("req-never", timeout=0.3)

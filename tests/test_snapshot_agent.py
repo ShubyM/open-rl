@@ -61,6 +61,35 @@ class NoSnapshotRestorer(RecordingRestorer):
     return False
 
 
+class FakeReader:
+  def __init__(self, line: bytes):
+    self.line = line
+
+  async def readline(self) -> bytes:
+    return self.line
+
+
+class FakeWriter:
+  def __init__(self):
+    self.closed = False
+    self.writes: list[bytes] = []
+
+  def is_closing(self) -> bool:
+    return self.closed
+
+  def write(self, data: bytes) -> None:
+    self.writes.append(data)
+
+  async def drain(self) -> None:
+    return None
+
+  def close(self) -> None:
+    self.closed = True
+
+  async def wait_closed(self) -> None:
+    return None
+
+
 class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
   async def test_agent_grants_only_one_active_process_at_a_time(self) -> None:
     restorer = RecordingRestorer()
@@ -198,6 +227,18 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue((await agent.unregister(WorkloadRef(job_id="101")))["ok"])
     self.assertFalse((await agent.unregister(WorkloadRef(job_id="101")))["ok"])
 
+  async def test_register_replaces_failed_workload(self) -> None:
+    agent = SingleNodeTimeSlicer(RecordingRestorer())
+    workload = WorkloadRef(job_id="101")
+
+    self.assertTrue((await agent.register(workload, connection_id=1))["ok"])
+    await agent.connection_closed(1)
+    self.assertTrue(agent.workloads[workload.key].failed)
+
+    self.assertTrue((await agent.register(workload, connection_id=2))["ok"])
+    self.assertFalse(agent.workloads[workload.key].failed)
+    self.assertEqual(agent.workloads[workload.key].connection_id, 2)
+
   async def test_waiters_are_granted_in_fifo_order(self) -> None:
     agent = SingleNodeTimeSlicer(RecordingRestorer())
     for pid in [101, 202, 303, 404]:
@@ -236,6 +277,29 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
+  async def test_request_failure_closes_connection_before_reconnect(self) -> None:
+    client = SocketTimeSlicerClient("/unused.sock")
+    first_writer = FakeWriter()
+    second_writer = FakeWriter()
+    connections = [
+      (FakeReader(b""), first_writer),
+      (FakeReader(b'{"ok": true}\n'), second_writer),
+    ]
+
+    async def connect() -> None:
+      client.reader, client.writer = connections.pop(0)
+
+    client.connect = connect
+
+    with self.assertRaisesRegex(RuntimeError, "time slicer connection closed"):
+      await client.request({"command": "REGISTER", "job_id": "101"})
+
+    self.assertTrue(first_writer.closed)
+    self.assertIsNone(client.reader)
+    self.assertIsNone(client.writer)
+    self.assertEqual(await client.request({"command": "REGISTER", "job_id": "101"}), {"ok": True})
+    self.assertFalse(second_writer.closed)
+
   async def test_persistent_socket_clients_alternate(self) -> None:
     restorer = RecordingRestorer()
     agent = SingleNodeTimeSlicer(restorer)

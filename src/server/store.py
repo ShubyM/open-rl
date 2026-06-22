@@ -3,8 +3,8 @@
 import asyncio
 import json
 import os
-import time
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from typing import Any
 
 import redis.asyncio as redis
@@ -59,11 +59,11 @@ class RequestStore(ABC):
 
   async def start(self) -> None:
     """Initialize any background tasks/connections required by the store."""
-    pass
+    return None
 
   async def stop(self) -> None:
     """Clean up background tasks/connections."""
-    pass
+    return None
 
 
 class InMemoryStore(RequestStore):
@@ -151,19 +151,18 @@ class InMemoryStore(RequestStore):
 
 
 class RedisStore(RequestStore):
-  def __init__(self, redis_url: str):
-    self.redis = redis.from_url(
-      redis_url,
-      decode_responses=True,
-      health_check_interval=2,
-      max_connections=1000,
-    )
+  FUTURE_CHANNEL = "open_rl:completed_futures"
+
+  def __init__(self, redis_url: str, max_connections: int = 1000):
+    self.redis = redis.from_url(redis_url, decode_responses=True, health_check_interval=2, max_connections=max_connections)
     self.active_list = "open_rl:active_tenants"
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
     self.worker_launch_queue = "open_rl:worker_launch_queue"
-    self.futures_events = {}
-    self._listener_task = None
+    self.future_waiters: dict[str, set[asyncio.Future[None]]] = {}
+    self._future_listener_task: asyncio.Task | None = None
+    self._future_listener_ready: asyncio.Event | None = None
+    self._future_listener_lock = asyncio.Lock()
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -287,67 +286,97 @@ class RedisStore(RequestStore):
 
     return batch
 
-  async def start(self) -> None:
-    self._listener_task = asyncio.create_task(self._pubsub_listener())
-
-  async def stop(self) -> None:
-    if self._listener_task:
-      self._listener_task.cancel()
-      try:
-        await self._listener_task
-      except asyncio.CancelledError:
-        pass
-
-  async def _pubsub_listener(self) -> None:
-    ps = self.redis.pubsub()
-    await ps.subscribe("open_rl:completed_futures")
-    try:
-      async for message in ps.listen():
-        if message["type"] == "message":
-          try:
-            data = json.loads(message["data"])
-            req_id = data["req_id"]
-            result = data["result"]
-            if req_id in self.futures_events:
-              event, _ = self.futures_events[req_id]
-              self.futures_events[req_id] = (event, result)
-              event.set()
-          except Exception:
-            import traceback
-            traceback.print_exc()
-    finally:
-      await ps.unsubscribe("open_rl:completed_futures")
-      await ps.close()
-
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
       return
 
     key = f"open_rl:future:{req_id}"
-    await self.redis.rpush(key, json.dumps(result))
-    await self.redis.expire(key, 300)
-    await self.redis.publish("open_rl:completed_futures", json.dumps({
-        "req_id": req_id,
-        "result": result
-    }))
+    payload = json.dumps(result)
+    await self.redis.set(key, payload, ex=300)
+    await self.redis.publish(self.FUTURE_CHANNEL, req_id)
 
   async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
-    event = asyncio.Event()
-    self.futures_events[req_id] = (event, None)
+    result = await self._read_future_result(req_id)
+    if result is not None:
+      return result
+
+    await self._ensure_future_listener()
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[None] = loop.create_future()
+    self.future_waiters.setdefault(req_id, set()).add(future)
 
     try:
-      key = f"open_rl:future:{req_id}"
-      item = await self.redis.lindex(key, 0)
-      if item:
-        return json.loads(item)
-
-      try:
-        await asyncio.wait_for(event.wait(), timeout=timeout)
-        return self.futures_events[req_id][1]
-      except asyncio.TimeoutError:
-        return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
+      # Close the race where the result is written between the first Redis read
+      # and waiter registration.
+      result = await self._read_future_result(req_id)
+      if result is not None:
+        return result
+      await asyncio.wait_for(future, timeout=timeout)
+      result = await self._read_future_result(req_id)
+      if result is not None:
+        return result
+      return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
+    except TimeoutError:
+      return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
     finally:
-      self.futures_events.pop(req_id, None)
+      waiters = self.future_waiters.get(req_id)
+      if waiters is not None:
+        waiters.discard(future)
+        if not waiters:
+          self.future_waiters.pop(req_id, None)
+
+  async def _read_future_result(self, req_id: str) -> dict[str, Any] | None:
+    payload = await self.redis.get(f"open_rl:future:{req_id}")
+    return json.loads(payload) if payload else None
+
+  async def _ensure_future_listener(self) -> None:
+    async with self._future_listener_lock:
+      if self._future_listener_task is None or self._future_listener_task.done():
+        self._future_listener_ready = asyncio.Event()
+        self._future_listener_task = asyncio.create_task(self._future_listener(self._future_listener_ready))
+      ready = self._future_listener_ready
+
+    assert ready is not None
+    await ready.wait()
+
+  async def _future_listener(self, ready: asyncio.Event) -> None:
+    pubsub = self.redis.pubsub()
+    try:
+      await pubsub.subscribe(self.FUTURE_CHANNEL)
+      ready.set()
+      async for message in pubsub.listen():
+        if message.get("type") != "message":
+          continue
+        req_id = message["data"]
+        waiters = self.future_waiters.pop(req_id, set())
+        for future in waiters:
+          if not future.done():
+            future.set_result(None)
+    except asyncio.CancelledError:
+      raise
+    except Exception:
+      ready.set()
+      raise
+    finally:
+      ready.set()
+      with suppress(Exception):
+        await pubsub.unsubscribe(self.FUTURE_CHANNEL)
+      with suppress(Exception):
+        await pubsub.close()
+
+  async def aclose(self) -> None:
+    if self._future_listener_task is not None:
+      self._future_listener_task.cancel()
+      with suppress(asyncio.CancelledError, Exception):
+        await self._future_listener_task
+    for waiters in self.future_waiters.values():
+      for future in waiters:
+        future.cancel()
+    self.future_waiters.clear()
+    await self.redis.aclose()
+
+  async def stop(self) -> None:
+    await self.aclose()
 
 
 # Global singleton factory

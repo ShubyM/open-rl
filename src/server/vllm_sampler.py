@@ -347,17 +347,18 @@ async def run_sampling_worker(model_id: str) -> None:
             sampling_reqs.append(req)
 
         if sampling_reqs:
-          from collections import defaultdict
-          grouped_reqs = defaultdict(list)
-          for req in sampling_reqs:
-            grouped_reqs[req.get("weights_path")].append(req)
+          weights_path_to_requests: dict[str | None, list[dict[str, Any]]] = {}
+          for request in sampling_reqs:
+            weights_path = request.get("weights_path")
+            if weights_path not in weights_path_to_requests:
+              weights_path_to_requests[weights_path] = []
+            weights_path_to_requests[weights_path].append(request)
 
           if time_slicer is not None:
             assert workload is not None
             async with time_slicer.acquire(workload):
-              for w_path, reqs in grouped_reqs.items():
-                tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in reqs]
-                await asyncio.gather(*tasks)
+              for request_group in weights_path_to_requests.values():
+                await asyncio.gather(*(process_sampling_request(request, store) for request in request_group))
               if has_shutdown:
                 await exit_gracefully()
               if engine is not None:
@@ -365,9 +366,8 @@ async def run_sampling_worker(model_id: str) -> None:
                 await engine.sleep(level=2)
                 CURRENT_LOADED_SAMPLER_WEIGHTS = None
           else:
-            for w_path, reqs in grouped_reqs.items():
-              tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in reqs]
-              await asyncio.gather(*tasks)
+            for request_group in weights_path_to_requests.values():
+              await asyncio.gather(*(process_sampling_request(request, store) for request in request_group))
 
         if has_shutdown:
           print("[vLLM Worker] Shutdown sentinel popped from queue. Initiating clean exit...")
