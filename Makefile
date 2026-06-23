@@ -1,4 +1,4 @@
-.PHONY: server vllm test lint fmt help push-vm pull-vm cluster-eval
+.PHONY: server vllm test lint fmt help push-vm pull-vm cluster-eval skaffold-dev
 
 # ---------------------------------------------------------------------------
 # Knobs (override on the command line: make server BASE_MODEL=... SAMPLING_BACKEND=...)
@@ -43,6 +43,7 @@ help:
 	@echo "make test e2e fft-gsm8k TRAINING_TEST_ARGS='steps=10 eval_examples=8 extra=\"batch=2\"'"
 	@echo "make test piglatin                      # pig-latin example end-to-end tests"
 	@echo "make cluster-eval EVAL_MODEL_PATH=/mnt/shared/open-rl/checkpoints/...  # one-off vLLM eval job on the cluster"
+	@echo "make skaffold-dev GCP_PROJECT=<project> # build/deploy FFT time-slice stack and sync src/**/*.py"
 	@echo "make lint | fmt"
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,9 @@ deploy:
 # See docs/setup/gke-fft-timeslice.md.
 deploy-fft-timeslice:
 	kubectl apply -k k8s/deploy/distributed-fft-timeslice/
+
+skaffold-dev:
+	skaffold dev --default-repo=gcr.io/$(GCP_PROJECT)
 
 rollout:
 	kubectl rollout restart deployment redis-store open-rl-gateway open-rl-trainer-worker vllm-worker

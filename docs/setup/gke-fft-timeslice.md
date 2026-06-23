@@ -209,6 +209,24 @@ the relevant pod and process set.
   so all trainer worker pods can share one GPU through a single `ResourceClaim`.
 - Helm v3 for the DRA-driver chart.
 
+## Fast dev loop with Skaffold
+
+For Python-only changes, use Skaffold instead of rebuilding and pushing the
+CUDA/vLLM images by hand:
+
+```bash
+skaffold dev --default-repo=gcr.io/$GCP_PROJECT
+```
+
+The root `skaffold.yaml` builds the existing server and gateway Dockerfiles,
+deploys `k8s/deploy/distributed-fft-timeslice`, and syncs `src/**/*.py` into
+`/app/src/...` in matching running containers. Dependency changes still require
+a real image rebuild: `pyproject.toml`, `uv.lock`, Dockerfiles, system packages,
+or native libraries are not source-sync-only changes.
+
+This is a development workflow. Production deploys should continue to use
+immutable images.
+
 ## Setup 1: Create the DRA GPU node pool
 
 Trainer worker pods share the GPU through the `open-rl-trainer-gpu-1`

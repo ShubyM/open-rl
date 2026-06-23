@@ -1,0 +1,35 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: open-rl-fft-timeslice
+
+build:
+  local:
+    push: true
+  artifacts:
+    # These names match the image refs in the manifests. Use
+    # `--default-repo=gcr.io/$GCP_PROJECT` to push them to your project.
+    - image: gcr.io/open-rl/open-rl-server
+      context: .
+      docker:
+        dockerfile: src/server/Dockerfile
+      sync:
+        manual:
+          - src: "src/**/*.py"
+            dest: /app
+    - image: gcr.io/open-rl/open-rl-gateway
+      context: .
+      docker:
+        dockerfile: src/server/Dockerfile.gateway
+      sync:
+        manual:
+          - src: "src/**/*.py"
+            dest: /app
+
+manifests:
+  kustomize:
+    paths:
+      - k8s/deploy/distributed-fft-timeslice
+
+deploy:
+  kubectl: {}
