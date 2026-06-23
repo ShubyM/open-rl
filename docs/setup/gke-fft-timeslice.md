@@ -209,6 +209,58 @@ the relevant pod and process set.
   so all trainer worker pods can share one GPU through a single `ResourceClaim`.
 - Helm v3 for the DRA-driver chart.
 
+## Deploying your working tree
+
+```bash
+make push-to-cluster GCP_PROJECT=<project>
+```
+
+Runs `skaffold run`: builds the server, gateway, and client images from the
+working tree with content-addressed tags (`inputDigest` — uncommitted changes
+produce a new tag), pushes them to `gcr.io/$GCP_PROJECT`, and applies
+`k8s/deploy/distributed-fft-timeslice` with the built images substituted into
+the rendered manifests. The substitution covers the gateway and
+accel-timeslicer images and — via the `resourceSelector` in `skaffold.yaml` —
+the `OPEN_RL_WORKER_IMAGE` env var, so trainer/sampler pods launched after the
+deploy run the new server image. The wrapper then waits for the gateway
+rollout and deletes stale trainer pods (the gateway reuses running pods per
+model id, so jobs must start fresh to pick up new code). Sampler pods are
+kept: their vLLM engine serves the unchanged base model and reloads trained
+weights from disk; run `make clean-workers` after sampler code changes.
+
+Docker layer caching applies: code-only edits rebuild just the final copy
+layer. Set `GCP_PROJECT` in your environment (`export GCP_PROJECT=my-project`)
+instead of passing it per command.
+
+`push-to-cluster` records the built images in a gitignored
+`.skaffold-build.json`; `make cluster-e2e` reads the client image from it
+automatically, so the full loop is:
+
+```bash
+make push-to-cluster
+make cluster-e2e E2E_SCENARIO=fft-textsql-rl E2E_ARGS="steps=2"
+```
+
+### Image overrides for plain kubectl deploys
+
+`make deploy-fft-timeslice` (`kubectl apply -k`) deploys the pinned published
+images. To deploy your own images without editing committed manifests, use the
+gitignored local overlay:
+
+```bash
+make deploy-local   # first run copies k8s/deploy/local/kustomization.yaml.example
+```
+
+Then edit `k8s/deploy/local/kustomization.yaml` (gitignored) to point the
+`images:` transformer at your registry and tag; a `replacements` block
+propagates the override into `OPEN_RL_WORKER_IMAGE`, so dynamically launched
+trainer/sampler pods follow it too. The committed example defaults to the
+published images, so an unedited overlay deploys exactly what
+`deploy-fft-timeslice` does.
+
+This is a development workflow. Production deploys should continue to use
+immutable images.
+
 ## Setup 1: Create the DRA GPU node pool
 
 Trainer worker pods share the GPU through the `open-rl-trainer-gpu-1`

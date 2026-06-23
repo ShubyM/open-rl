@@ -1,31 +1,26 @@
-# Pod template the gateway uses to launch one trainer worker per model
-# (server/k8s_worker_manager.py). The launcher stamps metadata.name, the
-# time-slicing coordination labels (snapshot-agent, timeslice.io/group,
-# timeslice.io/job-id), the OPEN_RL_TIME_SLICE_* env vars, and appends --model-id
-# to args.
-#
-# All trainer worker pods in this group share one GPU through the single DRA
-# ResourceClaim open-rl-trainer-gpu-1 (06-gpu-resourceclaim.yaml), which pins them
-# to the same physical device. DRA does not serialize CUDA execution; OpenRL's
-# node-local snapshot agent coordinates GPU windows. See
-# docs/setup/gke-fft-timeslice.md.
+# GKE single-L4 test variant.
+# Pod template the gateway uses to launch one sampler worker per model
+# (server/k8s_worker_manager.py). All sampler worker pods reference the shared
+# trainer DRA ResourceClaim open-rl-trainer-gpu-1 (06-gpu-resourceclaim.yaml) and
+# are placed onto the sampler GPU node. The node-local snapshot agent time-slices
+# GPU access across concurrent inference engines.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: open-rl-trainer-worker-pod-template
+  name: open-rl-sampler-worker-pod-template
 data:
-  trainer-worker-pod.yaml: |
+  sampler-worker-pod.yaml: |
     apiVersion: v1
     kind: Pod
     spec:
       restartPolicy: OnFailure
       containers:
-      - name: trainer-worker
+      - name: sampler-worker
         # Fallback only: the gateway overwrites this with OPEN_RL_WORKER_IMAGE
         # when rendering pods (server/k8s_worker_manager.py).
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: IfNotPresent
-        command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
+        command: ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"]
         env:
         - name: REDIS_URL
           value: "redis://redis-service:6379?max_connections=500"
@@ -36,8 +31,8 @@ data:
               key: BASE_MODEL
         - name: OPEN_RL_ENABLE_FFT
           value: "true"
-        - name: PYTORCH_CUDA_ALLOC_CONF
-          value: "expandable_segments:True"
+        - name: VLLM_GPU_MEMORY_UTILIZATION
+          value: "0.35"
         - name: OPEN_RL_TMP_DIR
           value: "/mnt/shared/open-rl"
         - name: HF_HOME
@@ -50,30 +45,26 @@ data:
           value: "9753"
         resources:
           claims:
-          - name: trainer-gpu
+          - name: sampler-gpu
           limits:
-            memory: "180Gi"
+            memory: "12Gi"
           requests:
-            # Sized at 18Gi to allow concurrent pod scheduling on 42Gi allocatable nodes.
-            memory: "18Gi"
-            cpu: "4"
+            memory: "2Gi"
+            cpu: "1"
         volumeMounts:
         - name: shared-storage
           mountPath: /mnt/shared
       resourceClaims:
-      - name: trainer-gpu
+      - name: sampler-gpu
+        # Samplers share the trainer claim on single-GPU clusters.
         resourceClaimName: open-rl-trainer-gpu-1
       volumes:
       - name: shared-storage
         persistentVolumeClaim:
           claimName: open-rl-shared-pvc
       nodeSelector:
-        group.timeslice.io/trainers: "true"
-        cloud.google.com/gke-accelerator: "nvidia-h100-80gb"
+        group.timeslice.io/samplers: "true"
       tolerations:
       - key: "nvidia.com/gpu"
-        operator: "Exists"
-        effect: "NoSchedule"
-      - key: "node.kubernetes.io/disk-pressure"
         operator: "Exists"
         effect: "NoSchedule"

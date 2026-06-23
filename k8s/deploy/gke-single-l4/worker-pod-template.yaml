@@ -1,3 +1,4 @@
+# GKE single-L4 test variant.
 # Pod template the gateway uses to launch one trainer worker per model
 # (server/k8s_worker_manager.py). The launcher stamps metadata.name, the
 # time-slicing coordination labels (snapshot-agent, timeslice.io/group,
@@ -52,11 +53,10 @@ data:
           claims:
           - name: trainer-gpu
           limits:
-            memory: "180Gi"
+            memory: "12Gi"
           requests:
-            # Sized at 18Gi to allow concurrent pod scheduling on 42Gi allocatable nodes.
-            memory: "18Gi"
-            cpu: "4"
+            memory: "2Gi"
+            cpu: "1"
         volumeMounts:
         - name: shared-storage
           mountPath: /mnt/shared
@@ -69,7 +69,6 @@ data:
           claimName: open-rl-shared-pvc
       nodeSelector:
         group.timeslice.io/trainers: "true"
-        cloud.google.com/gke-accelerator: "nvidia-h100-80gb"
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"
