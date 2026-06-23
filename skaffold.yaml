@@ -1,0 +1,50 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: open-rl-dev
+
+# `skaffold run`: build the working tree's images with content-addressed tags
+# (inputDigest tracks uncommitted changes), push to --default-repo, and deploy
+# the FFT time-slice manifests with the built images substituted — including
+# the OPEN_RL_WORKER_IMAGE env var the gateway uses for dynamically launched
+# trainer/sampler pods (via the resourceSelector below).
+build:
+  local:
+    push: true
+  tagPolicy:
+    inputDigest: {}
+  artifacts:
+    - image: ghcr.io/gke-labs/open-rl/server
+      context: .
+      docker:
+        dockerfile: src/server/Dockerfile
+    - image: ghcr.io/gke-labs/open-rl/gateway
+      context: .
+      docker:
+        dockerfile: src/server/Dockerfile.gateway
+    - image: ghcr.io/gke-labs/open-rl/client
+      context: .
+      docker:
+        dockerfile: src/server/Dockerfile.client
+
+manifests:
+  kustomize:
+    paths:
+      - k8s/deploy/distributed-fft-timeslice
+
+deploy:
+  kubectl: {}
+
+resourceSelector:
+  allow:
+    - groupKind: Deployment.apps
+      image:
+        - ".*"
+        - ".spec.template.spec.containers.*.env.*.value"
+      labels:
+        - ".*"
+    - groupKind: DaemonSet.apps
+      image:
+        - ".*"
+      labels:
+        - ".*"

@@ -57,3 +57,12 @@ Thumbs.db
 
 # Local benchmark run outputs
 runs/
+
+# Per-developer image overrides for kubectl deploys (see kustomization.yaml.example)
+k8s/deploy/local/kustomization.yaml
+
+# Per-developer Makefile overrides (see local.mk.example)
+local.mk
+
+# Built-image record from make push-to-cluster (read by make cluster-e2e)
+.skaffold-build.json

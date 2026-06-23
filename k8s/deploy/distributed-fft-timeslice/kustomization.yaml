@@ -25,10 +25,28 @@ configMapGenerator:
       - BASE_MODEL="Qwen/Qwen2.5-0.5B"
       - ENABLE_GCP_TRACE="1"
 
+# The manifests reference the canonical images published by CI
+# (ghcr.io/gke-labs/open-rl/*); this transformer pins the deployed version in
+# ONE place. To deploy from a private registry or pin a different tag, override
+# here — or per-developer without touching committed files via the gitignored
+# k8s/deploy/local/ overlay (make deploy-local).
 images:
   - name: ghcr.io/gke-labs/open-rl/server
-    newName: gcr.io/cdrollouts-sunilarora/open-rl-server
-    newTag: 0.1.30
+    newTag: latest
   - name: ghcr.io/gke-labs/open-rl/gateway
-    newName: gcr.io/cdrollouts-sunilarora/open-rl-gateway
-    newTag: 0.1.30
+    newTag: latest
+
+# The images transformer cannot reach OPEN_RL_WORKER_IMAGE (an env string), so
+# copy the post-transformer server image from the accel-timeslicer DaemonSet
+# into it. Replacements run after the images transformer.
+replacements:
+  - source:
+      kind: DaemonSet
+      name: open-rl-accel-timeslicer
+      fieldPath: spec.template.spec.containers.0.image
+    targets:
+      - select:
+          kind: Deployment
+          name: open-rl-gateway
+        fieldPaths:
+          - spec.template.spec.containers.0.env.[name=OPEN_RL_WORKER_IMAGE].value

@@ -1,0 +1,39 @@
+# Local deploy overlay. Copy to kustomization.yaml (gitignored) and point the
+# images at your own registry/tag. The committed manifests always reference the
+# published images, so nothing under version control needs editing.
+#
+#   cp k8s/deploy/local/kustomization.yaml.example k8s/deploy/local/kustomization.yaml
+#   make deploy-local
+#
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../distributed-fft-timeslice
+
+# Override the deployed images. The `name:` fields must match what the base
+# renders (its images transformer output), so if the base pin moves registries,
+# update these to match.
+images:
+  - name: ghcr.io/gke-labs/open-rl/server
+    newName: ghcr.io/gke-labs/open-rl/server # e.g. gcr.io/<your-project>/open-rl-server
+    newTag: "latest" # e.g. dev, or a pinned release tag
+  - name: ghcr.io/gke-labs/open-rl/gateway
+    newName: ghcr.io/gke-labs/open-rl/gateway
+    newTag: "latest"
+
+# Re-copy the (now overridden) server image into OPEN_RL_WORKER_IMAGE so
+# dynamically launched trainer/sampler pods follow it too. This mirrors the
+# replacements block in the base; it must be repeated here because the base's
+# copy runs before this overlay's images transformer.
+replacements:
+  - source:
+      kind: DaemonSet
+      name: open-rl-accel-timeslicer
+      fieldPath: spec.template.spec.containers.0.image
+    targets:
+      - select:
+          kind: Deployment
+          name: open-rl-gateway
+        fieldPaths:
+          - spec.template.spec.containers.0.env.[name=OPEN_RL_WORKER_IMAGE].value
