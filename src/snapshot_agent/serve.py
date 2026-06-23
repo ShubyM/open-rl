@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .checkpoint import CudaCheckpointRestorer
+from .gpucr import GpuCrCheckpointRestorer
 from .llmd import LlmDCheckpointRestorer
 from .single_node import SingleNodeTimeSlicer
 from .workload import DEFAULT_TIME_SLICE_GROUP, WorkloadRef
@@ -79,9 +80,11 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--socket", default=os.getenv("OPEN_RL_SNAPSHOT_AGENT_SOCKET", "/tmp/open-rl/snapshot-agent.sock"))
   parser.add_argument("--listen-host", default=None)
   parser.add_argument("--port", type=int, default=None)
-  parser.add_argument("--backend", choices=["cuda", "llmd"], default=os.getenv("OPEN_RL_SNAPSHOT_AGENT_BACKEND", "cuda"))
+  parser.add_argument("--backend", choices=["cuda", "gpucr", "llmd"], default=os.getenv("OPEN_RL_SNAPSHOT_AGENT_BACKEND", "cuda"))
   parser.add_argument("--cuda-checkpoint-bin", default=os.getenv("CUDA_CHECKPOINT_BIN", "cuda-checkpoint"))
   parser.add_argument("--cuda-checkpoint-timeout-ms", type=int, default=None)
+  parser.add_argument("--gpucr-client-bin", default=os.getenv("GPUCR_CLIENT_BIN", "cr_client"))
+  parser.add_argument("--gpucr-multi-client-bin", default=os.getenv("GPUCR_MULTI_CLIENT_BIN", "multi_cr_client"))
   parser.add_argument("--llmd-snapshot-endpoint", default=os.getenv("LLMD_SNAPSHOT_AGENT_ENDPOINT", "127.0.0.1:9001"))
   parser.add_argument("--llmd-backend", default=os.getenv("LLMD_SNAPSHOT_BACKEND", "CUDA"))
   parser.add_argument("--llmd-poll-interval-sec", type=float, default=float(os.getenv("LLMD_SNAPSHOT_POLL_INTERVAL_SEC", "1.0")))
@@ -94,6 +97,9 @@ async def main_async() -> None:
     if LlmDClient is None:
       raise RuntimeError("--backend llmd requires the llm-d timeslice snapshot client package")
     restorer = LlmDCheckpointRestorer(LlmDClient(endpoint=args.llmd_snapshot_endpoint), args.llmd_backend, args.llmd_poll_interval_sec)
+    time_slicer = SingleNodeTimeSlicer(restorer=restorer)
+  elif args.backend == "gpucr":
+    restorer = GpuCrCheckpointRestorer(args.gpucr_client_bin, args.gpucr_multi_client_bin)
     time_slicer = SingleNodeTimeSlicer(restorer=restorer)
   else:
     restorer = CudaCheckpointRestorer(args.cuda_checkpoint_bin, args.cuda_checkpoint_timeout_ms)

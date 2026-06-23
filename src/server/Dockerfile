@@ -1,3 +1,21 @@
+FROM nvidia/cuda:12.1.0-devel-ubuntu22.04 AS gpu-cr-builder
+
+ARG GPU_CR_REF=e9bbb52e1f52986587fc631217c0f2b50b46245a
+ARG GPU_CR_SHM_SIZE_GB=40
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    cmake \
+    build-essential \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/gpu-os/GPU-CR.git /tmp/GPU-CR \
+    && cd /tmp/GPU-CR \
+    && git checkout "$GPU_CR_REF" \
+    && cmake -S . -B build -DGPU_VENDOR=NVIDIA -DSHM_SIZE_GB="$GPU_CR_SHM_SIZE_GB" \
+    && cmake --build build -j"$(nproc)"
+
 # Use NVIDIA CUDA base image
 FROM nvidia/cuda:12.1.0-base-ubuntu22.04
 
@@ -27,6 +45,12 @@ RUN uv python install 3.12
 RUN curl -fsSL https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/main/bin/x86_64_Linux/cuda-checkpoint \
     -o /usr/local/bin/cuda-checkpoint \
     && chmod +x /usr/local/bin/cuda-checkpoint
+
+RUN mkdir -p /usr/local/lib/open-rl/gpu-cr
+COPY --from=gpu-cr-builder /tmp/GPU-CR/build/vGPU-NVIDIA.so /usr/local/lib/open-rl/gpu-cr/vGPU-NVIDIA.so
+COPY --from=gpu-cr-builder /tmp/GPU-CR/build/cr_client /usr/local/bin/cr_client
+COPY --from=gpu-cr-builder /tmp/GPU-CR/build/multi_cr_client /usr/local/bin/multi_cr_client
+ENV GPUCR_PRELOAD=/usr/local/lib/open-rl/gpu-cr/vGPU-NVIDIA.so
 
 WORKDIR /app
 

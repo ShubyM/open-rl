@@ -18,6 +18,8 @@ It delegates physical checkpoint/restore to a `CheckpointRestorer` backend:
 
 - `CudaCheckpointRestorer` discovers local GPU PIDs from the workload identity,
   then calls `cuda-checkpoint`.
+- `GpuCrCheckpointRestorer` discovers local GPU PIDs from the workload identity,
+  then calls GPU-CR's `cr_client` / `multi_cr_client`.
 - `LlmDCheckpointRestorer` uses llm-d's Python snapshot client with the workload
   `job_id` and `group`; llm-d discovers the actual pod/PIDs from labels.
 
@@ -50,3 +52,23 @@ calling `snapshot_and_wait` / `restore_and_wait`.
 For this first integration, release checkpoints the workload before another
 workload can acquire the accelerator when the backend reports resident GPU
 state.
+
+## GPU-CR backend
+
+The same daemon can run with `--backend gpucr` to trigger GPU-CR instead of the
+NVIDIA `cuda-checkpoint` CLI. The backend still uses OpenRL workload identity
+and local GPU PID discovery, so the process being checkpointed must have
+`OPEN_RL_TIME_SLICE_JOB_ID` / `OPEN_RL_TIME_SLICE_GROUP` in its environment and
+must be launched under GPU-CR's preload library:
+
+```bash
+OPEN_RL_SNAPSHOT_AGENT_BACKEND=gpucr \
+  GPUCR_PRELOAD=/usr/local/lib/open-rl/gpu-cr/vGPU-NVIDIA.so \
+  python -m snapshot_agent.serve --backend gpucr
+```
+
+When the local or Kubernetes worker manager sees
+`OPEN_RL_SNAPSHOT_AGENT_BACKEND=gpucr`, it injects `LD_PRELOAD=$GPUCR_PRELOAD`
+and `GPU_VENDOR=NVIDIA` into launched trainer and sampler workers. Set
+`EXPORT_FILE_PATH` to use file-backed staging; otherwise GPU-CR expects the
+node-level hugepage staging mount at `/mnt/huge-ckpt`.

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from snapshot_agent.checkpoint import CudaCheckpointRestorer
+from snapshot_agent.gpucr import GpuCrCheckpointRestorer
 from snapshot_agent.llmd import LlmDCheckpointRestorer
 from snapshot_agent.serve import start_tcp_time_slicer, start_time_slicer
 from snapshot_agent.single_node import SingleNodeTimeSlicer
@@ -491,6 +492,69 @@ class CudaCheckpointRestorerTest(unittest.TestCase):
     ):
       self.assertEqual(discover_workload_gpu_pids(workload), [12])
       self.assertEqual(workload_root_pids(workload), [11])
+
+
+class GpuCrCheckpointRestorerTest(unittest.TestCase):
+  def test_single_pid_checkpoint_and_restore_use_cr_client(self) -> None:
+    restorer = GpuCrCheckpointRestorer("cr_client", "multi_cr_client")
+    workload = WorkloadRef(job_id="trainer-model-a")
+
+    with (
+      patch.object(restorer, "discover_pids", return_value=[101]),
+      patch.object(restorer, "run_gpucr") as run_gpucr,
+    ):
+      restorer.checkpoint(workload)
+      restorer.restore(workload)
+
+    self.assertEqual(
+      [call.args[0] for call in run_gpucr.call_args_list],
+      [
+        ["cr_client", "-c", "-p", "101"],
+        ["cr_client", "-r", "-p", "101"],
+      ],
+    )
+
+  def test_multi_pid_checkpoint_initializes_once_and_uses_multi_client(self) -> None:
+    restorer = GpuCrCheckpointRestorer("cr_client", "multi_cr_client")
+    workload = WorkloadRef(job_id="trainer-model-a")
+
+    with (
+      patch.object(restorer, "discover_pids", return_value=[101, 202]),
+      patch.object(restorer, "run_gpucr") as run_gpucr,
+    ):
+      restorer.checkpoint(workload)
+      restorer.restore(workload)
+      restorer.checkpoint(workload)
+
+    self.assertEqual(
+      [call.args[0] for call in run_gpucr.call_args_list],
+      [
+        ["multi_cr_client", "-i", "-p", "101,202"],
+        ["multi_cr_client", "-c", "-p", "101,202"],
+        ["multi_cr_client", "-r", "-p", "101,202"],
+        ["multi_cr_client", "-c", "-p", "101,202"],
+      ],
+    )
+
+  def test_checkpoint_with_no_gpu_pids_skips_snapshot(self) -> None:
+    restorer = GpuCrCheckpointRestorer("cr_client", "multi_cr_client")
+    workload = WorkloadRef(job_id="trainer-model-a")
+
+    with (
+      patch.object(restorer, "discover_pids", return_value=[]),
+      patch.object(restorer, "run_gpucr") as run_gpucr,
+    ):
+      self.assertFalse(restorer.checkpoint(workload))
+
+    run_gpucr.assert_not_called()
+    self.assertEqual(restorer.checkpointed_pids, {})
+
+  def test_restore_without_prior_checkpoint_fails(self) -> None:
+    restorer = GpuCrCheckpointRestorer("cr_client", "multi_cr_client")
+    workload = WorkloadRef(job_id="trainer-model-a")
+
+    with self.assertRaisesRegex(RuntimeError, "no checkpointed PIDs"):
+      restorer.restore(workload)
 
 
 class LlmDCheckpointRestorerTest(unittest.TestCase):

@@ -101,6 +101,23 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
     self.assertEqual(env["OPEN_RL_TIME_SLICE_JOB_ID"], "trainer-model-a-1")
     self.assertEqual(env["OPEN_RL_TIME_SLICE_GROUP"], "trainers")
 
+  def test_launch_injects_gpucr_preload_when_backend_is_selected(self) -> None:
+    api = _FakeCoreApi()
+    env = {
+      **self.env,
+      "OPEN_RL_SNAPSHOT_AGENT_BACKEND": "gpucr",
+      "GPUCR_PRELOAD": "/opt/gpucr/vGPU-NVIDIA.so",
+      "EXPORT_FILE_PATH": "/mnt/shared/gpucr",
+    }
+    with patch.dict(os.environ, env, clear=True):
+      KubernetesFFTWorkerManager(core_api=api).launch("Model_A.1")
+
+    container = api.created[0][1]["spec"]["containers"][0]
+    pod_env = {item["name"]: item["value"] for item in container["env"] if "value" in item}
+    self.assertEqual(pod_env["LD_PRELOAD"], "/opt/gpucr/vGPU-NVIDIA.so")
+    self.assertEqual(pod_env["GPU_VENDOR"], "NVIDIA")
+    self.assertEqual(pod_env["EXPORT_FILE_PATH"], "/mnt/shared/gpucr")
+
   def test_launch_sampler_stamps_sampler_identity(self) -> None:
     api = _FakeCoreApi()
     self._manager(api).launch_sampler("Model_A.1")

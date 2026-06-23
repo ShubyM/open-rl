@@ -21,6 +21,7 @@ from typing import Any
 import yaml
 from kubernetes import client, config
 
+from snapshot_agent.gpucr import gpucr_worker_env
 from snapshot_agent.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
 
 POD_NAME_PREFIX = "open-rl-trainer-"
@@ -131,6 +132,8 @@ class KubernetesFFTWorkerManager:
     set_env(container, "OPEN_RL_TIME_SLICE_JOB_ID", role_job_id)
     set_env(container, "OPEN_RL_TIME_SLICE_GROUP", role_group)
     set_env(container, "OPEN_RL_ENABLE_FFT", "true")
+    for name, value in gpucr_worker_env(container_env_value(container, "LD_PRELOAD")).items():
+      set_env(container, name, value)
     return pod
 
   def read_pod(self, pod_name: str) -> Any | None:
@@ -158,3 +161,10 @@ def set_env(container: dict[str, Any], name: str, value: str) -> None:
       item.update({"name": name, "value": value})
       return
   env.append({"name": name, "value": value})
+
+
+def container_env_value(container: dict[str, Any], name: str) -> str | None:
+  for item in container.get("env", []):
+    if item.get("name") == name:
+      return item.get("value")
+  return None

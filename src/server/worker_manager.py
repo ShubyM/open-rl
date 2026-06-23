@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Protocol
 
+from snapshot_agent.gpucr import gpucr_worker_env
 from snapshot_agent.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -72,6 +73,7 @@ class FFTWorkerManager:
       "OPEN_RL_TIME_SLICE_JOB_ID": workload_job_id("trainer", model_id),
       "OPEN_RL_TIME_SLICE_GROUP": TRAINER_TIME_SLICE_GROUP,
     }
+    env.update(gpucr_worker_env(env.get("LD_PRELOAD")))
     self.train_processes[model_id] = subprocess.Popen(
       _py_cmd(["gpu"], "server.training_requests_processor", model_id),
       cwd=self.project_dir,
@@ -94,6 +96,7 @@ class FFTWorkerManager:
       sampler_gpu = os.getenv("SAMPLER_CUDA_VISIBLE_DEVICES")
       if sampler_gpu:
         sampler_env["CUDA_VISIBLE_DEVICES"] = sampler_gpu
+      sampler_env.update(gpucr_worker_env(sampler_env.get("LD_PRELOAD")))
 
       self.sampler_processes[model_id] = subprocess.Popen(
         _py_cmd(["gpu", "vllm"], "server.vllm_sampler", model_id),

@@ -124,6 +124,26 @@ class FFTWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "trainer-Model_A.1")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "trainers")
 
+  async def test_local_launch_preloads_gpucr_when_backend_is_selected(self) -> None:
+    with (
+      patch.dict(
+        "os.environ",
+        {
+          "REDIS_URL": "redis://localhost:6379",
+          "OPEN_RL_SNAPSHOT_AGENT_BACKEND": "gpucr",
+          "GPUCR_PRELOAD": "/opt/gpucr/vGPU-NVIDIA.so",
+        },
+        clear=True,
+      ),
+      patch("server.worker_manager.subprocess.Popen") as popen,
+    ):
+      manager = FFTWorkerManager()
+      manager.launch("Model_A.1")
+
+    _, kwargs = popen.call_args
+    self.assertEqual(kwargs["env"]["LD_PRELOAD"], "/opt/gpucr/vGPU-NVIDIA.so")
+    self.assertEqual(kwargs["env"]["GPU_VENDOR"], "NVIDIA")
+
   async def test_local_sampler_launch_stamps_workload_tags_and_process_group(self) -> None:
     with (
       patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm"}, clear=True),

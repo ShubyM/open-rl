@@ -209,6 +209,30 @@ the relevant pod and process set.
   so all trainer worker pods can share one GPU through a single `ResourceClaim`.
 - Helm v3 for the DRA-driver chart.
 
+### Experimental GPU-CR backend
+
+The default cluster path remains llm-d. The server image also includes GPU-CR's
+NVIDIA preload library and `cr_client` binaries, so a test cluster can opt into
+GPU-CR by changing the OpenRL time-slicer DaemonSet to:
+
+```yaml
+args:
+  ["--listen-host", "0.0.0.0", "--port", "9753", "--backend", "gpucr"]
+```
+
+The worker launcher only injects GPU-CR preload env when the gateway has:
+
+```yaml
+- name: OPEN_RL_SNAPSHOT_AGENT_BACKEND
+  value: gpucr
+```
+
+For file-backed staging, also set `EXPORT_FILE_PATH` on the gateway so launched
+trainer and sampler pods inherit it. For hugepage-backed staging, prepare the
+GPU node with GPU-CR's expected `/mnt/huge-ckpt` hugetlbfs mount. This first
+pass does not switch the checked-in manifests to GPU-CR because the default
+llm-d path owns Kubernetes pod/PID discovery today.
+
 ## Fast dev loop with Skaffold
 
 For Python-only changes, use Skaffold instead of rebuilding and pushing the

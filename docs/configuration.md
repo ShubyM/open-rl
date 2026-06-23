@@ -75,6 +75,11 @@ make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
 | `OPEN_RL_SNAPSHOT_AGENT_SOCKET` | `/tmp/open-rl/snapshot-agent.sock` | Unix socket path for a local snapshot agent. Used when `OPEN_RL_SNAPSHOT_AGENT_HOST` is unset. |
 | `OPEN_RL_SNAPSHOT_AGENT_HOST` | unset | Node-local snapshot-agent host for Kubernetes workers. When set, the worker uses TCP instead of the Unix socket; Kubernetes sets this from `status.hostIP`. |
 | `OPEN_RL_SNAPSHOT_AGENT_PORT` | `9753` | Node-local snapshot-agent TCP port for Kubernetes workers. |
+| `OPEN_RL_SNAPSHOT_AGENT_BACKEND` | `cuda` locally, `llmd` in the time-slice manifests | Snapshot backend used by `snapshot_agent.serve`: `cuda`, `llmd`, or experimental `gpucr`. |
+| `GPUCR_PRELOAD` | `/usr/local/lib/open-rl/gpu-cr/vGPU-NVIDIA.so` in the server image | GPU-CR preload library injected into launched workers when `OPEN_RL_SNAPSHOT_AGENT_BACKEND=gpucr`. |
+| `GPUCR_CLIENT_BIN` | `cr_client` | GPU-CR single-process checkpoint/restore client used by the `gpucr` backend. |
+| `GPUCR_MULTI_CLIENT_BIN` | `multi_cr_client` | GPU-CR multi-process checkpoint/restore client used by the `gpucr` backend. |
+| `EXPORT_FILE_PATH` | unset | Optional GPU-CR file-backed VRAM staging directory. If unset, GPU-CR uses its hugepage staging path. |
 
 For local FFT subprocess mode, start `python -m snapshot_agent.serve` before the
 workers run. The local launcher tags each worker with a time-slice job id and
