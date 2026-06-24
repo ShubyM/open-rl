@@ -60,7 +60,6 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
       "REDIS_URL": "redis://redis-service:6379",
       "OPEN_RL_WORKER_POD_TEMPLATE": self.template_file.name,
       "OPEN_RL_WORKER_NAMESPACE": "training",
-      "OPEN_RL_TIME_SLICE_GROUP": "trainers",
     }
 
   def _manager(self, core_api: _FakeCoreApi) -> KubernetesFFTWorkerManager:
@@ -81,12 +80,48 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
         "app": "open-rl-trainer-worker",
         "snapshot-agent": "true",
         "timeslice.io/group": "trainers",
-        "timeslice.io/job-id": "model-a-1",
+        "timeslice.io/job-id": "trainer-model-a-1",
       },
     )
     container = body["spec"]["containers"][0]
     self.assertEqual(container["args"], ["--model-id", "Model_A.1"])
-    self.assertIn({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": "model-a-1"}, container["env"])
+    self.assertIn({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": "trainer-model-a-1"}, container["env"])
+    self.assertIn({"name": "OPEN_RL_TIME_SLICE_GROUP", "value": "trainers"}, container["env"])
+
+  def test_launch_replaces_stale_job_id_env_from_template(self) -> None:
+    api = _FakeCoreApi()
+    manager = self._manager(api)
+    manager.pod_template["spec"]["containers"][0]["env"].append({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": "stale-job"})
+    manager.pod_template["spec"]["containers"][0]["env"].append({"name": "OPEN_RL_TIME_SLICE_GROUP", "value": "stale-group"})
+
+    manager.launch("Model_A.1")
+
+    container = api.created[0][1]["spec"]["containers"][0]
+    env = {item["name"]: item["value"] for item in container["env"] if "value" in item}
+    self.assertEqual(env["OPEN_RL_TIME_SLICE_JOB_ID"], "trainer-model-a-1")
+    self.assertEqual(env["OPEN_RL_TIME_SLICE_GROUP"], "trainers")
+
+  def test_launch_sampler_stamps_sampler_identity(self) -> None:
+    api = _FakeCoreApi()
+    self._manager(api).launch_sampler("Model_A.1")
+
+    self.assertEqual(len(api.created), 1)
+    _, body = api.created[0]
+    self.assertEqual(body["metadata"]["name"], "open-rl-sampler-model-a-1")
+    self.assertEqual(
+      body["metadata"]["labels"],
+      {
+        "app": "open-rl-sampler-worker",
+        "snapshot-agent": "true",
+        "timeslice.io/group": "samplers",
+        "timeslice.io/job-id": "sampler-model-a-1",
+      },
+    )
+    container = body["spec"]["containers"][0]
+    self.assertEqual(container["command"], ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"])
+    self.assertEqual(container["args"], ["--model-id", "Model_A.1"])
+    self.assertIn({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": "sampler-model-a-1"}, container["env"])
+    self.assertIn({"name": "OPEN_RL_TIME_SLICE_GROUP", "value": "samplers"}, container["env"])
 
   def test_launch_is_idempotent_while_pod_is_live(self) -> None:
     api = _FakeCoreApi(pod_phases={"open-rl-trainer-model-a": "Running"})

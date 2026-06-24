@@ -1,15 +1,15 @@
 """Kubernetes manager for dedicated per-model trainer workers.
 
 Cluster-mode counterpart of FFTWorkerManager: instead of a local subprocess, each
-FFT model gets its own trainer worker pod, labeled with a stable per-model identity.
+FFT model gets its own trainer worker pod, labeled with a stable per-model id.
 The pod spec comes from a ConfigMap-mounted YAML template; this class only stamps the
 per-model name, labels, job-id env, and --model-id argument. The labels follow
 the time-slicing convention used by the node-local snapshot agent. DRA pinning
 is handled by the shared ResourceClaim in the pod template; the snapshot agent
 coordinates which colocated worker process may touch CUDA.
 
-Kept separate from worker_manager.py so the `kubernetes` dependency (the
-`cluster` extra) is only imported when this launcher is selected.
+This module is part of the cluster extra; importing it assumes Kubernetes
+dependencies are installed.
 """
 
 import copy
@@ -19,6 +19,9 @@ import time
 from typing import Any
 
 import yaml
+from kubernetes import client, config
+
+from snapshot_agent.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
 
 POD_NAME_PREFIX = "open-rl-trainer-"
 TERMINAL_POD_PHASES = {"Succeeded", "Failed"}
@@ -54,11 +57,8 @@ class KubernetesFFTWorkerManager:
     self.pod_template = self.trainer_template
 
     self.namespace = os.getenv("OPEN_RL_WORKER_NAMESPACE", "default")
-    self.group_id = os.getenv("OPEN_RL_TIME_SLICE_GROUP", "trainers")
 
     if core_api is None:
-      from kubernetes import client, config
-
       config.load_incluster_config()
       core_api = client.CoreV1Api()
     self.core_api = core_api
@@ -108,13 +108,14 @@ class KubernetesFFTWorkerManager:
     metadata = pod.setdefault("metadata", {})
     metadata["name"] = pod_name
     app_label = "open-rl-trainer-worker" if role == "trainer" else "open-rl-sampler-worker"
-    group_val = self.group_id if role == "trainer" else "samplers"
+    role_group = TRAINER_TIME_SLICE_GROUP if role == "trainer" else SAMPLER_TIME_SLICE_GROUP
+    role_job_id = workload_job_id(role, job_id)
     metadata.setdefault("labels", {}).update(
       {
         "app": app_label,
         "snapshot-agent": "true",
-        "timeslice.io/group": group_val,
-        "timeslice.io/job-id": job_id,
+        "timeslice.io/group": role_group,
+        "timeslice.io/job-id": role_job_id,
       }
     )
 
@@ -125,9 +126,10 @@ class KubernetesFFTWorkerManager:
     if role == "sampler":
       container["command"] = ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"]
     container.setdefault("args", []).extend(["--model-id", model_id])
-    env_list = container.setdefault("env", [])
-    env_list.append({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": job_id})
-    env_list.append({"name": "OPEN_RL_TIMESLICE_GROUP", "value": group_val})
+    # Keep env aligned with labels so process discovery and llm-d target the
+    # same workload identity.
+    set_env(container, "OPEN_RL_TIME_SLICE_JOB_ID", role_job_id)
+    set_env(container, "OPEN_RL_TIME_SLICE_GROUP", role_group)
     return pod
 
   def read_pod(self, pod_name: str) -> Any | None:
@@ -145,3 +147,13 @@ class KubernetesFFTWorkerManager:
       if time.monotonic() > deadline:
         raise RuntimeError(f"pod {pod_name} did not terminate within {timeout:.0f}s; cannot relaunch worker")
       time.sleep(0.5)
+
+
+def set_env(container: dict[str, Any], name: str, value: str) -> None:
+  env = container.setdefault("env", [])
+  for item in env:
+    if item.get("name") == name:
+      item.clear()
+      item.update({"name": name, "value": value})
+      return
+  env.append({"name": name, "value": value})

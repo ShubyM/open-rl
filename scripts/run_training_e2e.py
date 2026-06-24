@@ -431,22 +431,25 @@ def check_snapshot_interleaving(config: RunConfig) -> None:
     return
   text = log_path.read_text(encoding="utf-8", errors="replace")
 
-  cp_t = set(re.findall(r"checkpointed pid (\d+) \(group trainers\)", text))
-  rs_t = set(re.findall(r"restored pid (\d+) \(group trainers\)", text))
+  checkpointed = set(re.findall(r"checkpointed workload (\S+) group \S+", text))
+  restored = set(re.findall(r"restored workload (\S+) group \S+", text))
+
+  cp_t = {workload for workload in checkpointed if ":trainer-" in workload or workload.startswith("trainer-")}
+  rs_t = {workload for workload in restored if ":trainer-" in workload or workload.startswith("trainer-")}
   if len(cp_t) < 2 or len(rs_t) < 2:
     raise RuntimeError(
       f"Expected both FFT trainer workers to interleave, but saw checkpoints {sorted(cp_t)} and restores {sorted(rs_t)} in {log_path}"
     )
-  print(f"[training-e2e] trainer snapshot agent time-sliced: checkpointed pids {sorted(cp_t)}, restored pids {sorted(rs_t)}")
+  print(f"[training-e2e] trainer snapshot agent time-sliced: checkpointed workloads {sorted(cp_t)}, restored workloads {sorted(rs_t)}")
 
   if config.sampling_backend == "vllm":
-    cp_s = set(re.findall(r"checkpointed pid (\d+) \(group samplers\)", text))
-    rs_s = set(re.findall(r"restored pid (\d+) \(group samplers\)", text))
+    cp_s = {workload for workload in checkpointed if ":sampler-" in workload or workload.startswith("sampler-")}
+    rs_s = {workload for workload in restored if ":sampler-" in workload or workload.startswith("sampler-")}
     if len(cp_s) < 2 or len(rs_s) < 2:
       raise RuntimeError(
         f"Expected both FFT sampler workers to interleave, but saw checkpoints {sorted(cp_s)} and restores {sorted(rs_s)} in {log_path}"
       )
-    print(f"[training-e2e] sampler snapshot agent time-sliced: checkpointed pids {sorted(cp_s)}, restored pids {sorted(rs_s)}")
+    print(f"[training-e2e] sampler snapshot agent time-sliced: checkpointed workloads {sorted(cp_s)}, restored workloads {sorted(rs_s)}")
 
 
 def run_gsm8k_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:

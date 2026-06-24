@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Protocol
 
+from snapshot_agent.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
+
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 
@@ -64,11 +66,17 @@ class FFTWorkerManager:
     if proc is not None and proc.poll() is None:
       return
 
-    env = {**os.environ, "OPEN_RL_ENABLE_FFT": "true", "OPEN_RL_TIMESLICE_GROUP": "trainers"}
+    env = {
+      **os.environ,
+      "OPEN_RL_ENABLE_FFT": "true",
+      "OPEN_RL_TIME_SLICE_JOB_ID": workload_job_id("trainer", model_id),
+      "OPEN_RL_TIME_SLICE_GROUP": TRAINER_TIME_SLICE_GROUP,
+    }
     self.train_processes[model_id] = subprocess.Popen(
       _py_cmd(["gpu"], "server.training_requests_processor", model_id),
       cwd=self.project_dir,
       env=env,
+      start_new_session=True,
     )
 
   def launch_sampler(self, model_id: str) -> None:
@@ -81,7 +89,8 @@ class FFTWorkerManager:
     if sampling_backend == "vllm":
       sampler_env = env.copy()
       sampler_env["OPEN_RL_MODEL_ID"] = model_id
-      sampler_env["OPEN_RL_TIMESLICE_GROUP"] = "samplers"
+      sampler_env["OPEN_RL_TIME_SLICE_JOB_ID"] = workload_job_id("sampler", model_id)
+      sampler_env["OPEN_RL_TIME_SLICE_GROUP"] = SAMPLER_TIME_SLICE_GROUP
       sampler_gpu = os.getenv("SAMPLER_CUDA_VISIBLE_DEVICES")
       if sampler_gpu:
         sampler_env["CUDA_VISIBLE_DEVICES"] = sampler_gpu
@@ -90,6 +99,7 @@ class FFTWorkerManager:
         _py_cmd(["gpu", "vllm"], "server.vllm_sampler", model_id),
         cwd=self.project_dir,
         env=sampler_env,
+        start_new_session=True,
       )
 
   def shutdown(self, model_id: str) -> None:

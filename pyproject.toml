@@ -47,6 +47,7 @@ vllm = [
 # Kubernetes cluster mode: the k8s API client used to launch FFT worker pods.
 cluster = [
     "kubernetes>=29",
+    "timeslice @ git+https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git#subdirectory=pkg/client/python",
 ]
 
 [tool.setuptools.package-dir]

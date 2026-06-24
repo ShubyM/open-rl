@@ -4,7 +4,8 @@ FROM nvidia/cuda:12.1.0-base-ubuntu22.04
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    UV_FROZEN=1
 
 # Install dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -40,13 +41,13 @@ ENV UV_COMPILE_BYTECODE=1 \
 # Install dependencies using uv with BuildKit cache
 # --frozen ensures it uses the uv.lock exactly
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --extra gpu --extra vllm
+    uv sync --frozen --no-install-project --extra gpu --extra vllm --extra cluster
 
 # Copy source code
 COPY . .
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --extra gpu --extra vllm
+    uv sync --frozen --extra gpu --extra vllm --extra cluster
 
 # TODO: this is a hack until vllm is fixed upstream
 # Apply Gemma 4 LoRA deduplication patch
