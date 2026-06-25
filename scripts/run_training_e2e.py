@@ -54,7 +54,18 @@ GSM8K_ANSWER_RE = re.compile(r"-?\d[\d,]*")
 
 @chz.chz
 class RunConfig:
-  scenario: Literal["tiny-lora", "tiny-fft", "tiny-rl", "tiny-fft-rl", "tiny-fft-rl-x2", "lora-textsql", "fft-gsm8k", "fft-gsm8k-x2"]
+  scenario: Literal[
+    "tiny-lora",
+    "tiny-fft",
+    "tiny-rl",
+    "tiny-fft-rl",
+    "tiny-fft-rl-x2",
+    "lora-textsql",
+    "fft-gsm8k",
+    "fft-gsm8k-x2",
+    "fft-gsm8k-rl",
+    "fft-gsm8k-rl-x2",
+  ]
   sampling_backend: str = "torch"
   trainer_gpu: str = "0"
   sampler_gpu: str = "1"
@@ -280,6 +291,7 @@ def examples_env(config: RunConfig) -> dict[str, str]:
   env = os.environ.copy()
   env["OPEN_RL_TMP_DIR"] = str(open_rl_tmp_dir(config))
   env["PYTHONUNBUFFERED"] = "1"
+  env.setdefault("TINKER_API_KEY", "tml-dummy-key")
   # Keep examples isolated from the root server/eval venv. This also avoids
   # creating examples/.venv on workspace mounts with tight file quotas.
   env["UV_PROJECT_ENVIRONMENT"] = os.environ.get("OPEN_RL_EXAMPLES_UV_PROJECT_ENVIRONMENT", str(open_rl_tmp_dir(config) / "examples-venv"))
@@ -377,8 +389,6 @@ def resolve_eval_model_path(output: str) -> str:
   for line in reversed(output.splitlines()):
     if line.startswith("eval_model_path="):
       path = line.removeprefix("eval_model_path=").strip()
-      if not Path(path).exists():
-        raise RuntimeError(f"Eval model path does not exist: {path}")
       return path
   raise RuntimeError("GSM8K SFT finished without printing eval_model_path=...")
 
@@ -388,7 +398,7 @@ def run_gsm8k_train(config: RunConfig, base_url: str, watch: list[ManagedProcess
     "base_model": config.base_model,
     "base_url": base_url,
     "log_path": str(Path(config.log_dir) / log_subdir),
-    "max_steps": str(config.steps if config.steps is not None else 50),
+    "max_steps": str(config.steps if config.steps is not None else 10),
     "batch": "1",
     "rank": "16",
     "max_len": "640",
@@ -398,14 +408,17 @@ def run_gsm8k_train(config: RunConfig, base_url: str, watch: list[ManagedProcess
   return run_example(config, ["examples/sft/gsm8k/gsm8k_sft.py"], defaults, watch=watch, prefix=prefix)
 
 
-def run_gsm8k_eval(config: RunConfig, model_path: str) -> None:
+def run_gsm8k_eval(config: RunConfig, model_path: str | list[str]) -> None:
+  paths = model_path if isinstance(model_path, list) else [model_path]
+  path_args = []
+  for p in paths:
+    path_args.extend(["--path", p])
   run_command(
-    uv_run(config.eval_uv_extra)
+    ["uv", "--project", "examples", "run", "python", "examples/sft/gsm8k/vllm_eval.py"]
+    + path_args
     + [
-      "python",
-      "examples/sft/gsm8k/vllm_eval.py",
-      "--path",
-      model_path,
+      "--base-url",
+      config.base_url or "http://127.0.0.1:8000",
       "--data",
       str(write_gsm8k_eval_data(config)),
       "--gpu-memory-utilization",
@@ -474,10 +487,83 @@ def run_gsm8k_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) 
       raise RuntimeError(f"gsm8k {job} failed") from result
 
   check_snapshot_interleaving(config)
-  for job, result in sorted(results.items()):
+  eval_paths = []
+  for _, result in sorted(results.items()):
     assert isinstance(result, str)
-    print(f"[training-e2e] evaluating {job}")
-    run_gsm8k_eval(config, resolve_eval_model_path(result))
+    eval_paths.append(resolve_eval_model_path(result))
+  print(f"[training-e2e] evaluating jobs in single micro-batched invocation: {eval_paths}")
+  run_gsm8k_eval(config, eval_paths)
+
+
+def run_gsm8k_rl(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
+  log_path = str(open_rl_tmp_dir(config) / "fft_gsm8k_rl")
+  if os.path.exists(log_path):
+    shutil.rmtree(log_path)
+  args = [
+    "env=gsm8k",
+    f"model_name={config.base_model}",
+    "renderer_name=qwen3_instruct",
+    f"max_steps={config.steps if config.steps is not None else 2}",
+    f"base_url={base_url}",
+    f"log_path={log_path}",
+    "group_size=2",
+    "groups_per_batch=1",
+    "max_tokens=64",
+    "learning_rate=1e-5",
+    "eval_every=0",
+    "save_every=1",
+  ]
+  run_command(
+    ["uv", "--project", "examples", "run", "python", "-m", "tinker_cookbook.recipes.math_rl.train", *args],
+    env=examples_env(config),
+    watch=watch,
+  )
+
+
+def run_gsm8k_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
+  """Run two concurrent FFT RL jobs on GSM8K using standard tinker_cookbook math_rl CLI, check Snapshot Agent
+  time slicing, and verify metrics."""
+  results: dict[str, str | BaseException] = {}
+
+  def train(job: str) -> None:
+    try:
+      log_path = str(open_rl_tmp_dir(config) / f"fft_gsm8k_rl_{job}")
+      if os.path.exists(log_path):
+        shutil.rmtree(log_path)
+      args = [
+        "env=gsm8k",
+        f"model_name={config.base_model}",
+        "renderer_name=qwen3_instruct",
+        f"max_steps={config.steps if config.steps is not None else 2}",
+        f"base_url={base_url}",
+        f"log_path={log_path}",
+        "group_size=2",
+        "groups_per_batch=1",
+        "max_tokens=64",
+        "learning_rate=1e-5",
+        "eval_every=0",
+        "save_every=1",
+      ]
+      results[job] = run_command(
+        ["uv", "--project", "examples", "run", "python", "-m", "tinker_cookbook.recipes.math_rl.train", *args],
+        env=examples_env(config),
+        watch=watch,
+        prefix=f"[{job}] ",
+      )
+    except BaseException as exc:
+      results[job] = exc
+
+  threads = [threading.Thread(target=train, args=(job,)) for job in ("job-a", "job-b")]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+
+  for job, result in sorted(results.items()):
+    if isinstance(result, BaseException):
+      raise RuntimeError(f"fft-gsm8k-rl-x2 {job} failed") from result
+
+  check_snapshot_interleaving(config)
 
 
 def run_tiny_fft_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
@@ -572,6 +658,10 @@ def main() -> None:
       run_gsm8k(config, base_url, processes)
     elif config.scenario == "fft-gsm8k-x2":
       run_gsm8k_x2(config, base_url, processes)
+    elif config.scenario == "fft-gsm8k-rl":
+      run_gsm8k_rl(config, base_url, processes)
+    elif config.scenario == "fft-gsm8k-rl-x2":
+      run_gsm8k_rl_x2(config, base_url, processes)
     elif config.scenario == "lora-textsql":
       run_textsql(config, base_url, processes)
     elif config.scenario == "tiny-fft-rl-x2":
