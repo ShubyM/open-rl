@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-rl"
-version = "0.1.0"
+version = "0.1.1"
 description = "Open-RL server and training runtime."
 readme = "README.md"
 requires-python = ">=3.12, <3.13"
@@ -48,6 +48,9 @@ vllm = [
 cluster = [
     "kubernetes>=29",
     "timeslice @ git+https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git#subdirectory=pkg/client/python",
+]
+dev = [
+    "ruff>=0.5.0",
 ]
 
 [tool.setuptools.package-dir]
