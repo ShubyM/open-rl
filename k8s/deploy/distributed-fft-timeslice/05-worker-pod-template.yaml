@@ -21,7 +21,7 @@ data:
       restartPolicy: OnFailure
       containers:
       - name: trainer-worker
-        image: gcr.io/cdrollouts-sunilarora/open-rl-server:0.1.5
+        image: gcr.io/cdrollouts-sunilarora/open-rl-server:0.1.7
         imagePullPolicy: IfNotPresent
         command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
         env:
@@ -50,12 +50,11 @@ data:
           claims:
           - name: trainer-gpu
           limits:
-            memory: "20Gi"
+            memory: "80Gi"
           requests:
-            # Sized generously for model load and optimizer state; increase this
-            # if a future coordination layer checkpoints GPU state to host RAM.
-            memory: "16Gi"
-            cpu: "2"
+            # Sized at 18Gi to allow concurrent pod scheduling on 42Gi allocatable nodes.
+            memory: "18Gi"
+            cpu: "4"
         volumeMounts:
         - name: shared-storage
           mountPath: /mnt/shared
