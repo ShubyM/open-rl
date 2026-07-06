@@ -1,0 +1,14 @@
+# kind replacement for 01-shared-pvc.yaml: the local-path provisioner only
+# supports ReadWriteOnce, which is equivalent on a single-node cluster —
+# every pod mounts the same node-local volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-rl-shared-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 50Gi

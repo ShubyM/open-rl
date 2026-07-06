@@ -1,0 +1,76 @@
+# Single-node kind deployment of the FFT time-slice stack for local GPU boxes.
+# See docs/setup/kind-dev-cluster.md and hack/kind/kind-up.sh.
+#
+# The redis/rbac/gateway/claim/daemonset manifests are vendored copies of the
+# distributed-fft-timeslice base (kustomize load restrictions forbid referencing
+# individual files outside this directory). Kept byte-identical to the base;
+# kind-specific changes live in the patches below or in the kind-only files
+# (pvc.yaml, *-pod-template.yaml). Excluded from the base on purpose: 01 (RWX
+# storage class), 05/09 (H100 nodeSelector + sizing), 08 (single-GPU mode shares
+# the trainer claim), 10 (GCP-only PodMonitoring CRD).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 02-redis.yaml
+  - 03-rbac.yaml
+  - 04-gateway.yaml
+  - 06-gpu-resourceclaim.yaml
+  - 07-accel-timeslicer-daemonset.yaml
+  - pvc.yaml
+  - worker-pod-template.yaml
+  - sampler-pod-template.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: open-rl-config
+    literals:
+      - BASE_MODEL="Qwen/Qwen2.5-0.5B"
+      - ENABLE_GCP_TRACE="0"
+
+# Locally built images, side-loaded with `kind load docker-image` (make kind-images).
+images:
+  - name: gcr.io/cdrollouts-sunilarora/open-rl-server
+    newName: open-rl-server
+    newTag: kind-dev
+  - name: gcr.io/cdrollouts-sunilarora/open-rl-gateway
+    newName: open-rl-gateway
+    newTag: kind-dev
+
+patches:
+  # Dynamically launched worker/sampler pods must use the locally loaded image.
+  - target:
+      kind: Deployment
+      name: open-rl-gateway
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-gateway
+      spec:
+        template:
+          spec:
+            containers:
+              - name: gateway
+                env:
+                  - name: OPEN_RL_WORKER_IMAGE
+                    value: "open-rl-server:kind-dev"
+  # No cuda-checkpoint / llm-d locally: serialize cooperatively via the noop
+  # backend. Swap to "cuda" on bare-metal Linux boxes with cuda-checkpoint baked
+  # into the image (requires hostPID).
+  - target:
+      kind: DaemonSet
+      name: open-rl-accel-timeslicer
+    patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: open-rl-accel-timeslicer
+      spec:
+        template:
+          spec:
+            containers:
+              - name: accel-timeslicer
+                args: ["--listen-host", "0.0.0.0", "--port", "9753", "--backend", "noop", "--scheduling-policy", "lrs"]

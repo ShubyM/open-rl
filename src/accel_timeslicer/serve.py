@@ -7,7 +7,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from .checkpoint import CudaCheckpointRestorer
+from .checkpoint import CudaCheckpointRestorer, NoopCheckpointRestorer
 from .llmd import LlmDCheckpointRestorer
 from .single_node import SingleNodeTimeSlicer
 from .workload import DEFAULT_TIME_SLICE_GROUP, WorkloadRef
@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--socket", default=os.getenv("OPEN_RL_ACCEL_TIMESLICER_SOCKET", "/tmp/open-rl/accel-timeslicer.sock"))
   parser.add_argument("--listen-host", default=None)
   parser.add_argument("--port", type=int, default=None)
-  parser.add_argument("--backend", choices=["cuda", "llmd"], default=os.getenv("OPEN_RL_ACCEL_TIMESLICER_BACKEND", "cuda"))
+  parser.add_argument("--backend", choices=["cuda", "llmd", "noop"], default=os.getenv("OPEN_RL_ACCEL_TIMESLICER_BACKEND", "cuda"))
   parser.add_argument("--cuda-checkpoint-bin", default=os.getenv("CUDA_CHECKPOINT_BIN", "cuda-checkpoint"))
   parser.add_argument("--cuda-checkpoint-timeout-ms", type=int, default=None)
   parser.add_argument("--llmd-snapshot-endpoint", default=os.getenv("LLMD_SNAPSHOT_AGENT_ENDPOINT", "127.0.0.1:9001"))
@@ -100,10 +100,11 @@ async def main_async() -> None:
     if LlmDClient is None:
       raise RuntimeError("--backend llmd requires the llm-d timeslice snapshot client package")
     restorer = LlmDCheckpointRestorer(LlmDClient(endpoint=args.llmd_snapshot_endpoint), args.llmd_backend, args.llmd_poll_interval_sec)
-    time_slicer = SingleNodeTimeSlicer(restorer=restorer, scheduling_policy=args.scheduling_policy)
+  elif args.backend == "noop":
+    restorer = NoopCheckpointRestorer()
   else:
     restorer = CudaCheckpointRestorer(args.cuda_checkpoint_bin, args.cuda_checkpoint_timeout_ms)
-    time_slicer = SingleNodeTimeSlicer(restorer=restorer, scheduling_policy=args.scheduling_policy)
+  time_slicer = SingleNodeTimeSlicer(restorer=restorer, scheduling_policy=args.scheduling_policy)
   if args.port is None:
     server = await start_time_slicer(time_slicer, args.socket)
     logger.info("listening on unix://%s", args.socket)

@@ -1,0 +1,20 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: open-rl
+nodes:
+  # Kubernetes 1.34 has DRA GA, so no feature gates are needed.
+  - role: control-plane
+    image: kindest/node:v1.34.0
+    labels:
+      group.timeslice.io/trainers: "true"
+      group.timeslice.io/samplers: "true"
+      # The NVIDIA DRA driver's kubelet plugin schedules only onto nodes with
+      # node-feature-discovery PCI labels (10de = NVIDIA vendor id). kind has
+      # no NFD, so set the label statically.
+      feature.node.kubernetes.io/pci-10de.present: "true"
+    extraMounts:
+      # nvidia-container-toolkit injects all host GPUs into the node container
+      # when it sees this mount; requires nvidia runtime as docker default AND
+      # accept-nvidia-visible-devices-as-volume-mounts=true.
+      - hostPath: /dev/null
+        containerPath: /var/run/nvidia-container-devices/all

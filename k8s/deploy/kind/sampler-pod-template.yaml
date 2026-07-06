@@ -1,0 +1,67 @@
+# kind pod template variant for small models with a locally loaded image.
+# (server/k8s_worker_manager.py). All sampler worker pods share the trainer
+# DRA ResourceClaim open-rl-trainer-gpu-1 in single-GPU mode. The node-local
+# snapshot agent time-slices GPU access across concurrent inference engines.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: open-rl-sampler-worker-pod-template
+data:
+  sampler-worker-pod.yaml: |
+    apiVersion: v1
+    kind: Pod
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: sampler-worker
+        image: open-rl-server:kind-dev
+        imagePullPolicy: IfNotPresent
+        command: ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"]
+        env:
+        - name: REDIS_URL
+          value: "redis://redis-service:6379?max_connections=500"
+        - name: BASE_MODEL
+          valueFrom:
+            configMapKeyRef:
+              name: open-rl-config
+              key: BASE_MODEL
+        - name: OPEN_RL_ENABLE_FFT
+          value: "true"
+        - name: VLLM_GPU_MEMORY_UTILIZATION
+          value: "0.35"
+        - name: OPEN_RL_TMP_DIR
+          value: "/mnt/shared/open-rl"
+        - name: HF_HOME
+          value: "/mnt/shared/open-rl/huggingface"
+        - name: OPEN_RL_ACCEL_TIMESLICER_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: OPEN_RL_ACCEL_TIMESLICER_PORT
+          value: "9753"
+        resources:
+          claims:
+          - name: sampler-gpu
+          limits:
+            memory: "12Gi"
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+        volumeMounts:
+        - name: shared-storage
+          mountPath: /mnt/shared
+      resourceClaims:
+      # Single-GPU mode: samplers share the trainer GPU claim while keeping the
+      # sampler-gpu claim name that the container resource reference uses.
+      - name: sampler-gpu
+        resourceClaimName: open-rl-trainer-gpu-1
+      volumes:
+      - name: shared-storage
+        persistentVolumeClaim:
+          claimName: open-rl-shared-pvc
+      nodeSelector:
+        group.timeslice.io/samplers: "true"
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"

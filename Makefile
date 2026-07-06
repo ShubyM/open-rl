@@ -1,4 +1,4 @@
-.PHONY: server vllm test lint fmt help push-vm pull-vm cluster-eval
+.PHONY: server vllm test lint fmt help push-vm pull-vm cluster-eval kind-up kind-down kind-images kind-deploy kind-status
 
 # ---------------------------------------------------------------------------
 # Knobs (override on the command line: make server BASE_MODEL=... SAMPLING_BACKEND=...)
@@ -46,6 +46,11 @@ help:
 	@echo "make test e2e fft-gsm8k TRAINING_TEST_ARGS='steps=10 eval_examples=8 extra=\"batch=2\"'"
 	@echo "make test piglatin                      # pig-latin example end-to-end tests"
 	@echo "make cluster-eval EVAL_MODEL_PATH=/mnt/shared/open-rl/checkpoints/...  # one-off vLLM eval job on the cluster"
+	@echo "make kind-up                            # create local single-node GPU kind cluster"
+	@echo "make kind-images                        # build and load local kind images"
+	@echo "make kind-deploy                        # deploy the kind FFT time-slice stack"
+	@echo "make kind-status                        # show kind pods, claims, and device classes"
+	@echo "make kind-down                          # delete the local kind cluster"
 	@echo "make lint | fmt"
 
 # ---------------------------------------------------------------------------
@@ -140,6 +145,25 @@ deploy:
 # See docs/setup/gke-fft-timeslice.md.
 deploy-fft-timeslice:
 	kubectl apply -k k8s/deploy/distributed-fft-timeslice/
+
+kind-up:
+	bash hack/kind/kind-up.sh
+
+kind-down:
+	kind delete cluster --name open-rl
+
+kind-images:
+	DOCKER_BUILDKIT=1 docker build -t open-rl-server:kind-dev -f src/server/Dockerfile .
+	DOCKER_BUILDKIT=1 docker build -t open-rl-gateway:kind-dev -f src/server/Dockerfile.gateway .
+	kind load docker-image open-rl-server:kind-dev open-rl-gateway:kind-dev --name open-rl
+
+kind-deploy:
+	kubectl apply -k k8s/deploy/kind/
+
+kind-status:
+	-kubectl get pods -o wide
+	-kubectl get resourceclaims
+	-kubectl get deviceclass
 
 rollout:
 	kubectl rollout restart deployment redis-store open-rl-gateway open-rl-trainer-worker vllm-worker

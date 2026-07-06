@@ -19,6 +19,23 @@ class CheckpointRestorer(Protocol):
     pass
 
 
+class NoopCheckpointRestorer:
+  """Skips physical checkpoint/restore while keeping the acquire/release protocol intact.
+
+  Serialization of GPU access becomes purely cooperative (workers still sleep()
+  before release), so this is for dev environments without cuda-checkpoint or
+  llm-d, e.g. kind clusters and CPU-only CI. Inactive workloads keep their
+  CUDA contexts resident on the GPU.
+  """
+
+  def checkpoint(self, workload: WorkloadRef) -> bool:
+    logger.info("noop checkpoint workload=%s", workload.key)
+    return True
+
+  def restore(self, workload: WorkloadRef) -> None:
+    logger.info("noop restore workload=%s", workload.key)
+
+
 class CudaCheckpointRestorer:
   def __init__(self, cuda_checkpoint_bin: str | None = None, timeout_ms: int | None = None):
     self.cuda_checkpoint_bin = cuda_checkpoint_bin or os.getenv("CUDA_CHECKPOINT_BIN", "cuda-checkpoint")

@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from accel_timeslicer.checkpoint import CudaCheckpointRestorer
+from accel_timeslicer.checkpoint import CudaCheckpointRestorer, NoopCheckpointRestorer
 from accel_timeslicer.llmd import LlmDCheckpointRestorer
 from accel_timeslicer.serve import start_tcp_time_slicer, start_time_slicer
 from accel_timeslicer.single_node import SingleNodeTimeSlicer
@@ -62,6 +62,21 @@ class NoSnapshotRestorer(RecordingRestorer):
 
 
 class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
+  async def test_noop_backend_serializes_without_physical_checkpoint(self) -> None:
+    agent = SingleNodeTimeSlicer(NoopCheckpointRestorer())
+    await agent.register(WorkloadRef(job_id="101"))
+    await agent.register(WorkloadRef(job_id="202"))
+
+    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
+    blocked = asyncio.create_task(agent.acquire(WorkloadRef(job_id="202")))
+    await asyncio.sleep(0.05)
+    self.assertFalse(blocked.done())
+
+    self.assertTrue((await agent.release(WorkloadRef(job_id="101")))["ok"])
+    self.assertTrue((await asyncio.wait_for(blocked, timeout=1.0))["ok"])
+    self.assertTrue((await agent.release(WorkloadRef(job_id="202")))["ok"])
+    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
+
   async def test_agent_grants_only_one_active_process_at_a_time(self) -> None:
     restorer = RecordingRestorer()
     agent = SingleNodeTimeSlicer(restorer)
