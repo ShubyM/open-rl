@@ -13,16 +13,15 @@ from pathlib import Path
 from typing import Any
 
 import chz
+from renderer import register_gemma4_tool_renderer
+from reward import LabRubricReward
 from tinker_cookbook import model_info, tokenizer_utils
 from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.renderers.base import Message, Renderer
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetBuilder
 from tinker_cookbook.tool_use import build_agent_tool_env
 from tinker_cookbook.tool_use.types import Tool
-
-from recipes.harvey_labs.renderer import register_gemma4_tool_renderer
-from recipes.harvey_labs.reward import LabRubricReward
-from recipes.harvey_labs.tools import build_lab_tools
+from tools import build_lab_tools
 
 logger = logging.getLogger(__name__)
 

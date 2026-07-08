@@ -6,11 +6,10 @@ import asyncio
 from pathlib import Path
 
 import chz
+from env import LabDatasetBuilder
+from renderer import register_gemma4_tool_renderer
 from tinker_cookbook.rl import train as rl_train
 from tinker_utils import LimitedDatasetBuilder, force_rich_log_colors, resolve_base_url
-
-from recipes.harvey_labs.env import LabDatasetBuilder
-from recipes.harvey_labs.renderer import register_gemma4_tool_renderer
 
 MODEL_NAME = "gemma-4-e4b"
 RENDERER_NAME = "gemma4"

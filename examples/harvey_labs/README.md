@@ -32,7 +32,7 @@ Tiny LAB run:
 ```bash
 export PATH=$PATH:$HOME/.local/bin
 TINKER_API_KEY=tml-dummy-key TINKER_BASE_URL=http://127.0.0.1:9003 \
-uv --project examples run python -m recipes.harvey_labs.train \
+uv --project examples run python examples/harvey_labs/train.py \
   base-url=http://127.0.0.1:9003 \
   lab-root=experiments/lab-traces/harvey-labs \
   train-limit=1 eval-limit=0 \
