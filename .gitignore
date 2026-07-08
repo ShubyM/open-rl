@@ -57,3 +57,8 @@ Thumbs.db
 
 # Local benchmark run outputs
 runs/
+
+# Harvey LAB trace collection
+experiments/lab-traces/harvey-labs/
+experiments/lab-traces/traces/
+experiments/lab-traces/split.json
