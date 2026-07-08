@@ -21,7 +21,9 @@ data:
       restartPolicy: OnFailure
       containers:
       - name: trainer-worker
-        image: gcr.io/cdrollouts-sunilarora/open-rl-server:0.1.30
+        # Fallback only: the gateway overwrites this with OPEN_RL_WORKER_IMAGE
+        # when rendering pods (server/k8s_worker_manager.py).
+        image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: IfNotPresent
         command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
         env:
