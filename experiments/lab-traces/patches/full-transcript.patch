@@ -1,8 +1,51 @@
 diff --git a/evaluation/judge.py b/evaluation/judge.py
-index ffad89de..37d143af 100644
+index ffad89de..d9d0595b 100644
 --- a/evaluation/judge.py
 +++ b/evaluation/judge.py
-@@ -232,6 +232,24 @@ class Judge:
+@@ -12,7 +12,7 @@ from pathlib import Path
+ import anthropic
+ import openai
+ from google import genai
+-from google.genai import types
++from google.genai import errors, types
+ from mistralai.client import Mistral
+ 
+ PROMPTS_DIR = Path(__file__).parent / "prompts"
+@@ -136,16 +136,28 @@ class Judge:
+                 temperature=temperature,
+                 max_output_tokens=16384,
+                 response_mime_type="application/json",
++                thinking_config=types.ThinkingConfig(thinking_budget=0),
+             )
+             # Constrain to the verdict schema on early attempts; drop it on the last.
+             if attempt < _retries - 1:
+                 config_kwargs["response_schema"] = _VERDICT_SCHEMA
+             try:
+-                response = self.client.models.generate_content(
+-                    model=self.model,
+-                    contents=prompt,
+-                    config=types.GenerateContentConfig(**config_kwargs),
+-                )
++                try:
++                    response = self.client.models.generate_content(
++                        model=self.model,
++                        contents=prompt,
++                        config=types.GenerateContentConfig(**config_kwargs),
++                    )
++                except (TypeError, errors.ClientError) as e:
++                    if not isinstance(e, TypeError) and "thinking" not in str(e).lower():
++                        raise
++                    fallback_kwargs = dict(config_kwargs)
++                    fallback_kwargs.pop("thinking_config", None)
++                    response = self.client.models.generate_content(
++                        model=self.model,
++                        contents=prompt,
++                        config=types.GenerateContentConfig(**fallback_kwargs),
++                    )
+             except Exception as e:
+                 last_err = e
+                 continue
+@@ -232,6 +244,24 @@ class Judge:
      @staticmethod
      def _parse_json(text: str) -> dict:
          """Extract JSON from model response, handling markdown fences."""
@@ -28,12 +71,12 @@ index ffad89de..37d143af 100644
          match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
          if match:
 diff --git a/harness/adapters/google.py b/harness/adapters/google.py
-index 262464e9..2971e112 100644
+index 262464e9..f7d8056e 100644
 --- a/harness/adapters/google.py
 +++ b/harness/adapters/google.py
 @@ -9,8 +9,11 @@ The SDK chat handles thought signatures automatically.
  """
-
+ 
  import json
 +import random
 +import re
@@ -42,18 +85,18 @@ index 262464e9..2971e112 100644
 -from google.genai import types
 +from google.genai import errors, types
  from harness.adapters.base import ModelAdapter, ModelResponse, ToolCall
-
-
+ 
+ 
 @@ -101,7 +104,7 @@ class GoogleAdapter(ModelAdapter):
                          user_msg = msg.get("content", "")
                      break
-
+ 
 -            response = self._chat.send_message(user_msg or "Begin.")
 +            response = self._send_message_with_retry(user_msg or "Begin.")
          else:
              last_msg = messages[-1]
              if last_msg.get("role") == "user" and "parts" in last_msg:
-@@ -115,10 +118,10 @@ class GoogleAdapter(ModelAdapter):
+@@ -115,11 +118,25 @@ class GoogleAdapter(ModelAdapter):
                          ))
                      elif "text" in part_dict:
                          parts.append(types.Part.from_text(text=part_dict["text"]))
@@ -63,13 +106,28 @@ index 262464e9..2971e112 100644
                  text = last_msg.get("content", "") if "content" in last_msg else ""
 -                response = self._chat.send_message(text or "Continue.")
 +                response = self._send_message_with_retry(text or "Continue.")
-
+ 
++        model_response = self._model_response_from_google_response(response)
++        for _ in range(3):
++            if model_response.tool_calls or model_response.text:
++                break
++            response = self._send_message_with_retry(
++                "Continue: execute your next tool call, or if the task is complete, "
++                "state your final summary as plain text."
++            )
++            model_response = self._model_response_from_google_response(response)
++
++        return model_response
++
++    @staticmethod
++    def _model_response_from_google_response(response) -> ModelResponse:
          # Extract tool calls and text from response
          tool_calls = []
-@@ -160,6 +163,52 @@ class GoogleAdapter(ModelAdapter):
+         text_parts = []
+@@ -160,6 +177,52 @@ class GoogleAdapter(ModelAdapter):
              output_tokens=usage.candidates_token_count if usage else 0,
          )
-
+ 
 +    def _send_message_with_retry(self, content):
 +        for attempt in range(5):
 +            try:
@@ -125,7 +183,7 @@ index bc186a6b..5e2183d4 100644
 +++ b/harness/agent_loop.py
 @@ -53,9 +53,12 @@ def run_agent(
      start_time = time.time()
-
+ 
      transcript_file = None
 +    full_transcript_file = None
      if transcript_path:
@@ -134,7 +192,7 @@ index bc186a6b..5e2183d4 100644
 +        transcript_dir.mkdir(parents=True, exist_ok=True)
          transcript_file = open(transcript_path, "w")
 +        full_transcript_file = open(transcript_dir / "full_transcript.jsonl", "w")
-
+ 
      context_overflow = False
      try:
 @@ -80,6 +83,8 @@ def run_agent(
@@ -143,27 +201,27 @@ index bc186a6b..5e2183d4 100644
                  _log_turn(transcript_file, turn_count, "assistant", response)
 +            if full_transcript_file:
 +                _log_full_turn(full_transcript_file, turn_count, "assistant", response)
-
+ 
              # If no tool calls, the agent is done
              if not response.tool_calls:
 @@ -92,6 +97,8 @@ def run_agent(
-
+ 
                  if transcript_file:
                      _log_tool(transcript_file, turn_count, tc.name, tc.arguments, result)
 +                if full_transcript_file:
 +                    _log_full_tool(full_transcript_file, turn_count, tc.name, tc.arguments, result)
-
+ 
                  tool_results.append((tc, result))
-
+ 
 @@ -104,6 +111,8 @@ def run_agent(
      finally:
          if transcript_file:
              transcript_file.close()
 +        if full_transcript_file:
 +            full_transcript_file.close()
-
+ 
      elapsed = time.time() - start_time
-
+ 
 @@ -149,3 +158,33 @@ def _log_tool(f, turn: int, name: str, arguments: str, result: str):
      }
      f.write(json.dumps(entry) + "\n")
