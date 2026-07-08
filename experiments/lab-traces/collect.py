@@ -22,6 +22,18 @@ from typing import Any
 STOP_REQUESTED = threading.Event()
 MANIFEST_LOCK = threading.Lock()
 FILTERED_WORDS = re.compile(r"\b(criterion|criteria|rubric|judge|verdict|pass|passed|fail|failed)\b", re.IGNORECASE)
+OUTPUT_INSTRUCTIONS_SUFFIX = (
+    "\n\nSave every deliverable to /workspace/output using exactly the filename "
+    "specified in the instructions."
+)
+
+
+class AttemptEvaluationError(Exception):
+    def __init__(self, run_dir: Path, metrics: dict[str, Any], cause: Exception):
+        super().__init__(repr(cause))
+        self.run_dir = run_dir
+        self.metrics = metrics
+        self.cause = cause
 
 
 def parse_args() -> argparse.Namespace:
@@ -148,6 +160,36 @@ def build_feedback(failed: list[dict[str, Any]]) -> str:
     return "\n\n" + "\n".join(lines)
 
 
+def read_run_metrics(run_dir: Path) -> dict[str, Any]:
+    metrics_path = run_dir / "metrics.json"
+    if not metrics_path.exists():
+        return {}
+    try:
+        return json.loads(metrics_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def token_counts(metrics: dict[str, Any]) -> tuple[int, int]:
+    return (
+        int(metrics.get("input_tokens", 0) or 0),
+        int(metrics.get("output_tokens", 0) or 0),
+    )
+
+
+def evaluate_with_retry(lab, run_id: str, task_name: str, judge) -> dict[str, Any]:
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            return lab.evaluate_run(run_id=run_id, task=task_name, judge=judge, parallel=1)
+        except Exception as exc:
+            last_err = exc
+            if attempt == 0:
+                time.sleep(30)
+    assert last_err is not None
+    raise last_err
+
+
 def run_attempt(
     lab,
     lab_root: Path,
@@ -205,7 +247,7 @@ def run_attempt(
         result = lab.run_agent(
             adapter=adapter,
             system_prompt=system_prompt,
-            user_prompt=task["instructions"] + instructions_suffix,
+            user_prompt=task["instructions"] + OUTPUT_INSTRUCTIONS_SUFFIX + instructions_suffix,
             tool_executor=tool_executor,
             tools=lab.get_all_tool_definitions(),
             max_turns=args.max_turns,
@@ -230,7 +272,10 @@ def run_attempt(
     (results_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     judge = lab.Judge(model=args.judge_model)
-    scores = lab.evaluate_run(run_id=run_id, task=task_name, judge=judge, parallel=1)
+    try:
+        scores = evaluate_with_retry(lab, run_id, task_name, judge)
+    except Exception as exc:
+        raise AttemptEvaluationError(results_dir, read_run_metrics(results_dir) or metrics, exc) from exc
     return results_dir, metrics, scores
 
 
@@ -269,8 +314,10 @@ def collect_one(lab, lab_root: Path, task_name: str, args: argparse.Namespace, m
                 break
             attempts = attempt
             run_dir, metrics, scores = run_attempt(lab, lab_root, task_name, feedback, attempt, args)
-            input_tokens += int(metrics.get("input_tokens", 0) or 0)
-            output_tokens += int(metrics.get("output_tokens", 0) or 0)
+            metrics = read_run_metrics(run_dir) or metrics
+            attempt_input_tokens, attempt_output_tokens = token_counts(metrics)
+            input_tokens += attempt_input_tokens
+            output_tokens += attempt_output_tokens
             if scores.get("all_pass"):
                 keep_attempt(task_name, run_dir, scores, args, attempt)
                 append_manifest(manifest_path, {
@@ -292,6 +339,19 @@ def collect_one(lab, lab_root: Path, task_name: str, args: argparse.Namespace, m
             "wall_s": round(time.time() - start, 2),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+        })
+    except AttemptEvaluationError as exc:
+        attempt_input_tokens, attempt_output_tokens = token_counts(exc.metrics)
+        input_tokens += attempt_input_tokens
+        output_tokens += attempt_output_tokens
+        append_manifest(manifest_path, {
+            "task": task_name,
+            "status": "error",
+            "attempts": attempts,
+            "wall_s": round(time.time() - start, 2),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "error": repr(exc.cause),
         })
     except Exception as exc:
         append_manifest(manifest_path, {
