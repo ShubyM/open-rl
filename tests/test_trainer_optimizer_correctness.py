@@ -319,6 +319,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     )
 
     self.assertAlmostEqual(result["metrics"]["grad_norm:mean"], 1.0)
+    self.assertIs(worker.optimizer.defaults["foreach"], False)
     self.assertFalse(torch.allclose(trainable_param.detach(), torch.tensor([1.0])))
     self.assertTrue(torch.allclose(frozen_param.detach(), torch.tensor([1.0])))
     if trainable_param.grad is not None:
@@ -531,6 +532,25 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual([event[0] for event in events], ["acquire", "release", "set_future"])
     self.assertEqual(store.results["req-a"]["type"], "model_created")
+
+  async def test_full_processor_restores_optimizer_only_for_optimizer_step(self) -> None:
+    worker = _RecordingFullWorker()
+    wake_calls = []
+    worker.wake_up = lambda include_optimizer=True: wake_calls.append(include_optimizer)
+    worker.sleep = lambda: None
+    worker.optim_step = lambda _params, _model_id: {"metrics": {}}
+    store = _TrainingRequestsStoreStub(
+      [
+        [{"request_id": "req-forward", "model_id": "model-a", "op": "forward_backward", "payload": {"data": []}}],
+        [{"request_id": "req-optim", "model_id": "model-a", "op": "optim_step", "payload": {"adam_params": {}}}],
+      ]
+    )
+    with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=_TimeSlicerStub())
+      await processor.run_once()
+      await processor.run_once()
+
+    self.assertEqual(wake_calls, [False, True])
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):

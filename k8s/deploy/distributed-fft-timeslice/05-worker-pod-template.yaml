@@ -38,6 +38,12 @@ data:
           value: "true"
         - name: PYTORCH_CUDA_ALLOC_CONF
           value: "expandable_segments:True"
+        - name: OPEN_RL_ATTN_IMPLEMENTATION
+          value: "sdpa"
+        - name: OPEN_RL_SDPA_NO_MATH
+          value: "1"
+        - name: OPEN_RL_LOGPROB_CHUNK
+          value: "128"
         - name: OPEN_RL_TMP_DIR
           value: "/mnt/shared/open-rl"
         - name: HF_HOME

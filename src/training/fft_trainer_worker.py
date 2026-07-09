@@ -30,6 +30,16 @@ def trainable_model_parameters(model: PreTrainedModel) -> list[torch.nn.Paramete
   return params
 
 
+def configure_fft_attention() -> str:
+  attention_backend = os.getenv("OPEN_RL_ATTN_IMPLEMENTATION", "sdpa")
+  if torch.cuda.is_available() and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
+    # Gradient checkpointing recomputes attention during backward, outside the
+    # original forward context. Disable the quadratic math backend process-wide
+    # so recomputation cannot silently materialize [batch, heads, seq, seq].
+    torch.backends.cuda.enable_math_sdp(False)
+  return attention_backend
+
+
 class FFTTrainingWorker(BaseTrainerWorker):
   def __init__(self):
     super().__init__()
@@ -56,7 +66,15 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
-    self.model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=target_device)
+    attention_backend = configure_fft_attention()
+    self.model = AutoModelForCausalLM.from_pretrained(
+      base_model_name,
+      dtype=dtype,
+      device_map=target_device,
+      attn_implementation=attention_backend,
+    )
+    print(f"Full fine-tuning attention backend: {self.model.config.get_text_config()._attn_implementation}")
+    print(f"Full fine-tuning device map: {getattr(self.model, 'hf_device_map', {'.': str(self.device)})}")
     print("Successfully loaded full fine-tuning model.")
 
   def create_model(self, base_model_name: str, model_id: str | None = None, config: FFTConfig | None = None) -> None:
@@ -174,13 +192,18 @@ class FFTTrainingWorker(BaseTrainerWorker):
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     target_device = "auto" if num_gpus > 1 else self.device
-    self.model = AutoModelForCausalLM.from_pretrained(state_path, dtype=dtype, device_map=target_device)
+    self.model = AutoModelForCausalLM.from_pretrained(
+      state_path,
+      dtype=dtype,
+      device_map=target_device,
+      attn_implementation=configure_fft_attention(),
+    )
     self.prepare_model_for_training()
 
     if restore_optimizer and metadata.get("has_optimizer"):
       optimizer_path = os.path.join(state_path, "optimizer.pt")
       if os.path.exists(optimizer_path):
-        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=1e-4)
+        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=1e-4, foreach=False)
         self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
         print(f"Restored optimizer state from {optimizer_path}")
 
@@ -215,6 +238,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
         betas=(beta1, beta2),
         eps=eps,
         weight_decay=weight_decay,
+        foreach=False,
       )
 
     learning_rate = adam_params.get("learning_rate")
@@ -326,7 +350,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self._is_offloaded = True
     print(f"[FFT Worker] Offloaded weights & states to pinned CPU memory in {(time.perf_counter() - start_t) * 1000:.1f} ms.")
 
-  def wake_up(self) -> None:
+  def wake_up(self, include_optimizer: bool = True) -> None:
     """Reload pinned CPU shadow tensors back to CUDA VRAM without destroying host shadow buffers."""
     if (
       not getattr(self, "cpu_offload", False)
@@ -345,7 +369,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
         orig_device, cpu_grad = self._grad_shadow[tensor]
         tensor.grad.data = cpu_grad.to(orig_device, non_blocking=True)
 
-    if self.optimizer is not None:
+    if include_optimizer and self.optimizer is not None:
       for param, state in self.optimizer.state.items():
         if isinstance(state, dict):
           state.pop("_orig_devices", None)

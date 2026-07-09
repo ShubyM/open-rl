@@ -321,7 +321,8 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         if gpu_reqs:
           async with self.time_slicer.acquire(self.workload):
             if hasattr(self.worker, "wake_up"):
-              await asyncio.to_thread(self.worker.wake_up)
+              include_optimizer = any(request.get("op") == "optim_step" for request in gpu_reqs)
+              await asyncio.to_thread(self.worker.wake_up, include_optimizer)
             try:
               for request in gpu_reqs:
                 results.append(await self.handle_request(request, self.model_id))

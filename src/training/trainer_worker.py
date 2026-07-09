@@ -2,6 +2,7 @@
 
 import math
 import os
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -242,8 +243,20 @@ class BaseTrainerWorker:
     backbone = getattr(model, "model", None) or getattr(model, "transformer", None)
     if backbone is None or backbone is model:
       return None
+    backbone_attention_mask = attention_mask
+    if attention_mask is not None and bool(attention_mask.all()):
+      # A dense all-ones mask only describes ordinary causal attention. Omitting
+      # it lets SDPA select Flash Attention instead of materializing a quadratic
+      # additive mask for Gemma's global-attention layers.
+      backbone_attention_mask = None
+    attention_context = nullcontext()
+    if input_ids.is_cuda and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
+      from torch.nn.attention import SDPBackend, sdpa_kernel
+
+      attention_context = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.CUDNN_ATTENTION])
     try:
-      outputs = backbone(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+      with attention_context:
+        outputs = backbone(input_ids=input_ids, attention_mask=backbone_attention_mask, use_cache=False, return_dict=True)
     except Exception as exc:
       print(f"[trainer] fused-logprob backbone forward failed ({exc}); using full-logits path")
       return None
@@ -261,13 +274,16 @@ class BaseTrainerWorker:
     lm_head = model.get_output_embeddings()
     weight = lm_head.weight
     bias = getattr(lm_head, "bias", None)
-    softcap = getattr(getattr(model, "config", None), "final_logit_softcapping", None)
+    model_config = getattr(model, "config", None)
+    if model_config is not None and hasattr(model_config, "get_text_config"):
+      model_config = model_config.get_text_config()
+    softcap = getattr(model_config, "final_logit_softcapping", None)
 
     batch, seq_len, _ = hidden.shape
     flat_hidden = hidden.reshape(batch * seq_len, -1).to(weight.device)
     flat_targets = target_token_ids.reshape(batch * seq_len).to(weight.device)
 
-    chunk = max(1, int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "1024")))
+    chunk = max(1, int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "128")))
     logprob_chunks = []
     for start in range(0, flat_hidden.shape[0], chunk):
       hidden_chunk = flat_hidden[start : start + chunk]
