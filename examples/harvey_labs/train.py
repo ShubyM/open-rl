@@ -11,7 +11,7 @@ from renderer import register_gemma4_tool_renderer
 from tinker_cookbook.rl import train as rl_train
 from tinker_utils import LimitedDatasetBuilder, force_rich_log_colors, resolve_base_url
 
-MODEL_NAME = "gemma-4-e4b"
+MODEL_NAME = "google/gemma-4-e4b"
 RENDERER_NAME = "gemma4"
 LORA_RANK = 32
 LEARNING_RATE = 3e-6
@@ -28,6 +28,8 @@ class RunConfig:
     """Small set of knobs for the LAB RL experiment."""
 
     base_url: str | None = None
+    model_name: str = MODEL_NAME
+    renderer_name: str = RENDERER_NAME
     lab_root: Path = Path("experiments/lab-traces/harvey-labs")
     split_path: Path | None = None
     task: str | None = None
@@ -52,8 +54,8 @@ def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
         eval_limit=config.eval_limit,
         batch_size=config.batch_size,
         group_size=config.rollouts_per_example,
-        model_name=MODEL_NAME,
-        renderer_name=RENDERER_NAME,
+        model_name=config.model_name,
+        renderer_name=config.renderer_name,
         max_turns=config.max_turns,
         command_timeout=COMMAND_TIMEOUT,
         judge_model=config.judge_model,
@@ -74,8 +76,8 @@ async def run(config: RunConfig) -> None:
     train_config = rl_train.Config(
         learning_rate=LEARNING_RATE,
         dataset_builder=builder,
-        model_name=MODEL_NAME,
-        renderer_name=RENDERER_NAME,
+        model_name=config.model_name,
+        renderer_name=config.renderer_name,
         lora_rank=LORA_RANK,
         max_tokens=config.max_tokens,
         temperature=TEMPERATURE,

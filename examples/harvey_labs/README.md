@@ -21,7 +21,7 @@ Phase 0 backend smoke, from repo root on `box` with gateway at `:9003`:
 export PATH=$PATH:$HOME/.local/bin
 TINKER_API_KEY=tml-dummy-key TINKER_BASE_URL=http://127.0.0.1:9003 \
 uv --project examples run python examples/autoresearch/recipes/math_rl/train_gemma.py \
-  model_name=gemma-4-e4b renderer_name=gemma4 env=gsm8k \
+  model_name=google/gemma-4-e4b renderer_name=gemma4 env=gsm8k \
   group_size=2 groups_per_batch=1 max_steps=1 max_tokens=128 \
   base_url=http://127.0.0.1:9003 save_every=0 eval_every=0 \
   behavior_if_log_dir_exists=delete log_path=artifacts/harvey-labs/phase0-math
@@ -33,8 +33,8 @@ Tiny LAB run:
 export PATH=$PATH:$HOME/.local/bin
 TINKER_API_KEY=tml-dummy-key TINKER_BASE_URL=http://127.0.0.1:9003 \
 uv --project examples run python examples/harvey_labs/train.py \
-  base-url=http://127.0.0.1:9003 \
-  lab-root=experiments/lab-traces/harvey-labs \
-  train-limit=1 eval-limit=0 \
-  max-reward-criteria=3 log-path=artifacts/harvey-labs/lab-tiny
+  base_url=http://127.0.0.1:9003 \
+  lab_root=experiments/lab-traces/harvey-labs \
+  train_limit=1 eval_limit=0 \
+  max_reward_criteria=3 log_path=artifacts/harvey-labs/lab-tiny
 ```
