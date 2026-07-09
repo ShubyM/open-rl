@@ -253,6 +253,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     total_norm = torch.nn.utils.clip_grad_norm_(
       self.trainable_params,
       max_grad_norm,
+      foreach=False,
     )
 
     self.optimizer.step()

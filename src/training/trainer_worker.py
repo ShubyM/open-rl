@@ -253,7 +253,7 @@ class BaseTrainerWorker:
     if input_ids.is_cuda and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
       from torch.nn.attention import SDPBackend, sdpa_kernel
 
-      attention_context = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.CUDNN_ATTENTION])
+      attention_context = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
     try:
       with attention_context:
         outputs = backbone(input_ids=input_ids, attention_mask=backbone_attention_mask, use_cache=False, return_dict=True)
