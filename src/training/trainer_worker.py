@@ -5,10 +5,31 @@ import os
 from typing import Any
 
 import torch
+import torch.utils.checkpoint
 from pydantic import BaseModel
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
+
+
+def chunk_target_logprob(
+  hidden_chunk: torch.Tensor,
+  weight: torch.Tensor,
+  bias: torch.Tensor | None,
+  target_chunk: torch.Tensor,
+  softcap: float | None,
+) -> torch.Tensor:
+  """Project one chunk of hidden states through the vocab and return the selected
+  target logprob (logit[target] - logsumexp). The [chunk, vocab] logits tensor is
+  local to this call, so under activation checkpointing it is never stored for the
+  backward pass -- it is recomputed."""
+  logits = torch.nn.functional.linear(hidden_chunk, weight, bias)
+  if logits.dtype in (torch.float16, torch.bfloat16):
+    logits = logits.float()
+  if softcap is not None:
+    logits = softcap * torch.tanh(logits / softcap)
+  target_logit = logits.gather(dim=-1, index=target_chunk.unsqueeze(-1)).squeeze(-1)
+  return target_logit - torch.logsumexp(logits, dim=-1)
 
 
 class TensorData(BaseModel):
@@ -185,10 +206,81 @@ class BaseTrainerWorker:
     attention_mask: torch.Tensor,
     target_token_ids: torch.Tensor,
   ) -> torch.Tensor:
-    """Return selected target logprobs with shape [batch, max_target_len]."""
+    """Return selected target logprobs with shape [batch, max_target_len].
+
+    Large-vocab models (e.g. Gemma's ~256K vocab) OOM the GPU holding the lm_head
+    because the full [batch, seq, vocab] logits tensor is materialized twice (once
+    by the head, again by log_softmax upcasting to fp32). We instead run the
+    backbone to get hidden states and project + reduce to the target logprob in
+    vocab-sized chunks, so peak head activation is [chunk, vocab]. Falls back to the
+    standard full-logits path when disabled or when the backbone can't be resolved.
+    """
+    seq_len = target_token_ids.shape[1]
+
+    if os.getenv("OPEN_RL_FUSED_LOGPROB", "1") == "1":
+      hidden = self.backbone_hidden_states(model, input_ids, attention_mask)
+      if hidden is not None:
+        return self.fused_target_logprobs(model, hidden[:, :seq_len, :], target_token_ids)
+
+    # Full-logits path. Use logit - logsumexp rather than log_softmax(...).gather so
+    # we avoid the extra full-size fp32 log_softmax allocation.
     outputs = model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
-    logits = outputs.logits[:, : target_token_ids.shape[1], :]
-    return torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
+    logits = outputs.logits[:, :seq_len, :]
+    target_logit = logits.gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
+    return target_logit - torch.logsumexp(logits, dim=-1)
+
+  def backbone_hidden_states(
+    self,
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+  ) -> torch.Tensor | None:
+    """Return the transformer backbone's last_hidden_state without running the
+    lm_head. Returns None (so the caller uses the full-logits path) when the
+    backbone can't be resolved or does not expose hidden states -- e.g. PEFT/LoRA
+    wrappers whose forward only yields logits."""
+    backbone = getattr(model, "model", None) or getattr(model, "transformer", None)
+    if backbone is None or backbone is model:
+      return None
+    try:
+      outputs = backbone(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+    except Exception as exc:
+      print(f"[trainer] fused-logprob backbone forward failed ({exc}); using full-logits path")
+      return None
+    return getattr(outputs, "last_hidden_state", None)
+
+  def fused_target_logprobs(
+    self,
+    model: PreTrainedModel,
+    hidden: torch.Tensor,
+    target_token_ids: torch.Tensor,
+  ) -> torch.Tensor:
+    """Project hidden states through the lm_head in chunks and reduce to the
+    selected target logprob, never materializing the full [batch, seq, vocab]
+    logits tensor."""
+    lm_head = model.get_output_embeddings()
+    weight = lm_head.weight
+    bias = getattr(lm_head, "bias", None)
+    softcap = getattr(getattr(model, "config", None), "final_logit_softcapping", None)
+
+    batch, seq_len, _ = hidden.shape
+    flat_hidden = hidden.reshape(batch * seq_len, -1).to(weight.device)
+    flat_targets = target_token_ids.reshape(batch * seq_len).to(weight.device)
+
+    chunk = max(1, int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "1024")))
+    logprob_chunks = []
+    for start in range(0, flat_hidden.shape[0], chunk):
+      hidden_chunk = flat_hidden[start : start + chunk]
+      target_chunk = flat_targets[start : start + chunk]
+      if hidden_chunk.requires_grad or weight.requires_grad:
+        logprob_chunk = torch.utils.checkpoint.checkpoint(
+          chunk_target_logprob, hidden_chunk, weight, bias, target_chunk, softcap, use_reentrant=False
+        )
+      else:
+        logprob_chunk = chunk_target_logprob(hidden_chunk, weight, bias, target_chunk, softcap)
+      logprob_chunks.append(logprob_chunk)
+
+    return torch.cat(logprob_chunks, dim=0).reshape(batch, seq_len)
 
   def generate(
     self,
