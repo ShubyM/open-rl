@@ -105,6 +105,31 @@ def init_engine():
     print("[vLLM Worker] Engine initialized successfully.")
 
 
+async def prepare_engine(weights_path: str | None) -> None:
+  """Wake vLLM and load a changed full-model checkpoint in place."""
+  global CURRENT_LOADED_SAMPLER_WEIGHTS
+
+  if engine is None:
+    init_engine()
+
+  if engine is None:
+    return
+
+  if weights_path and weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
+    print(f"[vLLM Worker] Loading checkpoint: {CURRENT_LOADED_SAMPLER_WEIGHTS} -> {weights_path}")
+    if not await engine.is_sleeping():
+      await engine.sleep(level=2)
+    await engine.wake_up(tags=["weights"])
+    await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+    await engine.wake_up(tags=["kv_cache"])
+    CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
+    return
+
+  if await engine.is_sleeping():
+    print("[vLLM Worker] Waking engine for sampling...")
+    await engine.wake_up()
+
+
 async def run_generation_backend(
   request_id: str,
   prompt_token_ids: list[int],
@@ -207,23 +232,14 @@ async def process_sampling_request(req: dict, store: Any) -> None:
   parent_span = propagate.extract(trace_context)
   with tracer.start_as_current_span("process_sampling_request", context=parent_span):
     try:
-      # 1. Manage weights reloading
+      # 1. Load the exact full-model checkpoint and wake the engine.
       weights_path = req.get("weights_path")
       if is_fft_enabled() and weights_path:
         async with reload_lock:
-          if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
-            print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
-            if engine is not None:
-              print("[vLLM Worker] Triggering sleep level 2...")
-              await engine.sleep(level=2)
-              print("[vLLM Worker] Waking up weights...")
-              await engine.wake_up(tags=["weights"])
-              print(f"[vLLM Worker] Reloading weights from {weights_path} in-place...")
-              await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
-              print("[vLLM Worker] Waking up KV cache...")
-              await engine.wake_up(tags=["kv_cache"])
-            CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
-            print("[vLLM Worker] Weights reload completed successfully!")
+          await prepare_engine(weights_path)
+      elif is_fft_enabled():
+        async with reload_lock:
+          await prepare_engine(None)
 
       # 2. Run inference
       prompt_token_ids = req.get("prompt_token_ids", [])
@@ -355,7 +371,6 @@ async def run_sampling_worker(model_id: str) -> None:
               if engine is not None:
                 print("[vLLM Worker] Exiting batch: sleeping engine to yield GPU memory...")
                 await engine.sleep(level=2)
-                CURRENT_LOADED_SAMPLER_WEIGHTS = None
           else:
             tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
             await asyncio.gather(*tasks)

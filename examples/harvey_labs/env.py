@@ -240,7 +240,7 @@ class LabDatasetBuilder(RLDatasetBuilder):
   eval_limit: int | None = 1
   batch_size: int = 1
   group_size: int = 4
-  model_name: str = "google/gemma-4-e4b"
+  model_name: str = "google/gemma-4-E4B-it"
   renderer_name: str | None = "gemma4"
   max_turns: int = 40
   command_timeout: int = 60

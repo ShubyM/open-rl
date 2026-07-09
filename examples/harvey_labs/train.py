@@ -11,7 +11,7 @@ from renderer import register_gemma4_tool_renderer
 from tinker_cookbook.rl import train as rl_train
 from tinker_utils import LimitedDatasetBuilder, force_rich_log_colors, resolve_base_url
 
-MODEL_NAME = "google/gemma-4-e4b"
+MODEL_NAME = "google/gemma-4-E4B-it"
 RENDERER_NAME = "gemma4"
 LORA_RANK = 32
 LEARNING_RATE = 3e-6
