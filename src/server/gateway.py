@@ -18,6 +18,7 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from server.session_reaper import start_session_reaper
 from server.store import get_store
 from server.worker_manager import WorkerManager, create_fft_worker_manager
 
@@ -241,8 +242,12 @@ def translate_future_result(result: dict) -> dict:
 async def lifespan(_: FastAPI):
   global fft_worker_manager
   task = None
+  reaper_task = None
   if is_fft_enabled():
     fft_worker_manager = create_fft_worker_manager()
+    # Clients heartbeat their session every ~10s; when a session goes quiet its
+    # trainer pods are torn down (samplers are left running).
+    reaper_task = start_session_reaper(store, fft_worker_manager)
   if is_single_process_mode():
     base_model = os.getenv("BASE_MODEL")
     print("\n" + "=" * 50)
@@ -265,6 +270,8 @@ async def lifespan(_: FastAPI):
   finally:
     if task is not None:
       task.cancel()
+    if reaper_task is not None:
+      reaper_task.cancel()
     if fft_worker_manager is not None:
       fft_worker_manager.shutdown_all()
       fft_worker_manager = None
@@ -302,11 +309,17 @@ async def client_config(_: dict):
 
 @app.post("/api/v1/create_session")
 async def create_session(_: dict):
-  return {"session_id": "sess-real-123", "type": "create_session"}
+  session_id = f"sess-{uuid.uuid4()}"
+  await store.touch_session(session_id)
+  return {"session_id": session_id, "type": "create_session"}
 
 
 @app.post("/api/v1/session_heartbeat")
-async def session_heartbeat(_: dict):
+async def session_heartbeat(req: dict):
+  # Upsert so sessions predating a gateway restart (or this endpoint doing
+  # anything at all) come back under heartbeat tracking.
+  if session_id := req.get("session_id"):
+    await store.touch_session(session_id)
   return {"type": "session_heartbeat"}
 
 
@@ -321,6 +334,9 @@ async def create_model(req: dict):
   meta_obj = TrainingModelMetadata(base_model=base_model, created_at=time.time(), training_kind="full")
   await s.set_value(f"open_rl:model_meta:{model_id}", json.dumps(asdict(meta_obj)))
   await s.set_value(f"open_rl:model_base:{model_id}", base_model)
+  if session_id := req.get("session_id"):
+    await s.add_session_model(session_id, model_id)
+    await s.touch_session(session_id)
   command = make_training_request(
     "create_model",
     model_id,
@@ -363,6 +379,9 @@ async def create_model_from_state(req: dict):
     meta_obj = TrainingModelMetadata(base_model=base_model, created_at=time.time(), training_kind="restored")
     await s.set_value(f"open_rl:model_meta:{model_id}", json.dumps(asdict(meta_obj)))
     await s.set_value(f"open_rl:model_base:{model_id}", base_model)
+  if session_id := req.get("session_id"):
+    await s.add_session_model(session_id, model_id)
+    await s.touch_session(session_id)
   command = make_training_request(
     "create_model_from_state",
     model_id,

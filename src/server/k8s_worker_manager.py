@@ -93,12 +93,17 @@ class KubernetesFFTWorkerManager:
   def shutdown(self, model_id: str) -> None:
     job_id = sanitize_job_id(model_id)
     for prefix in ("open-rl-trainer-", "open-rl-sampler-"):
-      pod_name = prefix + job_id
-      try:
-        self.core_api.delete_namespaced_pod(name=pod_name, namespace=self.namespace)
-      except Exception as exc:
-        if getattr(exc, "status", None) != 404:
-          raise
+      self._delete_pod_if_exists(prefix + job_id)
+
+  def shutdown_trainer(self, model_id: str) -> None:
+    self._delete_pod_if_exists("open-rl-trainer-" + sanitize_job_id(model_id))
+
+  def _delete_pod_if_exists(self, pod_name: str) -> None:
+    try:
+      self.core_api.delete_namespaced_pod(name=pod_name, namespace=self.namespace)
+    except Exception as exc:
+      if getattr(exc, "status", None) != 404:
+        raise
 
   def shutdown_all(self) -> None:
     pass

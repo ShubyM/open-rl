@@ -72,6 +72,11 @@ spec:
           value: "/etc/open-rl/trainer/trainer-worker-pod.yaml"
         - name: OPEN_RL_WORKER_IMAGE
           value: "gcr.io/cdrollouts-sunilarora/open-rl-server:0.1.17"
+        # Tear down trainer pods whose client session stopped heartbeating
+        # (the tinker SDK heartbeats every ~10s). Sampler pods are exempt.
+        # Set to "0" to disable the reaper.
+        - name: OPEN_RL_SESSION_IDLE_TIMEOUT_SEC
+          value: "180"
         resources:
           limits:
             memory: "2Gi"

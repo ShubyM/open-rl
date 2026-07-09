@@ -39,6 +39,43 @@ class GetInfoTest(unittest.TestCase):
     self.assertEqual(queued[0]["payload"]["base_model"], "my-model")
 
 
+class SessionTrackingTest(unittest.TestCase):
+  def setUp(self) -> None:
+    self.store = InMemoryStore()
+    for patcher in (
+      patch.object(gateway, "store", self.store),
+      patch.object(gateway, "get_store", lambda: self.store),
+    ):
+      patcher.start()
+      self.addCleanup(patcher.stop)
+
+  def test_create_session_mints_unique_tracked_sessions(self) -> None:
+    first = asyncio.run(gateway.create_session({}))
+    second = asyncio.run(gateway.create_session({}))
+
+    self.assertNotEqual(first["session_id"], second["session_id"])
+    sessions = asyncio.run(self.store.list_sessions())
+    self.assertIn(first["session_id"], sessions)
+    self.assertIn(second["session_id"], sessions)
+
+  def test_session_heartbeat_upserts_even_unknown_sessions(self) -> None:
+    response = asyncio.run(gateway.session_heartbeat({"session_id": "sess-legacy"}))
+
+    self.assertEqual(response, {"type": "session_heartbeat"})
+    self.assertIn("sess-legacy", asyncio.run(self.store.list_sessions()))
+
+  def test_session_heartbeat_tolerates_missing_session_id(self) -> None:
+    asyncio.run(gateway.session_heartbeat({}))
+    self.assertEqual(asyncio.run(self.store.list_sessions()), {})
+
+  def test_create_model_registers_model_under_its_session(self) -> None:
+    created = asyncio.run(gateway.create_model({"base_model": "my-model", "session_id": "sess-a"}))
+    model_id = created["request_id"]
+
+    self.assertEqual(asyncio.run(self.store.get_session_models("sess-a")), [model_id])
+    self.assertIn("sess-a", asyncio.run(self.store.list_sessions()))
+
+
 class GatewayPathTest(unittest.TestCase):
   def test_checkpoint_state_paths_are_model_scoped(self) -> None:
     old_tmp_dir = gateway.TMP_DIR

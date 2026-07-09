@@ -34,6 +34,7 @@ class _FakeCoreApi:
     self.created: list[tuple[str, dict]] = []
     self.deleted: list[str] = []
     self.create_error: Exception | None = None
+    self.delete_error: Exception | None = None
 
   def read_namespaced_pod(self, name: str, namespace: str):
     if name not in self.pod_phases:
@@ -46,6 +47,8 @@ class _FakeCoreApi:
     self.created.append((namespace, body))
 
   def delete_namespaced_pod(self, name: str, namespace: str):
+    if self.delete_error is not None:
+      raise self.delete_error
     self.deleted.append(name)
     self.pod_phases.pop(name, None)
 
@@ -136,6 +139,18 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
 
     self.assertEqual(api.deleted, ["open-rl-trainer-model-a"])
     self.assertEqual(len(api.created), 1)
+
+  def test_shutdown_trainer_leaves_sampler_pod_alone(self) -> None:
+    api = _FakeCoreApi(pod_phases={"open-rl-trainer-model-a": "Running", "open-rl-sampler-model-a": "Running"})
+    self._manager(api).shutdown_trainer("model-a")
+
+    self.assertEqual(api.deleted, ["open-rl-trainer-model-a"])
+    self.assertIn("open-rl-sampler-model-a", api.pod_phases)
+
+  def test_shutdown_trainer_tolerates_missing_pod(self) -> None:
+    api = _FakeCoreApi()
+    api.delete_error = _ApiError(404)
+    self._manager(api).shutdown_trainer("model-a")  # must not raise
 
   def test_launch_tolerates_conflict_on_create(self) -> None:
     api = _FakeCoreApi()

@@ -23,8 +23,7 @@ def free_port() -> int:
     return sock.getsockname()[1]
 
 
-@unittest.skipUnless(TEST_REDIS_URL or REDIS_SERVER, "needs OPEN_RL_TEST_REDIS_URL or redis-server on PATH")
-class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
+class _RedisStoreTestBase(unittest.IsolatedAsyncioTestCase):
   server: subprocess.Popen | None = None
   redis_url: str
 
@@ -65,6 +64,9 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
   async def asyncTearDown(self) -> None:
     await self.store.redis.aclose()
 
+
+@unittest.skipUnless(TEST_REDIS_URL or REDIS_SERVER, "needs OPEN_RL_TEST_REDIS_URL or redis-server on PATH")
+class RedisFutureTest(_RedisStoreTestBase):
   async def test_get_future_returns_already_resolved_result(self) -> None:
     await self.store.set_future("req-1", {"type": "sample", "ok": True})
     self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample", "ok": True})
@@ -99,6 +101,29 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
   async def test_pending_markers_are_not_stored(self) -> None:
     await self.store.set_future("req-1", {"status": "pending"})
     self.assertEqual((await self.store.get_future("req-1", timeout=0.3))["type"], "try_again")
+
+
+@unittest.skipUnless(TEST_REDIS_URL or REDIS_SERVER, "needs OPEN_RL_TEST_REDIS_URL or redis-server on PATH")
+class RedisSessionTest(_RedisStoreTestBase):
+  async def test_touch_session_records_recent_timestamp(self) -> None:
+    before = time.time()
+    await self.store.touch_session("sess-a")
+
+    sessions = await self.store.list_sessions()
+    self.assertGreaterEqual(sessions["sess-a"], before)
+    self.assertLessEqual(sessions["sess-a"], time.time())
+
+  async def test_session_model_roundtrip_and_delete(self) -> None:
+    await self.store.touch_session("sess-a")
+    await self.store.add_session_model("sess-a", "model-b")
+    await self.store.add_session_model("sess-a", "model-a")
+    await self.store.add_session_model("sess-a", "model-a")
+
+    self.assertEqual(await self.store.get_session_models("sess-a"), ["model-a", "model-b"])
+
+    await self.store.delete_session("sess-a")
+    self.assertEqual(await self.store.list_sessions(), {})
+    self.assertEqual(await self.store.get_session_models("sess-a"), [])
 
 
 if __name__ == "__main__":

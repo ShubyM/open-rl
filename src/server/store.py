@@ -72,6 +72,31 @@ class RequestStore(ABC):
     """Delete one or more keys."""
     pass
 
+  @abstractmethod
+  async def touch_session(self, session_id: str) -> None:
+    """Record a client heartbeat for this session (upserts the session)."""
+    pass
+
+  @abstractmethod
+  async def add_session_model(self, session_id: str, model_id: str) -> None:
+    """Associate a training model with the client session that created it."""
+    pass
+
+  @abstractmethod
+  async def list_sessions(self) -> dict[str, float]:
+    """Return session_id -> last heartbeat time (epoch seconds) for all known sessions."""
+    pass
+
+  @abstractmethod
+  async def get_session_models(self, session_id: str) -> list[str]:
+    """Return the model ids created under this session."""
+    pass
+
+  @abstractmethod
+  async def delete_session(self, session_id: str) -> None:
+    """Forget a session's heartbeat record and model associations."""
+    pass
+
 
 class InMemoryStore(RequestStore):
   def __init__(self):
@@ -83,6 +108,8 @@ class InMemoryStore(RequestStore):
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, asyncio.Event] = {}
     self.kv_store: dict[str, str] = {}
+    self.session_last_seen: dict[str, float] = {}
+    self.session_models: dict[str, set[str]] = {}
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -167,6 +194,22 @@ class InMemoryStore(RequestStore):
     for k in keys:
       self.kv_store.pop(k, None)
 
+  async def touch_session(self, session_id: str) -> None:
+    self.session_last_seen[session_id] = time.time()
+
+  async def add_session_model(self, session_id: str, model_id: str) -> None:
+    self.session_models.setdefault(session_id, set()).add(model_id)
+
+  async def list_sessions(self) -> dict[str, float]:
+    return dict(self.session_last_seen)
+
+  async def get_session_models(self, session_id: str) -> list[str]:
+    return sorted(self.session_models.get(session_id, set()))
+
+  async def delete_session(self, session_id: str) -> None:
+    self.session_last_seen.pop(session_id, None)
+    self.session_models.pop(session_id, None)
+
 
 class RedisStore(RequestStore):
   def __init__(self, redis_url: str):
@@ -175,6 +218,9 @@ class RedisStore(RequestStore):
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
     self.worker_launch_queue = "open_rl:worker_launch_queue"
+    # session_id -> last heartbeat epoch; per-session model sets live under
+    # open_rl:session_models:{session_id}.
+    self.session_last_seen_key = "open_rl:session_last_seen"
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -337,6 +383,26 @@ class RedisStore(RequestStore):
   async def delete_values(self, *keys: str) -> None:
     if keys:
       await self.redis.delete(*keys)
+
+  def _session_models_key(self, session_id: str) -> str:
+    return f"open_rl:session_models:{session_id}"
+
+  async def touch_session(self, session_id: str) -> None:
+    await self.redis.hset(self.session_last_seen_key, session_id, str(time.time()))
+
+  async def add_session_model(self, session_id: str, model_id: str) -> None:
+    await self.redis.sadd(self._session_models_key(session_id), model_id)
+
+  async def list_sessions(self) -> dict[str, float]:
+    sessions = await self.redis.hgetall(self.session_last_seen_key)
+    return {session_id: float(last_seen) for session_id, last_seen in sessions.items()}
+
+  async def get_session_models(self, session_id: str) -> list[str]:
+    return sorted(await self.redis.smembers(self._session_models_key(session_id)))
+
+  async def delete_session(self, session_id: str) -> None:
+    await self.redis.hdel(self.session_last_seen_key, session_id)
+    await self.redis.delete(self._session_models_key(session_id))
 
 
 # Global singleton factory

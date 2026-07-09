@@ -1,5 +1,9 @@
 # Open-RL TODOs & Future Improvements
 
+## 0. Sampler Pod Lifecycle via GPU Memory Snapshots
+- **Current Behavior:** The gateway's session reaper (`src/server/session_reaper.py`) tears down idle trainer pods when client session heartbeats stop, but deliberately leaves sampler pods running forever: vLLM cold starts (weight load + CUDA graph capture) are expensive, so killing and relaunching samplers per session would dominate end-to-end latency.
+- **Improvement:** Manage sampler pod lifecycle with GPU memory snapshot/restore (in the spirit of Modal's GPU memory snapshots, https://modal.com/blog/gpu-mem-snapshots, and our existing cuda-checkpoint work in the accel-timeslicer): snapshot the fully warmed sampler (weights + CUDA state) so idle sampler pods can be reaped too and restored in seconds on the next `create_sampling_session`, instead of paying a full cold start.
+
 ## 1. Do Not Cache Worker Pod Templates in Memory
 - **Current Behavior:** `KubernetesFFTWorkerManager.__init__` reads and parses pod templates (`/etc/open-rl/trainer/trainer-worker-pod.yaml`) once at startup and stores them in memory (`self.trainer_template`).
 - **Improvement:** Read and parse the template file dynamically from disk on every `render_pod()` invocation so live ConfigMap updates take effect immediately without requiring a rolling restart of the gateway deployment (`kubectl rollout restart deployment open-rl-gateway`).

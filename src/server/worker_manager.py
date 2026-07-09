@@ -44,6 +44,10 @@ class WorkerManager(Protocol):
     """Tear down the model's worker, if any. The idempotent launch can revive it later."""
     ...
 
+  def shutdown_trainer(self, model_id: str) -> None:
+    """Tear down only the model's trainer worker, leaving its sampler running."""
+    ...
+
   def shutdown_all(self) -> None: ...
 
 
@@ -107,12 +111,15 @@ class FFTWorkerManager:
       )
 
   def shutdown(self, model_id: str) -> None:
-    proc = self.train_processes.pop(model_id, None)
-    if proc is not None and proc.poll() is None:
-      proc.terminate()
+    self.shutdown_trainer(model_id)
     proc_s = self.sampler_processes.pop(model_id, None)
     if proc_s is not None and proc_s.poll() is None:
       proc_s.terminate()
+
+  def shutdown_trainer(self, model_id: str) -> None:
+    proc = self.train_processes.pop(model_id, None)
+    if proc is not None and proc.poll() is None:
+      proc.terminate()
 
   def shutdown_all(self) -> None:
     for model_id in set(list(self.train_processes) + list(self.sampler_processes)):
