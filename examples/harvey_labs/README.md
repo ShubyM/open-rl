@@ -38,3 +38,8 @@ uv --project examples run python examples/harvey_labs/train.py \
   train_limit=1 eval_limit=0 \
   max_reward_criteria=3 log_path=artifacts/harvey-labs/lab-tiny
 ```
+
+The training defaults run 40 task groups with four rollouts per group. Each
+rollout is trained as a separate microbatch and is capped at 32K trajectory
+tokens, with at most 1K generated tokens per tool turn. The 32K cap completed a
+full Gemma 4 E4B FFT update on one 80GB H100; a 64K trajectory did not.
