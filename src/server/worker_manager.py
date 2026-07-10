@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Protocol
 
@@ -28,16 +29,16 @@ def _py_cmd(extras: list[str], module: str, model_id: str) -> list[str]:
 
 
 class WorkerManager(Protocol):
-  def launch(self, model_id: str, base_model: str | None = None) -> None:
-    """Ensure the model's worker exists; idempotent per model_id."""
+  def launch(self, model_id: str, base_model: str | None = None) -> str | None:
+    """Ensure the model's worker exists and return its instance id when available."""
     ...
 
-  def launch_trainer(self, model_id: str, base_model: str | None = None) -> None:
+  def launch_trainer(self, model_id: str, base_model: str | None = None) -> str | None:
     """Ensure the trainer worker exists."""
     ...
 
-  def launch_sampler(self, model_id: str, base_model: str | None = None) -> None:
-    """Ensure the sampler worker exists."""
+  def launch_sampler(self, model_id: str, base_model: str | None = None) -> str | None:
+    """Ensure the sampler worker exists and return its readiness instance id."""
     ...
 
   def shutdown(self, model_id: str) -> None:
@@ -57,6 +58,7 @@ class FFTWorkerManager:
     self.project_dir = project_dir
     self.train_processes: dict[str, subprocess.Popen] = {}
     self.sampler_processes: dict[str, subprocess.Popen] = {}
+    self.sampler_instances: dict[str, str] = {}
 
   def launch(self, model_id: str, base_model: str | None = None) -> None:
     self.launch_trainer(model_id, base_model)
@@ -81,18 +83,20 @@ class FFTWorkerManager:
       start_new_session=True,
     )
 
-  def launch_sampler(self, model_id: str, base_model: str | None = None) -> None:
+  def launch_sampler(self, model_id: str, base_model: str | None = None) -> str | None:
     proc = self.sampler_processes.get(model_id)
     if proc is not None and proc.poll() is None:
-      return
+      return self.sampler_instances[model_id]
 
     env = {**os.environ, "OPEN_RL_ENABLE_FFT": "true"}
     if base_model:
       env["BASE_MODEL"] = base_model
     sampling_backend = os.getenv("SAMPLING_BACKEND", "vllm").lower()
     if sampling_backend == "vllm":
+      instance_id = uuid.uuid4().hex
       sampler_env = env.copy()
       sampler_env["OPEN_RL_MODEL_ID"] = model_id
+      sampler_env["OPEN_RL_WORKER_INSTANCE_ID"] = instance_id
       sampler_env["OPEN_RL_TIME_SLICE_JOB_ID"] = workload_job_id("sampler", model_id)
       sampler_env["OPEN_RL_TIME_SLICE_GROUP"] = SAMPLER_TIME_SLICE_GROUP
       sampler_gpu = os.getenv("SAMPLER_CUDA_VISIBLE_DEVICES")
@@ -105,12 +109,16 @@ class FFTWorkerManager:
         env=sampler_env,
         start_new_session=True,
       )
+      self.sampler_instances[model_id] = instance_id
+      return instance_id
+    return None
 
   def shutdown(self, model_id: str) -> None:
     proc = self.train_processes.pop(model_id, None)
     if proc is not None and proc.poll() is None:
       proc.terminate()
     proc_s = self.sampler_processes.pop(model_id, None)
+    self.sampler_instances.pop(model_id, None)
     if proc_s is not None and proc_s.poll() is None:
       proc_s.terminate()
 

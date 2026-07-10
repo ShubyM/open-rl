@@ -127,6 +127,7 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
     self.loaded_base_models = []
     self.created_models = []
     self.saved_states = []
+    self.transitions = []
 
   def load_base_model(self, base_model_name):
     self.base_model_name = base_model_name
@@ -141,6 +142,12 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
   def save_state(self, model_id, state_path, include_optimizer=False, kind="state"):
     self.saved_states.append((model_id, state_path, include_optimizer, kind))
     return {"path": state_path}
+
+  def wake_up(self):
+    self.transitions.append("wake_up")
+
+  def sleep(self):
+    self.transitions.append("sleep")
 
 
 class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker):
@@ -531,6 +538,38 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual([event[0] for event in events], ["acquire", "release", "set_future"])
     self.assertEqual(store.results["req-a"]["type"], "model_created")
+
+  async def test_full_processor_skips_cpu_transitions_for_sticky_gpu_lease(self) -> None:
+    worker = _RecordingFullWorker()
+    store = _TrainingRequestsStoreStub(
+      [
+        [
+          {
+            "request_id": "req-a",
+            "model_id": "model-a",
+            "op": "create_model",
+            "payload": {"base_model": "base-model", "full_config": {}},
+          }
+        ]
+      ]
+    )
+
+    with patch.dict(
+      os.environ,
+      {
+        "OPEN_RL_STICKY_GPU_LEASE": "1",
+        "REDIS_URL": "redis://localhost:6379",
+      },
+    ):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(
+        store,
+        worker,
+        "model-a",
+        time_slicer=_TimeSlicerStub(),
+      )
+      await processor.run_once()
+
+    self.assertEqual(worker.transitions, [])
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):

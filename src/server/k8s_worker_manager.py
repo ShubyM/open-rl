@@ -13,28 +13,47 @@ dependencies are installed.
 """
 
 import copy
+import hashlib
+import logging
 import os
 import re
 import time
+import uuid
 from typing import Any
 
 import yaml
 from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
 
 from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
 
-POD_NAME_PREFIX = "open-rl-trainer-"
+logger = logging.getLogger(__name__)
+
 TERMINAL_POD_PHASES = {"Succeeded", "Failed"}
+FATAL_CONTAINER_REASONS = {
+  "CreateContainerConfigError",
+  "CreateContainerError",
+  "CrashLoopBackOff",
+  "ErrImagePull",
+  "ImagePullBackOff",
+  "InvalidImageName",
+}
+WORKER_INSTANCE_ANNOTATION = "open-rl.dev/worker-instance"
+WORKER_REVISION_ANNOTATION = "open-rl.dev/worker-revision"
 # Label values allow at most 63 chars of [a-z0-9A-Z-_.]; we also reuse the
 # sanitized id in the pod name, which is stricter (lowercase DNS).
 _LABEL_SAFE = re.compile(r"[^a-z0-9-]+")
+_MAX_JOB_ID_LENGTH = 47
 
 
 def sanitize_job_id(model_id: str) -> str:
   cleaned = _LABEL_SAFE.sub("-", model_id.lower()).strip("-")
   if not cleaned:
     raise ValueError(f"model_id {model_id!r} has no label-safe characters")
-  return cleaned[:63]
+  if len(cleaned) <= _MAX_JOB_ID_LENGTH:
+    return cleaned
+  digest = hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:8]
+  return f"{cleaned[: _MAX_JOB_ID_LENGTH - len(digest) - 1].rstrip('-')}-{digest}"
 
 
 class KubernetesFFTWorkerManager:
@@ -57,38 +76,68 @@ class KubernetesFFTWorkerManager:
     self.pod_template = self.trainer_template
 
     self.namespace = os.getenv("OPEN_RL_WORKER_NAMESPACE", "default")
+    self.startup_timeout = float(os.getenv("OPEN_RL_WORKER_STARTUP_TIMEOUT_SECONDS", "180"))
 
     if core_api is None:
       config.load_incluster_config()
       core_api = client.CoreV1Api()
     self.core_api = core_api
 
-  def launch(self, model_id: str, base_model: str | None = None) -> None:
-    self.launch_trainer(model_id, base_model)
+  def launch(self, model_id: str, base_model: str | None = None) -> str:
+    return self.launch_trainer(model_id, base_model)
 
-  def launch_trainer(self, model_id: str, base_model: str | None = None) -> None:
-    self._launch_pod(model_id, role="trainer", base_model=base_model)
+  def launch_trainer(self, model_id: str, base_model: str | None = None) -> str:
+    return self.launch_pod(model_id, role="trainer", base_model=base_model)
 
-  def launch_sampler(self, model_id: str, base_model: str | None = None) -> None:
-    self._launch_pod(model_id, role="sampler", base_model=base_model)
+  def launch_sampler(self, model_id: str, base_model: str | None = None) -> str:
+    return self.launch_pod(model_id, role="sampler", base_model=base_model)
 
-  def _launch_pod(self, model_id: str, role: str, base_model: str | None = None) -> None:
+  def launch_pod(self, model_id: str, role: str, base_model: str | None = None) -> str:
     job_id = sanitize_job_id(model_id)
     prefix = "open-rl-trainer-" if role == "trainer" else "open-rl-sampler-"
     pod_name = prefix + job_id
+    revision = self.worker_revision(role)
 
     existing = self.read_pod(pod_name)
     if existing is not None:
-      if existing.status.phase not in TERMINAL_POD_PHASES:
-        return
+      if instance_id := reusable_worker_instance(existing, revision):
+        self.wait_for_pod_startup(pod_name)
+        return instance_id
+      annotations = existing.metadata.annotations or {}
+      logger.info(
+        "replacing %s pod %s (phase=%s, revision=%s, expected=%s)",
+        role,
+        pod_name,
+        existing.status.phase,
+        annotations.get(WORKER_REVISION_ANNOTATION, "missing"),
+        revision,
+      )
       self.delete_pod_and_wait(pod_name)
 
+    instance_id = uuid.uuid4().hex
+    pod_body = self.render_pod(
+      pod_name,
+      model_id,
+      job_id,
+      role=role,
+      base_model=base_model,
+      revision=revision,
+      instance_id=instance_id,
+    )
     try:
-      pod_body = self.render_pod(pod_name, model_id, job_id, role=role, base_model=base_model)
       self.core_api.create_namespaced_pod(namespace=self.namespace, body=pod_body)
-    except Exception as exc:
-      if getattr(exc, "status", None) != 409:
+    except ApiException as exc:
+      if exc.status != 409:
         raise
+      existing = self.read_pod(pod_name)
+      if existing is None:
+        raise RuntimeError(f"pod {pod_name} reported a create conflict but could not be read") from exc
+      instance_id = reusable_worker_instance(existing, revision)
+      if instance_id is None:
+        raise RuntimeError(f"pod {pod_name} already exists with an unexpected worker revision") from exc
+
+    self.wait_for_pod_startup(pod_name)
+    return instance_id
 
   def shutdown(self, model_id: str) -> None:
     job_id = sanitize_job_id(model_id)
@@ -96,18 +145,37 @@ class KubernetesFFTWorkerManager:
       pod_name = prefix + job_id
       try:
         self.core_api.delete_namespaced_pod(name=pod_name, namespace=self.namespace)
-      except Exception as exc:
-        if getattr(exc, "status", None) != 404:
+      except ApiException as exc:
+        if exc.status != 404:
           raise
 
   def shutdown_all(self) -> None:
-    pass
+    # Workers outlive gateway rollouts and are replaced lazily when their
+    # revision changes. Explicit model deletion owns worker teardown.
+    return None
 
-  def render_pod(self, pod_name: str, model_id: str, job_id: str, role: str = "trainer", base_model: str | None = None) -> dict[str, Any]:
+  def render_pod(
+    self,
+    pod_name: str,
+    model_id: str,
+    job_id: str,
+    role: str = "trainer",
+    base_model: str | None = None,
+    revision: str | None = None,
+    instance_id: str | None = None,
+  ) -> dict[str, Any]:
     base_tmpl = self.trainer_template if role == "trainer" else self.sampler_template
     pod = copy.deepcopy(base_tmpl)
     metadata = pod.setdefault("metadata", {})
     metadata["name"] = pod_name
+    revision = revision or self.worker_revision(role)
+    instance_id = instance_id or uuid.uuid4().hex
+    metadata.setdefault("annotations", {}).update(
+      {
+        WORKER_INSTANCE_ANNOTATION: instance_id,
+        WORKER_REVISION_ANNOTATION: revision,
+      }
+    )
     app_label = "open-rl-trainer-worker" if role == "trainer" else "open-rl-sampler-worker"
     role_group = TRAINER_TIME_SLICE_GROUP if role == "trainer" else SAMPLER_TIME_SLICE_GROUP
     role_job_id = workload_job_id(role, job_id)
@@ -121,11 +189,11 @@ class KubernetesFFTWorkerManager:
     )
 
     container = pod["spec"]["containers"][0]
-    worker_image = os.getenv("OPEN_RL_WORKER_IMAGE")
+    worker_image = self.worker_image(role)
     if worker_image:
       container["image"] = worker_image
     if role == "sampler":
-      container["command"] = ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"]
+      container["command"] = ["uv", "run", "--no-sync", "python", "-u", "-m", "server.vllm_sampler"]
     container.setdefault("args", []).extend(["--model-id", model_id])
     if base_model:
       set_env(container, "BASE_MODEL", base_model)
@@ -133,13 +201,26 @@ class KubernetesFFTWorkerManager:
     # same workload identity.
     set_env(container, "OPEN_RL_TIME_SLICE_JOB_ID", role_job_id)
     set_env(container, "OPEN_RL_TIME_SLICE_GROUP", role_group)
+    set_env(container, "OPEN_RL_WORKER_INSTANCE_ID", instance_id)
+    apply_resource_overrides(container, role)
     return pod
 
-  def read_pod(self, pod_name: str) -> Any | None:
+  def worker_image(self, role: str) -> str | None:
+    role_image = os.getenv("OPEN_RL_TRAINER_IMAGE" if role == "trainer" else "OPEN_RL_SAMPLER_IMAGE")
+    return role_image or os.getenv("OPEN_RL_WORKER_IMAGE")
+
+  def worker_revision(self, role: str) -> str:
+    template = self.trainer_template if role == "trainer" else self.sampler_template
+    template_bytes = yaml.safe_dump(template, sort_keys=True).encode("utf-8")
+    template_digest = hashlib.sha256(template_bytes).hexdigest()
+    image_revision = os.getenv("OPEN_RL_WORKER_REVISION") or self.worker_image(role) or "unversioned"
+    return hashlib.sha256(f"{image_revision}\0{template_digest}".encode()).hexdigest()[:16]
+
+  def read_pod(self, pod_name: str) -> client.V1Pod | None:
     try:
       return self.core_api.read_namespaced_pod(name=pod_name, namespace=self.namespace)
-    except Exception as exc:
-      if getattr(exc, "status", None) == 404:
+    except ApiException as exc:
+      if exc.status == 404:
         return None
       raise
 
@@ -151,6 +232,72 @@ class KubernetesFFTWorkerManager:
         raise RuntimeError(f"pod {pod_name} did not terminate within {timeout:.0f}s; cannot relaunch worker")
       time.sleep(0.5)
 
+  def wait_for_pod_startup(self, pod_name: str) -> None:
+    start = time.monotonic()
+    deadline = start + self.startup_timeout
+    while time.monotonic() < deadline:
+      pod = self.read_pod(pod_name)
+      if pod is None:
+        time.sleep(0.5)
+        continue
+
+      phase = pod.status.phase or "Unknown"
+      failure = pod_container_failure(pod)
+      if failure:
+        raise RuntimeError(f"worker pod {pod_name} cannot start: {failure}. {self.pod_events(pod_name)}")
+      if phase == "Running":
+        logger.info("worker pod %s reached Running in %.2fs", pod_name, time.monotonic() - start)
+        return
+      if phase in TERMINAL_POD_PHASES:
+        raise RuntimeError(f"worker pod {pod_name} entered {phase}. {self.pod_events(pod_name)}")
+      time.sleep(1)
+
+    pod = self.read_pod(pod_name)
+    detail = describe_pod_status(pod) if pod is not None else "pod disappeared"
+    raise TimeoutError(f"worker pod {pod_name} did not reach Running within {self.startup_timeout:.0f}s ({detail}). {self.pod_events(pod_name)}")
+
+  def pod_events(self, pod_name: str) -> str:
+    try:
+      events = self.core_api.list_namespaced_event(namespace=self.namespace, field_selector=f"involvedObject.name={pod_name}")
+    except Exception as exc:
+      return f"Kubernetes events unavailable: {exc}"
+    items = events.items[-3:]
+    if not items:
+      return "No Kubernetes events recorded"
+    return "Events: " + "; ".join(f"{item.reason or 'Unknown'}: {item.message or ''}" for item in items)
+
+
+def pod_container_failure(pod: client.V1Pod) -> str | None:
+  statuses = pod.status.container_statuses or []
+  for status in statuses:
+    state = status.state
+    if state is None:
+      continue
+    waiting = state.waiting
+    if waiting is not None and waiting.reason in FATAL_CONTAINER_REASONS:
+      detail = f": {waiting.message}" if waiting.message else ""
+      return f"container {status.name} is waiting with {waiting.reason}{detail}"
+    terminated = state.terminated
+    if terminated is not None and terminated.exit_code != 0:
+      return f"container {status.name} exited with code {terminated.exit_code}: {terminated.message or ''}"
+  return None
+
+
+def reusable_worker_instance(pod: client.V1Pod, revision: str) -> str | None:
+  if pod.status.phase in TERMINAL_POD_PHASES:
+    return None
+  annotations = pod.metadata.annotations or {}
+  if annotations.get(WORKER_REVISION_ANNOTATION) != revision:
+    return None
+  return annotations.get(WORKER_INSTANCE_ANNOTATION)
+
+
+def describe_pod_status(pod: client.V1Pod) -> str:
+  phase = pod.status.phase or "Unknown"
+  conditions = pod.status.conditions or []
+  waiting = [f"{condition.reason or 'Unknown'}: {condition.message or ''}" for condition in conditions if condition.status == "False"]
+  return f"phase={phase}" + (f", conditions={'; '.join(waiting)}" if waiting else "")
+
 
 def set_env(container: dict[str, Any], name: str, value: str) -> None:
   env = container.setdefault("env", [])
@@ -160,3 +307,16 @@ def set_env(container: dict[str, Any], name: str, value: str) -> None:
       item.update({"name": name, "value": value})
       return
   env.append({"name": name, "value": value})
+
+
+def apply_resource_overrides(container: dict[str, Any], role: str) -> None:
+  prefix = f"OPEN_RL_{role.upper()}_"
+  resources = container.setdefault("resources", {})
+  for section, resource, suffix in (
+    ("requests", "cpu", "CPU_REQUEST"),
+    ("requests", "memory", "MEMORY_REQUEST"),
+    ("limits", "cpu", "CPU_LIMIT"),
+    ("limits", "memory", "MEMORY_LIMIT"),
+  ):
+    if value := os.getenv(prefix + suffix):
+      resources.setdefault(section, {})[resource] = value

@@ -21,16 +21,19 @@ class WorkloadState:
 
 
 class SingleNodeTimeSlicer(TimeSlicer):
-  def __init__(self, restorer: CheckpointRestorer, scheduling_policy: str = "lrs"):
+  def __init__(self, restorer: CheckpointRestorer, scheduling_policy: str = "lrs", checkpoint_on_handoff: bool = False):
     self.restorer = restorer
     self.scheduling_policy = scheduling_policy.lower()
+    self.checkpoint_on_handoff = checkpoint_on_handoff
     self.workloads: dict[str, WorkloadState] = {}
     self.waiting_workloads: deque[str] = deque()
     self.active_workload: str | None = None
+    self.resident_workload: str | None = None
+    self.handoff_in_progress = False
     self.condition = asyncio.Condition()
     self.last_release_time: dict[str, float] = {}
 
-  def _get_next_workload_key(self) -> str | None:
+  def next_workload_key(self) -> str | None:
     if not self.waiting_workloads:
       return None
     if self.scheduling_policy == "fifo" or len(self.waiting_workloads) == 1:
@@ -57,8 +60,8 @@ class SingleNodeTimeSlicer(TimeSlicer):
       return {"ok": True}
 
   async def acquire(self, workload: WorkloadRef) -> dict[str, Any]:
+    key = workload.key
     async with self.condition:
-      key = workload.key
       state = self.workloads.get(key)
       if state is None:
         return {"ok": False, "error": f"workload {key} is not registered"}
@@ -66,26 +69,58 @@ class SingleNodeTimeSlicer(TimeSlicer):
         return {"ok": False, "error": f"workload {key} is failed"}
       if key in self.waiting_workloads or self.active_workload == key:
         return {"ok": False, "error": f"workload {key} already has a pending or active acquire"}
-
       self.waiting_workloads.append(key)
-      try:
-        while self.active_workload is not None or (key in self.waiting_workloads and self._get_next_workload_key() != key):
-          await self.condition.wait()
-      except BaseException:
+
+    try:
+      while True:
+        resident_state = None
+        async with self.condition:
+          while self.active_workload is not None or self.handoff_in_progress or (key in self.waiting_workloads and self.next_workload_key() != key):
+            await self.condition.wait()
+
+          state = self.workloads.get(key)
+          if state is None or state.failed or key not in self.waiting_workloads:
+            self.clear_workload(key)
+            self.condition.notify_all()
+            return {"ok": False, "error": f"workload {key} is not available"}
+
+          if self.checkpoint_on_handoff and self.resident_workload not in {None, key}:
+            resident_state = self.workloads.get(self.resident_workload)
+            if resident_state is None:
+              self.resident_workload = None
+            else:
+              self.handoff_in_progress = True
+
+          if resident_state is None:
+            self.waiting_workloads.remove(key)
+            self.active_workload = key
+            if self.resident_workload == key:
+              self.resident_workload = None
+            self.condition.notify_all()
+            break
+
+        checkpointed = await self.run_checkpoint(resident_state)
+        async with self.condition:
+          if checkpointed is False:
+            if key in self.waiting_workloads:
+              self.waiting_workloads.remove(key)
+            self.handoff_in_progress = False
+            self.condition.notify_all()
+            return {"ok": False, "error": f"failed to checkpoint resident workload {resident_state.workload.key}"}
+          current_resident = self.workloads.get(resident_state.workload.key)
+          if current_resident is not None:
+            current_resident.checkpointed = checkpointed is not False
+          if self.resident_workload == resident_state.workload.key:
+            self.resident_workload = None
+          self.handoff_in_progress = False
+          self.condition.notify_all()
+    except BaseException:
+      async with self.condition:
         if key in self.waiting_workloads:
           self.waiting_workloads.remove(key)
+        self.handoff_in_progress = False
         self.condition.notify_all()
-        raise
-
-      state = self.workloads.get(key)
-      if state is None or state.failed or key not in self.waiting_workloads:
-        self.clear_workload(key)
-        self.condition.notify_all()
-        return {"ok": False, "error": f"workload {key} is not available"}
-
-      self.waiting_workloads.remove(key)
-      self.active_workload = key
-      self.condition.notify_all()
+      raise
 
     if state.checkpointed:
       await self.run_restore(state)
@@ -105,12 +140,28 @@ class SingleNodeTimeSlicer(TimeSlicer):
       if self.active_workload != key:
         return {"ok": False, "error": f"workload {key} does not hold an active acquire"}
 
+      if self.checkpoint_on_handoff and not self.waiting_workloads:
+        self.last_release_time[key] = time.time()
+        self.clear_workload(key)
+        self.resident_workload = key
+        self.condition.notify_all()
+        logger.info("kept workload %s group %s resident; no handoff is waiting", workload.key, workload.group)
+        return {"ok": True, "checkpointed": False, "resident": True}
+
     checkpointed = await self.run_checkpoint(state)
 
     async with self.condition:
+      if self.checkpoint_on_handoff and checkpointed is False:
+        self.last_release_time[workload.key] = time.time()
+        self.clear_workload(workload.key)
+        self.resident_workload = workload.key
+        self.condition.notify_all()
+        return {"ok": False, "error": f"failed to checkpoint workload {workload.key} for handoff"}
       state = self.workloads.get(workload.key)
       if state is not None:
         state.checkpointed = checkpointed is not False
+      if self.resident_workload == workload.key:
+        self.resident_workload = None
       self.last_release_time[workload.key] = time.time()
       self.clear_workload(workload.key)
       self.condition.notify_all()
@@ -143,6 +194,8 @@ class SingleNodeTimeSlicer(TimeSlicer):
       self.waiting_workloads.remove(key)
     if self.active_workload == key:
       self.active_workload = None
+    if self.resident_workload == key:
+      self.resident_workload = None
 
   async def run_checkpoint(self, state: WorkloadState) -> bool | None:
     workload = state.workload
@@ -166,3 +219,4 @@ class SingleNodeTimeSlicer(TimeSlicer):
       logger.info("restored workload %s group %s in %.2fs", workload.key, workload.group, time.monotonic() - start)
     except Exception as exc:
       logger.warning("restore failed for workload %s group %s: %s", workload.key, workload.group, exc)
+      raise

@@ -52,6 +52,26 @@ def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
+def uses_sticky_gpu_lease() -> bool:
+  return os.getenv("OPEN_RL_STICKY_GPU_LEASE", "0") == "1"
+
+
+async def publish_sampler_ready(store: Any, model_id: str, instance_id: str) -> None:
+  if store.redis is not None:
+    await store.redis.set(f"open_rl:sampler_ready:{model_id}", instance_id)
+
+
+async def clear_sampler_ready(store: Any, model_id: str, instance_id: str) -> None:
+  if store.redis is None:
+    return
+  key = f"open_rl:sampler_ready:{model_id}"
+  value = await store.redis.get(key)
+  if isinstance(value, bytes):
+    value = value.decode("utf-8")
+  if value == instance_id:
+    await store.redis.delete(key)
+
+
 time_slicer: Any = None
 if is_fft_enabled():
   from accel_timeslicer.time_slicer import time_slicer_client_from_env, workload_from_env
@@ -209,10 +229,11 @@ async def process_sampling_request(req: dict, store: Any) -> None:
     try:
       # 1. Manage weights reloading
       weights_path = req.get("weights_path")
+      weights_revision = req.get("weights_revision") or weights_path
       if is_fft_enabled() and weights_path:
         async with reload_lock:
-          if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
-            print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
+          if weights_revision != CURRENT_LOADED_SAMPLER_WEIGHTS:
+            print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_revision}")
             if engine is not None:
               print("[vLLM Worker] Triggering sleep level 2...")
               await engine.sleep(level=2)
@@ -222,7 +243,7 @@ async def process_sampling_request(req: dict, store: Any) -> None:
               await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
               print("[vLLM Worker] Waking up KV cache...")
               await engine.wake_up(tags=["kv_cache"])
-            CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
+            CURRENT_LOADED_SAMPLER_WEIGHTS = weights_revision
             print("[vLLM Worker] Weights reload completed successfully!")
 
       # 2. Run inference
@@ -266,6 +287,7 @@ async def run_sampling_worker(model_id: str) -> None:
   from server.store import get_store
 
   store = get_store()
+  instance_id = os.getenv("OPEN_RL_WORKER_INSTANCE_ID", "1")
   snapshot_registered = False
   workload = None
   if time_slicer is not None:
@@ -281,7 +303,7 @@ async def run_sampling_worker(model_id: str) -> None:
         print("[vLLM Worker] Initializing vLLM engine under parent lock...")
         init_engine()
         print("[vLLM Worker] Engine initialized successfully.")
-        if engine is not None:
+        if engine is not None and not uses_sticky_gpu_lease():
           print("[vLLM Worker] Sleeping engine after init to yield GPU memory...")
           await engine.sleep(level=2)
     except Exception as exc:
@@ -295,6 +317,7 @@ async def run_sampling_worker(model_id: str) -> None:
   async def exit_gracefully() -> None:
     print(f"[vLLM Worker] Initiating immediate exit for model {model_id} sampler worker...")
     nonlocal snapshot_registered
+    await clear_sampler_ready(store, model_id, instance_id)
     if snapshot_registered and time_slicer is not None:
       assert workload is not None
       try:
@@ -323,9 +346,7 @@ async def run_sampling_worker(model_id: str) -> None:
     except NotImplementedError:
       pass
 
-  if hasattr(store, "redis"):
-    await store.redis.set(f"open_rl:sampler_ready:{model_id}", "1")
-    await store.redis.expire(f"open_rl:sampler_ready:{model_id}", 3600)
+  await publish_sampler_ready(store, model_id, instance_id)
 
   print(f"[vLLM Worker] Listening for sampling requests on queue for model: {model_id}...")
   try:
@@ -352,7 +373,7 @@ async def run_sampling_worker(model_id: str) -> None:
               await asyncio.gather(*tasks)
               if has_shutdown:
                 await exit_gracefully()
-              if engine is not None:
+              if engine is not None and not uses_sticky_gpu_lease():
                 print("[vLLM Worker] Exiting batch: sleeping engine to yield GPU memory...")
                 await engine.sleep(level=2)
                 CURRENT_LOADED_SAMPLER_WEIGHTS = None
@@ -370,6 +391,7 @@ async def run_sampling_worker(model_id: str) -> None:
         traceback.print_exc()
         await asyncio.sleep(1)
   finally:
+    await clear_sampler_ready(store, model_id, instance_id)
     if time_slicer is not None:
       assert workload is not None
       try:
