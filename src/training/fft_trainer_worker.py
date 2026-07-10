@@ -30,6 +30,16 @@ def trainable_model_parameters(model: PreTrainedModel) -> list[torch.nn.Paramete
   return params
 
 
+def configure_fft_attention() -> str:
+  attention_backend = os.getenv("OPEN_RL_ATTN_IMPLEMENTATION", "sdpa")
+  if torch.cuda.is_available() and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
+    # Gradient checkpointing recomputes attention during backward, outside the
+    # original forward context. Disable the quadratic math backend process-wide
+    # so recomputation cannot silently materialize [batch, heads, seq, seq].
+    torch.backends.cuda.enable_math_sdp(False)
+  return attention_backend
+
+
 class FFTTrainingWorker(BaseTrainerWorker):
   def __init__(self):
     super().__init__()
@@ -56,7 +66,16 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
-    self.model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=target_device)
+    attention_backend = configure_fft_attention()
+    self.model = AutoModelForCausalLM.from_pretrained(
+      base_model_name,
+      dtype=dtype,
+      device_map=target_device,
+      attn_implementation=attention_backend,
+    )
+    print(f"Full fine-tuning attention backend: {self.model.config.get_text_config()._attn_implementation}")
+    device_map = vars(self.model).get("hf_device_map") or {".": str(self.device)}
+    print(f"Full fine-tuning device map: {device_map}")
     print("Successfully loaded full fine-tuning model.")
 
   def create_model(self, base_model_name: str, model_id: str | None = None, config: FFTConfig | None = None) -> None:
@@ -85,15 +104,15 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
     self.model.train()
 
-  def _prepare_for_save(self) -> bool:
-    was_offloaded = getattr(self, "_is_offloaded", False)
+  def prepare_for_save(self) -> bool:
+    was_offloaded = self._is_offloaded
     if was_offloaded and self.model is not None:
       for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
         if tensor in self._param_shadow:
           tensor.data = self._param_shadow[tensor][1]
     return was_offloaded
 
-  def _cleanup_after_save(self, was_offloaded: bool) -> None:
+  def cleanup_after_save(self, was_offloaded: bool) -> None:
     if was_offloaded and self.model is not None:
       for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
         if tensor in self._param_shadow:
@@ -107,13 +126,13 @@ class FFTTrainingWorker(BaseTrainerWorker):
     save_path = name if os.path.isabs(name) else os.path.join(tmp_dir, "fft", name)
     os.makedirs(save_path, exist_ok=True)
 
-    was_offloaded = self._prepare_for_save()
+    was_offloaded = self.prepare_for_save()
     try:
       self.model.save_pretrained(save_path)
       if self.tokenizer is not None:
         self.tokenizer.save_pretrained(save_path)
     finally:
-      self._cleanup_after_save(was_offloaded)
+      self.cleanup_after_save(was_offloaded)
 
     metadata = {
       "base_model": self.base_model_name,
@@ -132,7 +151,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     assert self.model is not None, "Model must be loaded first."
 
     os.makedirs(state_path, exist_ok=True)
-    was_offloaded = self._prepare_for_save()
+    was_offloaded = self.prepare_for_save()
     try:
       self.model.save_pretrained(state_path)
       if self.tokenizer is not None:
@@ -141,7 +160,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       if include_optimizer and self.optimizer is not None:
         torch.save(self.optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
     finally:
-      self._cleanup_after_save(was_offloaded)
+      self.cleanup_after_save(was_offloaded)
 
     metadata = {
       "base_model": self.base_model_name,
@@ -174,13 +193,18 @@ class FFTTrainingWorker(BaseTrainerWorker):
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     target_device = "auto" if num_gpus > 1 else self.device
-    self.model = AutoModelForCausalLM.from_pretrained(state_path, dtype=dtype, device_map=target_device)
+    self.model = AutoModelForCausalLM.from_pretrained(
+      state_path,
+      dtype=dtype,
+      device_map=target_device,
+      attn_implementation=configure_fft_attention(),
+    )
     self.prepare_model_for_training()
 
     if restore_optimizer and metadata.get("has_optimizer"):
       optimizer_path = os.path.join(state_path, "optimizer.pt")
       if os.path.exists(optimizer_path):
-        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=1e-4)
+        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=1e-4, foreach=False)
         self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
         print(f"Restored optimizer state from {optimizer_path}")
 
@@ -215,6 +239,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
         betas=(beta1, beta2),
         eps=eps,
         weight_decay=weight_decay,
+        foreach=False,
       )
 
     learning_rate = adam_params.get("learning_rate")
@@ -229,6 +254,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     total_norm = torch.nn.utils.clip_grad_norm_(
       self.trainable_params,
       max_grad_norm,
+      foreach=False,
     )
 
     self.optimizer.step()
@@ -248,17 +274,25 @@ class FFTTrainingWorker(BaseTrainerWorker):
     temperature: float = 0.0,
     model_id: str | None = None,
     include_prompt_logprobs: bool = False,
+    stop: list[int] | None = None,
+    top_p: float = 1.0,
+    top_k: int = -1,
   ) -> dict[str, Any]:
-    return super().generate(self.model, prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
+    return super().generate(
+      model=self.model,
+      prompt_tokens=prompt_tokens,
+      max_tokens=max_tokens,
+      num_samples=num_samples,
+      temperature=temperature,
+      include_prompt_logprobs=include_prompt_logprobs,
+      stop=stop,
+      top_p=top_p,
+      top_k=top_k,
+    )
 
   def sleep(self) -> None:
     """Offload GPU tensors to pinned host CPU memory and empty CUDA allocator cache."""
-    if (
-      not getattr(self, "cpu_offload", False)
-      or getattr(self, "model", None) is None
-      or getattr(self, "_is_offloaded", False)
-      or not torch.cuda.is_available()
-    ):
+    if not self.cpu_offload or self.model is None or self._is_offloaded or not torch.cuda.is_available():
       return
     start_t = time.perf_counter()
 
@@ -320,20 +354,14 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if torch.cuda.is_available():
       gc.collect()
       torch.cuda.empty_cache()
-      if hasattr(torch.cuda, "ipc_collect"):
-        torch.cuda.ipc_collect()
+      torch.cuda.ipc_collect()
 
     self._is_offloaded = True
     print(f"[FFT Worker] Offloaded weights & states to pinned CPU memory in {(time.perf_counter() - start_t) * 1000:.1f} ms.")
 
-  def wake_up(self) -> None:
+  def wake_up(self, include_optimizer: bool = True) -> None:
     """Reload pinned CPU shadow tensors back to CUDA VRAM without destroying host shadow buffers."""
-    if (
-      not getattr(self, "cpu_offload", False)
-      or getattr(self, "model", None) is None
-      or not getattr(self, "_is_offloaded", False)
-      or not torch.cuda.is_available()
-    ):
+    if not self.cpu_offload or self.model is None or not self._is_offloaded or not torch.cuda.is_available():
       return
     start_t = time.perf_counter()
 
@@ -345,7 +373,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
         orig_device, cpu_grad = self._grad_shadow[tensor]
         tensor.grad.data = cpu_grad.to(orig_device, non_blocking=True)
 
-    if self.optimizer is not None:
+    if include_optimizer and self.optimizer is not None:
       for param, state in self.optimizer.state.items():
         if isinstance(state, dict):
           state.pop("_orig_devices", None)

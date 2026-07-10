@@ -2,13 +2,35 @@
 
 import math
 import os
+from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.utils.checkpoint
 from pydantic import BaseModel
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
+
+
+def chunk_target_logprob(
+  hidden_chunk: torch.Tensor,
+  weight: torch.Tensor,
+  bias: torch.Tensor | None,
+  target_chunk: torch.Tensor,
+  softcap: float | None,
+) -> torch.Tensor:
+  """Project one chunk of hidden states through the vocab and return the selected
+  target logprob (logit[target] - logsumexp). The [chunk, vocab] logits tensor is
+  local to this call, so under activation checkpointing it is never stored for the
+  backward pass -- it is recomputed."""
+  logits = torch.nn.functional.linear(hidden_chunk, weight, bias)
+  if logits.dtype in (torch.float16, torch.bfloat16):
+    logits = logits.float()
+  if softcap is not None:
+    logits = softcap * torch.tanh(logits / softcap)
+  target_logit = logits.gather(dim=-1, index=target_chunk.unsqueeze(-1)).squeeze(-1)
+  return target_logit - torch.logsumexp(logits, dim=-1)
 
 
 class TensorData(BaseModel):
@@ -185,10 +207,96 @@ class BaseTrainerWorker:
     attention_mask: torch.Tensor,
     target_token_ids: torch.Tensor,
   ) -> torch.Tensor:
-    """Return selected target logprobs with shape [batch, max_target_len]."""
+    """Return selected target logprobs with shape [batch, max_target_len].
+
+    Large-vocab models (e.g. Gemma's ~256K vocab) OOM the GPU holding the lm_head
+    because the full [batch, seq, vocab] logits tensor is materialized twice (once
+    by the head, again by log_softmax upcasting to fp32). We instead run the
+    backbone to get hidden states and project + reduce to the target logprob in
+    vocab-sized chunks, so peak head activation is [chunk, vocab]. Falls back to the
+    standard full-logits path when disabled or when the backbone can't be resolved.
+    """
+    seq_len = target_token_ids.shape[1]
+
+    if os.getenv("OPEN_RL_FUSED_LOGPROB", "1") == "1":
+      hidden = self.backbone_hidden_states(model, input_ids, attention_mask)
+      if hidden is not None:
+        return self.fused_target_logprobs(model, hidden[:, :seq_len, :], target_token_ids)
+
+    # Full-logits path. Use logit - logsumexp rather than log_softmax(...).gather so
+    # we avoid the extra full-size fp32 log_softmax allocation.
     outputs = model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
-    logits = outputs.logits[:, : target_token_ids.shape[1], :]
-    return torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
+    logits = outputs.logits[:, :seq_len, :]
+    target_logit = logits.gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
+    return target_logit - torch.logsumexp(logits, dim=-1)
+
+  def backbone_hidden_states(
+    self,
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+  ) -> torch.Tensor | None:
+    """Return the transformer backbone's last_hidden_state without running the
+    lm_head. Returns None (so the caller uses the full-logits path) when the
+    backbone can't be resolved or does not expose hidden states -- e.g. PEFT/LoRA
+    wrappers whose forward only yields logits."""
+    backbone = getattr(model, "model", None) or getattr(model, "transformer", None)
+    if backbone is None or backbone is model:
+      return None
+    backbone_attention_mask = attention_mask
+    if attention_mask is not None and bool(attention_mask.all()):
+      # A dense all-ones mask only describes ordinary causal attention. Omitting
+      # it lets SDPA select Flash Attention instead of materializing a quadratic
+      # additive mask for Gemma's global-attention layers.
+      backbone_attention_mask = None
+    attention_context = nullcontext()
+    if input_ids.is_cuda and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
+      from torch.nn.attention import SDPBackend, sdpa_kernel
+
+      attention_context = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+    try:
+      with attention_context:
+        outputs = backbone(input_ids=input_ids, attention_mask=backbone_attention_mask, use_cache=False, return_dict=True)
+    except Exception as exc:
+      print(f"[trainer] fused-logprob backbone forward failed ({exc}); using full-logits path")
+      return None
+    return getattr(outputs, "last_hidden_state", None)
+
+  def fused_target_logprobs(
+    self,
+    model: PreTrainedModel,
+    hidden: torch.Tensor,
+    target_token_ids: torch.Tensor,
+  ) -> torch.Tensor:
+    """Project hidden states through the lm_head in chunks and reduce to the
+    selected target logprob, never materializing the full [batch, seq, vocab]
+    logits tensor."""
+    lm_head = model.get_output_embeddings()
+    weight = lm_head.weight
+    bias = getattr(lm_head, "bias", None)
+    model_config = getattr(model, "config", None)
+    if model_config is not None and hasattr(model_config, "get_text_config"):
+      model_config = model_config.get_text_config()
+    softcap = getattr(model_config, "final_logit_softcapping", None)
+
+    batch, seq_len, _ = hidden.shape
+    flat_hidden = hidden.reshape(batch * seq_len, -1).to(weight.device)
+    flat_targets = target_token_ids.reshape(batch * seq_len).to(weight.device)
+
+    chunk = max(1, int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "128")))
+    logprob_chunks = []
+    for start in range(0, flat_hidden.shape[0], chunk):
+      hidden_chunk = flat_hidden[start : start + chunk]
+      target_chunk = flat_targets[start : start + chunk]
+      if hidden_chunk.requires_grad or weight.requires_grad:
+        logprob_chunk = torch.utils.checkpoint.checkpoint(
+          chunk_target_logprob, hidden_chunk, weight, bias, target_chunk, softcap, use_reentrant=False
+        )
+      else:
+        logprob_chunk = chunk_target_logprob(hidden_chunk, weight, bias, target_chunk, softcap)
+      logprob_chunks.append(logprob_chunk)
+
+    return torch.cat(logprob_chunks, dim=0).reshape(batch, seq_len)
 
   def generate(
     self,
@@ -198,6 +306,9 @@ class BaseTrainerWorker:
     num_samples: int = 1,
     temperature: float = 0.0,
     include_prompt_logprobs: bool = False,
+    stop: list[int] | None = None,
+    top_p: float = 1.0,
+    top_k: int = -1,
   ) -> dict[str, Any]:
     """Generate completions from model."""
     model.eval()
@@ -205,6 +316,17 @@ class BaseTrainerWorker:
     input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
     do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
     prompt_logprobs = self.prompt_logprobs(model, input_tensor) if include_prompt_logprobs else None
+    eos_token_ids: list[int] = []
+    tokenizer_eos = self.tokenizer.eos_token_id
+    if isinstance(tokenizer_eos, int):
+      eos_token_ids.append(tokenizer_eos)
+    elif tokenizer_eos:
+      eos_token_ids.extend(tokenizer_eos)
+    eos_token_ids.extend(stop or [])
+    eos_token_ids = list(dict.fromkeys(eos_token_ids))
+    pad_token_id = self.tokenizer.pad_token_id
+    if pad_token_id is None and eos_token_ids:
+      pad_token_id = eos_token_ids[0]
 
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
@@ -212,11 +334,12 @@ class BaseTrainerWorker:
         input_tensor,
         attention_mask=attention_mask,
         max_new_tokens=max_tokens,
-        pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_ids or None,
         do_sample=do_sample,
         temperature=temperature if do_sample else None,
-        top_p=None,
-        top_k=None,
+        top_p=top_p if do_sample else None,
+        top_k=max(0, top_k) if do_sample else None,
         num_return_sequences=num_samples,
         output_scores=True,
         return_dict_in_generate=True,
@@ -235,7 +358,9 @@ class BaseTrainerWorker:
         logprob = logprob_dist[token_id].item()
         logprobs.append(self.sanitize_float(logprob))
 
-      sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": "stop"})
+      stopped = bool(generated_tokens and generated_tokens[-1] in eos_token_ids)
+      stop_reason = "stop" if stopped or len(generated_tokens) < max_tokens else "length"
+      sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": stop_reason})
 
     result = {"sequences": sequences_out}
     if prompt_logprobs is not None:
