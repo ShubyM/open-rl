@@ -62,3 +62,6 @@ runs/
 experiments/lab-traces/harvey-labs/
 experiments/lab-traces/traces/
 experiments/lab-traces/split.json
+
+# Built-image record from make push-to-cluster (read by make cluster-e2e)
+.skaffold-build.json
