@@ -5,14 +5,15 @@
 # Easiest usage via Makefile:
 #   make cluster-e2e SCENARIO=fft-gsm8k-rl-x2 ARGS="base_model=Qwen/Qwen3-8B steps=30 jitter_sec=5"
 #
-# By hand: replace E2E-* placeholders below, then
-#   kubectl delete job open-rl-e2e-client --ignore-not-found
-#   kubectl apply -f k8s/eval/e2e-client-job.yaml
-#   kubectl logs -f job/open-rl-e2e-client
+# By hand: replace the placeholders below, create the manifest, and follow the
+# resulting Job logs.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: open-rl-e2e-client
+  name: E2E-JOB-NAME
+  labels:
+    app: open-rl-e2e-client
+    open-rl.dev/e2e-run: E2E-JOB-NAME
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 86400
@@ -20,6 +21,7 @@ spec:
     metadata:
       labels:
         app: open-rl-e2e-client
+        open-rl.dev/e2e-run: E2E-JOB-NAME
     spec:
       restartPolicy: Never
       serviceAccountName: open-rl-sa

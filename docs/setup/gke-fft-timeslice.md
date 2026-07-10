@@ -31,8 +31,11 @@ sampler worker pods connect to the agent on their node with
 `OPEN_RL_ACCEL_TIMESLICER_HOST=status.hostIP` and
 `OPEN_RL_ACCEL_TIMESLICER_PORT=9753`. The training processor registers its
 workload identity with the agent and wraps GPU work in acquire/release calls.
-The agent keeps a FIFO queue per node-local process, allows one active workload
-at a time within that process, checkpoints on release, and restores on acquire.
+The agent keeps a queue per node, allows one active workload at a time, and
+keeps the last workload resident while no handoff is waiting. When a different
+workload arrives, it checkpoints the resident process before granting the GPU
+and restores it on its next acquire. This avoids snapshot and CPU-offload work
+between uncontended RL steps while preserving isolation under contention.
 In the cluster deployment, the OpenRL time-slicer runs with `--backend llmd`;
 llm-d's physical snapshot agent performs the actual pod/PID discovery and CUDA
 checkpoint/restore.
@@ -161,6 +164,12 @@ template in `05-worker-pod-template.yaml`. It stamps:
 - `OPEN_RL_TIME_SLICE_GROUP`, aligned with the `timeslice.io/group` label
 - `--model-id <model_id>`, so the worker drains only its own queue
 
+It also stamps an image-and-template revision plus a unique worker instance.
+Live pods are reused only when that revision matches. A changed image or pod
+template is replaced lazily on the next request. The launcher waits for
+`Running` and reports terminal container state and Kubernetes events directly,
+so image pull and scheduling failures do not become opaque future timeouts.
+
 The gateway still has a local subprocess launcher for VM development. Select the
 cluster launcher with `OPEN_RL_WORKER_MANAGER=kubernetes`.
 
@@ -171,16 +180,16 @@ OpenRL accelerator time-slicer on each trainer or sampler GPU node:
 
 ```yaml
 hostNetwork: true
-command: ["uv", "run", "python", "-m", "accel_timeslicer.serve"]
 args:
   ["--listen-host", "0.0.0.0", "--port", "9753",
-   "--backend", "llmd", "--llmd-snapshot-endpoint", "127.0.0.1:9001"]
+   "--backend", "llmd", "--llmd-snapshot-endpoint", "127.0.0.1:9001",
+   "--checkpoint-on-handoff"]
 ```
 
 The dynamically launched trainer worker pods run the normal training processor:
 
 ```yaml
-command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
+command: ["uv", "run", "--no-sync", "python", "-m", "server.training_requests_processor"]
 ```
 
 The training processor uses:
@@ -215,28 +224,53 @@ the relevant pod and process set.
 make push-to-cluster GCP_PROJECT=<project>
 ```
 
-Runs `skaffold run`: builds the server, gateway, and client images from the
-working tree with content-addressed tags (`inputDigest` — uncommitted changes
+Runs `skaffold run`: builds the server, gateway, and lightweight time-slicer
+images from the working tree with content-addressed tags (`inputDigest`; uncommitted changes
 produce a new tag), pushes them to `gcr.io/$GCP_PROJECT`, and applies
 `k8s/deploy/distributed-fft-timeslice` with the built images substituted into
 the rendered manifests. The substitution covers the gateway and
 accel-timeslicer images and — via the `resourceSelector` in `skaffold.yaml` —
-the `OPEN_RL_WORKER_IMAGE` env var, so trainer/sampler pods launched after the
-deploy run the new server image. The wrapper then waits for the gateway
-rollout and deletes stale worker pods (the gateway reuses running pods per
-model id, so jobs must start fresh to pick up new code).
+the role-specific worker image env vars, so trainer/sampler pods launched after
+the deploy run the new server image. The wrapper reloads ConfigMap pod
+templates and waits for both rollouts. It does not delete active jobs;
+revision-aware launch replaces only stale workers.
 
-Docker layer caching applies: code-only edits rebuild just the final copy
-layer. Set `GCP_PROJECT` once in a gitignored `local.mk`
+Skaffold builds independent artifacts concurrently and skips unchanged image
+digests. Dockerfiles copy only runtime-owned paths, so docs, manifests, and
+client edits do not invalidate the large GPU image. Set `GCP_PROJECT` once in
+a gitignored `local.mk`
 (`cp local.mk.example local.mk`) instead of passing it per command.
 
-`push-to-cluster` records the built images in a gitignored
+The client image is opt-in because backend-only iterations do not need it.
+`push-to-cluster-client` records all built images in a gitignored
 `.skaffold-build.json`; `make cluster-e2e` reads the client image from it
 automatically, so the full loop is:
 
 ```bash
-make push-to-cluster
+make push-to-cluster-client
 make cluster-e2e E2E_SCENARIO=fft-textsql-rl E2E_ARGS="steps=2"
+```
+
+Each E2E invocation gets a unique Job name, so runs can overlap. On failure the
+runner prints pod state, events, descriptions, and log tails. Use
+`E2E_CLEANUP=1` to remove a successful Job, or set both `E2E_NAME=<name>` and
+`E2E_REPLACE=1` when intentionally replacing a named run.
+
+Deploy settings are ordinary Make variables:
+
+```bash
+make push-to-cluster \
+  BASE_MODEL=google/gemma-4-e4b \
+  TRAINER_MEMORY_REQUEST=64Gi \
+  SAMPLER_MEMORY_REQUEST=32Gi
+```
+
+`CLEAN_WORKERS=1` opts into deleting active workers. Managed GKE monitoring is
+separate from the portable base manifest:
+
+```bash
+make push-to-cluster SKAFFOLD_PROFILES=gke-monitoring
+make push-to-cluster-client SKAFFOLD_PROFILES=client,gke-monitoring
 ```
 
 ### Image overrides for plain kubectl deploys
@@ -250,10 +284,9 @@ make deploy-local   # first run copies k8s/deploy/local/kustomization.yaml.examp
 ```
 
 Then edit `k8s/deploy/local/kustomization.yaml` (gitignored) to point the
-`images:` transformer at your registry and tag; a `replacements` block
-propagates the override into `OPEN_RL_WORKER_IMAGE`, so dynamically launched
-trainer/sampler pods follow it too. The committed example defaults to the
-published images, so an unedited overlay deploys exactly what
+`images:` transformer and the three worker-image env values at your registry
+and tag, so dynamically launched trainer/sampler pods follow it too. The
+committed example defaults to the published images, so an unedited overlay deploys exactly what
 `deploy-fft-timeslice` does.
 
 This is a development workflow. Production deploys should continue to use
@@ -367,9 +400,9 @@ make deploy-fft-timeslice
 shared GPU `ResourceClaim`, the node-local OpenRL time-slicer DaemonSet, and the
 gateway with `OPEN_RL_ENABLE_FFT=true` and
 `OPEN_RL_WORKER_MANAGER=kubernetes`.
-The deployment assumes one base model per rollout: set `BASE_MODEL` in
-`kustomization.yaml`, and the gateway uses that value for `get_info` and
-`create_model` requests that do not explicitly pass a base model.
+The deployment defaults to `google/gemma-4-e4b`; setting `BASE_MODEL=...` on
+`make push-to-cluster` patches the ConfigMap before restarting the gateway. A base
+model in the client request still overrides the worker template.
 
 There are no static worker deployments. Every `create_model` call makes the gateway create a trainer pod named `open-rl-trainer-<model-id>`, and every `create_sampling_client` call makes the gateway create a dedicated vLLM sampler pod named `open-rl-sampler-<model-id>`. Both are labeled:
 
@@ -379,20 +412,31 @@ timeslice.io/group: trainers    # or samplers
 timeslice.io/job-id: trainer-<model-id> # or sampler-<model-id>
 ```
 
-The gateway's `open-rl-sa` service account has a Role allowing pod CRUD in the workload namespace (`03-rbac.yaml`). When weight updates occur during FFT training, Trainers write checkpoints to NFS `/mnt/shared`, and Samplers dynamically reload those checkpoint safetensors in-place in ~1.1 seconds while yielding GPU VRAM via cooperative sleep.
+The gateway's `open-rl-sa` service account has a Role allowing pod and event
+access in the workload namespace (`03-rbac.yaml`). During FFT RL, trainers
+rotate ephemeral sampling checkpoints through two NFS directories by default
+(`OPEN_RL_SAMPLER_SNAPSHOT_SLOTS=2`). Sampling session ids remain unique, so
+vLLM reloads every policy revision while disk use stays bounded. Named eval or
+publication checkpoints are not rotated.
 
 ### Structured Model Serialization in Redis
 To ensure reliable metadata persistence across gateway restarts and worker spawns, model configuration is serialized in Redis using the `TrainingModelMetadata` dataclass:
 - **Generic KV Store:** The `RequestStore` interface provides generic `set_value`, `get_value`, and `delete_values` operations for storing structured objects alongside tenant request queues.
 - **Mandatory Architecture Specification:** The `/api/v1/create_model` endpoint strictly requires a valid `base_model` in the request payload, guaranteeing deterministic worker pod configuration.
 
-### Zero-Fragmentation Application-Level CPU Offloading
-When multiple training jobs share physical GPUs via the Accelerator Time-Slicer, `FFTTrainingWorker` performs zero-fragmentation memory swapping between VRAM and Pinned DRAM during time-slicer `acquire()` and `release()` cycles:
-- **Client Toggle:** Configured via `cpu_offload: bool = True` inside `FFTConfig`.
-- **Symmetric Primitives:** `sleep()` transfers model parameters and initialized AdamW optimizer states (`exp_avg`, `exp_avg_sq`) to pinned host memory (`.to("cpu", non_blocking=True).pin_memory()`) while replacing GPU tensors with empty shells (`torch.empty(0, ...)`). `wake_up()` reloads pinned shadow tensors back to CUDA instantly before processing training requests.
+### Contention-only checkpointing
+The cluster templates set `OPEN_RL_STICKY_GPU_LEASE=1` and the agent uses
+`--checkpoint-on-handoff`. A job therefore keeps weights, gradients, and
+optimizer state resident between its own steps. When another job waits, llm-d
+physically checkpoints the resident process before the scheduler grants that
+job. The existing pinned-CPU `sleep()`/`wake_up()` path remains available when
+sticky residency is disabled.
 
 ### DCGM GPU Observability
-The Kustomize rollout includes `10-dcgm-monitoring.yaml`, deploying the NVIDIA DCGM Exporter DaemonSet and a Google Cloud Monitoring `PodMonitoring` custom resource to scrape GPU utilization, VRAM usage, clock speeds, and temperature metrics every 10 seconds.
+The portable base does not require Google Monitoring CRDs. Activate the
+`gke-monitoring` Skaffold profile to deploy DCGM Exporter and `PodMonitoring`
+resources that scrape utilization, VRAM, clocks, and temperatures every 10
+seconds.
 
 ## Setup 3: Run training on the cluster
 
