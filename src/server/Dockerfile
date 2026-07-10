@@ -43,8 +43,11 @@ ENV UV_COMPILE_BYTECODE=1 \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --extra gpu --extra vllm --extra cluster
 
-# Copy source code
-COPY . .
+# Copy only the files installed into the runtime package. Keeping examples,
+# tests, docs, and manifests out of this layer avoids invalidating the 12GB GPU
+# image for client-only or deployment-only edits.
+COPY README.md .
+COPY src ./src
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --extra gpu --extra vllm --extra cluster
@@ -58,4 +61,4 @@ EXPOSE 8000
 EXPOSE 8001
 
 # Start the Gateway using uv run to ensure the venv is active
-CMD ["uv", "run", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "--no-sync", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
