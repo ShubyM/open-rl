@@ -30,7 +30,7 @@ class SingleNodeTimeSlicer(TimeSlicer):
     self.condition = asyncio.Condition()
     self.last_release_time: dict[str, float] = {}
 
-  def _get_next_workload_key(self) -> str | None:
+  def next_workload_key(self) -> str | None:
     if not self.waiting_workloads:
       return None
     if self.scheduling_policy == "fifo" or len(self.waiting_workloads) == 1:
@@ -66,10 +66,9 @@ class SingleNodeTimeSlicer(TimeSlicer):
         return {"ok": False, "error": f"workload {key} is failed"}
       if key in self.waiting_workloads or self.active_workload == key:
         return {"ok": False, "error": f"workload {key} already has a pending or active acquire"}
-
       self.waiting_workloads.append(key)
       try:
-        while self.active_workload is not None or (key in self.waiting_workloads and self._get_next_workload_key() != key):
+        while self.active_workload is not None or (key in self.waiting_workloads and self.next_workload_key() != key):
           await self.condition.wait()
       except BaseException:
         if key in self.waiting_workloads:
@@ -166,3 +165,4 @@ class SingleNodeTimeSlicer(TimeSlicer):
       logger.info("restored workload %s group %s in %.2fs", workload.key, workload.group, time.monotonic() - start)
     except Exception as exc:
       logger.warning("restore failed for workload %s group %s: %s", workload.key, workload.group, exc)
+      raise

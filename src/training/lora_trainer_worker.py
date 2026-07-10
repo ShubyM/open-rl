@@ -330,7 +330,20 @@ class LoraTrainingWorker(BaseTrainerWorker):
     temperature: float = 0.0,
     model_id: str | None = None,
     include_prompt_logprobs: bool = False,
+    stop: list[int] | None = None,
+    top_p: float = 1.0,
+    top_k: int = -1,
   ) -> dict[str, Any]:
     if model_id:
       self.peft_model.set_adapter(model_id)
-    return super().generate(self.peft_model, prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
+    return super().generate(
+      model=self.peft_model,
+      prompt_tokens=prompt_tokens,
+      max_tokens=max_tokens,
+      num_samples=num_samples,
+      temperature=temperature,
+      include_prompt_logprobs=include_prompt_logprobs,
+      stop=stop,
+      top_p=top_p,
+      top_k=top_k,
+    )

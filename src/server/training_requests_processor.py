@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import os
 import threading
+import time
 import traceback
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import uvicorn
@@ -62,7 +64,16 @@ class TrainingRequestsProcessor(Protocol):
       ctx = propagate.extract(carrier) if carrier else None
       token = otel_context.attach(ctx) if ctx else None
 
-      result = await self.dispatch_operation(op, raw_request.get("payload", {}), resolved_model_id)
+      started = time.monotonic()
+      with tracer.start_as_current_span(f"training.{op}") as operation_span:
+        operation_span.set_attribute("model_id", resolved_model_id)
+        operation_span.set_attribute("operation", op)
+        try:
+          result = await self.dispatch_operation(op, raw_request.get("payload", {}), resolved_model_id)
+        finally:
+          elapsed = time.monotonic() - started
+          operation_span.set_attribute("duration_seconds", elapsed)
+          print(f"[TIMING] model={resolved_model_id} phase={op} duration={elapsed:.3f}s")
       return request_id, result
     except Exception as exc:
       traceback.print_exc()
@@ -195,12 +206,15 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
   async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     result = await asyncio.to_thread(
       self.worker.generate,
-      payload.get("prompt_tokens", []),
-      payload.get("max_tokens", 20),
-      payload.get("num_samples", 1),
-      payload.get("temperature", 0.0),
-      model_id,
-      bool(payload.get("prompt_logprobs", False)),
+      prompt_tokens=payload.get("prompt_tokens", []),
+      max_tokens=payload.get("max_tokens", 20),
+      num_samples=payload.get("num_samples", 1),
+      temperature=payload.get("temperature", 0.0),
+      model_id=model_id,
+      include_prompt_logprobs=bool(payload.get("prompt_logprobs", False)),
+      stop=payload.get("stop"),
+      top_p=payload.get("top_p", 1.0),
+      top_k=payload.get("top_k", -1),
     )
     result["type"] = "sample_completed"
     return result
@@ -319,15 +333,18 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
 
         if gpu_reqs:
+          lease_started = time.monotonic()
           async with self.time_slicer.acquire(self.workload):
-            if hasattr(self.worker, "wake_up"):
-              await asyncio.to_thread(self.worker.wake_up)
+            lease_wait = time.monotonic() - lease_started
+            batch_span.set_attribute("gpu_lease_wait_seconds", lease_wait)
+            print(f"[TIMING] model={self.model_id} phase=gpu_lease_wait duration={lease_wait:.3f}s")
+            include_optimizer = any(request.get("op") == "optim_step" for request in gpu_reqs)
+            await self.transition_worker("wake_up", self.worker.wake_up, include_optimizer)
             try:
               for request in gpu_reqs:
                 results.append(await self.handle_request(request, self.model_id))
             finally:
-              if hasattr(self.worker, "sleep"):
-                await asyncio.to_thread(self.worker.sleep)
+              await self.transition_worker("sleep", self.worker.sleep)
 
         for request in save_reqs:
           results.append(await self.handle_request(request, self.model_id))
@@ -338,6 +355,15 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
     if has_shutdown:
       await self.exit_gracefully()
+
+  async def transition_worker(self, phase: str, transition: Callable[..., None], *args: Any) -> None:
+    started = time.monotonic()
+    with tracer.start_as_current_span(f"training.{phase}") as span:
+      await asyncio.to_thread(transition, *args)
+      elapsed = time.monotonic() - started
+      span.set_attribute("duration_seconds", elapsed)
+      span.set_attribute("model_id", self.model_id)
+      print(f"[TIMING] model={self.model_id} phase={phase} duration={elapsed:.3f}s")
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     raw_config = payload.get("full_config") or {}
@@ -384,12 +410,15 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     result = await asyncio.to_thread(
       self.worker.generate,
-      payload.get("prompt_tokens", []),
-      payload.get("max_tokens", 20),
-      payload.get("num_samples", 1),
-      payload.get("temperature", 0.0),
-      model_id,
-      bool(payload.get("prompt_logprobs", False)),
+      prompt_tokens=payload.get("prompt_tokens", []),
+      max_tokens=payload.get("max_tokens", 20),
+      num_samples=payload.get("num_samples", 1),
+      temperature=payload.get("temperature", 0.0),
+      model_id=model_id,
+      include_prompt_logprobs=bool(payload.get("prompt_logprobs", False)),
+      stop=payload.get("stop"),
+      top_p=payload.get("top_p", 1.0),
+      top_k=payload.get("top_k", -1),
     )
     result["type"] = "sample_completed"
     return result
