@@ -267,7 +267,6 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     self.workload = workload_from_env(os.getpid(), job_id=workload_job_id("trainer", model_id), group=TRAINER_TIME_SLICE_GROUP)
     self.time_slicer = time_slicer
     self.snapshot_registered = False
-    self.sticky_gpu_lease = os.getenv("OPEN_RL_STICKY_GPU_LEASE", "0") == "1"
 
   async def exit_gracefully(self) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
@@ -354,8 +353,6 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       await self.exit_gracefully()
 
   async def transition_worker(self, phase: str, transition: Callable[[], None]) -> None:
-    if self.sticky_gpu_lease:
-      return
     started = time.monotonic()
     with tracer.start_as_current_span(f"training.{phase}") as span:
       await asyncio.to_thread(transition)

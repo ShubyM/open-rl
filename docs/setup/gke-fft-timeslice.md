@@ -31,11 +31,9 @@ sampler worker pods connect to the agent on their node with
 `OPEN_RL_ACCEL_TIMESLICER_HOST=status.hostIP` and
 `OPEN_RL_ACCEL_TIMESLICER_PORT=9753`. The training processor registers its
 workload identity with the agent and wraps GPU work in acquire/release calls.
-The agent keeps a queue per node, allows one active workload at a time, and
-keeps the last workload resident while no handoff is waiting. When a different
-workload arrives, it checkpoints the resident process before granting the GPU
-and restores it on its next acquire. This avoids snapshot and CPU-offload work
-between uncontended RL steps while preserving isolation under contention.
+The agent keeps a queue per node and allows one active workload at a time. Every
+release checkpoints that workload, and its next acquire restores it before GPU
+work resumes.
 In the cluster deployment, the OpenRL time-slicer runs with `--backend llmd`;
 llm-d's physical snapshot agent performs the actual pod/PID discovery and CUDA
 checkpoint/restore.
@@ -182,8 +180,7 @@ OpenRL accelerator time-slicer on each trainer or sampler GPU node:
 hostNetwork: true
 args:
   ["--listen-host", "0.0.0.0", "--port", "9753",
-   "--backend", "llmd", "--llmd-snapshot-endpoint", "127.0.0.1:9001",
-   "--checkpoint-on-handoff"]
+   "--backend", "llmd", "--llmd-snapshot-endpoint", "127.0.0.1:9001"]
 ```
 
 The dynamically launched trainer worker pods run the normal training processor:
@@ -434,13 +431,10 @@ To ensure reliable metadata persistence across gateway restarts and worker spawn
 - **Generic KV Store:** The `RequestStore` interface provides generic `set_value`, `get_value`, and `delete_values` operations for storing structured objects alongside tenant request queues.
 - **Mandatory Architecture Specification:** The `/api/v1/create_model` endpoint strictly requires a valid `base_model` in the request payload, guaranteeing deterministic worker pod configuration.
 
-### Contention-only checkpointing
-The cluster templates set `OPEN_RL_STICKY_GPU_LEASE=1` and the agent uses
-`--checkpoint-on-handoff`. A job therefore keeps weights, gradients, and
-optimizer state resident between its own steps. When another job waits, llm-d
-physically checkpoints the resident process before the scheduler grants that
-job. The existing pinned-CPU `sleep()`/`wake_up()` path remains available when
-sticky residency is disabled.
+### Checkpoint lifecycle
+Every release invokes llm-d checkpointing before the scheduler grants another
+workload. A later acquire restores that workload before processing its next GPU
+batch. Trainer and sampler `sleep()`/`wake_up()` transitions run on every batch.
 
 ### DCGM GPU Observability
 The portable base does not require Google Monitoring CRDs. Activate the

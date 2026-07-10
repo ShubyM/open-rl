@@ -110,54 +110,6 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
     self.assertFalse(agent.workloads["shared-accelerator:101"].failed)
     self.assertEqual(restorer.simple_labels(), [("checkpoint", "101")])
 
-  async def test_checkpoint_on_handoff_keeps_single_workload_resident(self) -> None:
-    restorer = RecordingRestorer()
-    agent = SingleNodeTimeSlicer(restorer, checkpoint_on_handoff=True)
-    workload = WorkloadRef(job_id="101")
-    await agent.register(workload)
-
-    self.assertTrue((await agent.acquire(workload))["ok"])
-    release = await agent.release(workload)
-
-    self.assertTrue(release["resident"])
-    self.assertEqual(agent.resident_workload, workload.key)
-    self.assertEqual(restorer.calls, [])
-
-    self.assertTrue((await agent.acquire(workload))["ok"])
-    self.assertIsNone(agent.resident_workload)
-    self.assertEqual(restorer.calls, [])
-
-  async def test_checkpoint_on_handoff_snapshots_resident_before_different_workload(self) -> None:
-    restorer = RecordingRestorer()
-    agent = SingleNodeTimeSlicer(restorer, checkpoint_on_handoff=True)
-    workload_a = WorkloadRef(job_id="101")
-    workload_b = WorkloadRef(job_id="202")
-    await agent.register(workload_a)
-    await agent.register(workload_b)
-
-    self.assertTrue((await agent.acquire(workload_a))["ok"])
-    self.assertTrue((await agent.release(workload_a))["resident"])
-    self.assertTrue((await agent.acquire(workload_b))["ok"])
-
-    self.assertEqual(restorer.simple_labels(), [("checkpoint", "101")])
-    self.assertTrue(agent.workloads[workload_a.key].checkpointed)
-    self.assertEqual(agent.active_workload, workload_b.key)
-
-  async def test_checkpoint_on_handoff_does_not_grant_after_snapshot_failure(self) -> None:
-    agent = SingleNodeTimeSlicer(NoSnapshotRestorer(), checkpoint_on_handoff=True)
-    workload_a = WorkloadRef(job_id="101")
-    workload_b = WorkloadRef(job_id="202")
-    await agent.register(workload_a)
-    await agent.register(workload_b)
-
-    self.assertTrue((await agent.acquire(workload_a))["ok"])
-    self.assertTrue((await agent.release(workload_a))["resident"])
-    acquire_b = await agent.acquire(workload_b)
-
-    self.assertFalse(acquire_b["ok"])
-    self.assertEqual(agent.resident_workload, workload_a.key)
-    self.assertIsNone(agent.active_workload)
-
   async def test_release_without_snapshot_does_not_restore_later(self) -> None:
     restorer = NoSnapshotRestorer()
     agent = SingleNodeTimeSlicer(restorer)

@@ -52,10 +52,6 @@ def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
-def uses_sticky_gpu_lease() -> bool:
-  return os.getenv("OPEN_RL_STICKY_GPU_LEASE", "0") == "1"
-
-
 async def publish_sampler_ready(store: Any, model_id: str, instance_id: str) -> None:
   if store.redis is not None:
     await store.redis.set(f"open_rl:sampler_ready:{model_id}", instance_id)
@@ -303,7 +299,7 @@ async def run_sampling_worker(model_id: str) -> None:
         print("[vLLM Worker] Initializing vLLM engine under parent lock...")
         init_engine()
         print("[vLLM Worker] Engine initialized successfully.")
-        if engine is not None and not uses_sticky_gpu_lease():
+        if engine is not None:
           print("[vLLM Worker] Sleeping engine after init to yield GPU memory...")
           await engine.sleep(level=2)
     except Exception as exc:
@@ -373,7 +369,7 @@ async def run_sampling_worker(model_id: str) -> None:
               await asyncio.gather(*tasks)
               if has_shutdown:
                 await exit_gracefully()
-              if engine is not None and not uses_sticky_gpu_lease():
+              if engine is not None:
                 print("[vLLM Worker] Exiting batch: sleeping engine to yield GPU memory...")
                 await engine.sleep(level=2)
                 CURRENT_LOADED_SAMPLER_WEIGHTS = None

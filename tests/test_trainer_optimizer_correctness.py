@@ -538,38 +538,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual([event[0] for event in events], ["acquire", "release", "set_future"])
     self.assertEqual(store.results["req-a"]["type"], "model_created")
-
-  async def test_full_processor_skips_cpu_transitions_for_sticky_gpu_lease(self) -> None:
-    worker = _RecordingFullWorker()
-    store = _TrainingRequestsStoreStub(
-      [
-        [
-          {
-            "request_id": "req-a",
-            "model_id": "model-a",
-            "op": "create_model",
-            "payload": {"base_model": "base-model", "full_config": {}},
-          }
-        ]
-      ]
-    )
-
-    with patch.dict(
-      os.environ,
-      {
-        "OPEN_RL_STICKY_GPU_LEASE": "1",
-        "REDIS_URL": "redis://localhost:6379",
-      },
-    ):
-      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(
-        store,
-        worker,
-        "model-a",
-        time_slicer=_TimeSlicerStub(),
-      )
-      await processor.run_once()
-
-    self.assertEqual(worker.transitions, [])
+    self.assertEqual(worker.transitions, ["wake_up", "sleep"])
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
