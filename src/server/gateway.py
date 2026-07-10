@@ -1,6 +1,7 @@
 # This file contains the FastAPI server entry point and request handlers for the Open-RL API backend.
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -89,6 +90,35 @@ def sampler_weights_path(model_id: str, name: str) -> str:
   return f"tinker://{model_id}/sampler_weights/{name}"
 
 
+def sampler_snapshot_slots() -> int:
+  slots = int(os.getenv("OPEN_RL_SAMPLER_SNAPSHOT_SLOTS", "2"))
+  if slots < 1:
+    raise ValueError("OPEN_RL_SAMPLER_SNAPSHOT_SLOTS must be at least 1")
+  return slots
+
+
+def sampler_snapshot_slot(seq_id: int | str) -> int:
+  try:
+    sequence = int(seq_id)
+  except (TypeError, ValueError):
+    sequence = int(hashlib.sha256(str(seq_id).encode()).hexdigest(), 16)
+  return sequence % sampler_snapshot_slots()
+
+
+def sampler_snapshot_path(model_id: str, seq_id: int | str) -> str:
+  return sampler_weights_path(model_id, f"live-slot-{sampler_snapshot_slot(seq_id)}")
+
+
+def sampler_storage_ref(sampling_ref: str) -> str:
+  if not sampling_ref.startswith("tinker://"):
+    return sampling_ref
+  parts = sampling_ref[len("tinker://") :].split("/")
+  if len(parts) != 3 or parts[1] != "sampler_weights" or not parts[2].startswith("sampler-"):
+    return sampling_ref
+  sequence = parts[2][len("sampler-") :]
+  return sampler_snapshot_path(parts[0], sequence)
+
+
 def checkpoint_state_path(model_id: str, name: str) -> str:
   if os.path.isabs(name):
     return name
@@ -165,7 +195,7 @@ async def launch_worker_and_enqueue(request: dict) -> str:
   return await enqueue(request)
 
 
-async def ensure_sampler_launched(model_id: str, base_model: str | None = None) -> None:
+async def ensure_sampler_launched(model_id: str, base_model: str | None = None) -> str | None:
   if is_fft_enabled() and fft_worker_manager is not None and get_sampler_backend() == "vllm":
     if not base_model:
       s = get_store()
@@ -176,10 +206,45 @@ async def ensure_sampler_launched(model_id: str, base_model: str | None = None) 
           base_model = meta.get("base_model") if isinstance(meta, dict) else val
         except Exception:
           base_model = val
-    try:
-      await asyncio.to_thread(fft_worker_manager.launch_sampler, model_id, base_model)
-    except Exception:
-      traceback.print_exc()
+    return await asyncio.to_thread(fft_worker_manager.launch_sampler, model_id, base_model)
+  return None
+
+
+def decode_redis_value(value: object) -> str | None:
+  if isinstance(value, bytes):
+    return value.decode("utf-8")
+  return str(value) if value is not None else None
+
+
+async def wait_for_sampler_ready(model_id: str, base_model: str | None = None) -> None:
+  s = get_store()
+  if s.redis is None:
+    return
+
+  timeout = float(os.getenv("OPEN_RL_SAMPLER_READY_TIMEOUT_SECONDS", "600"))
+  started = time.monotonic()
+  expected_instance = await ensure_sampler_launched(model_id, base_model)
+  ready_key = f"open_rl:sampler_ready:{model_id}"
+  last_ready_value = None
+  print(f"[GATEWAY] Waiting for vLLM sampler {model_id} (instance={expected_instance or 'legacy'})...")
+
+  while time.monotonic() - started <= timeout:
+    last_ready_value = decode_redis_value(await s.redis.get(ready_key))
+    if last_ready_value and (expected_instance is None or last_ready_value == expected_instance):
+      print(f"[GATEWAY] vLLM sampler {model_id} is ready after {time.monotonic() - started:.2f}s")
+      return
+
+    if is_fft_enabled() and fft_worker_manager is not None:
+      current_instance = await ensure_sampler_launched(model_id, base_model)
+      if current_instance != expected_instance:
+        print(f"[GATEWAY] vLLM sampler {model_id} was replaced ({expected_instance} -> {current_instance})")
+        expected_instance = current_instance
+    await asyncio.sleep(1)
+
+  raise TimeoutError(
+    f"vLLM sampler {model_id} did not become ready within {timeout:.0f}s "
+    f"(expected instance={expected_instance or 'legacy'}, readiness value={last_ready_value!r})"
+  )
 
 
 async def preflight_vllm() -> None:
@@ -475,17 +540,24 @@ async def save_weights_for_sampler(req: dict):
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
 
   await ensure_sampler_launched(model_id)
-  seq_id = req.get("sampling_session_seq_id") or int(time.time() * 1000)
+  seq_id = req.get("sampling_session_seq_id")
+  if seq_id is None:
+    seq_id = int(time.time() * 1000)
   alias = req.get("name") or req.get("alias") or req.get("path")
 
-  session_id = sampler_session_id(model_id, seq_id)
+  if alias:
+    session_id = alias if alias.startswith("tinker://") else sampler_weights_path(model_id, alias)
+    storage_path = session_id
+  else:
+    session_id = sampler_session_id(model_id, seq_id)
+    storage_path = sampler_snapshot_path(model_id, seq_id)
   req_id = await enqueue(
     make_training_request(
       "save_weights_for_sampler",
       model_id,
       {
         "alias": alias,
-        "path": sampler_weights_path(model_id, alias) if alias else None,
+        "path": storage_path,
         "sampling_session_id": session_id,
       },
     )
@@ -571,20 +643,7 @@ async def create_sampling_session(req: dict):
     target_model_id = sess_id
 
   if get_sampler_backend() == "vllm" and target_model_id:
-    if is_fft_enabled():
-      await ensure_sampler_launched(target_model_id, base_model)
-    s = get_store()
-    if hasattr(s, "redis"):
-      print(f"[GATEWAY] Waiting for dynamic vLLM sampler worker to be ready for model {target_model_id}...")
-      start_time = time.monotonic()
-      while True:
-        is_ready = await s.redis.get(f"open_rl:sampler_ready:{target_model_id}")
-        if is_ready == "1" or is_ready == b"1":
-          print(f"[GATEWAY] Dynamic vLLM sampler worker is ready! (took {time.monotonic() - start_time:.2f}s)")
-          break
-        if time.monotonic() - start_time > 300:
-          raise TimeoutError("Timed out waiting for dynamic vLLM sampler worker to be ready")
-        await asyncio.sleep(1)
+    await wait_for_sampler_ready(target_model_id, base_model)
 
   return {"sampling_session_id": sess_id, "type": "create_sampling_session"}
 
@@ -617,6 +676,9 @@ async def asample(req: dict):
           "prompt_tokens": prompt,
           "max_tokens": max_tokens,
           "temperature": temperature,
+          "stop": stop,
+          "top_p": top_p,
+          "top_k": top_k,
           "num_samples": num_samples,
           "prompt_logprobs": bool(include_prompt_logprobs),
         },
@@ -631,13 +693,16 @@ async def asample(req: dict):
   await store.set_future(req_id, {"status": "pending"})
 
   if is_fft_enabled():
-    rel_path = model_id[len("tinker://") :] if model_id.startswith("tinker://") else model_id.lstrip("/")
+    storage_ref = sampler_storage_ref(model_id)
+    rel_path = storage_ref[len("tinker://") :] if storage_ref.startswith("tinker://") else storage_ref.lstrip("/")
     local_path = os.path.join(TMP_DIR, "sampler_full", rel_path)
     weights_path = local_path
+    weights_revision = model_id
     lora_id = None
     lora_path = None
   else:
     weights_path = None
+    weights_revision = None
     lora_id = model_id
     lora_path = os.path.join(TMP_DIR, "peft", base_model_id, base_model_id) if is_sampler_weights_ref(model_id) else None
 
@@ -653,6 +718,7 @@ async def asample(req: dict):
     "lora_id": lora_id,
     "lora_path": lora_path,
     "weights_path": weights_path,
+    "weights_revision": weights_revision,
     "include_prompt_logprobs": include_prompt_logprobs,
     "model_id": base_model_id or model_id,
     "trace_context": carrier,

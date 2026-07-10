@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from server import gateway
@@ -8,6 +9,7 @@ from server.worker_manager import FFTWorkerManager
 class StoreStub:
   def __init__(self):
     self.forwarded_requests = []
+    self.sampling_requests = []
     self.futures = {}
 
   async def put_request(self, req_data: dict) -> None:
@@ -16,23 +18,28 @@ class StoreStub:
   async def set_future(self, req_id: str, result: dict) -> None:
     self.futures[req_id] = result
 
+  async def put_sampling_request(self, req_data: dict) -> None:
+    self.sampling_requests.append(req_data)
+
 
 class WorkerManagerStub:
   def __init__(self, error: Exception | None = None):
     self.error = error
+    self.instance_id = None
     self.launched_model_ids = []
     self.shutdown_model_ids = []
 
-  def launch(self, model_id: str, base_model: str | None = None) -> None:
+  def launch(self, model_id: str, base_model: str | None = None) -> str | None:
     self.launched_model_ids.append(model_id)
     if self.error is not None:
       raise self.error
+    return self.instance_id
 
-  def launch_trainer(self, model_id: str, base_model: str | None = None) -> None:
-    self.launch(model_id, base_model)
+  def launch_trainer(self, model_id: str, base_model: str | None = None) -> str | None:
+    return self.launch(model_id, base_model)
 
-  def launch_sampler(self, model_id: str, base_model: str | None = None) -> None:
-    self.launch(model_id, base_model)
+  def launch_sampler(self, model_id: str, base_model: str | None = None) -> str | None:
+    return self.launch(model_id, base_model)
 
   def shutdown(self, model_id: str) -> None:
     self.shutdown_model_ids.append(model_id)
@@ -52,9 +59,9 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.old_manager = gateway.fft_worker_manager
     gateway.store = self.store
     gateway.fft_worker_manager = self.worker_manager
-    self.addCleanup(self._restore)
+    self.addCleanup(self.restore_gateway)
 
-  def _restore(self) -> None:
+  def restore_gateway(self) -> None:
     gateway.store = self.old_store
     gateway.fft_worker_manager = self.old_manager
 
@@ -97,6 +104,79 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self.worker_manager.launched_model_ids, [])
     self.assertEqual(len(self.store.forwarded_requests), 1)
 
+  async def test_sampler_launch_errors_are_not_swallowed(self) -> None:
+    self.worker_manager.error = RuntimeError("image pull failed")
+
+    with (
+      patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}),
+      self.assertRaisesRegex(RuntimeError, "image pull failed"),
+    ):
+      await gateway.ensure_sampler_launched("model-a", "base-model")
+
+  async def test_sampler_readiness_must_match_launched_instance(self) -> None:
+    self.worker_manager.instance_id = "new-instance"
+
+    class RedisStub:
+      def __init__(self):
+        self.values = [b"stale-instance", b"new-instance"]
+
+      async def get(self, _key):
+        return self.values.pop(0)
+
+    with (
+      patch.dict(
+        "os.environ",
+        {
+          "OPEN_RL_ENABLE_FFT": "true",
+          "OPEN_RL_SAMPLER_READY_TIMEOUT_SECONDS": "1",
+          "SAMPLING_BACKEND": "vllm",
+        },
+      ),
+      patch("server.gateway.get_store", return_value=SimpleNamespace(redis=RedisStub())),
+      patch("server.gateway.asyncio.sleep", return_value=None),
+    ):
+      await gateway.wait_for_sampler_ready("model-a", "base-model")
+
+    self.assertEqual(self.worker_manager.launched_model_ids, ["model-a", "model-a"])
+
+  async def test_ephemeral_sampler_checkpoints_rotate_without_reusing_session_ids(self) -> None:
+    with patch.dict(
+      "os.environ",
+      {
+        "OPEN_RL_ENABLE_FFT": "true",
+        "OPEN_RL_SAMPLER_SNAPSHOT_SLOTS": "2",
+        "SAMPLING_BACKEND": "vllm",
+      },
+    ):
+      await gateway.save_weights_for_sampler({"model_id": "model-a", "sampling_session_seq_id": 3})
+      await gateway.save_weights_for_sampler({"model_id": "model-a", "sampling_session_seq_id": 5})
+
+    first = self.store.forwarded_requests[0]["payload"]
+    second = self.store.forwarded_requests[1]["payload"]
+    self.assertEqual(first["path"], "tinker://model-a/sampler_weights/live-slot-1")
+    self.assertEqual(second["path"], first["path"])
+    self.assertEqual(first["sampling_session_id"], "tinker://model-a/sampler_weights/sampler-3")
+    self.assertEqual(second["sampling_session_id"], "tinker://model-a/sampler_weights/sampler-5")
+    self.assertEqual(gateway.sampler_storage_ref(second["sampling_session_id"]), second["path"])
+
+  async def test_sampling_uses_rotating_path_and_unique_weight_revision(self) -> None:
+    session_id = "tinker://model-a/sampler_weights/sampler-5"
+    with patch.dict(
+      "os.environ",
+      {"OPEN_RL_ENABLE_FFT": "true", "OPEN_RL_SAMPLER_SNAPSHOT_SLOTS": "2"},
+    ):
+      await gateway.asample(
+        {
+          "model_id": session_id,
+          "prompt": {"chunks": [{"tokens": [1, 2]}]},
+          "sampling_params": {"max_tokens": 3},
+        }
+      )
+
+    request = self.store.sampling_requests[0]
+    self.assertTrue(request["weights_path"].endswith("/sampler_full/model-a/sampler_weights/live-slot-1"))
+    self.assertEqual(request["weights_revision"], session_id)
+
 
 class GatewayLifespanTest(unittest.IsolatedAsyncioTestCase):
   async def test_lifespan_full_mode_requires_redis(self) -> None:
@@ -130,14 +210,28 @@ class FFTWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = FFTWorkerManager()
-      manager.launch_sampler("Model_A.1")
+      instance_id = manager.launch_sampler("Model_A.1")
 
     _, kwargs = popen.call_args
     self.assertTrue(kwargs["start_new_session"])
     self.assertEqual(kwargs["env"]["OPEN_RL_ENABLE_FFT"], "true")
     self.assertEqual(kwargs["env"]["OPEN_RL_MODEL_ID"], "Model_A.1")
+    self.assertEqual(kwargs["env"]["OPEN_RL_WORKER_INSTANCE_ID"], instance_id)
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "sampler-Model_A.1")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "samplers")
+
+  async def test_local_sampler_reuses_instance_id_while_process_is_running(self) -> None:
+    with (
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm"}, clear=True),
+      patch("server.worker_manager.subprocess.Popen") as popen,
+    ):
+      popen.return_value.poll.return_value = None
+      manager = FFTWorkerManager()
+      first_instance = manager.launch_sampler("model-a")
+      second_instance = manager.launch_sampler("model-a")
+
+    self.assertEqual(first_instance, second_instance)
+    popen.assert_called_once()
 
 
 class GatewayFutureTranslationTest(unittest.TestCase):

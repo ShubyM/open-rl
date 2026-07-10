@@ -2,7 +2,7 @@ import asyncio
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from server import gateway
 from server.store import InMemoryStore
@@ -57,6 +57,42 @@ class GatewayPathTest(unittest.TestCase):
 
   def test_checkpoint_state_paths_accept_explicit_output_directories(self) -> None:
     self.assertEqual(gateway.checkpoint_state_path("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
+
+
+class SamplingPathTest(unittest.IsolatedAsyncioTestCase):
+  async def test_torch_sampling_preserves_stop_and_sampling_controls(self) -> None:
+    enqueue = AsyncMock(return_value="req-sample")
+    request = {
+      "model_id": "model-a",
+      "prompt": {"chunks": [{"tokens": [1, 2, 3]}]},
+      "sampling_params": {
+        "max_tokens": 32,
+        "temperature": 0.7,
+        "stop": [10, 11],
+        "top_p": 0.95,
+        "top_k": 64,
+      },
+      "num_samples": 2,
+    }
+
+    with patch.object(gateway, "get_sampler_backend", return_value="torch"), patch.object(gateway, "enqueue", enqueue):
+      result = await gateway.asample(request)
+
+    self.assertEqual(result, {"request_id": "req-sample"})
+    queued = enqueue.await_args.args[0]
+    self.assertEqual(
+      queued["payload"],
+      {
+        "prompt_tokens": [1, 2, 3],
+        "max_tokens": 32,
+        "temperature": 0.7,
+        "stop": [10, 11],
+        "top_p": 0.95,
+        "top_k": 64,
+        "num_samples": 2,
+        "prompt_logprobs": False,
+      },
+    )
 
 
 if __name__ == "__main__":
