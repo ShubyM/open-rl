@@ -30,8 +30,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --extra cluster && \
     uv --project examples sync --frozen --no-install-project
 
-# Copy source code
-COPY . .
+# Copy the root SDK package and client-side recipe sources only.
+COPY README.md .
+COPY src ./src
+COPY scripts ./scripts
+COPY examples ./examples
 
 # Install project packages
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -39,4 +42,4 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv --project examples sync --frozen
 
 WORKDIR /app
-ENTRYPOINT ["uv", "run", "python", "scripts/run_training_e2e.py"]
+ENTRYPOINT ["uv", "run", "--no-sync", "python", "scripts/run_training_e2e.py"]

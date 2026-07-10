@@ -14,7 +14,6 @@ resources:
   - 07-accel-timeslicer-daemonset.yaml
   - 08-sampler-resourceclaim.yaml
   - 09-sampler-pod-template.yaml
-  - 10-dcgm-monitoring.yaml
 
 generatorOptions:
   disableNameSuffixHash: true
@@ -22,7 +21,7 @@ generatorOptions:
 configMapGenerator:
   - name: open-rl-config
     literals:
-      - BASE_MODEL="Qwen/Qwen2.5-0.5B"
+      - BASE_MODEL="google/gemma-4-e4b"
       - ENABLE_GCP_TRACE="1"
 
 # The manifests reference the canonical images published by CI
@@ -35,18 +34,5 @@ images:
     newTag: latest
   - name: ghcr.io/gke-labs/open-rl/gateway
     newTag: latest
-
-# The images transformer cannot reach OPEN_RL_WORKER_IMAGE (an env string), so
-# copy the post-transformer server image from the accel-timeslicer DaemonSet
-# into it. Replacements run after the images transformer.
-replacements:
-  - source:
-      kind: DaemonSet
-      name: open-rl-accel-timeslicer
-      fieldPath: spec.template.spec.containers.0.image
-    targets:
-      - select:
-          kind: Deployment
-          name: open-rl-gateway
-        fieldPaths:
-          - spec.template.spec.containers.0.env.[name=OPEN_RL_WORKER_IMAGE].value
+  - name: ghcr.io/gke-labs/open-rl/timeslicer
+    newTag: latest

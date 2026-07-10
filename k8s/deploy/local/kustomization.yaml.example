@@ -21,19 +21,31 @@ images:
   - name: ghcr.io/gke-labs/open-rl/gateway
     newName: ghcr.io/gke-labs/open-rl/gateway
     newTag: "latest"
+  - name: ghcr.io/gke-labs/open-rl/timeslicer
+    newName: ghcr.io/gke-labs/open-rl/timeslicer
+    newTag: "latest"
 
-# Re-copy the (now overridden) server image into OPEN_RL_WORKER_IMAGE so
-# dynamically launched trainer/sampler pods follow it too. This mirrors the
-# replacements block in the base; it must be repeated here because the base's
-# copy runs before this overlay's images transformer.
-replacements:
-  - source:
-      kind: DaemonSet
-      name: open-rl-accel-timeslicer
-      fieldPath: spec.template.spec.containers.0.image
-    targets:
-      - select:
-          kind: Deployment
-          name: open-rl-gateway
-        fieldPaths:
-          - spec.template.spec.containers.0.env.[name=OPEN_RL_WORKER_IMAGE].value
+# Kustomize's image transformer does not inspect env strings. Keep these three
+# values aligned with the server override above so runtime-created workers use
+# the same image. Skaffold performs this substitution automatically.
+patches:
+  - target:
+      kind: Deployment
+      name: open-rl-gateway
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-gateway
+      spec:
+        template:
+          spec:
+            containers:
+              - name: gateway
+                env:
+                  - name: OPEN_RL_TRAINER_IMAGE
+                    value: ghcr.io/gke-labs/open-rl/server:latest
+                  - name: OPEN_RL_SAMPLER_IMAGE
+                    value: ghcr.io/gke-labs/open-rl/server:latest
+                  - name: OPEN_RL_WORKER_IMAGE
+                    value: ghcr.io/gke-labs/open-rl/server:latest

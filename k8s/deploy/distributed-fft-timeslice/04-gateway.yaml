@@ -34,7 +34,7 @@ spec:
       - name: gateway
         image: ghcr.io/gke-labs/open-rl/gateway:latest
         imagePullPolicy: IfNotPresent
-        command: ["uv", "run", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+        command: ["uv", "run", "--no-sync", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
         ports:
         - containerPort: 8000
         env:
@@ -70,12 +70,35 @@ spec:
           value: "/etc/open-rl/sampler/sampler-worker-pod.yaml"
         - name: OPEN_RL_WORKER_POD_TEMPLATE
           value: "/etc/open-rl/trainer/trainer-worker-pod.yaml"
-        # Image for dynamically launched trainer/sampler pods. The value here
-        # is a placeholder: kustomization.yaml `replacements` overwrites it with
-        # the accel-timeslicer image after the `images` transformer runs, so it
-        # always tracks the same server image as the rest of the deploy.
+        # Skaffold substitutes these env image references in addition to normal
+        # container image fields. Role-specific names let the worker images be
+        # split later without changing the gateway API.
+        - name: OPEN_RL_TRAINER_IMAGE
+          value: "ghcr.io/gke-labs/open-rl/server:latest"
+        - name: OPEN_RL_SAMPLER_IMAGE
+          value: "ghcr.io/gke-labs/open-rl/server:latest"
         - name: OPEN_RL_WORKER_IMAGE
           value: "ghcr.io/gke-labs/open-rl/server:latest"
+        - name: OPEN_RL_WORKER_STARTUP_TIMEOUT_SECONDS
+          value: "300"
+        - name: OPEN_RL_SAMPLER_READY_TIMEOUT_SECONDS
+          value: "900"
+        - name: OPEN_RL_SAMPLER_SNAPSHOT_SLOTS
+          value: "2"
+        # CPU memory requests account for FFT weights, gradients, optimizer
+        # state, and pinned shadows. Override these on smaller-model clusters.
+        - name: OPEN_RL_TRAINER_CPU_REQUEST
+          value: "8"
+        - name: OPEN_RL_TRAINER_MEMORY_REQUEST
+          value: "64Gi"
+        - name: OPEN_RL_TRAINER_MEMORY_LIMIT
+          value: "180Gi"
+        - name: OPEN_RL_SAMPLER_CPU_REQUEST
+          value: "4"
+        - name: OPEN_RL_SAMPLER_MEMORY_REQUEST
+          value: "32Gi"
+        - name: OPEN_RL_SAMPLER_MEMORY_LIMIT
+          value: "96Gi"
         resources:
           limits:
             memory: "2Gi"

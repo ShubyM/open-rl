@@ -7,10 +7,12 @@ metadata:
 # (inputDigest tracks uncommitted changes), push to --default-repo, and deploy
 # the FFT time-slice manifests with the built images substituted — including
 # the OPEN_RL_WORKER_IMAGE env var the gateway uses for dynamically launched
-# trainer/sampler pods (via the resourceSelector below).
+# trainer/sampler pods (via the resourceSelector below). The client image is
+# opt-in with `--profile client`; normal server deploys do not rebuild it.
 build:
   local:
     push: true
+    concurrency: 3
   tagPolicy:
     inputDigest: {}
   artifacts:
@@ -22,10 +24,10 @@ build:
       context: .
       docker:
         dockerfile: src/server/Dockerfile.gateway
-    - image: ghcr.io/gke-labs/open-rl/client
+    - image: ghcr.io/gke-labs/open-rl/timeslicer
       context: .
       docker:
-        dockerfile: src/server/Dockerfile.client
+        dockerfile: src/server/Dockerfile.timeslicer
 
 manifests:
   kustomize:
@@ -48,3 +50,19 @@ resourceSelector:
         - ".*"
       labels:
         - ".*"
+
+profiles:
+  - name: client
+    patches:
+      - op: add
+        path: /build/artifacts/-
+        value:
+          image: ghcr.io/gke-labs/open-rl/client
+          context: .
+          docker:
+            dockerfile: src/server/Dockerfile.client
+  - name: gke-monitoring
+    patches:
+      - op: replace
+        path: /manifests/kustomize/paths/0
+        value: k8s/deploy/distributed-fft-timeslice-gke-monitoring
