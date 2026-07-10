@@ -45,6 +45,7 @@ help:
 	@echo "make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm"
 	@echo "VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make vllm BASE_MODEL=google/gemma-4-e2b"
 	@echo "make test                               # fast unit tests"
+	@echo "make test harvey                        # Harvey LAB adapter tests"
 	@echo "make test e2e tiny-lora|tiny-fft|tiny-rl|lora-textsql|fft-gsm8k|fft-gsm8k-x2|fft-textsql-rl|fft-textsql-rl-x2  # tiny-* = fast overfit smoke tests"
 	@echo "make test e2e tiny-lora BASE_URL=http://host:9003"
 	@echo "CUDA_VISIBLE_DEVICES=0 make test e2e tiny-fft"
@@ -109,8 +110,10 @@ test:
 	  uv run --extra "$(TRAINING_TEST_EXTRA)" python scripts/run_training_e2e.py "$$@" $(TRAINING_TEST_ARGS); \
 	elif [ "$$mode" = "piglatin" ]; then \
 	  PYTHONPATH="$(PIGLATIN_TEST_PYTHONPATH)" uv --project examples run python -m unittest tests.test_piglatin_qwen tests.test_piglatin_gemma; \
+	elif [ "$$mode" = "harvey" ]; then \
+	  PYTHONPATH="examples/harvey_labs" uv --project examples run --frozen python -m unittest discover -s examples/harvey_labs -p 'test_*.py'; \
 	else \
-	  echo "Unknown test mode '$$mode'. Expected unit, e2e, or piglatin."; \
+	  echo "Unknown test mode '$$mode'. Expected unit, e2e, piglatin, or harvey."; \
 	  exit 2; \
 	fi
 

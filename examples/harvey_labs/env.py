@@ -26,9 +26,6 @@ from tools import build_lab_tools
 logger = logging.getLogger(__name__)
 
 DEFAULT_LAB_ROOT = Path("experiments/lab-traces/harvey-labs")
-OUTPUT_INSTRUCTIONS_SUFFIX = (
-  "\n\nSave every deliverable to /workspace/output using exactly the filename specified in the instructions. When finished, call the submit tool."
-)
 CONTEXT_OVERFLOW_REWARD = -0.1
 
 
@@ -56,16 +53,34 @@ def discover_tasks(lab_root: Path) -> list[str]:
 
 
 def load_task(lab_root: Path, task_name: str) -> LabTask:
-  task_dir = lab_root / "tasks" / Path(*task_name.split("/"))
-  config = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+  task_parts = task_name.split("/")
+  if not task_name or any(part in {"", ".", ".."} for part in task_parts):
+    raise ValueError(f"Invalid LAB task name: {task_name!r}")
+
+  tasks_root = (lab_root / "tasks").resolve()
+  task_dir = (tasks_root / Path(*task_parts)).resolve()
+  if not task_dir.is_relative_to(tasks_root):
+    raise ValueError(f"LAB task directory escapes tasks root: {task_dir}")
+
+  config_path = task_dir / "task.json"
+  if not config_path.is_file():
+    raise FileNotFoundError(f"LAB task config not found: {config_path}")
+  config = json.loads(config_path.read_text(encoding="utf-8"))
   instructions = config.get("instructions")
   if not instructions:
     instructions = (task_dir / "instructions.md").read_text(encoding="utf-8")
+  documents_dir = (task_dir / "documents").resolve()
+  if not documents_dir.is_relative_to(task_dir):
+    raise ValueError(f"LAB documents directory escapes task directory: {documents_dir}")
+  if not documents_dir.is_dir():
+    raise FileNotFoundError(f"LAB documents directory not found: {documents_dir}")
+  if not any(path.is_file() for path in documents_dir.rglob("*")):
+    raise ValueError(f"LAB documents directory is empty: {documents_dir}")
   return LabTask(
     name=task_name,
     instructions=instructions,
     task_dir=task_dir,
-    documents_dir=task_dir / "documents",
+    documents_dir=documents_dir,
   )
 
 
@@ -119,7 +134,7 @@ def initial_messages(
   return renderer.create_conversation_prefix_with_tools(
     tools=[tool.to_spec() for tool in tools],
     system_prompt=system_prompt,
-  ) + [{"role": "user", "content": task.instructions + OUTPUT_INSTRUCTIONS_SUFFIX}]
+  ) + [{"role": "user", "content": task.instructions}]
 
 
 def lab_renderer(model_name: str, renderer_name: str | None) -> Renderer:

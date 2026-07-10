@@ -195,12 +195,15 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
   async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     result = await asyncio.to_thread(
       self.worker.generate,
-      payload.get("prompt_tokens", []),
-      payload.get("max_tokens", 20),
-      payload.get("num_samples", 1),
-      payload.get("temperature", 0.0),
-      model_id,
-      bool(payload.get("prompt_logprobs", False)),
+      prompt_tokens=payload.get("prompt_tokens", []),
+      max_tokens=payload.get("max_tokens", 20),
+      num_samples=payload.get("num_samples", 1),
+      temperature=payload.get("temperature", 0.0),
+      model_id=model_id,
+      include_prompt_logprobs=bool(payload.get("prompt_logprobs", False)),
+      stop=payload.get("stop"),
+      top_p=payload.get("top_p", 1.0),
+      top_k=payload.get("top_k", -1),
     )
     result["type"] = "sample_completed"
     return result
@@ -385,12 +388,15 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     result = await asyncio.to_thread(
       self.worker.generate,
-      payload.get("prompt_tokens", []),
-      payload.get("max_tokens", 20),
-      payload.get("num_samples", 1),
-      payload.get("temperature", 0.0),
-      model_id,
-      bool(payload.get("prompt_logprobs", False)),
+      prompt_tokens=payload.get("prompt_tokens", []),
+      max_tokens=payload.get("max_tokens", 20),
+      num_samples=payload.get("num_samples", 1),
+      temperature=payload.get("temperature", 0.0),
+      model_id=model_id,
+      include_prompt_logprobs=bool(payload.get("prompt_logprobs", False)),
+      stop=payload.get("stop"),
+      top_p=payload.get("top_p", 1.0),
+      top_k=payload.get("top_k", -1),
     )
     result["type"] = "sample_completed"
     return result

@@ -8,7 +8,7 @@ The training path reuses tinker-cookbook's GRPO loop and multi-turn tool environ
 
 - `train.py`: small LAB-specific config mapped into `tinker_cookbook.rl.train`.
 - `env.py`: LAB task loading, sandbox env construction, and dataset builders.
-- `tools.py`: LAB `ToolExecutor` adapter plus `submit`.
+- `tools.py`: thin LAB `ToolExecutor` adapter for tinker-cookbook.
 - `reward.py`: terminal rubric reward wrapper around LAB's judge.
 - `renderer.py`: Gemma 4 chat renderer with XML-style tool calls.
 - `score_lab_run.py`: helper executed inside the LAB checkout/venv for rubric scoring.
@@ -45,6 +45,22 @@ tokens, with at most 1K generated tokens per tool turn. The 32K cap completed a
 full Gemma 4 E4B FFT update on one 80GB H100; a 64K trajectory did not.
 
 LAB uses the instruction-tuned `google/gemma-4-E4B-it` checkpoint and its native
-function-calling template. The environment reuses LAB's system prompt, default
+function-calling template. Until the upstream fix is merged, the renderer pins
+the canonical template from [Gemma 4 discussion #36](https://huggingface.co/google/gemma-4-E4B-it/discussions/36)
+at commit `4e34fcbc4c9a95b92d6a8a97c2faed16dd783f91`; this fixes null arguments,
+multi-turn tool-call closure, and preservation of reasoning in tool chains. The
+renderer enables Gemma's thinking channel for live rollouts and reconstructs
+the template's pre-opened thought channel when parsing post-tool continuations.
+The environment reuses LAB's system prompt, default
 `docx`/`pptx`/`xlsx` skill manuals and scripts, six sandbox tools, and rubric
-judge; `submit` is the only additional tool.
+judge without redefining their behavior. The tools keep their canonical names
+(`bash`, `read`, `write`, `edit`, `glob`, and `grep`) so their schemas match
+LAB's system prompt and executor. As in stock LAB, a response with no tool call
+finishes the episode; Open-RL does not add a separate terminal tool or duplicate
+LAB's workspace instructions.
+
+Run the focused environment tests with:
+
+```bash
+make test harvey
+```

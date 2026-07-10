@@ -306,6 +306,9 @@ class BaseTrainerWorker:
     num_samples: int = 1,
     temperature: float = 0.0,
     include_prompt_logprobs: bool = False,
+    stop: list[int] | None = None,
+    top_p: float = 1.0,
+    top_k: int = -1,
   ) -> dict[str, Any]:
     """Generate completions from model."""
     model.eval()
@@ -313,6 +316,17 @@ class BaseTrainerWorker:
     input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
     do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
     prompt_logprobs = self.prompt_logprobs(model, input_tensor) if include_prompt_logprobs else None
+    eos_token_ids: list[int] = []
+    tokenizer_eos = self.tokenizer.eos_token_id
+    if isinstance(tokenizer_eos, int):
+      eos_token_ids.append(tokenizer_eos)
+    elif tokenizer_eos:
+      eos_token_ids.extend(tokenizer_eos)
+    eos_token_ids.extend(stop or [])
+    eos_token_ids = list(dict.fromkeys(eos_token_ids))
+    pad_token_id = self.tokenizer.pad_token_id
+    if pad_token_id is None and eos_token_ids:
+      pad_token_id = eos_token_ids[0]
 
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
@@ -320,11 +334,12 @@ class BaseTrainerWorker:
         input_tensor,
         attention_mask=attention_mask,
         max_new_tokens=max_tokens,
-        pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_ids or None,
         do_sample=do_sample,
         temperature=temperature if do_sample else None,
-        top_p=None,
-        top_k=None,
+        top_p=top_p if do_sample else None,
+        top_k=max(0, top_k) if do_sample else None,
         num_return_sequences=num_samples,
         output_scores=True,
         return_dict_in_generate=True,
@@ -343,7 +358,9 @@ class BaseTrainerWorker:
         logprob = logprob_dist[token_id].item()
         logprobs.append(self.sanitize_float(logprob))
 
-      sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": "stop"})
+      stopped = bool(generated_tokens and generated_tokens[-1] in eos_token_ids)
+      stop_reason = "stop" if stopped or len(generated_tokens) < max_tokens else "length"
+      sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": stop_reason})
 
     result = {"sequences": sequences_out}
     if prompt_logprobs is not None:

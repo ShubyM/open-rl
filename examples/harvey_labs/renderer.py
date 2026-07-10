@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from functools import cache
+from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 import tinker
@@ -17,9 +20,27 @@ from tinker_cookbook.renderers.base import (
   ToolSpec,
 )
 
+GEMMA4_CHAT_TEMPLATE_REVISION = "4e34fcbc4c9a95b92d6a8a97c2faed16dd783f91"
+GEMMA4_CHAT_TEMPLATE_SHA256 = "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5"
+
+
+@cache
+def gemma4_chat_template() -> str:
+  """Return the pinned canonical Gemma 4 tool-calling template."""
+  template = Path(__file__).with_name("chat_template.jinja").read_text(encoding="utf-8")
+  digest = sha256(template.encode()).hexdigest()
+  if digest != GEMMA4_CHAT_TEMPLATE_SHA256:
+    raise ValueError(f"Gemma 4 chat template hash mismatch: {digest}")
+  return template
+
 
 class Gemma4ToolRenderer(renderers.Renderer):
   """Render and parse Gemma 4's native function-calling protocol."""
+
+  def __init__(self, tokenizer: Any, *, enable_thinking: bool = True):
+    super().__init__(tokenizer)
+    self.chat_template = gemma4_chat_template()
+    self.enable_thinking = enable_thinking
 
   @property
   def has_extension_property(self) -> bool:
@@ -39,12 +60,19 @@ class Gemma4ToolRenderer(renderers.Renderer):
   def get_stop_sequences(self) -> list[int]:
     return sorted(self._end_message_tokens)
 
-  def template_tokens(self, messages: list[dict[str, Any]], *, add_generation_prompt: bool) -> list[int]:
+  def template_tokens(
+    self,
+    messages: list[dict[str, Any]],
+    *,
+    add_generation_prompt: bool,
+    enable_thinking: bool | None = None,
+  ) -> list[int]:
     rendered = self.tokenizer.apply_chat_template(
       messages,
+      chat_template=self.chat_template,
       tokenize=True,
       add_generation_prompt=add_generation_prompt,
-      enable_thinking=False,
+      enable_thinking=self.enable_thinking if enable_thinking is None else enable_thinking,
     )
     if hasattr(rendered, "keys"):
       rendered = rendered["input_ids"]
@@ -70,12 +98,16 @@ class Gemma4ToolRenderer(renderers.Renderer):
     """Render one non-tool message for cookbook masking utilities.
 
     Live LAB rollouts use ``build_generation_prompt`` so the full conversation is
-    always formatted by Hugging Face's checkpoint-provided template.
+    always formatted by the pinned canonical Hugging Face template.
     """
     if message["role"] == "tool":
       raise NotImplementedError("Gemma 4 tool responses require their preceding tool call")
 
-    rendered = self.template_tokens([self.to_openai_message(message)], add_generation_prompt=False)
+    rendered = self.template_tokens(
+      [self.to_openai_message(message)],
+      add_generation_prompt=False,
+      enable_thinking=False,
+    )
     bos_len = len(self._bos_tokens)
     rendered = rendered[bos_len:]
     role = "model" if message["role"] in ("assistant", "model") else message["role"]
@@ -92,8 +124,14 @@ class Gemma4ToolRenderer(renderers.Renderer):
     if eos_token_id is not None and response and response[-1] == eos_token_id:
       response = response[:-1]
     decoded = self.tokenizer.decode(response, skip_special_tokens=False)
+    parse_input = decoded
+    if self.enable_thinking and "<channel|>" in decoded and not decoded.startswith("<|channel>"):
+      # After a tool response the canonical template opens the thought channel
+      # in the prompt. Sampling returns only its continuation, so reconstruct
+      # that opener before handing the response to Gemma's native parser.
+      parse_input = "<|channel>thought\n" + decoded
     try:
-      parsed = self.tokenizer.parse_response(decoded)
+      parsed = self.tokenizer.parse_response(parse_input)
     except Exception:
       return Message(role="assistant", content=decoded), False
 
@@ -132,8 +170,11 @@ class Gemma4ToolRenderer(renderers.Renderer):
     rendered = self.tokenizer.apply_chat_template(
       [{"role": "system", "content": system_prompt}],
       tools=native_tools,
+      chat_template=self.chat_template,
       tokenize=False,
       add_generation_prompt=False,
+      # Tools are embedded into the returned system message. The final full
+      # conversation render injects the single thinking marker.
       enable_thinking=False,
     )
     prefix = "<bos><|turn>system\n"

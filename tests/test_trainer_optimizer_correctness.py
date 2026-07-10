@@ -89,6 +89,24 @@ class _PeftModelStub:
 
 class _TokenizerStub:
   pad_token_id = 0
+  eos_token_id = 2
+
+
+class _GenerationModelStub:
+  def __init__(self, generated_tokens: list[int], vocab_size: int = 128):
+    self.generated_tokens = generated_tokens
+    self.vocab_size = vocab_size
+    self.generate_kwargs = None
+
+  def eval(self):
+    return None
+
+  def generate(self, input_tensor, **kwargs):
+    self.generate_kwargs = kwargs
+    generated = torch.tensor([self.generated_tokens], dtype=torch.long, device=input_tensor.device)
+    sequences = torch.cat((input_tensor, generated), dim=1)
+    scores = [torch.zeros((1, self.vocab_size), device=input_tensor.device) for _ in self.generated_tokens]
+    return types.SimpleNamespace(sequences=sequences, scores=scores)
 
 
 class _LogitModelStub:
@@ -127,6 +145,7 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
     self.loaded_base_models = []
     self.created_models = []
     self.saved_states = []
+    self.generate_calls = []
 
   def load_base_model(self, base_model_name):
     self.base_model_name = base_model_name
@@ -142,18 +161,27 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
     self.saved_states.append((model_id, state_path, include_optimizer, kind))
     return {"path": state_path}
 
+  def generate(self, *args, **kwargs):
+    self.generate_calls.append((args, kwargs))
+    return {"sequences": []}
+
 
 class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker):
   def __init__(self):
     super().__init__()
     self.loaded_base_models = []
     self.created_models = []
+    self.generate_calls = []
 
   def load_base_model(self, base_model_name):
     self.loaded_base_models.append(base_model_name)
 
   def create_model(self, base_model_name, model_id, config):
     self.created_models.append((base_model_name, model_id, config))
+
+  def generate(self, *args, **kwargs):
+    self.generate_calls.append((args, kwargs))
+    return {"sequences": []}
 
 
 class _FutureStoreStub:
@@ -361,6 +389,40 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result["training_kind"], "lora")
     self.assertEqual(result["type"], "model_created")
 
+  async def test_lora_processor_forwards_sampling_controls(self) -> None:
+    worker = _RecordingLoraWorker()
+    processor = training_requests_processor_module.LoraTrainingRequestsProcessor(_FutureStoreStub(), worker)
+    payload = {
+      "prompt_tokens": [1, 2],
+      "max_tokens": 32,
+      "num_samples": 2,
+      "temperature": 0.7,
+      "prompt_logprobs": True,
+      "stop": [10, 11],
+      "top_p": 0.95,
+      "top_k": 64,
+    }
+
+    result = await processor.sample(payload, "adapter-a")
+
+    self.assertEqual(result["type"], "sample_completed")
+    args, kwargs = worker.generate_calls[0]
+    self.assertEqual(args, ())
+    self.assertEqual(
+      kwargs,
+      {
+        "prompt_tokens": [1, 2],
+        "max_tokens": 32,
+        "num_samples": 2,
+        "temperature": 0.7,
+        "model_id": "adapter-a",
+        "include_prompt_logprobs": True,
+        "stop": [10, 11],
+        "top_p": 0.95,
+        "top_k": 64,
+      },
+    )
+
   def test_parse_datum_flattens_chunked_model_input(self) -> None:
     datum = training_requests_processor_module.parse_datum(
       {
@@ -406,6 +468,35 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result["base_model"], "base-model")
     self.assertEqual(result["training_kind"], "full")
     self.assertEqual(result["type"], "model_created")
+
+  async def test_full_processor_forwards_sampling_controls(self) -> None:
+    worker = _RecordingFullWorker()
+    with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(
+        _FutureStoreStub(), worker, "model-a", time_slicer=_TimeSlicerStub()
+      )
+
+    result = await processor.sample(
+      {
+        "prompt_tokens": [1, 2],
+        "max_tokens": 32,
+        "num_samples": 2,
+        "temperature": 0.7,
+        "prompt_logprobs": True,
+        "stop": [10, 11],
+        "top_p": 0.95,
+        "top_k": 64,
+      },
+      "model-a",
+    )
+
+    self.assertEqual(result["type"], "sample_completed")
+    args, kwargs = worker.generate_calls[0]
+    self.assertEqual(args, ())
+    self.assertEqual(kwargs["stop"], [10, 11])
+    self.assertEqual(kwargs["top_p"], 0.95)
+    self.assertEqual(kwargs["top_k"], 64)
+    self.assertTrue(kwargs["include_prompt_logprobs"])
 
   async def test_full_processor_saves_sampler_checkpoint_as_full_state(self) -> None:
     worker = _RecordingFullWorker()
@@ -551,6 +642,42 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       await processor.run_once()
 
     self.assertEqual(wake_calls, [False, True])
+
+
+class TestTrainerSamplingControls(unittest.TestCase):
+  def _worker(self) -> BaseTrainerWorker:
+    worker = BaseTrainerWorker()
+    worker.device = torch.device("cpu")
+    worker.tokenizer = _TokenizerStub()
+    return worker
+
+  def test_generate_uses_custom_stop_ids_and_sampling_controls(self) -> None:
+    worker = self._worker()
+    model = _GenerationModelStub([99])
+
+    result = worker.generate(
+      model,
+      prompt_tokens=[3, 4],
+      max_tokens=8,
+      temperature=0.7,
+      stop=[99],
+      top_p=0.95,
+      top_k=64,
+    )
+
+    self.assertEqual(result["sequences"][0]["stop_reason"], "stop")
+    self.assertEqual(model.generate_kwargs["eos_token_id"], [2, 99])
+    self.assertEqual(model.generate_kwargs["pad_token_id"], 0)
+    self.assertEqual(model.generate_kwargs["top_p"], 0.95)
+    self.assertEqual(model.generate_kwargs["top_k"], 64)
+
+  def test_generate_reports_length_when_budget_is_exhausted(self) -> None:
+    worker = self._worker()
+    model = _GenerationModelStub([5, 6])
+
+    result = worker.generate(model, prompt_tokens=[3, 4], max_tokens=2, stop=[99])
+
+    self.assertEqual(result["sequences"][0]["stop_reason"], "length")
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
