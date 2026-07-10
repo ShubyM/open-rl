@@ -66,3 +66,8 @@ profiles:
       - op: replace
         path: /manifests/kustomize/paths/0
         value: k8s/deploy/distributed-fft-timeslice-gke-monitoring
+  - name: gke-single-l4
+    manifests:
+      kustomize:
+        paths:
+          - k8s/deploy/gke-single-l4

@@ -273,6 +273,16 @@ make push-to-cluster SKAFFOLD_PROFILES=gke-monitoring
 make push-to-cluster-client SKAFFOLD_PROFILES=client,gke-monitoring
 ```
 
+For the small single-L4 test topology, select its dedicated manifest profile:
+
+```bash
+make push-to-cluster SKAFFOLD_PROFILES=gke-single-l4
+```
+
+That profile defaults to a 0.5B model and application-level GPU offload, so its
+CPU and memory requests stay intentionally smaller than the FFT production
+defaults.
+
 ### Image overrides for plain kubectl deploys
 
 `make deploy-fft-timeslice` (`kubectl apply -k`) deploys the pinned published

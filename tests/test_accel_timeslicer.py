@@ -487,8 +487,9 @@ class LlmDCheckpointRestorerTest(unittest.TestCase):
         self.skipTest("timeslice cluster extra is not installed")
       raise
 
-    for name in ["snapshot_and_wait", "restore_and_wait"]:
-      parameters = inspect.signature(getattr(SnapshotAgentClient, name)).parameters
+    methods = (SnapshotAgentClient.snapshot_and_wait, SnapshotAgentClient.restore_and_wait)
+    for method in methods:
+      parameters = inspect.signature(method).parameters
       self.assertEqual(
         list(parameters)[:5],
         ["self", "job_id", "group", "backend", "poll_interval_sec"],

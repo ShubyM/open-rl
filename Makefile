@@ -6,8 +6,10 @@
 # ---------------------------------------------------------------------------
 # Knobs (override on the command line: make server BASE_MODEL=... SAMPLING_BACKEND=...)
 # ---------------------------------------------------------------------------
+SKAFFOLD_PROFILES ?=
+SINGLE_L4_PROFILE = $(findstring gke-single-l4,$(SKAFFOLD_PROFILES))
 # The HuggingFace base model checkpoint loaded by the server and training workers
-BASE_MODEL     ?= google/gemma-4-e4b
+BASE_MODEL     ?= $(if $(SINGLE_L4_PROFILE),Qwen/Qwen2.5-0.5B,google/gemma-4-e4b)
 # The backend used for sampling ("torch" for local inference, or "vllm" for optimized remote inference)
 SAMPLING_BACKEND ?= torch
 # The network interface to bind the API server
@@ -35,14 +37,13 @@ E2E_TIMEOUT ?= 900
 E2E_REPLACE ?= 0
 E2E_CLEANUP ?= 0
 DEPLOY_NAMESPACE ?=
-SKAFFOLD_PROFILES ?=
 CLEAN_WORKERS ?= 0
-TRAINER_CPU_REQUEST ?= 8
-TRAINER_MEMORY_REQUEST ?= 64Gi
-TRAINER_MEMORY_LIMIT ?= 180Gi
-SAMPLER_CPU_REQUEST ?= 4
-SAMPLER_MEMORY_REQUEST ?= 32Gi
-SAMPLER_MEMORY_LIMIT ?= 96Gi
+TRAINER_CPU_REQUEST ?= $(if $(SINGLE_L4_PROFILE),1,8)
+TRAINER_MEMORY_REQUEST ?= $(if $(SINGLE_L4_PROFILE),2Gi,64Gi)
+TRAINER_MEMORY_LIMIT ?= $(if $(SINGLE_L4_PROFILE),12Gi,180Gi)
+SAMPLER_CPU_REQUEST ?= $(if $(SINGLE_L4_PROFILE),1,4)
+SAMPLER_MEMORY_REQUEST ?= $(if $(SINGLE_L4_PROFILE),2Gi,32Gi)
+SAMPLER_MEMORY_LIMIT ?= $(if $(SINGLE_L4_PROFILE),12Gi,96Gi)
 # Client image for cluster-e2e: the one built by the last client-profile deploy
 # (recorded in .skaffold-build.json), else the published client image.
 E2E_IMAGE ?= $(shell python3 -c "import json;print([b['tag'] for b in json.load(open('.skaffold-build.json'))['builds'] if 'client' in b['imageName']][0])" 2>/dev/null || echo ghcr.io/gke-labs/open-rl/client:latest)
@@ -69,6 +70,7 @@ help:
 	@echo "make push-to-cluster GCP_PROJECT=<project> # build the working tree, push, deploy (skaffold run)"
 	@echo "make push-to-cluster-client             # same deploy plus the cluster E2E client image"
 	@echo "make push-to-cluster SKAFFOLD_PROFILES=gke-monitoring # include GKE PodMonitoring resources"
+	@echo "make push-to-cluster SKAFFOLD_PROFILES=gke-single-l4 # deploy the small single-L4 test topology"
 	@echo "make clean-workers [FORCE=1]            # delete runtime-launched trainer/sampler pods"
 	@echo "make lint | fmt"
 
