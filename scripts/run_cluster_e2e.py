@@ -1,83 +1,77 @@
 #!/usr/bin/env python3
-"""Run an end-to-end (E2E) training/RL benchmark job on the Kubernetes cluster.
-
-Stamps the scenario, image, and extra arguments into k8s/eval/e2e-client-job.yaml,
-applies it with kubectl, and streams the logs. Stdlib only - no uv needed:
-
-  python3 scripts/run_cluster_e2e.py --scenario fft-gsm8k-rl-x2 \\
-    --args "base_model=Qwen/Qwen3-8B steps=30 jitter_sec=5" --image gcr.io/cdrollouts-sunilarora/open-rl-client:latest
-
---print-only shows the rendered manifest and kubectl commands without running anything.
-"""
+"""Launch an Open-RL E2E client job and stream its logs."""
 
 import argparse
+import json
 import shlex
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = REPO_ROOT / "k8s" / "eval" / "e2e-client-job.yaml"
-JOB = "open-rl-e2e-client"
 
 
-def render_manifest(scenario: str, extra_args_str: str, image: str) -> str:
+def render_manifest(scenario: str, extra_args: str, image: str) -> str:
   manifest = MANIFEST.read_text(encoding="utf-8")
-  for placeholder, value in [("E2E-IMAGE", image), ("E2E-SCENARIO", scenario)]:
+  for placeholder, value in (("E2E-IMAGE", image), ("E2E-SCENARIO", scenario)):
     if placeholder not in manifest:
-      raise RuntimeError(f"{MANIFEST} no longer contains the {placeholder} placeholder")
+      raise RuntimeError(f"{MANIFEST} is missing {placeholder}")
     manifest = manifest.replace(placeholder, value)
 
-  extra_args = shlex.split(extra_args_str) if extra_args_str else []
-  args_yaml = "\n".join(f'        - "{arg}"' for arg in extra_args) if extra_args else ""
-  if '        - "E2E-EXTRA-ARGS"' not in manifest:
-    raise RuntimeError(f"{MANIFEST} no longer contains the E2E-EXTRA-ARGS placeholder")
-  manifest = manifest.replace('        - "E2E-EXTRA-ARGS"', args_yaml)
-  return manifest
+  placeholder = '        - "E2E-EXTRA-ARGS"'
+  rendered_args = "\n".join(f"        - {json.dumps(value)}" for value in shlex.split(extra_args))
+  if placeholder not in manifest:
+    raise RuntimeError(f"{MANIFEST} is missing E2E-EXTRA-ARGS")
+  return manifest.replace(placeholder, rendered_args)
 
 
 def main() -> None:
-  parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("--scenario", required=True, help="E2E test scenario (e.g. fft-gsm8k-rl-x2).")
-  parser.add_argument("--args", default="", help="Extra arguments to pass to run_training_e2e.py.")
-  parser.add_argument("--image", required=True, help="Client container image to run.")
-  parser.add_argument("--namespace", default="", help="Kubernetes namespace (defaults to the kubectl context's).")
-  parser.add_argument("--no-follow", action="store_true", help="Launch the job but do not follow its logs.")
-  parser.add_argument("--print-only", action="store_true", help="Print the kubectl commands and manifest; run nothing.")
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--scenario", required=True)
+  parser.add_argument("--args", default="", help="Arguments passed to run_training_e2e.py.")
+  parser.add_argument("--image", required=True)
+  parser.add_argument("--namespace", default="")
+  parser.add_argument("--no-follow", action="store_true")
+  parser.add_argument("--print-only", action="store_true")
   args = parser.parse_args()
 
-  kubectl = ["kubectl"] + (["-n", args.namespace] if args.namespace else [])
+  kubectl = ["kubectl"] + (["--namespace", args.namespace] if args.namespace else [])
   manifest = render_manifest(args.scenario, args.args, args.image)
-  commands = [
-    kubectl + ["delete", "job", JOB, "--ignore-not-found"],
-    kubectl + ["apply", "-f", "<manifest>"],
-    kubectl + ["wait", "--for=condition=Ready", "pod", "-l", f"job-name={JOB}", "--timeout=600s"],
-    kubectl + ["logs", "-f", f"job/{JOB}"],
-  ]
-
   if args.print_only:
-    for command in commands:
-      print("$ " + " ".join(command))
-    print("\n# manifest applied at <manifest>:\n")
+    print("$ " + " ".join(kubectl + ["create", "-f", "<manifest>"]))
+    print("$ " + " ".join(kubectl + ["logs", "-f", "job/<generated-name>"]))
+    print("\n# manifest\n")
     print(manifest)
     return
 
-  with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-    f.write(manifest)
-    manifest_path = f.name
+  manifest_path: Path | None = None
+  try:
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as manifest_file:
+      manifest_file.write(manifest)
+      manifest_path = Path(manifest_file.name)
 
-  subprocess.run(commands[0], check=True)
-  subprocess.run(kubectl + ["apply", "-f", manifest_path], check=True)
-  if args.no_follow:
-    print(f"[cluster-e2e] launched job/{JOB}; follow it with: {' '.join(kubectl)} logs -f job/{JOB}")
-    return
-  subprocess.run(commands[2], check=True)
-  subprocess.run(commands[3], check=True)
-  done = subprocess.run(kubectl + ["wait", "--for=condition=Complete", f"job/{JOB}", "--timeout=30s"], capture_output=True, text=True)
-  if done.returncode != 0:
-    print(f"[cluster-e2e] job did not complete cleanly; inspect with: {' '.join(kubectl)} describe job/{JOB}")
-    sys.exit(1)
+    created = subprocess.run(
+      kubectl + ["create", "-f", str(manifest_path), "-o", "name"],
+      check=True,
+      capture_output=True,
+      text=True,
+    ).stdout.strip()
+    job_name = created.split("/", 1)[-1]
+    print(f"[cluster-e2e] launched {created}")
+    if args.no_follow:
+      print(f"[cluster-e2e] follow with: {' '.join(kubectl)} logs -f job/{job_name}")
+      return
+
+    subprocess.run(
+      kubectl + ["wait", "--for=condition=Ready", "pod", "-l", f"job-name={job_name}", "--timeout=600s"],
+      check=True,
+    )
+    subprocess.run(kubectl + ["logs", "-f", f"job/{job_name}"], check=True)
+    subprocess.run(kubectl + ["wait", "--for=condition=Complete", created, "--timeout=900s"], check=True)
+  finally:
+    if manifest_path is not None:
+      manifest_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
+# GKE single-L4 test variant.
 # Pod template the gateway uses to launch one sampler worker per model
 # (server/k8s_worker_manager.py). All sampler worker pods reference the shared
-# DRA ResourceClaim open-rl-sampler-gpu-1 (08-sampler-resourceclaim.yaml) and are
-# placed onto the sampler GPU node. The node-local snapshot agent time-slices
+# trainer DRA ResourceClaim open-rl-trainer-gpu-1 (06-gpu-resourceclaim.yaml) and
+# are placed onto the sampler GPU node. The node-local snapshot agent time-slices
 # GPU access across concurrent inference engines.
 apiVersion: v1
 kind: ConfigMap
@@ -15,8 +16,7 @@ data:
       restartPolicy: OnFailure
       containers:
       - name: sampler-worker
-        # Fallback only: the gateway overwrites this with OPEN_RL_WORKER_IMAGE
-        # when rendering pods (server/k8s_worker_manager.py).
+        # Fallback only: the gateway overwrites this with its sampler image.
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: IfNotPresent
         command: ["uv", "run", "--no-sync", "python", "-u", "-m", "server.vllm_sampler"]
@@ -31,7 +31,7 @@ data:
         - name: OPEN_RL_ENABLE_FFT
           value: "true"
         - name: VLLM_GPU_MEMORY_UTILIZATION
-          value: "0.70"
+          value: "0.35"
         - name: OPEN_RL_TMP_DIR
           value: "/mnt/shared/open-rl"
         - name: HF_HOME
@@ -46,23 +46,23 @@ data:
           claims:
           - name: sampler-gpu
           limits:
-            memory: "96Gi"
+            memory: "12Gi"
           requests:
-            memory: "32Gi"
-            cpu: "4"
+            memory: "2Gi"
+            cpu: "1"
         volumeMounts:
         - name: shared-storage
           mountPath: /mnt/shared
       resourceClaims:
       - name: sampler-gpu
-        resourceClaimName: open-rl-sampler-gpu-1
+        # Samplers share the trainer claim on single-GPU clusters.
+        resourceClaimName: open-rl-trainer-gpu-1
       volumes:
       - name: shared-storage
         persistentVolumeClaim:
           claimName: open-rl-shared-pvc
       nodeSelector:
         group.timeslice.io/samplers: "true"
-        cloud.google.com/gke-accelerator: "nvidia-h100-80gb"
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"

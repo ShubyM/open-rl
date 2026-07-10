@@ -1,0 +1,73 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: open-rl-dev
+
+# `skaffold run`: build the working tree's images with content-addressed tags
+# (inputDigest tracks uncommitted changes), push to --default-repo, and deploy
+# the FFT time-slice manifests with the built images substituted — including
+# the OPEN_RL_WORKER_IMAGE env var the gateway uses for dynamically launched
+# trainer/sampler pods (via the resourceSelector below). The client image is
+# opt-in with `--profile client`; normal server deploys do not rebuild it.
+build:
+  local:
+    push: true
+    concurrency: 3
+  tagPolicy:
+    inputDigest: {}
+  artifacts:
+    - image: ghcr.io/gke-labs/open-rl/server
+      context: .
+      docker:
+        dockerfile: src/server/Dockerfile
+    - image: ghcr.io/gke-labs/open-rl/gateway
+      context: .
+      docker:
+        dockerfile: src/server/Dockerfile.gateway
+    - image: ghcr.io/gke-labs/open-rl/timeslicer
+      context: .
+      docker:
+        dockerfile: src/server/Dockerfile.timeslicer
+
+manifests:
+  kustomize:
+    paths:
+      - k8s/deploy/distributed-fft-timeslice
+
+deploy:
+  kubectl: {}
+
+resourceSelector:
+  allow:
+    - groupKind: Deployment.apps
+      image:
+        - ".*"
+        - ".spec.template.spec.containers.*.env.*.value"
+      labels:
+        - ".*"
+    - groupKind: DaemonSet.apps
+      image:
+        - ".*"
+      labels:
+        - ".*"
+
+profiles:
+  - name: client
+    patches:
+      - op: add
+        path: /build/artifacts/-
+        value:
+          image: ghcr.io/gke-labs/open-rl/client
+          context: .
+          docker:
+            dockerfile: src/server/Dockerfile.client
+  - name: gke-monitoring
+    patches:
+      - op: replace
+        path: /manifests/kustomize/paths/0
+        value: k8s/deploy/distributed-fft-timeslice-gke-monitoring
+  - name: gke-single-l4
+    manifests:
+      kustomize:
+        paths:
+          - k8s/deploy/gke-single-l4

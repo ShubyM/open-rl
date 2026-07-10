@@ -1,3 +1,4 @@
+# GKE single-L4 test variant.
 # Pod template the gateway uses to launch one trainer worker per model
 # (server/k8s_worker_manager.py). The launcher stamps metadata.name, the
 # time-slicing coordination labels (snapshot-agent, timeslice.io/group,
@@ -21,8 +22,7 @@ data:
       restartPolicy: OnFailure
       containers:
       - name: trainer-worker
-        # Fallback only: the gateway overwrites this with OPEN_RL_WORKER_IMAGE
-        # when rendering pods (server/k8s_worker_manager.py).
+        # Fallback only: the gateway overwrites this with its trainer image.
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: IfNotPresent
         command: ["uv", "run", "--no-sync", "python", "-m", "server.training_requests_processor"]
@@ -38,12 +38,6 @@ data:
           value: "true"
         - name: PYTORCH_CUDA_ALLOC_CONF
           value: "expandable_segments:True"
-        - name: OPEN_RL_ATTN_IMPLEMENTATION
-          value: "sdpa"
-        - name: OPEN_RL_SDPA_NO_MATH
-          value: "1"
-        - name: OPEN_RL_LOGPROB_CHUNK
-          value: "128"
         - name: OPEN_RL_TMP_DIR
           value: "/mnt/shared/open-rl"
         - name: HF_HOME
@@ -58,10 +52,10 @@ data:
           claims:
           - name: trainer-gpu
           limits:
-            memory: "180Gi"
+            memory: "12Gi"
           requests:
-            memory: "64Gi"
-            cpu: "8"
+            memory: "2Gi"
+            cpu: "1"
         volumeMounts:
         - name: shared-storage
           mountPath: /mnt/shared
@@ -74,7 +68,6 @@ data:
           claimName: open-rl-shared-pvc
       nodeSelector:
         group.timeslice.io/trainers: "true"
-        cloud.google.com/gke-accelerator: "nvidia-h100-80gb"
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"

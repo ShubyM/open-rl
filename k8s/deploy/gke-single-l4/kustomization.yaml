@@ -1,0 +1,46 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../distributed-fft-timeslice
+
+patches:
+  - path: worker-pod-template.yaml
+  - path: sampler-pod-template.yaml
+  - target:
+      kind: ConfigMap
+      name: open-rl-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: open-rl-config
+      data:
+        BASE_MODEL: Qwen/Qwen2.5-0.5B
+        ENABLE_GCP_TRACE: "0"
+  - target:
+      kind: PersistentVolumeClaim
+      name: open-rl-shared-pvc
+    patch: |-
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: open-rl-shared-pvc
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: standard-rwo
+        resources:
+          requests:
+            storage: 100Gi
+  - target:
+      group: resource.k8s.io
+      version: v1
+      kind: ResourceClaim
+      name: open-rl-sampler-gpu-1
+    patch: |-
+      $patch: delete
+      apiVersion: resource.k8s.io/v1
+      kind: ResourceClaim
+      metadata:
+        name: open-rl-sampler-gpu-1

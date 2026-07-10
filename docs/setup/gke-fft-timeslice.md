@@ -31,8 +31,9 @@ sampler worker pods connect to the agent on their node with
 `OPEN_RL_ACCEL_TIMESLICER_HOST=status.hostIP` and
 `OPEN_RL_ACCEL_TIMESLICER_PORT=9753`. The training processor registers its
 workload identity with the agent and wraps GPU work in acquire/release calls.
-The agent keeps a FIFO queue per node-local process, allows one active workload
-at a time within that process, checkpoints on release, and restores on acquire.
+The agent keeps a queue per node and allows one active workload at a time. Every
+release checkpoints that workload, and its next acquire restores it before GPU
+work resumes.
 In the cluster deployment, the OpenRL time-slicer runs with `--backend llmd`;
 llm-d's physical snapshot agent performs the actual pod/PID discovery and CUDA
 checkpoint/restore.
@@ -161,6 +162,10 @@ template in `05-worker-pod-template.yaml`. It stamps:
 - `OPEN_RL_TIME_SLICE_GROUP`, aligned with the `timeslice.io/group` label
 - `--model-id <model_id>`, so the worker drains only its own queue
 
+It also stamps an image-and-template revision plus a unique worker instance.
+Live pods are reused only when that revision matches. A changed image or pod
+template is replaced lazily on the next request.
+
 The gateway still has a local subprocess launcher for VM development. Select the
 cluster launcher with `OPEN_RL_WORKER_MANAGER=kubernetes`.
 
@@ -171,7 +176,6 @@ OpenRL accelerator time-slicer on each trainer or sampler GPU node:
 
 ```yaml
 hostNetwork: true
-command: ["uv", "run", "python", "-m", "accel_timeslicer.serve"]
 args:
   ["--listen-host", "0.0.0.0", "--port", "9753",
    "--backend", "llmd", "--llmd-snapshot-endpoint", "127.0.0.1:9001"]
@@ -180,7 +184,7 @@ args:
 The dynamically launched trainer worker pods run the normal training processor:
 
 ```yaml
-command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
+command: ["uv", "run", "--no-sync", "python", "-m", "server.training_requests_processor"]
 ```
 
 The training processor uses:
@@ -208,6 +212,52 @@ the relevant pod and process set.
 - The **NVIDIA DRA GPU driver** (Helm chart `nvidia-dra-driver-gpu` >= 25.8.0)
   so all trainer worker pods can share one GPU through a single `ResourceClaim`.
 - Helm v3 for the DRA-driver chart.
+
+## Deploying your working tree
+
+```bash
+make push-to-cluster GCP_PROJECT=<project>
+```
+
+Runs `skaffold run`: builds the server, gateway, and lightweight time-slicer
+images with content-addressed tags, pushes them to `gcr.io/$GCP_PROJECT`, and applies
+`k8s/deploy/distributed-fft-timeslice` with the built images substituted into
+the rendered manifests. The worker image environment value is substituted too,
+so dynamically launched pods use the same server build. The wrapper restarts
+the gateway once to reload mounted pod templates. Existing workers are replaced
+only when their image or template revision is stale.
+
+Skaffold builds independent artifacts concurrently and skips unchanged image
+digests. Dockerfiles copy only runtime-owned paths, so docs, manifests, and
+client edits do not invalidate the large GPU image.
+
+The client image is opt-in because backend-only iterations do not need it.
+`push-to-cluster-client` records all built images in a gitignored
+`.skaffold-build.json`; `make cluster-e2e` reads the client image from it
+automatically, so the full loop is:
+
+```bash
+make push-to-cluster-client
+make cluster-e2e E2E_SCENARIO=fft-textsql-rl E2E_ARGS="steps=2"
+```
+
+Each E2E invocation uses Kubernetes `generateName`, so runs can overlap. The
+launcher delegates lifecycle handling to `kubectl create`, `wait`, and `logs`.
+
+Managed GKE monitoring and the single-L4 topology are Skaffold profiles:
+
+```bash
+make push-to-cluster SKAFFOLD_PROFILE=gke-monitoring
+make push-to-cluster SKAFFOLD_PROFILE=gke-single-l4
+```
+
+The single-L4 profile is a small Kustomize overlay on the base deployment. It
+changes only the model, storage, shared claim, and worker templates.
+
+### Image overrides for plain kubectl deploys
+
+`make deploy-fft-timeslice` (`kubectl apply -k`) deploys the published images.
+Use Skaffold when deploying a working tree or private registry build.
 
 ## Setup 1: Create the DRA GPU node pool
 
@@ -317,9 +367,9 @@ make deploy-fft-timeslice
 shared GPU `ResourceClaim`, the node-local OpenRL time-slicer DaemonSet, and the
 gateway with `OPEN_RL_ENABLE_FFT=true` and
 `OPEN_RL_WORKER_MANAGER=kubernetes`.
-The deployment assumes one base model per rollout: set `BASE_MODEL` in
-`kustomization.yaml`, and the gateway uses that value for `get_info` and
-`create_model` requests that do not explicitly pass a base model.
+The base deployment defaults to `google/gemma-4-e4b`; the single-L4 overlay
+defaults to `Qwen/Qwen2.5-0.5B`. A base model in the client request overrides
+the worker template.
 
 There are no static worker deployments. Every `create_model` call makes the gateway create a trainer pod named `open-rl-trainer-<model-id>`, and every `create_sampling_client` call makes the gateway create a dedicated vLLM sampler pod named `open-rl-sampler-<model-id>`. Both are labeled:
 
@@ -329,20 +379,28 @@ timeslice.io/group: trainers    # or samplers
 timeslice.io/job-id: trainer-<model-id> # or sampler-<model-id>
 ```
 
-The gateway's `open-rl-sa` service account has a Role allowing pod CRUD in the workload namespace (`03-rbac.yaml`). When weight updates occur during FFT training, Trainers write checkpoints to NFS `/mnt/shared`, and Samplers dynamically reload those checkpoint safetensors in-place in ~1.1 seconds while yielding GPU VRAM via cooperative sleep.
+The gateway's `open-rl-sa` service account has a Role allowing pod access in the
+workload namespace (`03-rbac.yaml`). During FFT RL, trainers
+rotate ephemeral sampling checkpoints through two NFS directories by default
+(`OPEN_RL_SAMPLER_SNAPSHOT_SLOTS=2`). Sampling session ids remain unique, so
+vLLM reloads every policy revision while disk use stays bounded. Named eval or
+publication checkpoints are not rotated.
 
 ### Structured Model Serialization in Redis
 To ensure reliable metadata persistence across gateway restarts and worker spawns, model configuration is serialized in Redis using the `TrainingModelMetadata` dataclass:
 - **Generic KV Store:** The `RequestStore` interface provides generic `set_value`, `get_value`, and `delete_values` operations for storing structured objects alongside tenant request queues.
 - **Mandatory Architecture Specification:** The `/api/v1/create_model` endpoint strictly requires a valid `base_model` in the request payload, guaranteeing deterministic worker pod configuration.
 
-### Zero-Fragmentation Application-Level CPU Offloading
-When multiple training jobs share physical GPUs via the Accelerator Time-Slicer, `FFTTrainingWorker` performs zero-fragmentation memory swapping between VRAM and Pinned DRAM during time-slicer `acquire()` and `release()` cycles:
-- **Client Toggle:** Configured via `cpu_offload: bool = True` inside `FFTConfig`.
-- **Symmetric Primitives:** `sleep()` transfers model parameters and initialized AdamW optimizer states (`exp_avg`, `exp_avg_sq`) to pinned host memory (`.to("cpu", non_blocking=True).pin_memory()`) while replacing GPU tensors with empty shells (`torch.empty(0, ...)`). `wake_up()` reloads pinned shadow tensors back to CUDA instantly before processing training requests.
+### Checkpoint lifecycle
+Every release invokes llm-d checkpointing before the scheduler grants another
+workload. A later acquire restores that workload before processing its next GPU
+batch. Trainer and sampler `sleep()`/`wake_up()` transitions run on every batch.
 
 ### DCGM GPU Observability
-The Kustomize rollout includes `10-dcgm-monitoring.yaml`, deploying the NVIDIA DCGM Exporter DaemonSet and a Google Cloud Monitoring `PodMonitoring` custom resource to scrape GPU utilization, VRAM usage, clock speeds, and temperature metrics every 10 seconds.
+The portable base does not require Google Monitoring CRDs. Activate the
+`gke-monitoring` Skaffold profile to deploy DCGM Exporter and `PodMonitoring`
+resources that scrape utilization, VRAM, clocks, and temperatures every 10
+seconds.
 
 ## Setup 3: Run training on the cluster
 

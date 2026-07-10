@@ -2,7 +2,6 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: dcgm-exporter-metrics
-  namespace: default
 data:
   default-counters.csv: |-
     ## GPU performance metrics,,
@@ -35,7 +34,6 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: nvidia-dcgm-exporter
-  namespace: default
   labels:
     app.kubernetes.io/name: nvidia-dcgm-exporter
 spec:
@@ -118,7 +116,6 @@ apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
   name: nvidia-dcgm-exporter-scraper
-  namespace: default
 spec:
   selector:
     matchLabels:

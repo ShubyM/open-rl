@@ -2,17 +2,14 @@
 # This job runs client-side recipes (like fft-gsm8k-rl-x2) inside a cluster pod,
 # communicating with the open-rl-gateway service over Kubernetes internal DNS.
 #
-# Easiest usage via Makefile:
-#   make cluster-e2e SCENARIO=fft-gsm8k-rl-x2 ARGS="base_model=Qwen/Qwen3-8B steps=30 jitter_sec=5"
-#
-# By hand: replace E2E-* placeholders below, then
-#   kubectl delete job open-rl-e2e-client --ignore-not-found
-#   kubectl apply -f k8s/eval/e2e-client-job.yaml
-#   kubectl logs -f job/open-rl-e2e-client
+# The launcher replaces the placeholders and lets Kubernetes generate a unique
+# name so runs can overlap.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: open-rl-e2e-client
+  generateName: open-rl-e2e-
+  labels:
+    app: open-rl-e2e-client
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 86400
