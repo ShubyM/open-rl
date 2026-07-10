@@ -1,15 +1,10 @@
-.PHONY: server vllm test lint fmt help push-vm pull-vm cluster-eval skaffold-check push-to-cluster push-to-cluster-client deploy-local clean-workers
-
-# Optional per-developer overrides (gitignored). See local.mk.example.
--include local.mk
+.PHONY: server vllm test lint fmt help push-vm pull-vm cluster-eval skaffold-check push-to-cluster push-to-cluster-client clean-workers
 
 # ---------------------------------------------------------------------------
 # Knobs (override on the command line: make server BASE_MODEL=... SAMPLING_BACKEND=...)
 # ---------------------------------------------------------------------------
-SKAFFOLD_PROFILES ?=
-SINGLE_L4_PROFILE = $(findstring gke-single-l4,$(SKAFFOLD_PROFILES))
 # The HuggingFace base model checkpoint loaded by the server and training workers
-BASE_MODEL     ?= $(if $(SINGLE_L4_PROFILE),Qwen/Qwen2.5-0.5B,google/gemma-4-e4b)
+BASE_MODEL     ?= google/gemma-4-e4b
 # The backend used for sampling ("torch" for local inference, or "vllm" for optimized remote inference)
 SAMPLING_BACKEND ?= torch
 # The network interface to bind the API server
@@ -32,18 +27,6 @@ EVAL_NAMESPACE ?=
 E2E_SCENARIO ?=
 E2E_ARGS ?=
 E2E_NAMESPACE ?=
-E2E_NAME ?=
-E2E_TIMEOUT ?= 900
-E2E_REPLACE ?= 0
-E2E_CLEANUP ?= 0
-DEPLOY_NAMESPACE ?=
-CLEAN_WORKERS ?= 0
-TRAINER_CPU_REQUEST ?= $(if $(SINGLE_L4_PROFILE),1,8)
-TRAINER_MEMORY_REQUEST ?= $(if $(SINGLE_L4_PROFILE),2Gi,64Gi)
-TRAINER_MEMORY_LIMIT ?= $(if $(SINGLE_L4_PROFILE),12Gi,180Gi)
-SAMPLER_CPU_REQUEST ?= $(if $(SINGLE_L4_PROFILE),1,4)
-SAMPLER_MEMORY_REQUEST ?= $(if $(SINGLE_L4_PROFILE),2Gi,32Gi)
-SAMPLER_MEMORY_LIMIT ?= $(if $(SINGLE_L4_PROFILE),12Gi,96Gi)
 # Client image for cluster-e2e: the one built by the last client-profile deploy
 # (recorded in .skaffold-build.json), else the published client image.
 E2E_IMAGE ?= $(shell python3 -c "import json;print([b['tag'] for b in json.load(open('.skaffold-build.json'))['builds'] if 'client' in b['imageName']][0])" 2>/dev/null || echo ghcr.io/gke-labs/open-rl/client:latest)
@@ -66,11 +49,9 @@ help:
 	@echo "make test e2e fft-gsm8k TRAINING_TEST_ARGS='steps=10 eval_examples=8 extra=\"batch=2\"'"
 	@echo "make test piglatin                      # pig-latin example end-to-end tests"
 	@echo "make cluster-eval EVAL_MODEL_PATH=/mnt/shared/open-rl/checkpoints/...  # one-off vLLM eval job on the cluster"
-	@echo "make deploy-local                       # kubectl apply with gitignored per-dev image overrides"
 	@echo "make push-to-cluster GCP_PROJECT=<project> # build the working tree, push, deploy (skaffold run)"
 	@echo "make push-to-cluster-client             # same deploy plus the cluster E2E client image"
-	@echo "make push-to-cluster SKAFFOLD_PROFILES=gke-monitoring # include GKE PodMonitoring resources"
-	@echo "make push-to-cluster SKAFFOLD_PROFILES=gke-single-l4 # deploy the small single-L4 test topology"
+	@echo "make push-to-cluster SKAFFOLD_PROFILE=gke-single-l4 # select a Skaffold profile"
 	@echo "make clean-workers [FORCE=1]            # delete runtime-launched trainer/sampler pods"
 	@echo "make lint | fmt"
 
@@ -143,6 +124,7 @@ fmt:
 # Deployment (GKE)
 # ---------------------------------------------------------------------------
 GCP_PROJECT ?= cdrollouts-sunilarora
+SKAFFOLD_PROFILE ?=
 # Content hash of uncommitted changes so a dirty tree gets a unique, stable tag
 # (same content -> same tag; new edits -> new tag -> kubectl set image rolls out).
 DIRTY       := $(shell git status --porcelain 2>/dev/null)
@@ -162,7 +144,7 @@ push-images:
 	docker push gcr.io/$(GCP_PROJECT)/open-rl-client:$(IMAGE_TAG)
 	kubectl set image deployment/open-rl-gateway gateway=gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) 2>/dev/null || true
 	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=gcr.io/$(GCP_PROJECT)/open-rl-timeslicer:$(IMAGE_TAG) 2>/dev/null || true
-	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) OPEN_RL_TRAINER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) OPEN_RL_SAMPLER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
+	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
 
 deploy:
 	kubectl apply -k k8s/deploy/distributed-lustre/
@@ -180,41 +162,20 @@ skaffold-check:
 # Build the working tree's images (content-addressed tags), push them to
 # gcr.io/$(GCP_PROJECT), and deploy k8s/deploy/distributed-fft-timeslice with
 # the built images substituted — including OPEN_RL_WORKER_IMAGE, so trainer/
-# sampler pods launched after this run the new server image. Existing worker
-# pods are replaced lazily when their image or pod-template revision changes.
-# CLEAN_WORKERS=1 remains available for an explicit destructive reset.
+# sampler pods launched after this run the new server image.
 push-to-cluster: skaffold-check
-	skaffold run --default-repo=gcr.io/$(GCP_PROJECT) --status-check=false --file-output=.skaffold-build.json $(if $(SKAFFOLD_PROFILES),--profile=$(SKAFFOLD_PROFILES),) $(if $(DEPLOY_NAMESPACE),--namespace=$(DEPLOY_NAMESPACE),)
-	$(if $(DEPLOY_NAMESPACE),kubectl --namespace $(DEPLOY_NAMESPACE),kubectl) patch configmap open-rl-config --type merge -p '{"data":{"BASE_MODEL":"$(BASE_MODEL)"}}'
-	$(if $(DEPLOY_NAMESPACE),kubectl --namespace $(DEPLOY_NAMESPACE),kubectl) set env deployment/open-rl-gateway \
-	  OPEN_RL_TRAINER_CPU_REQUEST=$(TRAINER_CPU_REQUEST) \
-	  OPEN_RL_TRAINER_MEMORY_REQUEST=$(TRAINER_MEMORY_REQUEST) \
-	  OPEN_RL_TRAINER_MEMORY_LIMIT=$(TRAINER_MEMORY_LIMIT) \
-	  OPEN_RL_SAMPLER_CPU_REQUEST=$(SAMPLER_CPU_REQUEST) \
-	  OPEN_RL_SAMPLER_MEMORY_REQUEST=$(SAMPLER_MEMORY_REQUEST) \
-	  OPEN_RL_SAMPLER_MEMORY_LIMIT=$(SAMPLER_MEMORY_LIMIT)
-	$(if $(DEPLOY_NAMESPACE),kubectl --namespace $(DEPLOY_NAMESPACE),kubectl) rollout restart deployment/open-rl-gateway
-	$(if $(DEPLOY_NAMESPACE),kubectl --namespace $(DEPLOY_NAMESPACE),kubectl) rollout status daemonset/open-rl-accel-timeslicer --timeout=300s
-	$(if $(DEPLOY_NAMESPACE),kubectl --namespace $(DEPLOY_NAMESPACE),kubectl) rollout status deployment/open-rl-gateway --timeout=300s
-	@if [ "$(CLEAN_WORKERS)" = "1" ]; then $(MAKE) clean-workers DEPLOY_NAMESPACE=$(DEPLOY_NAMESPACE); fi
+	skaffold run --default-repo=gcr.io/$(GCP_PROJECT) --file-output=.skaffold-build.json $(if $(SKAFFOLD_PROFILE),--profile=$(SKAFFOLD_PROFILE),)
+	kubectl rollout restart deployment/open-rl-gateway
+	kubectl rollout status deployment/open-rl-gateway --timeout=300s
 
-push-to-cluster-client: SKAFFOLD_PROFILES := $(if $(SKAFFOLD_PROFILES),$(SKAFFOLD_PROFILES),client)
+push-to-cluster-client: SKAFFOLD_PROFILE = client
 push-to-cluster-client: push-to-cluster
-
-# kubectl deploy with per-developer image overrides. The overlay file is
-# gitignored; first run seeds it from the committed example (which points at
-# the published images, so it is a no-op until you edit it).
-deploy-local: k8s/deploy/local/kustomization.yaml
-	kubectl apply -k k8s/deploy/local/
-
-k8s/deploy/local/kustomization.yaml:
-	cp k8s/deploy/local/kustomization.yaml.example $@
 
 # Delete dynamically launched trainer/sampler worker pods (all carry the
 # accel-timeslicer label). The gateway creates these at runtime, so no deploy
 # tooling cleans them up. FORCE=1 skips graceful termination.
 clean-workers:
-	$(if $(DEPLOY_NAMESPACE),kubectl --namespace $(DEPLOY_NAMESPACE),kubectl) delete pods -l accel-timeslicer=true $(if $(FORCE),--force --grace-period=0,) --ignore-not-found
+	kubectl delete pods -l accel-timeslicer=true $(if $(FORCE),--force --grace-period=0,) --ignore-not-found
 
 rollout:
 	kubectl rollout restart deployment redis-store open-rl-gateway open-rl-trainer-worker vllm-worker
@@ -238,12 +199,9 @@ cluster-e2e:
 	  echo "  make cluster-e2e E2E_SCENARIO=fft-gsm8k-rl-x2 E2E_ARGS=\"base_model=Qwen/Qwen3-8B steps=30 jitter_sec=5\""; \
 	  exit 2; \
 	fi; \
-	set -- --scenario "$(E2E_SCENARIO)" --image "$(E2E_IMAGE)" --timeout "$(E2E_TIMEOUT)"; \
+	set -- --scenario "$(E2E_SCENARIO)" --image "$(E2E_IMAGE)"; \
 	if [ -n "$(E2E_ARGS)" ]; then set -- "$$@" --args "$(E2E_ARGS)"; fi; \
 	if [ -n "$(E2E_NAMESPACE)" ]; then set -- "$$@" --namespace "$(E2E_NAMESPACE)"; fi; \
-	if [ -n "$(E2E_NAME)" ]; then set -- "$$@" --name "$(E2E_NAME)"; fi; \
-	if [ "$(E2E_REPLACE)" = "1" ]; then set -- "$$@" --replace; fi; \
-	if [ "$(E2E_CLEANUP)" = "1" ]; then set -- "$$@" --cleanup; fi; \
 	python3 scripts/run_cluster_e2e.py "$$@"
 
 # Local Redis (for testing distributed mode):

@@ -1,4 +1,0 @@
-# Per-developer Makefile overrides. Copy to local.mk (gitignored):
-#   cp local.mk.example local.mk
-# Any Makefile variable can be set here; the most common:
-GCP_PROJECT = my-gcp-project

@@ -26,9 +26,7 @@ configMapGenerator:
 
 # The manifests reference the canonical images published by CI
 # (ghcr.io/gke-labs/open-rl/*); this transformer pins the deployed version in
-# ONE place. To deploy from a private registry or pin a different tag, override
-# here — or per-developer without touching committed files via the gitignored
-# k8s/deploy/local/ overlay (make deploy-local).
+# ONE place. Skaffold overrides these values for working-tree deploys.
 images:
   - name: ghcr.io/gke-labs/open-rl/server
     newTag: latest

@@ -164,9 +164,7 @@ template in `05-worker-pod-template.yaml`. It stamps:
 
 It also stamps an image-and-template revision plus a unique worker instance.
 Live pods are reused only when that revision matches. A changed image or pod
-template is replaced lazily on the next request. The launcher waits for
-`Running` and reports terminal container state and Kubernetes events directly,
-so image pull and scheduling failures do not become opaque future timeouts.
+template is replaced lazily on the next request.
 
 The gateway still has a local subprocess launcher for VM development. Select the
 cluster launcher with `OPEN_RL_WORKER_MANAGER=kubernetes`.
@@ -222,21 +220,16 @@ make push-to-cluster GCP_PROJECT=<project>
 ```
 
 Runs `skaffold run`: builds the server, gateway, and lightweight time-slicer
-images from the working tree with content-addressed tags (`inputDigest`; uncommitted changes
-produce a new tag), pushes them to `gcr.io/$GCP_PROJECT`, and applies
+images with content-addressed tags, pushes them to `gcr.io/$GCP_PROJECT`, and applies
 `k8s/deploy/distributed-fft-timeslice` with the built images substituted into
-the rendered manifests. The substitution covers the gateway and
-accel-timeslicer images and — via the `resourceSelector` in `skaffold.yaml` —
-the role-specific worker image env vars, so trainer/sampler pods launched after
-the deploy run the new server image. The wrapper reloads ConfigMap pod
-templates and waits for both rollouts. It does not delete active jobs;
-revision-aware launch replaces only stale workers.
+the rendered manifests. The worker image environment value is substituted too,
+so dynamically launched pods use the same server build. The wrapper restarts
+the gateway once to reload mounted pod templates. Existing workers are replaced
+only when their image or template revision is stale.
 
 Skaffold builds independent artifacts concurrently and skips unchanged image
 digests. Dockerfiles copy only runtime-owned paths, so docs, manifests, and
-client edits do not invalidate the large GPU image. Set `GCP_PROJECT` once in
-a gitignored `local.mk`
-(`cp local.mk.example local.mk`) instead of passing it per command.
+client edits do not invalidate the large GPU image.
 
 The client image is opt-in because backend-only iterations do not need it.
 `push-to-cluster-client` records all built images in a gitignored
@@ -248,56 +241,23 @@ make push-to-cluster-client
 make cluster-e2e E2E_SCENARIO=fft-textsql-rl E2E_ARGS="steps=2"
 ```
 
-Each E2E invocation gets a unique Job name, so runs can overlap. On failure the
-runner prints pod state, events, descriptions, and log tails. Use
-`E2E_CLEANUP=1` to remove a successful Job, or set both `E2E_NAME=<name>` and
-`E2E_REPLACE=1` when intentionally replacing a named run.
+Each E2E invocation uses Kubernetes `generateName`, so runs can overlap. The
+launcher delegates lifecycle handling to `kubectl create`, `wait`, and `logs`.
 
-Deploy settings are ordinary Make variables:
+Managed GKE monitoring and the single-L4 topology are Skaffold profiles:
 
 ```bash
-make push-to-cluster \
-  BASE_MODEL=google/gemma-4-e4b \
-  TRAINER_MEMORY_REQUEST=64Gi \
-  SAMPLER_MEMORY_REQUEST=32Gi
+make push-to-cluster SKAFFOLD_PROFILE=gke-monitoring
+make push-to-cluster SKAFFOLD_PROFILE=gke-single-l4
 ```
 
-`CLEAN_WORKERS=1` opts into deleting active workers. Managed GKE monitoring is
-separate from the portable base manifest:
-
-```bash
-make push-to-cluster SKAFFOLD_PROFILES=gke-monitoring
-make push-to-cluster-client SKAFFOLD_PROFILES=client,gke-monitoring
-```
-
-For the small single-L4 test topology, select its dedicated manifest profile:
-
-```bash
-make push-to-cluster SKAFFOLD_PROFILES=gke-single-l4
-```
-
-That profile defaults to a 0.5B model and application-level GPU offload, so its
-CPU and memory requests stay intentionally smaller than the FFT production
-defaults.
+The single-L4 profile is a small Kustomize overlay on the base deployment. It
+changes only the model, storage, shared claim, and worker templates.
 
 ### Image overrides for plain kubectl deploys
 
-`make deploy-fft-timeslice` (`kubectl apply -k`) deploys the pinned published
-images. To deploy your own images without editing committed manifests, use the
-gitignored local overlay:
-
-```bash
-make deploy-local   # first run copies k8s/deploy/local/kustomization.yaml.example
-```
-
-Then edit `k8s/deploy/local/kustomization.yaml` (gitignored) to point the
-`images:` transformer and the three worker-image env values at your registry
-and tag, so dynamically launched trainer/sampler pods follow it too. The
-committed example defaults to the published images, so an unedited overlay deploys exactly what
-`deploy-fft-timeslice` does.
-
-This is a development workflow. Production deploys should continue to use
-immutable images.
+`make deploy-fft-timeslice` (`kubectl apply -k`) deploys the published images.
+Use Skaffold when deploying a working tree or private registry build.
 
 ## Setup 1: Create the DRA GPU node pool
 
@@ -407,9 +367,9 @@ make deploy-fft-timeslice
 shared GPU `ResourceClaim`, the node-local OpenRL time-slicer DaemonSet, and the
 gateway with `OPEN_RL_ENABLE_FFT=true` and
 `OPEN_RL_WORKER_MANAGER=kubernetes`.
-The deployment defaults to `google/gemma-4-e4b`; setting `BASE_MODEL=...` on
-`make push-to-cluster` patches the ConfigMap before restarting the gateway. A base
-model in the client request still overrides the worker template.
+The base deployment defaults to `google/gemma-4-e4b`; the single-L4 overlay
+defaults to `Qwen/Qwen2.5-0.5B`. A base model in the client request overrides
+the worker template.
 
 There are no static worker deployments. Every `create_model` call makes the gateway create a trainer pod named `open-rl-trainer-<model-id>`, and every `create_sampling_client` call makes the gateway create a dedicated vLLM sampler pod named `open-rl-sampler-<model-id>`. Both are labeled:
 
@@ -419,8 +379,8 @@ timeslice.io/group: trainers    # or samplers
 timeslice.io/job-id: trainer-<model-id> # or sampler-<model-id>
 ```
 
-The gateway's `open-rl-sa` service account has a Role allowing pod and event
-access in the workload namespace (`03-rbac.yaml`). During FFT RL, trainers
+The gateway's `open-rl-sa` service account has a Role allowing pod access in the
+workload namespace (`03-rbac.yaml`). During FFT RL, trainers
 rotate ephemeral sampling checkpoints through two NFS directories by default
 (`OPEN_RL_SAMPLER_SNAPSHOT_SLOTS=2`). Sampling session ids remain unique, so
 vLLM reloads every policy revision while disk use stays bounded. Named eval or

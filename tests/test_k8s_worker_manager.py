@@ -33,8 +33,6 @@ class _FakeCoreApi:
   def __init__(self, pod_phases: dict[str, str] | None = None):
     self.pod_phases = pod_phases or {}
     self.pod_annotations: dict[str, dict[str, str]] = {}
-    self.container_statuses: dict[str, list[object]] = {}
-    self.create_phase = "Running"
     self.created: list[tuple[str, dict]] = []
     self.deleted: list[str] = []
     self.create_error: ApiException | None = None
@@ -44,32 +42,25 @@ class _FakeCoreApi:
       raise ApiException(status=404)
     return types.SimpleNamespace(
       metadata=types.SimpleNamespace(annotations=self.pod_annotations.get(name, {})),
-      status=types.SimpleNamespace(
-        phase=self.pod_phases[name],
-        conditions=[],
-        container_statuses=self.container_statuses.get(name, []),
-      ),
+      status=types.SimpleNamespace(phase=self.pod_phases[name]),
     )
 
   def create_namespaced_pod(self, namespace: str, body: dict):
     if self.create_error is not None:
       if self.create_error.status == 409:
         name = body["metadata"]["name"]
-        self.pod_phases[name] = self.create_phase
+        self.pod_phases[name] = "Running"
         self.pod_annotations[name] = body["metadata"]["annotations"]
       raise self.create_error
     self.created.append((namespace, body))
     name = body["metadata"]["name"]
-    self.pod_phases[name] = self.create_phase
+    self.pod_phases[name] = "Running"
     self.pod_annotations[name] = body["metadata"]["annotations"]
 
   def delete_namespaced_pod(self, name: str, namespace: str):
     self.deleted.append(name)
     self.pod_phases.pop(name, None)
     self.pod_annotations.pop(name, None)
-
-  def list_namespaced_event(self, namespace: str, field_selector: str):
-    return types.SimpleNamespace(items=[])
 
 
 class KubernetesFFTWorkerManagerTest(unittest.TestCase):
@@ -84,13 +75,13 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
       "OPEN_RL_WORKER_NAMESPACE": "training",
     }
 
-  def _manager(self, core_api: _FakeCoreApi) -> KubernetesFFTWorkerManager:
+  def manager(self, core_api: _FakeCoreApi) -> KubernetesFFTWorkerManager:
     with patch.dict(os.environ, self.env, clear=True):
       return KubernetesFFTWorkerManager(core_api=core_api)
 
   def test_launch_stamps_name_labels_args_and_job_id_env(self) -> None:
     api = _FakeCoreApi()
-    self._manager(api).launch("Model_A.1")
+    self.manager(api).launch("Model_A.1")
 
     self.assertEqual(len(api.created), 1)
     namespace, body = api.created[0]
@@ -114,7 +105,7 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
 
   def test_launch_replaces_stale_job_id_env_from_template(self) -> None:
     api = _FakeCoreApi()
-    manager = self._manager(api)
+    manager = self.manager(api)
     manager.pod_template["spec"]["containers"][0]["env"].append({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": "stale-job"})
     manager.pod_template["spec"]["containers"][0]["env"].append({"name": "OPEN_RL_TIME_SLICE_GROUP", "value": "stale-group"})
 
@@ -127,7 +118,7 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
 
   def test_launch_sampler_stamps_sampler_identity(self) -> None:
     api = _FakeCoreApi()
-    self._manager(api).launch_sampler("Model_A.1")
+    self.manager(api).launch_sampler("Model_A.1")
 
     self.assertEqual(len(api.created), 1)
     _, body = api.created[0]
@@ -147,27 +138,9 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
     self.assertIn({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": "sampler-model-a-1"}, container["env"])
     self.assertIn({"name": "OPEN_RL_TIME_SLICE_GROUP", "value": "samplers"}, container["env"])
 
-  def test_role_images_and_resource_overrides_are_applied(self) -> None:
-    api = _FakeCoreApi()
-    env = {
-      **self.env,
-      "OPEN_RL_TRAINER_IMAGE": "example/trainer:revision-a",
-      "OPEN_RL_TRAINER_CPU_REQUEST": "8",
-      "OPEN_RL_TRAINER_MEMORY_REQUEST": "64Gi",
-      "OPEN_RL_TRAINER_MEMORY_LIMIT": "180Gi",
-    }
-
-    with patch.dict(os.environ, env, clear=True):
-      KubernetesFFTWorkerManager(core_api=api).launch("model-a")
-
-    container = api.created[0][1]["spec"]["containers"][0]
-    self.assertEqual(container["image"], "example/trainer:revision-a")
-    self.assertEqual(container["resources"]["requests"], {"cpu": "8", "memory": "64Gi"})
-    self.assertEqual(container["resources"]["limits"]["memory"], "180Gi")
-
   def test_launch_is_idempotent_while_pod_is_live(self) -> None:
     api = _FakeCoreApi(pod_phases={"open-rl-trainer-model-a": "Running"})
-    manager = self._manager(api)
+    manager = self.manager(api)
     api.pod_annotations["open-rl-trainer-model-a"] = {
       WORKER_INSTANCE_ANNOTATION: "instance-a",
       WORKER_REVISION_ANNOTATION: manager.worker_revision("trainer"),
@@ -186,7 +159,7 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
       WORKER_REVISION_ANNOTATION: "old-revision",
     }
 
-    instance_id = self._manager(api).launch("model-a")
+    instance_id = self.manager(api).launch("model-a")
 
     self.assertNotEqual(instance_id, "instance-a")
     self.assertEqual(api.deleted, ["open-rl-trainer-model-a"])
@@ -194,7 +167,7 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
 
   def test_launch_replaces_terminal_pod(self) -> None:
     api = _FakeCoreApi(pod_phases={"open-rl-trainer-model-a": "Failed"})
-    self._manager(api).launch("model-a")
+    self.manager(api).launch("model-a")
 
     self.assertEqual(api.deleted, ["open-rl-trainer-model-a"])
     self.assertEqual(len(api.created), 1)
@@ -202,23 +175,13 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
   def test_launch_tolerates_conflict_on_create(self) -> None:
     api = _FakeCoreApi()
     api.create_error = ApiException(status=409)
-    self._manager(api).launch("model-a")  # must not raise
+    self.manager(api).launch("model-a")  # must not raise
 
   def test_launch_raises_on_other_api_errors(self) -> None:
     api = _FakeCoreApi()
     api.create_error = ApiException(status=403)
     with self.assertRaises(ApiException):
-      self._manager(api).launch("model-a")
-
-  def test_launch_reports_fatal_container_startup_state(self) -> None:
-    api = _FakeCoreApi()
-    api.create_phase = "Pending"
-    waiting = types.SimpleNamespace(reason="ImagePullBackOff", message="denied")
-    state = types.SimpleNamespace(waiting=waiting, terminated=None)
-    api.container_statuses["open-rl-trainer-model-a"] = [types.SimpleNamespace(name="trainer-worker", state=state)]
-
-    with self.assertRaisesRegex(RuntimeError, "ImagePullBackOff"):
-      self._manager(api).launch("model-a")
+      self.manager(api).launch("model-a")
 
   def test_requires_template_and_redis(self) -> None:
     with patch.dict(os.environ, {"REDIS_URL": "redis://r:6379"}, clear=True), self.assertRaisesRegex(RuntimeError, "POD_TEMPLATE"):
