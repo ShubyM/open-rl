@@ -3,9 +3,9 @@
 This guide describes the core cluster shape introduced by this PR. It separates
 three ideas that build on each other:
 
-1. **DRA pinning:** one manually created `ResourceClaim` allocates one physical
-   GPU per role, and every worker pod that references that claim is scheduled
-   onto the node that can access that same device.
+1. **DRA pinning:** one manually created `ResourceClaim` allocates the physical
+   GPU bundle for each role. The default trainer claim contains two GPUs for
+   FSDP; the sampler claim contains one GPU.
 2. **Kubernetes worker manager:** the gateway creates one trainer worker pod per
    `model_id`, instead of relying on a static trainer Deployment.
 3. **OpenRL GPU coordination:** a node-local accelerator time-slicer DaemonSet serializes
@@ -18,7 +18,7 @@ three ideas that build on each other:
 There are three separate responsibilities in this PR.
 
 First, DRA is used only for GPU allocation and placement. The deployment creates
-two static `ResourceClaims` named `open-rl-trainer-gpu-1` and `open-rl-sampler-gpu-1`. Trainer worker pods reference `open-rl-trainer-gpu-1`, while Sampler worker pods reference `open-rl-sampler-gpu-1`. Kubernetes allocates one matching NVIDIA GPU to each claim and schedules those pods onto separate physical nodes where those devices are available.
+two static `ResourceClaims` named `open-rl-trainer-gpu-1` and `open-rl-sampler-gpu-1`. Trainer worker pods reference `open-rl-trainer-gpu-1`, which requests two co-located GPUs, while sampler worker pods reference the single-GPU `open-rl-sampler-gpu-1` claim.
 
 Second, the Kubernetes worker manager is the deployment launcher. It runs inside
 the gateway process today. When the gateway receives `create_model` in FFT mode, it creates a trainer pod for that `model_id`. When it receives `create_sampling_client`, it creates a dedicated vLLM sampler pod for that `model_id` from the sampler worker pod template. It enqueues the request
@@ -45,7 +45,7 @@ The request flow is:
 3. The Kubernetes worker manager ensures a trainer worker pod exists for that
    model.
 4. The trainer worker pod references `open-rl-trainer-gpu-1`, so Kubernetes
-   places it on the DRA GPU node.
+   places it on the two-GPU DRA trainer node.
 5. The gateway enqueues the create request on the model's Redis queue.
 6. The trainer worker drains that queue and uses the node-local time slicer
    before entering CUDA sections.
@@ -69,7 +69,7 @@ flowchart TD
         workerB["trainer worker pod\nmodel B"]
         agent["OpenRL time-slicer DaemonSet\none per GPU node"]
         llmd["llm-d snapshot-agent\nnode-local"]
-        gpu["Physical GPU"]
+        gpu["Physical GPU bundle"]
     end
 
     client -->|"create_model / retrieve_future"| gateway
@@ -77,9 +77,9 @@ flowchart TD
     gateway -->|"enqueue request / read future"| redis
     kube -->|"schedule pods that reference claim"| workerA
     kube -->|"schedule pods that reference claim"| workerB
-    claim -.->|"pins placement to one device"| workerA
-    claim -.->|"pins placement to one device"| workerB
-    claim -.->|"allocates physical device"| gpu
+    claim -.->|"pins placement to one bundle"| workerA
+    claim -.->|"pins placement to one bundle"| workerB
+    claim -.->|"allocates physical devices"| gpu
 
     workerA <-->|"pop request / write result"| redis
     workerB <-->|"pop request / write result"| redis
@@ -111,6 +111,7 @@ spec:
     - name: gpu
       exactly:
         deviceClassName: gpu.nvidia.com
+        count: 2 # trainer; sampler omits count and defaults to one
 ```
 
 Trainer worker pods reference `open-rl-trainer-gpu-1`, while Sampler worker pods reference `open-rl-sampler-gpu-1`:
@@ -121,7 +122,7 @@ resourceClaims:
   resourceClaimName: open-rl-trainer-gpu-1 # (or open-rl-sampler-gpu-1)
 ```
 
-Because these are shared `ResourceClaims`, Kubernetes allocates a single matching device to each claim and schedules referencing pods onto the dedicated nodes where those claims reside (`group.timeslice.io/trainers` vs `samplers`).
+Because these are shared `ResourceClaims`, Kubernetes allocates the requested device bundle once and schedules referencing pods onto the dedicated nodes where those claims reside (`group.timeslice.io/trainers` vs `samplers`).
 
 DRA is the allocation and placement layer. It does not serialize CUDA execution
 by itself. This PR is intentionally an oversubscription model: multiple trainer
@@ -210,7 +211,7 @@ the relevant pod and process set.
 - A working NVIDIA GPU driver on the DRA node. The llm-d snapshot path uses
   CUDA checkpointing under the hood, so use driver **r570 or newer**.
 - The **NVIDIA DRA GPU driver** (Helm chart `nvidia-dra-driver-gpu` >= 25.8.0)
-  so all trainer worker pods can share one GPU through a single `ResourceClaim`.
+  so all trainer worker pods can share one two-GPU bundle through a single `ResourceClaim`.
 - Helm v3 for the DRA-driver chart.
 
 ## Deploying your working tree
@@ -261,7 +262,7 @@ Use Skaffold when deploying a working tree or private registry build.
 
 ## Setup 1: Create the DRA GPU node pool
 
-Trainer worker pods share the GPU through the `open-rl-trainer-gpu-1`
+Trainer worker pods share the two-GPU allocation through the `open-rl-trainer-gpu-1`
 `ResourceClaim` (`06-gpu-resourceclaim.yaml`) instead of device-plugin time
 sharing, so the node pool disables the default device plugin and automatic
 driver install (per the

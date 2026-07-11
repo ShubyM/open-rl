@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
+from training.distributed import local_rank
 
 
 def chunk_target_logprob(
@@ -33,6 +34,30 @@ def chunk_target_logprob(
   return target_logit - torch.logsumexp(logits, dim=-1)
 
 
+def project_target_logprobs(model: PreTrainedModel, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+  """Project hidden states in small vocab chunks instead of building full logits."""
+  head = model.get_output_embeddings()
+  config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
+  batch, seq_len, _ = hidden.shape
+  hidden = hidden.reshape(batch * seq_len, -1).to(head.weight.device)
+  targets = targets.reshape(batch * seq_len).to(head.weight.device)
+  chunk_size = max(1, int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "128")))
+
+  def project(start: int) -> torch.Tensor:
+    args = (
+      hidden[start : start + chunk_size],
+      head.weight,
+      getattr(head, "bias", None),
+      targets[start : start + chunk_size],
+      getattr(config, "final_logit_softcapping", None),
+    )
+    if args[0].requires_grad or head.weight.requires_grad:
+      return torch.utils.checkpoint.checkpoint(chunk_target_logprob, *args, use_reentrant=False)
+    return chunk_target_logprob(*args)
+
+  return torch.cat([project(start) for start in range(0, hidden.shape[0], chunk_size)]).reshape(batch, seq_len)
+
+
 class TensorData(BaseModel):
   data: list[int] | list[float]
 
@@ -47,7 +72,7 @@ class BaseTrainerWorker:
     self.tokenizer: PreTrainedTokenizerBase | None = None
 
     if torch.cuda.is_available():
-      self.device = torch.device("cuda")
+      self.device = torch.device("cuda", local_rank())
     elif torch.backends.mps.is_available():
       self.device = torch.device("mps")
     else:
@@ -221,7 +246,7 @@ class BaseTrainerWorker:
     if os.getenv("OPEN_RL_FUSED_LOGPROB", "1") == "1":
       hidden = self.backbone_hidden_states(model, input_ids, attention_mask)
       if hidden is not None:
-        return self.fused_target_logprobs(model, hidden[:, :seq_len, :], target_token_ids)
+        return project_target_logprobs(model, hidden[:, :seq_len, :], target_token_ids)
 
     # Full-logits path. Use logit - logsumexp rather than log_softmax(...).gather so
     # we avoid the extra full-size fp32 log_softmax allocation.
@@ -261,42 +286,6 @@ class BaseTrainerWorker:
       print(f"[trainer] fused-logprob backbone forward failed ({exc}); using full-logits path")
       return None
     return getattr(outputs, "last_hidden_state", None)
-
-  def fused_target_logprobs(
-    self,
-    model: PreTrainedModel,
-    hidden: torch.Tensor,
-    target_token_ids: torch.Tensor,
-  ) -> torch.Tensor:
-    """Project hidden states through the lm_head in chunks and reduce to the
-    selected target logprob, never materializing the full [batch, seq, vocab]
-    logits tensor."""
-    lm_head = model.get_output_embeddings()
-    weight = lm_head.weight
-    bias = getattr(lm_head, "bias", None)
-    model_config = getattr(model, "config", None)
-    if model_config is not None and hasattr(model_config, "get_text_config"):
-      model_config = model_config.get_text_config()
-    softcap = getattr(model_config, "final_logit_softcapping", None)
-
-    batch, seq_len, _ = hidden.shape
-    flat_hidden = hidden.reshape(batch * seq_len, -1).to(weight.device)
-    flat_targets = target_token_ids.reshape(batch * seq_len).to(weight.device)
-
-    chunk = max(1, int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "128")))
-    logprob_chunks = []
-    for start in range(0, flat_hidden.shape[0], chunk):
-      hidden_chunk = flat_hidden[start : start + chunk]
-      target_chunk = flat_targets[start : start + chunk]
-      if hidden_chunk.requires_grad or weight.requires_grad:
-        logprob_chunk = torch.utils.checkpoint.checkpoint(
-          chunk_target_logprob, hidden_chunk, weight, bias, target_chunk, softcap, use_reentrant=False
-        )
-      else:
-        logprob_chunk = chunk_target_logprob(hidden_chunk, weight, bias, target_chunk, softcap)
-      logprob_chunks.append(logprob_chunk)
-
-    return torch.cat(logprob_chunks, dim=0).reshape(batch, seq_len)
 
   def generate(
     self,

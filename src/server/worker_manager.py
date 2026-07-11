@@ -28,6 +28,21 @@ def _py_cmd(extras: list[str], module: str, model_id: str) -> list[str]:
   return [sys.executable, "-u", "-m", module, "--model-id", model_id]
 
 
+def _trainer_cmd(model_id: str) -> list[str]:
+  world_size = int(os.getenv("OPEN_RL_FSDP_WORLD_SIZE", "1"))
+  if world_size <= 1:
+    return _py_cmd(["gpu"], "server.training_requests_processor", model_id)
+  runner = ["uv", "run", "--extra", "gpu", "torchrun"] if shutil.which("uv") else [sys.executable, "-u", "-m", "torch.distributed.run"]
+  return runner + [
+    "--standalone",
+    f"--nproc-per-node={world_size}",
+    "-m",
+    "server.training_requests_processor",
+    "--model-id",
+    model_id,
+  ]
+
+
 class WorkerManager(Protocol):
   def launch(self, model_id: str, base_model: str | None = None) -> str | None:
     """Ensure the model's worker exists and return its instance id when available."""
@@ -77,7 +92,7 @@ class FFTWorkerManager:
     if base_model:
       env["BASE_MODEL"] = base_model
     self.train_processes[model_id] = subprocess.Popen(
-      _py_cmd(["gpu"], "server.training_requests_processor", model_id),
+      _trainer_cmd(model_id),
       cwd=self.project_dir,
       env=env,
       start_new_session=True,

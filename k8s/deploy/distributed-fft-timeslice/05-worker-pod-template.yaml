@@ -4,10 +4,10 @@
 # timeslice.io/job-id), the OPEN_RL_TIME_SLICE_* env vars, and appends --model-id
 # to args.
 #
-# All trainer worker pods in this group share one GPU through the single DRA
-# ResourceClaim open-rl-trainer-gpu-1 (06-gpu-resourceclaim.yaml), which pins them
-# to the same physical device. DRA does not serialize CUDA execution; OpenRL's
-# node-local snapshot agent coordinates GPU windows. See
+# All trainer worker pods in this group share the same two-GPU allocation through
+# ResourceClaim open-rl-trainer-gpu-1 (06-gpu-resourceclaim.yaml). DRA does not
+# serialize CUDA execution; OpenRL's node-local snapshot agent coordinates GPU
+# windows for both rank processes. See
 # docs/setup/gke-fft-timeslice.md.
 apiVersion: v1
 kind: ConfigMap
@@ -25,7 +25,7 @@ data:
         # when rendering pods (server/k8s_worker_manager.py).
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: IfNotPresent
-        command: ["uv", "run", "--no-sync", "python", "-m", "server.training_requests_processor"]
+        command: ["uv", "run", "--no-sync", "torchrun", "--standalone", "--nproc-per-node=2", "-m", "server.training_requests_processor"]
         env:
         - name: REDIS_URL
           value: "redis://redis-service:6379?max_connections=500"
@@ -36,6 +36,8 @@ data:
               key: BASE_MODEL
         - name: OPEN_RL_ENABLE_FFT
           value: "true"
+        - name: OPEN_RL_FSDP_WORLD_SIZE
+          value: "2"
         - name: PYTORCH_CUDA_ALLOC_CONF
           value: "expandable_segments:True"
         - name: OPEN_RL_ATTN_IMPLEMENTATION
