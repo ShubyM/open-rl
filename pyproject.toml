@@ -32,6 +32,7 @@ cpu = [
 ]
 gpu = [
     "datasets",
+    "flash-linear-attention==0.5.1",
     "numpy",
     "peft",
     "torch; sys_platform == 'linux'",

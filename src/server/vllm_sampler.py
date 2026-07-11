@@ -60,6 +60,11 @@ def vllm_sleep_level() -> int:
   return level
 
 
+def vllm_language_model_only() -> bool:
+  default = "1" if is_fft_enabled() else "0"
+  return os.getenv("OPEN_RL_VLLM_LANGUAGE_MODEL_ONLY", default) == "1"
+
+
 async def publish_sampler_ready(store: Any, model_id: str, instance_id: str) -> None:
   if store.redis is not None:
     await store.redis.set(f"open_rl:sampler_ready:{model_id}", instance_id)
@@ -114,7 +119,7 @@ def init_engine():
       "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", "8192")),
       "max_num_seqs": int(os.getenv("VLLM_MAX_NUM_SEQS", "64")),
       "gpu_memory_utilization": float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")),
-      "language_model_only": os.getenv("OPEN_RL_VLLM_LANGUAGE_MODEL_ONLY", "0") == "1",
+      "language_model_only": vllm_language_model_only(),
       "enable_prefix_caching": False,
       "enforce_eager": os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
     }

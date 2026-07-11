@@ -5,17 +5,23 @@ import json
 import math
 import os
 import time
-from contextlib import nullcontext
 from datetime import datetime
-from functools import partial
 from typing import Any
 
 import torch
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+from transformers import AutoTokenizer, PreTrainedModel
 
 from training.distributed import barrier, fsdp_group, is_distributed, is_primary
-from training.trainer_worker import BaseTrainerWorker, Datum, project_target_logprobs
+from training.model_loading import load_text_causal_lm
+from training.trainer_worker import (
+  BaseTrainerWorker,
+  Datum,
+  activation_offload_context,
+  attention_backend_context,
+  attention_forward_kwargs,
+  project_target_logprobs,
+)
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
 
@@ -44,13 +50,15 @@ class FSDPTargetLogprobModel(torch.nn.Module):
       raise RuntimeError(f"FSDP fused logprobs cannot resolve the backbone for {type(model).__name__}")
 
     backbone_mask = None if bool(attention_mask.all()) else attention_mask
-    attention_context = nullcontext()
-    if input_ids.is_cuda and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
-      from torch.nn.attention import SDPBackend, sdpa_kernel
-
-      attention_context = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
-    with attention_context:
-      outputs = backbone(input_ids=input_ids, attention_mask=backbone_mask, use_cache=False, return_dict=True)
+    offload_threshold = int(os.getenv("OPEN_RL_ACTIVATION_CPU_OFFLOAD_MIN_TOKENS", "16384"))
+    with activation_offload_context(input_ids, default=input_ids.shape[1] >= offload_threshold), attention_backend_context(model.config, input_ids):
+      outputs = backbone(
+        input_ids=input_ids,
+        attention_mask=backbone_mask,
+        use_cache=False,
+        return_dict=True,
+        **attention_forward_kwargs(model.config),
+      )
 
     seq_len = target_token_ids.shape[1]
     hidden = outputs.last_hidden_state[:, :seq_len, :]
@@ -64,14 +72,12 @@ def trainable_model_parameters(model: PreTrainedModel) -> list[torch.nn.Paramete
   return params
 
 
-def configure_fft_attention() -> str:
-  attention_backend = os.getenv("OPEN_RL_ATTN_IMPLEMENTATION", "sdpa")
-  if torch.cuda.is_available() and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
+def configure_fft_attention(attention_backend: str) -> None:
+  if attention_backend == "sdpa" and torch.cuda.is_available() and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
     # Gradient checkpointing recomputes attention during backward, outside the
     # original forward context. Disable the quadratic math backend process-wide
     # so recomputation cannot silently materialize [batch, heads, seq, seq].
     torch.backends.cuda.enable_math_sdp(False)
-  return attention_backend
 
 
 class FFTTrainingWorker(BaseTrainerWorker):
@@ -90,6 +96,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if self.model is not None and self.base_model_name == base_model_name:
       print(f"Full fine-tuning model {base_model_name} already loaded.")
       return
+    if self.model is not None:
+      self.unload_model()
 
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     mode = f"FSDP rank {os.getenv('RANK', '0')}/{os.getenv('WORLD_SIZE', '1')}" if is_distributed() else str(self.device)
@@ -98,12 +106,11 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
-    attention_backend = configure_fft_attention()
-    causal_lm = AutoModelForCausalLM.from_pretrained(
-      base_model_name,
-      dtype=dtype,
-      attn_implementation=attention_backend,
-    )
+    load_kwargs: dict[str, Any] = {"dtype": dtype}
+    if attention_backend := os.getenv("OPEN_RL_ATTN_IMPLEMENTATION"):
+      load_kwargs["attn_implementation"] = attention_backend
+    causal_lm = load_text_causal_lm(base_model_name, **load_kwargs)
+    configure_fft_attention(causal_lm.config._attn_implementation)
     if ENABLE_GRADIENT_CHECKPOINTING:
       causal_lm.gradient_checkpointing_enable()
       causal_lm.enable_input_require_grads()
@@ -111,30 +118,52 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if is_distributed():
       from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
       from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-      from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
       decoder_classes = {type(module) for module in causal_lm.modules() if type(module).__name__.endswith("DecoderLayer")}
       if not decoder_classes:
         raise RuntimeError(f"Could not identify decoder layers for FSDP wrapping in {type(causal_lm).__name__}")
-      wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls=decoder_classes)
+      backbone = getattr(causal_lm, "model", None)
+      large_embeddings = {module for module in [getattr(backbone, "embed_tokens_per_layer", None)] if module is not None}
+
+      def wrap_policy(module: torch.nn.Module, recurse: bool, nonwrapped_numel: int) -> bool:
+        return True if recurse else type(module) in decoder_classes or module in large_embeddings
+
       mixed_precision = MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
-      self.model = FSDP(
-        FSDPTargetLogprobModel(causal_lm),
-        process_group=fsdp_group(),
-        auto_wrap_policy=wrap_policy,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        mixed_precision=mixed_precision,
-        device_id=self.device,
-        use_orig_params=True,
-        limit_all_gathers=True,
-      )
+      from torch.distributed.fsdp import BackwardPrefetch
+
+      with self.cuda_memory_phase("fsdp_wrap"):
+        self.model = FSDP(
+          FSDPTargetLogprobModel(causal_lm),
+          process_group=fsdp_group(),
+          auto_wrap_policy=wrap_policy,
+          sharding_strategy=ShardingStrategy.FULL_SHARD,
+          mixed_precision=mixed_precision,
+          backward_prefetch=BackwardPrefetch.BACKWARD_POST,
+          device_id=self.device,
+          use_orig_params=True,
+          limit_all_gathers=True,
+        )
       self.fsdp_enabled = True
       self.cpu_offload = False
-      print(f"FSDP FULL_SHARD enabled across {os.getenv('WORLD_SIZE')} ranks; decoder classes: {[c.__name__ for c in decoder_classes]}")
+      wrapped = [c.__name__ for c in decoder_classes]
+      if large_embeddings:
+        wrapped.append("per-layer embeddings")
+      print(f"FSDP FULL_SHARD enabled across {os.getenv('WORLD_SIZE')} ranks; wrapped: {wrapped}")
     else:
       self.model = causal_lm.to(self.device)
     print(f"Full fine-tuning attention backend: {causal_lm.config.get_text_config()._attn_implementation}")
     print("Successfully loaded full fine-tuning model.")
+
+  def unload_model(self) -> None:
+    """Drop all references to the old parameter set before loading another one."""
+    self.optimizer = None
+    self.trainable_params = []
+    self.model = None
+    self.fsdp_enabled = False
+    self._is_offloaded = False
+    gc.collect()
+    if torch.cuda.is_available():
+      torch.cuda.empty_cache()
 
   def create_model(self, base_model_name: str, model_id: str | None = None, config: FFTConfig | None = None) -> None:
     """Load the per-job model if needed, then prepare it for full fine-tuning."""
@@ -325,7 +354,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
       else torch.nn.utils.clip_grad_norm_(self.trainable_params, max_grad_norm, foreach=False)
     )
 
-    self.optimizer.step()
+    with self.cuda_memory_phase("optimizer_step"):
+      self.optimizer.step()
     self.optimizer.zero_grad()
 
     return {

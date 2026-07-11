@@ -166,6 +166,9 @@ Running as a `hostNetwork: true` DaemonSet across GPU nodes, the time-slicer ser
 The trainer executes real PyTorch FSDP policy-gradient optimization and coordinates directly with the time-slicer:
 * **One rank per GPU:** `torchrun` launches one worker rank per allocated GPU. Rank 0 alone drains Redis and publishes futures, then broadcasts each operation to the other ranks over a CPU-only Gloo control group.
 * **`FULL_SHARD`:** Decoder parameters, gradients, and AdamW state are sharded across ranks. The target-logprob projection remains inside the FSDP root forward and is vocabulary-chunked, avoiding a full `[batch, sequence, vocabulary]` activation.
+* **Text-only multimodal loading:** Gemma 3n/4 checkpoints stream `model.language_model.*` directly into their causal-LM class. Audio and vision towers are never instantiated, sharded, optimized, or exported to vLLM.
+* **Long-context activations:** Gemma 3n/4 defaults to FlexAttention so 32K attention does not materialize a quadratic score tensor. The 32K deployment also stores tensors saved for backward in pinned CPU memory; this lowers per-rank VRAM at the cost of PCIe traffic.
+* **Qwen 3.5 kernels:** Qwen 3.5 keeps native SDPA for its full-attention layers. The GPU environment installs Flash Linear Attention for its Gated DeltaNet layers instead of using Transformers' substantially larger float32 fallback.
 * **Sleep/wake:** FSDP ranks do not use the legacy per-tensor CPU shadow offload. The llm-d time-slicer snapshots and restores every rank process as one workload. CPU-only queue polling does not wake CUDA or allocate KV/cache memory between leases.
 * **vLLM checkpoint export:** A sampler checkpoint is a collective operation. All ranks gather a full state dictionary to rank 0 while the GPU lease is held; rank 0 writes a standard Hugging Face checkpoint to shared storage for vLLM.
 
@@ -275,6 +278,7 @@ The following environment variables govern multi-tenant GPU execution across Gat
 | `OPEN_RL_WORKER_IMAGE=<tag>` | Gateway | Runtime override injecting explicit container image digests into rendered worker pod specifications. |
 | `SAMPLING_BACKEND=vllm` | Client / Gateway | Instructs the framework to route rollout requests to vLLM dynamic sampler pods. |
 | `OPEN_RL_FSDP_WORLD_SIZE=2` | Trainer launcher | Uses `torchrun` with one FSDP rank per allocated trainer GPU. Must match the trainer DRA claim count. |
+| `OPEN_RL_VLLM_LANGUAGE_MODEL_ONLY=1` | Sampler Worker | Loads only the language backbone from multimodal checkpoints. Defaults on in FFT mode. |
 | `CUDA_VISIBLE_DEVICES=<ids>` | Trainer Worker | Exposes the DRA-allocated physical accelerators to the FSDP ranks. |
 | `SAMPLER_CUDA_VISIBLE_DEVICES=<ids>` | Sampler Worker | Binds vLLM Dynamo engines to isolated inference accelerators. |
 | `VLLM_GPU_MEMORY_UTILIZATION=0.70` | Sampler Worker | Configures vLLM pre-allocated KV cache ceiling, leaving headroom for cooperative memory swapping. |

@@ -2,7 +2,7 @@
 
 import math
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -37,7 +37,7 @@ def chunk_target_logprob(
 def project_target_logprobs(model: PreTrainedModel, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
   """Project hidden states in small vocab chunks instead of building full logits."""
   head = model.get_output_embeddings()
-  config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
+  config = model.config.get_text_config()
   batch, seq_len, _ = hidden.shape
   hidden = hidden.reshape(batch * seq_len, -1).to(head.weight.device)
   targets = targets.reshape(batch * seq_len).to(head.weight.device)
@@ -56,6 +56,36 @@ def project_target_logprobs(model: PreTrainedModel, hidden: torch.Tensor, target
     return chunk_target_logprob(*args)
 
   return torch.cat([project(start) for start in range(0, hidden.shape[0], chunk_size)]).reshape(batch, seq_len)
+
+
+def activation_offload_context(tensor: torch.Tensor, *, default: bool = False):
+  mode = os.getenv("OPEN_RL_ACTIVATION_CPU_OFFLOAD", "auto" if default else "0")
+  if tensor.is_cuda and (mode == "1" or mode == "auto" and default):
+    return torch.autograd.graph.save_on_cpu(pin_memory=True)
+  return nullcontext()
+
+
+def attention_forward_kwargs(config: Any) -> dict[str, Any]:
+  """Use a low-resource FlexAttention tile for unusually wide heads."""
+  config = config.get_text_config()
+  if config._attn_implementation != "flex_attention":
+    return {}
+
+  if max(config.head_dim, getattr(config, "global_head_dim", 0) or 0) <= 256:
+    return {}
+  return {"kernel_options": {"fwd_BLOCK_N": 16, "fwd_num_stages": 1}}
+
+
+def attention_backend_context(config: Any, tensor: torch.Tensor):
+  config = config.get_text_config()
+  if config._attn_implementation != "sdpa" or not tensor.is_cuda:
+    return nullcontext()
+  if os.getenv("OPEN_RL_SDPA_NO_MATH", "1") != "1":
+    return nullcontext()
+
+  from torch.nn.attention import SDPBackend, sdpa_kernel
+
+  return sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.CUDNN_ATTENTION])
 
 
 class TensorData(BaseModel):
@@ -91,7 +121,9 @@ class BaseTrainerWorker:
 
       input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
       target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
-      target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+      seq_len = input_ids.shape[1]
+      with self.cuda_memory_phase(f"forward[{len(batch_data)}x{seq_len}]"):
+        target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
 
       match loss_fn:
         case "cross_entropy":
@@ -120,7 +152,8 @@ class BaseTrainerWorker:
 
       per_datum_loss = elementwise_loss.sum(dim=1)
       loss = per_datum_loss.sum()
-      loss.backward()
+      with self.cuda_memory_phase(f"backward[{len(batch_data)}x{seq_len}]"):
+        loss.backward()
       total_loss += loss.item()
 
       detached_logprobs = target_logprobs.detach().cpu()
@@ -142,6 +175,39 @@ class BaseTrainerWorker:
       "loss_fn_outputs": completed_loss_fn_outputs,
       "loss_fn_output_type": "ArrayRecord",
     }
+
+  @contextmanager
+  def cuda_memory_phase(self, phase: str):
+    enabled = self.device.type == "cuda" and os.getenv("OPEN_RL_LOG_CUDA_MEMORY", "0") == "1"
+    if enabled:
+      torch.cuda.reset_peak_memory_stats(self.device)
+      self.log_cuda_memory(f"{phase}:start")
+    try:
+      yield
+    except torch.OutOfMemoryError:
+      self.log_cuda_memory(f"{phase}:oom", force=True)
+      print(torch.cuda.memory_summary(self.device, abbreviated=True))
+      raise
+    finally:
+      if enabled:
+        self.log_cuda_memory(f"{phase}:end", include_peak=True)
+
+  def log_cuda_memory(self, phase: str, *, force: bool = False, include_peak: bool = False) -> None:
+    if self.device.type != "cuda" or (not force and os.getenv("OPEN_RL_LOG_CUDA_MEMORY", "0") != "1"):
+      return
+    gib = 1024**3
+    free, total = torch.cuda.mem_get_info(self.device)
+    fields = {
+      "allocated": torch.cuda.memory_allocated(self.device) / gib,
+      "reserved": torch.cuda.memory_reserved(self.device) / gib,
+      "free": free / gib,
+      "total": total / gib,
+    }
+    if include_peak:
+      fields["peak_allocated"] = torch.cuda.max_memory_allocated(self.device) / gib
+      fields["peak_reserved"] = torch.cuda.max_memory_reserved(self.device) / gib
+    stats = " ".join(f"{key}={value:.2f}GiB" for key, value in fields.items())
+    print(f"[CUDA_MEMORY] rank={os.getenv('RANK', '0')} phase={phase} {stats}")
 
   def make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:
     """Group examples for the single padded forward/backward path."""
@@ -250,7 +316,13 @@ class BaseTrainerWorker:
 
     # Full-logits path. Use logit - logsumexp rather than log_softmax(...).gather so
     # we avoid the extra full-size fp32 log_softmax allocation.
-    outputs = model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+    outputs = model(
+      input_ids,
+      attention_mask=attention_mask,
+      use_cache=False,
+      return_dict=True,
+      **attention_forward_kwargs(model.config),
+    )
     logits = outputs.logits[:, :seq_len, :]
     target_logit = logits.gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
     return target_logit - torch.logsumexp(logits, dim=-1)
@@ -274,14 +346,15 @@ class BaseTrainerWorker:
       # it lets SDPA select Flash Attention instead of materializing a quadratic
       # additive mask for Gemma's global-attention layers.
       backbone_attention_mask = None
-    attention_context = nullcontext()
-    if input_ids.is_cuda and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
-      from torch.nn.attention import SDPBackend, sdpa_kernel
-
-      attention_context = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
     try:
-      with attention_context:
-        outputs = backbone(input_ids=input_ids, attention_mask=backbone_attention_mask, use_cache=False, return_dict=True)
+      with activation_offload_context(input_ids), attention_backend_context(model.config, input_ids):
+        outputs = backbone(
+          input_ids=input_ids,
+          attention_mask=backbone_attention_mask,
+          use_cache=False,
+          return_dict=True,
+          **attention_forward_kwargs(model.config),
+        )
     except Exception as exc:
       print(f"[trainer] fused-logprob backbone forward failed ({exc}); using full-logits path")
       return None
@@ -359,7 +432,11 @@ class BaseTrainerWorker:
   def prompt_logprobs(self, model: PreTrainedModel, input_tensor: torch.Tensor) -> list[float | None]:
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
-      outputs = model(input_tensor, attention_mask=attention_mask)
+      outputs = model(
+        input_tensor,
+        attention_mask=attention_mask,
+        **attention_forward_kwargs(model.config),
+      )
       logprob_dist = torch.nn.functional.log_softmax(outputs.logits[0, :-1], dim=-1)
 
     prompt_tokens = input_tensor[0].tolist()

@@ -29,9 +29,9 @@ def _load_trainer_modules():
     for module_name in list(sys.modules):
       if module_name == "training" or module_name.startswith("training."):
         del sys.modules[module_name]
-    from training import fft_trainer_worker, lora_trainer_worker, losses, trainer_worker
+    from training import fft_trainer_worker, lora_trainer_worker, losses, model_loading, trainer_worker
 
-  return trainer_worker, lora_trainer_worker, fft_trainer_worker, losses
+  return trainer_worker, lora_trainer_worker, fft_trainer_worker, losses, model_loading
 
 
 def _load_training_requests_processor_module():
@@ -60,7 +60,7 @@ def _load_training_requests_processor_module():
   return training_requests_processor
 
 
-trainer_worker_module, lora_trainer_worker_module, fft_trainer_worker_module, losses_module = _load_trainer_modules()
+trainer_worker_module, lora_trainer_worker_module, fft_trainer_worker_module, losses_module, model_loading_module = _load_trainer_modules()
 training_requests_processor_module = _load_training_requests_processor_module()
 BaseTrainerWorker = trainer_worker_module.BaseTrainerWorker
 FFTTrainingWorker = fft_trainer_worker_module.FFTTrainingWorker
@@ -113,6 +113,7 @@ class _LogitModelStub:
   def __init__(self, vocab_size: int = 17):
     self.vocab_size = vocab_size
     self.calls = []
+    self.config = types.SimpleNamespace(get_text_config=lambda: types.SimpleNamespace(_attn_implementation="sdpa"))
 
   def train(self):
     return None
@@ -239,6 +240,63 @@ class _TimeSlicerStub:
     self.events.append(("close",))
 
 
+class TestTextOnlyModelLoading(unittest.TestCase):
+  def test_wide_flex_attention_uses_low_resource_kernel(self) -> None:
+    text_config = types.SimpleNamespace(_attn_implementation="flex_attention", head_dim=256, global_head_dim=512)
+    config = types.SimpleNamespace(get_text_config=lambda: text_config)
+
+    self.assertEqual(
+      trainer_worker_module.attention_forward_kwargs(config),
+      {"kernel_options": {"fwd_BLOCK_N": 16, "fwd_num_stages": 1}},
+    )
+
+  def test_standard_attention_does_not_override_kernel(self) -> None:
+    text_config = types.SimpleNamespace(_attn_implementation="sdpa", head_dim=512)
+    config = types.SimpleNamespace(get_text_config=lambda: text_config)
+
+    self.assertEqual(trainer_worker_module.attention_forward_kwargs(config), {})
+
+  def test_gemma4_loads_nested_language_model_directly(self) -> None:
+    text_config = types.SimpleNamespace(model_type="gemma4_text")
+    config = types.SimpleNamespace(model_type="gemma4", text_config=text_config)
+    loaded = object()
+
+    with (
+      patch("transformers.AutoConfig.from_pretrained", return_value=config),
+      patch("transformers.AutoModelForCausalLM.from_pretrained", return_value=loaded) as from_pretrained,
+    ):
+      result = model_loading_module.load_text_causal_lm("google/gemma-4-E4B-it", dtype=torch.bfloat16)
+
+    self.assertIs(result, loaded)
+    from_pretrained.assert_called_once_with(
+      "google/gemma-4-E4B-it",
+      dtype=torch.bfloat16,
+      attn_implementation="flex_attention",
+      config=text_config,
+      key_mapping={r"^model\.language_model\.": "model."},
+    )
+
+  def test_regular_causal_model_load_is_unchanged(self) -> None:
+    config = types.SimpleNamespace(model_type="qwen3")
+    with (
+      patch("transformers.AutoConfig.from_pretrained", return_value=config),
+      patch("transformers.AutoModelForCausalLM.from_pretrained") as from_pretrained,
+    ):
+      model_loading_module.load_text_causal_lm("Qwen/Qwen3-8B", dtype=torch.bfloat16)
+
+    from_pretrained.assert_called_once_with("Qwen/Qwen3-8B", dtype=torch.bfloat16, attn_implementation="sdpa")
+
+  def test_saved_gemma_text_checkpoint_still_uses_flex_attention(self) -> None:
+    config = types.SimpleNamespace(model_type="gemma4_text")
+    with (
+      patch("transformers.AutoConfig.from_pretrained", return_value=config),
+      patch("transformers.AutoModelForCausalLM.from_pretrained") as from_pretrained,
+    ):
+      model_loading_module.load_text_causal_lm("/checkpoints/step-4")
+
+    from_pretrained.assert_called_once_with("/checkpoints/step-4", attn_implementation="flex_attention")
+
+
 def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantages=None):
   loss_fn_inputs = {"target_tokens": trainer_worker_module.TensorData(data=target_tokens)}
   if weights is not None:
@@ -295,6 +353,22 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     worker.create_model("base-model", "model-a", config)
 
     self.assertEqual(calls, [("load", "base-model"), ("prepare", None)])
+
+  def test_fft_unload_drops_old_optimizer_and_parameter_references(self) -> None:
+    worker = FFTTrainingWorker()
+    worker.model = torch.nn.Linear(2, 2)
+    worker.trainable_params = list(worker.model.parameters())
+    worker.optimizer = torch.optim.AdamW(worker.trainable_params)
+    worker.fsdp_enabled = True
+    worker._is_offloaded = True
+
+    worker.unload_model()
+
+    self.assertIsNone(worker.model)
+    self.assertIsNone(worker.optimizer)
+    self.assertEqual(worker.trainable_params, [])
+    self.assertFalse(worker.fsdp_enabled)
+    self.assertFalse(worker._is_offloaded)
 
   def test_optim_step_only_updates_active_adapter_params(self) -> None:
     active_param = torch.nn.Parameter(torch.tensor([1.0]))

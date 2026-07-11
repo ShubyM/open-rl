@@ -65,6 +65,11 @@ make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
 | --- | --- | --- |
 | `OPEN_RL_TMP_DIR` | `/tmp/open-rl` | Root directory for adapter snapshots under `peft/` and saved states under `checkpoints/`. |
 | `OPEN_RL_TRAIN_TOKEN_BUDGET` | `0` | Maximum `batch_size * max_sequence_length` for padded trainer chunks inside one `forward_backward` request. `0` keeps the previous one-datum-at-a-time execution path. |
+| `OPEN_RL_ACTIVATION_CPU_OFFLOAD` | `auto` for FSDP sequences ≥16K; otherwise `0` | Store backbone tensors saved for backward in pinned CPU memory. Use `0` to disable or `1` to force it, trading PCIe traffic and host RAM for lower per-rank VRAM. |
+| `OPEN_RL_ACTIVATION_CPU_OFFLOAD_MIN_TOKENS` | `16384` | Sequence length where the FSDP trainer's automatic activation offload turns on. |
+| `OPEN_RL_LOG_CUDA_MEMORY` | `0` | Log allocated, reserved, free, and peak CUDA memory around forward, backward, FSDP wrapping, and optimizer steps. OOMs always print a memory summary. |
+| `OPEN_RL_ATTN_IMPLEMENTATION` | unset | Optional Transformers attention override. Leave unset to select tuned FlexAttention for Gemma 3n/4 and SDPA for other models such as Qwen 3.5. |
+| `OPEN_RL_SDPA_NO_MATH` | `1` | Prevent quadratic SDPA math fallback. A `No available kernel` error then means all fused backends rejected the input; inspect the warnings immediately above it. |
 | `CUDA_VISIBLE_DEVICES` | unset | Standard PyTorch GPU selector. Use different devices when the vLLM worker and trainer run on separate GPUs. |
 
 ## Worker manager
@@ -82,6 +87,10 @@ starts it in its own process group so the CUDA checkpoint backend can discover
 the active GPU PIDs. Kubernetes deploys the equivalent process with the
 `open-rl-accel-timeslicer` DaemonSet, which layers on top of the llm-d snapshot
 backend by default for physical checkpoint/restore.
+
+A noop time-slicer coordinates leases but does not evict CUDA memory. Trainer,
+sampler, and local grader processes must use disjoint physical GPU masks; sharing
+a GPU is only valid with a real snapshot/offload backend.
 
 ## vLLM variables
 

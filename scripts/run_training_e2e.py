@@ -89,7 +89,7 @@ class RunConfig:
   eval_uv_extra: str = "vllm"
   log_dir: str = "/tmp/open-rl-training-tests"
   startup_timeout: float = 300.0
-  train_token_budget: int = 65_536
+  train_token_budget: int = 0
   vllm_gpu_memory_utilization: float = 0.70
 
 

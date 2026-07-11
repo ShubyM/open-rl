@@ -44,6 +44,24 @@ class SleepLevelTest(unittest.TestCase):
       vllm_sampler.vllm_sleep_level()
 
 
+class LanguageModelOnlyTest(unittest.TestCase):
+  def test_fft_defaults_to_text_only(self) -> None:
+    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}, clear=True):
+      self.assertTrue(vllm_sampler.vllm_language_model_only())
+
+  def test_lora_keeps_the_full_model_default(self) -> None:
+    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "false"}, clear=True):
+      self.assertFalse(vllm_sampler.vllm_language_model_only())
+
+  def test_explicit_override_wins(self) -> None:
+    with patch.dict(
+      "os.environ",
+      {"OPEN_RL_ENABLE_FFT": "true", "OPEN_RL_VLLM_LANGUAGE_MODEL_ONLY": "0"},
+      clear=True,
+    ):
+      self.assertFalse(vllm_sampler.vllm_language_model_only())
+
+
 class PrepareEngineTest(unittest.IsolatedAsyncioTestCase):
   def tearDown(self) -> None:
     vllm_sampler.engine = None

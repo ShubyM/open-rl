@@ -38,12 +38,12 @@ class _FakeCausalLM(nn.Module):
   """Minimal stand-in for a HF CausalLM: a `.model` backbone exposing
   last_hidden_state, a tied-style lm_head, and a config with softcapping."""
 
-  def __init__(self, vocab: int, hidden: int, softcap: float | None = None, nested_config: bool = False):
+  def __init__(self, vocab: int, hidden: int, softcap: float | None = None):
     super().__init__()
     self.model = _Backbone(vocab, hidden)
     self.lm_head = nn.Linear(hidden, vocab, bias=False)
-    text_config = SimpleNamespace(final_logit_softcapping=softcap)
-    self.config = SimpleNamespace(get_text_config=lambda: text_config) if nested_config else text_config
+    text_config = SimpleNamespace(final_logit_softcapping=softcap, _attn_implementation="sdpa")
+    self.config = SimpleNamespace(get_text_config=lambda: text_config)
 
   def get_output_embeddings(self):
     return self.lm_head
@@ -51,7 +51,7 @@ class _FakeCausalLM(nn.Module):
   def forward(self, input_ids, attention_mask=None, use_cache=False, return_dict=True):
     hidden = self.model(input_ids).last_hidden_state
     logits = self.lm_head(hidden)
-    config = self.config.get_text_config() if hasattr(self.config, "get_text_config") else self.config
+    config = self.config.get_text_config()
     if config.final_logit_softcapping is not None:
       softcap = config.final_logit_softcapping
       logits = softcap * torch.tanh(logits / softcap)
@@ -74,9 +74,9 @@ class ComputeTargetLogprobsTest(unittest.TestCase):
     self.attention_mask = torch.ones(self.batch, self.seq, dtype=torch.long)
     self.target_ids = torch.randint(0, self.vocab, (self.batch, self.seq))
 
-  def _run(self, softcap, chunk, fused, target_len=None, nested_config=False):
+  def _run(self, softcap, chunk, fused, target_len=None):
     target = self.target_ids if target_len is None else self.target_ids[:, :target_len]
-    model = _FakeCausalLM(self.vocab, self.hidden, softcap=softcap, nested_config=nested_config).double()
+    model = _FakeCausalLM(self.vocab, self.hidden, softcap=softcap).double()
     env = {"OPEN_RL_FUSED_LOGPROB": "1" if fused else "0", "OPEN_RL_LOGPROB_CHUNK": str(chunk)}
     with unittest.mock.patch.dict(os.environ, env):
       out = self.worker.compute_target_logprobs(model, self.input_ids, self.attention_mask, target)
@@ -100,11 +100,6 @@ class ComputeTargetLogprobsTest(unittest.TestCase):
   def test_shorter_target_length(self):
     model, fused = self._run(softcap=None, chunk=5, fused=True, target_len=6)
     ref = _reference_logprobs(model, self.input_ids, self.attention_mask, self.target_ids[:, :6])
-    torch.testing.assert_close(fused, ref, rtol=1e-9, atol=1e-9)
-
-  def test_nested_text_config_softcap(self):
-    model, fused = self._run(softcap=30.0, chunk=5, fused=True, nested_config=True)
-    ref = _reference_logprobs(model, self.input_ids, self.attention_mask, self.target_ids)
     torch.testing.assert_close(fused, ref, rtol=1e-9, atol=1e-9)
 
   def test_all_ones_mask_is_omitted_for_attention_backend(self):
