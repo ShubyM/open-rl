@@ -3,10 +3,13 @@
 import argparse
 import asyncio
 import hashlib
+import json
 import os
 import sys
 import traceback
 from typing import Any
+
+import redis.asyncio as redis
 
 try:
   from vllm import SamplingParams
@@ -23,6 +26,11 @@ except ImportError:
   LoRARequest = None
   RequestOutputKind = None
   VLLM_AVAILABLE = False
+
+try:
+  import server.delta_weight_transfer_engine  # noqa: F401
+except ImportError:
+  pass
 
 from opentelemetry import propagate, trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -45,6 +53,7 @@ tracer = trace.get_tracer("vllm.inference.worker")
 
 engine: Any = None
 CURRENT_LOADED_SAMPLER_WEIGHTS: str | None = None
+IS_ENGINE_SLEEPING: bool = True
 reload_lock = asyncio.Lock()
 
 
@@ -98,6 +107,14 @@ def init_engine():
       engine_kwargs["max_lora_rank"] = 64
     if hf_overrides:
       engine_kwargs["hf_overrides"] = hf_overrides
+
+    if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
+      try:
+        from vllm.config.weight_transfer import WeightTransferConfig
+
+        engine_kwargs["weight_transfer_config"] = WeightTransferConfig(backend="delta_snapshot")
+      except (ImportError, ValueError):
+        pass
 
     engine_args = AsyncEngineArgs(**engine_kwargs)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -200,6 +217,7 @@ async def run_generation_backend(
 async def process_sampling_request(req: dict, store: Any) -> None:
   global engine
   global CURRENT_LOADED_SAMPLER_WEIGHTS
+  global IS_ENGINE_SLEEPING
 
   request_id = req["request_id"]
   trace_context = req.get("trace_context", {})
@@ -214,14 +232,33 @@ async def process_sampling_request(req: dict, store: Any) -> None:
           if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
             print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
             if engine is not None:
-              print("[vLLM Worker] Triggering sleep level 2...")
-              await engine.sleep(level=2)
+              print("[vLLM Worker] Triggering sleep level 1 (CPU offload weights)...")
+              await engine.sleep(level=1)
               print("[vLLM Worker] Waking up weights...")
               await engine.wake_up(tags=["weights"])
-              print(f"[vLLM Worker] Reloading weights from {weights_path} in-place...")
-              await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+              if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
+                print(f"[vLLM Worker] Receiving incremental delta weights from {weights_path} via native WeightTransferEngine...")
+                try:
+                  await engine.collective_rpc(
+                    "update_weights",
+                    kwargs={
+                      "update_info": {
+                        "target_weights_path": weights_path,
+                        "base_model_path": (
+                          os.getenv("OPEN_RL_BASE_MODEL") or os.getenv("BASE_MODEL") or getattr(getattr(engine, "engine_args", None), "model", "")
+                        ),
+                      }
+                    },
+                  )
+                except Exception as exc:
+                  print(f"[vLLM Worker] Native update_weights collective_rpc failed ({exc}); falling back to standard disk reload...")
+                  await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+              else:
+                print(f"[vLLM Worker] Reloading weights from {weights_path} in-place...")
+                await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
               print("[vLLM Worker] Waking up KV cache...")
               await engine.wake_up(tags=["kv_cache"])
+              IS_ENGINE_SLEEPING = False
             CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
             print("[vLLM Worker] Weights reload completed successfully!")
 
@@ -260,14 +297,79 @@ async def process_sampling_request(req: dict, store: Any) -> None:
       await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(exc)}"})
 
 
+async def weight_prefetcher_loop(model_id: str, store: Any) -> None:
+  global engine
+  global CURRENT_LOADED_SAMPLER_WEIGHTS
+  global IS_ENGINE_SLEEPING
+
+  try:
+    if not hasattr(store, "redis"):
+      return
+
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+      return
+    client = redis.from_url(redis_url, decode_responses=True, socket_timeout=None, socket_connect_timeout=None)
+    pubsub = client.pubsub()
+    channel_key = f"open_rl:weight_update:{model_id}"
+    await pubsub.subscribe(channel_key)
+    print(f"[vLLM Worker] Weight prefetcher listening on channel: {channel_key}...")
+
+    while True:
+      try:
+        async for message in pubsub.listen():
+          if message["type"] != "message":
+            continue
+          try:
+            data = json.loads(message["data"])
+            target_path = data.get("weights_path")
+            if target_path and target_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
+              print(f"[vLLM Worker] Prefetch signal received. Target weights path: {target_path}")
+              async with reload_lock:
+                if target_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
+                  print("[vLLM Worker] Prefetching delta weights to CPU cache in background...")
+                  t0 = asyncio.get_event_loop().time()
+                  await engine.collective_rpc("cache_prefetch_weights", kwargs={"weights_path": target_path})
+                  dt = (asyncio.get_event_loop().time() - t0) * 1000.0
+                  print(f"[vLLM Worker] Background weights prefetch to CPU cache completed in {dt:.2f} ms!")
+          except Exception as e:
+            print(f"[vLLM Worker] Error in prefetch message processing: {e}")
+            traceback.print_exc()
+      except redis.exceptions.TimeoutError:
+        continue
+      except Exception as e:
+        print(f"[vLLM Worker] Pub/Sub connection error: {e}. Retrying subscription...")
+        await asyncio.sleep(2)
+        try:
+          await pubsub.subscribe(channel_key)
+        except Exception:
+          pass
+  except Exception as e:
+    print(f"[vLLM Worker] CRITICAL: Weight prefetcher loop crashed: {e}")
+    traceback.print_exc()
+  except asyncio.CancelledError:
+    print("[vLLM Worker] Weight prefetcher loop cancelled.")
+  finally:
+    try:
+      await pubsub.unsubscribe(channel_key)
+    except Exception:
+      pass
+    try:
+      await client.aclose()
+    except Exception:
+      pass
+
+
 async def run_sampling_worker(model_id: str) -> None:
   global engine
   global CURRENT_LOADED_SAMPLER_WEIGHTS
+  global IS_ENGINE_SLEEPING
   from server.store import get_store
 
   store = get_store()
   snapshot_registered = False
   workload = None
+  prefetch_task = None
   if time_slicer is not None:
     workload = workload_from_env(os.getpid(), job_id=workload_job_id("sampler", model_id), group=SAMPLER_TIME_SLICE_GROUP)
 
@@ -282,8 +384,9 @@ async def run_sampling_worker(model_id: str) -> None:
         init_engine()
         print("[vLLM Worker] Engine initialized successfully.")
         if engine is not None:
-          print("[vLLM Worker] Sleeping engine after init to yield GPU memory...")
-          await engine.sleep(level=2)
+          print("[vLLM Worker] Sleeping engine after init to yield GPU memory (CPU offload)...")
+          await engine.sleep(level=1)
+          IS_ENGINE_SLEEPING = True
     except Exception as exc:
       print(f"[vLLM Worker] Failed to perform coordinated initialization: {exc}")
       traceback.print_exc()
@@ -295,6 +398,11 @@ async def run_sampling_worker(model_id: str) -> None:
   async def exit_gracefully() -> None:
     print(f"[vLLM Worker] Initiating immediate exit for model {model_id} sampler worker...")
     nonlocal snapshot_registered
+    if prefetch_task is not None:
+      try:
+        prefetch_task.cancel()
+      except Exception:
+        pass
     if snapshot_registered and time_slicer is not None:
       assert workload is not None
       try:
@@ -328,6 +436,7 @@ async def run_sampling_worker(model_id: str) -> None:
     await store.redis.expire(f"open_rl:sampler_ready:{model_id}", 3600)
 
   print(f"[vLLM Worker] Listening for sampling requests on queue for model: {model_id}...")
+  prefetch_task = asyncio.create_task(weight_prefetcher_loop(model_id, store))
   try:
     while True:
       try:
@@ -348,15 +457,23 @@ async def run_sampling_worker(model_id: str) -> None:
           if time_slicer is not None:
             assert workload is not None
             async with time_slicer.acquire(workload):
+              if engine is not None and IS_ENGINE_SLEEPING:
+                print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")
+                await engine.wake_up(tags=["weights", "kv_cache"])
+                IS_ENGINE_SLEEPING = False
               tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
               await asyncio.gather(*tasks)
               if has_shutdown:
                 await exit_gracefully()
               if engine is not None:
-                print("[vLLM Worker] Exiting batch: sleeping engine to yield GPU memory...")
-                await engine.sleep(level=2)
-                CURRENT_LOADED_SAMPLER_WEIGHTS = None
+                print("[vLLM Worker] Exiting batch: sleeping engine (CPU offload weights) to yield GPU memory...")
+                await engine.sleep(level=1)
+                IS_ENGINE_SLEEPING = True
           else:
+            if engine is not None and IS_ENGINE_SLEEPING:
+              print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")
+              await engine.wake_up(tags=["weights", "kv_cache"])
+              IS_ENGINE_SLEEPING = False
             tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
             await asyncio.gather(*tasks)
 

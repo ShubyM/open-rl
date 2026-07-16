@@ -63,16 +63,16 @@ class KubernetesFFTWorkerManager:
       core_api = client.CoreV1Api()
     self.core_api = core_api
 
-  def launch(self, model_id: str, base_model: str | None = None) -> None:
-    self.launch_trainer(model_id, base_model)
+  def launch(self, model_id: str) -> None:
+    self.launch_trainer(model_id)
 
-  def launch_trainer(self, model_id: str, base_model: str | None = None) -> None:
-    self._launch_pod(model_id, role="trainer", base_model=base_model)
+  def launch_trainer(self, model_id: str) -> None:
+    self._launch_pod(model_id, role="trainer")
 
-  def launch_sampler(self, model_id: str, base_model: str | None = None) -> None:
-    self._launch_pod(model_id, role="sampler", base_model=base_model)
+  def launch_sampler(self, model_id: str) -> None:
+    self._launch_pod(model_id, role="sampler")
 
-  def _launch_pod(self, model_id: str, role: str, base_model: str | None = None) -> None:
+  def _launch_pod(self, model_id: str, role: str) -> None:
     job_id = sanitize_job_id(model_id)
     prefix = "open-rl-trainer-" if role == "trainer" else "open-rl-sampler-"
     pod_name = prefix + job_id
@@ -84,7 +84,7 @@ class KubernetesFFTWorkerManager:
       self.delete_pod_and_wait(pod_name)
 
     try:
-      pod_body = self.render_pod(pod_name, model_id, job_id, role=role, base_model=base_model)
+      pod_body = self.render_pod(pod_name, model_id, job_id, role=role)
       self.core_api.create_namespaced_pod(namespace=self.namespace, body=pod_body)
     except Exception as exc:
       if getattr(exc, "status", None) != 409:
@@ -103,7 +103,16 @@ class KubernetesFFTWorkerManager:
   def shutdown_all(self) -> None:
     pass
 
-  def render_pod(self, pod_name: str, model_id: str, job_id: str, role: str = "trainer", base_model: str | None = None) -> dict[str, Any]:
+  def render_pod(
+    self,
+    pod_name: str,
+    model_id: str,
+    job_id: str,
+    role: str = "trainer",
+  ) -> dict[str, Any]:
+    from server.worker_manager import _fetch_metadata_from_store
+
+    base_model, weight_sync_strategy = _fetch_metadata_from_store(model_id)
     base_tmpl = self.trainer_template if role == "trainer" else self.sampler_template
     pod = copy.deepcopy(base_tmpl)
     metadata = pod.setdefault("metadata", {})
@@ -129,10 +138,19 @@ class KubernetesFFTWorkerManager:
     container.setdefault("args", []).extend(["--model-id", model_id])
     if base_model:
       set_env(container, "BASE_MODEL", base_model)
+      set_env(container, "OPEN_RL_BASE_MODEL", base_model)
+      if "gemma-4" in base_model.lower() or "gemma4" in base_model.lower():
+        set_env(container, "VLLM_ARCHITECTURE_OVERRIDE", "Gemma4ForCausalLM")
+    arch_override = os.getenv("VLLM_ARCHITECTURE_OVERRIDE")
+    if arch_override:
+      set_env(container, "VLLM_ARCHITECTURE_OVERRIDE", arch_override)
     # Keep env aligned with labels so process discovery and llm-d target the
     # same workload identity.
     set_env(container, "OPEN_RL_TIME_SLICE_JOB_ID", role_job_id)
     set_env(container, "OPEN_RL_TIME_SLICE_GROUP", role_group)
+    weight_sync = weight_sync_strategy or os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta")
+    if weight_sync:
+      set_env(container, "OPEN_RL_WEIGHT_SYNC_STRATEGY", weight_sync)
     return pod
 
   def read_pod(self, pod_name: str) -> Any | None:

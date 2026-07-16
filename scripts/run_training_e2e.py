@@ -65,6 +65,8 @@ class RunConfig:
     "fft-gsm8k-x2",
     "fft-gsm8k-rl",
     "fft-gsm8k-rl-x2",
+    "fft-gsm8k-rl-x2-compare",
+    "fft-gsm8k-rl-x2-diffing-compare",
     "fft-gsm8k-rl-x3",
     "fft-gsm8k-rl-hetero",
     "fft-textsql-rl",
@@ -77,11 +79,15 @@ class RunConfig:
   base_model: str = "Qwen/Qwen2.5-0.5B"
   jitter_sec: int = 180
   steps: int | None = None
+  group_size: int = 8
+  groups_per_batch: int = 8
+  max_tokens: int = 512
   # Calibration (A100, 50 FFT steps on Qwen2.5-0.5B): measured 15.6% accuracy.
   # 100 examples + 5% floor keeps healthy-run flake risk below ~0.1% while
   # still failing a lobotomized checkpoint; eval costs ~15s in vLLM.
   eval_examples: int = 100
   min_accuracy: float = 0.05
+  weight_sync_strategy: str = ""
   extra: str = ""
   host: str = "127.0.0.1"
   port: int | None = None
@@ -313,14 +319,27 @@ def start_backend(config: RunConfig, processes: list[ManagedProcess]) -> str:
   return base_url
 
 
+def clean_cli_extra(extra: str) -> list[str]:
+  """Filter out open-rl specific weight_sync_strategy/diffing key-value options from CLI extras."""
+  return [token for token in shlex.split(extra) if not (token.startswith("weight_sync_strategy=") or token.startswith("jitter_sec="))]
+
+
 def examples_env(config: RunConfig) -> dict[str, str]:
   env = os.environ.copy()
   env["OPEN_RL_TMP_DIR"] = str(open_rl_tmp_dir(config))
   env["PYTHONUNBUFFERED"] = "1"
   env.setdefault("TINKER_API_KEY", "tml-dummy-key")
-  # Keep examples isolated from the root server/eval venv. This also avoids
-  # creating examples/.venv on workspace mounts with tight file quotas.
-  env["UV_PROJECT_ENVIRONMENT"] = os.environ.get("OPEN_RL_EXAMPLES_UV_PROJECT_ENVIRONMENT", str(open_rl_tmp_dir(config) / "examples-venv"))
+  for token in shlex.split(config.extra):
+    if token.startswith("weight_sync_strategy="):
+      env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = token.split("=", 1)[1]
+  if config.weight_sync_strategy:
+    env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = config.weight_sync_strategy
+  # Prepend 'examples' to PYTHONPATH so child subprocesses resolve both common.*
+  # and recipes.* cleanly. We deliberately do NOT set UV_PROJECT_ENVIRONMENT
+  # here so that container runs utilize the pre-built /app/examples/.venv
+  # instead of re-resolving/re-compiling from scratch on shared network mounts.
+  existing_path = env.get("PYTHONPATH", "")
+  env["PYTHONPATH"] = f"examples:{existing_path}" if existing_path else "examples"
   return env
 
 
@@ -525,8 +544,8 @@ def _math_rl_train_module_and_renderer(base_model: str) -> tuple[str, str]:
   if "gemma" in base_model.lower():
     return "recipes.math_rl.train_gemma", "gemma4"
   if "Instruct" in base_model or "Qwen2.5" in base_model:
-    return "tinker_cookbook.recipes.math_rl.train", "qwen3_instruct"
-  return "tinker_cookbook.recipes.math_rl.train", "qwen3"
+    return "recipes.math_rl.train_cli", "qwen3_instruct"
+  return "recipes.math_rl.train_cli", "qwen3"
 
 
 def run_gsm8k_rl(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
@@ -541,13 +560,14 @@ def run_gsm8k_rl(config: RunConfig, base_url: str, watch: list[ManagedProcess]) 
     f"max_steps={config.steps if config.steps is not None else 2}",
     f"base_url={base_url}",
     f"log_path={log_path}",
-    "group_size=8",
-    "groups_per_batch=8",
-    "max_tokens=512",
+    f"group_size={config.group_size}",
+    f"groups_per_batch={config.groups_per_batch}",
+    f"max_tokens={config.max_tokens}",
     "learning_rate=1e-5",
     "temperature=1.0",
     "eval_every=0",
     "save_every=0",
+    *clean_cli_extra(config.extra),
   ]
   out = None
   try:
@@ -579,14 +599,14 @@ def run_gsm8k_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess
         f"max_steps={config.steps if config.steps is not None else 2}",
         f"base_url={base_url}",
         f"log_path={log_path}",
-        "group_size=8",
-        "groups_per_batch=24",
-        "max_tokens=512",
+        f"group_size={config.group_size}",
+        f"groups_per_batch={config.groups_per_batch}",
+        f"max_tokens={config.max_tokens}",
         "learning_rate=1e-5",
         f"temperature={temp}",
         "eval_every=0",
         "save_every=0",
-        *shlex.split(config.extra),
+        *clean_cli_extra(config.extra),
       ]
       results[job] = run_command(
         ["uv", "--project", "examples", "run", "python", "-m", module_name, *args],
@@ -607,6 +627,69 @@ def run_gsm8k_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess
     for job, result in sorted(results.items()):
       if isinstance(result, BaseException):
         raise RuntimeError(f"fft-gsm8k-rl-x2 {job} failed") from result
+  finally:
+    cleanup_remote_models(base_url, [r for r in results.values() if isinstance(r, str)])
+
+
+def run_gsm8k_rl_x2_compare(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
+  """Run two concurrent FFT RL jobs on GSM8K: Job A (Full Sync) vs Job B (Delta Sync)."""
+  results: dict[str, str | BaseException] = {}
+
+  def train(job: str, weight_sync_strategy: str) -> None:
+    try:
+      log_path = str(open_rl_tmp_dir(config) / f"fft_gsm8k_rl_compare_{job}")
+      if os.path.exists(log_path):
+        shutil.rmtree(log_path)
+      module_name, renderer_name = _math_rl_train_module_and_renderer(config.base_model)
+      args = [
+        "env=gsm8k",
+        f"model_name={config.base_model}",
+        f"renderer_name={renderer_name}",
+        f"max_steps={config.steps if config.steps is not None else 30}",
+        f"base_url={base_url}",
+        f"log_path={log_path}",
+        f"group_size={config.group_size}",
+        f"groups_per_batch={config.groups_per_batch}",
+        f"max_tokens={config.max_tokens}",
+        "learning_rate=1e-5",
+        "temperature=1.0",
+        "eval_every=0",
+        "save_every=0",
+        *clean_cli_extra(config.extra),
+      ]
+      env = examples_env(config)
+      env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = weight_sync_strategy
+      results[job] = run_command(
+        [
+          "uv",
+          "--project",
+          "examples",
+          "run",
+          "python",
+          "-m",
+          module_name,
+          *args,
+        ],
+        env=env,
+        watch=watch,
+        prefix=f"[{job.upper()} ({weight_sync_strategy.upper()} SYNC)] ",
+      )
+    except BaseException as exc:
+      results[job] = exc
+
+  threads = [
+    threading.Thread(target=train, args=("job-a", "full")),
+    threading.Thread(target=train, args=("job-b", "delta")),
+  ]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+
+  try:
+    for job, result in sorted(results.items()):
+      if isinstance(result, BaseException):
+        raise RuntimeError(f"fft-gsm8k-rl-x2-compare {job} failed") from result
   finally:
     cleanup_remote_models(base_url, [r for r in results.values() if isinstance(r, str)])
 
@@ -640,7 +723,7 @@ def run_gsm8k_rl_x3(config: RunConfig, base_url: str, watch: list[ManagedProcess
         f"temperature={temp}",
         "eval_every=0",
         "save_every=0",
-        *shlex.split(config.extra),
+        *clean_cli_extra(config.extra),
       ]
       results[job] = run_command(
         ["uv", "--project", "examples", "run", "python", "-m", module_name, *args],
@@ -699,7 +782,7 @@ def run_gsm8k_rl_hetero(config: RunConfig, base_url: str, watch: list[ManagedPro
         f"temperature={temp}",
         "eval_every=0",
         "save_every=0",
-        *shlex.split(config.extra),
+        *clean_cli_extra(config.extra),
       ]
       results[job] = run_command(
         ["uv", "--project", "examples", "run", "python", "-m", module_name, *args],
@@ -890,6 +973,8 @@ def main() -> None:
       run_gsm8k_rl(config, base_url, processes)
     elif config.scenario == "fft-gsm8k-rl-x2":
       run_gsm8k_rl_x2(config, base_url, processes)
+    elif config.scenario == "fft-gsm8k-rl-x2-compare":
+      run_gsm8k_rl_x2_compare(config, base_url, processes)
     elif config.scenario == "fft-gsm8k-rl-x3":
       run_gsm8k_rl_x3(config, base_url, processes)
     elif config.scenario == "fft-gsm8k-rl-hetero":
