@@ -12,6 +12,8 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 
 class RequestStore(ABC):
+  redis: Any | None = None
+
   @abstractmethod
   async def put_request(self, req_data: dict[str, Any]) -> None:
     """Push a request into the global queue."""

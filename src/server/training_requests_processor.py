@@ -4,7 +4,10 @@ import argparse
 import asyncio
 import os
 import threading
+import time
 import traceback
+from collections.abc import Callable
+from contextlib import asynccontextmanager
 from typing import Any, Protocol
 
 import uvicorn
@@ -15,6 +18,9 @@ from opentelemetry import propagate, trace
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.store import RequestStore, get_store
+from training.distributed import barrier, broadcast_object, is_distributed, is_primary
+from training.distributed import close as close_distributed
+from training.distributed import initialize as initialize_distributed
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
 from training.trainer_worker import Datum
@@ -183,6 +189,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
       payload.get("loss_fn", "cross_entropy"),
       payload.get("loss_config"),
       model_id,
+      bool(payload.get("forward_only")),
     )
     result["type"] = "forward_backward_completed"
     return result
@@ -213,7 +220,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
       bool(payload.get("include_optimizer", False)),
       payload.get("kind", "state"),
     )
-    return {"path": result.get("path", payload["state_path"]), "type": "state_saved"}
+    return {"path": payload.get("public_path") or result.get("path", payload["state_path"]), "type": "state_saved"}
 
   async def load_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     await asyncio.to_thread(
@@ -225,7 +232,11 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     return {"path": payload["state_path"], "type": "weights_loaded"}
 
   async def save_weights_for_sampler(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.save_adapter, model_id, payload.get("alias"))
+    # The session ref's last segment (e.g. "sampler-<seq>") names this
+    # snapshot's immutable adapter directory.
+    session_id = payload.get("sampling_session_id") or ""
+    session_label = session_id.rsplit("/", 1)[-1] or None
+    await asyncio.to_thread(self.worker.save_adapter, model_id, payload.get("alias"), session_label)
     return {
       "path": payload.get("path"),
       "sampling_session_id": payload.get("sampling_session_id"),
@@ -243,7 +254,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     store: RequestStore,
     worker: FFTTrainingWorker,
     model_id: str | None,
-    time_slicer: TimeSlicerClient,
+    time_slicer: TimeSlicerClient | None,
   ):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
@@ -259,14 +270,15 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
   async def exit_gracefully(self) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if self.snapshot_registered:
+    if self.snapshot_registered and self.time_slicer is not None:
       try:
         await self.time_slicer.unregister(self.workload)
         self.snapshot_registered = False
       except Exception as exc:
         print(f"[WORKER] Failed to unregister: {exc}")
     try:
-      await self.time_slicer.close()
+      if self.time_slicer is not None:
+        await self.time_slicer.close()
     except Exception:
       pass
     os._exit(0)
@@ -275,8 +287,10 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     print("[WORKER] Full fine-tuning training requests processor started.")
 
     try:
-      await self.time_slicer.register(self.workload)
-      self.snapshot_registered = True
+      if is_primary():
+        assert self.time_slicer is not None
+        await self.time_slicer.register(self.workload)
+        self.snapshot_registered = True
       while True:
         try:
           await self.run_once()
@@ -288,15 +302,20 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
           await asyncio.sleep(1)
     finally:
       try:
-        if self.snapshot_registered:
+        if self.snapshot_registered and self.time_slicer is not None:
           await self.time_slicer.unregister(self.workload)
       finally:
-        await self.time_slicer.close()
+        if self.time_slicer is not None:
+          await self.time_slicer.close()
+        close_distributed()
 
   async def run_once(self) -> None:
-    batch = await self.store.get_requests_for_model(self.model_id)
+    batch = await self.store.get_requests_for_model(self.model_id) if is_primary() else None
+    if is_distributed():
+      batch = await asyncio.to_thread(broadcast_object, batch)
     if not batch:
-      await asyncio.sleep(0.1)
+      if is_primary():
+        await asyncio.sleep(0.1)
       return
 
     has_shutdown = False
@@ -314,30 +333,61 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       if training_reqs:
         print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}")
         results = []
-        save_ops = {"save_state", "save_weights", "save_weights_for_sampler"}
+        # FSDP checkpoint consolidation is collective GPU work, so distributed
+        # saves remain inside the trainer lease. Single-GPU CPU-offloaded saves
+        # retain the cheaper outside-lease behavior.
+        save_ops = set() if is_distributed() else {"save_state", "save_weights", "save_weights_for_sampler"}
         gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
         save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
 
         if gpu_reqs:
-          async with self.time_slicer.acquire(self.workload):
+          lease_started = time.monotonic()
+          async with self.gpu_lease():
+            lease_wait = time.monotonic() - lease_started
+            batch_span.set_attribute("gpu_lease_wait_seconds", lease_wait)
+            print(f"[TIMING] model={self.model_id} phase=gpu_lease_wait duration={lease_wait:.3f}s")
             if hasattr(self.worker, "wake_up"):
-              await asyncio.to_thread(self.worker.wake_up)
+              await self.transition_worker("wake_up", self.worker.wake_up)
             try:
               for request in gpu_reqs:
                 results.append(await self.handle_request(request, self.model_id))
             finally:
               if hasattr(self.worker, "sleep"):
-                await asyncio.to_thread(self.worker.sleep)
+                await self.transition_worker("sleep", self.worker.sleep)
 
         for request in save_reqs:
           results.append(await self.handle_request(request, self.model_id))
 
         for request_id, result in results:
-          if request_id is not None:
+          if is_primary() and request_id is not None:
             await self.store.set_future(request_id, result)
 
     if has_shutdown:
       await self.exit_gracefully()
+
+  @asynccontextmanager
+  async def gpu_lease(self):
+    lease = None
+    if is_primary():
+      assert self.time_slicer is not None
+      lease = self.time_slicer.acquire(self.workload)
+      await lease.__aenter__()
+    await asyncio.to_thread(barrier)
+    try:
+      yield
+    finally:
+      await asyncio.to_thread(barrier)
+      if lease is not None:
+        await lease.__aexit__(None, None, None)
+
+  async def transition_worker(self, phase: str, transition: Callable[..., None], *args: Any) -> None:
+    started = time.monotonic()
+    with tracer.start_as_current_span(f"training.{phase}") as span:
+      await asyncio.to_thread(transition, *args)
+      elapsed = time.monotonic() - started
+      span.set_attribute("duration_seconds", elapsed)
+      span.set_attribute("model_id", self.model_id)
+      print(f"[TIMING] model={self.model_id} phase={phase} duration={elapsed:.3f}s")
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     raw_config = payload.get("full_config") or {}
@@ -372,6 +422,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       payload.get("loss_fn", "cross_entropy"),
       payload.get("loss_config"),
       model_id,
+      bool(payload.get("forward_only")),
     )
     result["type"] = "forward_backward_completed"
     return result
@@ -402,7 +453,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       bool(payload.get("include_optimizer", False)),
       payload.get("kind", "state"),
     )
-    return {"path": result.get("path", payload["state_path"]), "type": "state_saved"}
+    return {"path": payload.get("public_path") or result.get("path", payload["state_path"]), "type": "state_saved"}
 
   async def load_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     await asyncio.to_thread(
@@ -438,7 +489,7 @@ async def run_training_requests_processor(
 ) -> None:
   store = get_store()
   if isinstance(worker, FFTTrainingWorker):
-    time_slicer = time_slicer or time_slicer_client_from_env()
+    time_slicer = (time_slicer or time_slicer_client_from_env()) if is_primary() else None
     processor = FFTTrainingRequestsProcessor(store, worker, model_id, time_slicer)
   else:
     processor = LoraTrainingRequestsProcessor(store, worker)
@@ -449,6 +500,7 @@ def start_request_processing_loop() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated trainer worker drains.")
   args = parser.parse_args()
+  initialize_distributed()
 
   print("\n" + "=" * 50)
   print("      Open-RL PyTorch Training Worker")
