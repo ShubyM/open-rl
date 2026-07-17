@@ -1,5 +1,8 @@
 # Tinker Client Compatibility
 
+> **Stale:** generated against `tinker==0.18.1`; the examples venv now pins `tinker==0.22.7`.
+> Regenerate with `tests/tinker_client_compat.py` before relying on specifics.
+
 Generated from `tinker==0.18.1` by
 `tests/tinker_client_compat.py`.
 
