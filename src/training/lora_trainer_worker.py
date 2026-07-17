@@ -4,7 +4,6 @@ import json
 import math
 import os
 import time
-import traceback
 from datetime import datetime
 from typing import Any
 
@@ -12,7 +11,7 @@ import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import PeftModelForCausalLM, get_peft_model
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
 from training.trainer_worker import BaseTrainerWorker, Datum
 
@@ -23,7 +22,10 @@ class LoraConfig(BaseModel):
   rank: int = 16
   seed: int | None = None
   lora_alpha: int = 16
-  lora_dropout: float = 0.05
+  # Default 0: dropout during logprob computation makes trainer logprobs
+  # stochastic while the sampler's are deterministic, biasing every
+  # importance-sampling ratio (and it costs ~1000 dropout kernels per step).
+  lora_dropout: float = 0.0
   train_attn: bool = True
   train_mlp: bool = True
   train_unembed: bool = False
@@ -45,6 +47,7 @@ class LoraTrainingWorker(BaseTrainerWorker):
     self.base_model_name: str | None = None
     self.adapter_states: dict[str, dict[str, Any]] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
+    self.linear_module_names: list[str] | None = None
 
   def load_base_model(self, base_model_name: str) -> None:
     """Eagerly load the massive base model tensors into VRAM."""
@@ -57,7 +60,17 @@ class LoraTrainingWorker(BaseTrainerWorker):
     self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
+    # Multimodal checkpoints (Qwen3.5/3.6, Gemma) load as a text-only causal LM
+    # here; saved adapters then need their keys mapped back to the hub layout
+    # so the vLLM sampler can match them (see _remap_adapter_to_hub_layout).
+    self.base_is_multimodal = getattr(AutoConfig.from_pretrained(base_model_name), "text_config", None) is not None
+
     self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
+    # Captured before any peft wrapping: get_peft_model mutates the module
+    # tree in place, so later isinstance(nn.Linear) scans would miss every
+    # already-adapted projection and a second adapter would silently train
+    # only the still-unwrapped modules.
+    self.linear_module_names = [name for name, module in self.base_model.named_modules() if isinstance(module, torch.nn.Linear)]
     print("Successfully loaded.")
 
   def target_lora_modules(self, config: LoraConfig) -> list[str]:
@@ -70,6 +83,14 @@ class LoraTrainingWorker(BaseTrainerWorker):
     target_suffixes: list[str] = []
     if config.train_attn:
       target_suffixes.extend(["q_proj", "k_proj", "v_proj", "o_proj"])
+      # Hybrid-attention checkpoints (Qwen3.5/3.6) implement most layers as
+      # gated-deltanet linear attention whose projections use these names —
+      # q/k/v/o alone would leave 3 out of 4 attention layers untrained. vLLM
+      # serves adapters on them: with --enable-lora it builds split
+      # in_proj_qkv/in_proj_z modules (instead of fused in_proj_qkvz) and
+      # packs in_proj_b/in_proj_a via its packed_modules_mapping. The GDN
+      # conv1d is excluded below by the nn.Linear filter.
+      target_suffixes.extend(["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"])
     if config.train_mlp:
       # TODO: Revisit MLP targets for packed/MoE module names across supported backends.
       target_suffixes.extend(["gate_proj", "up_proj", "down_proj"])
@@ -85,16 +106,31 @@ class LoraTrainingWorker(BaseTrainerWorker):
           f"[LoRA] Ignoring train_unembed=True: {self.base_model_name} ties lm_head to embed_tokens, "
           "and the resulting adapter could not be loaded by vLLM."
         )
-      else:
+      elif os.getenv("OPEN_RL_LORA_TRAIN_UNEMBED", "") == "1":
         target_suffixes.append("lm_head")
+      else:
+        # The tinker SDK's LoraConfig defaults train_unembed=True, so nearly
+        # every client asks for this. vLLM only serves lm_head adapters for
+        # model classes that declare embedding_modules (Qwen3.5/Gemma do not),
+        # so a trained lm_head either fails the adapter load outright or gets
+        # silently dropped — a trained-vs-served policy divergence. Keep every
+        # produced adapter vLLM-loadable by default.
+        print(
+          "[LoRA] Ignoring train_unembed=True: vLLM cannot apply lm_head adapters for this model "
+          "family, so the sampler would reject the adapter. Set OPEN_RL_LORA_TRAIN_UNEMBED=1 to "
+          "train it anyway (torch sampler only)."
+        )
 
     if not target_suffixes:
-      raise ValueError("No trainable LoRA targets remain (train_unembed is ignored on tied-embeddings models; enable train_attn or train_mlp)")
+      raise ValueError(
+        "No trainable LoRA targets remain (train_unembed is ignored unless OPEN_RL_LORA_TRAIN_UNEMBED=1; enable train_attn or train_mlp)"
+      )
 
     target_names = set(target_suffixes)
-    target_modules = [
-      name for name, module in self.base_model.named_modules() if name.rsplit(".", 1)[-1] in target_names and isinstance(module, torch.nn.Linear)
-    ]
+    module_names = self.linear_module_names
+    if module_names is None:
+      module_names = [name for name, module in self.base_model.named_modules() if isinstance(module, torch.nn.Linear)]
+    target_modules = [name for name in module_names if name.rsplit(".", 1)[-1] in target_names]
     if not target_modules:
       raise ValueError(f"No supported LoRA target modules found for suffixes: {target_suffixes}")
     self.lora_target_modules[cache_key] = target_modules
@@ -121,6 +157,9 @@ class LoraTrainingWorker(BaseTrainerWorker):
       target_modules=self.target_lora_modules(config),
       modules_to_save=None,
     )
+
+    if "lm_head" in peft_config.target_modules:
+      self.output_head_is_adapted = True
 
     if config.seed is not None:
       torch.manual_seed(config.seed)
@@ -150,28 +189,112 @@ class LoraTrainingWorker(BaseTrainerWorker):
     self.load_base_model(base_model_name)
     self.create_adapter(model_id, config)
 
-  def save_adapter(self, adapter_id: str, alias: str | None = None) -> None:
-    """Save adapter weights to disk for reliability and sharing."""
+  def _remap_adapter_to_hub_layout(self, adapter_dir: str) -> None:
+    """Rewrite adapter keys from the text-only layout to the hub (multimodal) layout.
+
+    The trainer holds a text-only causal LM, so peft writes module names like
+    `base_model.model.model.layers.N...`. vLLM resolves adapter modules through
+    the multimodal model's hf_to_vllm_mapper, which expects the hub layout
+    (`model.language_model.layers.N...`); text-layout names match nothing and
+    vLLM silently applies NO adapter — sampling then serves the base model.
+    """
+    if not getattr(self, "base_is_multimodal", False):
+      return
+    weights_file = os.path.join(adapter_dir, "adapter_model.safetensors")
+    if not os.path.exists(weights_file):
+      return
+    from safetensors.torch import load_file, save_file
+
+    tensors = load_file(weights_file)
+    if any(".language_model." in key for key in tensors):
+      return
+    prefix = "base_model.model.model."
+    remapped = {key.replace(prefix, prefix + "language_model.", 1) if key.startswith(prefix) else key: value for key, value in tensors.items()}
+    save_file(remapped, weights_file, metadata={"format": "pt"})
+    print(f"Remapped adapter keys to the multimodal hub layout in {weights_file}")
+
+  SNAPSHOT_KEEP = 4
+
+  def save_adapter(self, adapter_id: str, alias: str | None = None, session_label: str | None = None) -> None:
+    """Save adapter weights to disk for the sampler.
+
+    Each sampler snapshot gets its own immutable directory
+    (peft/<adapter_id>/<session_label>), written via staging + atomic rename.
+    The previous behavior overwrote one directory in place on every save while
+    samplers could be reading it concurrently — vLLM then found the directory
+    mid-write and failed with "<dir> doesn't contain tensors". Failures now
+    propagate to the caller (the training future) instead of logging a
+    success-shaped response over a broken adapter dir.
+    """
+    tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+    adapter_root = os.path.join(tmp_dir, "peft", adapter_id)
+    final_dir = os.path.join(adapter_root, session_label or adapter_id)
+    staging_root = os.path.join(adapter_root, f".staging-{os.getpid()}-{time.time_ns()}")
+    os.makedirs(staging_root, exist_ok=True)
+
     try:
-      tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-      save_path = os.path.join(tmp_dir, "peft", adapter_id)
-      os.makedirs(save_path, exist_ok=True)
-
-      # Save the adapter weights
       self.peft_model.set_adapter(adapter_id)
-      self.peft_model.save_pretrained(save_path, selected_adapters=[adapter_id])
+      self.peft_model.save_pretrained(staging_root, selected_adapters=[adapter_id])
+      staged_adapter = os.path.join(staging_root, adapter_id)
+      self._remap_adapter_to_hub_layout(staged_adapter)
 
-      # Save minimal metadata
-      metadata = {"model_id": adapter_id, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
-      if alias is not None:
-        metadata["alias"] = alias
-      with open(os.path.join(save_path, "metadata.json"), "w") as f:
-        json.dump(metadata, f)
+      if os.path.exists(final_dir):
+        # Only the legacy label (adapter_id itself) can collide; snapshot
+        # labels are unique per save. Move the old dir aside, never delete
+        # under a reader.
+        os.replace(final_dir, os.path.join(staging_root, "replaced"))
+      os.rename(staged_adapter, final_dir)
 
-      print(f"Auto-saved adapter '{adapter_id}' to {save_path}")
-    except Exception as e:
-      print(f"[ERROR] Failed to auto-save weights for {adapter_id}: {e}")
-      traceback.print_exc()
+      if alias and alias != os.path.basename(final_dir):
+        # Alias-named refs (e.g. tinker://<id>/sampler_weights/final) resolve
+        # to peft/<id>/<alias>, but the adapter itself lives in the snapshot
+        # dir — without this link the returned ref points at a directory that
+        # was never written and every sample against it fails.
+        alias_path = os.path.join(adapter_root, alias)
+        staged_link = os.path.join(staging_root, "alias-link")
+        os.symlink(os.path.basename(final_dir), staged_link)
+        if os.path.isdir(alias_path) and not os.path.islink(alias_path):
+          os.replace(alias_path, os.path.join(staging_root, "replaced-alias"))
+        os.replace(staged_link, alias_path)
+    finally:
+      import shutil
+
+      shutil.rmtree(staging_root, ignore_errors=True)
+
+    metadata = {"model_id": adapter_id, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
+    if alias is not None:
+      metadata["alias"] = alias
+    with open(os.path.join(adapter_root, "metadata.json"), "w") as f:
+      json.dump(metadata, f)
+
+    self._prune_snapshots(adapter_root, keep=self.SNAPSHOT_KEEP, current=final_dir)
+    print(f"Auto-saved adapter '{adapter_id}' to {final_dir}")
+
+  def _prune_snapshots(self, adapter_root: str, keep: int, current: str) -> None:
+    """Delete all but the newest `keep` snapshot dirs (in-flight rollouts may
+    still sample from a recent previous snapshot). Snapshots an alias symlink
+    (e.g. "final") points at are kept regardless of age."""
+    try:
+      entries = os.listdir(adapter_root)
+      alias_targets = {
+        os.path.realpath(os.path.join(adapter_root, name)) for name in entries if os.path.islink(os.path.join(adapter_root, name))
+      }
+      snapshots = sorted(
+        (
+          os.path.join(adapter_root, name)
+          for name in entries
+          if name.startswith("sampler-") and os.path.isdir(os.path.join(adapter_root, name)) and not os.path.islink(os.path.join(adapter_root, name))
+        ),
+        key=os.path.getmtime,
+        reverse=True,
+      )
+      import shutil
+
+      for stale in snapshots[keep:]:
+        if stale != current and os.path.realpath(stale) not in alias_targets:
+          shutil.rmtree(stale, ignore_errors=True)
+    except OSError:
+      pass
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     """Save adapter weights (and optionally optimizer state) to a specific path."""
@@ -235,6 +358,8 @@ class LoraTrainingWorker(BaseTrainerWorker):
       self.peft_model.load_adapter(adapter_dir, adapter_name=model_id, is_trainable=True)
 
     self.peft_model.set_adapter(model_id)
+    if "lm_head" in (self.peft_model.peft_config[model_id].target_modules or ()):
+      self.output_head_is_adapted = True
     params = active_adapter_parameters(self.peft_model, model_id)
     adapter_state = {"trainable_params": params, "optimizer": None}
     self.adapter_states[model_id] = adapter_state
@@ -261,11 +386,13 @@ class LoraTrainingWorker(BaseTrainerWorker):
     print(f"Loaded state for '{model_id}' from {state_path}")
     return {"model_id": model_id, "is_lora": True, "base_model": base_model}
 
-  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
+  def forward_backward(
+    self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
+  ) -> dict[str, Any]:
     assert self.peft_model is not None, "Model must be loaded first."
     if model_id:
       self.peft_model.set_adapter(model_id)
-    return super().forward_backward(self.peft_model, data, loss_fn, loss_config)
+    return super().forward_backward(self.peft_model, data, loss_fn, loss_config, forward_only=forward_only)
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str) -> dict[str, Any]:
     """Apply accumulated gradients and update model weights."""
