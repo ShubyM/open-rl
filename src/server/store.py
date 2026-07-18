@@ -286,19 +286,23 @@ class RedisModelMetadata:
   def key(model_id: str) -> str:
     return f"open_rl:model_meta:{model_id}"
 
+  @staticmethod
+  def decode(model_id: str, value: str) -> dict[str, Any]:
+    metadata = json.loads(value)
+    if not isinstance(metadata, dict):
+      raise ValueError(f"Model metadata for {model_id} must be a JSON object")
+    return metadata
+
   async def put(self, model_id: str, metadata: dict[str, Any]) -> None:
     await self.redis.set(self.key(model_id), json.dumps(metadata))
 
   async def get(self, model_id: str) -> dict[str, Any] | None:
     value = await self.redis.get(self.key(model_id))
-    return json.loads(value) if value else None
+    return self.decode(model_id, value) if value else None
 
   def get_sync(self, model_id: str) -> dict[str, Any] | None:
-    try:
-      value = self.sync_redis.get(self.key(model_id))
-      return json.loads(value) if value else None
-    except Exception:
-      return None
+    value = self.sync_redis.get(self.key(model_id))
+    return self.decode(model_id, value) if value else None
 
   async def delete(self, model_id: str) -> None:
     await self.redis.delete(self.key(model_id))

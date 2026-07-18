@@ -206,10 +206,7 @@ async def launch_worker_and_enqueue(request: dict) -> str:
 
 async def ensure_sampler_launched(model_id: str) -> None:
   if is_fft_enabled() and fft_worker_manager is not None and get_sampler_backend() == "vllm":
-    try:
-      await asyncio.to_thread(fft_worker_manager.launch_sampler, model_id)
-    except Exception:
-      traceback.print_exc()
+    await asyncio.to_thread(fft_worker_manager.launch_sampler, model_id)
 
 
 async def preflight_vllm() -> None:

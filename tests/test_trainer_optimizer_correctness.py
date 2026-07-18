@@ -157,9 +157,11 @@ class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker
 
 
 class _FutureStoreStub:
-  def __init__(self, events=None):
+  def __init__(self, events=None, model_metadata=None, model_error=None):
     self.results = {}
     self.events = events
+    self.model_metadata = model_metadata or {}
+    self.model_error = model_error
     self.futures = self
     self.models = self
 
@@ -169,15 +171,19 @@ class _FutureStoreStub:
     self.results[req_id] = result
 
   async def get(self, model_id: str) -> dict | None:
-    return None
+    if self.model_error is not None:
+      raise self.model_error
+    return self.model_metadata.get(model_id)
 
   def get_sync(self, model_id: str) -> dict | None:
-    return None
+    if self.model_error is not None:
+      raise self.model_error
+    return self.model_metadata.get(model_id)
 
 
 class _TrainingRequestsStoreStub(_FutureStoreStub):
-  def __init__(self, batches, events=None):
-    super().__init__(events=events)
+  def __init__(self, batches, events=None, model_metadata=None):
+    super().__init__(events=events, model_metadata=model_metadata)
     self.batches = list(batches)
     self.queried_model_ids = []
     self.commands = self
@@ -341,7 +347,15 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
   async def test_lora_processor_create_model_uses_worker_create_model(self) -> None:
     worker = _RecordingLoraWorker()
-    store = _FutureStoreStub()
+    store = _FutureStoreStub(
+      model_metadata={
+        "adapter-a": {
+          "base_model": "base-model",
+          "lora_config": {"seed": 123, "rank": 2},
+          "training_kind": "lora",
+        }
+      }
+    )
     processor = training_requests_processor_module.LoraTrainingRequestsProcessor(store, worker)
 
     await processor.process_request(
@@ -349,10 +363,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         "request_id": "req-a",
         "model_id": "adapter-a",
         "op": "create_model",
-        "payload": {
-          "base_model": "base-model",
-          "lora_config": {"seed": 123, "rank": 2},
-        },
+        "payload": {},
       },
       "adapter-a",
     )
@@ -386,7 +397,15 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
   async def test_full_processor_create_model_uses_model_worker(self) -> None:
     worker = _RecordingFullWorker()
-    store = _FutureStoreStub()
+    store = _FutureStoreStub(
+      model_metadata={
+        "model-a": {
+          "base_model": "base-model",
+          "full_config": {"seed": 123, "rank": 8},
+          "training_kind": "full",
+        }
+      }
+    )
     time_slicer = _TimeSlicerStub()
 
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
@@ -396,10 +415,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
           "request_id": "req-a",
           "model_id": "model-a",
           "op": "create_model",
-          "payload": {
-            "base_model": "base-model",
-            "full_config": {"seed": 123, "rank": 8},
-          },
+          "payload": {},
         },
         "model-a",
       )
@@ -414,6 +430,50 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result["base_model"], "base-model")
     self.assertEqual(result["training_kind"], "full")
     self.assertEqual(result["type"], "model_created")
+
+  async def test_create_model_rejects_missing_metadata_instead_of_using_payload(self) -> None:
+    worker = _RecordingLoraWorker()
+    store = _FutureStoreStub()
+    processor = training_requests_processor_module.LoraTrainingRequestsProcessor(store, worker)
+
+    with patch.object(training_requests_processor_module.traceback, "print_exc"):
+      await processor.process_request(
+        {
+          "request_id": "req-a",
+          "model_id": "adapter-a",
+          "op": "create_model",
+          "payload": {"base_model": "payload-fallback"},
+        },
+        "adapter-a",
+      )
+
+    self.assertEqual(worker.created_models, [])
+    self.assertEqual(
+      store.results["req-a"],
+      {"type": "RequestFailedResponse", "error_message": "Model metadata not found for adapter-a"},
+    )
+
+  async def test_create_model_surfaces_metadata_store_failure(self) -> None:
+    worker = _RecordingLoraWorker()
+    store = _FutureStoreStub(model_error=RuntimeError("redis unavailable"))
+    processor = training_requests_processor_module.LoraTrainingRequestsProcessor(store, worker)
+
+    with patch.object(training_requests_processor_module.traceback, "print_exc"):
+      await processor.process_request(
+        {
+          "request_id": "req-a",
+          "model_id": "adapter-a",
+          "op": "create_model",
+          "payload": {"base_model": "payload-fallback"},
+        },
+        "adapter-a",
+      )
+
+    self.assertEqual(worker.created_models, [])
+    self.assertEqual(
+      store.results["req-a"],
+      {"type": "RequestFailedResponse", "error_message": "redis unavailable"},
+    )
 
   async def test_full_processor_saves_sampler_checkpoint_as_full_state(self) -> None:
     worker = _RecordingFullWorker()
@@ -488,7 +548,14 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
             },
           }
         ]
-      ]
+      ],
+      model_metadata={
+        "model-a": {
+          "base_model": "base-model",
+          "full_config": {"seed": 123},
+          "training_kind": "full",
+        }
+      },
     )
     time_slicer = _TimeSlicerStub()
 
@@ -531,6 +598,13 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         ]
       ],
       events=events,
+      model_metadata={
+        "model-a": {
+          "base_model": "base-model",
+          "full_config": {"seed": 123},
+          "training_kind": "full",
+        }
+      },
     )
     time_slicer = _TimeSlicerStub(events=events)
 

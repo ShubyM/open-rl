@@ -31,12 +31,9 @@ def _fetch_metadata_from_store(model_id: str) -> tuple[str | None, str | None]:
   """Retrieve base_model and weight_sync_strategy from canonical open_rl:model_meta:<model_id>."""
   from server.store import get_store
 
-  try:
-    meta = get_store().models.get_sync(model_id)
-    if isinstance(meta, dict):
-      return meta.get("base_model"), meta.get("weight_sync_strategy")
-  except Exception:
-    pass
+  meta = get_store().models.get_sync(model_id)
+  if meta is not None:
+    return meta.get("base_model"), meta.get("weight_sync_strategy")
   return None, None
 
 

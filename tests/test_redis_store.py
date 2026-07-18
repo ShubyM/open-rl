@@ -125,6 +125,14 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     await self.store.models.delete("model-a")
     self.assertIsNone(await self.store.models.get("model-a"))
 
+  async def test_model_metadata_rejects_non_object_json(self) -> None:
+    await self.store.redis.set(self.store.models.key("model-a"), "[]")
+
+    with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+      await self.store.models.get("model-a")
+    with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+      self.store.models.get_sync("model-a")
+
 
 if __name__ == "__main__":
   unittest.main()

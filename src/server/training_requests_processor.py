@@ -119,29 +119,17 @@ class TrainingRequestsProcessor(Protocol):
 async def _fetch_model_meta(
   store: RequestStore,
   model_id: str,
-  payload: dict[str, Any],
   default_kind: str = "full",
 ) -> tuple[str, dict[str, Any], dict[str, Any], str]:
-  meta = None
-  try:
-    meta = await store.models.get(model_id)
-  except Exception:
-    pass
-  if meta:
-    try:
-      if isinstance(meta, dict):
-        base_model = meta.get("base_model") or payload.get("base_model") or ""
-        full_config = meta.get("full_config") or payload.get("full_config") or {}
-        lora_config = meta.get("lora_config") or payload.get("lora_config") or {}
-        training_kind = meta.get("training_kind") or ("lora" if "lora_config" in meta or "lora_config" in payload else default_kind)
-        return base_model, full_config, lora_config, training_kind
-    except Exception:
-      pass
+  meta = await store.models.get(model_id)
+  if meta is None:
+    raise RuntimeError(f"Model metadata not found for {model_id}")
+
   return (
-    payload.get("base_model", ""),
-    payload.get("full_config") or {},
-    payload.get("lora_config") or {},
-    "lora" if "lora_config" in payload or default_kind == "lora" else "full",
+    meta.get("base_model") or "",
+    meta.get("full_config") or {},
+    meta.get("lora_config") or {},
+    meta.get("training_kind") or default_kind,
   )
 
 
@@ -180,7 +168,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
         await self.process_request(request, model_id)
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, _, raw_config, training_kind = await _fetch_model_meta(self.store, model_id, payload, default_kind="lora")
+    base_model, _, raw_config, training_kind = await _fetch_model_meta(self.store, model_id, default_kind="lora")
     lora_config = LoraConfig(**{k: v for k, v in raw_config.items() if k in LoraConfig.model_fields})
     await asyncio.to_thread(self.worker.create_model, base_model, model_id, lora_config)
     return {
@@ -192,7 +180,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     }
 
   async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, _, _, training_kind = await _fetch_model_meta(self.store, model_id, payload, default_kind="lora")
+    base_model, _, _, training_kind = await _fetch_model_meta(self.store, model_id, default_kind="lora")
     result = await asyncio.to_thread(
       self.worker.load_from_state,
       model_id,
@@ -376,7 +364,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       await self.exit_gracefully()
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, raw_config, _, training_kind = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")
+    base_model, raw_config, _, training_kind = await _fetch_model_meta(self.store, model_id, default_kind="full")
     full_config = FFTConfig(**{k: v for k, v in raw_config.items() if k in FFTConfig.model_fields})
     await asyncio.to_thread(self.worker.create_model, base_model, model_id, full_config)
     return {
@@ -387,7 +375,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     }
 
   async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, _, _, training_kind = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")
+    base_model, _, _, training_kind = await _fetch_model_meta(self.store, model_id, default_kind="full")
     result = await asyncio.to_thread(
       self.worker.load_from_state,
       model_id,

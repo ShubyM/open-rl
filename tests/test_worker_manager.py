@@ -154,6 +154,15 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual(self.worker_manager.launched_sampler_model_ids, ["model-x"])
 
+  async def test_ensure_sampler_launched_propagates_launch_failure(self) -> None:
+    self.worker_manager.error = RuntimeError("metadata unavailable")
+
+    with (
+      patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}),
+      self.assertRaisesRegex(RuntimeError, "metadata unavailable"),
+    ):
+      await gateway.ensure_sampler_launched("model-x")
+
   async def test_create_model_without_fft_skips_launcher(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "false"}):
       await gateway.create_model({"base_model": "base-model"})
@@ -231,6 +240,19 @@ class FFTWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       _, kwargs_s = popen.call_args
       self.assertEqual(kwargs_s["env"].get("BASE_MODEL"), "base-model-a")
       self.assertEqual(kwargs_s["env"].get("OPEN_RL_WEIGHT_SYNC_STRATEGY"), "delta")
+
+  async def test_launch_propagates_metadata_store_failure(self) -> None:
+    with (
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True),
+      patch("server.store.get_store") as get_store,
+      patch("server.worker_manager.subprocess.Popen") as popen,
+    ):
+      get_store.return_value.models.get_sync.side_effect = RuntimeError("redis unavailable")
+      manager = FFTWorkerManager()
+      with self.assertRaisesRegex(RuntimeError, "redis unavailable"):
+        manager.launch_trainer("Model_A.1")
+
+    popen.assert_not_called()
 
 
 class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
