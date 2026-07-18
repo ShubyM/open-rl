@@ -22,6 +22,9 @@ dependencies = [
     "tqdm>=4.50",
 ]
 
+[project.scripts]
+openrl = "server.control_cli:main"
+
 [project.optional-dependencies]
 cpu = [
     "datasets",
@@ -49,7 +52,10 @@ cluster = [
     "kubernetes>=29",
     "timeslice @ git+https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git#subdirectory=pkg/client/python",
 ]
+
+[dependency-groups]
 dev = [
+    "pytest>=8.3",
     "ruff>=0.5.0",
 ]
 
@@ -59,6 +65,9 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["server*", "training*", "accel_timeslicer*"]
+
+[tool.setuptools.package-data]
+server = ["static/control/*"]
 
 [tool.uv]
 override-dependencies = [
@@ -110,6 +119,15 @@ torchvision = [
 ]
 vllm = [
     { index = "vllm-cu129", extra = "vllm", marker = "sys_platform == 'linux'" },
+]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not tinker_contract and not distributed'"
+testpaths = ["tests"]
+pythonpath = ["examples/sft/pig-latin"]
+markers = [
+    "tinker_contract: crosses the real Tinker SDK and HTTP gateway boundary",
+    "distributed: runs a recipe against an already-deployed OpenRL cluster",
 ]
 
 [tool.ruff]
