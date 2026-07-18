@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 import torch
 
+from server.store import InMemoryStore
+
 
 def _load_trainer_modules():
   stubs = {
@@ -127,6 +129,7 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
     self.loaded_base_models = []
     self.created_models = []
     self.saved_states = []
+    self.transitions = []
 
   def load_base_model(self, base_model_name):
     self.base_model_name = base_model_name
@@ -142,12 +145,19 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
     self.saved_states.append((model_id, state_path, include_optimizer, kind))
     return {"path": state_path}
 
+  def wake_up(self, include_optimizer: bool = True):
+    self.transitions.append(("wake_up", include_optimizer))
+
+  def sleep(self):
+    self.transitions.append(("sleep", None))
+
 
 class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker):
   def __init__(self):
     super().__init__()
     self.loaded_base_models = []
     self.created_models = []
+    self.saved_states = []
 
   def load_base_model(self, base_model_name):
     self.loaded_base_models.append(base_model_name)
@@ -155,9 +165,14 @@ class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker
   def create_model(self, base_model_name, model_id, config):
     self.created_models.append((base_model_name, model_id, config))
 
+  def save_state(self, model_id, state_path, include_optimizer=False, kind="state"):
+    self.saved_states.append((model_id, state_path, include_optimizer, kind))
+    return {"path": state_path}
 
-class _FutureStoreStub:
+
+class _FutureStoreStub(InMemoryStore):
   def __init__(self, events=None):
+    super().__init__()
     self.results = {}
     self.events = events
 
@@ -425,6 +440,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
           "model_id": "model-a",
           "op": "save_weights_for_sampler",
           "payload": {
+            "alias": "final",
             "path": "tinker://model-a/sampler_weights/final",
             "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
           },
@@ -434,16 +450,87 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual(
       worker.saved_states,
-      [("model-a", "/tmp/open-rl-test/sampler_full/model-a/sampler_weights/final", False, "sampler")],
+      [("model-a", "/tmp/open-rl-test/sampler_full/model-a/sampler_weights/revisions/0", False, "sampler")],
     )
-    self.assertEqual(
-      store.results["req-a"],
+    result = store.results["req-a"]
+    self.assertEqual(result["path"], "tinker://model-a/sampler_weights/final")
+    self.assertEqual(result["sampling_session_id"], "tinker://model-a/sampler_weights/sampler-7")
+    self.assertEqual(result["revision"], 0)
+    self.assertTrue(result["checkpoint_created"])
+    self.assertEqual(result["type"], "sampler_weights_saved")
+
+  async def test_full_processor_skips_checkpoint_for_explicit_mock_sampler(self) -> None:
+    worker = _RecordingFullWorker()
+    with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(
+        _FutureStoreStub(), worker, "model-a", time_slicer=_TimeSlicerStub()
+      )
+
+    result = await processor.save_weights_for_sampler(
       {
-        "path": "tinker://model-a/sampler_weights/final",
-        "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
-        "type": "sampler_weights_saved",
+        "path": "tinker://model-a/sampler_weights/live-slot-0",
+        "sampling_session_id": "tinker://model-a/sampler_weights/sampler-2",
+        "skip_checkpoint": True,
       },
+      "model-a",
     )
+
+    self.assertEqual(worker.saved_states, [])
+    self.assertTrue(result["mock"])
+    self.assertIsNone(result["path"])
+    self.assertEqual(result["sampling_session_id"], "tinker://model-a/sampler_weights/sampler-2")
+    self.assertEqual(result["type"], "sampler_weights_saved")
+
+  async def test_full_processor_hides_internal_path_for_ephemeral_sampler_snapshot(self) -> None:
+    worker = _RecordingFullWorker()
+    with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test", "REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(
+        _FutureStoreStub(), worker, "model-a", time_slicer=_TimeSlicerStub()
+      )
+
+      result = await processor.save_weights_for_sampler(
+        {
+          "alias": None,
+          "path": "tinker://model-a/sampler_weights/live-slot-0",
+          "sampling_session_id": "tinker://model-a/sampler_weights/sampler-2",
+        },
+        "model-a",
+      )
+
+    self.assertEqual(
+      worker.saved_states,
+      [("model-a", "/tmp/open-rl-test/sampler_full/model-a/sampler_weights/revisions/0", False, "sampler")],
+    )
+    self.assertIsNone(result["path"])
+    self.assertEqual(result["sampling_session_id"], "tinker://model-a/sampler_weights/sampler-2")
+
+  async def test_lora_processor_uses_the_same_immutable_sampler_snapshot_contract(self) -> None:
+    worker = _RecordingLoraWorker()
+    processor = training_requests_processor_module.LoraTrainingRequestsProcessor(_FutureStoreStub(), worker)
+
+    named = await processor.save_weights_for_sampler(
+      {
+        "alias": "final",
+        "path": "tinker://adapter-a/sampler_weights/final",
+        "sampling_session_id": "tinker://adapter-a/sampler_weights/final",
+      },
+      "adapter-a",
+    )
+    ephemeral = await processor.save_weights_for_sampler(
+      {
+        "alias": None,
+        "path": None,
+        "sampling_session_id": "tinker://adapter-a/sampler_weights/sampler-2",
+      },
+      "adapter-a",
+    )
+
+    self.assertEqual(
+      worker.saved_states,
+      [("adapter-a", "/tmp/open-rl/sampler_full/adapter-a/sampler_weights/revisions/0", False, "sampler")],
+    )
+    self.assertEqual(named["path"], "tinker://adapter-a/sampler_weights/final")
+    self.assertIsNone(ephemeral["path"])
 
   async def test_full_processor_requires_redis(self) -> None:
     with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
@@ -537,6 +624,44 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual([event[0] for event in events], ["acquire", "release", "set_future"])
     self.assertEqual(store.results["req-a"]["type"], "model_created")
+
+  async def test_full_processor_preserves_order_across_save_and_gpu_operations(self) -> None:
+    operations = ["save_state", "optim_step", "save_weights_for_sampler", "forward_backward"]
+    batch = [{"request_id": f"req-{index}", "model_id": "model-a", "op": operation, "payload": {}} for index, operation in enumerate(operations)]
+    store = _TrainingRequestsStoreStub([batch])
+    time_slicer = _TimeSlicerStub()
+    worker = _RecordingFullWorker()
+
+    with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
+
+    handled = []
+
+    async def record(request, _model_id):
+      handled.append(request["op"])
+      return request["request_id"], {"type": "ok"}
+
+    processor.handle_request = record
+    await processor.run_once()
+
+    self.assertEqual(handled, operations)
+    self.assertEqual([event[0] for event in time_slicer.events], ["acquire", "release", "acquire", "release"])
+
+  async def test_full_processor_restores_optimizer_only_for_optimizer_step(self) -> None:
+    worker = _RecordingFullWorker()
+    worker.optim_step = lambda _params, _model_id: {"metrics": {}}
+    store = _TrainingRequestsStoreStub(
+      [
+        [{"request_id": "req-forward", "model_id": "model-a", "op": "forward_backward", "payload": {"data": []}}],
+        [{"request_id": "req-optim", "model_id": "model-a", "op": "optim_step", "payload": {"adam_params": {}}}],
+      ]
+    )
+    with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=_TimeSlicerStub())
+      await processor.run_once()
+      await processor.run_once()
+
+    self.assertEqual(worker.transitions, [("wake_up", False), ("sleep", None), ("wake_up", True), ("sleep", None)])
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):

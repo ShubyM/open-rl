@@ -1,7 +1,7 @@
 # Integration tests for the Redis-backed stores. They need a real Redis: either
 # set OPEN_RL_TEST_REDIS_URL, or have redis-server on PATH (a throwaway instance
-# is started on a free port). Skipped entirely otherwise, so `make test` stays
-# green on machines without Redis.
+# is started on a free port). Skipped entirely otherwise, so the default pytest
+# suite stays green on machines without Redis.
 
 import asyncio
 import os

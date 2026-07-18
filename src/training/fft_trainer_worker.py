@@ -212,7 +212,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
     kind: str = "sampler",
   ) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
-    if self.cpu_offload and not self._is_offloaded:
+    model_is_on_cuda = any(tensor.device.type == "cuda" for tensor in itertools.chain(self.model.parameters(), self.model.buffers()))
+    if self.cpu_offload and model_is_on_cuda and not self._is_offloaded:
       raise RuntimeError(
         "Cannot save state delta while worker is not offloaded (self._is_offloaded is False) when cpu_offload=True. "
         "GPU time-slicer lock is not held during save operations."
@@ -296,7 +297,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       json.dump(metadata, f)
 
     print(f"Saved sparse delta ({metadata['density_pct']}% changed elements, {total_changed}/{total_elements}) to {state_path}")
-    return {"path": state_path, "density_pct": metadata["density_pct"]}
+    return {"path": state_path, **metadata}
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
     metadata_path = os.path.join(state_path, "metadata.json")
@@ -529,7 +530,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self._is_offloaded = True
     print(f"[FFT Worker] Offloaded weights & states to pinned CPU memory in {(time.perf_counter() - start_t) * 1000:.1f} ms.")
 
-  def wake_up(self) -> None:
+  def wake_up(self, include_optimizer: bool = True) -> None:
     """Reload pinned CPU shadow tensors back to CUDA VRAM without destroying host shadow buffers."""
     if not self.cpu_offload or self.model is None or not self._is_offloaded or not torch.cuda.is_available():
       return
@@ -543,7 +544,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
         orig_device, cpu_grad = self._grad_shadow[tensor]
         tensor.grad.data = cpu_grad.to(orig_device, non_blocking=True)
 
-    if self.optimizer is not None:
+    if include_optimizer and self.optimizer is not None:
       for param, state in self.optimizer.state.items():
         if isinstance(state, dict):
           state.pop("_orig_devices", None)

@@ -210,11 +210,12 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       step_dir = os.path.join(tmpdir, "step_1")
       os.makedirs(step_dir)
       with open(os.path.join(step_dir, "metadata.json"), "w") as f:
-        json.dump({"format": "sparse_delta", "changed_elements": 1}, f)
+        json.dump({"format": "sparse_delta", "changed_elements": 1, "layer_names": ["layer.0.weight"]}, f)
 
       sparse_dict = {
-        "layer.0.weight.indices": torch.tensor([2], dtype=torch.int32),
-        "layer.0.weight.values": torch.tensor([42.0], dtype=torch.float32),
+        "delta.indices_flat": torch.tensor([2], dtype=torch.int32),
+        "delta.values_flat": torch.tensor([42.0], dtype=torch.float32),
+        "delta.layer_lengths": torch.tensor([1], dtype=torch.int64),
       }
       save_file(sparse_dict, os.path.join(step_dir, "delta.safetensors"))
 
@@ -225,7 +226,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
         for p in hf_weights_files:
           if os.path.exists(p):
             with safetensors.safe_open(p, framework="pt", device="cpu") as f:
-              for key in f:
+              for key in list(f.keys()):
                 yield key, f.get_tensor(key)
 
       mock_utils.safetensors_weights_iterator.side_effect = fake_iterator
@@ -273,11 +274,12 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       step_dir = os.path.join(tmpdir, "step_1")
       os.makedirs(step_dir)
       with open(os.path.join(step_dir, "metadata.json"), "w") as f:
-        json.dump({"format": "sparse_delta", "changed_elements": 1}, f)
+        json.dump({"format": "sparse_delta", "changed_elements": 1, "layer_names": ["layer.0.weight"]}, f)
 
       sparse_dict = {
-        "layer.0.weight.indices": torch.tensor([4], dtype=torch.int32),
-        "layer.0.weight.values": torch.tensor([88.0], dtype=torch.float32),
+        "delta.indices_flat": torch.tensor([4], dtype=torch.int32),
+        "delta.values_flat": torch.tensor([88.0], dtype=torch.float32),
+        "delta.layer_lengths": torch.tensor([1], dtype=torch.int64),
       }
       save_file(sparse_dict, os.path.join(step_dir, "delta.safetensors"))
 
@@ -288,7 +290,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
         for p in hf_weights_files:
           if os.path.exists(p):
             with safetensors.safe_open(p, framework="pt", device="cpu") as f:
-              for key in f:
+              for key in list(f.keys()):
                 yield key, f.get_tensor(key)
 
       mock_utils.safetensors_weights_iterator.side_effect = fake_iterator

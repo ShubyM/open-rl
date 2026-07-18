@@ -314,8 +314,6 @@ class LoraTrainingWorker(BaseTrainerWorker):
     optimizer.step()
     optimizer.zero_grad()
 
-    self.save_adapter(model_id)
-
     return {
       "metrics": {
         "grad_norm:mean": self.sanitize_float(total_norm.item()),
