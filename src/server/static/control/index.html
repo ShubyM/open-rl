@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Cache-Control" content="no-store">
+  <title>OpenRL Control</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="#/topology">OpenRL <small>control</small></a>
+    <nav aria-label="Views">
+      <a href="#/topology" data-view="topology">Topology</a>
+      <a href="#/runs" data-view="runs">Runs</a>
+      <a href="#/doctor" data-view="doctor">Doctor</a>
+    </nav>
+    <span id="connection" class="muted">connecting</span>
+    <button id="theme" type="button" aria-label="Switch color theme" title="Switch color theme">◐</button>
+    <button id="simulation" type="button" aria-pressed="false">Simulation off</button>
+    <button id="refresh" type="button">Refresh</button>
+  </header>
+
+  <div class="layout">
+    <main id="main" tabindex="-1">
+      <div class="loading">Loading control plane…</div>
+    </main>
+
+    <aside id="inspector" class="inspector" hidden aria-label="Component inspector">
+      <button class="close" type="button" aria-label="Close inspector">×</button>
+      <div id="inspect-body"></div>
+    </aside>
+  </div>
+
+  <script src="demo.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
