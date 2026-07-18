@@ -72,6 +72,10 @@ spec:
           value: "/etc/open-rl/trainer/trainer-worker-pod.yaml"
         - name: OPEN_RL_WORKER_IMAGE
           value: "ghcr.io/gke-labs/open-rl/server:latest"
+        - name: OPEN_RL_SAMPLER_READY_TIMEOUT_SECONDS
+          value: "900"
+        - name: OPEN_RL_SAMPLER_SNAPSHOT_RETENTION
+          value: "2"
         resources:
           limits:
             memory: "2Gi"

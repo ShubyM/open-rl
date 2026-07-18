@@ -1,7 +1,7 @@
 # Pod template the gateway uses to launch one trainer worker per model
 # (server/k8s_worker_manager.py). The launcher stamps metadata.name, the
 # time-slicing coordination labels (snapshot-agent, timeslice.io/group,
-# timeslice.io/job-id), the OPEN_RL_TIME_SLICE_* env vars, and appends --model-id
+# timeslice.io/job-id), the OPEN_RL_TIME_SLICE_* env vars, and appends model_id
 # to args.
 #
 # All trainer worker pods in this group share one GPU through the single DRA
@@ -23,7 +23,7 @@ data:
       - name: trainer-worker
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: IfNotPresent
-        command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
+        command: ["uv", "run", "--no-sync", "python", "-m", "server.training_requests_processor"]
         env:
         - name: REDIS_URL
           value: "redis://redis-service:6379?max_connections=500"

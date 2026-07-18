@@ -41,22 +41,22 @@ ENV UV_COMPILE_BYTECODE=1 \
 # Install dependencies using uv with BuildKit cache
 # --frozen ensures it uses the uv.lock exactly
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --extra gpu --extra vllm --extra cluster
+    uv sync --frozen --no-dev --no-install-project --extra gpu --extra vllm --extra cluster
 
-# Copy and apply third-party upstream patches BEFORE copying local code so .venv stays immutable
-COPY src/server/scripts/patch_vllm_*.py /app/src/server/scripts/
-RUN uv run python /app/src/server/scripts/patch_vllm_lora_dedup.py \
-    && uv run python /app/src/server/scripts/patch_vllm_weight_transfer.py
+# Copy only the runtime package so recipe, test, and documentation edits do not
+# invalidate the large dependency layer.
+COPY README.md .
+COPY src ./src
 
-# Copy source code
-COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --extra gpu --extra vllm --extra cluster
 
-# Expose source directory via PYTHONPATH instead of re-running uv sync on .venv
-ENV PYTHONPATH="/app/src:/app:$PYTHONPATH"
+RUN uv run --no-sync python /app/src/server/scripts/patch_vllm_lora_dedup.py \
+    && uv run --no-sync python /app/src/server/scripts/patch_vllm_weight_transfer.py
 
 # Expose ports (Gateway: 8000, vLLM Worker: 8001)
 EXPOSE 8000
 EXPOSE 8001
 
 # Start the Gateway using uv run to ensure the venv is active
-CMD ["uv", "run", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "--no-sync", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]

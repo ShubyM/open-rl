@@ -27,15 +27,16 @@ ENV UV_COMPILE_BYTECODE=1 \
 # Install the CPU gateway dependencies plus the Kubernetes client used by the
 # cluster worker launcher. Keep the massive ML extras out of this image.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --extra cluster
+    uv sync --frozen --no-dev --no-install-project --extra cluster
 
-# Copy source code
-COPY . .
+# Copy only the package installed in the gateway image.
+COPY README.md .
+COPY src ./src
 
-# Expose source code via PYTHONPATH instead of modifying .venv after COPY . .
-ENV PYTHONPATH="/app/src:/app:$PYTHONPATH"
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --extra cluster
 
 EXPOSE 8000
 
 # Start the Gateway
-CMD ["uv", "run", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "--no-sync", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]

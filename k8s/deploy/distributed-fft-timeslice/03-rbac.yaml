@@ -13,6 +13,12 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["create", "get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -21,7 +27,32 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: open-rl-sa
+  namespace: default
 roleRef:
   kind: Role
   name: open-rl-worker-launcher
+  apiGroup: rbac.authorization.k8s.io
+---
+# Node capacity and readiness power the read-only cluster view. Keep this
+# permission separate from the namespaced worker-launch role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: open-rl-cluster-observer
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: open-rl-cluster-observer
+subjects:
+- kind: ServiceAccount
+  name: open-rl-sa
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: open-rl-cluster-observer
   apiGroup: rbac.authorization.k8s.io

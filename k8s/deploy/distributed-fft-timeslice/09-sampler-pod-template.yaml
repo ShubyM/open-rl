@@ -17,7 +17,7 @@ data:
       - name: sampler-worker
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: IfNotPresent
-        command: ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"]
+        command: ["uv", "run", "--no-sync", "python", "-u", "-m", "server.vllm_sampler"]
         env:
         - name: REDIS_URL
           value: "redis://redis-service:6379?max_connections=500"
