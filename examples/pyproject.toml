@@ -48,6 +48,11 @@ override-dependencies = [
     "torch",
 ]
 
+[dependency-groups]
+test = [
+    "pytest>=8.3",
+]
+
 [tool.setuptools.package-dir]
 "" = "autoresearch"
 "common" = "common"

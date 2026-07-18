@@ -31,7 +31,7 @@ def openrl_server(
   sampling_backend: str = "torch",
   startup_timeout: float = 60.0,
   health_path: str = "/api/v1/healthz",
-  uv_run_args: Sequence[str] = ("--frozen",),
+  uv_run_args: Sequence[str] = ("--no-sync",),
   extra_env: dict[str, str] | None = None,
   stdout: int | None = subprocess.PIPE,
   stderr: int | None = subprocess.STDOUT,
@@ -131,7 +131,7 @@ class OpenRlServerCase(unittest.TestCase):
   REQUIRE_HF_TOKEN: bool = False
   STARTUP_TIMEOUT: int = 300
   SAMPLING_BACKEND: str = "torch"
-  UV_RUN_ARGS: Sequence[str] = ("--extra", "cpu")
+  UV_RUN_ARGS: Sequence[str] = ("--no-sync",)
   HEALTH_PATH: str = "/api/v1/get_server_capabilities"
 
   _server_context: contextlib.AbstractContextManager[str] | None = None

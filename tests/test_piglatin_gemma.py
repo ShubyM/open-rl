@@ -7,10 +7,12 @@ preset's threshold, and the final exact-match clears a 20% floor.
 
 import unittest
 
-from piglatin_sft import PRESETS, run_training
+import pytest
 
 from tests._server_fixture import REPO_ROOT, OpenRlServerCase
 from tests.test_piglatin_qwen import PIGLATIN_EVAL_EXAMPLES
+
+pytestmark = pytest.mark.tinker_contract
 
 CLIENT_DIR = REPO_ROOT / "examples" / "sft" / "pig-latin"
 
@@ -21,6 +23,8 @@ class TestPigLatinGemma(OpenRlServerCase):
   REQUIRE_HF_TOKEN = True
 
   def test_sft_improves(self) -> None:
+    from piglatin_sft import PRESETS, run_training
+
     TEST_CONFIG = {
       "base_url": self.BASE_URL,
       "steps": 25,

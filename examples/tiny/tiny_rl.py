@@ -1,7 +1,7 @@
 """Tiny RL smoke test: sample from the current policy, reward completions that
 contain the target answer, and run a few importance-sampling policy-gradient steps.
 
-  uv --project examples run python examples/tiny/tiny_rl.py base_url=http://127.0.0.1:9003
+  uv --project examples run --no-sync python examples/tiny/tiny_rl.py base_url=http://127.0.0.1:9003
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ class Config:
   loss_fn: str = "importance_sampling"
   rank: int = 16
   seed: int = 0
+  save_final_state: bool = True
   behavior_if_log_dir_exists: str = "delete"
 
 
@@ -134,7 +135,12 @@ def main(config: Config) -> None:
       write_metric(log_dir, {"phase": "train", "step": step, "loss": loss, "mean_reward": mean_reward, "num_datums": len(datums)})
       print(f"[tiny-rl] step={step:02d}/{config.steps} loss={loss:.6f} mean_reward={mean_reward:.2f} datums={len(datums)}")
 
-    final_state_path = trainer.save_state("tiny-rl-final").result().path
+    if config.save_final_state:
+      final_state_path = trainer.save_state("tiny-rl-final").result().path
+    else:
+      # Control-plane smoke tests do not need a multi-gigabyte optimizer/model
+      # checkpoint. Keep the production/default recipe behavior unchanged.
+      final_state_path = "skipped"
     write_metric(log_dir, {"phase": "final", "step": config.steps, "final_state_path": final_state_path, "mean_reward": mean_reward})
     print(f"[tiny-rl] mean_reward={mean_reward:.2f}")
     print(f"final_state_path={final_state_path}")

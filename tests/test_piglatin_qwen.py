@@ -6,9 +6,11 @@ Non-gated model kept small for CI speed. Skips the baseline eval and runs
 
 import unittest
 
-from piglatin_sft import PRESETS, run_training
+import pytest
 
 from tests._server_fixture import REPO_ROOT, OpenRlServerCase
+
+pytestmark = pytest.mark.tinker_contract
 
 CLIENT_DIR = REPO_ROOT / "examples" / "sft" / "pig-latin"
 
@@ -32,6 +34,8 @@ class TestPigLatinQwen(OpenRlServerCase):
   PORT = 9010
 
   def test_sft_improves(self) -> None:
+    from piglatin_sft import PRESETS, run_training
+
     CI_CONFIG = {
       "base_url": self.BASE_URL,
       "steps": 5,
