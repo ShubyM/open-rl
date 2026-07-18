@@ -29,6 +29,7 @@ class SingleNodeTimeSlicer(TimeSlicer):
     self.active_workload: str | None = None
     self.condition = asyncio.Condition()
     self.last_release_time: dict[str, float] = {}
+    self.last_handoff_at: float | None = None
 
   def _get_next_workload_key(self) -> str | None:
     if not self.waiting_workloads:
@@ -114,9 +115,35 @@ class SingleNodeTimeSlicer(TimeSlicer):
       if state is not None:
         state.checkpointed = checkpointed is not False
       self.last_release_time[workload.key] = time.time()
+      self.last_handoff_at = self.last_release_time[workload.key]
       self.clear_workload(workload.key)
       self.condition.notify_all()
       return {"ok": True}
+
+  async def status(self) -> dict[str, Any]:
+    async with self.condition:
+      workloads = []
+      for key, state in sorted(self.workloads.items()):
+        workloads.append(
+          {
+            "key": key,
+            "job_id": state.workload.job_id,
+            "group": state.workload.group,
+            "active": self.active_workload == key,
+            "waiting": key in self.waiting_workloads,
+            "checkpointed": state.checkpointed,
+            "failed": state.failed,
+            "last_release_at": self.last_release_time.get(key),
+          }
+        )
+      return {
+        "ok": True,
+        "scheduling_policy": self.scheduling_policy,
+        "active_workload": self.active_workload,
+        "waiting_workloads": list(self.waiting_workloads),
+        "last_handoff_at": self.last_handoff_at,
+        "workloads": workloads,
+      }
 
   async def unregister(self, workload: WorkloadRef) -> dict[str, Any]:
     async with self.condition:

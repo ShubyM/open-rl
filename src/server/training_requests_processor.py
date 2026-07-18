@@ -1,13 +1,16 @@
 # This file contains the training request processor implementation for Open-RL.
 
-import argparse
 import asyncio
 import json
 import os
+import shutil
 import threading
+import time
 import traceback
+from collections.abc import Callable
 from typing import Any, Protocol
 
+import chz
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from opentelemetry import context as otel_context
@@ -15,7 +18,20 @@ from opentelemetry import propagate, trace
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
-from server.store import RequestStore, get_store
+from server.protocol import SamplerSnapshot, TrainingCommand, TrainingOperation
+from server.store import (
+  InMemoryStore,
+  RequestStore,
+  bump_model_revision,
+  get_model_revision,
+  get_sampler_artifact,
+  get_store,
+  prune_sampler_snapshots,
+  put_sampler_artifact,
+  put_sampler_snapshot,
+  report_control_event,
+  sampler_revision_path,
+)
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
 from training.trainer_worker import Datum
@@ -42,6 +58,71 @@ def parse_datum(raw: dict[str, Any]) -> Datum:
   return Datum(model_input=tokens, loss_fn_inputs=loss_fn_inputs)
 
 
+def sampler_local_path(storage_ref: str) -> str:
+  relative = storage_ref[len("tinker://") :] if storage_ref.startswith("tinker://") else storage_ref.lstrip("/")
+  return os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", relative)
+
+
+async def save_sampler_snapshot(
+  store: RequestStore,
+  worker: TrainingWorker,
+  payload: dict[str, Any],
+  model_id: str,
+) -> dict[str, Any]:
+  sampling_session_id = payload.get("sampling_session_id")
+  if not sampling_session_id:
+    raise ValueError("save_weights_for_sampler requires sampling_session_id")
+
+  revision = await get_model_revision(store, model_id)
+  storage_ref = await get_sampler_artifact(store, model_id, revision)
+  checkpoint_created = storage_ref is None
+  if storage_ref is None:
+    storage_ref = sampler_revision_path(model_id, revision)
+    if not payload.get("skip_checkpoint"):
+      await asyncio.to_thread(worker.save_state, model_id, sampler_local_path(storage_ref), False, "sampler")
+    else:
+      print(f"[WORKER] Explicit mock sampler: skipping unused sampler checkpoint for {storage_ref}")
+    await put_sampler_artifact(store, model_id, revision, storage_ref)
+    if redis_client := getattr(store, "redis", None):
+      local_path = sampler_local_path(storage_ref)
+      subscribers = await redis_client.publish(
+        f"open_rl:weight_update:{model_id}",
+        json.dumps({"weights_path": local_path, "weights_revision": revision}),
+      )
+      print(f"[Trainer] Published weight update for revision {revision} to {subscribers} subscribers: {local_path}")
+
+  ttl_seconds = payload.get("ttl_seconds")
+  if ttl_seconds is not None:
+    ttl_seconds = int(ttl_seconds)
+    if ttl_seconds < 1:
+      raise ValueError("ttl_seconds must be positive")
+  now = time.time()
+  named = bool(payload.get("alias"))
+  snapshot = SamplerSnapshot(
+    sampling_session_id=sampling_session_id,
+    model_id=model_id,
+    revision=revision,
+    storage_path=storage_ref,
+    named=named,
+    created_at=now,
+    expires_at=now + ttl_seconds if ttl_seconds is not None else None,
+  )
+  await put_sampler_snapshot(store, snapshot)
+  for orphaned_ref in await prune_sampler_snapshots(store, model_id):
+    orphaned_path = sampler_local_path(orphaned_ref)
+    if os.path.isdir(orphaned_path):
+      await asyncio.to_thread(shutil.rmtree, orphaned_path)
+
+  return {
+    "path": payload.get("path") if named else None,
+    "sampling_session_id": sampling_session_id,
+    "revision": revision,
+    "checkpoint_created": checkpoint_created,
+    "mock": bool(payload.get("skip_checkpoint")),
+    "type": "sampler_weights_saved",
+  }
+
+
 class TrainingRequestsProcessor(Protocol):
   store: RequestStore
 
@@ -52,23 +133,62 @@ class TrainingRequestsProcessor(Protocol):
 
   async def handle_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> tuple[str | None, dict[str, Any]]:
     request_id = raw_request.get("request_id")
+    resolved_model_id = model_id or raw_request.get("model_id") or "default"
     token = None
 
     try:
-      op = raw_request["op"]
-      request_id = raw_request["request_id"]
-      resolved_model_id = model_id or raw_request.get("model_id") or "default"
-
-      carrier = raw_request.get("trace_context")
+      command = TrainingCommand.model_validate(raw_request)
+      op = command.op
+      request_id = command.request_id
+      resolved_model_id = model_id or command.model_id or "default"
+      carrier = command.trace_context
       ctx = propagate.extract(carrier) if carrier else None
       token = otel_context.attach(ctx) if ctx else None
 
-      result = await self.dispatch_operation(op, raw_request.get("payload", {}), resolved_model_id)
+      started = time.monotonic()
+      await report_control_event(
+        self.store,
+        resolved_model_id,
+        component="trainer",
+        phase=op,
+        status="running",
+        message=f"Running {op.replace('_', ' ')}",
+        details={"request_id": request_id, "operation": op},
+      )
+      result = await self.dispatch_operation(op, command.payload, resolved_model_id)
+      if op == "optim_step":
+        result["revision"] = await bump_model_revision(self.store, resolved_model_id)
+      elapsed = time.monotonic() - started
+      details: dict[str, Any] = {"request_id": request_id, "operation": op}
+      if isinstance(result.get("metrics"), dict):
+        details["metrics"] = result["metrics"]
+      if result.get("mock") is True:
+        details["mock"] = True
+      await report_control_event(
+        self.store,
+        resolved_model_id,
+        component="trainer",
+        phase=f"{op}_complete",
+        status="ready",
+        message=f"Completed {op.replace('_', ' ')} in {elapsed:.1f}s",
+        duration_seconds=elapsed,
+        details=details,
+      )
       return request_id, result
     except Exception as exc:
       traceback.print_exc()
       if request_id is None:
         raise
+      await report_control_event(
+        self.store,
+        resolved_model_id,
+        component="trainer",
+        phase="operation_failed",
+        status="failed",
+        level="error",
+        message=str(exc),
+        details={"request_id": request_id, "operation": raw_request.get("op")},
+      )
       return request_id, {"type": "RequestFailedResponse", "error_message": str(exc)}
     finally:
       if token:
@@ -258,16 +378,48 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     return {"path": payload["state_path"], "type": "weights_loaded"}
 
   async def save_weights_for_sampler(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.save_adapter, model_id, payload.get("alias"))
-    return {
-      "path": payload.get("path"),
-      "sampling_session_id": payload.get("sampling_session_id"),
-      "type": "sampler_weights_saved",
-    }
+    return await save_sampler_snapshot(self.store, self.worker, payload, model_id)
 
   async def save_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     await asyncio.to_thread(self.worker.save_adapter, model_id, payload.get("alias"))
     return {"status": "ok", "type": "weights_saved"}
+
+
+class TrainingRequestFailed(RuntimeError):
+  """Raised when an in-process training command returns a failed response."""
+
+
+class InProcessLoraBackend:
+  """Exercise the LoRA training boundary without starting infrastructure.
+
+  The HTTP gateway and Redis worker loop are transports around the same
+  ``TrainingCommand`` contract. Local behavior tests can use this backend to
+  run that contract against the real worker in one Python process.
+  """
+
+  def __init__(self, store: RequestStore | None = None, worker: LoraTrainingWorker | None = None):
+    self.store = store or InMemoryStore()
+    self.worker = worker or LoraTrainingWorker()
+    self.processor = LoraTrainingRequestsProcessor(self.store, self.worker)
+    self.request_sequence = 0
+
+  async def request(
+    self,
+    op: TrainingOperation,
+    payload: dict[str, Any] | None = None,
+    model_id: str = "default",
+  ) -> dict[str, Any]:
+    self.request_sequence += 1
+    command = TrainingCommand(
+      request_id=f"local:{model_id}:{self.request_sequence}",
+      model_id=model_id,
+      op=op,
+      payload=payload or {},
+    )
+    _, response = await self.processor.handle_request(command.model_dump(), model_id)
+    if response.get("type") == "RequestFailedResponse":
+      raise TrainingRequestFailed(response.get("error_message", "Training request failed"))
+    return response
 
 
 class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
@@ -281,7 +433,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
     if not model_id:
-      raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
+      raise RuntimeError("A dedicated trainer worker needs model_id=<id> so it knows which per-model queue to drain")
 
     self.store = store
     self.worker = worker
@@ -308,8 +460,24 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     print("[WORKER] Full fine-tuning training requests processor started.")
 
     try:
+      await report_control_event(
+        self.store,
+        self.model_id,
+        component="trainer",
+        phase="registering",
+        status="starting",
+        message="Trainer process started; registering with the accelerator scheduler",
+      )
       await self.time_slicer.register(self.workload)
       self.snapshot_registered = True
+      await report_control_event(
+        self.store,
+        self.model_id,
+        component="trainer",
+        phase="idle",
+        status="ready",
+        message="Trainer is registered and waiting for work",
+      )
       while True:
         try:
           await self.run_once()
@@ -348,27 +516,51 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}")
         results = []
         save_ops = {"save_state", "save_weights", "save_weights_for_sampler"}
-        gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
-        save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
-
-        if gpu_reqs:
-          async with self.time_slicer.acquire(self.workload):
-            if hasattr(self.worker, "wake_up"):
-              await asyncio.to_thread(self.worker.wake_up)
-            try:
-              for request in gpu_reqs:
+        request_index = 0
+        while request_index < len(training_reqs):
+          request = training_reqs[request_index]
+          if request.get("op") in save_ops:
+            if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload:
+              async with self.time_slicer.acquire(self.workload):
                 results.append(await self.handle_request(request, self.model_id))
-            finally:
-              if hasattr(self.worker, "sleep"):
-                await asyncio.to_thread(self.worker.sleep)
-
-        if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload and save_reqs:
-          async with self.time_slicer.acquire(self.workload):
-            for request in save_reqs:
+            else:
               results.append(await self.handle_request(request, self.model_id))
-        else:
-          for request in save_reqs:
-            results.append(await self.handle_request(request, self.model_id))
+            request_index += 1
+            continue
+
+          gpu_reqs = []
+          while request_index < len(training_reqs) and training_reqs[request_index].get("op") not in save_ops:
+            gpu_reqs.append(training_reqs[request_index])
+            request_index += 1
+
+          lease_started = time.monotonic()
+          await report_control_event(
+            self.store,
+            self.model_id,
+            component="trainer",
+            phase="waiting_for_gpu",
+            status="waiting",
+            message="Waiting for an accelerator time slice",
+            details={"queued_operations": [queued.get("op") for queued in gpu_reqs]},
+          )
+          async with self.time_slicer.acquire(self.workload):
+            lease_wait = time.monotonic() - lease_started
+            await report_control_event(
+              self.store,
+              self.model_id,
+              component="trainer",
+              phase="gpu_acquired",
+              status="running",
+              message=f"Accelerator acquired after {lease_wait:.1f}s",
+              duration_seconds=lease_wait,
+            )
+            include_optimizer = any(queued.get("op") == "optim_step" for queued in gpu_reqs)
+            await self.transition_worker("wake_up", lambda include_optimizer=include_optimizer: self.worker.wake_up(include_optimizer))
+            try:
+              for gpu_request in gpu_reqs:
+                results.append(await self.handle_request(gpu_request, self.model_id))
+            finally:
+              await self.transition_worker("sleep", self.worker.sleep)
 
         for request_id, result in results:
           if request_id is not None:
@@ -376,6 +568,28 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
     if has_shutdown:
       await self.exit_gracefully()
+
+  async def transition_worker(self, phase: str, transition: Callable[[], None]) -> None:
+    started = time.monotonic()
+    await report_control_event(
+      self.store,
+      self.model_id,
+      component="trainer",
+      phase=phase,
+      status="running",
+      message=f"Trainer {phase.replace('_', ' ')}",
+    )
+    await asyncio.to_thread(transition)
+    elapsed = time.monotonic() - started
+    await report_control_event(
+      self.store,
+      self.model_id,
+      component="trainer",
+      phase=f"{phase}_complete",
+      status="running",
+      message=f"Trainer {phase.replace('_', ' ')} completed in {elapsed:.1f}s",
+      duration_seconds=elapsed,
+    )
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     base_model, raw_config, _, training_kind = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")
@@ -453,23 +667,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     return {"path": payload["state_path"], "type": "weights_loaded"}
 
   async def save_weights_for_sampler(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    ref = payload.get("path") or payload.get("sampling_session_id")
-    if not ref:
-      raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
-    rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
-    local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
-    await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
-    if hasattr(self.store, "redis"):
-      num_subs = await self.store.redis.publish(
-        f"open_rl:weight_update:{model_id}",
-        json.dumps({"weights_path": local_path}),
-      )
-      print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")
-    return {
-      "path": payload.get("path"),
-      "sampling_session_id": payload.get("sampling_session_id"),
-      "type": "sampler_weights_saved",
-    }
+    return await save_sampler_snapshot(self.store, self.worker, payload, model_id)
 
   async def save_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     await asyncio.to_thread(self.worker.save_model, payload.get("alias") or model_id)
@@ -490,10 +688,13 @@ async def run_training_requests_processor(
   await processor.run()
 
 
+@chz.chz
+class WorkerArgs:
+  model_id: str | None = chz.field(default=None, doc="Model id whose dedicated request queue this worker drains.")
+
+
 def start_request_processing_loop() -> None:
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated trainer worker drains.")
-  args = parser.parse_args()
+  args = chz.entrypoint(WorkerArgs, allow_hyphens=True)
 
   print("\n" + "=" * 50)
   print("      Open-RL PyTorch Training Worker")

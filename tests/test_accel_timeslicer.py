@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from accel_timeslicer.checkpoint import CudaCheckpointRestorer
+from accel_timeslicer.checkpoint import CudaCheckpointRestorer, NoopCheckpointRestorer
 from accel_timeslicer.llmd import LlmDCheckpointRestorer
 from accel_timeslicer.serve import start_tcp_time_slicer, start_time_slicer
 from accel_timeslicer.single_node import SingleNodeTimeSlicer
@@ -59,6 +59,15 @@ class NoSnapshotRestorer(RecordingRestorer):
   def checkpoint(self, target: WorkloadRef) -> bool:
     super().checkpoint(target)
     return False
+
+
+class NoopCheckpointRestorerTest(unittest.TestCase):
+  def test_checkpoint_reports_that_no_snapshot_was_created(self) -> None:
+    restorer = NoopCheckpointRestorer()
+    workload = WorkloadRef(job_id="local-dev", group="trainers")
+
+    self.assertFalse(restorer.checkpoint(workload))
+    self.assertIsNone(restorer.restore(workload))
 
 
 class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
@@ -198,6 +207,27 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue((await agent.unregister(WorkloadRef(job_id="101")))["ok"])
     self.assertFalse((await agent.unregister(WorkloadRef(job_id="101")))["ok"])
 
+  async def test_status_exposes_active_waiting_and_checkpoint_state(self) -> None:
+    agent = SingleNodeTimeSlicer(RecordingRestorer())
+    first = WorkloadRef(job_id="101")
+    second = WorkloadRef(job_id="202")
+    await agent.register(first)
+    await agent.register(second)
+    await agent.acquire(first)
+    blocked = asyncio.create_task(agent.acquire(second))
+    await asyncio.sleep(0.05)
+
+    status = await agent.status()
+
+    self.assertEqual(status["active_workload"], first.key)
+    self.assertEqual(status["waiting_workloads"], [second.key])
+    self.assertEqual(
+      [(item["job_id"], item["active"], item["waiting"]) for item in status["workloads"]],
+      [("101", True, False), ("202", False, True)],
+    )
+    await agent.release(first)
+    await blocked
+
   async def test_waiters_are_granted_in_fifo_order(self) -> None:
     agent = SingleNodeTimeSlicer(RecordingRestorer())
     for pid in [101, 202, 303, 404]:
@@ -300,6 +330,24 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
     finally:
       await client_a.close()
       await client_b.close()
+      server.close()
+      await server.wait_closed()
+
+  async def test_socket_status_does_not_register_a_fake_workload(self) -> None:
+    agent = SingleNodeTimeSlicer(RecordingRestorer())
+    server = await start_tcp_time_slicer(agent, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client = SocketTimeSlicerClient(host="127.0.0.1", port=port)
+    try:
+      await client.register(WorkloadRef(job_id="101"))
+
+      status = await client.status()
+
+      self.assertTrue(status["ok"])
+      self.assertEqual([item["job_id"] for item in status["workloads"]], ["101"])
+      self.assertEqual(len(agent.workloads), 1)
+    finally:
+      await client.close()
       server.close()
       await server.wait_closed()
 

@@ -1,13 +1,14 @@
-import argparse
 import asyncio
 import json
 import logging
 import os
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from .checkpoint import CudaCheckpointRestorer
+import chz
+
+from .checkpoint import CudaCheckpointRestorer, NoopCheckpointRestorer
 from .llmd import LlmDCheckpointRestorer
 from .single_node import SingleNodeTimeSlicer
 from .workload import DEFAULT_TIME_SLICE_GROUP, WorkloadRef
@@ -49,6 +50,9 @@ async def dispatch(time_slicer: SingleNodeTimeSlicer, line: bytes, connection_id
   payload = json.loads(line.decode("utf-8"))
 
   command = payload.get("command", "").upper()
+  if command == "STATUS":
+    return await time_slicer.status()
+
   workload = workload_from_payload(payload)
 
   match command:
@@ -74,36 +78,34 @@ def workload_from_payload(payload: dict[str, Any]) -> WorkloadRef:
   )
 
 
-def parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(description="Run the OpenRL accelerator time-slicer.")
-  parser.add_argument("--socket", default=os.getenv("OPEN_RL_ACCEL_TIMESLICER_SOCKET", "/tmp/open-rl/accel-timeslicer.sock"))
-  parser.add_argument("--listen-host", default=None)
-  parser.add_argument("--port", type=int, default=None)
-  parser.add_argument("--backend", choices=["cuda", "llmd"], default=os.getenv("OPEN_RL_ACCEL_TIMESLICER_BACKEND", "cuda"))
-  parser.add_argument("--cuda-checkpoint-bin", default=os.getenv("CUDA_CHECKPOINT_BIN", "cuda-checkpoint"))
-  parser.add_argument("--cuda-checkpoint-timeout-ms", type=int, default=None)
-  parser.add_argument("--llmd-snapshot-endpoint", default=os.getenv("LLMD_SNAPSHOT_AGENT_ENDPOINT", "127.0.0.1:9001"))
-  parser.add_argument("--llmd-backend", default=os.getenv("LLMD_SNAPSHOT_BACKEND", "CUDA"))
-  parser.add_argument("--llmd-poll-interval-sec", type=float, default=float(os.getenv("LLMD_SNAPSHOT_POLL_INTERVAL_SEC", "1.0")))
-  parser.add_argument(
-    "--scheduling-policy",
-    choices=["lrs", "fifo"],
-    default=os.getenv("OPEN_RL_ACCEL_TIMESLICER_SCHEDULING_POLICY", "lrs"),
-    help="Queue scheduling policy when multiple workloads wait for a lock.",
+@chz.chz
+class TimeSlicerArgs:
+  socket: str = chz.field(default_factory=lambda: os.getenv("OPEN_RL_ACCEL_TIMESLICER_SOCKET", "/tmp/open-rl/accel-timeslicer.sock"))
+  listen_host: str | None = None
+  port: int | None = None
+  backend: Literal["cuda", "llmd", "noop"] = chz.field(default_factory=lambda: os.getenv("OPEN_RL_ACCEL_TIMESLICER_BACKEND", "cuda"))
+  cuda_checkpoint_bin: str = chz.field(default_factory=lambda: os.getenv("CUDA_CHECKPOINT_BIN", "cuda-checkpoint"))
+  cuda_checkpoint_timeout_ms: int | None = None
+  llmd_snapshot_endpoint: str = chz.field(default_factory=lambda: os.getenv("LLMD_SNAPSHOT_AGENT_ENDPOINT", "127.0.0.1:9001"))
+  llmd_backend: str = chz.field(default_factory=lambda: os.getenv("LLMD_SNAPSHOT_BACKEND", "CUDA"))
+  llmd_poll_interval_sec: float = chz.field(default_factory=lambda: float(os.getenv("LLMD_SNAPSHOT_POLL_INTERVAL_SEC", "1.0")))
+  scheduling_policy: Literal["lrs", "fifo"] = chz.field(
+    default_factory=lambda: os.getenv("OPEN_RL_ACCEL_TIMESLICER_SCHEDULING_POLICY", "lrs"),
+    doc="Queue scheduling policy when multiple workloads wait for a lock.",
   )
-  return parser.parse_args()
 
 
 async def main_async() -> None:
-  args = parse_args()
+  args = chz.entrypoint(TimeSlicerArgs, allow_hyphens=True)
   if args.backend == "llmd":
     if LlmDClient is None:
       raise RuntimeError("--backend llmd requires the llm-d timeslice snapshot client package")
     restorer = LlmDCheckpointRestorer(LlmDClient(endpoint=args.llmd_snapshot_endpoint), args.llmd_backend, args.llmd_poll_interval_sec)
-    time_slicer = SingleNodeTimeSlicer(restorer=restorer, scheduling_policy=args.scheduling_policy)
-  else:
+  elif args.backend == "cuda":
     restorer = CudaCheckpointRestorer(args.cuda_checkpoint_bin, args.cuda_checkpoint_timeout_ms)
-    time_slicer = SingleNodeTimeSlicer(restorer=restorer, scheduling_policy=args.scheduling_policy)
+  else:
+    restorer = NoopCheckpointRestorer()
+  time_slicer = SingleNodeTimeSlicer(restorer=restorer, scheduling_policy=args.scheduling_policy)
   if args.port is None:
     server = await start_time_slicer(time_slicer, args.socket)
     logger.info("listening on unix://%s", args.socket)

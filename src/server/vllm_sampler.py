@@ -1,15 +1,31 @@
 # This file contains the vLLM worker implementation for high-throughput inference in Open-RL.
 
-import argparse
 import asyncio
+import ctypes
 import hashlib
 import json
 import os
+import site
 import sys
+import time
 import traceback
+from pathlib import Path
 from typing import Any
 
+import chz
 import redis.asyncio as redis
+
+
+def preload_bundled_cuda_runtime() -> None:
+  """Load vLLM's bundled CUDA 13 runtime when the wheel does not add it to the loader path."""
+  for packages in site.getsitepackages():
+    runtime = Path(packages) / "nvidia" / "cu13" / "lib" / "libcudart.so.13"
+    if runtime.is_file():
+      ctypes.CDLL(str(runtime), mode=ctypes.RTLD_GLOBAL)
+      return
+
+
+preload_bundled_cuda_runtime()
 
 try:
   from vllm import SamplingParams
@@ -36,6 +52,8 @@ from opentelemetry import propagate, trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from server.store import release_sampler_snapshot, report_control_event
+
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
 
@@ -61,6 +79,44 @@ def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
+def mock_vllm_enabled() -> bool:
+  """Return true only for the explicit, deterministic development sampler."""
+  return os.getenv("MOCK_VLLM", "0") == "1"
+
+
+def vllm_sleep_level() -> int:
+  """Use weight-preserving sleep unless the deployment opts into discard/reload."""
+  level = int(os.getenv("OPEN_RL_VLLM_SLEEP_LEVEL", "1"))
+  if level not in (1, 2):
+    raise ValueError(f"OPEN_RL_VLLM_SLEEP_LEVEL must be 1 or 2, got {level}")
+  return level
+
+
+async def publish_sampler_ready(store: Any, model_id: str, instance_id: str) -> None:
+  if getattr(store, "redis", None) is not None:
+    await store.redis.set(f"open_rl:sampler_ready:{model_id}", instance_id)
+  await report_control_event(
+    store,
+    model_id,
+    component="sampler",
+    phase="ready",
+    status="ready",
+    message="Deterministic mock sampler is ready" if mock_vllm_enabled() else "vLLM sampler is initialized and waiting for requests",
+    details={"instance_id": instance_id, "backend": "mock" if mock_vllm_enabled() else "vllm"},
+  )
+
+
+async def clear_sampler_ready(store: Any, model_id: str, instance_id: str) -> None:
+  if getattr(store, "redis", None) is None:
+    return
+  key = f"open_rl:sampler_ready:{model_id}"
+  value = await store.redis.get(key)
+  if isinstance(value, bytes):
+    value = value.decode("utf-8")
+  if value == instance_id:
+    await store.redis.delete(key)
+
+
 time_slicer: Any = None
 if is_fft_enabled():
   from accel_timeslicer.time_slicer import time_slicer_client_from_env, workload_from_env
@@ -80,9 +136,10 @@ def init_engine():
   print(f"-> Hardware     : CUDA_VISIBLE_DEVICES={cuda_devs}")
   print(f"-> Model        : {model_name or 'Not Set'}\n")
 
-  mock_vllm = os.getenv("MOCK_VLLM", "0") == "1"
-  if mock_vllm or not VLLM_AVAILABLE:
-    print("[vLLM Worker] MOCK_VLLM=1 or vllm not installed, bypassing real engine init for local dev.")
+  if mock_vllm_enabled():
+    print("[vLLM Worker] MOCK_VLLM=1: using deterministic dummy completions; no model or checkpoint is loaded.")
+  elif not VLLM_AVAILABLE:
+    raise RuntimeError("vLLM is not installed. Set MOCK_VLLM=1 only for an explicit control-plane test.")
   elif not model_name:
     print("[vLLM Worker] Error: BASE_MODEL environment variable is required.")
     sys.exit(1)
@@ -122,6 +179,53 @@ def init_engine():
     print("[vLLM Worker] Engine initialized successfully.")
 
 
+async def prepare_engine(weights_path: str | None, weights_revision: str | None = None) -> None:
+  """Wake vLLM and load a changed full-model checkpoint in place."""
+  global CURRENT_LOADED_SAMPLER_WEIGHTS
+  global IS_ENGINE_SLEEPING
+
+  if mock_vllm_enabled():
+    CURRENT_LOADED_SAMPLER_WEIGHTS = weights_revision or weights_path
+    return
+
+  if engine is None:
+    init_engine()
+  if engine is None:
+    return
+
+  target_revision = weights_revision or weights_path
+  if weights_path and target_revision != CURRENT_LOADED_SAMPLER_WEIGHTS:
+    if not await engine.is_sleeping():
+      await engine.sleep(level=vllm_sleep_level())
+    await engine.wake_up(tags=["weights"])
+    if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
+      try:
+        await engine.collective_rpc(
+          "update_weights",
+          kwargs={
+            "update_info": {
+              "target_weights_path": weights_path,
+              "base_model_path": os.getenv("OPEN_RL_BASE_MODEL")
+              or os.getenv("BASE_MODEL")
+              or getattr(getattr(engine, "engine_args", None), "model", ""),
+            }
+          },
+        )
+      except Exception as exc:
+        print(f"[vLLM Worker] Native update_weights failed ({exc}); falling back to standard disk reload...")
+        await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+    else:
+      await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+    await engine.wake_up(tags=["kv_cache"])
+    CURRENT_LOADED_SAMPLER_WEIGHTS = target_revision
+    IS_ENGINE_SLEEPING = False
+    return
+
+  if await engine.is_sleeping():
+    await engine.wake_up()
+    IS_ENGINE_SLEEPING = False
+
+
 async def run_generation_backend(
   request_id: str,
   prompt_token_ids: list[int],
@@ -137,11 +241,13 @@ async def run_generation_backend(
 ) -> dict[str, Any]:
   try:
     current_engine = engine
-    if current_engine is None:
-      # Mocking for local Mac dev
+    if current_engine is None and mock_vllm_enabled():
+      # Explicit deterministic mock for control-plane development. Preserve the
+      # API cardinality even though all dummy completions are identical.
       await asyncio.sleep(0.1)
-      # return dummy tokens locally
-      return {"sequences": [{"tokens": [0] * max_tokens, "logprobs": [-0.1] * max_tokens, "stop_reason": "length"}]}
+      return {"sequences": [{"tokens": [0] * max_tokens, "logprobs": [-0.1] * max_tokens, "stop_reason": "length"} for _ in range(num_samples)]}
+    if current_engine is None:
+      raise RuntimeError("vLLM engine is unavailable and MOCK_VLLM is not enabled")
 
     prompt_logprobs_val = 1 if include_prompt_logprobs else None
     sampling_params = SamplingParams(
@@ -220,47 +326,33 @@ async def process_sampling_request(req: dict, store: Any) -> None:
   global IS_ENGINE_SLEEPING
 
   request_id = req["request_id"]
+  model_id = req.get("model_id")
   trace_context = req.get("trace_context", {})
 
   parent_span = propagate.extract(trace_context)
   with tracer.start_as_current_span("process_sampling_request", context=parent_span):
     try:
-      # 1. Manage weights reloading
+      started = time.monotonic()
+      # 1. Load the exact full-model checkpoint and wake the engine.
       weights_path = req.get("weights_path")
-      if is_fft_enabled() and weights_path:
+      weights_revision = req.get("weights_revision") or weights_path
+      if is_fft_enabled():
+        mock_mode = mock_vllm_enabled()
+        await report_control_event(
+          store,
+          model_id,
+          component="sampler",
+          phase="mock_revision_selected" if mock_mode else "loading_weights",
+          status="running",
+          message=(
+            "Mock sampler selected the policy revision without loading its checkpoint"
+            if mock_mode
+            else "Waking the sampler and loading the requested policy weights"
+          ),
+          details={"request_id": request_id, "weights_revision": weights_revision, "backend": "mock" if mock_mode else "vllm"},
+        )
         async with reload_lock:
-          if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
-            print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
-            if engine is not None:
-              print("[vLLM Worker] Triggering sleep level 1 (CPU offload weights)...")
-              await engine.sleep(level=1)
-              print("[vLLM Worker] Waking up weights...")
-              await engine.wake_up(tags=["weights"])
-              if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
-                print(f"[vLLM Worker] Receiving incremental delta weights from {weights_path} via native WeightTransferEngine...")
-                try:
-                  await engine.collective_rpc(
-                    "update_weights",
-                    kwargs={
-                      "update_info": {
-                        "target_weights_path": weights_path,
-                        "base_model_path": (
-                          os.getenv("OPEN_RL_BASE_MODEL") or os.getenv("BASE_MODEL") or getattr(getattr(engine, "engine_args", None), "model", "")
-                        ),
-                      }
-                    },
-                  )
-                except Exception as exc:
-                  print(f"[vLLM Worker] Native update_weights collective_rpc failed ({exc}); falling back to standard disk reload...")
-                  await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
-              else:
-                print(f"[vLLM Worker] Reloading weights from {weights_path} in-place...")
-                await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
-              print("[vLLM Worker] Waking up KV cache...")
-              await engine.wake_up(tags=["kv_cache"])
-              IS_ENGINE_SLEEPING = False
-            CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
-            print("[vLLM Worker] Weights reload completed successfully!")
+          await prepare_engine(weights_path, weights_revision)
 
       # 2. Run inference
       prompt_token_ids = req.get("prompt_token_ids", [])
@@ -274,6 +366,15 @@ async def process_sampling_request(req: dict, store: Any) -> None:
       lora_path = req.get("lora_path")
       include_prompt_logprobs = req.get("include_prompt_logprobs", False)
 
+      await report_control_event(
+        store,
+        model_id,
+        component="sampler",
+        phase="generating",
+        status="running",
+        message=f"Generating {num_samples} completion{'s' if num_samples != 1 else ''}",
+        details={"request_id": request_id, "num_samples": num_samples, "max_tokens": max_tokens},
+      )
       result = await run_generation_backend(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
@@ -292,9 +393,39 @@ async def process_sampling_request(req: dict, store: Any) -> None:
         result["type"] = "sample"
 
       await store.set_future(request_id, result)
+      elapsed = time.monotonic() - started
+      failed = result.get("type") == "RequestFailedResponse"
+      await report_control_event(
+        store,
+        model_id,
+        component="sampler",
+        phase="sample_failed" if failed else "sample_complete",
+        status="failed" if failed else "ready",
+        level="error" if failed else "info",
+        message=str(result.get("error_message")) if failed else f"Sampling completed in {elapsed:.1f}s",
+        duration_seconds=elapsed,
+        details={"request_id": request_id, "num_samples": num_samples},
+      )
     except Exception as exc:
       traceback.print_exc()
       await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(exc)}"})
+      await report_control_event(
+        store,
+        model_id,
+        component="sampler",
+        phase="sample_failed",
+        status="failed",
+        level="error",
+        message=str(exc),
+        details={"request_id": request_id},
+      )
+    finally:
+      sampling_session_id = req.get("sampling_session_id")
+      if sampling_session_id:
+        try:
+          await release_sampler_snapshot(store, sampling_session_id)
+        except Exception as exc:
+          print(f"[vLLM Worker] Failed to release sampling session {sampling_session_id}: {exc}")
 
 
 async def weight_prefetcher_loop(model_id: str, store: Any) -> None:
@@ -367,6 +498,7 @@ async def run_sampling_worker(model_id: str) -> None:
   from server.store import get_store
 
   store = get_store()
+  instance_id = os.getenv("OPEN_RL_WORKER_INSTANCE_ID", "1")
   snapshot_registered = False
   workload = None
   prefetch_task = None
@@ -377,27 +509,63 @@ async def run_sampling_worker(model_id: str) -> None:
     assert workload is not None
     try:
       print(f"[vLLM Worker] Registering workload {workload.key} for initialization lock...")
+      await report_control_event(
+        store,
+        model_id,
+        component="sampler",
+        phase="waiting_for_gpu",
+        status="starting",
+        message="Sampler process started; waiting for an accelerator initialization slice",
+      )
       await time_slicer.register(workload)
       snapshot_registered = True
       async with time_slicer.acquire(workload):
         print("[vLLM Worker] Initializing vLLM engine under parent lock...")
+        await report_control_event(
+          store,
+          model_id,
+          component="sampler",
+          phase="initializing_mock_sampler" if mock_vllm_enabled() else "initializing_engine",
+          status="starting",
+          message="Initializing deterministic mock sampler" if mock_vllm_enabled() else "Initializing the vLLM engine",
+          details={"base_model": os.getenv("BASE_MODEL") or os.getenv("VLLM_MODEL"), "backend": "mock" if mock_vllm_enabled() else "vllm"},
+        )
         init_engine()
         print("[vLLM Worker] Engine initialized successfully.")
         if engine is not None:
-          print("[vLLM Worker] Sleeping engine after init to yield GPU memory (CPU offload)...")
-          await engine.sleep(level=1)
+          print("[vLLM Worker] Sleeping engine after init to yield GPU memory...")
+          await engine.sleep(level=vllm_sleep_level())
           IS_ENGINE_SLEEPING = True
     except Exception as exc:
       print(f"[vLLM Worker] Failed to perform coordinated initialization: {exc}")
       traceback.print_exc()
       if engine is None:
+        await report_control_event(
+          store,
+          model_id,
+          component="sampler",
+          phase="initialization_recovery",
+          status="starting",
+          level="warning",
+          message=f"Coordinated initialization failed; retrying directly: {exc}",
+        )
         init_engine()
   else:
+    await report_control_event(
+      store,
+      model_id,
+      component="sampler",
+      phase="initializing_mock_sampler" if mock_vllm_enabled() else "initializing_engine",
+      status="starting",
+      message="Initializing deterministic mock sampler" if mock_vllm_enabled() else "Initializing the vLLM engine",
+      details={"base_model": os.getenv("BASE_MODEL") or os.getenv("VLLM_MODEL"), "backend": "mock" if mock_vllm_enabled() else "vllm"},
+    )
     init_engine()
 
   async def exit_gracefully() -> None:
     print(f"[vLLM Worker] Initiating immediate exit for model {model_id} sampler worker...")
     nonlocal snapshot_registered
+    await clear_sampler_ready(store, model_id, instance_id)
     if prefetch_task is not None:
       try:
         prefetch_task.cancel()
@@ -431,9 +599,7 @@ async def run_sampling_worker(model_id: str) -> None:
     except NotImplementedError:
       pass
 
-  if hasattr(store, "redis"):
-    await store.redis.set(f"open_rl:sampler_ready:{model_id}", "1")
-    await store.redis.expire(f"open_rl:sampler_ready:{model_id}", 3600)
+  await publish_sampler_ready(store, model_id, instance_id)
 
   print(f"[vLLM Worker] Listening for sampling requests on queue for model: {model_id}...")
   prefetch_task = asyncio.create_task(weight_prefetcher_loop(model_id, store))
@@ -466,8 +632,11 @@ async def run_sampling_worker(model_id: str) -> None:
               if has_shutdown:
                 await exit_gracefully()
               if engine is not None:
-                print("[vLLM Worker] Exiting batch: sleeping engine (CPU offload weights) to yield GPU memory...")
-                await engine.sleep(level=1)
+                print("[vLLM Worker] Exiting batch: sleeping engine to yield GPU memory...")
+                sleep_level = vllm_sleep_level()
+                await engine.sleep(level=sleep_level)
+                if sleep_level == 2:
+                  CURRENT_LOADED_SAMPLER_WEIGHTS = None
                 IS_ENGINE_SLEEPING = True
           else:
             if engine is not None and IS_ENGINE_SLEEPING:
@@ -487,6 +656,7 @@ async def run_sampling_worker(model_id: str) -> None:
         traceback.print_exc()
         await asyncio.sleep(1)
   finally:
+    await clear_sampler_ready(store, model_id, instance_id)
     if time_slicer is not None:
       assert workload is not None
       try:
@@ -497,10 +667,13 @@ async def run_sampling_worker(model_id: str) -> None:
         os._exit(0)
 
 
+@chz.chz
+class SamplerArgs:
+  model_id: str = chz.field(doc="Model id whose sampling queue this worker drains.")
+
+
 def main() -> None:
-  parser = argparse.ArgumentParser(description="Open-RL vLLM Pull-Mode Sampler Worker")
-  parser.add_argument("--model-id", type=str, required=True, help="The model ID of the RL job to process requests for")
-  args = parser.parse_args()
+  args = chz.entrypoint(SamplerArgs, allow_hyphens=True)
 
   try:
     asyncio.run(run_sampling_worker(args.model_id))

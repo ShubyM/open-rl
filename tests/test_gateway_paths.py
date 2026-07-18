@@ -14,6 +14,9 @@ class GetInfoTest(unittest.TestCase):
     patcher = patch.object(gateway, "store", InMemoryStore())
     patcher.start()
     self.addCleanup(patcher.stop)
+    get_store_patcher = patch.object(gateway, "get_store", return_value=gateway.store)
+    get_store_patcher.start()
+    self.addCleanup(get_store_patcher.stop)
 
   def test_get_info_uses_base_model_env(self) -> None:
     with patch.dict(os.environ, {"BASE_MODEL": "env-model"}, clear=True):

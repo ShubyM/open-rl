@@ -19,6 +19,24 @@ class CheckpointRestorer(Protocol):
     pass
 
 
+class NoopCheckpointRestorer:
+  """Keep lease scheduling active without checkpointing the process.
+
+  This backend is intended for local control-plane development where CUDA
+  checkpoint/restore (or llm-d) is unavailable. Workers still invoke their
+  normal lifecycle hooks before releasing the lease, but this backend does not
+  promise process suspension or memory eviction. Returning False tells
+  SingleNodeTimeSlicer that no later restore is necessary.
+  """
+
+  def checkpoint(self, workload: WorkloadRef) -> bool:
+    logger.info("noop checkpoint for workload=%s", workload.key)
+    return False
+
+  def restore(self, workload: WorkloadRef) -> None:
+    logger.info("noop restore for workload=%s", workload.key)
+
+
 class CudaCheckpointRestorer:
   def __init__(self, cuda_checkpoint_bin: str | None = None, timeout_ms: int | None = None):
     self.cuda_checkpoint_bin = cuda_checkpoint_bin or os.getenv("CUDA_CHECKPOINT_BIN", "cuda-checkpoint")

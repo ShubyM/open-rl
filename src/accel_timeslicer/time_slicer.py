@@ -30,6 +30,8 @@ class TimeSlicer(Protocol):
 
   async def unregister(self, workload: WorkloadRef) -> dict[str, Any]: ...
 
+  async def status(self) -> dict[str, Any]: ...
+
 
 class SocketTimeSlicerClient:
   def __init__(
@@ -65,6 +67,9 @@ class SocketTimeSlicerClient:
 
   async def unregister(self, workload: WorkloadRef) -> dict[str, Any]:
     return await self.request({"command": "UNREGISTER", **workload.as_payload()})
+
+  async def status(self) -> dict[str, Any]:
+    return await self.request({"command": "STATUS"})
 
   @asynccontextmanager
   async def acquire(self, workload: WorkloadRef) -> AsyncIterator[None]:
