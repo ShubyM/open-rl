@@ -159,7 +159,7 @@ template in `05-worker-pod-template.yaml`. It stamps:
   `timeslice.io/job-id`) used by physical pod discovery
 - `OPEN_RL_TIME_SLICE_JOB_ID`, aligned with the `timeslice.io/job-id` label
 - `OPEN_RL_TIME_SLICE_GROUP`, aligned with the `timeslice.io/group` label
-- `--model-id <model_id>`, so the worker drains only its own queue
+- `model_id=<model_id>`, so the worker drains only its own queue
 
 The gateway still has a local subprocess launcher for VM development. Select the
 cluster launcher with `OPEN_RL_WORKER_MANAGER=kubernetes`.
@@ -171,16 +171,16 @@ OpenRL accelerator time-slicer on each trainer or sampler GPU node:
 
 ```yaml
 hostNetwork: true
-command: ["uv", "run", "python", "-m", "accel_timeslicer.serve"]
+command: ["uv", "run", "--no-sync", "python", "-m", "accel_timeslicer.serve"]
 args:
-  ["--listen-host", "0.0.0.0", "--port", "9753",
-   "--backend", "llmd", "--llmd-snapshot-endpoint", "127.0.0.1:9001"]
+  ["listen_host=0.0.0.0", "port=9753", "backend=llmd",
+   "llmd_snapshot_endpoint=127.0.0.1:9001"]
 ```
 
 The dynamically launched trainer worker pods run the normal training processor:
 
 ```yaml
-command: ["uv", "run", "python", "-m", "server.training_requests_processor"]
+command: ["uv", "run", "--no-sync", "python", "-m", "server.training_requests_processor"]
 ```
 
 The training processor uses:
@@ -309,8 +309,7 @@ To build and deploy the official `llmd-snapshot-agent` DaemonSet on GPU nodes:
 ## Setup 2: Build, push, and deploy OpenRL
 
 ```bash
-make build-images push-images
-make deploy-fft-timeslice
+make push-to-cluster GCP_PROJECT=<project>
 ```
 
 `k8s/deploy/distributed-fft-timeslice/` deploys Redis, the shared PVC, the
@@ -344,12 +343,26 @@ When multiple training jobs share physical GPUs via the Accelerator Time-Slicer,
 ### DCGM GPU Observability
 The Kustomize rollout includes `10-dcgm-monitoring.yaml`, deploying the NVIDIA DCGM Exporter DaemonSet and a Google Cloud Monitoring `PodMonitoring` custom resource to scrape GPU utilization, VRAM usage, clock speeds, and temperature metrics every 10 seconds.
 
+After that initial image deployment, ordinary Python edits use the shared PVC
+instead of rebuilding the GPU image:
+
+```bash
+uv run --no-sync openrl deploy
+```
+
+Use `--reset-workers` only when intentionally ending active development runs.
+
 ## Setup 3: Run training on the cluster
 
 ```bash
-kubectl port-forward svc/open-rl-gateway-service 8000:8000 &
-make test e2e fft-gsm8k BASE_URL=http://127.0.0.1:8000
+uv run --no-sync openrl launch examples/tiny/tiny_rl.py \
+  --image <client-image> \
+  --args 'base_model=Qwen/Qwen2.5-0.5B steps=1 save_final_state=false'
 ```
+
+The recipe runs inside Kubernetes and reaches the gateway through service DNS.
+A port-forward is optional for opening `/control/` in a local browser or for
+running a recipe from your workstation.
 
 ## Troubleshooting
 

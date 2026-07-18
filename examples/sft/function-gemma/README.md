@@ -13,14 +13,15 @@ This guide shows how to run the local FunctionGemma SFT demo.
 2. **Accept the model terms**: [google/functiongemma-270m-it](https://huggingface.co/google/functiongemma-270m-it)
 3. **Authenticate with Hugging Face** (required for gated models):
    ```bash
-   uv run hf auth login
+   uv run --no-sync hf auth login
    ```
 
 ## Running the Training Server
 
 Start the local server preloaded with FunctionGemma:
 ```bash
-make server BASE_MODEL=google/functiongemma-270m-it
+BASE_MODEL=google/functiongemma-270m-it SAMPLING_BACKEND=torch \
+  uv run --no-sync python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 ## Running the SFT Script
@@ -28,7 +29,7 @@ make server BASE_MODEL=google/functiongemma-270m-it
 Execute the training script:
 ```bash
 cd examples/sft/function-gemma
-uv run python functiongemma_sft.py
+uv run --no-sync python functiongemma_sft.py
 ```
 
 ## Contents

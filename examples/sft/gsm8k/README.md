@@ -16,6 +16,13 @@ worker shares requests and futures with the gateway through Redis.
 
 Start from the repository root in separate terminals.
 
+Install both environments once:
+
+```bash
+uv sync --extra gpu
+uv --project examples sync
+```
+
 ### Terminal 1: Redis
 
 ```bash
@@ -29,13 +36,13 @@ REDIS_URL=redis://127.0.0.1:6379 \
 OPEN_RL_ENABLE_FFT=true \
 BASE_MODEL=Qwen/Qwen2.5-0.5B \
 SAMPLING_BACKEND=torch \
-uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
+uv run --no-sync python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 ### Terminal 3: SFT Job
 
 ```bash
-uv --project examples run python examples/sft/gsm8k/gsm8k_sft.py \
+uv --project examples run --no-sync python examples/sft/gsm8k/gsm8k_sft.py \
   --log-path=examples/sft/gsm8k/artifacts/job_a \
   --max-steps=20 \
   --base-model=Qwen/Qwen2.5-0.5B

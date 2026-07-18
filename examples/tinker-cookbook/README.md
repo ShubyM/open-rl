@@ -11,6 +11,8 @@ Assuming you have cloned this repository, install the example dependencies:
 ```bash
 cd examples
 uv sync
+cd ..
+uv sync --extra gpu --extra vllm
 ```
 
 If you want to try other recipes, you may need to install other extras or dependencies.
@@ -21,7 +23,7 @@ From the repository root, start one vLLM sampler and one OpenRL gateway on
 separate GPUs. These examples are written for two L4 GPUs or better.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 BASE_MODEL="Qwen/Qwen3-1.7B" uv run --extra vllm python -m server.vllm_sampler
+CUDA_VISIBLE_DEVICES=0 BASE_MODEL="Qwen/Qwen3-1.7B" uv run --no-sync python -m server.vllm_sampler
 ```
 
 In another shell:
@@ -32,7 +34,7 @@ BASE_MODEL="Qwen/Qwen3-1.7B" \
 SAMPLING_BACKEND=vllm \
 VLLM_URL=http://127.0.0.1:8001 \
 TINKER_API_KEY=tml-dummy-key \
-uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
+uv run --no-sync python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 CPU mode is useful for tiny model fixtures, but Qwen-sized cookbook runs should
@@ -48,7 +50,7 @@ OpenRL does not yet implement full Tinker-compatible durable checkpoint manageme
 
 ```bash
 cd examples
-TINKER_API_KEY=tml-dummy-key uv run python -m tinker_cookbook.recipes.sl_loop \
+TINKER_API_KEY=tml-dummy-key uv run --no-sync python -m tinker_cookbook.recipes.sl_loop \
   base_url=http://127.0.0.1:9003 \
   model_name="Qwen/Qwen3-1.7B" \
   log_path=artifacts/tinker-cookbook/sl_loop \
@@ -63,7 +65,7 @@ TINKER_API_KEY=tml-dummy-key uv run python -m tinker_cookbook.recipes.sl_loop \
 
 ```bash
 cd examples
-TINKER_API_KEY=tml-dummy-key TINKER_BASE_URL=http://127.0.0.1:9003 TINKER_TELEMETRY=0 uv run python -m tinker_cookbook.recipes.preference.shorter.train \
+TINKER_API_KEY=tml-dummy-key TINKER_BASE_URL=http://127.0.0.1:9003 TINKER_TELEMETRY=0 uv run --no-sync python -m tinker_cookbook.recipes.preference.shorter.train \
   model_name="Qwen/Qwen3-1.7B" \
   batch_size=4 \
   group_size=4 \

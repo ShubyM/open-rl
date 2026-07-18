@@ -131,7 +131,8 @@ def require_server(base_url: str, expected_model: str | None = None) -> dict[str
     capabilities = response.json()
   except Exception as exc:
     raise RuntimeError(
-      f"Open-RL server at {base_url} is not reachable.\nStart it with:  make server BASE_MODEL={expected_model or '<model-id>'}"
+      f"Open-RL server at {base_url} is not reachable.\nStart it with:  "
+      f"BASE_MODEL={expected_model or '<model-id>'} uv run --no-sync python -m uvicorn server.gateway:app --port 9003"
     ) from exc
 
   server_model = capabilities.get("default_model")
@@ -139,7 +140,7 @@ def require_server(base_url: str, expected_model: str | None = None) -> dict[str
     raise RuntimeError(
       f"Open-RL server at {base_url} is running {server_model!r}, "
       f"but this recipe expects {expected_model!r}.\n"
-      f"Restart the server with:  make server BASE_MODEL={expected_model}"
+      f"Restart it with:  BASE_MODEL={expected_model} uv run --no-sync python -m uvicorn server.gateway:app --port 9003"
     )
   return capabilities
 

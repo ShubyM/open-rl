@@ -48,7 +48,11 @@ Ensure you have the required build tools, Python headers, and `uv` installed on 
 sudo apt update && sudo apt install -y build-essential python3.12-dev make
 # Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync --extra gpu --extra vllm
 ```
+
+The sync is the one environment-selection step. The service commands below use
+`--no-sync`, so restarting a process never resolves or reinstalls dependencies.
 
 ### 4. Sanity Check
 
@@ -67,7 +71,7 @@ All commands below assume you are in the **repository root** directory.
 Patch vLLM `0.20.0` for Gemma 4 LoRA support.
 
 ```bash
-uv run --extra vllm python src/server/scripts/patch_vllm_lora_dedup.py
+uv run --no-sync python src/server/scripts/patch_vllm_lora_dedup.py
 ```
 
 ### 2. Start the vLLM Sampler
@@ -81,7 +85,7 @@ export VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM
 
 # Recommended to avoid Hugging Face rate limits
 # export HF_TOKEN="your_huggingface_token"
-make vllm
+uv run --no-sync python -m server.vllm_sampler
 ```
 
 ### 3. Start the OpenRL Server
@@ -92,7 +96,8 @@ In a **second terminal session**, start the OpenRL gateway and trainer on GPU 1:
 export CUDA_VISIBLE_DEVICES=1
 export BASE_MODEL=google/gemma-4-e2b
 export SAMPLING_BACKEND=vllm
-make server
+uv run --no-sync python -m uvicorn server.gateway:app \
+  --host 127.0.0.1 --port 9003
 ```
 
 The OpenRL server is now available at `http://127.0.0.1:9003`.

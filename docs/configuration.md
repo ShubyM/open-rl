@@ -15,9 +15,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Start the API server and trainer with the default torch sampling backend:
 
 ```bash
+uv sync --extra cpu
 BASE_MODEL=google/gemma-4-e2b \
 SAMPLING_BACKEND=torch \
-uv run --extra cpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
+uv run --no-sync python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 Because `REDIS_URL` is unset, this starts the API server and trainer loop in one
@@ -26,11 +27,14 @@ process on the same workstation or VM.
 For a separate vLLM sampler, use two terminals:
 
 ```bash
+# Run once on this GPU machine.
+uv sync --extra gpu --extra vllm
+
 # Terminal 1: vLLM sampler
 BASE_MODEL=google/gemma-4-e2b \
 VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM \
 CUDA_VISIBLE_DEVICES=0 \
-uv run --extra vllm python -m server.vllm_sampler
+uv run --no-sync python -m server.vllm_sampler
 ```
 
 ```bash
@@ -38,15 +42,7 @@ uv run --extra vllm python -m server.vllm_sampler
 BASE_MODEL=google/gemma-4-e2b \
 SAMPLING_BACKEND=vllm \
 CUDA_VISIBLE_DEVICES=1 \
-uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
-```
-
-The equivalent Makefile shortcuts are:
-
-```bash
-make server BASE_MODEL=google/gemma-4-e2b
-VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make vllm BASE_MODEL=google/gemma-4-e2b
-make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
+uv run --no-sync python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 ## Core variables
@@ -116,7 +112,7 @@ uv run uvicorn server.gateway:app --host 0.0.0.0 --port 8000
 # Trainer worker pod
 REDIS_URL=redis://redis-service:6379 \
 BASE_MODEL=google/gemma-4-e2b \
-uv run python -m server.training_requests_processor
+uv run --no-sync python -m server.training_requests_processor
 ```
 
 ```bash

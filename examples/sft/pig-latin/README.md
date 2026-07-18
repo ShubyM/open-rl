@@ -16,13 +16,15 @@ This script demonstrates fine-tuning a model to translate English into Pig Latin
 ### Option 1: Qwen (Default)
 Start the local single-process OpenRL server for Qwen (`BASE_MODEL` defaults to `Qwen/Qwen3-0.6B`):
 ```bash
-make server
+BASE_MODEL=Qwen/Qwen3-0.6B SAMPLING_BACKEND=torch \
+  uv run --no-sync python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 ### Option 2: Gemma
 Start the local single-process OpenRL server for Gemma (set `BASE_MODEL`):
 ```bash
-make server BASE_MODEL=google/gemma-3-1b-it
+BASE_MODEL=google/gemma-3-1b-it SAMPLING_BACKEND=torch \
+  uv run --no-sync python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 ## Running the SFT Script
@@ -30,13 +32,13 @@ make server BASE_MODEL=google/gemma-3-1b-it
 ### Option 1: Qwen
 ```bash
 cd examples/sft/pig-latin
-uv run python piglatin_sft.py qwen
+uv run --no-sync python piglatin_sft.py qwen
 ```
 
 ### Option 2: Gemma
 ```bash
 cd examples/sft/pig-latin
-uv run python piglatin_sft.py gemma
+uv run --no-sync python piglatin_sft.py gemma
 ```
 
 ## Contents

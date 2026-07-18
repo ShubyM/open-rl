@@ -17,7 +17,8 @@ Text-to-SQL tasks using OpenRL. The Gemma 4 SFT+RL recipe lives under
 
 Start the local single-process OpenRL server:
 ```bash
-make server BASE_MODEL=google/gemma-3-1b-pt
+BASE_MODEL=google/gemma-3-1b-pt SAMPLING_BACKEND=torch \
+  uv run --no-sync python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
 ```
 
 ## Running the SFT Script
@@ -25,7 +26,7 @@ make server BASE_MODEL=google/gemma-3-1b-pt
 Execute the training script:
 ```bash
 cd examples/sft/text-to-sql
-uv run python texttosql_sft.py gemma
+uv run --no-sync python texttosql_sft.py gemma
 ```
 
 ## Contents

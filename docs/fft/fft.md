@@ -284,14 +284,26 @@ The following environment variables govern multi-tenant GPU execution across Gat
 | `VLLM_GPU_MEMORY_UTILIZATION=0.70` | Sampler Worker | Configures vLLM pre-allocated KV cache ceiling, leaving headroom for cooperative memory swapping. |
 | `OPEN_RL_ACCEL_TIMESLICER_HOST` | Workers | Target IP (`status.hostIP`) of the node-local time-slicer daemon controlling hardware locks. |
 
-### Reference E2E Invocation Commands
-To execute single-job FFT RL benchmark verification:
+### Contract and Benchmark Commands
+
+The distributed pytest contract assumes the platform is already running. It
+launches one bounded tiny-RL recipe and verifies the public deployment path:
+
 ```bash
-make test e2e tiny-fft-rl TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=0 sampler_gpu=1 steps=10"
+uv --project examples sync
+OPENRL_BASE_URL=http://127.0.0.1:9003 \
+  uv run --no-sync pytest -m distributed tests/test_distributed_contract.py -s
 ```
-To execute concurrent dual-job time-slicing verification:
+
+Concurrent time-slicing is a benchmark, not another branch in a test fixture.
+Launch two normal jobs, then inspect their placement, events, logs, and GPU use
+through the same control plane an agent uses:
+
 ```bash
-make test e2e tiny-fft-rl-x2 TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=0 sampler_gpu=1 steps=5"
+openrl launch examples/tiny/tiny_rl.py --args 'steps=5 save_final_state=false'
+openrl launch examples/tiny/tiny_rl.py --args 'steps=5 save_final_state=false'
+openrl runs --json
+openrl problems --json
 ```
 
 ---

@@ -18,7 +18,8 @@ async def require_server(service_client: tinker.ServiceClient, base_url: str, ex
     capabilities = await service_client.get_server_capabilities_async()
   except Exception as exc:
     raise RuntimeError(
-      f"Open-RL server at {base_url} is not reachable.\nStart it with:  make server BASE_MODEL={expected_model or '<model-id>'}"
+      f"Open-RL server at {base_url} is not reachable.\nStart it with:  "
+      f"BASE_MODEL={expected_model or '<model-id>'} uv run --no-sync python -m uvicorn server.gateway:app --port 9003"
     ) from exc
 
   model_names = [model.model_name for model in capabilities.supported_models if getattr(model, "model_name", None)]
@@ -28,7 +29,7 @@ async def require_server(service_client: tinker.ServiceClient, base_url: str, ex
     raise RuntimeError(
       f"Open-RL server at {base_url} is running {server_model!r}, "
       f"but this recipe expects {expected_model!r}.\n"
-      f"Restart the server with:  make server BASE_MODEL={expected_model}"
+      f"Restart it with:  BASE_MODEL={expected_model} uv run --no-sync python -m uvicorn server.gateway:app --port 9003"
     )
   return server_model
 
