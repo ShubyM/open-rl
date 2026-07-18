@@ -160,11 +160,19 @@ class _FutureStoreStub:
   def __init__(self, events=None):
     self.results = {}
     self.events = events
+    self.futures = self
+    self.models = self
 
-  async def set_future(self, req_id, result):
+  async def resolve(self, req_id, result):
     if self.events is not None:
-      self.events.append(("set_future", req_id))
+      self.events.append(("resolve_future", req_id))
     self.results[req_id] = result
+
+  async def get(self, model_id: str) -> dict | None:
+    return None
+
+  def get_sync(self, model_id: str) -> dict | None:
+    return None
 
 
 class _TrainingRequestsStoreStub(_FutureStoreStub):
@@ -172,18 +180,13 @@ class _TrainingRequestsStoreStub(_FutureStoreStub):
     super().__init__(events=events)
     self.batches = list(batches)
     self.queried_model_ids = []
+    self.commands = self
 
-  async def get_requests_for_model(self, model_id):
+  async def dequeue_training_for_model(self, model_id):
     self.queried_model_ids.append(model_id)
     if self.batches:
       return self.batches.pop(0)
     raise asyncio.CancelledError()
-
-  async def get_value(self, key: str) -> str | None:
-    return None
-
-  def get_value_sync(self, key: str) -> str | None:
-    return None
 
 
 class _TimeSlicerStub:
@@ -535,7 +538,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
       await processor.run_once()
 
-    self.assertEqual([event[0] for event in events], ["acquire", "release", "set_future"])
+    self.assertEqual([event[0] for event in events], ["acquire", "release", "resolve_future"])
     self.assertEqual(store.results["req-a"]["type"], "model_created")
 
 

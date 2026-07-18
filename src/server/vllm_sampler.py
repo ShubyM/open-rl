@@ -291,10 +291,10 @@ async def process_sampling_request(req: dict, store: Any) -> None:
       if result.get("type") != "RequestFailedResponse":
         result["type"] = "sample"
 
-      await store.set_future(request_id, result)
+      await store.futures.resolve(request_id, result)
     except Exception as exc:
       traceback.print_exc()
-      await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(exc)}"})
+      await store.futures.resolve(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(exc)}"})
 
 
 async def weight_prefetcher_loop(model_id: str, store: Any) -> None:
@@ -440,7 +440,7 @@ async def run_sampling_worker(model_id: str) -> None:
   try:
     while True:
       try:
-        batch = await store.get_sampling_requests_for_model(model_id)
+        batch = await store.commands.dequeue_sampling_for_model(model_id)
         if not batch:
           await asyncio.sleep(0.05)
           continue

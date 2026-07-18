@@ -29,16 +29,12 @@ def _py_cmd(extras: list[str], module: str, model_id: str) -> list[str]:
 
 def _fetch_metadata_from_store(model_id: str) -> tuple[str | None, str | None]:
   """Retrieve base_model and weight_sync_strategy from canonical open_rl:model_meta:<model_id>."""
-  import json
-
   from server.store import get_store
 
   try:
-    val = get_store().get_value_sync(f"open_rl:model_meta:{model_id}")
-    if val:
-      meta = json.loads(val) if isinstance(val, str) else val
-      if isinstance(meta, dict):
-        return meta.get("base_model"), meta.get("weight_sync_strategy")
+    meta = get_store().models.get_sync(model_id)
+    if isinstance(meta, dict):
+      return meta.get("base_model"), meta.get("weight_sync_strategy")
   except Exception:
     pass
   return None, None

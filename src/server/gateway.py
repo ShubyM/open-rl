@@ -1,7 +1,6 @@
 # This file contains the FastAPI server entry point and request handlers for the Open-RL API backend.
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -154,7 +153,7 @@ async def _extract_and_persist_model_metadata(
     full_config=full_config,
     lora_config=lora_config,
   )
-  await store.set_value(f"open_rl:model_meta:{model_id}", json.dumps(asdict(meta_obj)))
+  await store.models.put(model_id, asdict(meta_obj))
 
   return model_id
 
@@ -180,8 +179,8 @@ async def enqueue(request: dict) -> str:
   request_id = request["request_id"]
   carrier: dict = {}
   propagate.inject(carrier)
-  await store.set_future(request_id, {"status": "pending"})
-  await store.put_request({**request, "trace_context": carrier})
+  await store.futures.mark_pending(request_id)
+  await store.commands.enqueue_training({**request, "trace_context": carrier})
   return request_id
 
 
@@ -195,12 +194,12 @@ async def launch_worker_and_enqueue(request: dict) -> str:
   """
   assert fft_worker_manager is not None, "FFT worker manager is initialized by the app lifespan when FFT is enabled"
   request_id = request["request_id"]
-  await store.set_future(request_id, {"status": "pending"})
+  await store.futures.mark_pending(request_id)
   try:
     await asyncio.to_thread(fft_worker_manager.launch_trainer, request["model_id"])
   except Exception as exc:
     traceback.print_exc()
-    await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
+    await store.futures.resolve(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
     return request_id
   return await enqueue(request)
 
@@ -373,9 +372,9 @@ async def delete_model(req: dict):
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
   if is_fft_enabled():
     print(f"[GATEWAY] Requesting shutdown of workers for model {model_id}...")
-    await store.put_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
-    await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
-  await store.delete_values(f"open_rl:model_meta:{model_id}")
+    await store.commands.enqueue_training({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
+    await store.commands.enqueue_sampling({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
+  await store.models.delete(model_id)
   return {"status": "ok"}
 
 
@@ -434,7 +433,7 @@ async def retrieve_future(req: dict):
   if not request_id:
     return JSONResponse(status_code=400, content={"error": "request_id is required"})
 
-  result = await store.get_future(request_id, timeout=60.0)
+  result = await store.futures.wait(request_id, timeout=60.0)
   if result is None:
     return JSONResponse(status_code=400, content={"type": "RequestFailedResponse", "error_message": "Future not found"})
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
@@ -660,7 +659,7 @@ async def asample(req: dict):
   req_id = str(uuid.uuid4())
   carrier: dict = {}
   propagate.inject(carrier)
-  await store.set_future(req_id, {"status": "pending"})
+  await store.futures.mark_pending(req_id)
 
   if is_fft_enabled():
     rel_path = model_id[len("tinker://") :] if model_id.startswith("tinker://") else model_id.lstrip("/")
@@ -690,7 +689,7 @@ async def asample(req: dict):
     "trace_context": carrier,
   }
 
-  await store.put_sampling_request(sampling_req)
+  await store.commands.enqueue_sampling(sampling_req)
   return {"request_id": req_id}
 
 

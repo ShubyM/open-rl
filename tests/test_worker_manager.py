@@ -5,26 +5,44 @@ from server import gateway
 from server.worker_manager import FFTWorkerManager
 
 
-class StoreStub:
+class CommandsStub:
   def __init__(self):
     self.forwarded_requests = []
-    self.futures = {}
-    self.kv_store = {}
 
-  async def put_request(self, req_data: dict) -> None:
+  async def enqueue_training(self, req_data: dict) -> None:
     self.forwarded_requests.append(req_data)
 
-  async def set_future(self, req_id: str, result: dict) -> None:
-    self.futures[req_id] = result
 
-  async def set_value(self, key: str, value: str) -> None:
-    self.kv_store[key] = value
+class FuturesStub:
+  def __init__(self):
+    self.results = {}
 
-  async def get_value(self, key: str) -> str | None:
-    return self.kv_store.get(key)
+  async def mark_pending(self, req_id: str) -> None:
+    self.results[req_id] = {"status": "pending"}
 
-  def get_value_sync(self, key: str) -> str | None:
-    return self.kv_store.get(key)
+  async def resolve(self, req_id: str, result: dict) -> None:
+    self.results[req_id] = result
+
+
+class ModelsStub:
+  def __init__(self):
+    self.records = {}
+
+  async def put(self, model_id: str, metadata: dict) -> None:
+    self.records[model_id] = metadata
+
+  async def get(self, model_id: str) -> dict | None:
+    return self.records.get(model_id)
+
+  def get_sync(self, model_id: str) -> dict | None:
+    return self.records.get(model_id)
+
+
+class StoreStub:
+  def __init__(self):
+    self.commands = CommandsStub()
+    self.futures = FuturesStub()
+    self.models = ModelsStub()
 
 
 class WorkerManagerStub:
@@ -73,19 +91,17 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     gateway.fft_worker_manager = self.old_manager
 
   async def test_create_model_launches_worker_then_enqueues(self) -> None:
-    import json
-
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
       result = await gateway.create_model({"base_model": "base-model"})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
-    self.assertEqual(len(self.store.forwarded_requests), 1)
-    request = self.store.forwarded_requests[0]
+    self.assertEqual(len(self.store.commands.forwarded_requests), 1)
+    request = self.store.commands.forwarded_requests[0]
     self.assertEqual(request["op"], "create_model")
     self.assertEqual(request["model_id"], model_id)
     self.assertEqual(request["payload"], {})
-    meta = json.loads(self.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    meta = self.store.models.get_sync(model_id)
     self.assertEqual(meta["base_model"], "base-model")
 
   async def test_create_model_failed_launch_fails_future_and_enqueues_nothing(self) -> None:
@@ -96,12 +112,10 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
-    self.assertEqual(self.store.forwarded_requests, [])
-    self.assertEqual(self.store.futures[model_id], {"type": "RequestFailedResponse", "error_message": "boom"})
+    self.assertEqual(self.store.commands.forwarded_requests, [])
+    self.assertEqual(self.store.futures.results[model_id], {"type": "RequestFailedResponse", "error_message": "boom"})
 
   async def test_create_model_from_state_launches_worker_then_enqueues(self) -> None:
-    import json
-
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
       result = await gateway.create_model_from_state(
         {
@@ -114,32 +128,28 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
-    self.assertEqual(len(self.store.forwarded_requests), 1)
-    req_forwarded = self.store.forwarded_requests[0]
+    self.assertEqual(len(self.store.commands.forwarded_requests), 1)
+    req_forwarded = self.store.commands.forwarded_requests[0]
     self.assertEqual(req_forwarded["op"], "create_model_from_state")
     self.assertEqual(req_forwarded["payload"]["state_path"], "/tmp/checkpoint")
     self.assertTrue(req_forwarded["payload"]["restore_optimizer"])
 
     # Assert canonical metadata persistence:
-    meta = json.loads(self.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    meta = self.store.models.get_sync(model_id)
     self.assertEqual(meta["base_model"], "restored-base")
     self.assertEqual(meta["training_kind"], "restored")
     self.assertEqual(meta["full_config"]["weight_sync_strategy"], "delta")
 
-    # Assert no dual-key writing:
-    self.assertIsNone(self.store.get_value_sync(f"open_rl:model_base:{model_id}"))
+    # Assert one canonical metadata record was written for this model.
+    self.assertEqual(set(self.store.models.records), {model_id})
 
   async def test_ensure_sampler_launched_delegates_to_worker_manager_with_model_id(self) -> None:
-    import json
-
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}):
-      self.store.kv_store["open_rl:model_meta:model-x"] = json.dumps(
-        {
-          "base_model": "base-vllm",
-          "weight_sync_strategy": "delta",
-          "training_kind": "full",
-        }
-      )
+      self.store.models.records["model-x"] = {
+        "base_model": "base-vllm",
+        "weight_sync_strategy": "delta",
+        "training_kind": "full",
+      }
       await gateway.ensure_sampler_launched("model-x")
 
     self.assertEqual(self.worker_manager.launched_sampler_model_ids, ["model-x"])
@@ -149,7 +159,7 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
       await gateway.create_model({"base_model": "base-model"})
 
     self.assertEqual(self.worker_manager.launched_model_ids, [])
-    self.assertEqual(len(self.store.forwarded_requests), 1)
+    self.assertEqual(len(self.store.commands.forwarded_requests), 1)
 
 
 class GatewayLifespanTest(unittest.IsolatedAsyncioTestCase):
@@ -194,17 +204,16 @@ class FFTWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "samplers")
 
   async def test_launch_fetches_metadata_from_store(self) -> None:
-    import json
-
     from server.store import InMemoryStore
 
     s = InMemoryStore()
-    s.kv_store["open_rl:model_meta:Model_A.1"] = json.dumps(
+    await s.models.put(
+      "Model_A.1",
       {
         "base_model": "base-model-a",
         "weight_sync_strategy": "delta",
         "training_kind": "full",
-      }
+      },
     )
 
     with (
@@ -235,8 +244,6 @@ class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     gateway.store = self.old_store
 
   async def test_extract_and_persist_metadata_from_headers(self) -> None:
-    import json
-
     from fastapi import Request
 
     scope = {
@@ -253,9 +260,8 @@ class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
       default_training_kind="full",
     )
 
-    meta_val = self.store.kv_store.get(f"open_rl:model_meta:{model_id}")
-    self.assertIsNotNone(meta_val)
-    meta_dict = json.loads(meta_val)
+    meta_dict = self.store.models.get_sync(model_id)
+    self.assertIsNotNone(meta_dict)
     self.assertEqual(meta_dict["base_model"], "Qwen/Qwen2.5-0.5B")
     self.assertEqual(meta_dict["training_kind"], "lora")
     self.assertEqual(meta_dict["weight_sync_strategy"], "delta")

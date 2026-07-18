@@ -66,17 +66,17 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     await self.store.redis.aclose()
 
   async def test_get_future_returns_already_resolved_result(self) -> None:
-    await self.store.set_future("req-1", {"type": "sample", "ok": True})
-    self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample", "ok": True})
+    await self.store.futures.resolve("req-1", {"type": "sample", "ok": True})
+    self.assertEqual(await self.store.futures.wait("req-1", timeout=1.0), {"type": "sample", "ok": True})
 
   async def test_get_future_wakes_on_resolution(self) -> None:
     async def resolve_later() -> None:
       await asyncio.sleep(0.2)
-      await self.store.set_future("req-1", {"type": "sample"})
+      await self.store.futures.resolve("req-1", {"type": "sample"})
 
     resolver = asyncio.create_task(resolve_later())
     started = time.monotonic()
-    result = await self.store.get_future("req-1", timeout=10.0)
+    result = await self.store.futures.wait("req-1", timeout=10.0)
     await resolver
 
     self.assertEqual(result, {"type": "sample"})
@@ -84,21 +84,46 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     self.assertLess(time.monotonic() - started, 5.0)
 
   async def test_result_survives_repeated_and_concurrent_reads(self) -> None:
-    waiters = [asyncio.create_task(self.store.get_future("req-1", timeout=10.0)) for _ in range(5)]
+    waiters = [asyncio.create_task(self.store.futures.wait("req-1", timeout=10.0)) for _ in range(5)]
     await asyncio.sleep(0.2)
-    await self.store.set_future("req-1", {"type": "sample"})
+    await self.store.futures.resolve("req-1", {"type": "sample"})
 
     for result in await asyncio.gather(*waiters):
       self.assertEqual(result, {"type": "sample"})
-    self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample"})
+    self.assertEqual(await self.store.futures.wait("req-1", timeout=1.0), {"type": "sample"})
 
   async def test_unresolved_future_times_out_with_try_again(self) -> None:
-    result = await self.store.get_future("req-never", timeout=0.3)
+    result = await self.store.futures.wait("req-never", timeout=0.3)
     self.assertEqual(result["type"], "try_again")
 
   async def test_pending_markers_are_not_stored(self) -> None:
-    await self.store.set_future("req-1", {"status": "pending"})
-    self.assertEqual((await self.store.get_future("req-1", timeout=0.3))["type"], "try_again")
+    await self.store.futures.mark_pending("req-1")
+    self.assertEqual((await self.store.futures.wait("req-1", timeout=0.3))["type"], "try_again")
+
+  async def test_training_and_sampling_commands_use_separate_queues(self) -> None:
+    training = {"request_id": "train-1", "model_id": "model-a", "op": "optim_step"}
+    sampling = {"request_id": "sample-1", "model_id": "model-a", "prompt_token_ids": [1, 2]}
+
+    await self.store.commands.enqueue_training(training)
+    await self.store.commands.enqueue_sampling(sampling)
+
+    self.assertEqual(await self.store.commands.dequeue_training_for_model("model-a"), [training])
+    self.assertEqual(await self.store.commands.dequeue_sampling_for_model("model-a"), [sampling])
+
+  async def test_model_metadata_round_trips_through_named_boundary(self) -> None:
+    metadata = {
+      "base_model": "base-model",
+      "training_kind": "full",
+      "weight_sync_strategy": "delta",
+    }
+
+    await self.store.models.put("model-a", metadata)
+
+    self.assertEqual(await self.store.models.get("model-a"), metadata)
+    self.assertEqual(self.store.models.get_sync("model-a"), metadata)
+
+    await self.store.models.delete("model-a")
+    self.assertIsNone(await self.store.models.get("model-a"))
 
 
 if __name__ == "__main__":

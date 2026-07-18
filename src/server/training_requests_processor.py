@@ -48,7 +48,7 @@ class TrainingRequestsProcessor(Protocol):
   async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
     request_id, result = await self.handle_request(raw_request, model_id)
     if request_id is not None:
-      await self.store.set_future(request_id, result)
+      await self.store.futures.resolve(request_id, result)
 
   async def handle_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> tuple[str | None, dict[str, Any]]:
     request_id = raw_request.get("request_id")
@@ -122,15 +122,13 @@ async def _fetch_model_meta(
   payload: dict[str, Any],
   default_kind: str = "full",
 ) -> tuple[str, dict[str, Any], dict[str, Any], str]:
-  val = None
-  if hasattr(store, "get_value"):
+  meta = None
+  try:
+    meta = await store.models.get(model_id)
+  except Exception:
+    pass
+  if meta:
     try:
-      val = await store.get_value(f"open_rl:model_meta:{model_id}")
-    except Exception:
-      pass
-  if val:
-    try:
-      meta = json.loads(val) if isinstance(val, str) else val
       if isinstance(meta, dict):
         base_model = meta.get("base_model") or payload.get("base_model") or ""
         full_config = meta.get("full_config") or payload.get("full_config") or {}
@@ -166,7 +164,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
         await asyncio.sleep(1)
 
   async def run_once(self) -> None:
-    batch = await self.store.get_requests()
+    batch = await self.store.commands.dequeue_training()
     if not batch:
       await asyncio.sleep(0.1)
       return
@@ -327,7 +325,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         await self.time_slicer.close()
 
   async def run_once(self) -> None:
-    batch = await self.store.get_requests_for_model(self.model_id)
+    batch = await self.store.commands.dequeue_training_for_model(self.model_id)
     if not batch:
       await asyncio.sleep(0.1)
       return
@@ -372,7 +370,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
         for request_id, result in results:
           if request_id is not None:
-            await self.store.set_future(request_id, result)
+            await self.store.futures.resolve(request_id, result)
 
     if has_shutdown:
       await self.exit_gracefully()

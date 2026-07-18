@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import types
@@ -149,17 +150,18 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
       self._manager(api).launch("model-a")
 
   def test_launch_queries_model_metadata_for_pod_env(self) -> None:
-    import json
-
     from server.store import InMemoryStore
 
     s = InMemoryStore()
-    s.kv_store["open_rl:model_meta:Model_A.1"] = json.dumps(
-      {
-        "base_model": "gemma-4-k8s",
-        "weight_sync_strategy": "full",
-        "training_kind": "full",
-      }
+    asyncio.run(
+      s.models.put(
+        "Model_A.1",
+        {
+          "base_model": "gemma-4-k8s",
+          "weight_sync_strategy": "full",
+          "training_kind": "full",
+        },
+      )
     )
     api = _FakeCoreApi()
 

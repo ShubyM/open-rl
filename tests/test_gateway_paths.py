@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import tempfile
 import unittest
@@ -35,10 +34,10 @@ class GetInfoTest(unittest.TestCase):
   def test_create_model_accepts_base_model_payload(self) -> None:
     created = asyncio.run(gateway.create_model({"base_model": "my-model"}))
     model_id = created["request_id"]
-    queued = asyncio.run(gateway.store.get_requests())
+    queued = asyncio.run(gateway.store.commands.dequeue_training())
     self.assertEqual(queued[0]["model_id"], model_id)
     self.assertEqual(queued[0]["payload"], {})
-    meta = json.loads(gateway.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    meta = gateway.store.models.get_sync(model_id)
     self.assertEqual(meta["base_model"], "my-model")
 
 
