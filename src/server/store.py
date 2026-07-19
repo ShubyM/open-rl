@@ -47,6 +47,16 @@ class RequestStore(ABC):
     """Block until the future resolves or the timeout is reached."""
     pass
 
+  @abstractmethod
+  async def set_value(self, key: str, value: str, expires_seconds: int | None = None) -> None:
+    """Store a string value by key, optionally with a time to live."""
+    pass
+
+  @abstractmethod
+  async def get_value(self, key: str) -> str | None:
+    """Fetch a string value by key, returning None when absent or expired."""
+    pass
+
 
 class InMemoryStore(RequestStore):
   def __init__(self):
@@ -57,6 +67,8 @@ class InMemoryStore(RequestStore):
     self.active_tenants_cv = asyncio.Condition()
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, asyncio.Event] = {}
+    self.kv_store: dict[str, str] = {}
+    self.kv_expirations: dict[str, float] = {}
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -124,6 +136,20 @@ class InMemoryStore(RequestStore):
       return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
     finally:
       self.futures_events.pop(req_id, None)
+
+  async def set_value(self, key: str, value: str, expires_seconds: int | None = None) -> None:
+    self.kv_store[key] = value
+    if expires_seconds is None:
+      self.kv_expirations.pop(key, None)
+    else:
+      self.kv_expirations[key] = time.monotonic() + expires_seconds
+
+  async def get_value(self, key: str) -> str | None:
+    expires_at = self.kv_expirations.get(key)
+    if expires_at is not None and expires_at <= time.monotonic():
+      self.kv_store.pop(key, None)
+      self.kv_expirations.pop(key, None)
+    return self.kv_store.get(key)
 
 
 class RedisStore(RequestStore):
@@ -260,6 +286,12 @@ class RedisStore(RequestStore):
         await self.redis.rpush(key, result[1])
         await self.redis.expire(key, 300)
         return payload
+
+  async def set_value(self, key: str, value: str, expires_seconds: int | None = None) -> None:
+    await self.redis.set(key, value, ex=expires_seconds)
+
+  async def get_value(self, key: str) -> str | None:
+    return await self.redis.get(key)
 
 
 # Global singleton factory

@@ -16,6 +16,7 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from server.protocol import ClientSession, CreateSessionRequest, SessionHeartbeatRequest
 from server.store import get_store
 from server.worker_launch_processor import (
   FFTWorkerManager,
@@ -50,6 +51,7 @@ logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
+SESSION_KEY_PREFIX = "open_rl:session:"
 
 
 # *** Helpers ***
@@ -85,6 +87,30 @@ def checkpoint_state_path(model_id: str, name: str) -> str:
   if os.path.isabs(name):
     return name
   return os.path.join(TMP_DIR, "checkpoints", model_id, "weights", name)
+
+
+def session_ttl_seconds() -> int:
+  raw_ttl = os.getenv("OPEN_RL_SESSION_TTL_SECONDS", "300")
+  try:
+    ttl_seconds = int(raw_ttl)
+  except ValueError as exc:
+    raise ValueError("OPEN_RL_SESSION_TTL_SECONDS must be a positive integer") from exc
+  if ttl_seconds < 1:
+    raise ValueError("OPEN_RL_SESSION_TTL_SECONDS must be a positive integer")
+  return ttl_seconds
+
+
+def session_key(session_id: str) -> str:
+  return f"{SESSION_KEY_PREFIX}{session_id}"
+
+
+async def put_session(session: ClientSession, ttl_seconds: int) -> None:
+  await store.set_value(session_key(session.session_id), session.model_dump_json(), expires_seconds=ttl_seconds)
+
+
+async def get_session(session_id: str) -> ClientSession | None:
+  value = await store.get_value(session_key(session_id))
+  return ClientSession.model_validate_json(value) if value is not None else None
 
 
 def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
@@ -269,12 +295,38 @@ async def client_config(_: dict):
 
 
 @app.post("/api/v1/create_session")
-async def create_session(_: dict):
-  return {"session_id": "sess-real-123", "type": "create_session"}
+async def create_session(req: CreateSessionRequest):
+  try:
+    ttl_seconds = session_ttl_seconds()
+  except ValueError as exc:
+    return JSONResponse(status_code=500, content={"error": str(exc)})
+
+  now = time.time()
+  session = ClientSession(
+    session_id=f"sess-{uuid.uuid4().hex}",
+    created_at=now,
+    last_heartbeat=now,
+    tags=req.tags,
+    user_metadata=req.user_metadata,
+    sdk_version=req.sdk_version,
+    project_id=req.project_id,
+  )
+  await put_session(session, ttl_seconds)
+  return {"session_id": session.session_id, "type": "create_session"}
 
 
 @app.post("/api/v1/session_heartbeat")
-async def session_heartbeat(_: dict):
+async def session_heartbeat(req: SessionHeartbeatRequest):
+  try:
+    ttl_seconds = session_ttl_seconds()
+  except ValueError as exc:
+    return JSONResponse(status_code=500, content={"error": str(exc)})
+
+  session = await get_session(req.session_id)
+  if session is None:
+    return JSONResponse(status_code=404, content={"error": "session not found or expired"})
+  session.last_heartbeat = time.time()
+  await put_session(session, ttl_seconds)
   return {"type": "session_heartbeat"}
 
 
