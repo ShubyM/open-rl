@@ -54,6 +54,7 @@ Thumbs.db
 !examples/rl/text-to-sql/results/
 !examples/rl/text-to-sql/results/*.png
 !examples/tinker-cookbook/plots/*.png
+!docs/reports/**/*.png
 
 # Local benchmark run outputs
 runs/

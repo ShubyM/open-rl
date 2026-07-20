@@ -41,6 +41,9 @@ async def preflight(base_url: str) -> None:
     async with _client() as client:
       resp = await client.get(f"{base_url}/health", timeout=5.0)
       resp.raise_for_status()
+      # Resolve the served model now so a broken /v1/models (or an adapter-only
+      # listing) fails at startup instead of on the first sample call.
+      await _served_model_name(client, base_url)
   except Exception as exc:
     raise RuntimeError(
       f"SAMPLER_BASE_URL={base_url} is set but no vLLM server responds on {base_url}/health. "
@@ -54,7 +57,11 @@ async def _served_model_name(client: httpx.AsyncClient, base_url: str) -> str:
   if _served_model is None:
     resp = await client.get(f"{base_url}/v1/models")
     resp.raise_for_status()
-    model_data = resp.json()["data"][0]
+    models = resp.json()["data"]
+    # Runtime-loaded LoRA adapters appear as extra entries without a
+    # max_model_len; the base model is the one that has it.
+    base_entries = [m for m in models if m.get("max_model_len")]
+    model_data = base_entries[0] if base_entries else models[0]
     _served_model = model_data["id"]
     _served_max_model_len = model_data.get("max_model_len")
   return _served_model
@@ -153,7 +160,8 @@ async def sample(req: dict) -> dict:
       _loaded_adapters.discard(lora_id)
       await _ensure_adapter_loaded(client, base_url, lora_id, lora_path, req.get("model_id"))
       resp = await client.post(f"{base_url}/v1/completions", json=body)
-    resp.raise_for_status()
+    if resp.status_code != 200:
+      raise RuntimeError(f"External sampler /v1/completions returned {resp.status_code}: {resp.text}")
     data = resp.json()
 
     sequences = []

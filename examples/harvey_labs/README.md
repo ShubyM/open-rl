@@ -8,8 +8,9 @@ sandbox tools, and rubric reward.
 
 ## Layout
 
-- `train.py` — run config and entrypoint.
-- `tasks.py` — training/eval task pools and task loading.
+- `train.py` — run config and entrypoint (with grading preflight and final eval).
+- `tasks.py` — task discovery, loading, and the seeded random train/eval split.
+- `eval_checkpoint.py` — evaluate any saved adapter checkpoint on the eval split.
 - `prompts.py` — system prompt, skills, and the output-path contract.
 - `env.py` — sandbox env construction and dataset builders.
 - `reward.py` — rubric reward wrapper around LAB's judge.
@@ -50,9 +51,16 @@ Validated end to end on a bare Ubuntu GPU box; the steps are idempotent.
    PRs #85–#90) that change tool behavior and rubric scoring; rewards from
    unfixed upstream are not comparable.
 
-3. **Judge key** — rubric scoring calls the judge model (`judge_model`,
-   default Gemini): `export GEMINI_API_KEY=...`. Training needs no other
-   provider keys.
+3. **Judge keys** — rubric scoring calls the judge model (`judge_model`,
+   default Gemini): `export GEMINI_API_KEY=...`. Also
+   `export ANTHROPIC_API_KEY=...` — when the model names an output file
+   differently than the rubric expects, LAB's deliverable matcher resolves it
+   with an Anthropic call; without the key those episodes fail grading.
+
+   `train.py` and `eval_checkpoint.py` preflight the grading environment at
+   startup (LAB venv present, judge importable and carrying the truncation
+   fixes) and refuse to start otherwise — a broken grader silently zeroes
+   rewards, which is far more expensive than a loud early failure.
 
 4. **Gateway** — an open-rl server for the policy model. Simplest vLLM shape
    is your own stock server plus the gateway pointed at it:
@@ -74,27 +82,54 @@ Validated end to end on a bare Ubuntu GPU box; the steps are idempotent.
 
 ## Run
 
+One command on an 8-GPU box — brings up sampler (GPUs 1-7), gateway +
+trainer (GPU 0), and a typed train command in a tmux session named `work`:
+
+```bash
+MODEL=9b ./scripts/launch_work.sh    # Qwen3.5-9B at its full 262K window
+MODEL=27b ./scripts/launch_work.sh   # Qwen3.5-27B at 98K (measured H200 ceiling)
+```
+
+Or by hand:
+
 ```bash
 TINKER_API_KEY=tml-dummy-key \
 uv --project examples run python examples/harvey_labs/train.py \
   model_name=Qwen/Qwen3.5-27B \
   base_url=http://127.0.0.1:9003 \
   learning_rate=2e-4 lora_rank=32 \
-  batch_size=10 rollouts_per_example=4 max_steps=40 \
-  max_trajectory_tokens=65536 max_tool_result_tokens=16384 \
+  batch_size=5 rollouts_per_example=2 max_steps=20 eval_every=5 \
+  max_tokens=16384 max_trajectory_tokens=98304 max_tool_result_tokens=16384 \
   log_path=artifacts/harvey-labs/my-run
 ```
 
-The renderer is derived from the model name (`qwen3_5` / `gemma4`);
-`renderer_name=` overrides. For a cheap smoke first: `train_limit=1
-max_reward_criteria=3 eval_limit=0`. For LoRA, the cookbook recommends
-learning rates near `hyperparam_utils.get_lr(model_name)` (~4.6e-4 for a
-27B) — the 3e-6 default in `RunConfig` is an FFT-scale value.
+**Task selection** is a seeded random split of the whole runnable LAB pool
+(~1,750 tasks): `train_tasks=300 eval_tasks=50 task_split_seed=0` by
+default, disjoint, preflighted for instructions/criteria/documents. The
+same config always reproduces the same split, so the split is the
+benchmark — keep the seed fixed across runs you want to compare.
+`task=<name>` trains a single task (no eval set) for smoke tests:
+`task=immigration/identify-h1b-qualification-issues max_reward_criteria=3`.
 
-Batching math to know: the dataset yields `ceil(train_limit / batch_size)`
-batches and the loop runs `min(max_steps, batches)` steps — one pass, no
-epochs. Size `train_limit` and `batch_size` so `max_steps` is actually
-reachable.
+The renderer is derived from the model name (`qwen3_5` / `gemma4`);
+`renderer_name=` overrides. For LoRA, the cookbook recommends learning
+rates near `hyperparam_utils.get_lr(model_name)` (~4.6e-4 for a 27B) — the
+3e-6 default in `RunConfig` is an FFT-scale value.
+
+In-loop evals run *before* the optimizer step of their batch (batch 0 is
+the untrained baseline); `final_eval=true` (default) additionally
+evaluates the last checkpoint after training. To evaluate any saved
+checkpoint later:
+
+```bash
+uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
+  checkpoint=/tmp/open-rl/peft/<model-id>/final \
+  model_name=Qwen/Qwen3.5-27B base_url=http://127.0.0.1:9003 \
+  max_tokens=16384 max_trajectory_tokens=98304 max_tool_result_tokens=16384
+```
+
+Pass the same split/window knobs as the training run, or the eval measures
+a different benchmark than the run's own evals.
 
 ## Watching a run
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -187,3 +188,51 @@ def load_task(lab_root: Path, task_name: str) -> LabTask:
 def load_lab_tasks(lab_root: Path, task_names: list[str], limit: int | None = None) -> list[LabTask]:
   lab_root = lab_root.resolve()
   return [load_task(lab_root, task_name) for task_name in task_names[:limit]]
+
+
+def discover_lab_tasks(lab_root: Path) -> tuple[list[str], int]:
+  """Every runnable task under <lab_root>/tasks, sorted, plus the skipped count.
+
+  A task dir is any directory holding a task.json. Runnable means load_task
+  would succeed and the task has grading criteria: instructions present,
+  criteria non-empty, and a non-empty documents dir.
+  """
+  tasks_root = (lab_root / "tasks").resolve()
+  if not tasks_root.is_dir():
+    raise FileNotFoundError(f"LAB tasks root not found: {tasks_root}")
+  names: list[str] = []
+  skipped = 0
+  for config_path in sorted(tasks_root.rglob("task.json")):
+    task_dir = config_path.parent
+    try:
+      config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+      skipped += 1
+      continue
+    documents_dir = task_dir / "documents"
+    if (
+      not (config.get("instructions") or (task_dir / "instructions.md").is_file())
+      or not config.get("criteria")
+      or not documents_dir.is_dir()
+      or not any(path.is_file() for path in documents_dir.rglob("*"))
+    ):
+      skipped += 1
+      continue
+    names.append(task_dir.relative_to(tasks_root).as_posix())
+  return names, skipped
+
+
+def random_task_split(lab_root: Path, num_train: int, num_eval: int, seed: int) -> tuple[list[str], list[str]]:
+  """Seeded disjoint train/eval task split over the whole runnable pool."""
+  names, skipped = discover_lab_tasks(lab_root)
+  if num_train + num_eval > len(names):
+    raise ValueError(
+      f"Requested {num_train} train + {num_eval} eval tasks but only "
+      f"{len(names)} runnable tasks exist under {lab_root / 'tasks'}"
+    )
+  random.Random(seed).shuffle(names)
+  print(
+    f"[tasks] split seed={seed}: {num_train} train / {num_eval} eval "
+    f"from {len(names)} runnable tasks ({skipped} skipped as broken)"
+  )
+  return names[:num_train], names[num_train : num_train + num_eval]

@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
+import subprocess
 from pathlib import Path
 
 import chz
+import tinker
 from env import LabDatasetBuilder
-from tasks import BOOTSTRAP_TASKS, EVAL_TASKS
+from tasks import BOOTSTRAP_TASKS, EVAL_TASKS, random_task_split
+from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.rl import train as rl_train
+from tinker_cookbook.rl.metric_util import RLTestSetEvaluator
+from tinker_cookbook.stores.storage import LocalStorage
+from tinker_cookbook.stores.training_store import TrainingRunStore
 from tinker_utils import force_rich_log_colors, resolve_base_url
 
 MODEL_NAME = "google/gemma-4-E4B-it"
@@ -63,9 +70,14 @@ class RunConfig:
   learning_rate: float = 3e-6
   lora_rank: int = 32
   lab_root: Path = Path(__file__).resolve().parent / "harvey-labs"
+  # Single-task override; otherwise task_set picks the pools: "random" is a
+  # seeded disjoint split of the whole runnable pool, "bootstrap" is the
+  # curated 100-train/20-eval lists earlier runs used (comparable numbers).
   task: str | None = None
-  train_limit: int | None = None
-  eval_limit: int | None = 20
+  task_set: str = "random"
+  train_tasks: int = 300
+  eval_tasks: int = 50
+  task_split_seed: int = 0
   eval_every: int = 20
   batch_size: int = 1
   rollouts_per_example: int = 4
@@ -78,6 +90,11 @@ class RunConfig:
   max_reward_criteria: int | None = None
   log_path: str = "artifacts/harvey-labs"
   log_full_rollouts: bool = False
+  # The in-loop evals measure the model BEFORE an optimizer step (batch 0 is
+  # the untrained baseline); this one runs after training, on the final
+  # checkpoint. The cookbook always evals once more at the top of the last
+  # iteration, even with eval_every=0.
+  final_eval: bool = True
 
 
 def resolve_renderer_name(config: RunConfig) -> str:
@@ -91,13 +108,51 @@ def resolve_renderer_name(config: RunConfig) -> str:
   raise ValueError(f"Cannot infer a renderer for model {config.model_name!r}; pass renderer_name explicitly.")
 
 
+def preflight_grading(config: RunConfig) -> None:
+  """Fail before step 0 on the grading-environment rot that poisoned runs 3/4.
+
+  Run 4 lost 38% of its gradings to a missing LAB venv (reward.py silently
+  fell back to the recipe interpreter, which cannot import anthropic) and 58%
+  to a stale judge without the schema fix. Both are detectable up front.
+  """
+  lab_python = config.lab_root / ".venv" / "bin" / "python"
+  if not lab_python.exists():
+    raise RuntimeError(
+      f"LAB venv not found at {lab_python}. Run setup_lab.sh so grading uses the "
+      "LAB environment; without it every reward silently falls back to the recipe venv."
+    )
+  probe = subprocess.run(
+    [str(lab_python), "-c", "from evaluation.judge import Judge; Judge._salvage_verdict"],
+    cwd=str(config.lab_root),
+    capture_output=True,
+    text=True,
+  )
+  if probe.returncode != 0:
+    raise RuntimeError(
+      "LAB grading preflight failed — every episode would score 0 as reward_error. "
+      "Missing deps mean setup_lab.sh didn't finish; a missing Judge._salvage_verdict "
+      "means the LAB checkout predates the judge fix (git pull in the LAB checkout).\n"
+      f"{probe.stderr.strip()}"
+    )
+
+
 def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
+  if config.task:
+    train_names, eval_names = [config.task], []
+  elif config.task_set == "bootstrap":
+    train_names, eval_names = list(BOOTSTRAP_TASKS), list(EVAL_TASKS)
+  elif config.task_set == "random":
+    train_names, eval_names = random_task_split(
+      config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed
+    )
+  else:
+    raise ValueError(f"Unknown task_set {config.task_set!r} (use 'random' or 'bootstrap').")
   return LabDatasetBuilder(
     lab_root=config.lab_root,
-    task_names=[config.task] if config.task else list(BOOTSTRAP_TASKS),
-    eval_task_names=list(EVAL_TASKS),
-    train_limit=config.train_limit,
-    eval_limit=config.eval_limit,
+    task_names=train_names,
+    eval_task_names=eval_names,
+    train_limit=None,
+    eval_limit=len(eval_names) or None,
     batch_size=config.batch_size,
     group_size=config.rollouts_per_example,
     model_name=config.model_name,
@@ -113,7 +168,37 @@ def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
   )
 
 
+async def run_final_eval(train_config: rl_train.Config) -> None:
+  record = checkpoint_utils.get_last_checkpoint(train_config.log_path, required_key="sampler_path")
+  if record is None:
+    raise RuntimeError(
+      f"No sampler checkpoint in {train_config.log_path}/checkpoints.jsonl; cannot run the final eval."
+    )
+  _, test_dataset = await train_config.dataset_builder()
+  if test_dataset is None:
+    return
+  batch = record.batch if record.batch is not None else train_config.max_steps or 0
+  service_client = tinker.ServiceClient(base_url=train_config.base_url)
+  sampling_client = service_client.create_sampling_client(model_path=record.sampler_path)
+  evaluator = RLTestSetEvaluator(test_dataset, max_tokens=train_config.max_tokens)
+  store = TrainingRunStore(LocalStorage(Path(train_config.log_path)))
+  metrics = await rl_train.run_single_evaluation(
+    evaluator, train_config, batch, sampling_client, "test", store=store
+  )
+  with open(Path(train_config.log_path) / "metrics.jsonl", "a", encoding="utf-8") as f:
+    f.write(json.dumps({"progress/batch": batch, **metrics}) + "\n")
+  passed = metrics.get("test/env/harvey-labs/lab/criteria_passed")
+  total = metrics.get("test/env/harvey-labs/lab/criteria_total")
+  episodes = metrics.get("test/env/harvey-labs/total_episodes")
+  if passed is not None and total and episodes:
+    rl_train.logger.info(
+      f"Final eval after {batch} steps: pooled criteria "
+      f"{passed * episodes:.0f}/{total * episodes:.0f} ({passed / total:.1%})"
+    )
+
+
 async def run(config: RunConfig) -> None:
+  preflight_grading(config)
   rl_train.print_group = print_group_responses if config.log_full_rollouts else print_group_summary
   train_config = rl_train.Config(
     learning_rate=config.learning_rate,
@@ -131,6 +216,8 @@ async def run(config: RunConfig) -> None:
     num_groups_to_log=NUM_GROUPS_TO_LOG,
   )
   await rl_train.main(train_config)
+  if config.final_eval:
+    await run_final_eval(train_config)
 
 
 def main() -> None:

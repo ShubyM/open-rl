@@ -738,7 +738,9 @@ async def create_sampling_session(req: dict):
     if is_fft_enabled():
       await ensure_sampler_launched(target_model_id, base_model)
     s = get_store()
-    if hasattr(s, "redis"):
+    # Only managed queue workers (RedisStore) publish sampler_ready flags; the
+    # in-memory store inherits redis=None and must not wait for one.
+    if s.redis is not None:
       print(f"[GATEWAY] Waiting for dynamic vLLM sampler worker to be ready for model {target_model_id}...")
       start_time = time.monotonic()
       while True:
