@@ -3,19 +3,21 @@
 # a stock vLLM sampler on GPUs 1-N, the gateway + LoRA trainer on GPU 0, and
 # typed (not yet run) train/eval commands.
 #
-#   MODEL=9b  ./scripts/launch_work.sh    # Qwen3.5-9B, full 262K window (default)
-#   MODEL=27b ./scripts/launch_work.sh    # Qwen3.5-27B, 98K (measured H200 ceiling)
+#   MODEL=9b  ./scripts/launch_work.sh                # Qwen3.5-9B, full 262K window (default)
+#   MODEL=27b ./scripts/launch_work.sh                # Qwen3.5-27B, 98K (measured H200 ceiling)
+#   TRAIN_GPUS=4 MODEL=27b ./scripts/launch_work.sh   # data-parallel LoRA trainer on 4 GPUs
 #
 # Windows:
-#   0 sampler   vllm serve, GPUs 1-7, data-parallel            auto-starts
-#   1 gateway   gateway + LoRA trainer, GPU 0                  auto-starts (waits for sampler)
-#   2 train     training command — TYPED, press Enter to launch
-#   3 eval      eval_checkpoint command — TYPED, edit checkpoint= then Enter
-#   4 gpu       nvidia-smi watch
+#   sampler   vllm serve, data-parallel on the non-trainer GPUs   auto-starts
+#   gateway   API gateway (in-gateway trainer when TRAIN_GPUS=1)  auto-starts (waits for sampler)
+#   trainer   torchrun data-parallel LoRA trainer                 auto-starts (TRAIN_GPUS>1 only)
+#   train     training command — TYPED, press Enter to launch
+#   eval      eval_checkpoint command — TYPED, edit checkpoint= then Enter
+#   gpu       nvidia-smi watch
 #
 # Re-running never kills anything: an existing session is attached as-is.
 # The LAB checkout is bootstrapped via setup_lab.sh if missing. Logs tee to
-# artifacts/box-logs/. Overridable: MODEL, RUN_LABEL, GEN_TOKENS.
+# artifacts/box-logs/. Overridable: MODEL, TRAIN_GPUS, RUN_LABEL, GEN_TOKENS.
 set -euo pipefail
 
 SESSION=work
@@ -45,11 +47,39 @@ fi
 mkdir -p "$LOGS"
 cd "$REPO"
 
+# Disk preflight: podman layers + per-episode results exhaust small disks
+# mid-run, which kills episodes in confusing ways. Refuse to start low.
+GRAPHROOT=$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null || echo "$HOME/.local/share/containers/storage")
+for path in "$REPO" "$GRAPHROOT"; do
+  [ -e "$path" ] || path=$(dirname "$path")
+  AVAIL_GB=$(df -BG --output=avail "$path" 2>/dev/null | tail -1 | tr -dc '0-9')
+  if [ "${AVAIL_GB:-0}" -lt 20 ]; then
+    echo "ERROR: only ${AVAIL_GB:-?}G free on $path (< 20G). Free space before training:" >&2
+    echo "  old runs:      rm -rf $LAB_ROOT/results/<old-run-id>" >&2
+    echo "  podman layers: move graphroot in ~/.config/containers/storage.conf to a big disk" >&2
+    exit 1
+  fi
+done
+
+# Reap sandbox containers leaked by crashed episodes (normal teardown is
+# handled by env cleanup; these are only crash leftovers).
+LEAKED=$(podman ps -a --filter name=lab-sandbox --format '{{.Names}}' 2>/dev/null)
+if [ -n "$LEAKED" ]; then
+  echo "[work] removing leaked sandbox containers: $LEAKED"
+  echo "$LEAKED" | xargs -r podman rm -f >/dev/null
+fi
+
 if [ ! -d "$LAB_ROOT" ]; then
   echo "[work] LAB checkout missing — running setup_lab.sh (clones the fork, installs pandoc/podman)..."
   ./examples/harvey_labs/setup_lab.sh
 fi
 echo "[work] LAB judge at: $(git -C "$LAB_ROOT" log --oneline -1 -- evaluation/judge.py 2>/dev/null || echo 'unknown')"
+
+FP=$(uv run --no-sync python -c "from transformers.models.qwen3_5 import modeling_qwen3_5 as m; print(m.is_fast_path_available)" 2>/dev/null)
+if [ "$FP" != "True" ]; then
+  echo "WARNING: Qwen deltanet fast path is NOT available — training runs the eager" >&2
+  echo "         fallback (2-5x slower). Run ./scripts/setup_vm.sh to build causal-conv1d." >&2
+fi
 
 # The 27B ceiling on a 141GB H200 is 98K tokens (measured, activation offload
 # on); 9B fits its full 262K window with room to spare.
@@ -62,6 +92,18 @@ case "$MODEL" in
     TASK_SET=${TASK_SET:-random}
     RUN_LABEL=${RUN_LABEL:-lab-lora-qwen9b}
     ;;
+  9b-128k)
+    # Signal-hunting shape: big groups for GRPO contrast, the seeded random
+    # 300/50 split for task diversity — and the 50-task eval's ~3,150
+    # criteria cut eval noise to ~±1%, so small gains are detectable.
+    MODEL_NAME=Qwen/Qwen3.5-9B
+    CONTEXT=131072
+    GEN_TOKENS=${GEN_TOKENS:-16384}
+    TASK_SET=${TASK_SET:-random}
+    BATCH_SIZE=${BATCH_SIZE:-8}
+    ROLLOUTS=${ROLLOUTS:-6}
+    RUN_LABEL=${RUN_LABEL:-lab-lora-qwen9b-128k}
+    ;;
   27b)
     MODEL_NAME=Qwen/Qwen3.5-27B
     CONTEXT=98304
@@ -73,30 +115,87 @@ case "$MODEL" in
     RUN_LABEL=${RUN_LABEL:-lab-lora-qwen27b}
     ;;
   *)
-    echo "Unknown MODEL=$MODEL (use 9b or 27b)" >&2
+    echo "Unknown MODEL=$MODEL (use 9b, 9b-128k, or 27b)" >&2
     exit 1
     ;;
 esac
-echo "[work] MODEL=$MODEL -> $MODEL_NAME, context $CONTEXT, log $RUN_LABEL"
+BATCH_SIZE=${BATCH_SIZE:-5}
+ROLLOUTS=${ROLLOUTS:-2}
+echo "[work] MODEL=$MODEL -> $MODEL_NAME, context $CONTEXT, batch ${BATCH_SIZE}x${ROLLOUTS}, log $RUN_LABEL"
 
-SAMPLER_CMD="CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 VLLM_ALLOW_RUNTIME_LORA_UPDATING=true \
-uv run --extra gpu --extra vllm vllm serve $MODEL_NAME \
---port 8000 --enable-lora --max-lora-rank 64 --max-loras 2 \
---data-parallel-size 7 --api-server-count 1 \
+# fla kernel backend by architecture: Hopper requires TileLang (Triton>=3.4
+# dropped the deltanet path there); Blackwell runs the proven Triton backend
+# (TileLang on sm_100 has produced misaligned-address kernel faults).
+GPU0=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+case "$GPU0" in
+  *H100*|*H200*) FLA_TILELANG=${FLA_TILELANG:-1} ;;
+  *)             FLA_TILELANG=${FLA_TILELANG:-0} ;;
+esac
+echo "[work] GPU: $GPU0 -> FLA_TILELANG=$FLA_TILELANG"
+
+# TRAIN_GPUS=1 (default): trainer runs inside the gateway on GPU 0.
+# TRAIN_GPUS=N>1: dedicated torchrun trainer (data-parallel LoRA) on GPUs
+# 0..N-1 via the Redis queue; the sampler shrinks to the remaining GPUs.
+TRAIN_GPUS=${TRAIN_GPUS:-1}
+NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l); NUM_GPUS=${NUM_GPUS:-8}
+SAMPLER_DP=$((NUM_GPUS - TRAIN_GPUS))
+SAMPLER_DEV=$(seq -s, "$TRAIN_GPUS" $((NUM_GPUS - 1)))
+TRAIN_DEV=$(seq -s, 0 $((TRAIN_GPUS - 1)))
+QUEUE_ENV=""
+if [ "$TRAIN_GPUS" -gt 1 ]; then
+  pgrep -x redis-server >/dev/null || redis-server --daemonize yes
+  QUEUE_ENV="REDIS_URL=redis://127.0.0.1:6379 OPEN_RL_EXTERNAL_TRAINER=1"
+  echo "[work] TRAIN_GPUS=$TRAIN_GPUS -> torchrun trainer on GPUs $TRAIN_DEV, sampler DP$SAMPLER_DP on $SAMPLER_DEV"
+fi
+
+# AFFINITY=1: one single-GPU vllm serve per sampler GPU (ports 8000+i) and
+# prefix-hash routing in the gateway, so every turn of an episode hits the
+# instance that already holds its KV/prefix cache. Default: one DP server
+# (per-request round-robin, no cross-turn cache reuse).
+AFFINITY=${AFFINITY:-0}
+if [ "$AFFINITY" = "1" ]; then
+  SAMPLER_CMD=""
+  SAMPLER_URLS=""
+  for i in $(seq 0 $((SAMPLER_DP - 1))); do
+    GPU_ID=$((TRAIN_GPUS + i))
+    PORT=$((8000 + i))
+    SAMPLER_URLS="$SAMPLER_URLS,http://127.0.0.1:$PORT"
+    SAMPLER_CMD="$SAMPLER_CMD CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_ALLOW_RUNTIME_LORA_UPDATING=true \
+uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
+--port $PORT --enable-lora --max-lora-rank 64 --max-loras 2 --enable-prefix-caching \
+--max-model-len $CONTEXT --gpu-memory-utilization 0.92 \
+--language-model-only |& tee -a $LOGS/sampler-$i.log &"
+  done
+  SAMPLER_CMD="${SAMPLER_CMD} wait"
+  SAMPLER_URLS="${SAMPLER_URLS#,}"
+  SAMPLER_ENV="SAMPLER_BASE_URLS=$SAMPLER_URLS"
+  LAST_PORT=$((8000 + SAMPLER_DP - 1))
+  SAMPLER_WAIT="until curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && curl -sf http://127.0.0.1:$LAST_PORT/v1/models >/dev/null 2>&1; do echo 'waiting for samplers...'; sleep 10; done"
+  echo "[work] AFFINITY=1 -> $SAMPLER_DP single-GPU samplers on ports 8000-$LAST_PORT"
+else
+  SAMPLER_ENV="SAMPLER_BASE_URL=http://127.0.0.1:8000"
+  SAMPLER_WAIT="until curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1; do echo 'waiting for sampler...'; sleep 10; done"
+  SAMPLER_CMD="CUDA_VISIBLE_DEVICES=$SAMPLER_DEV VLLM_ALLOW_RUNTIME_LORA_UPDATING=true \
+uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
+--port 8000 --enable-lora --max-lora-rank 64 --max-loras 2 --enable-prefix-caching \
+--data-parallel-size $SAMPLER_DP --api-server-count 1 \
 --max-model-len $CONTEXT --gpu-memory-utilization 0.92 \
 --language-model-only |& tee -a $LOGS/sampler.log"
+fi
 
-GATEWAY_CMD="until curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1; do echo 'waiting for sampler...'; sleep 10; done; \
-CUDA_VISIBLE_DEVICES=0 BASE_MODEL=$MODEL_NAME SAMPLER_BASE_URL=http://127.0.0.1:8000 \
+GATEWAY_DEV=0
+[ "$TRAIN_GPUS" -gt 1 ] && GATEWAY_DEV=""
+GATEWAY_CMD="$SAMPLER_WAIT; \
+CUDA_VISIBLE_DEVICES=$GATEWAY_DEV $QUEUE_ENV FLA_TILELANG=$FLA_TILELANG BASE_MODEL=$MODEL_NAME $SAMPLER_ENV \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 OPEN_RL_TRAIN_TOKEN_BUDGET=$CONTEXT OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
 OPEN_RL_LOG_CUDA_MEMORY=1 \
-uv run --extra gpu --extra vllm python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003 |& tee -a $LOGS/gateway.log"
+uv run --extra gpu --extra vllm --extra fastpath python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003 |& tee -a $LOGS/gateway.log"
 
 TRAIN_CMD="TINKER_API_KEY=tml-dummy uv --project examples run python examples/harvey_labs/train.py \
 model_name=$MODEL_NAME renderer_name=qwen3_5 base_url=http://127.0.0.1:9003 \
 learning_rate=2e-4 lora_rank=32 \
-batch_size=5 rollouts_per_example=2 max_steps=20 eval_every=5 \
+batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=20 eval_every=5 \
 task_set=$TASK_SET \
 max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$GEN_TOKENS \
 log_path=artifacts/harvey-labs/$RUN_LABEL"
@@ -113,6 +212,17 @@ tmux send-keys -t "$SESSION:sampler" "$SAMPLER_CMD" C-m
 
 tmux new-window -t "$SESSION" -n gateway -c "$REPO"
 tmux send-keys -t "$SESSION:gateway" "$GATEWAY_CMD" C-m
+
+if [ "$TRAIN_GPUS" -gt 1 ]; then
+  TRAINER_CMD="CUDA_VISIBLE_DEVICES=$TRAIN_DEV FLA_TILELANG=$FLA_TILELANG REDIS_URL=redis://127.0.0.1:6379 \
+OPEN_RL_FSDP_WORLD_SIZE=$TRAIN_GPUS OPEN_RL_WORKER_PROBE_PORT=8090 \
+BASE_MODEL=$MODEL_NAME PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+OPEN_RL_TRAIN_TOKEN_BUDGET=$CONTEXT OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
+OPEN_RL_LOG_CUDA_MEMORY=1 \
+uv run --extra gpu --extra fastpath torchrun --standalone --nproc-per-node=$TRAIN_GPUS -m server.training_requests_processor |& tee -a $LOGS/trainer.log"
+  tmux new-window -t "$SESSION" -n trainer -c "$REPO"
+  tmux send-keys -t "$SESSION:trainer" "$TRAINER_CMD" C-m
+fi
 
 tmux new-window -t "$SESSION" -n train -c "$REPO"
 tmux send-keys -t "$SESSION:train" "$TRAIN_CMD"          # typed, NOT run
