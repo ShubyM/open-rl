@@ -1,11 +1,16 @@
 """Unit tests for DeltaSnapshotWeightTransferEngine."""
 
+import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import safetensors
 import torch
+from safetensors.torch import save_file
 
+from src.server import delta_weight_transfer_engine as delta_module
 from src.server.delta_weight_transfer_engine import (
   DeltaSnapshotInitInfo,
   DeltaSnapshotUpdateInfo,
@@ -40,8 +45,6 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
 
   def test_receive_weights_loads_tensors_into_callback(self):
     """Test that receive_weights parses safetensors and passes to load_weights."""
-    from safetensors.torch import save_file
-
     with tempfile.TemporaryDirectory() as tmpdir:
       dummy_weights = {
         "model.layers.0.self_attn.q_proj.weight": torch.randn(64, 64),
@@ -68,8 +71,6 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
 
   def test_noop_patch_detection_skips_gpu_reload(self):
     """Test that applying an identical patch is identified as a no-op and skipped."""
-    from safetensors.torch import save_file
-
     with tempfile.TemporaryDirectory() as tmpdir:
       weights_v1 = {
         "layer.0.weight": torch.ones(4, 4),
@@ -101,8 +102,6 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
 
   def test_selective_layer_filtering_skips_noop_tensors(self):
     """Test that only genuinely modified tensors are passed to load_weights."""
-    from safetensors.torch import save_file
-
     with tempfile.TemporaryDirectory() as tmpdir:
       weights_v1 = {
         "layer.0.weight": torch.ones(4, 4),
@@ -137,10 +136,6 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
 
   def test_receive_weights_sparse_delta_patching(self):
     """Test that receive_weights parses sparse_delta metadata, applies indices to CPU snapshot, and passes full reconstructed layer tensor."""
-    import json
-
-    from safetensors.torch import save_file
-
     with tempfile.TemporaryDirectory() as tmpdir:
       # Create metadata specifying sparse_delta format and layer_names
       with open(os.path.join(tmpdir, "metadata.json"), "w") as f:
@@ -184,13 +179,6 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
 
   def test_receive_weights_base_model_directory_loading(self):
     """Test that receive_weights directly populates CPU snapshot from base_model_path when provided."""
-    import json
-    import sys
-    from unittest.mock import MagicMock, patch
-
-    import safetensors
-    from safetensors.torch import save_file
-
     with tempfile.TemporaryDirectory() as tmpdir:
       base_dir = os.path.join(tmpdir, "base_model")
       os.makedirs(base_dir)
@@ -209,9 +197,6 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       }
       save_file(sparse_dict, os.path.join(step_dir, "delta.safetensors"))
 
-      mock_utils = MagicMock()
-      mock_utils.download_weights_from_hf.side_effect = lambda bm, cache_dir=None, allow_patterns=None: bm
-
       def fake_iterator(hf_weights_files, use_tqdm_on_load=False):
         for p in hf_weights_files:
           if os.path.exists(p):
@@ -219,16 +204,9 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
               for key in list(f.keys()):
                 yield key, f.get_tensor(key)
 
-      mock_utils.safetensors_weights_iterator.side_effect = fake_iterator
-
-      with patch.dict(
-        sys.modules,
-        {
-          "vllm": MagicMock(),
-          "vllm.model_executor": MagicMock(),
-          "vllm.model_executor.model_loader": MagicMock(),
-          "vllm.model_executor.model_loader.weight_utils": mock_utils,
-        },
+      with (
+        patch.object(delta_module, "download_weights_from_hf", side_effect=lambda model, **_: model),
+        patch.object(delta_module, "safetensors_weights_iterator", side_effect=fake_iterator),
       ):
         model = RecordingModel()
         engine = DeltaSnapshotWeightTransferEngine(
@@ -247,13 +225,6 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
 
   def test_receive_weights_hf_cache_and_env_loading(self):
     """Test that _ensure_cpu_snapshot resolves HF model IDs from OPEN_RL_BASE_MODEL (e.g. Qwen/Test-4B -> models--Qwen--Test-4B)."""
-    import json
-    import sys
-    from unittest.mock import MagicMock, patch
-
-    import safetensors
-    from safetensors.torch import save_file
-
     with tempfile.TemporaryDirectory() as tmpdir:
       # Mock HF hub cache structure: ~/.cache/huggingface/hub/models--Qwen--Test-4B/snapshots/commit123/
       hf_folder = os.path.join(tmpdir, "models--Qwen--Test-4B", "snapshots", "commit123")
@@ -272,9 +243,6 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       }
       save_file(sparse_dict, os.path.join(step_dir, "delta.safetensors"))
 
-      mock_utils = MagicMock()
-      mock_utils.download_weights_from_hf.side_effect = lambda bm, cache_dir=None, allow_patterns=None: hf_folder
-
       def fake_iterator(hf_weights_files, use_tqdm_on_load=False):
         for p in hf_weights_files:
           if os.path.exists(p):
@@ -282,21 +250,10 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
               for key in list(f.keys()):
                 yield key, f.get_tensor(key)
 
-      mock_utils.safetensors_weights_iterator.side_effect = fake_iterator
-
-      # Patch os.path.expanduser and sys.modules for vllm
       with (
         patch.dict(os.environ, {"OPEN_RL_BASE_MODEL": "Qwen/Test-4B"}),
-        patch("os.path.expanduser", lambda path: path.replace("~/.cache/huggingface/hub", tmpdir) if path.startswith("~") else path),
-        patch.dict(
-          sys.modules,
-          {
-            "vllm": MagicMock(),
-            "vllm.model_executor": MagicMock(),
-            "vllm.model_executor.model_loader": MagicMock(),
-            "vllm.model_executor.model_loader.weight_utils": mock_utils,
-          },
-        ),
+        patch.object(delta_module, "download_weights_from_hf", return_value=hf_folder),
+        patch.object(delta_module, "safetensors_weights_iterator", side_effect=fake_iterator),
       ):
         model = RecordingModel()
         engine = DeltaSnapshotWeightTransferEngine(

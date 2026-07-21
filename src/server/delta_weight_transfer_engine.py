@@ -5,6 +5,8 @@ delta patching in host CPU RAM and reload tensors directly into GPU VRAM
 without external sleep/wake workarounds.
 """
 
+import json
+import logging
 import os
 import time
 from collections.abc import Iterator
@@ -12,14 +14,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from safetensors.torch import load_file
 
 try:
   from vllm.logger import init_logger
 
   logger = init_logger("vllm.distributed.weight_transfer.delta_snapshot")
 except ImportError:
-  import logging
-
   logger = logging.getLogger("vllm.distributed.weight_transfer.delta_snapshot")
 
 try:
@@ -28,7 +29,15 @@ try:
     WeightTransferInitInfo,
     WeightTransferUpdateInfo,
   )
+  from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
+  from vllm.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf,
+    safetensors_weights_iterator,
+  )
 except ImportError:
+  WeightTransferEngineFactory = None
+  download_weights_from_hf = None
+  safetensors_weights_iterator = None
 
   @dataclass
   class WeightTransferInitInfo:
@@ -84,8 +93,8 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     self.current_weights_path: str | None = None
     self._cpu_snapshot: dict[str, torch.Tensor] = {}
     self._base_model: str = os.getenv("OPEN_RL_BASE_MODEL", os.getenv("BASE_MODEL", ""))
-    if not self._base_model:
-      self._base_model = getattr(self.model_config, "model", "")
+    if not self._base_model and self.model_config is not None:
+      self._base_model = self.model_config.model
 
   def _ensure_cpu_snapshot(self, base_model: str) -> None:
     if self._cpu_snapshot:
@@ -95,10 +104,8 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
     if base_model:
       start_t = time.perf_counter()
-      from vllm.model_executor.model_loader.weight_utils import (
-        download_weights_from_hf,
-        safetensors_weights_iterator,
-      )
+      if download_weights_from_hf is None or safetensors_weights_iterator is None:
+        raise RuntimeError("vLLM weight utilities are required to initialize the CPU snapshot.")
 
       if os.path.isdir(base_model):
         hf_folder = base_model
@@ -129,8 +136,6 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
   def receive_weights(self, update_info: DeltaSnapshotUpdateInfo) -> None:
     """Receive sparse deltas and load reconstructed HF tensors into vLLM."""
-    import json
-
     target_path = update_info.target_weights_path
     if not target_path or not os.path.exists(target_path):
       raise ValueError(f"Target weights path does not exist: {target_path}")
@@ -153,15 +158,13 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
       if not os.path.exists(delta_file):
         raise ValueError(f"Sparse delta metadata present but delta.safetensors not found at: {target_path}")
 
-      from safetensors.torch import load_file
-
       sparse_delta = load_file(delta_file, device="cpu")
       elapsed_read = (time.perf_counter() - start_t) * 1000.0
       logger.info(f"[DeltaSnapshotEngine] Loaded sparse delta from {delta_file} in {elapsed_read:.2f} ms")
 
       # Initialize base CPU snapshot if not yet populated
       if not self._cpu_snapshot:
-        base_model = getattr(update_info, "base_model_path", "") or self._base_model
+        base_model = update_info.base_model_path or self._base_model
         self._ensure_cpu_snapshot(base_model)
 
       meta_names: list[str] | None = None
@@ -213,16 +216,12 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
       # Full snapshot safetensors path
       weights: list[tuple[str, torch.Tensor]] = []
       if os.path.isdir(target_path):
-        from safetensors.torch import load_file
-
         for root, _, files in os.walk(target_path):
           for f in sorted(files):
             if f.endswith(".safetensors"):
               shard_dict = load_file(os.path.join(root, f), device="cpu")
               weights.extend(shard_dict.items())
       elif target_path.endswith(".safetensors"):
-        from safetensors.torch import load_file
-
         shard_dict = load_file(target_path, device="cpu")
         weights.extend(shard_dict.items())
       else:
@@ -280,12 +279,11 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     pass
 
 
-try:
-  from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
-
-  WeightTransferEngineFactory.register_engine(
-    "delta_snapshot",
-    DeltaSnapshotWeightTransferEngine,
-  )
-except (ImportError, ValueError):
-  pass
+if WeightTransferEngineFactory is not None:
+  try:
+    WeightTransferEngineFactory.register_engine(
+      "delta_snapshot",
+      DeltaSnapshotWeightTransferEngine,
+    )
+  except ValueError:
+    pass

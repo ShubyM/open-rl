@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import signal
 import sys
 import traceback
 from typing import Any
@@ -13,8 +14,11 @@ os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 import redis.asyncio as redis
 
+from server.store import RedisStore, RequestStore, get_store
+
 try:
   from vllm import SamplingParams
+  from vllm.config.weight_transfer import WeightTransferConfig
   from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
   from vllm.engine.arg_utils import AsyncEngineArgs
   from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -24,6 +28,7 @@ try:
   VLLM_AVAILABLE = True
 except ImportError:
   SamplingParams = None
+  WeightTransferConfig = None
   WeightTransferUpdateRequest = None
   AsyncEngineArgs = None
   AsyncLLMEngine = None
@@ -112,13 +117,8 @@ def init_engine():
     if hf_overrides:
       engine_kwargs["hf_overrides"] = hf_overrides
 
-    if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
-      try:
-        from vllm.config.weight_transfer import WeightTransferConfig
-
-        engine_kwargs["weight_transfer_config"] = WeightTransferConfig(backend="delta_snapshot")
-      except (ImportError, ValueError):
-        pass
+    if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta" and WeightTransferConfig is not None:
+      engine_kwargs["weight_transfer_config"] = WeightTransferConfig(backend="delta_snapshot")
 
     engine_args = AsyncEngineArgs(**engine_kwargs)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -297,13 +297,13 @@ async def process_sampling_request(req: dict, store: Any) -> None:
       await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(exc)}"})
 
 
-async def weight_prefetcher_loop(model_id: str, store: Any) -> None:
+async def weight_prefetcher_loop(model_id: str, store: RequestStore) -> None:
   global engine
   global CURRENT_LOADED_SAMPLER_WEIGHTS
   global IS_ENGINE_SLEEPING
 
   try:
-    if not hasattr(store, "redis"):
+    if not isinstance(store, RedisStore):
       return
 
     redis_url = os.getenv("REDIS_URL")
@@ -361,8 +361,6 @@ async def run_sampling_worker(model_id: str) -> None:
   global engine
   global CURRENT_LOADED_SAMPLER_WEIGHTS
   global IS_ENGINE_SLEEPING
-  from server.store import get_store
-
   store = get_store()
   snapshot_registered = False
   workload = None
@@ -415,7 +413,6 @@ async def run_sampling_worker(model_id: str) -> None:
     os._exit(0)
 
   if time_slicer is not None:
-    import signal
 
     async def handle_shutdown():
       print(f"[vLLM Worker] Received termination signal, shutting down model {model_id} sampler worker...")
@@ -428,7 +425,7 @@ async def run_sampling_worker(model_id: str) -> None:
     except NotImplementedError:
       pass
 
-  if hasattr(store, "redis"):
+  if isinstance(store, RedisStore):
     await store.redis.set(f"open_rl:sampler_ready:{model_id}", "1")
     await store.redis.expire(f"open_rl:sampler_ready:{model_id}", 3600)
 
