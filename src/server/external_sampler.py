@@ -15,19 +15,75 @@
 
 import asyncio
 import os
+import zlib
 
 import httpx
 
-_served_model: str | None = None
-_served_max_model_len: int | None = None
-_loaded_adapters: set[str] = set()
-_latest_adapter_for_model: dict[str, str] = {}
+_served_model: dict[str, str] = {}
+_served_max_model_len: dict[str, int | None] = {}
+_loaded_adapters: dict[str, set[str]] = {}
+_latest_adapter_for_model: dict[str, dict[str, str]] = {}
 _adapter_lock = asyncio.Lock()
 
 
+def get_sampler_base_urls() -> list[str]:
+  """All external sampler instances. SAMPLER_BASE_URLS (comma-separated,
+  one single-GPU server each) enables prefix-affinity routing; a lone
+  SAMPLER_BASE_URL keeps the single-endpoint behavior."""
+  urls = os.getenv("SAMPLER_BASE_URLS") or os.getenv("SAMPLER_BASE_URL") or ""
+  return [u.strip().rstrip("/") for u in urls.split(",") if u.strip()]
+
+
 def get_sampler_base_url() -> str | None:
-  url = os.getenv("SAMPLER_BASE_URL")
-  return url.rstrip("/") if url else None
+  urls = get_sampler_base_urls()
+  return urls[0] if urls else None
+
+
+# Episode routing table: first-turn prompts register (length, crc) -> url;
+# every later turn of the episode carries that first prompt as a prefix, so
+# the lookup is exact. No fixed hash window works here — measured on the LAB
+# recipe, tasks share up to 6,413 of their ~6,434 first-turn tokens, leaving
+# no window that both separates tasks and stays inside every first prompt.
+_episode_routes: dict[int, dict[int, str]] = {}  # length -> {crc -> url}
+_route_order: list[tuple[int, int]] = []  # insertion order for eviction
+_inflight: dict[str, int] = {}
+_placement_counter = 0
+_MAX_ROUTES = 4096
+
+
+def _crc(prompt_token_ids: list[int], length: int) -> int:
+  return zlib.crc32(bytes(str(prompt_token_ids[:length]), "utf-8"))
+
+
+def pick_base_url(prompt_token_ids: list[int]) -> str:
+  """Keep every turn of an episode on one instance so its KV/prefix cache is
+  reused instead of re-prefilling the conversation on a random replica; new
+  episodes go to the least-loaded instance."""
+  urls = get_sampler_base_urls()
+  assert urls, "external sampler requires SAMPLER_BASE_URL(S)"
+  if len(urls) == 1:
+    return urls[0]
+  length = len(prompt_token_ids)
+  for first_len, by_crc in _episode_routes.items():
+    if first_len <= length:
+      url = by_crc.get(_crc(prompt_token_ids, first_len))
+      if url is not None:
+        return url
+  # Unseen prefix: this is an episode's first turn. Place it on the
+  # least-loaded instance (rotating among ties so idle bursts still spread)
+  # and remember it.
+  global _placement_counter
+  low = min(_inflight.get(u, 0) for u in urls)
+  candidates = [u for u in urls if _inflight.get(u, 0) == low]
+  url = candidates[_placement_counter % len(candidates)]
+  _placement_counter += 1
+  key = _crc(prompt_token_ids, length)
+  _episode_routes.setdefault(length, {})[key] = url
+  _route_order.append((length, key))
+  if len(_route_order) > _MAX_ROUTES:
+    old_len, old_key = _route_order.pop(0)
+    _episode_routes.get(old_len, {}).pop(old_key, None)
+  return url
 
 
 def _client() -> httpx.AsyncClient:
@@ -53,8 +109,7 @@ async def preflight(base_url: str) -> None:
 
 
 async def _served_model_name(client: httpx.AsyncClient, base_url: str) -> str:
-  global _served_model, _served_max_model_len
-  if _served_model is None:
+  if base_url not in _served_model:
     resp = await client.get(f"{base_url}/v1/models")
     resp.raise_for_status()
     models = resp.json()["data"]
@@ -62,16 +117,17 @@ async def _served_model_name(client: httpx.AsyncClient, base_url: str) -> str:
     # max_model_len; the base model is the one that has it.
     base_entries = [m for m in models if m.get("max_model_len")]
     model_data = base_entries[0] if base_entries else models[0]
-    _served_model = model_data["id"]
-    _served_max_model_len = model_data.get("max_model_len")
-  return _served_model
+    _served_model[base_url] = model_data["id"]
+    _served_max_model_len[base_url] = model_data.get("max_model_len")
+  return _served_model[base_url]
 
 
 async def _ensure_adapter_loaded(client: httpx.AsyncClient, base_url: str, name: str, path: str, base_model_id: str | None) -> None:
-  if name in _loaded_adapters:
+  loaded = _loaded_adapters.setdefault(base_url, set())
+  if name in loaded:
     return
   async with _adapter_lock:
-    if name in _loaded_adapters:
+    if name in loaded:
       return
     resp = await client.post(f"{base_url}/v1/load_lora_adapter", json={"lora_name": name, "lora_path": path})
     if resp.status_code != 200 and "already been loaded" not in resp.text:
@@ -80,19 +136,20 @@ async def _ensure_adapter_loaded(client: httpx.AsyncClient, base_url: str, name:
         "Is the vLLM server running with --enable-lora and VLLM_ALLOW_RUNTIME_LORA_UPDATING=true, "
         "and does it share the trainer's filesystem?"
       )
-    _loaded_adapters.add(name)
+    loaded.add(name)
 
     # Each sampler snapshot registers under a fresh name; retire the previous
     # snapshot's adapter so a long training run does not accumulate them.
     if base_model_id:
-      previous = _latest_adapter_for_model.get(base_model_id)
+      latest = _latest_adapter_for_model.setdefault(base_url, {})
+      previous = latest.get(base_model_id)
       if previous and previous != name:
         try:
           await client.post(f"{base_url}/v1/unload_lora_adapter", json={"lora_name": previous})
         except Exception:
           pass
-        _loaded_adapters.discard(previous)
-      _latest_adapter_for_model[base_model_id] = name
+        loaded.discard(previous)
+      latest[base_model_id] = name
 
 
 def _token_id(token: str) -> int:
@@ -107,9 +164,15 @@ async def sample(req: dict) -> dict:
   result shape ({"type": "sample", "sequences": [...]}), so callers cannot
   tell which sampler backend ran.
   """
-  base_url = get_sampler_base_url()
-  assert base_url, "external_sampler.sample requires SAMPLER_BASE_URL"
+  base_url = pick_base_url(req.get("prompt_token_ids", []))
+  _inflight[base_url] = _inflight.get(base_url, 0) + 1
+  try:
+    return await _sample_on(base_url, req)
+  finally:
+    _inflight[base_url] = _inflight.get(base_url, 1) - 1
 
+
+async def _sample_on(base_url: str, req: dict) -> dict:
   async with _client() as client:
     model = await _served_model_name(client, base_url)
     lora_id, lora_path = req.get("lora_id"), req.get("lora_path")
@@ -124,16 +187,17 @@ async def sample(req: dict) -> dict:
     prompt_token_ids = req.get("prompt_token_ids", [])
     max_tokens = req.get("max_tokens", 20)
     num_samples = req.get("num_samples", 1)
-    if _served_max_model_len is not None:
+    max_model_len = _served_max_model_len.get(base_url)
+    if max_model_len is not None:
       prompt_len = len(prompt_token_ids)
-      if prompt_len >= _served_max_model_len or max_tokens <= 0:
+      if prompt_len >= max_model_len or max_tokens <= 0:
         print(
-          f"[external-sampler] Prompt of {prompt_len} tokens leaves no room in max_model_len={_served_max_model_len} "
+          f"[external-sampler] Prompt of {prompt_len} tokens leaves no room in max_model_len={max_model_len} "
           f"(max_tokens={max_tokens}); returning empty length-stop truncation."
         )
         return {"type": "sample", "sequences": [{"tokens": [], "logprobs": [], "stop_reason": "length"} for _ in range(num_samples)]}
-      if prompt_len + max_tokens > _served_max_model_len:
-        max_tokens = _served_max_model_len - prompt_len
+      if prompt_len + max_tokens > max_model_len:
+        max_tokens = max_model_len - prompt_len
 
     body: dict = {
       "model": model,
@@ -157,7 +221,7 @@ async def sample(req: dict) -> dict:
     if resp.status_code in (400, 404) and lora_id and lora_path and lora_id in resp.text:
       # The server no longer knows this adapter (e.g. vllm serve restarted and
       # our loaded-adapter cache went stale). Re-register once and retry.
-      _loaded_adapters.discard(lora_id)
+      _loaded_adapters.setdefault(base_url, set()).discard(lora_id)
       await _ensure_adapter_loaded(client, base_url, lora_id, lora_path, req.get("model_id"))
       resp = await client.post(f"{base_url}/v1/completions", json=body)
     if resp.status_code != 200:
