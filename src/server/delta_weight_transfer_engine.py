@@ -1,8 +1,8 @@
-"""Native vLLM WeightTransferEngine implementation for CPU Weights Snapshot Delta Sync.
+"""Native vLLM WeightTransferEngine implementation for CPU snapshot weight sync.
 
-Implements vLLM's abstract WeightTransferEngine contract to perform sparse
-delta patching in host CPU RAM and reload tensors directly into GPU VRAM
-without external sleep/wake workarounds.
+Implements vLLM's abstract WeightTransferEngine contract to apply adaptive
+sparse or full-tensor overwrites to a host CPU snapshot, then reload only the
+changed Hugging Face tensors into GPU VRAM.
 """
 
 import json
@@ -48,9 +48,9 @@ class DeltaSnapshotUpdateInfo(WeightTransferUpdateInfo):
 class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
   """Pull-based Delta Snapshot Weight Transfer Engine for vLLM.
 
-  Applies sparse .safetensors delta updates directly to an in-memory host CPU
-  HuggingFace snapshot and feeds updated tensors into vLLM's native load_weights
-  callback.
+  Applies adaptive .safetensors updates directly to an in-memory host CPU
+  Hugging Face snapshot and feeds changed tensors into vLLM's native
+  load_weights callback.
   """
 
   init_info_cls = DeltaSnapshotInitInfo
@@ -100,25 +100,21 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     pass
 
   def receive_weights(self, update_info: DeltaSnapshotUpdateInfo) -> None:
-    """Receive sparse deltas and load reconstructed HF tensors into vLLM."""
+    """Receive adaptive absolute updates and load changed HF tensors into vLLM."""
     target_path = update_info.target_weights_path
     if not target_path or not os.path.exists(target_path):
       raise ValueError(f"Target weights path does not exist: {target_path}")
 
     start_t = time.perf_counter()
 
-    # Check for sparse_delta metadata format
-    is_sparse_delta = False
     metadata_path = os.path.join(target_path, "metadata.json") if os.path.isdir(target_path) else ""
+    metadata: dict[str, Any] = {}
     if metadata_path and os.path.exists(metadata_path):
-      try:
-        with open(metadata_path) as f:
-          meta = json.load(f)
-        is_sparse_delta = meta.get("format") == "sparse_delta"
-      except Exception:
-        pass
+      with open(metadata_path) as f:
+        metadata = json.load(f)
+    update_format = metadata.get("format")
 
-    if is_sparse_delta:
+    if update_format == "sparse_delta":
       delta_file = os.path.join(target_path, "delta.safetensors")
       if not os.path.exists(delta_file):
         raise ValueError(f"Sparse delta metadata present but delta.safetensors not found at: {target_path}")
@@ -127,23 +123,11 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
       elapsed_read = (time.perf_counter() - start_t) * 1000.0
       logger.info(f"[DeltaSnapshotEngine] Loaded sparse delta from {delta_file} in {elapsed_read:.2f} ms")
 
-      # Initialize base CPU snapshot if not yet populated
-      if not self._cpu_snapshot:
-        base_model = update_info.base_model_path or self._base_model
-        self._ensure_cpu_snapshot(base_model)
-
-      meta_names: list[str] | None = None
-      if metadata_path and os.path.exists(metadata_path):
-        try:
-          with open(metadata_path) as f:
-            meta = json.load(f)
-          if "layer_names" in meta:
-            meta_names = json.loads(meta["layer_names"]) if isinstance(meta["layer_names"], str) else meta["layer_names"]
-        except Exception:
-          pass
-
+      meta_names = metadata.get("layer_names")
       if meta_names is None:
         raise ValueError("Missing 'layer_names' metadata in sparse delta directory.")
+      if isinstance(meta_names, str):
+        meta_names = json.loads(meta_names)
 
       indices_flat = sparse_delta["delta.indices_flat"].to(torch.int64)
       values_flat = sparse_delta["delta.values_flat"]
@@ -156,6 +140,9 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
         self.current_weights_path = target_path
         logger.info("[DeltaSnapshotEngine] Verified patch: 0 tensors changed (NO-OP PATCH DETECTED - Skipping GPU reload)")
         return
+
+      if not self._cpu_snapshot:
+        self._ensure_cpu_snapshot(update_info.base_model_path or self._base_model)
 
       t0_apply = time.perf_counter()
       split_indices = torch.split(indices_flat, layer_lengths)
@@ -176,7 +163,42 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
         f"{changed_numel}/{total_numel} elements [{pct_changed:.3f}% changed]) to CPU snapshot in {t_apply_ms:.2f} ms"
       )
 
-      weights_to_load = list(self._cpu_snapshot.items())
+      weights_to_load = [(name, self._cpu_snapshot[name]) for name in meta_names]
+    elif update_format == "absolute_tensors":
+      delta_file = os.path.join(target_path, "delta.safetensors")
+      if not os.path.exists(delta_file):
+        raise ValueError(f"Absolute tensor metadata present but delta.safetensors not found at: {target_path}")
+      if not self._cpu_snapshot:
+        self._ensure_cpu_snapshot(update_info.base_model_path or self._base_model)
+
+      incoming_tensors = load_file(delta_file, device="cpu")
+      metadata_names = metadata.get("layer_names")
+      if metadata_names is None:
+        raise ValueError("Missing 'layer_names' metadata in absolute tensor update directory.")
+      if isinstance(metadata_names, str):
+        metadata_names = json.loads(metadata_names)
+      if set(metadata_names) != set(incoming_tensors):
+        raise ValueError("Absolute tensor names do not match metadata layer_names.")
+
+      weights_to_load = []
+      for name, incoming_tensor in incoming_tensors.items():
+        if name not in self._cpu_snapshot:
+          raise KeyError(f"Parameter '{name}' found in absolute tensor update but missing from CPU snapshot.")
+        previous_tensor = self._cpu_snapshot[name]
+        if previous_tensor.shape != incoming_tensor.shape or previous_tensor.dtype != incoming_tensor.dtype:
+          raise ValueError(f"Absolute tensor '{name}' does not match the CPU snapshot shape and dtype.")
+        if not torch.equal(previous_tensor, incoming_tensor):
+          self._cpu_snapshot[name] = incoming_tensor
+          weights_to_load.append((name, incoming_tensor))
+
+      if not weights_to_load:
+        self.current_weights_path = target_path
+        logger.info("[DeltaSnapshotEngine] Absolute tensor update is a no-op; skipping GPU reload")
+        return
+      elapsed_read = (time.perf_counter() - start_t) * 1000.0
+      logger.info(
+        f"[DeltaSnapshotEngine] Loaded adaptive absolute update ({len(weights_to_load)} changed tensors) from {delta_file} in {elapsed_read:.2f} ms"
+      )
     else:
       # Full snapshot safetensors path
       weights: list[tuple[str, torch.Tensor]] = []

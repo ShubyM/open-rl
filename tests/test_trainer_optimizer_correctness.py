@@ -316,6 +316,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     frozen_param.grad = torch.tensor([10.0])
 
     worker = FFTTrainingWorker()
+    worker.set_weight_sync_strategy("full")
     worker.model = _FullModelStub([trainable_param, frozen_param])
     worker.trainable_params = fft_trainer_worker_module.trainable_model_parameters(worker.model)
 

@@ -247,6 +247,31 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       self.assertEqual(loaded_calls[0][1].shape, (4, 4))
       self.assertEqual(loaded_calls[0][1].view(-1)[5].item(), 99.0)
 
+  def test_receive_weights_absolute_changed_tensor_patching(self):
+    """Test that adaptive dense updates replace the CPU snapshot and load only changed tensors."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      with open(os.path.join(tmpdir, "metadata.json"), "w") as f:
+        json.dump({"format": "absolute_tensors", "layer_names": ["layer.0.weight"]}, f)
+      updated_weight = torch.full((4, 4), 3.5)
+      save_file({"layer.0.weight": updated_weight}, os.path.join(tmpdir, "delta.safetensors"))
+
+      model = RecordingModel()
+      engine = DeltaSnapshotWeightTransferEngine(
+        config=None,
+        parallel_config=None,  # type: ignore
+        model=model,
+      )
+      engine._cpu_snapshot = {"layer.0.weight": torch.zeros(4, 4)}
+
+      update_info = DeltaSnapshotUpdateInfo(target_weights_path=tmpdir)
+      engine.receive_weights(update_info)
+      engine.receive_weights(update_info)
+
+      self.assertEqual(len(model.load_calls), 1)
+      self.assertEqual(model.load_calls[0][0][0], "layer.0.weight")
+      self.assertTrue(torch.equal(model.load_calls[0][0][1], updated_weight))
+      self.assertTrue(torch.equal(engine._cpu_snapshot["layer.0.weight"], updated_weight))
+
   def test_receive_weights_base_model_directory_loading(self):
     """Test that receive_weights directly populates CPU snapshot from base_model_path when provided."""
     with tempfile.TemporaryDirectory() as tmpdir:

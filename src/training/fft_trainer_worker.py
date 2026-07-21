@@ -45,7 +45,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self.cpu_offload: bool = True
     self.weight_sync_strategy: str = os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower()
     self._is_offloaded: bool = False
-    self._latest_delta_tensors: dict[str, torch.Tensor] = {}
+    self._latest_delta_tensors: dict[str, Any] = {}
     self._latest_total_changed: int = 0
     self._latest_total_elements: int = 0
     self._param_shadow: dict[torch.nn.Parameter, tuple[torch.device, torch.Tensor]] = {}
@@ -226,13 +226,21 @@ class FFTTrainingWorker(BaseTrainerWorker):
     indices_list: list[torch.Tensor] = []
     values_list: list[torch.Tensor] = []
     layer_lengths_list: list[int] = []
+    absolute_tensors: dict[str, torch.Tensor] = {}
+    encoding = "sparse_delta"
+    sparse_bytes = 0
+    dense_bytes = 0
 
     t_collect_start = time.perf_counter()
     if self._latest_delta_tensors and "names" in self._latest_delta_tensors:
+      encoding = self._latest_delta_tensors["encoding"]
       layer_names_list = self._latest_delta_tensors["names"]
       indices_list = self._latest_delta_tensors["indices_list"]
       values_list = self._latest_delta_tensors["values_list"]
       layer_lengths_list = self._latest_delta_tensors["layer_lengths_list"]
+      absolute_tensors = self._latest_delta_tensors["absolute_tensors"]
+      sparse_bytes = self._latest_delta_tensors["sparse_bytes"]
+      dense_bytes = self._latest_delta_tensors["dense_bytes"]
       total_changed = self._latest_total_changed
       total_elements = self._latest_total_elements
     else:
@@ -243,20 +251,22 @@ class FFTTrainingWorker(BaseTrainerWorker):
       indices_list = []
       values_list = []
 
-    if indices_list:
-      indices_flat = torch.cat(indices_list).to(torch.int32).contiguous()
-      values_flat = torch.cat(values_list).contiguous()
+    if encoding == "absolute_tensors":
+      tensors_to_save = absolute_tensors
     else:
-      fallback_dtype = next(self.model.parameters()).dtype if self.model else torch.float32
-      indices_flat = torch.empty(0, dtype=torch.int32, device="cpu")
-      values_flat = torch.empty(0, dtype=fallback_dtype, device="cpu")
+      if indices_list:
+        indices_flat = torch.cat(indices_list).to(torch.int32).contiguous()
+        values_flat = torch.cat(values_list).contiguous()
+      else:
+        fallback_dtype = next(self.model.parameters()).dtype if self.model else torch.float32
+        indices_flat = torch.empty(0, dtype=torch.int32, device="cpu")
+        values_flat = torch.empty(0, dtype=fallback_dtype, device="cpu")
 
-    layer_lengths_tensor = torch.tensor(layer_lengths_list, dtype=torch.int64, device="cpu")
-    packed_delta = {
-      "delta.indices_flat": indices_flat,
-      "delta.values_flat": values_flat,
-      "delta.layer_lengths": layer_lengths_tensor,
-    }
+      tensors_to_save = {
+        "delta.indices_flat": indices_flat,
+        "delta.values_flat": values_flat,
+        "delta.layer_lengths": torch.tensor(layer_lengths_list, dtype=torch.int64, device="cpu"),
+      }
 
     t_collect_end = time.perf_counter()
     collect_time = t_collect_end - t_collect_start
@@ -264,7 +274,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     delta_path = os.path.join(state_path, "delta.safetensors")
     t_save_start = time.perf_counter()
     safetensors.torch.save_file(
-      packed_delta,
+      tensors_to_save,
       delta_path,
       metadata={"layer_names": json.dumps(layer_names_list)},
     )
@@ -276,26 +286,29 @@ class FFTTrainingWorker(BaseTrainerWorker):
       f"collect_time={collect_time:.4f}s | "
       f"safetensors_save_time={save_file_time:.4f}s | "
       f"total_delta_save_time={collect_time + save_file_time:.4f}s | "
+      f"encoding={encoding} sparse_bytes={sparse_bytes} dense_bytes={dense_bytes} | "
       f"changed={total_changed}/{total_elements} ({100.0 * total_changed / max(1, total_elements):.2f}%) across {len(layer_names_list)} layers"
     )
 
     metadata = {
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
-      "format": "sparse_delta",
+      "format": encoding,
       "kind": kind,
       "model_id": model_id,
       "changed_elements": total_changed,
       "total_elements": total_elements,
       "layer_names": layer_names_list,
+      "sparse_bytes": sparse_bytes,
+      "dense_bytes": dense_bytes,
       "density_pct": round(100.0 * total_changed / max(1, total_elements), 3),
       "timestamp": time.time(),
     }
     with open(os.path.join(state_path, "metadata.json"), "w") as f:
       json.dump(metadata, f)
 
-    print(f"Saved sparse delta ({metadata['density_pct']}% changed elements, {total_changed}/{total_elements}) to {state_path}")
-    return {"path": state_path, "density_pct": metadata["density_pct"]}
+    print(f"Saved {encoding} update ({metadata['density_pct']}% changed elements, {total_changed}/{total_elements}) to {state_path}")
+    return {"path": state_path, "density_pct": metadata["density_pct"], "format": encoding}
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
     metadata_path = os.path.join(state_path, "metadata.json")
@@ -375,13 +388,16 @@ class FFTTrainingWorker(BaseTrainerWorker):
     clip_time = t_clip_end - t_clip_start
 
     t_step_start = time.perf_counter()
+    dirty_parameters = None
+    if self.weight_sync_strategy == "delta":
+      dirty_parameters = [(name, param) for name, param in self.model.named_parameters() if param.requires_grad and param.grad is not None]
     self.optimizer.step()
     self.optimizer.zero_grad()
     t_step_end = time.perf_counter()
     step_time = t_step_end - t_step_start
 
     delta_compute_time = 0.0
-    if self.weight_sync_strategy == "delta" and self.model is not None:
+    if dirty_parameters is not None:
       t_delta_start = time.perf_counter()
       self._latest_delta_tensors.clear()
       self._latest_total_changed = 0
@@ -391,43 +407,59 @@ class FFTTrainingWorker(BaseTrainerWorker):
       indices_list: list[torch.Tensor] = []
       values_list: list[torch.Tensor] = []
       layer_lengths_list: list[int] = []
+      changed_parameters: list[tuple[str, torch.nn.Parameter, torch.Tensor]] = []
+      sparse_bytes = 0
+      dense_bytes = 0
 
-      for name, param in self.model.named_parameters():
-        if not param.requires_grad:
-          continue
+      for name, param in dirty_parameters:
         prev_tensor = self._get_prev_cpu_weight(name, param)
         if prev_tensor is None:
-          cpu_buf = torch.empty(param.shape, dtype=param.dtype, device="cpu", pin_memory=torch.cuda.is_available())
-          cpu_buf.copy_(param.data, non_blocking=True)
-          self._param_shadow[param] = (param.device, cpu_buf)
-          prev_tensor = cpu_buf
+          raise RuntimeError(f"Missing CPU shadow for optimizer-updated parameter '{name}'.")
 
         prev_gpu = prev_tensor.to(param.device, non_blocking=True)
 
         diff_mask = param.data.view(-1).ne(prev_gpu.view(-1))
         indices = diff_mask.nonzero(as_tuple=True)[0]
         if indices.numel() > 0:
-          idx_cpu = indices.to(torch.int32).contiguous().cpu()
-          val_cpu = param.data.view(-1)[diff_mask].contiguous().cpu()
           layer_names_list.append(name)
+          changed_numel = int(indices.numel())
+          layer_lengths_list.append(changed_numel)
+          self._latest_total_changed += changed_numel
+          changed_parameters.append((name, param, indices))
+          sparse_bytes += changed_numel * (4 + param.element_size())
+          dense_bytes += param.numel() * param.element_size()
+        del prev_gpu, diff_mask
+
+      encoding = "absolute_tensors" if dense_bytes > 0 and dense_bytes <= sparse_bytes else "sparse_delta"
+      absolute_tensors: dict[str, torch.Tensor] = {}
+      for name, param, indices in changed_parameters:
+        if encoding == "absolute_tensors":
+          absolute_tensor = param.detach().cpu().clone().contiguous()
+          absolute_tensors[name] = absolute_tensor
+          self._param_shadow[param][1].copy_(absolute_tensor)
+        else:
+          idx_cpu = indices.to(torch.int32).contiguous().cpu()
+          val_cpu = param.data.view(-1).index_select(0, indices).contiguous().cpu()
           indices_list.append(idx_cpu)
           values_list.append(val_cpu)
-          layer_lengths_list.append(int(idx_cpu.numel()))
-          self._latest_total_changed += int(idx_cpu.numel())
           self._update_prev_cpu_weight(name, param, idx_cpu, val_cpu)
-        del prev_gpu, diff_mask, indices
 
       self._latest_delta_tensors = {
+        "encoding": encoding,
         "names": layer_names_list,
         "indices_list": indices_list,
         "values_list": values_list,
         "layer_lengths_list": layer_lengths_list,
+        "absolute_tensors": absolute_tensors,
+        "sparse_bytes": sparse_bytes,
+        "dense_bytes": dense_bytes,
       }
 
       t_delta_end = time.perf_counter()
       delta_compute_time = t_delta_end - t_delta_start
       logger.info(
         f"[OPTIM_STEP] model_id={model_id} | delta_compute_time={delta_compute_time:.4f}s | "
+        f"dirty_params={len(dirty_parameters)} changed_params={len(layer_names_list)} encoding={encoding} | "
         f"changed={self._latest_total_changed}/{self._latest_total_elements} "
         f"({100.0 * self._latest_total_changed / max(1, self._latest_total_elements):.2f}%) across {len(layer_names_list)} layers"
       )
