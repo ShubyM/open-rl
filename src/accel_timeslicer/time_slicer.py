@@ -44,13 +44,20 @@ class SocketTimeSlicerClient:
     self.reader: asyncio.StreamReader | None = None
     self.writer: asyncio.StreamWriter | None = None
 
-  async def connect(self) -> None:
+  async def connect(self, retries: int = 10, backoff: float = 0.5) -> None:
     if self.writer is not None and not self.writer.is_closing():
       return
-    if self.host:
-      self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
-    else:
-      self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
+    for attempt in range(retries):
+      try:
+        if self.host:
+          self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+        else:
+          self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
+        return
+      except (OSError, ConnectionRefusedError):
+        if attempt == retries - 1:
+          raise
+        await asyncio.sleep(backoff)
 
   async def close(self) -> None:
     if self.writer is None:
@@ -80,16 +87,21 @@ class SocketTimeSlicerClient:
     assert self.reader is not None
     assert self.writer is not None
 
-    self.writer.write(json.dumps(payload).encode("utf-8") + b"\n")
-    await self.writer.drain()
-    line = await self.reader.readline()
-    if not line:
-      raise RuntimeError("time slicer connection closed")
+    try:
+      self.writer.write(json.dumps(payload).encode("utf-8") + b"\n")
+      await self.writer.drain()
+      line = await self.reader.readline()
+      if not line:
+        await self.close()
+        raise RuntimeError("time slicer connection closed")
 
-    response = json.loads(line.decode("utf-8"))
-    if not response.get("ok"):
-      raise RuntimeError(response.get("error", "time slicer command failed"))
-    return response
+      response = json.loads(line.decode("utf-8"))
+      if not response.get("ok"):
+        raise RuntimeError(response.get("error", "time slicer command failed"))
+      return response
+    except Exception:
+      await self.close()
+      raise
 
 
 def workload_from_env(pid: int | None = None, job_id: str | None = None, group: str = DEFAULT_TIME_SLICE_GROUP) -> WorkloadRef:
