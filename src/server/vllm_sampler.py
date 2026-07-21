@@ -9,6 +9,8 @@ import sys
 import traceback
 from typing import Any
 
+os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
 import redis.asyncio as redis
 
 try:
@@ -237,25 +239,20 @@ async def process_sampling_request(req: dict, store: Any) -> None:
               print("[vLLM Worker] Waking up weights...")
               await engine.wake_up(tags=["weights"])
               if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
-                print(f"[vLLM Worker] Receiving incremental delta weights from {weights_path} via native WeightTransferEngine...")
-                try:
-                  await engine.collective_rpc(
-                    "update_weights",
-                    kwargs={
-                      "update_info": {
-                        "target_weights_path": weights_path,
-                        "base_model_path": (
-                          os.getenv("OPEN_RL_BASE_MODEL") or os.getenv("BASE_MODEL") or getattr(getattr(engine, "engine_args", None), "model", "")
-                        ),
-                      }
-                    },
-                  )
-                except Exception as exc:
-                  print(f"[vLLM Worker] Native update_weights collective_rpc failed ({exc}); falling back to standard disk reload...")
-                  await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+
+                def _trigger_wt(worker, path=weights_path):
+                  wt = worker.weight_transfer_engine
+                  info = wt.parse_update_info({"target_weights_path": path})
+                  model = worker.model_runner.model
+                  return wt.receive_weights(info, load_weights=model.load_weights)
+
+                res = await engine.collective_rpc(_trigger_wt)
+                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
               else:
-                print(f"[vLLM Worker] Reloading weights from {weights_path} in-place...")
-                await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+                res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                print(f"[vLLM Worker] Full weights reloaded from {weights_path} in-place.")
               print("[vLLM Worker] Waking up KV cache...")
               await engine.wake_up(tags=["kv_cache"])
               IS_ENGINE_SLEEPING = False
@@ -327,16 +324,13 @@ async def weight_prefetcher_loop(model_id: str, store: Any) -> None:
               print(f"[vLLM Worker] Prefetch signal received. Target weights path: {target_path}")
               async with reload_lock:
                 if target_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
-                  print("[vLLM Worker] Prefetching delta weights to CPU cache in background...")
-                  t0 = asyncio.get_event_loop().time()
-                  await engine.collective_rpc("cache_prefetch_weights", kwargs={"weights_path": target_path})
-                  dt = (asyncio.get_event_loop().time() - t0) * 1000.0
-                  print(f"[vLLM Worker] Background weights prefetch to CPU cache completed in {dt:.2f} ms!")
+                  print(f"[vLLM Worker] Background prefetch signal registered for target: {target_path}")
           except Exception as e:
             print(f"[vLLM Worker] Error in prefetch message processing: {e}")
             traceback.print_exc()
-      except redis.exceptions.TimeoutError:
-        continue
+      except (asyncio.CancelledError, GeneratorExit):
+        print("[vLLM Worker] Weight prefetcher loop cancelled cleanly during shutdown.")
+        break
       except Exception as e:
         print(f"[vLLM Worker] Pub/Sub connection error: {e}. Retrying subscription...")
         await asyncio.sleep(2)
@@ -344,11 +338,11 @@ async def weight_prefetcher_loop(model_id: str, store: Any) -> None:
           await pubsub.subscribe(channel_key)
         except Exception:
           pass
+  except (asyncio.CancelledError, GeneratorExit):
+    print("[vLLM Worker] Weight prefetcher task terminated cleanly.")
   except Exception as e:
     print(f"[vLLM Worker] CRITICAL: Weight prefetcher loop crashed: {e}")
     traceback.print_exc()
-  except asyncio.CancelledError:
-    print("[vLLM Worker] Weight prefetcher loop cancelled.")
   finally:
     try:
       await pubsub.unsubscribe(channel_key)

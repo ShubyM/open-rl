@@ -14,6 +14,15 @@ from typing import Any
 import torch
 
 try:
+  from vllm.logger import init_logger
+
+  logger = init_logger("vllm.distributed.weight_transfer.delta_snapshot")
+except ImportError:
+  import logging
+
+  logger = logging.getLogger("vllm.distributed.weight_transfer.delta_snapshot")
+
+try:
   from vllm.distributed.weight_transfer.base import (
     WeightTransferEngine,
     WeightTransferInitInfo,
@@ -106,7 +115,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     if self._cpu_snapshot:
       return
     base_model = base_model or self._base_model or os.getenv("OPEN_RL_BASE_MODEL", os.getenv("BASE_MODEL", ""))
-    print(f"[DeltaSnapshotEngine] Initializing CPU weights snapshot for sparse delta patching (base model: '{base_model}')...")
+    logger.info(f"[DeltaSnapshotEngine] Initializing CPU weights snapshot for sparse delta patching (base model: '{base_model}')...")
 
     if base_model:
       start_t = time.perf_counter()
@@ -126,7 +135,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
           self._cpu_snapshot[name] = tensor.pin_memory() if torch.cuda.is_available() else tensor.clone()
       if self._cpu_snapshot:
         elapsed = (time.perf_counter() - start_t) * 1000.0
-        print(
+        logger.info(
           f"[DeltaSnapshotEngine] CPU weights snapshot initialized with {len(self._cpu_snapshot)} "
           f"HuggingFace tensors from base model '{base_model}' via vLLM weight iterator in {elapsed:.2f} ms."
         )
@@ -141,7 +150,9 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
         real_t = self._get_real_tensor(model, name, buf)
         self._cpu_snapshot[name] = real_t.data.cpu().pin_memory() if torch.cuda.is_available() else real_t.data.cpu().clone()
       elapsed = (time.perf_counter() - start_t) * 1000.0
-      print(f"[DeltaSnapshotEngine] CPU weights snapshot initialized with {len(self._cpu_snapshot)} vLLM tensors from model in {elapsed:.2f} ms.")
+      logger.info(
+        f"[DeltaSnapshotEngine] CPU weights snapshot initialized with {len(self._cpu_snapshot)} vLLM tensors from model in {elapsed:.2f} ms."
+      )
       return
 
     raise RuntimeError(f"Failed to initialize CPU weights snapshot: neither base safetensors for '{base_model}' nor model instance available.")
@@ -188,7 +199,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
       sparse_delta = load_file(delta_file, device="cpu")
       elapsed_read = (time.perf_counter() - start_t) * 1000.0
-      print(f"[DeltaSnapshotEngine] Loaded sparse delta from {delta_file} in {elapsed_read:.2f} ms")
+      logger.info(f"[DeltaSnapshotEngine] Loaded sparse delta from {delta_file} in {elapsed_read:.2f} ms")
 
       # Initialize base CPU snapshot if not yet populated
       if not self._cpu_snapshot:
@@ -222,7 +233,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
       if len(meta_names) == 0 or sum(layer_lengths) == 0 or indices_flat.numel() == 0:
         self.current_weights_path = target_path
-        print("[DeltaSnapshotEngine] Verified patch: 0 tensors changed (NO-OP PATCH DETECTED - Skipping GPU reload)")
+        logger.info("[DeltaSnapshotEngine] Verified patch: 0 tensors changed (NO-OP PATCH DETECTED - Skipping GPU reload)")
         return
 
       t0_apply = time.perf_counter()
@@ -236,9 +247,12 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
         snap_flat[split_indices[i]] = split_values[i]
 
       t_apply_ms = (time.perf_counter() - t0_apply) * 1000.0
-      print(
+      total_numel = sum(t.numel() for t in self._cpu_snapshot.values())
+      changed_numel = indices_flat.numel()
+      pct_changed = (changed_numel / total_numel * 100.0) if total_numel > 0 else 0.0
+      logger.info(
         f"[DeltaSnapshotEngine] Applied packed 1D sparse delta ({len(meta_names)} layers, "
-        f"{indices_flat.numel()} total elements) to CPU snapshot in {t_apply_ms:.2f} ms"
+        f"{changed_numel}/{total_numel} elements [{pct_changed:.3f}% changed]) to CPU snapshot in {t_apply_ms:.2f} ms"
       )
 
       weights_to_load = list(self._cpu_snapshot.items())
@@ -262,7 +276,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
         raise ValueError(f"Unsupported weight path format: {target_path}")
 
       elapsed_read = (time.perf_counter() - start_t) * 1000.0
-      print(f"[DeltaSnapshotEngine] Loaded {len(weights)} parameter tensors from {target_path} in {elapsed_read:.2f} ms")
+      logger.info(f"[DeltaSnapshotEngine] Loaded {len(weights)} parameter tensors from {target_path} in {elapsed_read:.2f} ms")
 
       changed_weights = []
       no_op_tensors = 0
@@ -280,10 +294,12 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
       if len(changed_weights) == 0 and len(weights) > 0:
         self.current_weights_path = target_path
-        print(f"[DeltaSnapshotEngine] Verified patch: 0/{len(weights)} tensors changed (NO-OP PATCH DETECTED - Skipping GPU reload)")
+        logger.info(f"[DeltaSnapshotEngine] Verified patch: 0/{len(weights)} tensors changed (NO-OP PATCH DETECTED - Skipping GPU reload)")
         return
 
-      print(f"[DeltaSnapshotEngine] Verified patch: {len(changed_weights)}/{len(weights)} tensors changed ({no_op_tensors} no-op tensors skipped)")
+      logger.info(
+        f"[DeltaSnapshotEngine] Verified patch: {len(changed_weights)}/{len(weights)} tensors changed ({no_op_tensors} no-op tensors skipped)"
+      )
       weights_to_load = changed_weights
 
     # Feed genuinely changed parameter tensors directly into vLLM's internal layer loader
@@ -291,7 +307,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     load_weights(weights_to_load)
     elapsed_load = (time.perf_counter() - start_load) * 1000.0
     self.current_weights_path = target_path
-    print(f"[DeltaSnapshotEngine] Incremental load_weights completed ({len(weights_to_load)} tensors) in {elapsed_load:.2f} ms")
+    logger.info(f"[DeltaSnapshotEngine] Incremental load_weights completed ({len(weights_to_load)} tensors) in {elapsed_load:.2f} ms")
 
   def finish_weight_update(self) -> None:
     """Finalize layerwise reload."""

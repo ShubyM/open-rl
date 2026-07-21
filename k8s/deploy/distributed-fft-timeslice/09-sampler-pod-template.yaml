@@ -30,6 +30,10 @@ data:
           value: "true"
         - name: VLLM_GPU_MEMORY_UTILIZATION
           value: "0.70"
+        - name: VLLM_SERVER_DEV_MODE
+          value: "1"
+        - name: VLLM_ALLOW_INSECURE_SERIALIZATION
+          value: "1"
         - name: OPEN_RL_TMP_DIR
           value: "/mnt/shared/open-rl"
         - name: HF_HOME
