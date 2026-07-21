@@ -178,7 +178,7 @@ class InMemoryStore(RequestStore):
 
 class RedisStore(RequestStore):
   def __init__(self, redis_url: str):
-    self.redis = redis.from_url(redis_url, decode_responses=True, health_check_interval=2)
+    self.redis = redis.from_url(redis_url, decode_responses=True, health_check_interval=2, max_connections=10000)
     import redis as sync_redis_mod
 
     self.sync_redis = sync_redis_mod.Redis.from_url(redis_url, decode_responses=True)
