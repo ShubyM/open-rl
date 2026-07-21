@@ -8,6 +8,7 @@ import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import patch
 
+import safetensors.torch  # noqa: F401
 import torch
 
 
@@ -118,6 +119,10 @@ class _FullModelStub:
 
   def parameters(self):
     yield from self.params
+
+  def named_parameters(self):
+    for index, parameter in enumerate(self.params):
+      yield f"parameter_{index}", parameter
 
 
 class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker):

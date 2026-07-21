@@ -6,7 +6,6 @@ without external sleep/wake workarounds.
 """
 
 import json
-import logging
 import os
 import time
 from collections.abc import Iterator
@@ -15,50 +14,19 @@ from typing import Any
 
 import torch
 from safetensors.torch import load_file
+from vllm.distributed.weight_transfer.base import (
+  WeightTransferEngine,
+  WeightTransferInitInfo,
+  WeightTransferUpdateInfo,
+)
+from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
+from vllm.logger import init_logger
+from vllm.model_executor.model_loader.weight_utils import (
+  download_weights_from_hf,
+  safetensors_weights_iterator,
+)
 
-try:
-  from vllm.logger import init_logger
-
-  logger = init_logger("vllm.distributed.weight_transfer.delta_snapshot")
-except ImportError:
-  logger = logging.getLogger("vllm.distributed.weight_transfer.delta_snapshot")
-
-try:
-  from vllm.distributed.weight_transfer.base import (
-    WeightTransferEngine,
-    WeightTransferInitInfo,
-    WeightTransferUpdateInfo,
-  )
-  from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
-  from vllm.model_executor.model_loader.weight_utils import (
-    download_weights_from_hf,
-    safetensors_weights_iterator,
-  )
-except ImportError:
-  WeightTransferEngineFactory = None
-  download_weights_from_hf = None
-  safetensors_weights_iterator = None
-
-  @dataclass
-  class WeightTransferInitInfo:
-    pass
-
-  @dataclass
-  class WeightTransferUpdateInfo:
-    is_checkpoint_format: bool = True
-
-  class WeightTransferEngine:
-    def __init__(self, *args, **kwargs):
-      self.model = kwargs.get("model")
-      self.model_config = kwargs.get("vllm_config")
-
-    @classmethod
-    def parse_init_info(cls, init_dict: dict[str, Any]):
-      return cls.init_info_cls(**init_dict)
-
-    @classmethod
-    def parse_update_info(cls, update_dict: dict[str, Any]):
-      return cls.update_info_cls(**update_dict)
+logger = init_logger("vllm.distributed.weight_transfer.delta_snapshot")
 
 
 @dataclass
@@ -104,9 +72,6 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
     if base_model:
       start_t = time.perf_counter()
-      if download_weights_from_hf is None or safetensors_weights_iterator is None:
-        raise RuntimeError("vLLM weight utilities are required to initialize the CPU snapshot.")
-
       if os.path.isdir(base_model):
         hf_folder = base_model
       else:
@@ -279,11 +244,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     pass
 
 
-if WeightTransferEngineFactory is not None:
-  try:
-    WeightTransferEngineFactory.register_engine(
-      "delta_snapshot",
-      DeltaSnapshotWeightTransferEngine,
-    )
-  except ValueError:
-    pass
+WeightTransferEngineFactory.register_engine(
+  "delta_snapshot",
+  DeltaSnapshotWeightTransferEngine,
+)

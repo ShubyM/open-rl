@@ -6,6 +6,7 @@ import unittest
 
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file
 
 from training.fft_trainer_worker import FFTTrainingWorker
 
@@ -54,9 +55,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
 
     delta_file = os.path.join(state_path, "delta.safetensors")
     self.assertTrue(os.path.exists(delta_file))
-    import safetensors.torch
-
-    sparse_delta = safetensors.torch.load_file(delta_file)
+    sparse_delta = load_file(delta_file)
 
     self.assertIn("delta.indices_flat", sparse_delta)
     self.assertIn("delta.values_flat", sparse_delta)
@@ -120,9 +119,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
     # Verify that delta.safetensors was cleanly saved from offloaded CPU buffer
     delta_file = os.path.join(state_path, "delta.safetensors")
     self.assertTrue(os.path.exists(delta_file))
-    import safetensors.torch
-
-    sparse_delta = safetensors.torch.load_file(delta_file)
+    sparse_delta = load_file(delta_file)
     self.assertIn("delta.indices_flat", sparse_delta)
     self.assertEqual(sparse_delta["delta.indices_flat"].numel(), 1)
     self.assertAlmostEqual(sparse_delta["delta.values_flat"][0].item(), 77.7, places=4)

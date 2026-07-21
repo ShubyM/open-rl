@@ -12,6 +12,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+import safetensors.torch
 import torch
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
@@ -88,7 +89,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     """Load the per-job model if needed, then prepare it for full fine-tuning."""
     if config is not None:
       self.cpu_offload = config.cpu_offload
-      if hasattr(config, "weight_sync_strategy") and config.weight_sync_strategy:
+      if config.weight_sync_strategy:
         self.set_weight_sync_strategy(config.weight_sync_strategy)
     self.load_base_model(base_model_name)
     if config is not None and config.seed is not None:
@@ -260,8 +261,6 @@ class FFTTrainingWorker(BaseTrainerWorker):
     t_collect_end = time.perf_counter()
     collect_time = t_collect_end - t_collect_start
 
-    import safetensors.torch
-
     delta_path = os.path.join(state_path, "delta.safetensors")
     t_save_start = time.perf_counter()
     safetensors.torch.save_file(
@@ -382,7 +381,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     step_time = t_step_end - t_step_start
 
     delta_compute_time = 0.0
-    if self.weight_sync_strategy == "delta" and self.model is not None and hasattr(self.model, "named_parameters"):
+    if self.weight_sync_strategy == "delta" and self.model is not None:
       t_delta_start = time.perf_counter()
       self._latest_delta_tensors.clear()
       self._latest_total_changed = 0
@@ -523,8 +522,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if torch.cuda.is_available():
       gc.collect()
       torch.cuda.empty_cache()
-      if hasattr(torch.cuda, "ipc_collect"):
-        torch.cuda.ipc_collect()
+      torch.cuda.ipc_collect()
 
     self._is_offloaded = True
     print(f"[FFT Worker] Offloaded weights & states to pinned CPU memory in {(time.perf_counter() - start_t) * 1000:.1f} ms.")

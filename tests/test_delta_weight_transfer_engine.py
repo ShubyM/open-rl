@@ -1,14 +1,84 @@
 """Unit tests for DeltaSnapshotWeightTransferEngine."""
 
 import json
+import logging
 import os
+import sys
 import tempfile
+import types
 import unittest
+from dataclasses import dataclass
 from unittest.mock import patch
 
 import safetensors
 import torch
 from safetensors.torch import save_file
+
+
+@dataclass
+class StubWeightTransferInitInfo:
+  pass
+
+
+@dataclass
+class StubWeightTransferUpdateInfo:
+  is_checkpoint_format: bool = True
+
+
+class StubWeightTransferEngine:
+  def __init__(self, *args, model=None, vllm_config=None, **kwargs) -> None:
+    self.model = model
+    self.model_config = vllm_config
+
+  @classmethod
+  def parse_init_info(cls, init_dict):
+    return cls.init_info_cls(**init_dict)
+
+  @classmethod
+  def parse_update_info(cls, update_dict):
+    return cls.update_info_cls(**update_dict)
+
+
+class StubWeightTransferEngineFactory:
+  @classmethod
+  def register_engine(cls, name, engine_cls) -> None:
+    pass
+
+
+def unavailable_weight_utility(*args, **kwargs):
+  raise RuntimeError("Test must patch the vLLM weight utility before use.")
+
+
+vllm_module = types.ModuleType("vllm")
+distributed_module = types.ModuleType("vllm.distributed")
+weight_transfer_module = types.ModuleType("vllm.distributed.weight_transfer")
+base_module = types.ModuleType("vllm.distributed.weight_transfer.base")
+base_module.WeightTransferEngine = StubWeightTransferEngine
+base_module.WeightTransferInitInfo = StubWeightTransferInitInfo
+base_module.WeightTransferUpdateInfo = StubWeightTransferUpdateInfo
+factory_module = types.ModuleType("vllm.distributed.weight_transfer.factory")
+factory_module.WeightTransferEngineFactory = StubWeightTransferEngineFactory
+logger_module = types.ModuleType("vllm.logger")
+logger_module.init_logger = logging.getLogger
+model_executor_module = types.ModuleType("vllm.model_executor")
+model_loader_module = types.ModuleType("vllm.model_executor.model_loader")
+weight_utils_module = types.ModuleType("vllm.model_executor.model_loader.weight_utils")
+weight_utils_module.download_weights_from_hf = unavailable_weight_utility
+weight_utils_module.safetensors_weights_iterator = unavailable_weight_utility
+
+sys.modules.update(
+  {
+    "vllm": vllm_module,
+    "vllm.distributed": distributed_module,
+    "vllm.distributed.weight_transfer": weight_transfer_module,
+    "vllm.distributed.weight_transfer.base": base_module,
+    "vllm.distributed.weight_transfer.factory": factory_module,
+    "vllm.logger": logger_module,
+    "vllm.model_executor": model_executor_module,
+    "vllm.model_executor.model_loader": model_loader_module,
+    "vllm.model_executor.model_loader.weight_utils": weight_utils_module,
+  }
+)
 
 from src.server import delta_weight_transfer_engine as delta_module
 from src.server.delta_weight_transfer_engine import (

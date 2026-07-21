@@ -13,50 +13,30 @@ from typing import Any
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 import redis.asyncio as redis
-
-from server.store import RedisStore, RequestStore, get_store
-
-try:
-  from vllm import SamplingParams
-  from vllm.config.weight_transfer import WeightTransferConfig
-  from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
-  from vllm.engine.arg_utils import AsyncEngineArgs
-  from vllm.engine.async_llm_engine import AsyncLLMEngine
-  from vllm.lora.request import LoRARequest
-  from vllm.sampling_params import RequestOutputKind
-
-  VLLM_AVAILABLE = True
-except ImportError:
-  SamplingParams = None
-  WeightTransferConfig = None
-  WeightTransferUpdateRequest = None
-  AsyncEngineArgs = None
-  AsyncLLMEngine = None
-  LoRARequest = None
-  RequestOutputKind = None
-  VLLM_AVAILABLE = False
-
-try:
-  import server.delta_weight_transfer_engine  # noqa: F401
-except ImportError:
-  pass
-
 from opentelemetry import propagate, trace
+from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from vllm import SamplingParams
+from vllm.config.weight_transfer import WeightTransferConfig
+from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.lora.request import LoRARequest
+from vllm.sampling_params import RequestOutputKind
+
+import server.delta_weight_transfer_engine  # noqa: F401
+from accel_timeslicer.time_slicer import time_slicer_client_from_env, workload_from_env
+from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, workload_job_id
+from server.store import RedisStore, RequestStore, get_store
 
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
 
 if os.getenv("ENABLE_GCP_TRACE", "0") == "1":
-  try:
-    from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
-
-    exporter = CloudTraceSpanExporter()
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    print("OpenTelemetry: Configured GCP CloudTraceSpanExporter for vLLM Worker")
-  except ImportError:
-    print("OpenTelemetry: opentelemetry-exporter-gcp-trace is not installed")
+  exporter = CloudTraceSpanExporter()
+  provider.add_span_processor(BatchSpanProcessor(exporter))
+  print("OpenTelemetry: Configured GCP CloudTraceSpanExporter for vLLM Worker")
 
 tracer = trace.get_tracer("vllm.inference.worker")
 
@@ -72,9 +52,6 @@ def is_fft_enabled() -> bool:
 
 time_slicer: Any = None
 if is_fft_enabled():
-  from accel_timeslicer.time_slicer import time_slicer_client_from_env, workload_from_env
-  from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, workload_job_id
-
   time_slicer = time_slicer_client_from_env()
 
 
@@ -90,8 +67,8 @@ def init_engine():
   print(f"-> Model        : {model_name or 'Not Set'}\n")
 
   mock_vllm = os.getenv("MOCK_VLLM", "0") == "1"
-  if mock_vllm or not VLLM_AVAILABLE:
-    print("[vLLM Worker] MOCK_VLLM=1 or vllm not installed, bypassing real engine init for local dev.")
+  if mock_vllm:
+    print("[vLLM Worker] MOCK_VLLM=1, bypassing real engine init for local dev.")
   elif not model_name:
     print("[vLLM Worker] Error: BASE_MODEL environment variable is required.")
     sys.exit(1)
@@ -117,7 +94,7 @@ def init_engine():
     if hf_overrides:
       engine_kwargs["hf_overrides"] = hf_overrides
 
-    if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta" and WeightTransferConfig is not None:
+    if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
       engine_kwargs["weight_transfer_config"] = WeightTransferConfig(backend="delta_snapshot")
 
     engine_args = AsyncEngineArgs(**engine_kwargs)
@@ -241,7 +218,6 @@ async def process_sampling_request(req: dict, store: Any) -> None:
               print("[vLLM Worker] Waking up weights...")
               await engine.wake_up(tags=["weights"])
               if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
-                assert WeightTransferUpdateRequest is not None
                 update = WeightTransferUpdateRequest(
                   update_info={
                     "target_weights_path": weights_path,
