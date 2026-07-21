@@ -52,7 +52,7 @@ class TrainingRequestsProcessor(Protocol):
 
   async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
     request_id, result = await self.handle_request(raw_request, model_id)
-    if request_id is not None:
+    if request_id is not None and is_primary():
       await self.store.set_future(request_id, result)
 
   async def handle_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> tuple[str | None, dict[str, Any]]:
@@ -140,9 +140,14 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
         await asyncio.sleep(1)
 
   async def run_once(self) -> None:
-    batch = await self.store.get_requests()
+    batch = await self.store.get_requests() if is_primary() else None
+    if is_distributed():
+      # Every rank must execute the same request sequence (collectives are
+      # positional); rank 0 owns the queue and fans the batch out.
+      batch = await asyncio.to_thread(broadcast_object, batch)
     if not batch:
-      await asyncio.sleep(0.1)
+      if is_primary():
+        await asyncio.sleep(0.1)
       return
 
     model_id = batch[0].get("model_id", "default")
@@ -522,7 +527,7 @@ def start_request_processing_loop() -> None:
       print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
     is_ready = True
 
-  if not is_fft_enabled():
+  if not is_fft_enabled() and is_primary():
     probe_app = FastAPI()
 
     @probe_app.get("/healthz")
@@ -531,8 +536,13 @@ def start_request_processing_loop() -> None:
         return {"status": "ready"}
       raise HTTPException(status_code=503, detail="Model Loading")
 
+    # Configurable so a dedicated trainer can coexist with a vLLM server on
+    # the same box (both defaulted to 8000); non-primary ranks skip the probe
+    # entirely or every rank would fight over the port.
+    probe_port = int(os.getenv("OPEN_RL_WORKER_PROBE_PORT", "8000"))
+
     def run_probe_server():
-      uvicorn.run(probe_app, host="0.0.0.0", port=8000, log_level="warning")
+      uvicorn.run(probe_app, host="0.0.0.0", port=probe_port, log_level="warning")
 
     threading.Thread(target=run_probe_server, daemon=True).start()
   asyncio.run(run_training_requests_processor(worker, args.model_id))

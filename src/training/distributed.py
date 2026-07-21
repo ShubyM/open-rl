@@ -1,6 +1,7 @@
 """Small torch.distributed boundary shared by the FFT worker and its queue loop."""
 
 import os
+from collections.abc import Iterable
 from datetime import timedelta
 from typing import Any
 
@@ -89,6 +90,33 @@ def all_gather_object(value: Any) -> list[Any]:
   values: list[Any] = [None] * world_size()
   dist.all_gather_object(values, value)
   return values
+
+
+def broadcast_parameters(params: Iterable[torch.nn.Parameter]) -> None:
+  """Replicate rank 0's parameter values (e.g. a freshly initialized adapter)."""
+  if not is_distributed():
+    return
+  for param in params:
+    dist.broadcast(param.data, src=0)
+
+
+def all_reduce_gradients(params: Iterable[torch.nn.Parameter]) -> None:
+  """Combine data-parallel gradients so every rank steps identically.
+
+  forward_backward scales each rank's loss by the shard count, so summing
+  gradients across ranks and dividing by the world size recovers exactly the
+  single-process gradient over the full datum list.
+  """
+  if not is_distributed():
+    return
+  size = float(world_size())
+  for param in params:
+    if param.grad is None:
+      # Collectives are positional across the group: a rank whose shard never
+      # touched this parameter must still contribute zeros.
+      param.grad = torch.zeros_like(param.data)
+    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+    param.grad.div_(size)
 
 
 def close() -> None:

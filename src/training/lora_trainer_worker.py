@@ -13,6 +13,7 @@ from peft import PeftModelForCausalLM, get_peft_model
 from pydantic import BaseModel
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
+from training.distributed import all_reduce_gradients, barrier, broadcast_parameters, is_primary
 from training.trainer_worker import BaseTrainerWorker, Datum
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
@@ -170,6 +171,9 @@ class LoraTrainingWorker(BaseTrainerWorker):
 
     self.peft_model.set_adapter(adapter_id)
     self.adapter_states[adapter_id] = {"trainable_params": active_adapter_parameters(self.peft_model, adapter_id), "optimizer": None}
+    # lora_A initializes randomly per process; data-parallel ranks must train
+    # rank 0's copy or their adapters silently diverge from step one.
+    broadcast_parameters(self.adapter_states[adapter_id]["trainable_params"])
 
     if ENABLE_GRADIENT_CHECKPOINTING:
       try:
@@ -216,6 +220,15 @@ class LoraTrainingWorker(BaseTrainerWorker):
   SNAPSHOT_KEEP = 4
 
   def save_adapter(self, adapter_id: str, alias: str | None = None, session_label: str | None = None) -> None:
+    """Write the adapter snapshot on rank 0; other ranks wait at the barrier
+    so no rank reports success while the sampler-visible dir is mid-write.
+    Adapters are replicated across data-parallel ranks, so one copy is the
+    whole truth."""
+    if is_primary():
+      self.write_adapter(adapter_id, alias, session_label)
+    barrier()
+
+  def write_adapter(self, adapter_id: str, alias: str | None = None, session_label: str | None = None) -> None:
     """Save adapter weights to disk for the sampler.
 
     Each sampler snapshot gets its own immutable directory
@@ -299,6 +312,9 @@ class LoraTrainingWorker(BaseTrainerWorker):
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     """Save adapter weights (and optionally optimizer state) to a specific path."""
     assert self.peft_model is not None, "Model must be loaded first."
+    if not is_primary():
+      barrier()
+      return {"path": state_path}
 
     self.peft_model.set_adapter(model_id)
     os.makedirs(state_path, exist_ok=True)
@@ -321,6 +337,7 @@ class LoraTrainingWorker(BaseTrainerWorker):
       json.dump(metadata, f)
 
     print(f"Saved state for '{model_id}' to {state_path}")
+    barrier()
     return {"path": state_path}
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
@@ -432,6 +449,10 @@ class LoraTrainingWorker(BaseTrainerWorker):
     max_grad_norm = adam_params.get("grad_clip_norm") or math.inf
     if max_grad_norm <= 0.0:
       max_grad_norm = math.inf
+
+    # Each data-parallel rank holds gradients for its datum shard; combine
+    # them so the replicated optimizer steps identically on every rank.
+    all_reduce_gradients(params)
 
     total_norm = torch.nn.utils.clip_grad_norm_(
       params,

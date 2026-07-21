@@ -338,7 +338,8 @@ async def lifespan(_: FastAPI):
   if is_fft_enabled() or (get_sampler_backend() == "vllm" and not is_single_process_mode() and not get_sampler_base_url()):
     fft_worker_manager = create_fft_worker_manager()
   if get_sampler_base_url() and get_sampler_backend() == "vllm" and not is_single_process_mode():
-    await external_sampler.preflight(get_sampler_base_url())
+    for sampler_url in external_sampler.get_sampler_base_urls():
+      await external_sampler.preflight(sampler_url)
   if is_single_process_mode():
     base_model = os.getenv("BASE_MODEL")
     print("\n" + "=" * 50)
@@ -349,7 +350,17 @@ async def lifespan(_: FastAPI):
     print(f"-> FFT enabled     : {is_fft_enabled()}")
     print("-> Server mode     : API server + worker loop in one process\n")
     await preflight_vllm()
-  if not is_fft_enabled():
+  if os.getenv("OPEN_RL_EXTERNAL_TRAINER") == "1":
+    # A dedicated trainer process (torchrun for OPEN_RL_FSDP_WORLD_SIZE > 1)
+    # drains the training queue; running the in-gateway worker too would race
+    # it for requests.
+    if not os.getenv("REDIS_URL"):
+      raise RuntimeError(
+        "OPEN_RL_EXTERNAL_TRAINER=1 requires REDIS_URL: a dedicated trainer "
+        "process can only share the queue through Redis."
+      )
+    print("-> Training: dedicated external trainer process (in-gateway worker disabled)")
+  elif not is_fft_enabled():
     from server import training_requests_processor
 
     worker = training_requests_processor.LoraTrainingWorker()
@@ -739,8 +750,9 @@ async def create_sampling_session(req: dict):
       await ensure_sampler_launched(target_model_id, base_model)
     s = get_store()
     # Only managed queue workers (RedisStore) publish sampler_ready flags; the
-    # in-memory store inherits redis=None and must not wait for one.
-    if s.redis is not None:
+    # in-memory store inherits redis=None, and an external SAMPLER_BASE_URL
+    # server is preflighted at startup and never publishes one.
+    if s.redis is not None and not get_sampler_base_url():
       print(f"[GATEWAY] Waiting for dynamic vLLM sampler worker to be ready for model {target_model_id}...")
       start_time = time.monotonic()
       while True:
