@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -17,6 +18,12 @@ from typing import Any
 from tinker_cookbook.renderers.base import Message, message_to_jsonable
 
 ARTIFACT_EXTENSIONS = ("docx", "xlsx", "pptx", "pdf", "md", "txt")
+
+# All episodes of a batch finish (and grade) near-simultaneously; without a
+# cap, 30-50 concurrent gradings each fire judge calls at once and the burst
+# rate-limits the judge into slow retries or hard failures. Serialized within
+# an episode (judge_parallel=1), bounded across episodes here.
+GRADING_CONCURRENCY = threading.Semaphore(int(os.getenv("OPEN_RL_GRADING_CONCURRENCY", "6")))
 _EXPECTED_EXTENSION_RE = re.compile(rf"\.({'|'.join(ARTIFACT_EXTENSIONS)})\b", re.IGNORECASE)
 
 
@@ -32,7 +39,7 @@ class LabRubricReward:
   criteria_count: int
   tool_metrics: Callable[[], dict[str, Any]]
   config: dict[str, Any] = field(default_factory=dict)
-  timeout_seconds: int = 900
+  timeout_seconds: int = 3600
   # Reward is pure rubric score by default; process metrics are still computed
   # and logged, and the no-output gate still skips pointless judge calls.
   process_reward_weight: float = 0.0
@@ -81,19 +88,41 @@ class LabRubricReward:
     if self.max_criteria is not None:
       cmd += ["--max-criteria", str(self.max_criteria)]
 
-    result = subprocess.run(
-      cmd,
-      cwd=str(self.lab_root),
-      capture_output=True,
-      text=True,
-      encoding="utf-8",
-      errors="replace",
-      env={**os.environ, "PYTHONUNBUFFERED": "1"},
-      timeout=self.timeout_seconds,
-    )
+    # Judge output streams to grading.log as it happens (tail -f to watch the
+    # [rubric n/N] progress live); captured output would sit invisible until
+    # the subprocess exits.
+    grading_log = self.run_dir / "grading.log"
+    with GRADING_CONCURRENCY:
+      return self.run_grading(cmd, grading_log, process_reward, process_metrics)
+
+  def run_grading(self, cmd, grading_log, process_reward, process_metrics):
+    try:
+      with open(grading_log, "w", encoding="utf-8") as log:
+        log.write("COMMAND:\n" + " ".join(cmd) + "\n\n")
+        log.flush()
+        result = subprocess.run(
+          cmd,
+          cwd=str(self.lab_root),
+          stdout=log,
+          stderr=subprocess.STDOUT,
+          env={**os.environ, "PYTHONUNBUFFERED": "1"},
+          timeout=self.timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+      # An uncaught timeout would escape reward containment entirely and fail
+      # the whole rollout group; grade it like any other grading failure.
+      (self.run_dir / "reward_error.log").write_text(
+        f"TIMEOUT after {self.timeout_seconds}s\n\n" + grading_log.read_text(encoding="utf-8", errors="replace"),
+        encoding="utf-8",
+      )
+      return self.combine_rewards(0.0, process_reward), {
+        **process_metrics,
+        **self.failure_metrics(),
+        "lab/reward_error": 1.0,
+      }
     if result.returncode != 0:
       (self.run_dir / "reward_error.log").write_text(
-        "COMMAND:\n" + " ".join(cmd) + "\n\nSTDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr,
+        grading_log.read_text(encoding="utf-8", errors="replace"),
         encoding="utf-8",
       )
       return self.combine_rewards(0.0, process_reward), {
