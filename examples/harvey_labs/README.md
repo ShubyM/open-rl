@@ -21,15 +21,28 @@ sandbox tools, and rubric reward.
 
 ## Setup
 
-Validated end to end on a bare Ubuntu GPU box; the steps are idempotent.
+One command on a bare Ubuntu GPU VM:
 
-1. **Repo + Python env** (needs `nvcc` for the GPU extra — it builds
-   `causal-conv1d`, which the Qwen fast path requires):
+```bash
+git clone https://github.com/ShubyM/open-rl && cd open-rl
+./scripts/setup_vm.sh
+```
+
+It installs apt build deps (build-essential, python3-dev, ninja-build, tmux),
+uv, finds and persists the CUDA toolchain, syncs the Python env, bootstraps
+the LAB harness (sandbox image, pandoc, podman), checks disk space for
+container storage, and ends with a green/red checklist. Idempotent — re-run
+it any time as a health check. The `causal-conv1d` fast path lives in its own
+`fastpath` extra so a compiler problem degrades to a loud 2–5x-slower warning
+instead of killing the install.
+
+The manual steps it replaces, for reference:
+
+1. **Repo + Python env** (`nvcc` needed only for the `fastpath` extra):
 
    ```bash
    curl -LsSf https://astral.sh/uv/install.sh | sh
-   git clone https://github.com/ShubyM/open-rl && cd open-rl
-   uv sync --frozen --exact --extra gpu --extra vllm --extra cluster
+   uv sync --frozen --exact --extra gpu --extra vllm --extra fastpath
    ```
 
    Sanity check the fast path — this must print `True` or Qwen training runs
