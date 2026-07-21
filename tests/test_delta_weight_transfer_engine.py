@@ -13,6 +13,14 @@ from src.server.delta_weight_transfer_engine import (
 )
 
 
+class RecordingModel:
+  def __init__(self) -> None:
+    self.load_calls: list[list[tuple[str, torch.Tensor]]] = []
+
+  def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+    self.load_calls.append(list(weights))
+
+
 class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
   def test_delta_snapshot_weight_transfer_engine_contract(self):
     """Test that DeltaSnapshotWeightTransferEngine satisfies the vLLM contract."""
@@ -42,20 +50,18 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       file_path = os.path.join(tmpdir, "delta.safetensors")
       save_file(dummy_weights, file_path)
 
+      model = RecordingModel()
       engine = DeltaSnapshotWeightTransferEngine(
         config=None,
         parallel_config=None,  # type: ignore
+        model=model,
       )
       update_info = DeltaSnapshotUpdateInfo(target_weights_path=file_path)
 
-      loaded_tensors: list[tuple[str, torch.Tensor]] = []
-
-      def mock_load_weights(weights: list[tuple[str, torch.Tensor]]) -> None:
-        loaded_tensors.extend(weights)
-
-      engine.receive_weights(update_info, mock_load_weights)
+      engine.receive_weights(update_info)
 
       self.assertEqual(engine.current_weights_path, file_path)
+      loaded_tensors = model.load_calls[0]
       self.assertEqual(len(loaded_tensors), 2)
       loaded_names = {k for k, _ in loaded_tensors}
       self.assertIn("model.layers.0.self_attn.q_proj.weight", loaded_names)
@@ -72,31 +78,25 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       file_v1 = os.path.join(tmpdir, "delta1.safetensors")
       save_file(weights_v1, file_v1)
 
+      model = RecordingModel()
       engine = DeltaSnapshotWeightTransferEngine(
         config=None,
         parallel_config=None,  # type: ignore
+        model=model,
       )
 
       # First update: 2 new/changed tensors
-      calls_v1: list[list[tuple[str, torch.Tensor]]] = []
-      engine.receive_weights(
-        DeltaSnapshotUpdateInfo(target_weights_path=file_v1),
-        lambda w: calls_v1.append(w),
-      )
-      self.assertEqual(len(calls_v1), 1)
-      self.assertEqual(len(calls_v1[0]), 2)
+      engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=file_v1))
+      self.assertEqual(len(model.load_calls), 1)
+      self.assertEqual(len(model.load_calls[0]), 2)
 
       # Second update: identical weights (NO-OP patch)
       file_v2 = os.path.join(tmpdir, "delta2.safetensors")
       save_file(weights_v1, file_v2)
 
-      calls_v2: list[list[tuple[str, torch.Tensor]]] = []
-      engine.receive_weights(
-        DeltaSnapshotUpdateInfo(target_weights_path=file_v2),
-        lambda w: calls_v2.append(w),
-      )
-      # Must detect complete no-op and skip calling load_weights callback
-      self.assertEqual(len(calls_v2), 0)
+      engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=file_v2))
+      # Must detect complete no-op and skip calling model.load_weights.
+      self.assertEqual(len(model.load_calls), 1)
       self.assertEqual(engine.current_weights_path, file_v2)
 
   def test_selective_layer_filtering_skips_noop_tensors(self):
@@ -111,14 +111,13 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       file_v1 = os.path.join(tmpdir, "delta1.safetensors")
       save_file(weights_v1, file_v1)
 
+      model = RecordingModel()
       engine = DeltaSnapshotWeightTransferEngine(
         config=None,
         parallel_config=None,  # type: ignore
+        model=model,
       )
-      engine.receive_weights(
-        DeltaSnapshotUpdateInfo(target_weights_path=file_v1),
-        lambda w: None,
-      )
+      engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=file_v1))
 
       # Update 2: layer.0.weight is unchanged (no-op), layer.1.weight is modified
       weights_v2 = {
@@ -128,13 +127,10 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       file_v2 = os.path.join(tmpdir, "delta2.safetensors")
       save_file(weights_v2, file_v2)
 
-      loaded_calls: list[tuple[str, torch.Tensor]] = []
-      engine.receive_weights(
-        DeltaSnapshotUpdateInfo(target_weights_path=file_v2),
-        lambda w: loaded_calls.extend(w),
-      )
+      engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=file_v2))
 
       # Only layer.1.weight should be passed to callback
+      loaded_calls = model.load_calls[-1]
       self.assertEqual(len(loaded_calls), 1)
       self.assertEqual(loaded_calls[0][0], "layer.1.weight")
       self.assertTrue(torch.equal(loaded_calls[0][1], torch.full((4, 4), 2.5)))
@@ -158,35 +154,29 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       }
       save_file(sparse_dict, os.path.join(tmpdir, "delta.safetensors"))
 
-      engine = DeltaSnapshotWeightTransferEngine(
-        config=None,
-        parallel_config=None,  # type: ignore
-      )
-
       # Mock active vLLM model holding initial weights (all zeros)
-      class DummyModel:
+      class DummyModel(RecordingModel):
+        def __init__(self) -> None:
+          super().__init__()
+          self.weight = torch.nn.Parameter(torch.zeros(4, 4))
+
         def named_parameters(self):
-          return [("layer.0.weight", torch.nn.Parameter(torch.zeros(4, 4)))]
+          return [("layer.0.weight", self.weight)]
 
         def named_buffers(self):
           return []
 
       dummy_model = DummyModel()
-
-      loaded_calls: list[tuple[str, torch.Tensor]] = []
-
-      # Bind load_weights callback to dummy_model exactly as vLLM does
-      class BoundLoader:
-        def __init__(self, model):
-          self.__self__ = model
-
-        def __call__(self, weights):
-          loaded_calls.extend(weights)
-
-      mock_loader = BoundLoader(dummy_model)
-      engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=tmpdir), mock_loader)
+      engine = DeltaSnapshotWeightTransferEngine(
+        config=None,
+        parallel_config=None,  # type: ignore
+        model=dummy_model,
+      )
+      engine._cpu_snapshot = {"layer.0.weight": dummy_model.weight.detach().clone()}
+      engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=tmpdir))
 
       # Assert mock_loader received only the full reconstructed 2D layer tensor, NOT .indices / .values
+      loaded_calls = dummy_model.load_calls[0]
       self.assertEqual(len(loaded_calls), 1)
       self.assertEqual(loaded_calls[0][0], "layer.0.weight")
       self.assertEqual(loaded_calls[0][1].shape, (4, 4))
@@ -210,11 +200,12 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       step_dir = os.path.join(tmpdir, "step_1")
       os.makedirs(step_dir)
       with open(os.path.join(step_dir, "metadata.json"), "w") as f:
-        json.dump({"format": "sparse_delta", "changed_elements": 1}, f)
+        json.dump({"format": "sparse_delta", "changed_elements": 1, "layer_names": ["layer.0.weight"]}, f)
 
       sparse_dict = {
-        "layer.0.weight.indices": torch.tensor([2], dtype=torch.int32),
-        "layer.0.weight.values": torch.tensor([42.0], dtype=torch.float32),
+        "delta.indices_flat": torch.tensor([2], dtype=torch.int32),
+        "delta.values_flat": torch.tensor([42.0], dtype=torch.float32),
+        "delta.layer_lengths": torch.tensor([1], dtype=torch.int64),
       }
       save_file(sparse_dict, os.path.join(step_dir, "delta.safetensors"))
 
@@ -225,7 +216,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
         for p in hf_weights_files:
           if os.path.exists(p):
             with safetensors.safe_open(p, framework="pt", device="cpu") as f:
-              for key in f:
+              for key in list(f.keys()):
                 yield key, f.get_tensor(key)
 
       mock_utils.safetensors_weights_iterator.side_effect = fake_iterator
@@ -239,17 +230,16 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
           "vllm.model_executor.model_loader.weight_utils": mock_utils,
         },
       ):
+        model = RecordingModel()
         engine = DeltaSnapshotWeightTransferEngine(
           config=None,
           parallel_config=None,  # type: ignore
+          model=model,
         )
 
-        loaded_calls: list[tuple[str, torch.Tensor]] = []
-        engine.receive_weights(
-          DeltaSnapshotUpdateInfo(target_weights_path=step_dir, base_model_path=base_dir),
-          lambda w: loaded_calls.extend(w),
-        )
+        engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=step_dir, base_model_path=base_dir))
 
+        loaded_calls = model.load_calls[0]
         self.assertEqual(len(loaded_calls), 1)
         self.assertEqual(loaded_calls[0][0], "layer.0.weight")
         self.assertEqual(loaded_calls[0][1].shape, (4, 4))
@@ -273,11 +263,12 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       step_dir = os.path.join(tmpdir, "step_1")
       os.makedirs(step_dir)
       with open(os.path.join(step_dir, "metadata.json"), "w") as f:
-        json.dump({"format": "sparse_delta", "changed_elements": 1}, f)
+        json.dump({"format": "sparse_delta", "changed_elements": 1, "layer_names": ["layer.0.weight"]}, f)
 
       sparse_dict = {
-        "layer.0.weight.indices": torch.tensor([4], dtype=torch.int32),
-        "layer.0.weight.values": torch.tensor([88.0], dtype=torch.float32),
+        "delta.indices_flat": torch.tensor([4], dtype=torch.int32),
+        "delta.values_flat": torch.tensor([88.0], dtype=torch.float32),
+        "delta.layer_lengths": torch.tensor([1], dtype=torch.int64),
       }
       save_file(sparse_dict, os.path.join(step_dir, "delta.safetensors"))
 
@@ -288,7 +279,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
         for p in hf_weights_files:
           if os.path.exists(p):
             with safetensors.safe_open(p, framework="pt", device="cpu") as f:
-              for key in f:
+              for key in list(f.keys()):
                 yield key, f.get_tensor(key)
 
       mock_utils.safetensors_weights_iterator.side_effect = fake_iterator
@@ -307,17 +298,16 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
           },
         ),
       ):
+        model = RecordingModel()
         engine = DeltaSnapshotWeightTransferEngine(
           config=None,
           parallel_config=None,  # type: ignore
+          model=model,
         )
 
-        loaded_calls: list[tuple[str, torch.Tensor]] = []
-        engine.receive_weights(
-          DeltaSnapshotUpdateInfo(target_weights_path=step_dir),
-          lambda w: loaded_calls.extend(w),
-        )
+        engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=step_dir))
 
+        loaded_calls = model.load_calls[0]
         self.assertEqual(len(loaded_calls), 1)
         self.assertEqual(loaded_calls[0][0], "layer.0.weight")
         self.assertEqual(loaded_calls[0][1].shape, (3, 3))

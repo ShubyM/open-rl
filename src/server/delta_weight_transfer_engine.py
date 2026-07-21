@@ -7,7 +7,7 @@ without external sleep/wake workarounds.
 
 import os
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,7 +40,8 @@ except ImportError:
 
   class WeightTransferEngine:
     def __init__(self, *args, **kwargs):
-      pass
+      self.model = kwargs.get("model")
+      self.model_config = kwargs.get("vllm_config")
 
     @classmethod
     def parse_init_info(cls, init_dict: dict[str, Any]):
@@ -83,35 +84,10 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     self.current_weights_path: str | None = None
     self._cpu_snapshot: dict[str, torch.Tensor] = {}
     self._base_model: str = os.getenv("OPEN_RL_BASE_MODEL", os.getenv("BASE_MODEL", ""))
-    if args and hasattr(args[0], "model"):
-      self._base_model = args[0].model
+    if not self._base_model:
+      self._base_model = getattr(self.model_config, "model", "")
 
-  @staticmethod
-  def _get_real_tensor(model: torch.nn.Module, name: str, tensor: torch.Tensor) -> torch.Tensor:
-    if not getattr(tensor, "is_meta", False) and not getattr(tensor.data, "is_meta", False):
-      return tensor
-    try:
-      from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
-
-      if "." in name:
-        mod_name, p_name = name.rsplit(".", 1)
-      else:
-        mod_name, p_name = "", name
-      modules = dict(model.named_modules())
-      mod = modules.get(mod_name)
-      if mod is not None and mod in LAYERWISE_INFO:
-        info = LAYERWISE_INFO[mod]
-        if hasattr(info, "kernel_tensors") and info.kernel_tensors is not None:
-          params, buffers = info.kernel_tensors
-          if p_name in params:
-            return params[p_name]
-          if p_name in buffers:
-            return buffers[p_name]
-    except Exception:
-      pass
-    return tensor
-
-  def _ensure_cpu_snapshot(self, base_model: str, model: torch.nn.Module | None) -> None:
+  def _ensure_cpu_snapshot(self, base_model: str) -> None:
     if self._cpu_snapshot:
       return
     base_model = base_model or self._base_model or os.getenv("OPEN_RL_BASE_MODEL", os.getenv("BASE_MODEL", ""))
@@ -141,21 +117,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
         )
         return
 
-    if model is not None:
-      start_t = time.perf_counter()
-      for name, param in model.named_parameters():
-        real_t = self._get_real_tensor(model, name, param)
-        self._cpu_snapshot[name] = real_t.data.cpu().pin_memory() if torch.cuda.is_available() else real_t.data.cpu().clone()
-      for name, buf in model.named_buffers():
-        real_t = self._get_real_tensor(model, name, buf)
-        self._cpu_snapshot[name] = real_t.data.cpu().pin_memory() if torch.cuda.is_available() else real_t.data.cpu().clone()
-      elapsed = (time.perf_counter() - start_t) * 1000.0
-      logger.info(
-        f"[DeltaSnapshotEngine] CPU weights snapshot initialized with {len(self._cpu_snapshot)} vLLM tensors from model in {elapsed:.2f} ms."
-      )
-      return
-
-    raise RuntimeError(f"Failed to initialize CPU weights snapshot: neither base safetensors for '{base_model}' nor model instance available.")
+    raise RuntimeError(f"Failed to initialize CPU weights snapshot from base model '{base_model}'.")
 
   def init_transfer_engine(self, init_info: DeltaSnapshotInitInfo) -> None:
     """Initialize the delta transfer engine on the inference worker."""
@@ -165,12 +127,8 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     """Prepare for an upcoming weight update."""
     pass
 
-  def receive_weights(
-    self,
-    update_info: DeltaSnapshotUpdateInfo,
-    load_weights: Callable[[list[tuple[str, torch.Tensor]]], None],
-  ) -> None:
-    """Receive/patch sparse delta weights in host CPU RAM and pass to load_weights."""
+  def receive_weights(self, update_info: DeltaSnapshotUpdateInfo) -> None:
+    """Receive sparse deltas and load reconstructed HF tensors into vLLM."""
     import json
 
     target_path = update_info.target_weights_path
@@ -203,13 +161,8 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
       # Initialize base CPU snapshot if not yet populated
       if not self._cpu_snapshot:
-        model = getattr(load_weights, "__self__", None)
-        if model is None and getattr(load_weights, "__closure__", None):
-          for cell in load_weights.__closure__:
-            if hasattr(cell.cell_contents, "named_parameters"):
-              model = cell.cell_contents
         base_model = getattr(update_info, "base_model_path", "") or self._base_model
-        self._ensure_cpu_snapshot(base_model, model)
+        self._ensure_cpu_snapshot(base_model)
 
       meta_names: list[str] | None = None
       if metadata_path and os.path.exists(metadata_path):
@@ -302,9 +255,10 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
       )
       weights_to_load = changed_weights
 
-    # Feed genuinely changed parameter tensors directly into vLLM's internal layer loader
+    # WeightTransferEngine's constructor supplies the model. Calling its loader
+    # here follows the same boundary as vLLM's built-in IPC and NCCL engines.
     start_load = time.perf_counter()
-    load_weights(weights_to_load)
+    self.model.load_weights(weights_to_load)
     elapsed_load = (time.perf_counter() - start_load) * 1000.0
     self.current_weights_path = target_path
     logger.info(f"[DeltaSnapshotEngine] Incremental load_weights completed ({len(weights_to_load)} tensors) in {elapsed_load:.2f} ms")

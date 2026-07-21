@@ -15,6 +15,7 @@ import redis.asyncio as redis
 
 try:
   from vllm import SamplingParams
+  from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
   from vllm.engine.arg_utils import AsyncEngineArgs
   from vllm.engine.async_llm_engine import AsyncLLMEngine
   from vllm.lora.request import LoRARequest
@@ -23,6 +24,7 @@ try:
   VLLM_AVAILABLE = True
 except ImportError:
   SamplingParams = None
+  WeightTransferUpdateRequest = None
   AsyncEngineArgs = None
   AsyncLLMEngine = None
   LoRARequest = None
@@ -239,15 +241,16 @@ async def process_sampling_request(req: dict, store: Any) -> None:
               print("[vLLM Worker] Waking up weights...")
               await engine.wake_up(tags=["weights"])
               if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
-
-                def _trigger_wt(worker, path=weights_path):
-                  wt = worker.weight_transfer_engine
-                  info = wt.parse_update_info({"target_weights_path": path})
-                  model = worker.model_runner.model
-                  return wt.receive_weights(info, load_weights=model.load_weights)
-
-                res = await engine.collective_rpc(_trigger_wt)
-                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                assert WeightTransferUpdateRequest is not None
+                update = WeightTransferUpdateRequest(
+                  update_info={
+                    "target_weights_path": weights_path,
+                    "base_model_path": os.getenv("OPEN_RL_BASE_MODEL") or os.getenv("BASE_MODEL") or "",
+                  }
+                )
+                await engine.start_weight_update()
+                await engine.update_weights(update)
+                await engine.finish_weight_update()
                 print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
               else:
                 res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
