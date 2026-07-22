@@ -17,7 +17,9 @@
 #
 # Re-running never kills anything: an existing session is attached as-is.
 # The LAB checkout is bootstrapped via setup_lab.sh if missing. Logs tee to
-# artifacts/box-logs/. Overridable: MODEL, TRAIN_GPUS, RUN_LABEL, GEN_TOKENS.
+# artifacts/box-logs/. Overridable: MODEL, TRAIN_GPUS, RUN_LABEL, GEN_TOKENS,
+# JUDGE_MODEL (gemini-* via GEMINI_API_KEY, or glm-* via a self-deployed
+# Vertex SGLang endpoint — needs VERTEX_JUDGE_ENDPOINT and ADC).
 set -euo pipefail
 
 SESSION=work
@@ -37,9 +39,26 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   fi
 fi
 
-if [ -z "${GEMINI_API_KEY:-}" ]; then
-  echo "WARNING: GEMINI_API_KEY is not set — rubric grading will fail without it." >&2
-fi
+# Judge selection: gemini-* grades through the API key; glm-* grades through
+# a self-deployed SGLang endpoint on Vertex, reached via ADC (no API key).
+JUDGE_MODEL=${JUDGE_MODEL:-gemini-3.5-flash}
+JUDGE_ENV=""
+case "$JUDGE_MODEL" in
+  glm*)
+    if [ -z "${VERTEX_JUDGE_ENDPOINT:-}" ]; then
+      echo "ERROR: JUDGE_MODEL=$JUDGE_MODEL needs the Vertex endpoint:" >&2
+      echo "  export VERTEX_JUDGE_ENDPOINT=projects/<project>/locations/<region>/endpoints/<id>" >&2
+      exit 1
+    fi
+    VERTEX_JUDGE_TOKENIZER=${VERTEX_JUDGE_TOKENIZER:-zai-org/GLM-5.2-FP8}
+    JUDGE_ENV="VERTEX_JUDGE_ENDPOINT=$VERTEX_JUDGE_ENDPOINT VERTEX_JUDGE_TOKENIZER=$VERTEX_JUDGE_TOKENIZER"
+    ;;
+  *)
+    if [ -z "${GEMINI_API_KEY:-}" ]; then
+      echo "WARNING: GEMINI_API_KEY is not set — rubric grading will fail without it." >&2
+    fi
+    ;;
+esac
 if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   echo "WARNING: ANTHROPIC_API_KEY is not set — deliverable-name matching errors on mismatched filenames without it." >&2
 fi
@@ -74,6 +93,22 @@ if [ ! -d "$LAB_ROOT" ]; then
   ./examples/harvey_labs/setup_lab.sh
 fi
 echo "[work] LAB judge at: $(git -C "$LAB_ROOT" log --oneline -1 -- evaluation/judge.py 2>/dev/null || echo 'unknown')"
+
+if [[ "$JUDGE_MODEL" == glm* ]]; then
+  if ! "$LAB_ROOT/.venv/bin/python" -c "import google.cloud.aiplatform, transformers" 2>/dev/null; then
+    echo "[work] installing GLM judge deps into the LAB venv..."
+    "$LAB_ROOT/.venv/bin/pip" install -q google-cloud-aiplatform transformers
+  fi
+  if ! "$LAB_ROOT/.venv/bin/python" -c "import google.auth; google.auth.default()" 2>/dev/null; then
+    echo "ERROR: no Application Default Credentials — the GLM judge cannot authenticate to Vertex." >&2
+    echo "  Fix one of:" >&2
+    echo "    gcloud auth application-default login --no-launch-browser" >&2
+    echo "    export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json" >&2
+    echo "    (on a GCP VM: attach a service account with the Vertex AI User role)" >&2
+    exit 1
+  fi
+  echo "[work] JUDGE_MODEL=$JUDGE_MODEL via $VERTEX_JUDGE_ENDPOINT (ADC ok)"
+fi
 
 FP=$(uv run --no-sync python -c "from transformers.models.qwen3_5 import modeling_qwen3_5 as m; print(m.is_fast_path_available)" 2>/dev/null)
 if [ "$FP" != "True" ]; then
@@ -192,17 +227,17 @@ OPEN_RL_TRAIN_TOKEN_BUDGET=$CONTEXT OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
 OPEN_RL_LOG_CUDA_MEMORY=1 \
 uv run --extra gpu --extra vllm --extra fastpath python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003 |& tee -a $LOGS/gateway.log"
 
-TRAIN_CMD="TINKER_API_KEY=tml-dummy uv --project examples run python examples/harvey_labs/train.py \
+TRAIN_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/train.py \
 model_name=$MODEL_NAME renderer_name=qwen3_5 base_url=http://127.0.0.1:9003 \
 learning_rate=2e-4 lora_rank=32 \
 batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=20 eval_every=5 \
-task_set=$TASK_SET \
+task_set=$TASK_SET judge_model=$JUDGE_MODEL \
 max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$GEN_TOKENS \
 log_path=artifacts/harvey-labs/$RUN_LABEL"
 
-EVAL_CMD="TINKER_API_KEY=tml-dummy uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
+EVAL_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
 checkpoint=/tmp/open-rl/peft/CHANGE-ME/final model_name=$MODEL_NAME renderer_name=qwen3_5 \
-base_url=http://127.0.0.1:9003 task_set=$TASK_SET \
+base_url=http://127.0.0.1:9003 task_set=$TASK_SET judge_model=$JUDGE_MODEL \
 max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$GEN_TOKENS"
 
 # set-option needs a running tmux server, so the session must exist first.

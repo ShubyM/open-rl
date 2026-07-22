@@ -137,7 +137,15 @@ FP=$(uv run --no-sync python -c "from transformers.models.qwen3_5 import modelin
 if [ "$FP" = "True" ]; then ok "Qwen deltanet fast path available"; else bad "Qwen deltanet fast path unavailable — training would run 2-5x slower"; fi
 timeout 90 podman run --rm ghcr.io/harveyai/lab-sandbox:latest echo ok >/dev/null 2>&1 && ok "podman sandbox runs" || bad "podman run lab-sandbox (try: podman system migrate; check /etc/subuid)"
 [ -x "$LAB_ROOT/.venv/bin/python" ] && "$LAB_ROOT/.venv/bin/python" -c "import sys; sys.path.insert(0,'$LAB_ROOT'); from evaluation.judge import Judge; Judge._salvage_verdict" 2>/dev/null && ok "LAB grading env (judge + salvage fix)" || bad "LAB venv judge import — rerun setup_lab.sh / git pull the LAB checkout"
-[ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ] && ok "Gemini judge key present" || echo "    [WARN] export GEMINI_API_KEY before training — grading needs it"
+if [ -n "${VERTEX_JUDGE_ENDPOINT:-}" ]; then
+  "$LAB_ROOT/.venv/bin/python" -c "import google.cloud.aiplatform, transformers" 2>/dev/null \
+    || "$LAB_ROOT/.venv/bin/pip" install -q google-cloud-aiplatform transformers
+  "$LAB_ROOT/.venv/bin/python" -c "import google.cloud.aiplatform, transformers, google.auth; google.auth.default()" 2>/dev/null \
+    && ok "GLM judge ready (Vertex deps + ADC)" \
+    || bad "GLM judge — ADC missing or deps failed (gcloud auth application-default login, or GOOGLE_APPLICATION_CREDENTIALS)"
+else
+  [ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ] && ok "Gemini judge key present" || echo "    [WARN] export GEMINI_API_KEY before training — grading needs it (or use the GLM judge: set VERTEX_JUDGE_ENDPOINT + JUDGE_MODEL=glm-5.2)"
+fi
 [ -n "${ANTHROPIC_API_KEY:-}" ] && ok "Anthropic key present" || echo "    [WARN] export ANTHROPIC_API_KEY — deliverable-name matching degrades without it"
 
 echo
