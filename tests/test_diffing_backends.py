@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -24,33 +25,38 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
   def tearDown(self):
     shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-  def _create_worker_and_modify(self) -> FFTTrainingWorker:
+  def _create_worker(self, *, with_gradients: bool) -> FFTTrainingWorker:
     torch.manual_seed(42)
     model = DummyModel().to(self.device)
     worker = FFTTrainingWorker()
+    worker.cpu_offload = False
     worker.base_model_name = "dummy"
     worker.model = model
     worker.prepare_model_for_training()
 
-    # Modify specific elements
-    with torch.no_grad():
-      model.fc1.weight[0, 0] += 1.5
-      model.fc1.weight[3, 5] -= 0.75
-      model.fc2.weight[2, 2] += 2.0
+    if with_gradients:
+      model.fc1.weight.grad = torch.zeros_like(model.fc1.weight)
+      model.fc1.weight.grad[0, 0] = 1.0
+      model.fc1.weight.grad[3, 5] = -1.0
+      model.fc2.weight.grad = torch.zeros_like(model.fc2.weight)
+      model.fc2.weight.grad[2, 2] = 1.0
 
     return worker
 
   def test_streamed_diffing_optim_step_and_multi_save_idempotency(self):
-    """Verifies optim_step streams diff to _latest_delta_tensors and multiple saves read it non-destructively."""
-    worker = self._create_worker_and_modify()
-    worker.weight_sync_strategy = "delta"
-    worker.optim_step({})
+    """Verifies optimizer-coupled updates can be saved repeatedly without mutation."""
+    worker = self._create_worker(with_gradients=True)
+    worker.optim_step({"learning_rate": 0.1, "beta1": 0.0, "beta2": 0.0, "eps": 1e-8, "weight_decay": 0.0})
 
     save_dir_1 = os.path.join(self.temp_dir, "save_optim_1")
-    meta_1 = worker.save_state_delta("dummy", save_dir_1, kind="sampler")
+    worker.save_state_delta("dummy", save_dir_1, kind="sampler")
 
     save_dir_2 = os.path.join(self.temp_dir, "save_optim_2")
-    meta_2 = worker.save_state_delta("dummy", save_dir_2, kind="state")
+    worker.save_state_delta("dummy", save_dir_2, kind="state")
+    with open(os.path.join(save_dir_1, "metadata.json")) as f:
+      meta_1 = json.load(f)
+    with open(os.path.join(save_dir_2, "metadata.json")) as f:
+      meta_2 = json.load(f)
 
     self.assertEqual(meta_1["changed_elements"], 3)
     self.assertEqual(meta_1["changed_elements"], meta_2["changed_elements"])
@@ -58,9 +64,11 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
 
   def test_streamed_diffing_empty_delta_fallback(self):
     """Verifies save_state_delta before optim_step emits an exact O(1) empty delta."""
-    worker = self._create_worker_and_modify()
+    worker = self._create_worker(with_gradients=False)
     save_dir = os.path.join(self.temp_dir, "save_empty")
-    meta = worker.save_state_delta("dummy", save_dir, kind="sampler")
+    worker.save_state_delta("dummy", save_dir, kind="sampler")
+    with open(os.path.join(save_dir, "metadata.json")) as f:
+      meta = json.load(f)
 
     self.assertEqual(meta["changed_elements"], 0)
     self.assertEqual(meta["total_elements"], worker.total_model_elements)

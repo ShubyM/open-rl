@@ -111,9 +111,13 @@ class DeltaWeightSyncTest(unittest.TestCase):
     worker.prepare_model_for_training()
 
     worker.optim_step({"weight_decay": 0.0})
+    state_path = os.path.join(self.test_dir, "no_gradient_step")
+    worker.save_state_delta(model_id="test-model", state_path=state_path, kind="sampler")
+    with open(os.path.join(state_path, "metadata.json")) as f:
+      metadata = json.load(f)
 
-    self.assertEqual(worker._latest_delta_tensors["names"], [])
-    self.assertEqual(worker._latest_total_changed, 0)
+    self.assertEqual(metadata["layer_names"], [])
+    self.assertEqual(metadata["changed_elements"], 0)
 
   def test_weight_sync_strategy_selection(self):
     worker = FFTTrainingWorker()
@@ -128,28 +132,14 @@ class DeltaWeightSyncTest(unittest.TestCase):
     worker = FFTTrainingWorker()
     worker.base_model_name = "test-offload-model"
     worker.model = SimpleModel()
+    worker.prepare_model_for_training()
 
-    # Initialize shadow with base weights W0
-    worker._param_shadow = {param: (param.device, param.data.detach().cpu().clone()) for param in worker.model.parameters() if param.requires_grad}
+    worker.model.fc.weight.grad = torch.zeros_like(worker.model.fc.weight)
+    worker.model.fc.weight.grad[1, 1] = 1.0
+    worker.optim_step({"learning_rate": 0.1, "beta1": 0.0, "beta2": 0.0, "eps": 1e-8, "weight_decay": 0.0})
+    expected_value = worker.model.fc.weight.detach()[1, 1].item()
 
-    # Simulate what optim_step() produces on GPU before offload_to_cpu() moves weights and sets _is_offloaded=True
-    w1_fc = worker.model.fc.weight.data.detach().cpu().clone()
-    w1_fc[1, 1] = 77.7
-    worker._param_shadow[worker.model.fc.weight] = (torch.device("cuda" if torch.cuda.is_available() else "cpu"), w1_fc)
-    worker._latest_delta_tensors = {
-      "encoding": "sparse_delta",
-      "names": ["fc.weight"],
-      "indices_list": [torch.tensor([1 * 10 + 1], dtype=torch.int32)],
-      "values_list": [torch.tensor([77.7], dtype=torch.float32)],
-      "layer_lengths_list": [1],
-      "absolute_tensors": {},
-      "sparse_bytes": 8,
-      "dense_bytes": 400,
-    }
-    worker._latest_total_changed = 1
-    worker._latest_total_elements = 100
-
-    # Simulate offload state where GPU param.data is set to 0-size tensor
+    # The update payload must remain saveable after the live parameter is offloaded.
     worker._is_offloaded = True
     worker.model.fc.weight.data = torch.empty(0, dtype=worker.model.fc.weight.dtype, device="cpu")
 
@@ -162,7 +152,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
     sparse_delta = load_file(delta_file)
     self.assertIn("delta.indices_flat", sparse_delta)
     self.assertEqual(sparse_delta["delta.indices_flat"].numel(), 1)
-    self.assertAlmostEqual(sparse_delta["delta.values_flat"][0].item(), 77.7, places=4)
+    self.assertEqual(sparse_delta["delta.values_flat"][0].item(), expected_value)
 
 
 if __name__ == "__main__":

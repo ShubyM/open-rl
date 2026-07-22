@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -20,6 +21,41 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from training.trainer_worker import BaseTrainerWorker, Datum
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
+SPARSE_DELTA_FORMAT = "sparse_delta"
+ABSOLUTE_TENSORS_FORMAT = "absolute_tensors"
+
+
+@dataclass
+class _PendingWeightUpdate:
+  format: str = SPARSE_DELTA_FORMAT
+  names: list[str] = field(default_factory=list)
+  layer_lengths: list[int] = field(default_factory=list)
+  indices: list[torch.Tensor] = field(default_factory=list)
+  values: list[torch.Tensor] = field(default_factory=list)
+  absolute_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+  total_elements: int = 0
+  sparse_bytes: int = 0
+  dense_bytes: int = 0
+
+  @property
+  def changed_elements(self) -> int:
+    return sum(self.layer_lengths)
+
+  @property
+  def density_pct(self) -> float:
+    return round(100.0 * self.changed_elements / max(1, self.total_elements), 3)
+
+  def safetensors_payload(self, fallback_dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    if self.format == ABSOLUTE_TENSORS_FORMAT:
+      return self.absolute_tensors
+
+    indices = torch.cat(self.indices).to(torch.int32).contiguous() if self.indices else torch.empty(0, dtype=torch.int32)
+    values = torch.cat(self.values).contiguous() if self.values else torch.empty(0, dtype=fallback_dtype)
+    return {
+      "delta.indices_flat": indices,
+      "delta.values_flat": values,
+      "delta.layer_lengths": torch.tensor(self.layer_lengths, dtype=torch.int64),
+    }
 
 
 class FFTConfig(BaseModel):
@@ -45,13 +81,10 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self.cpu_offload: bool = True
     self.weight_sync_strategy: str = os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower()
     self._is_offloaded: bool = False
-    self._latest_delta_tensors: dict[str, Any] = {}
-    self._latest_total_changed: int = 0
-    self._latest_total_elements: int = 0
+    self._pending_weight_update: _PendingWeightUpdate | None = None
     self._param_shadow: dict[torch.nn.Parameter, tuple[torch.device, torch.Tensor]] = {}
     self._grad_shadow: dict[torch.nn.Parameter, tuple[torch.device, torch.Tensor]] = {}
     self._opt_shadow: dict[tuple[torch.nn.Parameter, str], tuple[torch.device, torch.Tensor]] = {}
-    self._prev_weights_shadow: dict[str, torch.Tensor] = {}
     self.model_layer_names: list[str] = []
     self.total_model_elements: int = 0
 
@@ -60,14 +93,10 @@ class FFTTrainingWorker(BaseTrainerWorker):
       raise ValueError(f"Invalid weight_sync_strategy '{strategy}'. Must be 'full' or 'delta'.")
     self.weight_sync_strategy = strategy
 
-  def _get_prev_cpu_weight(self, name: str, param: torch.nn.Parameter) -> torch.Tensor | None:
-    if param in self._param_shadow:
-      return self._param_shadow[param][1]
-    return None
-
-  def _update_prev_cpu_weight(self, name: str, param: torch.nn.Parameter, indices: torch.Tensor, values: torch.Tensor) -> None:
-    if param in self._param_shadow:
-      self._param_shadow[param][1].view(-1)[indices.to(torch.int64).cpu()] = values
+  def _cpu_weight_shadow(self, name: str, param: torch.nn.Parameter) -> torch.Tensor:
+    if param not in self._param_shadow:
+      raise RuntimeError(f"Missing CPU shadow for optimizer-updated parameter '{name}'.")
+    return self._param_shadow[param][1]
 
   def load_base_model(self, base_model_name: str) -> None:
     """Load one full model for one fine-tuning job process."""
@@ -108,7 +137,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       for param in self.model.parameters():
         if param.requires_grad and param not in self._param_shadow:
           cpu_buf = torch.empty(param.shape, dtype=param.dtype, device="cpu", pin_memory=torch.cuda.is_available())
-          cpu_buf.copy_(param.data, non_blocking=True)
+          cpu_buf.copy_(param.detach(), non_blocking=True)
           self._param_shadow[param] = (param.device, cpu_buf)
 
     if ENABLE_GRADIENT_CHECKPOINTING:
@@ -220,95 +249,52 @@ class FFTTrainingWorker(BaseTrainerWorker):
       )
 
     os.makedirs(state_path, exist_ok=True)
-    total_changed = 0
-    total_elements = 0
-    layer_names_list: list[str] = []
-    indices_list: list[torch.Tensor] = []
-    values_list: list[torch.Tensor] = []
-    layer_lengths_list: list[int] = []
-    absolute_tensors: dict[str, torch.Tensor] = {}
-    encoding = "sparse_delta"
-    sparse_bytes = 0
-    dense_bytes = 0
-
     t_collect_start = time.perf_counter()
-    if self._latest_delta_tensors and "names" in self._latest_delta_tensors:
-      encoding = self._latest_delta_tensors["encoding"]
-      layer_names_list = self._latest_delta_tensors["names"]
-      indices_list = self._latest_delta_tensors["indices_list"]
-      values_list = self._latest_delta_tensors["values_list"]
-      layer_lengths_list = self._latest_delta_tensors["layer_lengths_list"]
-      absolute_tensors = self._latest_delta_tensors["absolute_tensors"]
-      sparse_bytes = self._latest_delta_tensors["sparse_bytes"]
-      dense_bytes = self._latest_delta_tensors["dense_bytes"]
-      total_changed = self._latest_total_changed
-      total_elements = self._latest_total_elements
-    else:
-      layer_names_list = self.model_layer_names
-      layer_lengths_list = [0] * len(layer_names_list)
-      total_changed = 0
-      total_elements = self.total_model_elements
-      indices_list = []
-      values_list = []
-
-    if encoding == "absolute_tensors":
-      tensors_to_save = absolute_tensors
-    else:
-      if indices_list:
-        indices_flat = torch.cat(indices_list).to(torch.int32).contiguous()
-        values_flat = torch.cat(values_list).contiguous()
-      else:
-        fallback_dtype = next(self.model.parameters()).dtype if self.model else torch.float32
-        indices_flat = torch.empty(0, dtype=torch.int32, device="cpu")
-        values_flat = torch.empty(0, dtype=fallback_dtype, device="cpu")
-
-      tensors_to_save = {
-        "delta.indices_flat": indices_flat,
-        "delta.values_flat": values_flat,
-        "delta.layer_lengths": torch.tensor(layer_lengths_list, dtype=torch.int64, device="cpu"),
-      }
-
-    t_collect_end = time.perf_counter()
-    collect_time = t_collect_end - t_collect_start
+    update = self._pending_weight_update or _PendingWeightUpdate(
+      names=self.model_layer_names,
+      layer_lengths=[0] * len(self.model_layer_names),
+      total_elements=self.total_model_elements,
+    )
+    tensors_to_save = update.safetensors_payload(next(self.model.parameters()).dtype)
+    collect_time = time.perf_counter() - t_collect_start
 
     delta_path = os.path.join(state_path, "delta.safetensors")
     t_save_start = time.perf_counter()
     safetensors.torch.save_file(
       tensors_to_save,
       delta_path,
-      metadata={"layer_names": json.dumps(layer_names_list)},
+      metadata={"layer_names": json.dumps(update.names)},
     )
-    t_save_end = time.perf_counter()
-    save_file_time = t_save_end - t_save_start
+    save_file_time = time.perf_counter() - t_save_start
 
     logger.info(
       f"[SAVE_STATE_DELTA] model_id={model_id} kind={kind} | "
       f"collect_time={collect_time:.4f}s | "
       f"safetensors_save_time={save_file_time:.4f}s | "
       f"total_delta_save_time={collect_time + save_file_time:.4f}s | "
-      f"encoding={encoding} sparse_bytes={sparse_bytes} dense_bytes={dense_bytes} | "
-      f"changed={total_changed}/{total_elements} ({100.0 * total_changed / max(1, total_elements):.2f}%) across {len(layer_names_list)} layers"
+      f"encoding={update.format} sparse_bytes={update.sparse_bytes} dense_bytes={update.dense_bytes} | "
+      f"changed={update.changed_elements}/{update.total_elements} ({update.density_pct:.2f}%) across {len(update.names)} layers"
     )
 
     metadata = {
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
-      "format": encoding,
+      "format": update.format,
       "kind": kind,
       "model_id": model_id,
-      "changed_elements": total_changed,
-      "total_elements": total_elements,
-      "layer_names": layer_names_list,
-      "sparse_bytes": sparse_bytes,
-      "dense_bytes": dense_bytes,
-      "density_pct": round(100.0 * total_changed / max(1, total_elements), 3),
+      "changed_elements": update.changed_elements,
+      "total_elements": update.total_elements,
+      "layer_names": update.names,
+      "sparse_bytes": update.sparse_bytes,
+      "dense_bytes": update.dense_bytes,
+      "density_pct": update.density_pct,
       "timestamp": time.time(),
     }
     with open(os.path.join(state_path, "metadata.json"), "w") as f:
       json.dump(metadata, f)
 
-    print(f"Saved {encoding} update ({metadata['density_pct']}% changed elements, {total_changed}/{total_elements}) to {state_path}")
-    return {"path": state_path, "density_pct": metadata["density_pct"], "format": encoding}
+    print(f"Saved {update.format} update ({update.density_pct}% changed elements, {update.changed_elements}/{update.total_elements}) to {state_path}")
+    return {"path": state_path, "density_pct": update.density_pct, "format": update.format}
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
     metadata_path = os.path.join(state_path, "metadata.json")
@@ -346,6 +332,52 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
     return res
+
+  def _collect_weight_update(self, dirty_parameters: list[tuple[str, torch.nn.Parameter]]) -> _PendingWeightUpdate:
+    changed_parameters: list[tuple[str, torch.nn.Parameter, torch.Tensor]] = []
+    names: list[str] = []
+    layer_lengths: list[int] = []
+    sparse_bytes = 0
+    dense_bytes = 0
+
+    for name, param in dirty_parameters:
+      current = param.detach()
+      previous = self._cpu_weight_shadow(name, param).to(param.device, non_blocking=True)
+      indices = current.view(-1).ne(previous.view(-1)).nonzero(as_tuple=True)[0]
+      del previous
+      if indices.numel() == 0:
+        continue
+
+      changed_numel = int(indices.numel())
+      names.append(name)
+      layer_lengths.append(changed_numel)
+      changed_parameters.append((name, param, indices))
+      sparse_bytes += changed_numel * (4 + param.element_size())
+      dense_bytes += param.numel() * param.element_size()
+
+    update_format = ABSOLUTE_TENSORS_FORMAT if dense_bytes > 0 and dense_bytes <= sparse_bytes else SPARSE_DELTA_FORMAT
+    update = _PendingWeightUpdate(
+      format=update_format,
+      names=names,
+      layer_lengths=layer_lengths,
+      total_elements=self.total_model_elements,
+      sparse_bytes=sparse_bytes,
+      dense_bytes=dense_bytes,
+    )
+
+    for name, param, indices in changed_parameters:
+      if update_format == ABSOLUTE_TENSORS_FORMAT:
+        absolute_tensor = param.detach().cpu().clone().contiguous()
+        update.absolute_tensors[name] = absolute_tensor
+        self._cpu_weight_shadow(name, param).copy_(absolute_tensor)
+      else:
+        cpu_indices = indices.to(torch.int32).contiguous().cpu()
+        cpu_values = param.detach().view(-1).index_select(0, indices).contiguous().cpu()
+        update.indices.append(cpu_indices)
+        update.values.append(cpu_values)
+        self._cpu_weight_shadow(name, param).view(-1)[cpu_indices.to(torch.int64)] = cpu_values
+
+    return update
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
@@ -392,76 +424,21 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if self.weight_sync_strategy == "delta":
       dirty_parameters = [(name, param) for name, param in self.model.named_parameters() if param.requires_grad and param.grad is not None]
     self.optimizer.step()
-    self.optimizer.zero_grad()
+    self.optimizer.zero_grad(set_to_none=True)
     t_step_end = time.perf_counter()
     step_time = t_step_end - t_step_start
 
     delta_compute_time = 0.0
     if dirty_parameters is not None:
       t_delta_start = time.perf_counter()
-      self._latest_delta_tensors.clear()
-      self._latest_total_changed = 0
-      self._latest_total_elements = self.total_model_elements
-
-      layer_names_list: list[str] = []
-      indices_list: list[torch.Tensor] = []
-      values_list: list[torch.Tensor] = []
-      layer_lengths_list: list[int] = []
-      changed_parameters: list[tuple[str, torch.nn.Parameter, torch.Tensor]] = []
-      sparse_bytes = 0
-      dense_bytes = 0
-
-      for name, param in dirty_parameters:
-        prev_tensor = self._get_prev_cpu_weight(name, param)
-        if prev_tensor is None:
-          raise RuntimeError(f"Missing CPU shadow for optimizer-updated parameter '{name}'.")
-
-        prev_gpu = prev_tensor.to(param.device, non_blocking=True)
-
-        diff_mask = param.data.view(-1).ne(prev_gpu.view(-1))
-        indices = diff_mask.nonzero(as_tuple=True)[0]
-        if indices.numel() > 0:
-          layer_names_list.append(name)
-          changed_numel = int(indices.numel())
-          layer_lengths_list.append(changed_numel)
-          self._latest_total_changed += changed_numel
-          changed_parameters.append((name, param, indices))
-          sparse_bytes += changed_numel * (4 + param.element_size())
-          dense_bytes += param.numel() * param.element_size()
-        del prev_gpu, diff_mask
-
-      encoding = "absolute_tensors" if dense_bytes > 0 and dense_bytes <= sparse_bytes else "sparse_delta"
-      absolute_tensors: dict[str, torch.Tensor] = {}
-      for name, param, indices in changed_parameters:
-        if encoding == "absolute_tensors":
-          absolute_tensor = param.detach().cpu().clone().contiguous()
-          absolute_tensors[name] = absolute_tensor
-          self._param_shadow[param][1].copy_(absolute_tensor)
-        else:
-          idx_cpu = indices.to(torch.int32).contiguous().cpu()
-          val_cpu = param.data.view(-1).index_select(0, indices).contiguous().cpu()
-          indices_list.append(idx_cpu)
-          values_list.append(val_cpu)
-          self._update_prev_cpu_weight(name, param, idx_cpu, val_cpu)
-
-      self._latest_delta_tensors = {
-        "encoding": encoding,
-        "names": layer_names_list,
-        "indices_list": indices_list,
-        "values_list": values_list,
-        "layer_lengths_list": layer_lengths_list,
-        "absolute_tensors": absolute_tensors,
-        "sparse_bytes": sparse_bytes,
-        "dense_bytes": dense_bytes,
-      }
-
-      t_delta_end = time.perf_counter()
-      delta_compute_time = t_delta_end - t_delta_start
+      self._pending_weight_update = self._collect_weight_update(dirty_parameters)
+      delta_compute_time = time.perf_counter() - t_delta_start
       logger.info(
         f"[OPTIM_STEP] model_id={model_id} | delta_compute_time={delta_compute_time:.4f}s | "
-        f"dirty_params={len(dirty_parameters)} changed_params={len(layer_names_list)} encoding={encoding} | "
-        f"changed={self._latest_total_changed}/{self._latest_total_elements} "
-        f"({100.0 * self._latest_total_changed / max(1, self._latest_total_elements):.2f}%) across {len(layer_names_list)} layers"
+        f"dirty_params={len(dirty_parameters)} changed_params={len(self._pending_weight_update.names)} "
+        f"encoding={self._pending_weight_update.format} | "
+        f"changed={self._pending_weight_update.changed_elements}/{self._pending_weight_update.total_elements} "
+        f"({self._pending_weight_update.density_pct:.2f}%)"
       )
 
     logger.info(
