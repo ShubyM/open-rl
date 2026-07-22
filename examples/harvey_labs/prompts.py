@@ -81,4 +81,13 @@ def lab_renderer(model_name: str, renderer_name: str | None) -> Renderer:
   register_gemma4_tool_renderer()
   tokenizer = tokenizer_utils.get_tokenizer(model_name)
   resolved_name = renderer_name or model_info.get_recommended_renderer_name(model_name)
-  return get_renderer(resolved_name, tokenizer, model_name=model_name)
+  renderer = get_renderer(resolved_name, tokenizer, model_name=model_name)
+  if resolved_name.startswith("qwen3") and hasattr(renderer, "strip_thinking_from_history"):
+    # Multi-turn RL needs each observation to extend the preceding one. The
+    # Qwen default removes earlier thinking blocks when history is re-rendered,
+    # which breaks sampler prefix affinity and makes trajectory_to_data emit a
+    # separate cumulative datum for nearly every turn.
+    renderer.strip_thinking_from_history = False
+  if not renderer.has_extension_property:
+    raise ValueError(f"Harvey LAB multi-turn RL requires a prefix-extending renderer; {resolved_name!r} does not preserve history")
+  return renderer
