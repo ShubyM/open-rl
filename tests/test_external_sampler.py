@@ -115,6 +115,55 @@ class ExternalSamplerTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result["sequences"][0]["tokens"], [11, 7])
 
 
+class AffinityRoutingTest(unittest.IsolatedAsyncioTestCase):
+  URLS = "http://s0:8000,http://s1:8001,http://s2:8002"
+
+  def setUp(self) -> None:
+    external_sampler._served_model.clear()
+    external_sampler._served_max_model_len.clear()
+    external_sampler._loaded_adapters.clear()
+    external_sampler._latest_adapter_for_model.clear()
+    external_sampler._episode_routes.clear()
+    external_sampler._route_order.clear()
+    external_sampler._inflight.clear()
+    self.state: dict = {}
+    transport = _mock_vllm_serve(self.state)
+    self._client_patch = patch.object(external_sampler, "_client", lambda: httpx.AsyncClient(transport=transport))
+    self._client_patch.start()
+    self.addCleanup(self._client_patch.stop)
+    self._env_patch = patch.dict("os.environ", {"SAMPLER_BASE_URLS": self.URLS})
+    self._env_patch.start()
+    self.addCleanup(self._env_patch.stop)
+
+  async def test_identical_first_turns_spread_across_instances(self) -> None:
+    # GRPO groups share byte-identical first prompts; the group must NOT
+    # collapse onto one instance (the run-6 sampler-tail stall).
+    prompt = [1, 2, 3]
+    picked = set()
+    for _ in range(3):
+      picked.add(external_sampler.pick_base_url(prompt))
+      # simulate the request being in flight so least-loaded moves on
+      external_sampler._inflight[list(picked)[-1]] = external_sampler._inflight.get(list(picked)[-1], 0) + 1
+    self.assertEqual(len(picked), 3)
+
+  async def test_next_turn_follows_its_own_rollouts_instance(self) -> None:
+    prompt = [1, 2, 3]
+    result = await external_sampler.sample({"prompt_token_ids": prompt, "max_tokens": 4})
+    # the mock returns tokens [11, 7]; the next turn extends them
+    next_turn = prompt + result["sequences"][0]["tokens"] + [99, 100]
+    routed = external_sampler.pick_base_url(next_turn)
+    registered = external_sampler._episode_routes[len(prompt) + 2]
+    self.assertEqual(list(registered.values()), [routed])
+
+  async def test_failed_instance_routes_are_evicted(self) -> None:
+    prompt = [5, 6]
+    result = await external_sampler.sample({"prompt_token_ids": prompt, "max_tokens": 4})
+    url = next(iter({u for by in external_sampler._episode_routes.values() for u in by.values()}))
+    external_sampler.drop_routes_for(url)
+    self.assertEqual(external_sampler._episode_routes, {2 + len(result["sequences"][0]["tokens"]): {}})
+    self.assertEqual(external_sampler._route_order, [])
+
+
 if __name__ == "__main__":
   unittest.main()
 

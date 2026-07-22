@@ -39,11 +39,15 @@ def get_sampler_base_url() -> str | None:
   return urls[0] if urls else None
 
 
-# Episode routing table: first-turn prompts register (length, crc) -> url;
-# every later turn of the episode carries that first prompt as a prefix, so
-# the lookup is exact. No fixed hash window works here — measured on the LAB
-# recipe, tasks share up to 6,413 of their ~6,434 first-turn tokens, leaving
-# no window that both separates tasks and stays inside every first prompt.
+# Episode routing table, registered at RESPONSE time: after an instance
+# serves a turn, (len, crc) of prompt+completion — exactly the prefix the
+# rollout's next turn starts with — maps to that instance. Registering on the
+# request side is wrong twice over: GRPO groups have byte-identical first
+# prompts (all rollouts of a group would collapse onto one instance), and no
+# fixed hash window separates tasks either — measured on the LAB recipe,
+# tasks share up to 6,413 of their ~6,434 first-turn tokens. First turns
+# therefore match nothing and spread least-loaded; every later turn follows
+# the instance holding its own rollout's KV cache.
 _episode_routes: dict[int, dict[int, str]] = {}  # length -> {crc -> url}
 _route_order: list[tuple[int, int]] = []  # insertion order for eviction
 _inflight: dict[str, int] = {}
@@ -51,44 +55,58 @@ _placement_counter = 0
 _MAX_ROUTES = 4096
 
 
-def _crc(prompt_token_ids: list[int], length: int) -> int:
-  return zlib.crc32(bytes(str(prompt_token_ids[:length]), "utf-8"))
+def _crc(token_ids: list[int], length: int) -> int:
+  return zlib.crc32(bytes(str(token_ids[:length]), "utf-8"))
 
 
 def pick_base_url(prompt_token_ids: list[int]) -> str:
-  """Keep every turn of an episode on one instance so its KV/prefix cache is
-  reused instead of re-prefilling the conversation on a random replica; new
-  episodes go to the least-loaded instance."""
+  """Route a turn to the instance that served this rollout's previous turn
+  (KV/prefix cache reuse); unrecognized prompts go to the least-loaded
+  instance."""
   urls = get_sampler_base_urls()
   assert urls, "external sampler requires SAMPLER_BASE_URL(S)"
   if len(urls) == 1:
     return urls[0]
   length = len(prompt_token_ids)
-  for first_len, by_crc in _episode_routes.items():
-    if first_len <= length:
-      url = by_crc.get(_crc(prompt_token_ids, first_len))
-      if url is not None:
+  for prefix_len, by_crc in _episode_routes.items():
+    if prefix_len <= length:
+      url = by_crc.get(_crc(prompt_token_ids, prefix_len))
+      if url is not None and url in urls:
         return url
-  # Unseen prefix: this is an episode's first turn. Place it on the
-  # least-loaded instance (rotating among ties so idle bursts still spread)
-  # and remember it.
   global _placement_counter
   low = min(_inflight.get(u, 0) for u in urls)
   candidates = [u for u in urls if _inflight.get(u, 0) == low]
   url = candidates[_placement_counter % len(candidates)]
   _placement_counter += 1
-  key = _crc(prompt_token_ids, length)
+  return url
+
+
+def register_route(prefix_token_ids: list[int], url: str) -> None:
+  """Remember that a rollout whose next turn starts with this prefix should
+  return to `url`."""
+  length = len(prefix_token_ids)
+  key = _crc(prefix_token_ids, length)
   _episode_routes.setdefault(length, {})[key] = url
   _route_order.append((length, key))
   if len(_route_order) > _MAX_ROUTES:
     old_len, old_key = _route_order.pop(0)
     _episode_routes.get(old_len, {}).pop(old_key, None)
-  return url
+
+
+def drop_routes_for(url: str) -> None:
+  """Forget every route pinned to an instance that just failed a request, so
+  its episodes re-place onto healthy instances instead of retrying into it."""
+  for length, by_crc in _episode_routes.items():
+    stale = [k for k, u in by_crc.items() if u == url]
+    for k in stale:
+      del by_crc[k]
+  _route_order[:] = [(length, k) for length, k in _route_order if k in _episode_routes.get(length, {})]
 
 
 def _client() -> httpx.AsyncClient:
   # Generation at long context is slow; only connecting has a tight deadline.
-  return httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=30.0))
+  read_timeout = float(os.getenv("OPEN_RL_SAMPLER_TIMEOUT", "3600"))
+  return httpx.AsyncClient(timeout=httpx.Timeout(read_timeout, connect=30.0))
 
 
 async def preflight(base_url: str) -> None:
@@ -164,12 +182,20 @@ async def sample(req: dict) -> dict:
   result shape ({"type": "sample", "sequences": [...]}), so callers cannot
   tell which sampler backend ran.
   """
-  base_url = pick_base_url(req.get("prompt_token_ids", []))
+  prompt_token_ids = req.get("prompt_token_ids", [])
+  base_url = pick_base_url(prompt_token_ids)
   _inflight[base_url] = _inflight.get(base_url, 0) + 1
   try:
-    return await _sample_on(base_url, req)
+    result = await _sample_on(base_url, req)
+  except Exception:
+    drop_routes_for(base_url)
+    raise
   finally:
     _inflight[base_url] = _inflight.get(base_url, 1) - 1
+  for seq in result.get("sequences", []):
+    if seq.get("tokens"):
+      register_route(prompt_token_ids + seq["tokens"], base_url)
+  return result
 
 
 async def _sample_on(base_url: str, req: dict) -> dict:
