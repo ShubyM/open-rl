@@ -901,7 +901,16 @@ async def _sample_via_external_server(req_id: str, sampling_req: dict) -> None:
   except Exception as exc:
     traceback.print_exc()
     result = {"type": "RequestFailedResponse", "error_message": f"External vLLM sampler error: {exc}"}
-  await store.set_future(req_id, result)
+  # The result MUST reach the future: this task is fire-and-forget, so an
+  # unhandled store error here would strand the client polling req_id forever.
+  for attempt in range(4):
+    try:
+      await store.set_future(req_id, result)
+      return
+    except Exception:
+      traceback.print_exc()
+      await asyncio.sleep(2**attempt)
+  print(f"[gateway] FAILED to deliver sample result for {req_id} after 4 attempts; the client's poll will time out")
 
 
 # *** CLI endpoints ***

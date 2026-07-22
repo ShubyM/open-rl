@@ -178,7 +178,12 @@ SAMPLER_DEV=$(seq -s, "$TRAIN_GPUS" $((NUM_GPUS - 1)))
 TRAIN_DEV=$(seq -s, 0 $((TRAIN_GPUS - 1)))
 QUEUE_ENV=""
 if [ "$TRAIN_GPUS" -gt 1 ]; then
-  pgrep -x redis-server >/dev/null || redis-server --daemonize yes
+  # Ephemeral queue: no RDB snapshots or AOF — background persistence of
+  # multi-MB training payloads is pure stall risk for zero value. Raise the
+  # fd limit before daemonizing: redis derives maxclients from it, and every
+  # pending gateway request holds one BLPOP connection.
+  ulimit -n 65535 2>/dev/null || true
+  pgrep -x redis-server >/dev/null || redis-server --daemonize yes --save '' --appendonly no --maxclients 8192
   QUEUE_ENV="REDIS_URL=redis://127.0.0.1:6379 OPEN_RL_EXTERNAL_TRAINER=1"
   echo "[work] TRAIN_GPUS=$TRAIN_GPUS -> torchrun trainer on GPUs $TRAIN_DEV, sampler DP$SAMPLER_DP on $SAMPLER_DEV"
 fi
