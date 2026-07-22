@@ -689,6 +689,50 @@ async def save_weights(req: dict):
   return {"request_id": req_id}
 
 
+@app.post("/api/v1/weights_info")
+async def weights_info(req: dict):
+  """ServiceClient.create_training_client_from_state() resume flow.
+
+  The SDK validates a tinker:// checkpoint ref here before loading it; the
+  route was missing and the SDK's retry loop turned that into repeating 404s
+  on every resume attempt.
+  """
+  tinker_path = req.get("tinker_path") or req.get("path")
+  state_path = resolve_state_ref(tinker_path)
+  if not state_path or not os.path.isdir(state_path):
+    return JSONResponse(status_code=404, content={"error": f"No checkpoint at {tinker_path!r}"})
+
+  metadata = {}
+  metadata_file = os.path.join(state_path, "metadata.json")
+  if os.path.isfile(metadata_file):
+    with open(metadata_file, encoding="utf-8") as f:
+      metadata = json.load(f)
+
+  lora_rank = None
+  train_unembed = None
+  train_mlp = None
+  for root, _dirs, files in os.walk(state_path):
+    if "adapter_config.json" in files:
+      with open(os.path.join(root, "adapter_config.json"), encoding="utf-8") as f:
+        adapter_config = json.load(f)
+      lora_rank = adapter_config.get("r")
+      targets = adapter_config.get("target_modules") or []
+      train_unembed = "lm_head" in targets
+      train_mlp = any("gate_proj" in t or "up_proj" in t for t in targets)
+      break
+
+  base_model = metadata.get("base_model")
+  if not base_model:
+    return JSONResponse(status_code=404, content={"error": f"Checkpoint at {tinker_path!r} has no base_model metadata"})
+  return {
+    "base_model": base_model,
+    "is_lora": lora_rank is not None,
+    "lora_rank": lora_rank,
+    "train_unembed": train_unembed,
+    "train_mlp": train_mlp,
+  }
+
+
 @app.post("/api/v1/load_weights")
 async def load_weights(req: dict):
   """TrainingClient.load_state() / load_state_with_optimizer()."""
