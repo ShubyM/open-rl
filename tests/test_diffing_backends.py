@@ -25,7 +25,7 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
   def tearDown(self):
     shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-  def _create_worker(self, *, with_gradients: bool) -> FFTTrainingWorker:
+  def create_worker(self, *, with_gradients: bool) -> FFTTrainingWorker:
     torch.manual_seed(42)
     model = DummyModel().to(self.device)
     worker = FFTTrainingWorker()
@@ -45,7 +45,7 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
 
   def test_streamed_diffing_optim_step_and_multi_save_idempotency(self):
     """Verifies optimizer-coupled updates can be saved repeatedly without mutation."""
-    worker = self._create_worker(with_gradients=True)
+    worker = self.create_worker(with_gradients=True)
     worker.optim_step({"learning_rate": 0.1, "beta1": 0.0, "beta2": 0.0, "eps": 1e-8, "weight_decay": 0.0})
 
     save_dir_1 = os.path.join(self.temp_dir, "save_optim_1")
@@ -64,7 +64,7 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
 
   def test_streamed_diffing_empty_delta_fallback(self):
     """Verifies save_state_delta before optim_step emits an exact O(1) empty delta."""
-    worker = self._create_worker(with_gradients=False)
+    worker = self.create_worker(with_gradients=False)
     save_dir = os.path.join(self.temp_dir, "save_empty")
     worker.save_state_delta("dummy", save_dir, kind="sampler")
     with open(os.path.join(save_dir, "metadata.json")) as f:

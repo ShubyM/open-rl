@@ -26,7 +26,7 @@ ABSOLUTE_TENSORS_FORMAT = "absolute_tensors"
 
 
 @dataclass
-class _PendingWeightUpdate:
+class PendingWeightUpdate:
   format: str = SPARSE_DELTA_FORMAT
   names: list[str] = field(default_factory=list)
   layer_lengths: list[int] = field(default_factory=list)
@@ -80,11 +80,11 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self.optimizer: torch.optim.Optimizer | None = None
     self.cpu_offload: bool = True
     self.weight_sync_strategy: str = os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower()
-    self._is_offloaded: bool = False
-    self._pending_weight_update: _PendingWeightUpdate | None = None
-    self._param_shadow: dict[torch.nn.Parameter, tuple[torch.device, torch.Tensor]] = {}
-    self._grad_shadow: dict[torch.nn.Parameter, tuple[torch.device, torch.Tensor]] = {}
-    self._opt_shadow: dict[tuple[torch.nn.Parameter, str], tuple[torch.device, torch.Tensor]] = {}
+    self.is_offloaded: bool = False
+    self.pending_weight_update: PendingWeightUpdate | None = None
+    self.param_shadow: dict[torch.nn.Parameter, tuple[torch.device, torch.Tensor]] = {}
+    self.grad_shadow: dict[torch.nn.Parameter, tuple[torch.device, torch.Tensor]] = {}
+    self.opt_shadow: dict[tuple[torch.nn.Parameter, str], tuple[torch.device, torch.Tensor]] = {}
     self.model_layer_names: list[str] = []
     self.total_model_elements: int = 0
 
@@ -93,10 +93,10 @@ class FFTTrainingWorker(BaseTrainerWorker):
       raise ValueError(f"Invalid weight_sync_strategy '{strategy}'. Must be 'full' or 'delta'.")
     self.weight_sync_strategy = strategy
 
-  def _cpu_weight_shadow(self, name: str, param: torch.nn.Parameter) -> torch.Tensor:
-    if param not in self._param_shadow:
+  def cpu_weight_shadow(self, name: str, param: torch.nn.Parameter) -> torch.Tensor:
+    if param not in self.param_shadow:
       raise RuntimeError(f"Missing CPU shadow for optimizer-updated parameter '{name}'.")
-    return self._param_shadow[param][1]
+    return self.param_shadow[param][1]
 
   def load_base_model(self, base_model_name: str) -> None:
     """Load one full model for one fine-tuning job process."""
@@ -135,10 +135,10 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self.total_model_elements = sum(p.numel() for p in self.model.parameters())
     if self.weight_sync_strategy == "delta":
       for param in self.model.parameters():
-        if param.requires_grad and param not in self._param_shadow:
+        if param.requires_grad and param not in self.param_shadow:
           cpu_buf = torch.empty(param.shape, dtype=param.dtype, device="cpu", pin_memory=torch.cuda.is_available())
           cpu_buf.copy_(param.detach(), non_blocking=True)
-          self._param_shadow[param] = (param.device, cpu_buf)
+          self.param_shadow[param] = (param.device, cpu_buf)
 
     if ENABLE_GRADIENT_CHECKPOINTING:
       try:
@@ -150,25 +150,25 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
     self.model.train()
 
-  def _prepare_for_save(self) -> bool:
-    was_offloaded = self._is_offloaded
+  def prepare_for_save(self) -> bool:
+    was_offloaded = self.is_offloaded
     if was_offloaded and self.model is not None:
       for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
-        if tensor in self._param_shadow:
-          tensor.data = self._param_shadow[tensor][1]
+        if tensor in self.param_shadow:
+          tensor.data = self.param_shadow[tensor][1]
     return was_offloaded
 
-  def _cleanup_after_save(self, was_offloaded: bool) -> None:
+  def cleanup_after_save(self, was_offloaded: bool) -> None:
     if was_offloaded and self.model is not None:
       for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
-        if tensor in self._param_shadow:
-          tensor.data = torch.empty(0, dtype=tensor.dtype, device=self._param_shadow[tensor][0])
+        if tensor in self.param_shadow:
+          tensor.data = torch.empty(0, dtype=tensor.dtype, device=self.param_shadow[tensor][0])
 
   def save_model(self, alias: str | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
-    if self.cpu_offload and not self._is_offloaded:
+    if self.cpu_offload and not self.is_offloaded:
       raise RuntimeError(
-        "Cannot save model while worker is not offloaded (self._is_offloaded is False) when cpu_offload=True. "
+        "Cannot save model while worker is not offloaded (self.is_offloaded is False) when cpu_offload=True. "
         "GPU time-slicer lock is not held during save operations."
       )
 
@@ -177,13 +177,13 @@ class FFTTrainingWorker(BaseTrainerWorker):
     save_path = name if os.path.isabs(name) else os.path.join(tmp_dir, "fft", name)
     os.makedirs(save_path, exist_ok=True)
 
-    was_offloaded = self._prepare_for_save()
+    was_offloaded = self.prepare_for_save()
     try:
       self.model.save_pretrained(save_path)
       if self.tokenizer is not None:
         self.tokenizer.save_pretrained(save_path)
     finally:
-      self._cleanup_after_save(was_offloaded)
+      self.cleanup_after_save(was_offloaded)
 
     metadata = {
       "base_model": self.base_model_name,
@@ -200,9 +200,9 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
-    if self.cpu_offload and not self._is_offloaded:
+    if self.cpu_offload and not self.is_offloaded:
       raise RuntimeError(
-        "Cannot save state while worker is not offloaded (self._is_offloaded is False) when cpu_offload=True. "
+        "Cannot save state while worker is not offloaded (self.is_offloaded is False) when cpu_offload=True. "
         "GPU time-slicer lock is not held during save operations."
       )
 
@@ -210,7 +210,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       return self.save_state_delta(model_id=model_id, state_path=state_path, kind=kind)
 
     os.makedirs(state_path, exist_ok=True)
-    was_offloaded = self._prepare_for_save()
+    was_offloaded = self.prepare_for_save()
     try:
       self.model.save_pretrained(state_path)
       if self.tokenizer is not None:
@@ -219,7 +219,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       if include_optimizer and self.optimizer is not None:
         torch.save(self.optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
     finally:
-      self._cleanup_after_save(was_offloaded)
+      self.cleanup_after_save(was_offloaded)
 
     metadata = {
       "base_model": self.base_model_name,
@@ -242,15 +242,15 @@ class FFTTrainingWorker(BaseTrainerWorker):
     kind: str = "sampler",
   ) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
-    if self.cpu_offload and not self._is_offloaded:
+    if self.cpu_offload and not self.is_offloaded:
       raise RuntimeError(
-        "Cannot save state delta while worker is not offloaded (self._is_offloaded is False) when cpu_offload=True. "
+        "Cannot save state delta while worker is not offloaded (self.is_offloaded is False) when cpu_offload=True. "
         "GPU time-slicer lock is not held during save operations."
       )
 
     os.makedirs(state_path, exist_ok=True)
     t_collect_start = time.perf_counter()
-    update = self._pending_weight_update or _PendingWeightUpdate(
+    update = self.pending_weight_update or PendingWeightUpdate(
       names=self.model_layer_names,
       layer_lengths=[0] * len(self.model_layer_names),
       total_elements=self.total_model_elements,
@@ -333,7 +333,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       torch.cuda.empty_cache()
     return res
 
-  def _collect_weight_update(self, dirty_parameters: list[tuple[str, torch.nn.Parameter]]) -> _PendingWeightUpdate:
+  def collect_weight_update(self, dirty_parameters: list[tuple[str, torch.nn.Parameter]]) -> PendingWeightUpdate:
     changed_parameters: list[tuple[str, torch.nn.Parameter, torch.Tensor]] = []
     names: list[str] = []
     layer_lengths: list[int] = []
@@ -342,7 +342,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
     for name, param in dirty_parameters:
       current = param.detach()
-      previous = self._cpu_weight_shadow(name, param).to(param.device, non_blocking=True)
+      previous = self.cpu_weight_shadow(name, param).to(param.device, non_blocking=True)
       indices = current.view(-1).ne(previous.view(-1)).nonzero(as_tuple=True)[0]
       del previous
       if indices.numel() == 0:
@@ -356,7 +356,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       dense_bytes += param.numel() * param.element_size()
 
     update_format = ABSOLUTE_TENSORS_FORMAT if dense_bytes > 0 and dense_bytes <= sparse_bytes else SPARSE_DELTA_FORMAT
-    update = _PendingWeightUpdate(
+    update = PendingWeightUpdate(
       format=update_format,
       names=names,
       layer_lengths=layer_lengths,
@@ -369,13 +369,13 @@ class FFTTrainingWorker(BaseTrainerWorker):
       if update_format == ABSOLUTE_TENSORS_FORMAT:
         absolute_tensor = param.detach().cpu().clone().contiguous()
         update.absolute_tensors[name] = absolute_tensor
-        self._cpu_weight_shadow(name, param).copy_(absolute_tensor)
+        self.cpu_weight_shadow(name, param).copy_(absolute_tensor)
       else:
         cpu_indices = indices.to(torch.int32).contiguous().cpu()
         cpu_values = param.detach().view(-1).index_select(0, indices).contiguous().cpu()
         update.indices.append(cpu_indices)
         update.values.append(cpu_values)
-        self._cpu_weight_shadow(name, param).view(-1)[cpu_indices.to(torch.int64)] = cpu_values
+        self.cpu_weight_shadow(name, param).view(-1)[cpu_indices.to(torch.int64)] = cpu_values
 
     return update
 
@@ -431,14 +431,14 @@ class FFTTrainingWorker(BaseTrainerWorker):
     delta_compute_time = 0.0
     if dirty_parameters is not None:
       t_delta_start = time.perf_counter()
-      self._pending_weight_update = self._collect_weight_update(dirty_parameters)
+      self.pending_weight_update = self.collect_weight_update(dirty_parameters)
       delta_compute_time = time.perf_counter() - t_delta_start
       logger.info(
         f"[OPTIM_STEP] model_id={model_id} | delta_compute_time={delta_compute_time:.4f}s | "
-        f"dirty_params={len(dirty_parameters)} changed_params={len(self._pending_weight_update.names)} "
-        f"encoding={self._pending_weight_update.format} | "
-        f"changed={self._pending_weight_update.changed_elements}/{self._pending_weight_update.total_elements} "
-        f"({self._pending_weight_update.density_pct:.2f}%)"
+        f"dirty_params={len(dirty_parameters)} changed_params={len(self.pending_weight_update.names)} "
+        f"encoding={self.pending_weight_update.format} | "
+        f"changed={self.pending_weight_update.changed_elements}/{self.pending_weight_update.total_elements} "
+        f"({self.pending_weight_update.density_pct:.2f}%)"
       )
 
     logger.info(
@@ -469,7 +469,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
   def sleep(self) -> None:
     """Offload GPU tensors to pinned host CPU memory and empty CUDA allocator cache."""
-    if not self.cpu_offload or self.model is None or self._is_offloaded or not torch.cuda.is_available():
+    if not self.cpu_offload or self.model is None or self.is_offloaded or not torch.cuda.is_available():
       return
     start_t = time.perf_counter()
 
@@ -477,19 +477,19 @@ class FFTTrainingWorker(BaseTrainerWorker):
     for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
       if tensor.device.type == "cuda":
         orig_device = tensor.device
-        if tensor in self._param_shadow and self._param_shadow[tensor][1].shape == tensor.shape:
-          cpu_buf = self._param_shadow[tensor][1]
+        if tensor in self.param_shadow and self.param_shadow[tensor][1].shape == tensor.shape:
+          cpu_buf = self.param_shadow[tensor][1]
         else:
           cpu_buf = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=torch.cuda.is_available())
-          self._param_shadow[tensor] = (orig_device, cpu_buf)
+          self.param_shadow[tensor] = (orig_device, cpu_buf)
         cpu_buf.copy_(tensor.data, non_blocking=True)
       if isinstance(tensor, torch.nn.Parameter) and tensor.grad is not None and tensor.grad.device.type == "cuda":
         orig_device = tensor.grad.device
-        if tensor in self._grad_shadow and self._grad_shadow[tensor][1].shape == tensor.grad.shape:
-          cpu_buf = self._grad_shadow[tensor][1]
+        if tensor in self.grad_shadow and self.grad_shadow[tensor][1].shape == tensor.grad.shape:
+          cpu_buf = self.grad_shadow[tensor][1]
         else:
           cpu_buf = torch.empty(tensor.grad.shape, dtype=tensor.grad.dtype, device="cpu", pin_memory=torch.cuda.is_available())
-          self._grad_shadow[tensor] = (orig_device, cpu_buf)
+          self.grad_shadow[tensor] = (orig_device, cpu_buf)
         cpu_buf.copy_(tensor.grad.data, non_blocking=True)
 
     if self.optimizer is not None:
@@ -499,11 +499,11 @@ class FFTTrainingWorker(BaseTrainerWorker):
             if isinstance(v, torch.Tensor) and v.device.type == "cuda":
               orig_device = v.device
               opt_key = (param, k)
-              if opt_key in self._opt_shadow and self._opt_shadow[opt_key][1].shape == v.shape:
-                cpu_buf = self._opt_shadow[opt_key][1]
+              if opt_key in self.opt_shadow and self.opt_shadow[opt_key][1].shape == v.shape:
+                cpu_buf = self.opt_shadow[opt_key][1]
               else:
                 cpu_buf = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=torch.cuda.is_available())
-                self._opt_shadow[opt_key] = (orig_device, cpu_buf)
+                self.opt_shadow[opt_key] = (orig_device, cpu_buf)
               cpu_buf.copy_(v, non_blocking=True)
 
     # Phase 2: Single Barrier Synchronization point!
@@ -512,11 +512,11 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
     # Phase 3: Now that DMA has finished, safely deallocate GPU VRAM!
     for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
-      if tensor in self._param_shadow:
-        orig_device = self._param_shadow[tensor][0]
+      if tensor in self.param_shadow:
+        orig_device = self.param_shadow[tensor][0]
         tensor.data = torch.empty(0, dtype=tensor.dtype, device=orig_device)
-      if isinstance(tensor, torch.nn.Parameter) and tensor.grad is not None and tensor in self._grad_shadow:
-        orig_device = self._grad_shadow[tensor][0]
+      if isinstance(tensor, torch.nn.Parameter) and tensor.grad is not None and tensor in self.grad_shadow:
+        orig_device = self.grad_shadow[tensor][0]
         tensor.grad.data = torch.empty(0, dtype=tensor.grad.dtype, device=orig_device)
 
     if self.optimizer is not None:
@@ -524,8 +524,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
         if isinstance(state, dict):
           for k in list(state.keys()):
             opt_key = (param, k)
-            if opt_key in self._opt_shadow:
-              orig_device, cpu_buf = self._opt_shadow[opt_key]
+            if opt_key in self.opt_shadow:
+              orig_device, cpu_buf = self.opt_shadow[opt_key]
               state[k] = cpu_buf
 
     if torch.cuda.is_available():
@@ -533,21 +533,21 @@ class FFTTrainingWorker(BaseTrainerWorker):
       torch.cuda.empty_cache()
       torch.cuda.ipc_collect()
 
-    self._is_offloaded = True
+    self.is_offloaded = True
     print(f"[FFT Worker] Offloaded weights & states to pinned CPU memory in {(time.perf_counter() - start_t) * 1000:.1f} ms.")
 
   def wake_up(self) -> None:
     """Reload pinned CPU shadow tensors back to CUDA VRAM without destroying host shadow buffers."""
-    if not self.cpu_offload or self.model is None or not self._is_offloaded or not torch.cuda.is_available():
+    if not self.cpu_offload or self.model is None or not self.is_offloaded or not torch.cuda.is_available():
       return
     start_t = time.perf_counter()
 
     for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
-      if tensor in self._param_shadow:
-        orig_device, cpu_data = self._param_shadow[tensor]
+      if tensor in self.param_shadow:
+        orig_device, cpu_data = self.param_shadow[tensor]
         tensor.data = cpu_data.to(orig_device, non_blocking=True)
-      if isinstance(tensor, torch.nn.Parameter) and tensor.grad is not None and tensor in self._grad_shadow:
-        orig_device, cpu_grad = self._grad_shadow[tensor]
+      if isinstance(tensor, torch.nn.Parameter) and tensor.grad is not None and tensor in self.grad_shadow:
+        orig_device, cpu_grad = self.grad_shadow[tensor]
         tensor.grad.data = cpu_grad.to(orig_device, non_blocking=True)
 
     if self.optimizer is not None:
@@ -557,8 +557,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
           target_device = param.device
           for k, v in list(state.items()):
             opt_key = (param, k)
-            if opt_key in self._opt_shadow:
-              orig_device, cpu_buf = self._opt_shadow[opt_key]
+            if opt_key in self.opt_shadow:
+              orig_device, cpu_buf = self.opt_shadow[opt_key]
               state[k] = cpu_buf.to(orig_device, non_blocking=True)
             elif isinstance(v, torch.Tensor) and v.device.type == "cpu" and k != "step":
               state[k] = v.to(target_device, non_blocking=True)
@@ -566,5 +566,5 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if torch.cuda.is_available():
       torch.cuda.synchronize()
 
-    self._is_offloaded = False
+    self.is_offloaded = False
     print(f"[FFT Worker] Reloaded weights & states to CUDA in {(time.perf_counter() - start_t) * 1000:.1f} ms.")

@@ -76,7 +76,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
 
     # 4. Verify worker's CPU shadow was updated to W1 so next step diffs correctly
     self.assertTrue(
-      torch.equal(worker._param_shadow[worker.model.fc.weight][1], worker.model.fc.weight.data.cpu()),
+      torch.equal(worker.param_shadow[worker.model.fc.weight][1], worker.model.fc.weight.data.cpu()),
       "Worker shadow must be updated after delta save",
     )
 
@@ -128,7 +128,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
       worker.set_weight_sync_strategy("invalid_strategy")
 
   def test_save_state_delta_with_offloading(self):
-    """Test that save_state_delta() succeeds cleanly when model is offloaded (_is_offloaded=True and param.data size 0)."""
+    """Test that save_state_delta() succeeds cleanly when the model is offloaded."""
     worker = FFTTrainingWorker()
     worker.base_model_name = "test-offload-model"
     worker.model = SimpleModel()
@@ -140,7 +140,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
     expected_value = worker.model.fc.weight.detach()[1, 1].item()
 
     # The update payload must remain saveable after the live parameter is offloaded.
-    worker._is_offloaded = True
+    worker.is_offloaded = True
     worker.model.fc.weight.data = torch.empty(0, dtype=worker.model.fc.weight.dtype, device="cpu")
 
     state_path = os.path.join(self.test_dir, "step_offload")

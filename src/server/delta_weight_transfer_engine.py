@@ -61,15 +61,15 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
   def __init__(self, *args, **kwargs) -> None:
     super().__init__(*args, **kwargs)
     self.current_weights_path: str | None = None
-    self._cpu_snapshot: dict[str, torch.Tensor] = {}
-    self._base_model: str = os.getenv("OPEN_RL_BASE_MODEL", os.getenv("BASE_MODEL", ""))
-    if not self._base_model and self.model_config is not None:
-      self._base_model = self.model_config.model
+    self.cpu_snapshot: dict[str, torch.Tensor] = {}
+    self.base_model: str = os.getenv("OPEN_RL_BASE_MODEL", os.getenv("BASE_MODEL", ""))
+    if not self.base_model and self.model_config is not None:
+      self.base_model = self.model_config.model
 
-  def _ensure_cpu_snapshot(self, base_model: str) -> None:
-    if self._cpu_snapshot:
+  def ensure_cpu_snapshot(self, base_model: str) -> None:
+    if self.cpu_snapshot:
       return
-    base_model = base_model or self._base_model or os.getenv("OPEN_RL_BASE_MODEL", os.getenv("BASE_MODEL", ""))
+    base_model = base_model or self.base_model or os.getenv("OPEN_RL_BASE_MODEL", os.getenv("BASE_MODEL", ""))
     logger.info(f"[DeltaSnapshotEngine] Initializing CPU weights snapshot (base model: '{base_model}')...")
 
     if base_model:
@@ -84,11 +84,11 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
       )
       for name, tensor in safetensors_weights_iterator(hf_weights_files, use_tqdm_on_load=False):
         if not name.endswith(".indices") and "delta" not in name:
-          self._cpu_snapshot[name] = tensor.pin_memory() if torch.cuda.is_available() else tensor.clone()
-      if self._cpu_snapshot:
+          self.cpu_snapshot[name] = tensor.pin_memory() if torch.cuda.is_available() else tensor.clone()
+      if self.cpu_snapshot:
         elapsed = (time.perf_counter() - start_t) * 1000.0
         logger.info(
-          f"[DeltaSnapshotEngine] CPU weights snapshot initialized with {len(self._cpu_snapshot)} "
+          f"[DeltaSnapshotEngine] CPU weights snapshot initialized with {len(self.cpu_snapshot)} "
           f"HuggingFace tensors from base model '{base_model}' via vLLM weight iterator in {elapsed:.2f} ms."
         )
         return
@@ -102,7 +102,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     """Updates are applied in place, so no layerwise setup is needed."""
 
   @staticmethod
-  def _load_metadata(target_path: str) -> dict[str, Any]:
+  def load_metadata(target_path: str) -> dict[str, Any]:
     if not os.path.isdir(target_path):
       return {}
     metadata_path = os.path.join(target_path, "metadata.json")
@@ -112,7 +112,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
       return json.load(f)
 
   @staticmethod
-  def _layer_names(metadata: dict[str, Any], update_format: str) -> list[str]:
+  def layer_names(metadata: dict[str, Any], update_format: str) -> list[str]:
     names = metadata.get("layer_names")
     if names is None:
       raise ValueError(f"Missing 'layer_names' metadata in {update_format} update.")
@@ -123,24 +123,24 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     return names
 
   @staticmethod
-  def _update_file(target_path: str, update_format: str) -> str:
+  def update_file(target_path: str, update_format: str) -> str:
     update_file = os.path.join(target_path, "delta.safetensors")
     if not os.path.exists(update_file):
       raise ValueError(f"{update_format} metadata present but delta.safetensors not found at: {target_path}")
     return update_file
 
-  def _sparse_update_weights(
+  def sparse_update_weights(
     self,
     target_path: str,
     metadata: dict[str, Any],
     base_model_path: str,
   ) -> list[tuple[str, torch.Tensor]]:
     start_t = time.perf_counter()
-    update_file = self._update_file(target_path, SPARSE_DELTA_FORMAT)
+    update_file = self.update_file(target_path, SPARSE_DELTA_FORMAT)
     sparse_update = load_file(update_file, device="cpu")
     logger.info(f"[DeltaSnapshotEngine] Loaded sparse delta from {update_file} in {(time.perf_counter() - start_t) * 1000.0:.2f} ms")
 
-    names = self._layer_names(metadata, SPARSE_DELTA_FORMAT)
+    names = self.layer_names(metadata, SPARSE_DELTA_FORMAT)
     indices = sparse_update["delta.indices_flat"].to(torch.int64)
     values = sparse_update["delta.values_flat"]
     layer_lengths = sparse_update["delta.layer_lengths"].tolist()
@@ -155,48 +155,48 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
       logger.info("[DeltaSnapshotEngine] Sparse update is a no-op; skipping GPU reload")
       return []
 
-    self._ensure_cpu_snapshot(base_model_path)
+    self.ensure_cpu_snapshot(base_model_path)
     apply_start = time.perf_counter()
     index_slices = torch.split(indices, layer_lengths)
     value_slices = torch.split(values, layer_lengths)
     for name, layer_indices, layer_values in zip(names, index_slices, value_slices, strict=True):
-      if name not in self._cpu_snapshot:
+      if name not in self.cpu_snapshot:
         raise KeyError(f"Parameter '{name}' found in sparse delta but missing from CPU snapshot.")
-      self._cpu_snapshot[name].view(-1)[layer_indices] = layer_values
+      self.cpu_snapshot[name].view(-1)[layer_indices] = layer_values
 
     changed_elements = indices.numel()
-    total_elements = sum(tensor.numel() for tensor in self._cpu_snapshot.values())
+    total_elements = sum(tensor.numel() for tensor in self.cpu_snapshot.values())
     density_pct = 100.0 * changed_elements / max(1, total_elements)
     logger.info(
       f"[DeltaSnapshotEngine] Applied packed sparse delta ({len(names)} layers, "
       f"{changed_elements}/{total_elements} elements [{density_pct:.3f}% changed]) "
       f"in {(time.perf_counter() - apply_start) * 1000.0:.2f} ms"
     )
-    return [(name, self._cpu_snapshot[name]) for name in names]
+    return [(name, self.cpu_snapshot[name]) for name in names]
 
-  def _absolute_update_weights(
+  def absolute_update_weights(
     self,
     target_path: str,
     metadata: dict[str, Any],
     base_model_path: str,
   ) -> list[tuple[str, torch.Tensor]]:
     start_t = time.perf_counter()
-    update_file = self._update_file(target_path, ABSOLUTE_TENSORS_FORMAT)
-    self._ensure_cpu_snapshot(base_model_path)
+    update_file = self.update_file(target_path, ABSOLUTE_TENSORS_FORMAT)
+    self.ensure_cpu_snapshot(base_model_path)
     incoming_tensors = load_file(update_file, device="cpu")
-    names = self._layer_names(metadata, ABSOLUTE_TENSORS_FORMAT)
+    names = self.layer_names(metadata, ABSOLUTE_TENSORS_FORMAT)
     if set(names) != set(incoming_tensors):
       raise ValueError("Absolute tensor names do not match metadata layer_names.")
 
     changed_weights = []
     for name, incoming_tensor in incoming_tensors.items():
-      if name not in self._cpu_snapshot:
+      if name not in self.cpu_snapshot:
         raise KeyError(f"Parameter '{name}' found in absolute tensor update but missing from CPU snapshot.")
-      previous_tensor = self._cpu_snapshot[name]
+      previous_tensor = self.cpu_snapshot[name]
       if previous_tensor.shape != incoming_tensor.shape or previous_tensor.dtype != incoming_tensor.dtype:
         raise ValueError(f"Absolute tensor '{name}' does not match the CPU snapshot shape and dtype.")
       if not torch.equal(previous_tensor, incoming_tensor):
-        self._cpu_snapshot[name] = incoming_tensor
+        self.cpu_snapshot[name] = incoming_tensor
         changed_weights.append((name, incoming_tensor))
 
     logger.info(
@@ -206,7 +206,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     return changed_weights
 
   @staticmethod
-  def _checkpoint_weights(target_path: str) -> list[tuple[str, torch.Tensor]]:
+  def checkpoint_weights(target_path: str) -> list[tuple[str, torch.Tensor]]:
     if target_path.endswith(".safetensors"):
       return list(load_file(target_path, device="cpu").items())
     if not os.path.isdir(target_path):
@@ -219,9 +219,9 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
           weights.extend(load_file(os.path.join(root, filename), device="cpu").items())
     return weights
 
-  def _changed_checkpoint_weights(self, target_path: str) -> list[tuple[str, torch.Tensor]]:
+  def changed_checkpoint_weights(self, target_path: str) -> list[tuple[str, torch.Tensor]]:
     start_t = time.perf_counter()
-    incoming_weights = self._checkpoint_weights(target_path)
+    incoming_weights = self.checkpoint_weights(target_path)
     logger.info(
       f"[DeltaSnapshotEngine] Loaded {len(incoming_weights)} parameter tensors "
       f"from {target_path} in {(time.perf_counter() - start_t) * 1000.0:.2f} ms"
@@ -229,7 +229,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
     changed_weights = []
     for name, incoming_tensor in incoming_weights:
-      previous_tensor = self._cpu_snapshot.get(name)
+      previous_tensor = self.cpu_snapshot.get(name)
       if (
         previous_tensor is not None
         and previous_tensor.shape == incoming_tensor.shape
@@ -237,7 +237,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
         and torch.equal(previous_tensor, incoming_tensor)
       ):
         continue
-      self._cpu_snapshot[name] = incoming_tensor
+      self.cpu_snapshot[name] = incoming_tensor
       changed_weights.append((name, incoming_tensor))
 
     logger.info(
@@ -252,15 +252,15 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     if not target_path or not os.path.exists(target_path):
       raise ValueError(f"Target weights path does not exist: {target_path}")
 
-    metadata = self._load_metadata(target_path)
+    metadata = self.load_metadata(target_path)
     update_format = metadata.get("format")
-    base_model_path = update_info.base_model_path or self._base_model
+    base_model_path = update_info.base_model_path or self.base_model
     if update_format == SPARSE_DELTA_FORMAT:
-      weights_to_load = self._sparse_update_weights(target_path, metadata, base_model_path)
+      weights_to_load = self.sparse_update_weights(target_path, metadata, base_model_path)
     elif update_format == ABSOLUTE_TENSORS_FORMAT:
-      weights_to_load = self._absolute_update_weights(target_path, metadata, base_model_path)
+      weights_to_load = self.absolute_update_weights(target_path, metadata, base_model_path)
     else:
-      weights_to_load = self._changed_checkpoint_weights(target_path)
+      weights_to_load = self.changed_checkpoint_weights(target_path)
 
     if not weights_to_load:
       self.current_weights_path = target_path

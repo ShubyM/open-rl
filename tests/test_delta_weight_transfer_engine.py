@@ -237,7 +237,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
         parallel_config=None,  # type: ignore
         model=dummy_model,
       )
-      engine._cpu_snapshot = {"layer.0.weight": dummy_model.weight.detach().clone()}
+      engine.cpu_snapshot = {"layer.0.weight": dummy_model.weight.detach().clone()}
       engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=tmpdir))
 
       # Assert mock_loader received only the full reconstructed 2D layer tensor, NOT .indices / .values
@@ -261,7 +261,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
         parallel_config=None,  # type: ignore
         model=model,
       )
-      engine._cpu_snapshot = {"layer.0.weight": torch.zeros(4, 4)}
+      engine.cpu_snapshot = {"layer.0.weight": torch.zeros(4, 4)}
 
       update_info = DeltaSnapshotUpdateInfo(target_weights_path=tmpdir)
       engine.receive_weights(update_info)
@@ -270,7 +270,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       self.assertEqual(len(model.load_calls), 1)
       self.assertEqual(model.load_calls[0][0][0], "layer.0.weight")
       self.assertTrue(torch.equal(model.load_calls[0][0][1], updated_weight))
-      self.assertTrue(torch.equal(engine._cpu_snapshot["layer.0.weight"], updated_weight))
+      self.assertTrue(torch.equal(engine.cpu_snapshot["layer.0.weight"], updated_weight))
 
   def test_receive_weights_base_model_directory_loading(self):
     """Test that receive_weights directly populates CPU snapshot from base_model_path when provided."""
@@ -319,7 +319,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
         self.assertEqual(loaded_calls[0][1].view(-1)[2].item(), 42.0)
 
   def test_receive_weights_hf_cache_and_env_loading(self):
-    """Test that _ensure_cpu_snapshot resolves HF model IDs from OPEN_RL_BASE_MODEL (e.g. Qwen/Test-4B -> models--Qwen--Test-4B)."""
+    """Test that ensure_cpu_snapshot resolves HF model IDs from OPEN_RL_BASE_MODEL."""
     with tempfile.TemporaryDirectory() as tmpdir:
       # Mock HF hub cache structure: ~/.cache/huggingface/hub/models--Qwen--Test-4B/snapshots/commit123/
       hf_folder = os.path.join(tmpdir, "models--Qwen--Test-4B", "snapshots", "commit123")
