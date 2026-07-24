@@ -120,6 +120,9 @@ class Datum(BaseModel):
 
 
 class BaseTrainerWorker:
+  # FSDP backwards run collectives, so pass counts must match across ranks.
+  backward_runs_collectives = True
+
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
     self.output_head_is_adapted = False
@@ -161,11 +164,8 @@ class BaseTrainerWorker:
     loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
 
     local_batches = self.make_training_batches(local_data)
-    if shard_count > 1:
-      # Every rank must execute the same number of forward and backward passes:
-      # FSDP all-gathers parameters per forward and reduce-scatters gradients
-      # per backward, and mismatched collective counts deadlock the group. Pad
-      # short ranks with zero-scaled passes over a real datum.
+    if shard_count > 1 and self.backward_runs_collectives:
+      # Pad short ranks with zero-scaled passes so FSDP collective counts match.
       total_passes = all_reduce_max(len(local_batches))
       filler_passes = total_passes - len(local_batches)
       if filler_passes > 0:
@@ -193,10 +193,7 @@ class BaseTrainerWorker:
         else:
           has_kl_penalty = bool(loss_config and loss_config.get("kl_coeff", 0.0) > 0 and (weights != 0).any())
           skip_backward = zero_effective_advantages and not has_kl_penalty
-      # Distributed ranks cannot skip: backward collective counts must match
-      # across the group even when this shard's gradient is zero. forward_only
-      # is uniform across ranks (it skips every backward), so it stays exempt.
-      skip_backward = (skip_backward and shard_count == 1) or forward_only
+      skip_backward = (skip_backward and (shard_count == 1 or not self.backward_runs_collectives)) or forward_only
 
       # A zero-advantage batch contributes no gradient; computing its logprobs
       # under no_grad avoids building and retaining the autograd graph.

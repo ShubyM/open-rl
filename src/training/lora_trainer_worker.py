@@ -41,6 +41,9 @@ def active_adapter_parameters(model: PeftModelForCausalLM, adapter_id: str) -> l
 
 
 class LoraTrainingWorker(BaseTrainerWorker):
+  # Gradients meet only at optim_step's all_reduce; empty shards skip work.
+  backward_runs_collectives = False
+
   def __init__(self):
     super().__init__()
     self.base_model: PreTrainedModel | None = None

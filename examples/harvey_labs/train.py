@@ -13,6 +13,12 @@ import tinker
 from env import LabDatasetBuilder
 from tasks import BOOTSTRAP_TASKS, EVAL_TASKS, random_task_split
 from tinker_cookbook import checkpoint_utils
+from tinker.lib.public_interfaces import training_client as tinker_training_client
+
+# 5MB chunks put one long-context datum per request, collapsing DP sharding
+# to rank 0; keep the substep's datums in a single request.
+tinker_training_client.MAX_CHUNK_BYTES_COUNT = 1_000_000_000
+
 from tinker_cookbook.rl import train as rl_train
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator
 from tinker_cookbook.stores.storage import LocalStorage
