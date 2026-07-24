@@ -88,6 +88,13 @@ class RunConfig:
   max_tool_result_tokens: int = 8 * 1024
   judge_model: str = "gemini-3.5-flash"
   max_reward_criteria: int | None = None
+  # Full-state checkpoint cadence (weights + optimizer, resumable). 0 = off.
+  save_every: int = 5
+  # Warm-start: initialize adapter weights from an existing snapshot
+  # (tinker://<model_id>/sampler_weights/<label>) with a fresh optimizer.
+  # The batch counter restarts at 0 — this begins a NEW run from those
+  # weights, it does not resume the old run's step position.
+  load_checkpoint_path: str | None = None
   log_path: str = "artifacts/harvey-labs"
   log_full_rollouts: bool = False
   # The in-loop evals measure the model BEFORE an optimizer step (batch 0 is
@@ -211,9 +218,10 @@ async def run(config: RunConfig) -> None:
     log_path=config.log_path,
     base_url=resolve_base_url(config.base_url),
     eval_every=config.eval_every,
-    save_every=0,
+    save_every=config.save_every,
     max_steps=config.max_steps,
     num_groups_to_log=NUM_GROUPS_TO_LOG,
+    load_checkpoint_path=config.load_checkpoint_path,
   )
   await rl_train.main(train_config)
   if config.final_eval:

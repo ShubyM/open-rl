@@ -114,6 +114,9 @@ def resolve_state_ref(ref: str | None) -> str | None:
   parts = ref[len("tinker://") :].split("/")
   if len(parts) >= 3 and parts[1] == "weights":
     return os.path.join(TMP_DIR, "checkpoints", parts[0], "weights", *parts[2:])
+  if len(parts) >= 3 and parts[1] == "sampler_weights":
+    # Adapter-only sampler snapshots are valid weights-only warm-start sources.
+    return os.path.join(TMP_DIR, "peft", parts[0], *parts[2:])
   return None
 
 
@@ -711,17 +714,21 @@ async def weights_info(req: dict):
   lora_rank = None
   train_unembed = None
   train_mlp = None
+  adapter_base_model = None
   for root, _dirs, files in os.walk(state_path):
     if "adapter_config.json" in files:
       with open(os.path.join(root, "adapter_config.json"), encoding="utf-8") as f:
         adapter_config = json.load(f)
       lora_rank = adapter_config.get("r")
+      adapter_base_model = adapter_config.get("base_model_name_or_path")
       targets = adapter_config.get("target_modules") or []
       train_unembed = "lm_head" in targets
       train_mlp = any("gate_proj" in t or "up_proj" in t for t in targets)
       break
 
-  base_model = metadata.get("base_model")
+  # Sampler snapshots carry no metadata.json; PEFT's adapter config names
+  # the base model, which is enough for a weights-only warm start.
+  base_model = metadata.get("base_model") or adapter_base_model
   if not base_model:
     return JSONResponse(status_code=404, content={"error": f"Checkpoint at {tinker_path!r} has no base_model metadata"})
   return {

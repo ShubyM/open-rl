@@ -347,15 +347,23 @@ class LoraTrainingWorker(BaseTrainerWorker):
     and (optionally) an adapter subdirectory with the saved LoRA weights.
     """
     metadata_path = os.path.join(state_path, "metadata.json")
-    if not os.path.exists(metadata_path):
-      raise FileNotFoundError(f"No metadata.json found at {state_path}")
-
-    with open(metadata_path) as f:
-      metadata = json.load(f)
+    if os.path.exists(metadata_path):
+      with open(metadata_path) as f:
+        metadata = json.load(f)
+    else:
+      # Sampler snapshots carry no metadata.json; PEFT's adapter_config.json
+      # names the base model, which is all a weights-only load needs.
+      adapter_config_path = os.path.join(state_path, "adapter_config.json")
+      if not os.path.exists(adapter_config_path):
+        raise FileNotFoundError(
+          f"{state_path} has neither metadata.json nor adapter_config.json — not a checkpoint or adapter snapshot"
+        )
+      with open(adapter_config_path) as f:
+        metadata = {"base_model": json.load(f).get("base_model_name_or_path")}
 
     base_model = metadata.get("base_model")
     if not base_model:
-      raise ValueError(f"metadata.json at {state_path} missing base_model")
+      raise ValueError(f"{state_path} does not name its base model (metadata.json/adapter_config.json)")
 
     src_adapter_id = metadata.get("model_id")
     adapter_dir = state_path
