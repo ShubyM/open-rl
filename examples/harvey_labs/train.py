@@ -98,6 +98,11 @@ class RunConfig:
   max_reward_criteria: int | None = None
   # Full-state checkpoint cadence (weights + optimizer, resumable). 0 = off.
   save_every: int = 5
+  # Overlap training with sampling: forward_backward runs on each trajectory
+  # group as its rollouts finish instead of waiting for the whole batch.
+  # Gradient math is unchanged at num_substeps=1 (one optim_step per batch).
+  stream_minibatches: bool = False
+  num_substeps: int = 1
   # Warm-start: initialize adapter weights from an existing snapshot
   # (tinker://<model_id>/sampler_weights/<label>) with a fresh optimizer.
   # The batch counter restarts at 0 — this begins a NEW run from those
@@ -230,6 +235,15 @@ async def run(config: RunConfig) -> None:
     max_steps=config.max_steps,
     num_groups_to_log=NUM_GROUPS_TO_LOG,
     load_checkpoint_path=config.load_checkpoint_path,
+    num_substeps=config.num_substeps,
+    stream_minibatch_config=(
+      rl_train.StreamMinibatchConfig(
+        groups_per_batch=config.batch_size,
+        num_minibatches=config.batch_size // config.num_substeps,
+      )
+      if config.stream_minibatches
+      else None
+    ),
   )
   await rl_train.main(train_config)
   if config.final_eval:
