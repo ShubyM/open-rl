@@ -29,7 +29,9 @@ from tinker_utils import force_rich_log_colors, resolve_base_url
 
 MODEL_NAME = "google/gemma-4-E4B-it"
 COMMAND_TIMEOUT = 60
-JUDGE_PARALLEL = 1
+def default_judge_parallel(judge_model: str) -> int:
+  # Self-hosted GLM absorbs concurrent grading; Gemini rate limits force 1.
+  return 16 if "glm" in judge_model else 1
 NUM_GROUPS_TO_LOG = 1
 
 def print_group_summary(traj_group, tokenizer) -> None:
@@ -95,6 +97,8 @@ class RunConfig:
   max_trajectory_tokens: int = 128 * 1024
   max_tool_result_tokens: int = 8 * 1024
   judge_model: str = "gemini-3.5-flash"
+  # Criteria graded concurrently within one episode. 0 = auto by judge model.
+  judge_parallel: int = 0
   max_reward_criteria: int | None = None
   # Full-state checkpoint cadence (weights + optimizer, resumable). 0 = off.
   save_every: int = 5
@@ -180,7 +184,7 @@ def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
     max_turns=config.max_turns,
     command_timeout=COMMAND_TIMEOUT,
     judge_model=config.judge_model,
-    judge_parallel=JUDGE_PARALLEL,
+    judge_parallel=config.judge_parallel or default_judge_parallel(config.judge_model),
     max_reward_criteria=config.max_reward_criteria,
     max_trajectory_tokens=config.max_trajectory_tokens,
     max_generation_tokens=config.max_tokens,
