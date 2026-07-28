@@ -6,6 +6,14 @@ rubric, and the pass fraction is the reward. Training reuses tinker-cookbook's
 GRPO loop and multi-turn tool environment; this module adapts LAB tasks,
 sandbox tools, and rubric reward.
 
+## Results
+
+Run 9 (Qwen3.5-9B LoRA, 20 steps, batch 8×6 rollouts, GLM judge): held-out
+criterion pass rate 48.7% → **67.6%** (peak, step 15), 65.1% at the final
+checkpoint — 3,151 pooled rubric criteria over the 50-task eval split.
+
+![run 9 training curve](assets/run9.png)
+
 ## Layout
 
 - `train.py` — run config and entrypoint (with grading preflight and final eval).

@@ -61,3 +61,4 @@ runs/
 
 # Harvey LAB benchmark checkout (created by examples/harvey_labs/setup_lab.sh)
 examples/harvey_labs/harvey-labs/
+!examples/harvey_labs/assets/*.png
