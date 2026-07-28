@@ -51,3 +51,4 @@ Thumbs.db
 !examples/rl/text-to-sql/results/
 !examples/rl/text-to-sql/results/*.png
 !examples/tinker-cookbook/plots/*.png
+!examples/harvey_labs/assets/*.png
