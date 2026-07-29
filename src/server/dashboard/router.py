@@ -32,6 +32,19 @@ async def dashboard_runs(request: Request):
   return await data.runs_snapshot(get_store(), request.app.state.fft_worker_manager, k8s["pods"])
 
 
+@router.get("/runs/{run_id}")
+async def dashboard_run_detail(run_id: str, request: Request, logs: int = 0):
+  log_tail = min(max(logs, 0), 2000)
+  if data.demo_mode_enabled():
+    detail = demo.demo_run_detail(run_id, log_tail)
+  else:
+    k8s = await asyncio.to_thread(data.k8s_snapshot)
+    detail = await data.run_detail(get_store(), request.app.state.fft_worker_manager, run_id, k8s, log_tail)
+  if detail is None:
+    return JSONResponse(status_code=404, content={"error": f"unknown run: {run_id}"})
+  return detail
+
+
 @router.post("/runs/{run_id}/stop")
 async def dashboard_stop_run(run_id: str, request: Request):
   if data.demo_mode_enabled():

@@ -47,6 +47,10 @@ def main() -> None:
   sub.add_parser("inspect", help="Cluster snapshot: pools, nodes, pods, gateway, services")
   sub.add_parser("runs", help="List runs with lifecycle state")
 
+  run = sub.add_parser("run", help="Everything about one run: state, pods, queue depth, GPU claims, optional logs")
+  run.add_argument("run_id")
+  run.add_argument("--logs", type=int, default=0, metavar="N", help="Include the last N log lines per pod")
+
   logs = sub.add_parser("logs", help="Fetch logs for a pod")
   logs.add_argument("pod")
   logs.add_argument("--container")
@@ -68,6 +72,11 @@ def main() -> None:
     emit(request("GET", "/api/v1/dashboard/cluster"))
   elif args.command == "runs":
     emit(request("GET", "/api/v1/dashboard/runs"))
+  elif args.command == "run":
+    path = f"/api/v1/dashboard/runs/{urllib.parse.quote(args.run_id)}"
+    if args.logs:
+      path += f"?logs={args.logs}"
+    emit(request("GET", path))
   elif args.command == "logs":
     params = {"tail": str(args.tail)}
     if args.container:

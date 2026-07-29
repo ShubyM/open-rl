@@ -274,6 +274,24 @@ def demo_problems() -> dict:
   }
 
 
+def demo_run_detail(run_id: str, log_tail: int = 0) -> dict | None:
+  run = next((r for r in demo_runs()["runs"] if r["run_id"] == run_id), None)
+  if run is None:
+    return None
+  cluster = demo_cluster()
+  pods = [pod for pod in cluster["pods"] if run_id in pod["name"]]
+  gpu_claims = {}
+  for pool in cluster["pools"]:
+    duty = pool.get("duty")
+    if duty and duty["series"] and duty["series"][-1][1].get(run_id):
+      gpu_claims[pool["id"]] = duty["series"][-1][1][run_id]
+  queue_depth = next((q["depth"] for q in demo_health()["queues"] if q["model_id"] == run_id), 0)
+  detail = {**run, "demo": True, "notice": DEMO_NOTICE, "pods": pods, "queue_depth": queue_depth, "gpu_claims": gpu_claims}
+  if log_tail:
+    detail["logs"] = {pod["name"]: demo_pod_logs(pod["name"])["text"] for pod in pods}
+  return detail
+
+
 def demo_pod_logs(pod: str) -> dict:
   lines = [
     "[demo] fictional log output — this pod does not exist",

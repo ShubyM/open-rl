@@ -2,6 +2,7 @@
 # filesystem, and (when reachable) the Kubernetes API. Every accessor degrades to an explicit
 # "unavailable" result instead of raising so the dashboard can always render something truthful.
 
+import asyncio
 import functools
 import json
 import os
@@ -452,6 +453,48 @@ async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | 
     )
   runs.sort(key=lambda r: (r["created_at"] is None, r["created_at"] or "", r["run_id"]), reverse=True)
   return {"demo": False, "runs": runs}
+
+
+async def run_detail(
+  store: RequestStore,
+  worker_manager: FFTWorkerManager | None,
+  run_id: str,
+  k8s: dict,
+  log_tail: int = 0,
+) -> dict | None:
+  """Everything about one run in a single payload: its record, full pod state, queue depth,
+  current GPU claims per pool, and (when log_tail > 0) a log tail per pod."""
+  snapshot = await runs_snapshot(store, worker_manager, k8s["pods"])
+  run = next((r for r in snapshot["runs"] if r["run_id"] == run_id), None)
+  if run is None:
+    return None
+
+  queue_depth = 0
+  if isinstance(store, RedisStore):
+    try:
+      queue_depth = await store.redis.llen(f"open_rl:queue:{run_id}")
+    except Exception:
+      pass
+  elif isinstance(store, InMemoryStore):
+    queue = store.queues.get(run_id)
+    queue_depth = queue.qsize() if queue else 0
+
+  gpu_claims = {}
+  for pool_id, series in duty_tracker.series.items():
+    if series and series[-1][1].get(run_id):
+      gpu_claims[pool_id] = series[-1][1][run_id]
+
+  pods = model_pods(run_id, k8s["pods"])
+  detail = {**run, "demo": False, "pods": pods, "queue_depth": queue_depth, "gpu_claims": gpu_claims}
+  if log_tail:
+    logs = {}
+    for pod in pods:
+      try:
+        logs[pod["name"]] = (await asyncio.to_thread(k8s_pod_logs, pod["name"], None, log_tail))["text"]
+      except Exception as exc:
+        logs[pod["name"]] = f"(logs unavailable: {exc})"
+    detail["logs"] = logs
+  return detail
 
 
 async def stop_run(store: RequestStore, worker_manager: FFTWorkerManager | None, model_id: str) -> dict:

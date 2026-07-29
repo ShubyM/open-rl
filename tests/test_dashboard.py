@@ -71,13 +71,31 @@ class DashboardEndpointsTest(unittest.TestCase):
       self.assertIn("model-def-456", runs)
       self.assertIn("checkpoint", runs["model-def-456"]["sources"])
 
+  def test_run_detail_bundles_run_state(self) -> None:
+    old_tmp_dir = os.environ.get("OPEN_RL_TMP_DIR")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      os.environ["OPEN_RL_TMP_DIR"] = tmp_dir
+      self.addCleanup(lambda: os.environ.update({"OPEN_RL_TMP_DIR": old_tmp_dir}) if old_tmp_dir else os.environ.pop("OPEN_RL_TMP_DIR", None))
+      os.makedirs(os.path.join(tmp_dir, "checkpoints", "model-xyz-789"))
+
+      resp = self.client.get("/api/v1/dashboard/runs/model-xyz-789")
+      self.assertEqual(resp.status_code, 200)
+      detail = resp.json()
+      self.assertEqual(detail["run_id"], "model-xyz-789")
+      self.assertEqual(detail["queue_depth"], 0)
+      self.assertEqual(detail["pods"], [])
+      self.assertEqual(detail["gpu_claims"], {})
+      self.assertNotIn("logs", detail, "logs are only included when requested")
+
+    self.assertEqual(self.client.get("/api/v1/dashboard/runs/no-such-run").status_code, 404)
+
   def test_stop_unknown_run_conflicts(self) -> None:
     resp = self.client.post("/api/v1/dashboard/runs/does-not-exist/stop")
     self.assertEqual(resp.status_code, 409)
 
   def test_demo_mode_flags_every_payload(self) -> None:
     os.environ["OPEN_RL_DASHBOARD_DEMO"] = "1"
-    for path in ("cluster", "runs", "health", "problems", "pods/any-pod/logs"):
+    for path in ("cluster", "runs", "health", "problems", "pods/any-pod/logs", "runs/demo-run-1?logs=5"):
       body = self.client.get(f"/api/v1/dashboard/{path}").json()
       self.assertTrue(body["demo"], path)
       self.assertIn("fictional", body["notice"], path)

@@ -42,6 +42,7 @@ The UI serves humans; the same primitives are exposed as JSON for agents and scr
 | problems | `GET /api/v1/dashboard/problems` | `make ops problems` |
 | inspect | `GET /api/v1/dashboard/cluster` | `make ops inspect` |
 | runs | `GET /api/v1/dashboard/runs` | `make ops runs` |
+| run detail | `GET /api/v1/dashboard/runs/{run_id}?logs=N` | `make ops run <run_id> --logs N` |
 | logs | `GET /api/v1/dashboard/pods/{pod}/logs` | `make ops logs <pod>` |
 | launch | `POST /api/v1/create_model` | `make ops launch --base-model <model>` |
 | stop | `POST /api/v1/dashboard/runs/{run_id}/stop` | `make ops stop <run_id>` |
