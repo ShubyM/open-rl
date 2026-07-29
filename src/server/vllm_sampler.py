@@ -2,14 +2,14 @@
 
 import argparse
 import asyncio
-import hashlib
-import json
 import os
 import sys
 import traceback
 from typing import Any
 
-import redis.asyncio as redis
+os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+from server.model_metadata import WeightSyncConfig
 
 try:
   from vllm import SamplingParams
@@ -95,20 +95,20 @@ def init_engine():
     engine_kwargs = {
       "model": model_name,
       "enable_sleep_mode": is_fft_enabled(),
-      "enable_lora": not is_fft_enabled(),
+      "enable_lora": False,
       "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", "8192")),
       "max_num_seqs": int(os.getenv("VLLM_MAX_NUM_SEQS", "64")),
       "gpu_memory_utilization": float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")),
       "enable_prefix_caching": False,
       "enforce_eager": os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
     }
-    if not is_fft_enabled():
-      engine_kwargs["max_loras"] = 8
-      engine_kwargs["max_lora_rank"] = 64
     if hf_overrides:
       engine_kwargs["hf_overrides"] = hf_overrides
 
-    if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
+    from server.model_metadata import WeightSyncConfig
+
+    weight_sync_cfg = WeightSyncConfig.from_env()
+    if weight_sync_cfg.strategy == "delta":
       try:
         from vllm.config.weight_transfer import WeightTransferConfig
 
@@ -156,15 +156,8 @@ async def run_generation_backend(
       output_kind=RequestOutputKind.FINAL_ONLY,
     )
 
-    lora_request = None
-    if lora_id and lora_path:
-      # vLLM natively relies on lora_int_id to track cached adapter weights.
-      # Convert the sequence identifier UUID to a stable 32-bit positive integer hash.
-      lora_int_id = int(hashlib.md5(lora_id.encode("utf-8")).hexdigest(), 16) % (2**31 - 1) + 1
-      lora_request = LoRARequest(lora_id, lora_int_id, lora_path)
-
     results_generator = current_engine.generate(
-      prompt={"prompt_token_ids": prompt_token_ids}, sampling_params=sampling_params, request_id=request_id, lora_request=lora_request
+      prompt={"prompt_token_ids": prompt_token_ids}, sampling_params=sampling_params, request_id=request_id, lora_request=None
     )
 
     final_output = None
@@ -236,26 +229,22 @@ async def process_sampling_request(req: dict, store: Any) -> None:
               await engine.sleep(level=1)
               print("[vLLM Worker] Waking up weights...")
               await engine.wake_up(tags=["weights"])
-              if os.getenv("OPEN_RL_WEIGHT_SYNC_STRATEGY", "delta").lower() == "delta":
-                print(f"[vLLM Worker] Receiving incremental delta weights from {weights_path} via native WeightTransferEngine...")
-                try:
-                  await engine.collective_rpc(
-                    "update_weights",
-                    kwargs={
-                      "update_info": {
-                        "target_weights_path": weights_path,
-                        "base_model_path": (
-                          os.getenv("OPEN_RL_BASE_MODEL") or os.getenv("BASE_MODEL") or getattr(getattr(engine, "engine_args", None), "model", "")
-                        ),
-                      }
-                    },
-                  )
-                except Exception as exc:
-                  print(f"[vLLM Worker] Native update_weights collective_rpc failed ({exc}); falling back to standard disk reload...")
-                  await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+              if WeightSyncConfig.from_env().strategy == "delta":
+
+                def _trigger_wt(worker, path=weights_path):
+                  worker.start_weight_update()
+                  try:
+                    worker.update_weights({"target_weights_path": path})
+                  finally:
+                    worker.finish_weight_update()
+
+                res = await engine.collective_rpc(_trigger_wt)
+                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
               else:
-                print(f"[vLLM Worker] Reloading weights from {weights_path} in-place...")
-                await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+                res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                print(f"[vLLM Worker] Full weights reloaded from {weights_path} in-place.")
               print("[vLLM Worker] Waking up KV cache...")
               await engine.wake_up(tags=["kv_cache"])
               IS_ENGINE_SLEEPING = False
@@ -297,69 +286,6 @@ async def process_sampling_request(req: dict, store: Any) -> None:
       await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(exc)}"})
 
 
-async def weight_prefetcher_loop(model_id: str, store: Any) -> None:
-  global engine
-  global CURRENT_LOADED_SAMPLER_WEIGHTS
-  global IS_ENGINE_SLEEPING
-
-  try:
-    if not hasattr(store, "redis"):
-      return
-
-    redis_url = os.getenv("REDIS_URL")
-    if not redis_url:
-      return
-    client = redis.from_url(redis_url, decode_responses=True, socket_timeout=None, socket_connect_timeout=None)
-    pubsub = client.pubsub()
-    channel_key = f"open_rl:weight_update:{model_id}"
-    await pubsub.subscribe(channel_key)
-    print(f"[vLLM Worker] Weight prefetcher listening on channel: {channel_key}...")
-
-    while True:
-      try:
-        async for message in pubsub.listen():
-          if message["type"] != "message":
-            continue
-          try:
-            data = json.loads(message["data"])
-            target_path = data.get("weights_path")
-            if target_path and target_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
-              print(f"[vLLM Worker] Prefetch signal received. Target weights path: {target_path}")
-              async with reload_lock:
-                if target_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
-                  print("[vLLM Worker] Prefetching delta weights to CPU cache in background...")
-                  t0 = asyncio.get_event_loop().time()
-                  await engine.collective_rpc("cache_prefetch_weights", kwargs={"weights_path": target_path})
-                  dt = (asyncio.get_event_loop().time() - t0) * 1000.0
-                  print(f"[vLLM Worker] Background weights prefetch to CPU cache completed in {dt:.2f} ms!")
-          except Exception as e:
-            print(f"[vLLM Worker] Error in prefetch message processing: {e}")
-            traceback.print_exc()
-      except redis.exceptions.TimeoutError:
-        continue
-      except Exception as e:
-        print(f"[vLLM Worker] Pub/Sub connection error: {e}. Retrying subscription...")
-        await asyncio.sleep(2)
-        try:
-          await pubsub.subscribe(channel_key)
-        except Exception:
-          pass
-  except Exception as e:
-    print(f"[vLLM Worker] CRITICAL: Weight prefetcher loop crashed: {e}")
-    traceback.print_exc()
-  except asyncio.CancelledError:
-    print("[vLLM Worker] Weight prefetcher loop cancelled.")
-  finally:
-    try:
-      await pubsub.unsubscribe(channel_key)
-    except Exception:
-      pass
-    try:
-      await client.aclose()
-    except Exception:
-      pass
-
-
 async def run_sampling_worker(model_id: str) -> None:
   global engine
   global CURRENT_LOADED_SAMPLER_WEIGHTS
@@ -369,7 +295,6 @@ async def run_sampling_worker(model_id: str) -> None:
   store = get_store()
   snapshot_registered = False
   workload = None
-  prefetch_task = None
   if time_slicer is not None:
     workload = workload_from_env(os.getpid(), job_id=workload_job_id("sampler", model_id), group=SAMPLER_TIME_SLICE_GROUP)
 
@@ -398,11 +323,6 @@ async def run_sampling_worker(model_id: str) -> None:
   async def exit_gracefully() -> None:
     print(f"[vLLM Worker] Initiating immediate exit for model {model_id} sampler worker...")
     nonlocal snapshot_registered
-    if prefetch_task is not None:
-      try:
-        prefetch_task.cancel()
-      except Exception:
-        pass
     if snapshot_registered and time_slicer is not None:
       assert workload is not None
       try:
@@ -436,7 +356,6 @@ async def run_sampling_worker(model_id: str) -> None:
     await store.redis.expire(f"open_rl:sampler_ready:{model_id}", 3600)
 
   print(f"[vLLM Worker] Listening for sampling requests on queue for model: {model_id}...")
-  prefetch_task = asyncio.create_task(weight_prefetcher_loop(model_id, store))
   try:
     while True:
       try:

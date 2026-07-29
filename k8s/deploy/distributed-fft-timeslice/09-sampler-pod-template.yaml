@@ -28,8 +28,18 @@ data:
               key: BASE_MODEL
         - name: OPEN_RL_ENABLE_FFT
           value: "true"
+        - name: OPEN_RL_WEIGHT_SYNC_STRATEGY
+          value: "delta"
+        - name: OPEN_RL_WEIGHT_SYNC_DELTA_FORMAT
+          value: "vllm_fused"
+        - name: OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD
+          value: "patch_in_place"
         - name: VLLM_GPU_MEMORY_UTILIZATION
           value: "0.70"
+        - name: VLLM_SERVER_DEV_MODE
+          value: "1"
+        - name: VLLM_ALLOW_INSECURE_SERIALIZATION
+          value: "1"
         - name: OPEN_RL_TMP_DIR
           value: "/mnt/shared/open-rl"
         - name: HF_HOME

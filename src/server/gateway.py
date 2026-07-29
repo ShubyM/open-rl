@@ -8,7 +8,6 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
 from typing import Any
 
 import httpx
@@ -19,19 +18,9 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config
 from server.store import get_store
 from server.worker_manager import WorkerManager, create_fft_worker_manager
-
-
-@dataclass
-class TrainingModelMetadata:
-  base_model: str | None
-  created_at: float
-  training_kind: str
-  weight_sync_strategy: str | None = None
-  full_config: dict[str, Any] | None = None
-  lora_config: dict[str, Any] | None = None
-
 
 store = get_store()
 fft_worker_manager: WorkerManager | None = None
@@ -93,6 +82,23 @@ def sampler_weights_path(model_id: str, name: str) -> str:
   return f"tinker://{model_id}/sampler_weights/{name}"
 
 
+def resolve_sampler_weights_path(model_id: str) -> str:
+  """Resolves a model_id or tinker session reference to a fully-qualified step-specific weights path on disk."""
+  rel_path = model_id[len("tinker://") :] if model_id.startswith("tinker://") else model_id.lstrip("/")
+  local_path = os.path.join(TMP_DIR, "sampler_full", rel_path)
+  weights_path = local_path
+  if not os.path.basename(weights_path).startswith("sampler-"):
+    sampler_weights_dir = os.path.join(weights_path, "sampler_weights")
+    if os.path.exists(sampler_weights_dir):
+      try:
+        steps = [int(d.split("-")[1]) for d in os.listdir(sampler_weights_dir) if d.startswith("sampler-")]
+        if steps:
+          weights_path = os.path.join(sampler_weights_dir, f"sampler-{max(steps)}")
+      except Exception as e:
+        print(f"[GATEWAY] Warning: Failed parsing step subdirectories in {sampler_weights_dir}: {e}")
+  return weights_path
+
+
 def checkpoint_state_path(model_id: str, name: str) -> str:
   if os.path.isabs(name):
     return name
@@ -125,36 +131,42 @@ def is_sampler_weights_ref(model_id: str | None) -> bool:
 async def _extract_and_persist_model_metadata(
   req: dict[str, Any],
   request: Request | None = None,
-  default_training_kind: str = "full",
+  default_fine_tuning_type: str = "lora",
 ) -> str:
   """Extract and normalize model configuration from headers and payload, persisting TrainingModelMetadata exactly once."""
   base_model = req.get("base_model")
-  if not base_model and default_training_kind != "restored":
+  if not base_model and default_fine_tuning_type != "restored":
     raise ValueError("base_model is required in request payload")
 
   full_config = dict(req.get("full_config") or {})
   lora_config = dict(req.get("lora_config") or {})
 
-  weight_sync_strategy = None
-  training_kind = default_training_kind
-  if request and hasattr(request, "headers"):
-    weight_sync_strategy = request.headers.get("x-open-rl-weight-sync-strategy")
-    if "x-open-rl-training-kind" in request.headers:
-      training_kind = request.headers.get("x-open-rl-training-kind", default_training_kind)
+  headers = request.headers if (request and hasattr(request, "headers")) else {}
+  weight_sync_cfg = extract_weight_sync_config(headers)
 
-  if weight_sync_strategy in ("full", "delta"):
-    full_config["weight_sync_strategy"] = weight_sync_strategy
+  fine_tuning_type = default_fine_tuning_type
+  if request and hasattr(request, "headers") and "x-open-rl-fine-tuning-type" in request.headers:
+    h_val = (request.headers.get("x-open-rl-fine-tuning-type") or "").lower()
+    if h_val == "full":
+      fine_tuning_type = "full"
+    elif h_val == "lora":
+      fine_tuning_type = "lora"
+
+  if fine_tuning_type != "full" and default_fine_tuning_type != "restored":
+    fine_tuning_type = "lora"
+
+  full_config["weight_sync_strategy"] = weight_sync_cfg.strategy
 
   model_id = str(uuid.uuid4())
   meta_obj = TrainingModelMetadata(
     base_model=base_model,
     created_at=time.time(),
-    training_kind=training_kind,
-    weight_sync_strategy=weight_sync_strategy,
+    fine_tuning_type=fine_tuning_type,
+    weight_sync_config=weight_sync_cfg,
     full_config=full_config,
     lora_config=lora_config,
   )
-  await store.set_value(f"open_rl:model_meta:{model_id}", json.dumps(asdict(meta_obj)))
+  await store.set_value(f"open_rl:model_meta:{model_id}", json.dumps(meta_obj.to_dict()))
 
   return model_id
 
@@ -181,6 +193,7 @@ async def enqueue(request: dict) -> str:
   carrier: dict = {}
   propagate.inject(carrier)
   await store.set_future(request_id, {"status": "pending"})
+
   await store.put_request({**request, "trace_context": carrier})
   return request_id
 
@@ -245,7 +258,7 @@ def translate_future_result(result: dict) -> dict:
     }
     if "rank" in result:
       response["lora_rank"] = result["rank"]
-    elif result.get("training_kind") == "full":
+    elif result.get("fine_tuning_type") == "full":
       response["lora_rank"] = 16
     if result.get("base_model"):
       response["base_model"] = result["base_model"]
@@ -352,7 +365,7 @@ async def create_model(
 ) -> dict[str, Any]:
   """ServiceClient.create_lora_training_client_async()"""
   try:
-    model_id = await _extract_and_persist_model_metadata(req, request, default_training_kind="full")
+    model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="lora")
   except ValueError as exc:
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
@@ -375,7 +388,8 @@ async def delete_model(req: dict):
     print(f"[GATEWAY] Requesting shutdown of workers for model {model_id}...")
     await store.put_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
-  await store.delete_values(f"open_rl:model_meta:{model_id}")
+  now = time.time()
+  await store.update_job_metadata(model_id, {"status": "completed", "completed_at": now, "updated_at": now})
   return {"status": "ok"}
 
 
@@ -391,7 +405,7 @@ async def create_model_from_state(
   # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
   resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   try:
-    model_id = await _extract_and_persist_model_metadata(req, request, default_training_kind="restored")
+    model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="restored")
   except ValueError as exc:
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
@@ -662,16 +676,24 @@ async def asample(req: dict):
   propagate.inject(carrier)
   await store.set_future(req_id, {"status": "pending"})
 
-  if is_fft_enabled():
-    rel_path = model_id[len("tinker://") :] if model_id.startswith("tinker://") else model_id.lstrip("/")
-    local_path = os.path.join(TMP_DIR, "sampler_full", rel_path)
-    weights_path = local_path
-    lora_id = None
-    lora_path = None
-  else:
+  model_meta = await store.get_model_metadata(base_model_id or model_id)
+  fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
+
+  if fine_tuning_type == "lora":
     weights_path = None
     lora_id = model_id
-    lora_path = os.path.join(TMP_DIR, "peft", base_model_id, base_model_id) if is_sampler_weights_ref(model_id) else None
+    peft_dir = os.path.join(TMP_DIR, "peft", base_model_id or model_id, base_model_id or model_id)
+    lora_path = peft_dir if os.path.exists(peft_dir) else None
+  else:
+    resolved_path = resolve_sampler_weights_path(model_id) if is_sampler_weights_ref(model_id) or is_fft_enabled() else None
+    if resolved_path and os.path.exists(os.path.join(resolved_path, "adapter_config.json")):
+      weights_path = None
+      lora_id = model_id
+      lora_path = resolved_path
+    else:
+      weights_path = resolved_path
+      lora_id = None
+      lora_path = None
 
   sampling_req = {
     "request_id": req_id,
