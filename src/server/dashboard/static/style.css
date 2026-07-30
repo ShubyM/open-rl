@@ -341,6 +341,7 @@ main { flex: 1; min-height: 0; display: flex; }
 #duty-chart { display: block; }
 #duty-chart * { pointer-events: none; }
 .grid-line { stroke: var(--border); }
+.capacity-line { stroke: var(--border-strong); stroke-dasharray: 3 3; }
 .axis-label { fill: var(--faint); font: 10px var(--mono); }
 .chart-band { fill-opacity: 0.78; stroke: var(--surface); stroke-width: 1; }
 .chart-end { fill: var(--fg); }

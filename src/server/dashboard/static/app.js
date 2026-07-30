@@ -38,12 +38,20 @@ function setClass(el, cls) {
 }
 
 // Keyed child reconciliation: create/update/reorder/remove without rebuilding untouched nodes.
+// Duplicate keys get a deterministic suffix so repeated items reconcile instead of leaking.
 function sync(parent, items, keyOf, create, update) {
   const existing = new Map();
-  for (const el of [...parent.children]) if (el.dataset.key) existing.set(el.dataset.key, el);
+  for (const child of [...parent.children]) {
+    if (!child.dataset.key) continue;
+    if (existing.has(child.dataset.key)) child.remove();
+    else existing.set(child.dataset.key, child);
+  }
+  const claimed = new Set();
   let prev = null;
   for (const item of items) {
-    const key = String(keyOf(item));
+    let key = String(keyOf(item));
+    while (claimed.has(key)) key += "#";
+    claimed.add(key);
     let el = existing.get(key);
     if (el) {
       existing.delete(key);
@@ -124,9 +132,9 @@ const canvas = $("canvas");
 const world = $("world");
 
 function applyTransform() {
+  // Edges live inside the transformed world, so panning/zooming never needs a redraw.
   world.style.transform = `translate(${S.canvas.x}px, ${S.canvas.y}px) scale(${S.canvas.k})`;
   sessionStorage.setItem("canvas", JSON.stringify(S.canvas));
-  requestAnimationFrame(drawEdges);
 }
 applyTransform();
 
@@ -244,7 +252,7 @@ function sampleTotal(claims) {
 
 function dutyReadout(duty, sample) {
   const [at, claims] = sample || duty.series[duty.series.length - 1];
-  const total = Math.min(sampleTotal(claims), duty.capacity);
+  const total = sampleTotal(claims);
   return `${Math.round((total / duty.capacity) * 100)}% · ${total}/${duty.capacity} GPU · ${sample ? timeLabel(at) : "now"}`;
 }
 
@@ -273,28 +281,13 @@ function renderDutyChart(duty) {
   const series = duty.series;
   const start = series[0][0];
   const span = Math.max(1, series[series.length - 1][0] - start);
-  const x = (t) => CHART_MARGIN.left + ((t - start) / span) * (width - CHART_MARGIN.left - CHART_MARGIN.right);
-  const y = (v) => CHART_MARGIN.top + (1 - Math.min(1, v)) * (CHART_H - CHART_MARGIN.top - CHART_MARGIN.bottom);
-  chartGeometry = { x, y, duty, start, span };
-
-  const parts = [];
-  for (const v of [0, 0.25, 0.5, 0.75, 1]) {
-    parts.push(`<line class="grid-line" x1="${x(start)}" y1="${y(v)}" x2="${x(start + span)}" y2="${y(v)}"></line>`);
-  }
-  for (const v of [0, 0.5, 1]) {
-    parts.push(`<text class="axis-label" x="${CHART_MARGIN.left - 8}" y="${y(v) + 3}" text-anchor="end">${v * 100}%</text>`);
-  }
-  const ticks = Math.min(4, series.length);
-  for (let i = 0; i < ticks; i++) {
-    const t = start + (span * i) / Math.max(1, ticks - 1);
-    const anchor = i === 0 ? "start" : i === ticks - 1 ? "end" : "middle";
-    parts.push(`<text class="axis-label" x="${x(t)}" y="${CHART_H - 6}" text-anchor="${anchor}">${timeLabel(t)}</text>`);
-  }
 
   // Stack the jobs bottom-up in first-appearance order; each band is a step area whose
-  // bottom edge is the top of the band below it.
+  // bottom edge is the top of the band below it. Time-sliced pools can be overcommitted
+  // (claims beyond capacity), so the y-domain grows past 100% instead of clipping.
   const times = series.map((sample) => sample[0]);
   const stacks = duty.jobs.map(() => ({ lower: [], upper: [] }));
+  let yMax = 1;
   for (const [, claims] of series) {
     let cumulative = 0;
     duty.jobs.forEach((job, j) => {
@@ -302,6 +295,29 @@ function renderDutyChart(duty) {
       cumulative += (claims[job] || 0) / duty.capacity;
       stacks[j].upper.push(cumulative);
     });
+    yMax = Math.max(yMax, cumulative);
+  }
+
+  const x = (t) => CHART_MARGIN.left + ((t - start) / span) * (width - CHART_MARGIN.left - CHART_MARGIN.right);
+  const y = (v) => CHART_MARGIN.top + (1 - v / yMax) * (CHART_H - CHART_MARGIN.top - CHART_MARGIN.bottom);
+  chartGeometry = { x, y, duty, start, span };
+
+  const parts = [];
+  for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+    const capacity = v === 1 && yMax > 1;
+    parts.push(`<line class="${capacity ? "capacity-line" : "grid-line"}" x1="${x(start)}" y1="${y(v)}" x2="${x(start + span)}" y2="${y(v)}"></line>`);
+  }
+  for (const v of [0, 0.5, 1]) {
+    parts.push(`<text class="axis-label" x="${CHART_MARGIN.left - 8}" y="${y(v) + 3}" text-anchor="end">${v * 100}%</text>`);
+  }
+  if (yMax > 1) {
+    parts.push(`<text class="axis-label" x="${CHART_MARGIN.left - 8}" y="${y(yMax) + 3}" text-anchor="end">${Math.round(yMax * 100)}%</text>`);
+  }
+  const ticks = Math.min(4, series.length);
+  for (let i = 0; i < ticks; i++) {
+    const t = start + (span * i) / Math.max(1, ticks - 1);
+    const anchor = i === 0 ? "start" : i === ticks - 1 ? "end" : "middle";
+    parts.push(`<text class="axis-label" x="${x(t)}" y="${CHART_H - 6}" text-anchor="${anchor}">${timeLabel(t)}</text>`);
   }
   duty.jobs.forEach((job, j) => {
     const { lower, upper } = stacks[j];
@@ -312,7 +328,7 @@ function renderDutyChart(duty) {
     for (let i = n - 2; i >= 0; i--) d += ` V ${y(lower[i]).toFixed(1)} H ${x(times[i]).toFixed(1)}`;
     parts.push(`<path class="chart-band" fill="${jobColor(job)}" d="${d} Z"></path>`);
   });
-  const lastTotal = Math.min(1, sampleTotal(series[series.length - 1][1]) / duty.capacity);
+  const lastTotal = sampleTotal(series[series.length - 1][1]) / duty.capacity;
   parts.push(`<circle class="chart-end" r="2.5" cx="${x(times[times.length - 1]).toFixed(1)}" cy="${y(lastTotal).toFixed(1)}"></circle>`);
   parts.push('<line class="cross-line" visibility="hidden"></line><circle class="cross-dot" r="3" visibility="hidden"></circle>');
   svg.innerHTML = parts.join("");
@@ -877,7 +893,8 @@ async function refresh() {
     renderHealth(S.health, S.problems);
     const demo = [S.cluster, S.runs, S.health].some((d) => d?.demo);
     $("demo-banner").hidden = !demo;
-    setText($("updated-at"), `updated ${new Date().toLocaleTimeString()}`);
+    const anyOk = [cluster, runs, health, problems].some((r) => r.status === "fulfilled");
+    setText($("updated-at"), anyOk ? `updated ${new Date().toLocaleTimeString()}` : "gateway unreachable");
   } finally {
     refreshing = false;
   }

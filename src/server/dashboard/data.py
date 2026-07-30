@@ -243,7 +243,9 @@ class DutyTracker:
       for job in claims:
         if job not in jobs:
           jobs.append(job)
-    current = min(sum(series[-1][1].values()), capacity) / capacity if series else 0.0
+    # Deliberately unclamped: time-sliced pools can be overcommitted, and current > 1 is the
+    # honest way to report that.
+    current = sum(series[-1][1].values()) / capacity if series else 0.0
     return {"capacity": capacity, "current": round(current, 4), "jobs": jobs, "series": series}
 
 
@@ -328,6 +330,7 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
     pools["unscheduled"] = {
       "id": "unscheduled",
       "label": "not scheduled",
+      "duty": None,
       "nodes": [{"name": "—", "ready": None, "instance_type": None, "gpu_capacity": 0, "gpu_allocatable": 0, "pods": unplaced}],
     }
 
@@ -415,10 +418,12 @@ def sanitize_job_id(model_id: str) -> str:
 
 
 def model_pods(model_id: str, pods: list[dict]) -> list[dict]:
-  """Pods launched for this model, matched on the timeslice job-id labels the k8s worker
-  manager stamps (label values may be hash-truncated, so prefix-match)."""
-  prefixes = tuple(f"{role}-{sanitize_job_id(model_id)}"[:47] for role in ("trainer", "sampler"))
-  return [p for p in pods if (p.get("labels") or {}).get("timeslice.io/job-id", "").startswith(prefixes)]
+  """Pods launched for this model, matched exactly on the timeslice job-id labels the k8s
+  worker manager stamps. Exact match only: prefix matching would cross-match runs that share
+  an id prefix, and stop_run deletes what this returns. (Branches whose sanitize_job_id
+  hash-truncates long ids should swap that helper in here.)"""
+  wanted = {f"{role}-{sanitize_job_id(model_id)}" for role in ("trainer", "sampler")}
+  return [p for p in pods if (p.get("labels") or {}).get("timeslice.io/job-id") in wanted]
 
 
 async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | None, pods: list[dict]) -> dict:
@@ -451,7 +456,7 @@ async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | 
         "pods": [p["name"] for p in run_pods],
       }
     )
-  runs.sort(key=lambda r: (r["created_at"] is None, r["created_at"] or "", r["run_id"]), reverse=True)
+  runs.sort(key=lambda r: (r["created_at"] is not None, r["created_at"] or "", r["run_id"]), reverse=True)
   return {"demo": False, "runs": runs}
 
 

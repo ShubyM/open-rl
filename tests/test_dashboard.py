@@ -154,6 +154,35 @@ class DashboardEndpointsTest(unittest.TestCase):
     ]
     matched = {p["name"] for p in data.model_pods("abc_123", pods)}
     self.assertEqual(matched, {"open-rl-trainer-x", "open-rl-sampler-x"})
+    self.assertEqual(data.model_pods("abc", pods), [], "a run must never match another run's prefix-sharing pods")
+
+  def test_duty_reports_overcommit_honestly(self) -> None:
+    tracker = data.DutyTracker()
+    pools = [{"id": "shared", "nodes": [{"name": "n1", "gpu_capacity": 1}]}]
+    pods = [
+      {"node": "n1", "phase": "Running", "gpus": 1, "labels": {"timeslice.io/job-id": "trainer-run-a"}},
+      {"node": "n1", "phase": "Running", "gpus": 1, "labels": {"timeslice.io/job-id": "sampler-run-b"}},
+    ]
+    tracker.record(pools, pods, now=100.0)
+    duty = tracker.duty(pools[0])
+    self.assertEqual(duty["current"], 2.0, "time-sliced overcommit must not be clamped to 100%")
+
+  def test_runs_with_unknown_created_at_sort_last(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    old_tmp_dir = os.environ.get("OPEN_RL_TMP_DIR")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      os.environ["OPEN_RL_TMP_DIR"] = tmp_dir
+      self.addCleanup(lambda: os.environ.update({"OPEN_RL_TMP_DIR": old_tmp_dir}) if old_tmp_dir else os.environ.pop("OPEN_RL_TMP_DIR", None))
+      os.makedirs(os.path.join(tmp_dir, "checkpoints", "run-with-date"))
+
+      store = InMemoryStore()
+      asyncio.run(store.put_request({"model_id": "run-no-date", "op": "forward_backward"}))
+      snapshot = asyncio.run(data.runs_snapshot(store, None, pods=[]))
+      order = [run["run_id"] for run in snapshot["runs"]]
+      self.assertEqual(order, ["run-with-date", "run-no-date"], "runs without created_at belong at the end")
 
 
 if __name__ == "__main__":
