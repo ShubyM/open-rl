@@ -11,9 +11,9 @@ from pathlib import Path
 import chz
 import tinker
 from env import LabDatasetBuilder
-from tasks import BOOTSTRAP_TASKS, EVAL_TASKS, random_task_split
-from tinker_cookbook import checkpoint_utils
+from tasks import BOOTSTRAP_TASKS, EVAL_TASKS, family_task_split, random_task_split
 from tinker.lib.public_interfaces import training_client as tinker_training_client
+from tinker_cookbook import checkpoint_utils
 
 # 5MB chunks put one long-context datum per request, collapsing DP sharding
 # to rank 0. ~30MB carries several datums so ranks get real shards, while
@@ -29,10 +29,15 @@ from tinker_utils import force_rich_log_colors, resolve_base_url
 
 MODEL_NAME = "google/gemma-4-E4B-it"
 COMMAND_TIMEOUT = 60
+
+
 def default_judge_parallel(judge_model: str) -> int:
   # Self-hosted GLM absorbs concurrent grading; Gemini rate limits force 1.
   return 16 if "glm" in judge_model else 1
+
+
 NUM_GROUPS_TO_LOG = 1
+
 
 def print_group_summary(traj_group, tokenizer) -> None:
   rewards = traj_group.get_total_rewards()
@@ -166,11 +171,11 @@ def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
   elif config.task_set == "bootstrap":
     train_names, eval_names = list(BOOTSTRAP_TASKS), list(EVAL_TASKS)
   elif config.task_set == "random":
-    train_names, eval_names = random_task_split(
-      config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed
-    )
+    train_names, eval_names = random_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
+  elif config.task_set == "family":
+    train_names, eval_names = family_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
   else:
-    raise ValueError(f"Unknown task_set {config.task_set!r} (use 'random' or 'bootstrap').")
+    raise ValueError(f"Unknown task_set {config.task_set!r} (use 'random', 'family', or 'bootstrap').")
   return LabDatasetBuilder(
     lab_root=config.lab_root,
     task_names=train_names,
@@ -195,9 +200,7 @@ def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
 async def run_final_eval(train_config: rl_train.Config) -> None:
   record = checkpoint_utils.get_last_checkpoint(train_config.log_path, required_key="sampler_path")
   if record is None:
-    raise RuntimeError(
-      f"No sampler checkpoint in {train_config.log_path}/checkpoints.jsonl; cannot run the final eval."
-    )
+    raise RuntimeError(f"No sampler checkpoint in {train_config.log_path}/checkpoints.jsonl; cannot run the final eval.")
   _, test_dataset = await train_config.dataset_builder()
   if test_dataset is None:
     return
@@ -206,19 +209,14 @@ async def run_final_eval(train_config: rl_train.Config) -> None:
   sampling_client = service_client.create_sampling_client(model_path=record.sampler_path)
   evaluator = RLTestSetEvaluator(test_dataset, max_tokens=train_config.max_tokens)
   store = TrainingRunStore(LocalStorage(Path(train_config.log_path)))
-  metrics = await rl_train.run_single_evaluation(
-    evaluator, train_config, batch, sampling_client, "test", store=store
-  )
+  metrics = await rl_train.run_single_evaluation(evaluator, train_config, batch, sampling_client, "test", store=store)
   with open(Path(train_config.log_path) / "metrics.jsonl", "a", encoding="utf-8") as f:
     f.write(json.dumps({"progress/batch": batch, **metrics}) + "\n")
   passed = metrics.get("test/env/harvey-labs/lab/criteria_passed")
   total = metrics.get("test/env/harvey-labs/lab/criteria_total")
   episodes = metrics.get("test/env/harvey-labs/total_episodes")
   if passed is not None and total and episodes:
-    rl_train.logger.info(
-      f"Final eval after {batch} steps: pooled criteria "
-      f"{passed * episodes:.0f}/{total * episodes:.0f} ({passed / total:.1%})"
-    )
+    rl_train.logger.info(f"Final eval after {batch} steps: pooled criteria {passed * episodes:.0f}/{total * episodes:.0f} ({passed / total:.1%})")
 
 
 async def run(config: RunConfig) -> None:

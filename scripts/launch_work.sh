@@ -133,7 +133,7 @@ case "$MODEL" in
     # criteria cut eval noise to ~±1%, so small gains are detectable.
     MODEL_NAME=Qwen/Qwen3.5-9B
     CONTEXT=131072
-    GEN_TOKENS=${GEN_TOKENS:-16384}
+    GEN_TOKENS=${GEN_TOKENS:-32768}
     TASK_SET=${TASK_SET:-random}
     BATCH_SIZE=${BATCH_SIZE:-8}
     ROLLOUTS=${ROLLOUTS:-6}
@@ -154,6 +154,7 @@ case "$MODEL" in
     exit 1
     ;;
 esac
+TOOL_TOKENS=${TOOL_TOKENS:-16384}
 BATCH_SIZE=${BATCH_SIZE:-5}
 ROLLOUTS=${ROLLOUTS:-2}
 echo "[work] MODEL=$MODEL -> $MODEL_NAME, context $CONTEXT, batch ${BATCH_SIZE}x${ROLLOUTS}, log $RUN_LABEL"
@@ -237,13 +238,13 @@ model_name=$MODEL_NAME renderer_name=qwen3_5 base_url=http://127.0.0.1:9003 \
 learning_rate=2e-4 lora_rank=32 \
 batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=20 eval_every=5 \
 task_set=$TASK_SET judge_model=$JUDGE_MODEL \
-max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$GEN_TOKENS \
+max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TOOL_TOKENS \
 log_path=artifacts/harvey-labs/$RUN_LABEL"
 
 EVAL_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
 checkpoint=/tmp/open-rl/peft/CHANGE-ME/final model_name=$MODEL_NAME renderer_name=qwen3_5 \
 base_url=http://127.0.0.1:9003 task_set=$TASK_SET judge_model=$JUDGE_MODEL \
-max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$GEN_TOKENS"
+max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TOOL_TOKENS"
 
 # set-option needs a running tmux server, so the session must exist first.
 tmux new-session -d -s "$SESSION" -n sampler -c "$REPO"
