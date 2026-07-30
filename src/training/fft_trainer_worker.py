@@ -1,23 +1,88 @@
 # Full fine-tuning trainer worker lifecycle.
 
+import gc
 import json
 import math
 import os
+import shutil
 import time
+from contextlib import nullcontext
 from datetime import datetime
+from functools import partial
 from typing import Any
 
 import torch
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+from transformers import AutoTokenizer, PreTrainedModel
 
-from training.trainer_worker import BaseTrainerWorker, Datum
+from training.distributed import barrier, fsdp_group, is_distributed, is_primary
+from training.model_loading import load_text_causal_lm
+from training.trainer_worker import (
+  BaseTrainerWorker,
+  Datum,
+  activation_offload_context,
+  attention_forward_kwargs,
+  project_target_logprobs,
+)
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
 
 
+def configure_fft_attention(attention_backend: str) -> None:
+  if attention_backend == "sdpa" and torch.cuda.is_available() and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
+    # Gradient checkpointing recomputes attention during backward, outside the
+    # original forward context. Disable the quadratic math backend process-wide
+    # so recomputation cannot silently materialize [batch, heads, seq, seq].
+    torch.backends.cuda.enable_math_sdp(False)
+
+
 class FFTConfig(BaseModel):
   seed: int | None = None
+  cpu_offload: bool = True
+
+
+class FSDPTargetLogprobModel(torch.nn.Module):
+  """FSDP root whose forward avoids materializing [batch, sequence, vocabulary]."""
+
+  def __init__(self, causal_lm: PreTrainedModel):
+    super().__init__()
+    self.causal_lm = causal_lm
+
+  def forward(
+    self,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    target_token_ids: torch.Tensor,
+  ) -> torch.Tensor:
+    model = self.causal_lm
+    backbone = getattr(model, "model", None) or getattr(model, "transformer", None)
+    if backbone is None:
+      raise RuntimeError(f"FSDP fused logprobs cannot resolve the backbone for {type(model).__name__}")
+
+    backbone_mask = None if bool(attention_mask.all()) else attention_mask
+    attention_context = nullcontext()
+    if input_ids.is_cuda and os.getenv("OPEN_RL_SDPA_NO_MATH", "1") == "1":
+      from torch.nn.attention import SDPBackend, sdpa_kernel
+
+      attention_context = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+    # activation_offload_context streams saved activations to pinned host RAM
+    # (OPEN_RL_ACTIVATION_CPU_OFFLOAD) - activations are per-rank and unsharded
+    # under FSDP, so long-context runs need it exactly like single-GPU ones.
+    with activation_offload_context(input_ids), attention_context:
+      # attention_forward_kwargs supplies the low-resource FlexAttention tiles
+      # for wide heads (Gemma's 512-dim global heads): the default tiles need
+      # 256KB of shared memory per block and sm_90 tops out at 227KB.
+      outputs = backbone(
+        input_ids=input_ids,
+        attention_mask=backbone_mask,
+        use_cache=False,
+        return_dict=True,
+        **attention_forward_kwargs(model.config),
+      )
+
+    seq_len = target_token_ids.shape[1]
+    hidden = outputs.last_hidden_state[:, :seq_len, :]
+    return project_target_logprobs(model, hidden, target_token_ids)
 
 
 def trainable_model_parameters(model: PreTrainedModel) -> list[torch.nn.Parameter]:
@@ -30,10 +95,13 @@ def trainable_model_parameters(model: PreTrainedModel) -> list[torch.nn.Paramete
 class FFTTrainingWorker(BaseTrainerWorker):
   def __init__(self):
     super().__init__()
-    self.model: PreTrainedModel | None = None
+    self.model: torch.nn.Module | None = None
     self.base_model_name: str | None = None
     self.trainable_params: list[torch.nn.Parameter] = []
     self.optimizer: torch.optim.Optimizer | None = None
+    self.fsdp_enabled = False
+    self.cpu_offload: bool = True
+    self._is_offloaded: bool = False
 
   def load_base_model(self, base_model_name: str) -> None:
     """Load one full model for one fine-tuning job process."""
@@ -41,16 +109,58 @@ class FFTTrainingWorker(BaseTrainerWorker):
       print(f"Full fine-tuning model {base_model_name} already loaded.")
       return
 
-    print(f"Loading full fine-tuning model {base_model_name} to {self.device}...")
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    mode = f"FSDP rank {os.getenv('RANK', '0')}/{os.getenv('WORLD_SIZE', '1')}" if is_distributed() else str(self.device)
+    print(f"Loading full fine-tuning model {base_model_name} ({mode}, visible GPUs: {num_gpus})...")
     self.base_model_name = base_model_name
     self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
-    self.model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
+    load_kwargs: dict[str, Any] = {"dtype": dtype}
+    if attention_backend := os.getenv("OPEN_RL_ATTN_IMPLEMENTATION"):
+      load_kwargs["attn_implementation"] = attention_backend
+    if not is_distributed() and num_gpus > 1:
+      load_kwargs["device_map"] = "auto"
+    causal_lm = load_text_causal_lm(base_model_name, **load_kwargs)
+    configure_fft_attention(causal_lm.config.get_text_config()._attn_implementation)
+    if ENABLE_GRADIENT_CHECKPOINTING:
+      causal_lm.gradient_checkpointing_enable()
+      causal_lm.enable_input_require_grads()
+
+    if is_distributed():
+      from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+      from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+      from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+      decoder_classes = {type(module) for module in causal_lm.modules() if type(module).__name__.endswith("DecoderLayer")}
+      if not decoder_classes:
+        raise RuntimeError(f"Could not identify decoder layers for FSDP wrapping in {type(causal_lm).__name__}")
+      wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls=decoder_classes)
+      mixed_precision = MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
+      self.model = FSDP(
+        FSDPTargetLogprobModel(causal_lm),
+        process_group=fsdp_group(),
+        auto_wrap_policy=wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        mixed_precision=mixed_precision,
+        device_id=self.device,
+        use_orig_params=True,
+        limit_all_gathers=True,
+      )
+      self.fsdp_enabled = True
+      self.cpu_offload = False
+      print(f"FSDP FULL_SHARD enabled across {os.getenv('WORLD_SIZE')} ranks; decoder classes: {[c.__name__ for c in decoder_classes]}")
+    elif num_gpus > 1:
+      self.model = causal_lm  # device_map="auto" already placed the layers
+    else:
+      self.model = causal_lm.to(self.device)
+    print(f"Full fine-tuning attention backend: {causal_lm.config.get_text_config()._attn_implementation}")
     print("Successfully loaded full fine-tuning model.")
 
   def create_model(self, base_model_name: str, model_id: str | None = None, config: FFTConfig | None = None) -> None:
     """Load the per-job model if needed, then prepare it for full fine-tuning."""
+    if config is not None:
+      self.cpu_offload = config.cpu_offload
     self.load_base_model(base_model_name)
     if config is not None and config.seed is not None:
       torch.manual_seed(config.seed)
@@ -63,28 +173,76 @@ class FFTTrainingWorker(BaseTrainerWorker):
       param.requires_grad_(True)
     self.trainable_params = trainable_model_parameters(self.model)
 
-    if ENABLE_GRADIENT_CHECKPOINTING:
-      try:
-        self.model.gradient_checkpointing_enable()
-        self.model.enable_input_require_grads()
-        print("Gradient checkpointing and input require grads enabled on full fine-tuning model.")
-      except Exception as e:
-        print(f"Failed to enable gradient checkpointing: {e}")
-
     self.model.train()
 
-  def save_model(self, alias: str | None = None) -> dict[str, Any]:
-    assert self.model is not None, "Model must be loaded first."
+  def causal_model(self) -> PreTrainedModel:
+    assert self.model is not None
+    if self.fsdp_enabled:
+      return self.model.module.causal_lm
+    return self.model
 
+  def full_model_state_dict(self) -> dict[str, torch.Tensor]:
+    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    assert self.fsdp_enabled
+    config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, config):
+      wrapped_state = self.model.state_dict()
+    if not is_primary():
+      return {}
+    prefix = "causal_lm."
+    return {key[len(prefix) :] if key.startswith(prefix) else key: value for key, value in wrapped_state.items()}
+
+  def optimizer_state_dict(self) -> dict[str, Any]:
+    assert self.optimizer is not None
+    if not self.fsdp_enabled:
+      return self.optimizer.state_dict()
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    assert self.model is not None
+    return FSDP.full_optim_state_dict(self.model, self.optimizer, rank0_only=True)
+
+  def write_pretrained(self, save_path: str) -> None:
+    state_dict = self.full_model_state_dict() if self.fsdp_enabled else None
+    if is_primary():
+      self.causal_model().save_pretrained(save_path, state_dict=state_dict)
+      if self.tokenizer is not None:
+        self.tokenizer.save_pretrained(save_path)
+    barrier()
+
+  def save_checkpoint(self, path: str, metadata: dict[str, Any], include_optimizer: bool = False) -> dict[str, Any]:
+    assert self.model is not None, "Model must be loaded first."
+    # Stage into a sibling directory and swap it in with atomic renames: a save
+    # killed mid-write (OOM) must never leave a half-overwritten checkpoint
+    # that vLLM or a resumed trainer can load as a mix of old and new shards.
+    staging_path = f"{path}.staging-{os.getpid()}"
+    previous_path = f"{path}.previous-{os.getpid()}"
+    if is_primary():
+      shutil.rmtree(staging_path, ignore_errors=True)
+      os.makedirs(staging_path, exist_ok=True)
+    barrier()
+    self.write_pretrained(staging_path)
+    if include_optimizer and self.optimizer is not None:
+      optimizer_state = self.optimizer_state_dict()
+      if is_primary():
+        torch.save(optimizer_state, os.path.join(staging_path, "optimizer.pt"))
+    if is_primary():
+      with open(os.path.join(staging_path, "metadata.json"), "w") as f:
+        json.dump(metadata, f)
+      shutil.rmtree(previous_path, ignore_errors=True)
+      if os.path.exists(path):
+        os.rename(path, previous_path)
+      os.rename(staging_path, path)
+      shutil.rmtree(previous_path, ignore_errors=True)
+    barrier()
+    print(f"Saved full fine-tuning state to {path}")
+    return {"path": path}
+
+  def save_model(self, alias: str | None = None) -> dict[str, Any]:
     tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
     name = alias or "fft-model"
     save_path = name if os.path.isabs(name) else os.path.join(tmp_dir, "fft", name)
-    os.makedirs(save_path, exist_ok=True)
-
-    self.model.save_pretrained(save_path)
-    if self.tokenizer is not None:
-      self.tokenizer.save_pretrained(save_path)
-
     metadata = {
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
@@ -92,23 +250,9 @@ class FFTTrainingWorker(BaseTrainerWorker):
       "model_id": alias,
       "timestamp": time.time(),
     }
-    with open(os.path.join(save_path, "metadata.json"), "w") as f:
-      json.dump(metadata, f)
-
-    print(f"Saved full fine-tuning model to {save_path}")
-    return {"path": save_path}
+    return self.save_checkpoint(save_path, metadata)
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
-    assert self.model is not None, "Model must be loaded first."
-
-    os.makedirs(state_path, exist_ok=True)
-    self.model.save_pretrained(state_path)
-    if self.tokenizer is not None:
-      self.tokenizer.save_pretrained(state_path)
-
-    if include_optimizer and self.optimizer is not None:
-      torch.save(self.optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
-
     metadata = {
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
@@ -117,11 +261,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       "model_id": model_id,
       "timestamp": time.time(),
     }
-    with open(os.path.join(state_path, "metadata.json"), "w") as f:
-      json.dump(metadata, f)
-
-    print(f"Saved full fine-tuning state to {state_path}")
-    return {"path": state_path}
+    return self.save_checkpoint(state_path, metadata, include_optimizer)
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
     metadata_path = os.path.join(state_path, "metadata.json")
@@ -135,30 +275,67 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if not base_model:
       raise ValueError(f"metadata.json at {state_path} missing base_model")
 
+    self.load_base_model(state_path)
     self.base_model_name = base_model
-    self.tokenizer = AutoTokenizer.from_pretrained(state_path)
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-    self.model = AutoModelForCausalLM.from_pretrained(state_path, dtype=dtype, device_map=self.device)
     self.prepare_model_for_training()
 
     if restore_optimizer and metadata.get("has_optimizer"):
       optimizer_path = os.path.join(state_path, "optimizer.pt")
       if os.path.exists(optimizer_path):
-        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=1e-4)
-        self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
+        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=1e-4, foreach=False)
+        full_optimizer_state = torch.load(optimizer_path, map_location="cpu") if is_primary() else None
+        if self.fsdp_enabled:
+          from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+          sharded_state = FSDP.scatter_full_optim_state_dict(
+            full_optimizer_state,
+            self.model,
+            optim=self.optimizer,
+          )
+          self.optimizer.load_state_dict(sharded_state)
+        else:
+          self.optimizer.load_state_dict(full_optimizer_state)
         print(f"Restored optimizer state from {optimizer_path}")
 
     print(f"Loaded full fine-tuning state from {state_path}")
     return {"model_id": model_id, "base_model": base_model}
 
-  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
+  def forward_backward(
+    self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
+  ) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
-    return super().forward_backward(self.model, data, loss_fn, loss_config)
+    res = super().forward_backward(self.model, data, loss_fn, loss_config, forward_only=forward_only)
+    if torch.cuda.is_available():
+      torch.cuda.empty_cache()
+    return res
+
+  def compute_target_logprobs(
+    self,
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    target_token_ids: torch.Tensor,
+  ) -> torch.Tensor:
+    if self.fsdp_enabled:
+      return model(input_ids, attention_mask, target_token_ids)
+    return super().compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
+    if torch.cuda.is_available():
+      torch.cuda.empty_cache()
     if not self.trainable_params:
       self.trainable_params = trainable_model_parameters(self.model)
+
+    # ZeRO-Offload-style step: params and grads move to the host so the AdamW
+    # moments never occupy GPU memory. Frees 2x model size of VRAM for
+    # activations at the cost of PCIe traffic (~30s/step for a 9B model).
+    cpu_step = os.getenv("OPEN_RL_OPTIM_CPU_STEP", "0") == "1" and not self.fsdp_enabled
+    if cpu_step:
+      self.model.to("cpu")
+      self.move_optimizer_state("cpu")
+      if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if self.optimizer is None:
       lr = adam_params.get("learning_rate", 1e-4)
@@ -174,6 +351,10 @@ class FFTTrainingWorker(BaseTrainerWorker):
         betas=(beta1, beta2),
         eps=eps,
         weight_decay=weight_decay,
+        # Per-parameter updates cap the optimizer's transient VRAM/RAM at one
+        # tensor instead of a fused batch; the measured seq-len ceilings and
+        # CPU-step timings assume this. Do not "fix" to foreach=True.
+        foreach=False,
       )
 
     learning_rate = adam_params.get("learning_rate")
@@ -185,13 +366,17 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if max_grad_norm <= 0.0:
       max_grad_norm = math.inf
 
-    total_norm = torch.nn.utils.clip_grad_norm_(
-      self.trainable_params,
-      max_grad_norm,
+    total_norm = (
+      self.model.clip_grad_norm_(max_grad_norm)
+      if self.fsdp_enabled
+      else torch.nn.utils.clip_grad_norm_(self.trainable_params, max_grad_norm, foreach=False)
     )
 
     self.optimizer.step()
     self.optimizer.zero_grad()
+
+    if cpu_step:
+      self.model.to(self.device)
 
     return {
       "metrics": {
@@ -208,4 +393,38 @@ class FFTTrainingWorker(BaseTrainerWorker):
     model_id: str | None = None,
     include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
+    if self.fsdp_enabled:
+      raise RuntimeError("Sampling from an FSDP trainer is unsupported; use the vLLM sampler worker")
     return super().generate(self.model, prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
+
+  def sleep(self) -> None:
+    """Move the single-GPU trainer to CPU. FSDP state is handled by the time-slicer's checkpoint backend."""
+    if self.fsdp_enabled or not self.cpu_offload or self.model is None or self._is_offloaded or not torch.cuda.is_available():
+      return
+    start_t = time.perf_counter()
+    self.model.to("cpu")
+    self.move_optimizer_state("cpu")
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    self._is_offloaded = True
+    print(f"[FFT Worker] Moved weights and optimizer to CPU in {(time.perf_counter() - start_t) * 1000:.1f} ms.")
+
+  def wake_up(self, include_optimizer: bool = True) -> None:
+    if self.fsdp_enabled or not self.cpu_offload or self.model is None or not self._is_offloaded or not torch.cuda.is_available():
+      return
+    start_t = time.perf_counter()
+    self.model.to(self.device)
+    if include_optimizer:
+      self.move_optimizer_state(self.device)
+    self._is_offloaded = False
+    print(f"[FFT Worker] Restored weights and optimizer to CUDA in {(time.perf_counter() - start_t) * 1000:.1f} ms.")
+
+  def move_optimizer_state(self, device: str | torch.device) -> None:
+    if self.optimizer is None:
+      return
+    target = torch.device(device)
+    for state in self.optimizer.state.values():
+      for key, value in state.items():
+        if isinstance(value, torch.Tensor) and (key != "step" or target.type == "cpu"):
+          state[key] = value.to(target)

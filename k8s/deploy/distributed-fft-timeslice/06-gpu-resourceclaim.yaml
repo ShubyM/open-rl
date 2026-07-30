@@ -1,0 +1,19 @@
+# One DRA ResourceClaim for the trainer GPU allocation. Every trainer worker pod
+# that references this claim is scheduled onto a node that can access the same
+# allocated physical GPU(s).
+#
+# For single-GPU training (e.g. 0.5B, 1.7B models), request exactly 1 GPU.
+# This deployment runs a two-rank FSDP trainer and therefore allocates two
+# co-located physical GPUs. Adjust this count together with torchrun's
+# --nproc-per-node in 05-worker-pod-template.yaml.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: open-rl-trainer-gpu-1
+spec:
+  devices:
+    requests:
+    - name: gpu
+      exactly:
+        deviceClassName: gpu.nvidia.com
+        count: 2

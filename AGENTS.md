@@ -37,6 +37,11 @@ E2E tests boot up a local backend and run actual SFT/RL training against it. Run
 ```bash
 make test e2e <scenario_name>
 ```
+An example command for running end to end test:
+```
+pkill -9 -f port-forward 2>/dev/null; nohup sh -c '\''while true; do kubectl port-forward svc/open-rl-gateway-service 8000:8000 >/dev/null 2>&1; sleep 1; done'\'' >/dev/null 2>&1 & make test e2e fft-gsm8k-rl BASE_URL=http://127.0.0.1:8000
+```
+
 
 ### Supported Scenarios:
 - **`tiny-lora`**: Minimal overfit test using LoRA (asserts that loss drops).
@@ -44,7 +49,7 @@ make test e2e <scenario_name>
 - **`tiny-rl`**: Simple sample -> reward -> train policy update loop.
 - **`lora-textsql`**: A trimmed version of a real Reinforcement Learning recipe for Text-to-SQL.
 - **`fft-gsm8k`**: Full fine-tuning SFT training + vLLM evaluation on 100 math problems (*requires `redis-server`*).
-- **`fft-gsm8k-x2`**: Runs two concurrent `fft-gsm8k` jobs sharing a single GPU via the Checkpoint/Restore Snapshot Agent.
+- **`fft-gsm8k-x2`**: Runs two concurrent `fft-gsm8k` jobs sharing a single GPU via the Accelerator Time-Slicer (which layers on llm-d's physical checkpoint/restore snapshot agent).
 
 ---
 
@@ -84,5 +89,39 @@ If there is a persistent active tmux session (e.g., `work`) on the remote machin
 ## 5. Required System Dependencies on VM
 If you encounter errors during E2E training or evaluation on a fresh GPU VM, ensure these system packages are installed:
 
-- **`redis-server`**: Required by the Snapshot Agent for memory/state synchronization in FFT/time-slicing scenarios (`sudo apt-get install -y redis-server`).
+- **`redis-server`**: Required by the Accelerator Time-Slicer for memory/state synchronization in FFT/time-slicing scenarios (`sudo apt-get install -y redis-server`).
 - **`python3-dev`**: Required for compiling custom Triton runtime kernels during vLLM engine initialization (`sudo apt-get install -y python3-dev`).
+
+---
+
+## 6. Repeatable Kubernetes & Deployment Workflows
+
+When debugging or executing distributed E2E benchmarks on Kubernetes (such as `fft-gsm8k-rl-x2`), always follow these standard lifecycle workflows:
+
+### Rebuilding & Pushing Container Images After Code Changes
+Kubernetes worker pods pull and execute Python code (`/app`) directly from the baked container images (`gcr.io/<project>/open-rl-server:<tag>`). Whenever you modify Python code under `src/`, always bump the version in the `VERSION` file (and update corresponding K8s manifests), then rebuild and push the images before running tests:
+```bash
+make build-images push-images IMAGE_TAG=$(cat VERSION 2>/dev/null || echo latest)
+```
+
+### Cleaning Up Stale Worker Pods & Background Tasks
+Aborting an E2E test harness (`make test e2e ...`) leaves background client tasks and active Kubernetes worker pods running. Always terminate stale client tasks and clean up worker pods cleanly by label before relaunching runs:
+```bash
+kubectl delete pods -l timeslice.io/group=trainers --ignore-not-found
+kubectl delete pods -l timeslice.io/group=samplers --ignore-not-found
+```
+
+### Applying Manifest Edits & Restarting the Gateway
+If Kubernetes pod templates or memory limits (`k8s/deploy/distributed-fft-timeslice/*.yaml`) are updated, apply the manifests and perform a rolling restart on the gateway deployment so future workers spawn with the updated configurations:
+```bash
+kubectl apply -f k8s/deploy/distributed-fft-timeslice/
+kubectl rollout restart deployment open-rl-gateway
+kubectl rollout status deployment open-rl-gateway
+```
+
+### Resetting the Time-Slicer DaemonSet
+If worker pods crash or lose their TCP connection (`9753`) to the time-slicer daemon, clean up old worker pods first, perform a clean restart of the time-slicer daemonset across all nodes, and wait for rollout completion before launching new jobs:
+```bash
+kubectl rollout restart daemonset open-rl-accel-timeslicer
+kubectl rollout status daemonset open-rl-accel-timeslicer
+```

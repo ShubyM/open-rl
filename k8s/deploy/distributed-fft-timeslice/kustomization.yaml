@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# FFT DRA deployment: the gateway launches one worker pod per FFT model and all
+# GPU workloads reference the same DRA ResourceClaim, pinning them to one
+# physical GPU allocation. There is no static trainer worker in this variant.
+resources:
+  - 01-shared-pvc.yaml
+  - 02-redis.yaml
+  - 03-rbac.yaml
+  - 04-gateway.yaml
+  - 05-worker-pod-template.yaml
+  - 06-gpu-resourceclaim.yaml
+  - 07-accel-timeslicer-daemonset.yaml
+  - 08-sampler-resourceclaim.yaml
+  - 09-sampler-pod-template.yaml
+  - 10-dcgm-monitoring.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: open-rl-config
+    literals:
+      - BASE_MODEL="Qwen/Qwen2.5-0.5B"
+      - ENABLE_GCP_TRACE="1"
+
+images:
+  - name: ghcr.io/gke-labs/open-rl/server
+    newName: gcr.io/cdrollouts-sunilarora/open-rl-server
+    newTag: 0.1.30
+  - name: ghcr.io/gke-labs/open-rl/gateway
+    newName: gcr.io/cdrollouts-sunilarora/open-rl-gateway
+    newTag: 0.1.30
