@@ -25,8 +25,8 @@ Maintaining separate, dedicated GPU clusters for training and sampling leads to 
 A **single RL step** represents one complete, closed-loop Reinforcement Learning iteration across four sequential phases:
 1. **Rollout Generation (`time/sampling`):** Worker acquires the Sampler GPU lock (`r8f5`), restores model weights in vLLM, and generates rollout trajectories (e.g., 192 completions across math prompts).
 2. **Reward Scoring (`time/do_group_rollout...`):** Host CPU scores completions against formatting/accuracy rules and computes group-relative advantages.
-3. **Policy Gradient Optimization (`time/train_step`):** Worker acquires the Trainer GPU lock (`tpdj`), reloads 16-bit weights/gradients and 32-bit AdamW momentum states from pinned CPU RAM into physical H100 VRAM (`wake_up`), runs FSDP forward/backward passes and AdamW updates, then offloads back to pinned CPU RAM (`sleep`) before releasing the GPU lock.
-4. **Non-Blocking Checkpoint Saving (`time/save_checkpoint`):** Outside the GPU mutex lock, the worker serializes updated model shards from pinned CPU RAM (`_param_shadow`) to NFS shared storage in background parallel while the next job computes on the GPU.
+3. **Policy Gradient Optimization (`time/train_step`):** The worker acquires the trainer GPU-bundle lock, runs FSDP forward/backward and AdamW updates across its ranks, then yields the bundle to the time-slicer.
+4. **Checkpoint Saving (`time/save_checkpoint`):** The FSDP ranks collectively gather a standard Hugging Face state dictionary to rank 0, which writes it to shared storage for the sampler. This remains inside the GPU lease because gathering shards requires NCCL.
 
 #### The Platoon Effect (Why FIFO Fails)
 In a multi-tenant cluster where jobs share regional GPU nodes via time-slicing, using standard First-In, First-Out queueing (`deque.popleft()`) causes severe **platooning**. If identical concurrent jobs start simultaneously (`jitter_sec=0`) or synchronize even once, whoever arrives at the queue tail first is served first on every subsequent phase transition. Workloads bunch up into rigid, sequential traffic jams (`1 -> 2 -> 3 -> 1 -> 2 -> 3`):
@@ -155,28 +155,23 @@ To prevent multi-tenant head-of-line blocking, Open-RL replaces FIFO request pro
 In addition to task queuing, Open-RL utilizes a centralized Metadata Store to maintain session definitions, tenant identifiers, active worker-provisioning status, and asynchronous request/response execution payloads. Today, Redis serves a dual architectural role—backing both the `MultiTenant WorkQueue` and the `Metadata Store`. Abstracting the Metadata Store as a distinct architectural component allows future scalability, enabling structured metadata persistence in relational databases (e.g., PostgreSQL) or distributed key-value stores while keeping high-throughput execution queuing in Redis.
 
 ### E. Accelerator Time-Slicer DaemonSet (`open-rl-accel-timeslicer`)
-Running as a `hostNetwork: true` DaemonSet across GPU nodes, the time-slicer serializes CUDA execution within workload groups (`trainers` vs. `samplers`) by coordinating application-level memory offloading with external process snapshotting.
+Running as a `hostNetwork: true` DaemonSet across GPU nodes, the time-slicer serializes CUDA execution within workload groups (`trainers` vs. `samplers`) and coordinates external process snapshotting.
 * **Configurable Queue Scheduling Policy (`--scheduling-policy fifo|lrs`):** When multiple tenant workloads compete for a GPU lock on the same node, the time-slicer supports two distinct queueing algorithms:
   * **`fifo` (First-In, First-Out):** Serves waiting workloads in strict order of arrival (`deque.popleft()`). While simple, when concurrent jobs start simultaneously, FIFO can trap workloads into rigid, sequential lockstep platoons (`1 -> 2 -> 3 -> 1 -> 2 -> 3`), causing one GPU node to sit 100% idle while workloads bunch up on the opposite node.
   * **`lrs` (Least Recently Served, Recommended Default):** Tracks the wall-clock release timestamp (`last_release_time[job_id]`) of each workload and prioritizes whichever waiting job released the GPU *least recently* ($\min(\text{last\_release\_time})$). By serving the job that has been away from this GPU longest, LRS acts as an automatic phase-balancing spring that breaks lockstep platoons and maintains continuous hardware overlap across physical nodes.
-* **Cooperative Sleep & Snapshotting:** When a worker yields its time slice (`RELEASE(workload)`), it first performs an application-level sleep to offload active GPU memory to system CPU RAM. Once offloaded, the daemon invokes its `llm-d` backend (`LlmDCheckpointRestorer`) to checkpoint residual VRAM pages and freeze the execution context.
+* **Cooperative Sleep & Snapshotting:** When a worker yields its time slice (`RELEASE(workload)`), the sampler first invokes vLLM sleep; FSDP trainers leave their sharded state to llm-d. The daemon then invokes its `llm-d` backend (`LlmDCheckpointRestorer`) to checkpoint VRAM pages and freeze every process in the workload.
 * **Restore & Wakeup:** When a workload is granted GPU access (`ACQUIRE(workload)`), `llm-d` restores the process context on the accelerator. The worker then executes an application-level wakeup to reload its model weights and optimizer states back into GPU VRAM before resuming execution.
 
 ### F. FFT PyTorch Trainer Worker (`fft_trainer_worker.py`)
-The trainer executes PyTorch FSDP policy gradient optimization and coordinates directly with the time-slicer during context handoffs:
-* **`sleep()`:** Before triggering time-slice release, the trainer iterates across model parameters and AdamW optimizer momentum dictionaries (`exp_avg`, `exp_avg_sq`), transferring CUDA tensors to pinned CPU host memory (`v.to("cpu").pin_memory()`) and clearing CUDA cache allocators.
-* **`wake_up()`:** After time-slice acquisition, the trainer asynchronously pushes pinned CPU tensors back across PCIe lanes into target GPU devices, restoring active training state.
-* **Non-Blocking DRAM Checkpoint Saving (Removing GPU from the Save Path):** In traditional LLM training loops, checkpoint serialization (`save_weights_for_sampler`) holds the active GPU lock while writing multi-gigabyte weight tensors across network filesystems (NFS). In Open-RL, checkpoint saving is completely decoupled from physical accelerator ownership:
-  * **Early GPU Release & CPU Offloading:** When an optimization step finishes, the trainer worker immediately executes `sleep()`, offloading active model parameters from GPU VRAM into pinned CPU host RAM (`_param_shadow`) and releasing the time-slicer GPU mutex lock *early*.
-  * **Removing GPU from the Save Path:** When the worker thread subsequently pops `save_weights_for_sampler`, the physical GPU has *already* been yielded to the next tenant! The worker serializes `.safetensors` checkpoint shards directly from CPU host RAM (`_param_shadow`) to shared NFS storage.
-  * **Architectural Advantages:**
-    1. **Zero GPU Idle Time During Disk I/O:** Serializing multi-gigabyte weight tensors across network storage is I/O-bound and latency-prone (~4s to ~100s+ depending on cluster filesystem load). Removing the GPU from the save path ensures expensive H100 accelerators never sit blocked waiting for network disk serialization.
-    2. **Massive Concurrency Overlap:** While Job A serializes its `.safetensors` shards to NFS from CPU RAM, Job B is actively executing forward and backward passes on the physical GPU! In concurrent multi-tenant benchmarks (such as 2x Qwen 8B), this dropped step iteration time from >180s down to ~76s per step.
-    3. **Decoupled Failure Domains:** Transient storage stalls or NFS dropouts during checkpoint serialization only affect the background saving thread of that individual tenant without holding up the accelerator time-slicer daemon or freezing other tenants' GPU computation.
+The trainer executes real PyTorch FSDP policy-gradient optimization and coordinates directly with the time-slicer:
+* **One rank per GPU:** `torchrun` launches one worker rank per allocated GPU. Rank 0 alone drains Redis and publishes futures, then broadcasts each operation to the other ranks over a CPU-only Gloo control group.
+* **`FULL_SHARD`:** Decoder parameters, gradients, and AdamW state are sharded across ranks. The target-logprob projection remains inside the FSDP root forward and is vocabulary-chunked, avoiding a full `[batch, sequence, vocabulary]` activation.
+* **Sleep/wake:** FSDP ranks do not use the legacy per-tensor CPU shadow offload. The llm-d time-slicer snapshots and restores every rank process as one workload. CPU-only queue polling does not wake CUDA or allocate KV/cache memory between leases.
+* **vLLM checkpoint export:** A sampler checkpoint is a collective operation. All ranks gather a full state dictionary to rank 0 while the GPU lease is held; rank 0 writes a standard Hugging Face checkpoint to shared storage for vLLM.
 
 ### G. vLLM Dynamic Sampler Worker (`vLLM Worker`)
 The sampler runs an inference engine wrapped around vLLM Dynamo and implements **cooperative sleep optimization** during handoffs:
-* **`sleep(level=2)`:** Before triggering time-slice release, the sampler commands the vLLM engine to sleep. This voluntarily discards ephemeral prefix caches (`~19 GiB` freed) and backs up model weights to CPU RAM, reducing the residual VRAM footprint to `<0.6 GiB` and cutting `llm-d` snapshot latency by 50%.
+* **`sleep(level=1)`:** Before triggering time-slice release, the sampler commands the vLLM engine to sleep. This releases CUDA allocations while retaining a CPU backup of model weights so repeated wake cycles remain valid.
 * **`wake_up()`:** After acquisition, the sampler wakes the engine and reloads updated policy checkpoint shards directly from NFS shared storage into page cache (`in-place reload`).
 
 ### H. WeightSync Component (`Shared PVC / NFS Storage`)
@@ -279,7 +274,8 @@ The following environment variables govern multi-tenant GPU execution across Gat
 | `OPEN_RL_WORKER_MANAGER=kubernetes` | Gateway | Configures API Server to provision pod workloads on cluster nodes rather than local subprocesses. |
 | `OPEN_RL_WORKER_IMAGE=<tag>` | Gateway | Runtime override injecting explicit container image digests into rendered worker pod specifications. |
 | `SAMPLING_BACKEND=vllm` | Client / Gateway | Instructs the framework to route rollout requests to vLLM dynamic sampler pods. |
-| `CUDA_VISIBLE_DEVICES=<ids>` | Trainer Worker | Binds PyTorch FSDP autograd engines to designated physical accelerator UUIDs or indices. |
+| `OPEN_RL_FSDP_WORLD_SIZE=2` | Trainer launcher | Uses `torchrun` with one FSDP rank per allocated trainer GPU. Must match the trainer DRA claim count. |
+| `CUDA_VISIBLE_DEVICES=<ids>` | Trainer Worker | Exposes the DRA-allocated physical accelerators to the FSDP ranks. |
 | `SAMPLER_CUDA_VISIBLE_DEVICES=<ids>` | Sampler Worker | Binds vLLM Dynamo engines to isolated inference accelerators. |
 | `VLLM_GPU_MEMORY_UTILIZATION=0.70` | Sampler Worker | Configures vLLM pre-allocated KV cache ceiling, leaving headroom for cooperative memory swapping. |
 | `OPEN_RL_ACCEL_TIMESLICER_HOST` | Workers | Target IP (`status.hostIP`) of the node-local time-slicer daemon controlling hardware locks. |
@@ -298,14 +294,13 @@ make test e2e tiny-fft-rl-x2 TRAINING_TEST_ARGS="sampling_backend=vllm trainer_g
 
 ## 8. Key Engineering Insights, Bugs & Workarounds
 
-### A. PyTorch AdamW Multi-Tensor Device Mismatch Bug
-* **Issue:** At Step 2 of multi-GPU FSDP runs, trainers crashed with `RuntimeError: Tensors of the same index must be on the same device and the same dtype except step tensors...`.
-* **Root Cause:** When `device_map="auto"` sharded Qwen 4B across `cuda:0` and `cuda:1`, parameter halves sat on separate devices. During `wake_up()`, old reloading code restored CPU momentum tensors without preserving exact parameter-to-device mapping, defaulting unmapped tensors to `cuda:0`. AdamW found parameter $i$ on `cuda:1` paired with momentum buffer $i$ on `cuda:0`.
-* **Workaround / Fix:** Updated `fft_trainer_worker.py` to iterate over `optimizer.state.items()` and explicitly cast every momentum tensor directly to its parent parameter device: `v.to(param.device, non_blocking=True)`.
+### A. Replacing Inference Device Maps with FSDP
+* **Issue:** The old multi-GPU path used `device_map="auto"`. That places layers for inference, but it does not shard gradients or AdamW state and can produce cross-device optimizer-state mismatches.
+* **Fix:** Multi-GPU FFT now uses one process per GPU and `FSDP(..., sharding_strategy=FULL_SHARD, use_orig_params=True)`. AdamW owns each rank's local parameter shards; `FSDP.clip_grad_norm_` performs the distributed norm reduction.
 
 ### B. Cooperative vLLM Sleep Optimization
 * **Insight:** Relying purely on external kernel-level snapshotting to freeze inference pods required paging out 25+ GiB of VRAM, taking >4.0 seconds.
-* **Workaround:** Implemented application-level `engine.sleep(level=2)` prior to yielding slices. By resetting prefix caches and discarding ephemeral KV blocks voluntarily, active VRAM shrinks to `<0.6 GiB`, cutting time-slicer checkpoint latency to **`2.00 s`**.
+* **Workaround:** The sampler uses vLLM sleep level 1 before yielding, preserving a CPU backup of model weights while releasing CUDA allocations. This allows the engine to wake after repeated sampling windows without reinitializing discarded weights.
 
 ### C. Network Filesystem (NFS) Serialization Overhead
 * **Issue:** Serializing 8 GiB PyTorch state dictionaries across the GKE Filestore NFS cluster (`time/save_checkpoint`) took **155 to 179 seconds** per job step, consuming >60% of total training time.
