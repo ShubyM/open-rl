@@ -27,6 +27,21 @@ def _py_cmd(extras: list[str], module: str, model_id: str) -> list[str]:
   return [sys.executable, "-u", "-m", module, "--model-id", model_id]
 
 
+def _trainer_cmd(model_id: str) -> list[str]:
+  world_size = int(os.getenv("OPEN_RL_FSDP_WORLD_SIZE", "1"))
+  if world_size <= 1:
+    return _py_cmd(["gpu"], "server.training_requests_processor", model_id)
+  runner = ["uv", "run", "--extra", "gpu", "torchrun"] if shutil.which("uv") else [sys.executable, "-u", "-m", "torch.distributed.run"]
+  return runner + [
+    "--standalone",
+    f"--nproc-per-node={world_size}",
+    "-m",
+    "server.training_requests_processor",
+    "--model-id",
+    model_id,
+  ]
+
+
 class WorkerManager(Protocol):
   def launch(self, model_id: str, base_model: str | None = None) -> None:
     """Ensure the model's worker exists; idempotent per model_id."""
@@ -52,7 +67,7 @@ class FFTWorkerManager:
 
   def __init__(self, project_dir: Path = PROJECT_DIR):
     if not os.getenv("REDIS_URL"):
-      raise RuntimeError("OPEN_RL_ENABLE_FFT=true requires REDIS_URL so launched workers can share queues and futures")
+      raise RuntimeError("Launching worker subprocesses (FFT trainers, vLLM samplers) requires REDIS_URL so they can share queues and futures")
 
     self.project_dir = project_dir
     self.train_processes: dict[str, subprocess.Popen] = {}
@@ -75,7 +90,7 @@ class FFTWorkerManager:
     if base_model:
       env["BASE_MODEL"] = base_model
     self.train_processes[model_id] = subprocess.Popen(
-      _py_cmd(["gpu"], "server.training_requests_processor", model_id),
+      _trainer_cmd(model_id),
       cwd=self.project_dir,
       env=env,
       start_new_session=True,
@@ -86,7 +101,10 @@ class FFTWorkerManager:
     if proc is not None and proc.poll() is None:
       return
 
-    env = {**os.environ, "OPEN_RL_ENABLE_FFT": "true"}
+    # Inherit OPEN_RL_ENABLE_FFT from the gateway: FFT samplers reload full
+    # checkpoints per revision, LoRA samplers serve the base model and apply
+    # per-request adapters.
+    env = {**os.environ}
     if base_model:
       env["BASE_MODEL"] = base_model
     sampling_backend = os.getenv("SAMPLING_BACKEND", "vllm").lower()
