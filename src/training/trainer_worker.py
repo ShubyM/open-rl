@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
-from training.distributed import local_rank
+from training.distributed import all_gather_object, all_reduce_max, all_reduce_sum, is_distributed, local_rank, rank, world_size
 
 
 def chunk_target_logprob(
@@ -34,10 +34,20 @@ def chunk_target_logprob(
   return target_logit - torch.logsumexp(logits, dim=-1)
 
 
+FILLER_DATUM_INDEX = -1
+
+
+def shard_datum_indices(count: int, shard_rank: int, shard_count: int) -> list[int]:
+  """Round-robin datum ownership for one data-parallel rank."""
+  if shard_count <= 1:
+    return list(range(count))
+  return list(range(shard_rank, count, shard_count))
+
+
 def project_target_logprobs(model: PreTrainedModel, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
   """Project hidden states in small vocab chunks instead of building full logits."""
   head = model.get_output_embeddings()
-  config = model.config.get_text_config()
+  config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
   batch, seq_len, _ = hidden.shape
   hidden = hidden.reshape(batch * seq_len, -1).to(head.weight.device)
   targets = targets.reshape(batch * seq_len).to(head.weight.device)
@@ -58,9 +68,10 @@ def project_target_logprobs(model: PreTrainedModel, hidden: torch.Tensor, target
   return torch.cat([project(start) for start in range(0, hidden.shape[0], chunk_size)]).reshape(batch, seq_len)
 
 
-def activation_offload_context(tensor: torch.Tensor, *, default: bool = False):
-  mode = os.getenv("OPEN_RL_ACTIVATION_CPU_OFFLOAD", "auto" if default else "0")
-  if tensor.is_cuda and (mode == "1" or mode == "auto" and default):
+
+
+def activation_offload_context(tensor: torch.Tensor):
+  if tensor.is_cuda and os.getenv("OPEN_RL_ACTIVATION_CPU_OFFLOAD", "0") == "1":
     return torch.autograd.graph.save_on_cpu(pin_memory=True)
   return nullcontext()
 
@@ -73,7 +84,18 @@ def attention_forward_kwargs(config: Any) -> dict[str, Any]:
 
   if max(config.head_dim, getattr(config, "global_head_dim", 0) or 0) <= 256:
     return {}
-  return {"kernel_options": {"fwd_BLOCK_N": 16, "fwd_num_stages": 1}}
+  return {
+    "kernel_options": {
+      "fwd_BLOCK_M": 16,
+      "fwd_BLOCK_N": 16,
+      "fwd_num_stages": 1,
+      "bwd_BLOCK_M1": 16,
+      "bwd_BLOCK_N1": 16,
+      "bwd_BLOCK_M2": 16,
+      "bwd_BLOCK_N2": 16,
+      "bwd_num_stages": 1,
+    }
+  }
 
 
 def attention_backend_context(config: Any, tensor: torch.Tensor):
@@ -98,8 +120,12 @@ class Datum(BaseModel):
 
 
 class BaseTrainerWorker:
+  # FSDP backwards run collectives, so pass counts must match across ranks.
+  backward_runs_collectives = True
+
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
+    self.output_head_is_adapted = False
 
     if torch.cuda.is_available():
       self.device = torch.device("cuda", local_rank())
@@ -108,29 +134,77 @@ class BaseTrainerWorker:
     else:
       self.device = torch.device("cpu")
 
-  def forward_backward(self, model: PreTrainedModel, data: list[Datum], loss_fn: str, loss_config: dict | None = None) -> dict[str, Any]:
-    """Run a forward/backward pass on model and return Tinker-shaped loss outputs."""
-    total_loss = 0.0
-    loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
+  def forward_backward(
+    self,
+    model: PreTrainedModel,
+    data: list[Datum],
+    loss_fn: str,
+    loss_config: dict | None = None,
+    forward_only: bool = False,
+  ) -> dict[str, Any]:
+    """Run a forward/backward pass on model and return Tinker-shaped loss outputs.
+
+    With forward_only=True (the SDK's TrainingClient.forward()) no gradients are
+    computed or accumulated — the SDK's custom-loss path (e.g. cookbook DPO)
+    fetches logprobs this way with real weights attached and then sends the
+    actual gradient as a second, linearized forward_backward; running backward
+    here would silently corrupt that update with a spurious CE term.
+
+    Under distributed training each rank owns a round-robin shard of the datums
+    and gradients are summed across ranks through FSDP's per-backward averaging
+    (each real pass scales its loss by the shard count to cancel the average).
+    """
+    shard_count = world_size() if is_distributed() else 1
+    local_indices = shard_datum_indices(len(data), rank(), shard_count)
+    local_data = [data[idx] for idx in local_indices]
 
     model.train()
 
-    for batch in self.make_training_batches(data):
-      batch_indices = [idx for idx, _ in batch]
+    total_loss = 0.0
+    loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
+
+    local_batches = self.make_training_batches(local_data)
+    if shard_count > 1 and self.backward_runs_collectives:
+      # Pad short ranks with zero-scaled passes so FSDP collective counts match.
+      total_passes = all_reduce_max(len(local_batches))
+      filler_passes = total_passes - len(local_batches)
+      if filler_passes > 0:
+        filler = local_data[0] if local_data else data[0]
+        local_batches.extend([[(FILLER_DATUM_INDEX, filler)]] * filler_passes)
+
+    for batch in local_batches:
+      batch_positions = [idx for idx, _ in batch]
       batch_data = [datum for _, datum in batch]
+      is_filler = batch_positions == [FILLER_DATUM_INDEX]
+      batch_indices = [] if is_filler else [local_indices[position] for position in batch_positions]
 
       input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
       target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
       seq_len = input_ids.shape[1]
-      with self.cuda_memory_phase(f"forward[{len(batch_data)}x{seq_len}]"):
+
+      old_logprobs = advantages = None
+      skip_backward = False
+      if loss_fn in ("importance_sampling", "ppo"):
+        old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
+        advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
+        zero_effective_advantages = not bool(((advantages != 0) & (weights != 0)).any())
+        if loss_fn == "importance_sampling":
+          skip_backward = zero_effective_advantages
+        else:
+          has_kl_penalty = bool(loss_config and loss_config.get("kl_coeff", 0.0) > 0 and (weights != 0).any())
+          skip_backward = zero_effective_advantages and not has_kl_penalty
+      skip_backward = (skip_backward and (shard_count == 1 or not self.backward_runs_collectives)) or forward_only
+
+      # A zero-advantage batch contributes no gradient; computing its logprobs
+      # under no_grad avoids building and retaining the autograd graph.
+      grad_context = torch.no_grad() if skip_backward else nullcontext()
+      with self.cuda_memory_phase(f"forward[{len(batch_data)}x{seq_len}]"), grad_context:
         target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
 
       match loss_fn:
         case "cross_entropy":
           elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
         case "importance_sampling":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
           elementwise_loss = losses.importance_sampling_loss(
             target_logprobs,
             weights,
@@ -138,8 +212,6 @@ class BaseTrainerWorker:
             advantages,
           )
         case "ppo":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
           elementwise_loss = losses.ppo_loss(
             target_logprobs,
             weights,
@@ -152,9 +224,15 @@ class BaseTrainerWorker:
 
       per_datum_loss = elementwise_loss.sum(dim=1)
       loss = per_datum_loss.sum()
-      with self.cuda_memory_phase(f"backward[{len(batch_data)}x{seq_len}]"):
-        loss.backward()
-      total_loss += loss.item()
+      if not skip_backward:
+        # FSDP averages gradients over the group on every backward; scaling
+        # each real pass by shard_count recovers the single-process sum, and
+        # filler passes contribute exactly zero.
+        backward_loss = loss * (0.0 if is_filler else float(shard_count)) if shard_count > 1 else loss
+        with self.cuda_memory_phase(f"backward[{len(batch_data)}x{seq_len}]"):
+          backward_loss.backward()
+      if not is_filler:
+        total_loss += loss.item()
 
       detached_logprobs = target_logprobs.detach().cpu()
       for row, original_idx in enumerate(batch_indices):
@@ -162,6 +240,15 @@ class BaseTrainerWorker:
         logprobs_list = detached_logprobs[row, :row_len].tolist()
         logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
         loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
+
+      if skip_backward:
+        del target_logprobs, elementwise_loss, per_datum_loss, loss
+
+    if shard_count > 1:
+      total_loss = all_reduce_sum(total_loss)
+      for part in all_gather_object({idx: loss_fn_outputs[idx] for idx in local_indices}):
+        for idx, output in part.items():
+          loss_fn_outputs[idx] = output
 
     mean_loss = total_loss / max(1, len(data))
     completed_loss_fn_outputs = []
@@ -309,10 +396,18 @@ class BaseTrainerWorker:
     """
     seq_len = target_token_ids.shape[1]
 
-    if os.getenv("OPEN_RL_FUSED_LOGPROB", "1") == "1":
+    # project_target_logprobs multiplies by head.weight directly, which would
+    # silently bypass an lm_head LoRA adapter (train_unembed) in both logprobs
+    # and gradients; the full-logits path runs the wrapped head's forward.
+    if os.getenv("OPEN_RL_FUSED_LOGPROB", "1") == "1" and not self.output_head_is_adapted:
       hidden = self.backbone_hidden_states(model, input_ids, attention_mask)
-      if hidden is not None:
-        return project_target_logprobs(model, hidden[:, :seq_len, :], target_token_ids)
+      if hidden is None:
+        raise RuntimeError(
+          "Fused logprob head could not resolve the model backbone. The full-logits "
+          "path materializes a [seq, vocab] tensor (tens of GiB at long context) and "
+          "bypasses activation offload; set OPEN_RL_FUSED_LOGPROB=0 to opt into it."
+        )
+      return project_target_logprobs(model, hidden[:, :seq_len, :], target_token_ids)
 
     # Full-logits path. Use logit - logsumexp rather than log_softmax(...).gather so
     # we avoid the extra full-size fp32 log_softmax allocation.
@@ -335,10 +430,19 @@ class BaseTrainerWorker:
   ) -> torch.Tensor | None:
     """Return the transformer backbone's last_hidden_state without running the
     lm_head. Returns None (so the caller uses the full-logits path) when the
-    backbone can't be resolved or does not expose hidden states -- e.g. PEFT/LoRA
-    wrappers whose forward only yields logits."""
-    backbone = getattr(model, "model", None) or getattr(model, "transformer", None)
-    if backbone is None or backbone is model:
+    backbone can't be resolved.
+
+    PEFT models must be unwrapped through get_base_model(): their attribute
+    delegation resolves `.model` to the full causal LM (lm_head included),
+    whose forward yields logits but no last_hidden_state — the old code then
+    ran a full forward, discarded it, and fell back to the full-logits path,
+    which at long context materializes a [seq, vocab] logits tensor tens of
+    GiB large, outside the activation-offload context. LoRA adapters live on
+    the backbone's submodules, so calling the backbone directly still applies
+    them."""
+    backbone_owner = model.get_base_model() if hasattr(model, "get_base_model") else model
+    backbone = getattr(backbone_owner, "model", None) or getattr(backbone_owner, "transformer", None)
+    if backbone is None or backbone is backbone_owner:
       return None
     backbone_attention_mask = attention_mask
     if attention_mask is not None and bool(attention_mask.all()):
@@ -346,18 +450,14 @@ class BaseTrainerWorker:
       # it lets SDPA select Flash Attention instead of materializing a quadratic
       # additive mask for Gemma's global-attention layers.
       backbone_attention_mask = None
-    try:
-      with activation_offload_context(input_ids), attention_backend_context(model.config, input_ids):
-        outputs = backbone(
-          input_ids=input_ids,
-          attention_mask=backbone_attention_mask,
-          use_cache=False,
-          return_dict=True,
-          **attention_forward_kwargs(model.config),
-        )
-    except Exception as exc:
-      print(f"[trainer] fused-logprob backbone forward failed ({exc}); using full-logits path")
-      return None
+    with activation_offload_context(input_ids), attention_backend_context(model.config, input_ids):
+      outputs = backbone(
+        input_ids=input_ids,
+        attention_mask=backbone_attention_mask,
+        use_cache=False,
+        return_dict=True,
+        **attention_forward_kwargs(model.config),
+      )
     return getattr(outputs, "last_hidden_state", None)
 
   def generate(
@@ -368,9 +468,6 @@ class BaseTrainerWorker:
     num_samples: int = 1,
     temperature: float = 0.0,
     include_prompt_logprobs: bool = False,
-    stop: list[int] | None = None,
-    top_p: float = 1.0,
-    top_k: int = -1,
   ) -> dict[str, Any]:
     """Generate completions from model."""
     model.eval()
@@ -378,17 +475,6 @@ class BaseTrainerWorker:
     input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
     do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
     prompt_logprobs = self.prompt_logprobs(model, input_tensor) if include_prompt_logprobs else None
-    eos_token_ids: list[int] = []
-    tokenizer_eos = self.tokenizer.eos_token_id
-    if isinstance(tokenizer_eos, int):
-      eos_token_ids.append(tokenizer_eos)
-    elif tokenizer_eos:
-      eos_token_ids.extend(tokenizer_eos)
-    eos_token_ids.extend(stop or [])
-    eos_token_ids = list(dict.fromkeys(eos_token_ids))
-    pad_token_id = self.tokenizer.pad_token_id
-    if pad_token_id is None and eos_token_ids:
-      pad_token_id = eos_token_ids[0]
 
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
@@ -396,12 +482,11 @@ class BaseTrainerWorker:
         input_tensor,
         attention_mask=attention_mask,
         max_new_tokens=max_tokens,
-        pad_token_id=pad_token_id,
-        eos_token_id=eos_token_ids or None,
+        pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
         do_sample=do_sample,
         temperature=temperature if do_sample else None,
-        top_p=top_p if do_sample else None,
-        top_k=max(0, top_k) if do_sample else None,
+        top_p=None,
+        top_k=None,
         num_return_sequences=num_samples,
         output_scores=True,
         return_dict_in_generate=True,
@@ -420,9 +505,7 @@ class BaseTrainerWorker:
         logprob = logprob_dist[token_id].item()
         logprobs.append(self.sanitize_float(logprob))
 
-      stopped = bool(generated_tokens and generated_tokens[-1] in eos_token_ids)
-      stop_reason = "stop" if stopped or len(generated_tokens) < max_tokens else "length"
-      sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": stop_reason})
+      sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": "stop"})
 
     result = {"sequences": sequences_out}
     if prompt_logprobs is not None:
