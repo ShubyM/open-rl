@@ -42,7 +42,7 @@ class KubernetesFFTWorkerManager:
 
   def __init__(self, core_api: Any = None):
     if not os.getenv("REDIS_URL"):
-      raise RuntimeError("OPEN_RL_ENABLE_FFT=true requires REDIS_URL so launched workers can share queues and futures")
+      raise RuntimeError("Launching worker pods (FFT trainers, vLLM samplers) requires REDIS_URL so they can share queues and futures")
 
     trainer_path = os.getenv("OPEN_RL_TRAINER_POD_TEMPLATE") or os.getenv("OPEN_RL_WORKER_POD_TEMPLATE")
     if not trainer_path:

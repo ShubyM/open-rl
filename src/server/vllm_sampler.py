@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import os
 import sys
+import time
 import traceback
 from typing import Any
 
@@ -28,6 +29,8 @@ from opentelemetry import propagate, trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from accel_timeslicer.time_slicer import is_time_slicing_enabled
+
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
 
@@ -47,17 +50,113 @@ engine: Any = None
 CURRENT_LOADED_SAMPLER_WEIGHTS: str | None = None
 reload_lock = asyncio.Lock()
 
+# Weight reloads sleep and rebuild the engine; doing that under an in-flight
+# decode corrupts its output. Generations register here and a reload drains
+# them first (new arrivals queue on reload_lock, so the drain terminates).
+ACTIVE_GENERATIONS = 0
+generation_idle = asyncio.Condition()
+
+
+async def begin_generation() -> None:
+  global ACTIVE_GENERATIONS
+  async with generation_idle:
+    ACTIVE_GENERATIONS += 1
+
+
+async def end_generation() -> None:
+  global ACTIVE_GENERATIONS
+  async with generation_idle:
+    ACTIVE_GENERATIONS -= 1
+    generation_idle.notify_all()
+
+
+async def wait_for_generation_drain() -> None:
+  async with generation_idle:
+    await generation_idle.wait_for(lambda: ACTIVE_GENERATIONS == 0)
+
 
 def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
+def vllm_sleep_level() -> int:
+  """Use weight-preserving sleep unless the deployment opts into discard/reload."""
+  level = int(os.getenv("OPEN_RL_VLLM_SLEEP_LEVEL", "1"))
+  if level not in (1, 2):
+    raise ValueError(f"OPEN_RL_VLLM_SLEEP_LEVEL must be 1 or 2, got {level}")
+  return level
+
+
+def vllm_language_model_only() -> bool:
+  # Both supported base families (Qwen3.5/3.6, Gemma 4) are multimodal
+  # wrappers and sampling is text-only, so the vision tower is off by
+  # default. This only disables multimodal inputs — the constructed graph
+  # and its weight names are unchanged, so LoRA adapter key matching is
+  # unaffected. Set 0 to sample with multimodal inputs enabled.
+  return os.getenv("OPEN_RL_VLLM_LANGUAGE_MODEL_ONLY", "1") == "1"
+
+
+def architecture_override_missing_for_fft() -> bool:
+  """FFT reloads need the checkpoint's text-only weight names to match the graph.
+
+  language_model_only only disables multimodal inputs - it does not change the
+  constructed architecture or its weight names. Reloading a text-only FFT
+  checkpoint into a multimodal graph silently skips most weights ("Following
+  weights were not loaded from checkpoint"), so multimodal base models must set
+  VLLM_ARCHITECTURE_OVERRIDE (e.g. Gemma4ForCausalLM) to build the text graph.
+  """
+  return is_fft_enabled() and vllm_language_model_only() and not os.getenv("VLLM_ARCHITECTURE_OVERRIDE")
+
+
+async def publish_sampler_ready(store: Any, model_id: str, instance_id: str) -> None:
+  if store.redis is not None:
+    await store.redis.set(f"open_rl:sampler_ready:{model_id}", instance_id)
+
+
+async def clear_sampler_ready(store: Any, model_id: str, instance_id: str) -> None:
+  if store.redis is None:
+    return
+  key = f"open_rl:sampler_ready:{model_id}"
+  value = await store.redis.get(key)
+  if isinstance(value, bytes):
+    value = value.decode("utf-8")
+  if value == instance_id:
+    await store.redis.delete(key)
+
+
 time_slicer: Any = None
-if is_fft_enabled():
+if is_fft_enabled() and is_time_slicing_enabled():
   from accel_timeslicer.time_slicer import time_slicer_client_from_env, workload_from_env
   from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, workload_job_id
 
   time_slicer = time_slicer_client_from_env()
+
+
+def build_engine_kwargs(model_name: str) -> dict:
+  hf_overrides: dict = {}
+  arch_override = os.getenv("VLLM_ARCHITECTURE_OVERRIDE")
+  if arch_override:
+    hf_overrides["architectures"] = [arch_override]
+
+  engine_kwargs = {
+    "model": model_name,
+    "enable_sleep_mode": is_fft_enabled(),
+    "enable_lora": not is_fft_enabled(),
+    "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", "8192")),
+    "max_num_seqs": int(os.getenv("VLLM_MAX_NUM_SEQS", "64")),
+    "gpu_memory_utilization": float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")),
+    "language_model_only": vllm_language_model_only(),
+    "enable_prefix_caching": False,
+    "enforce_eager": os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
+  }
+  if attention_backend := os.getenv("OPEN_RL_VLLM_ATTENTION_BACKEND"):
+    engine_kwargs["attention_backend"] = attention_backend
+  if not is_fft_enabled():
+    engine_kwargs["max_loras"] = 8
+    engine_kwargs["max_lora_rank"] = 64
+  if hf_overrides:
+    engine_kwargs["hf_overrides"] = hf_overrides
+  return engine_kwargs
 
 
 def init_engine():
@@ -78,31 +177,92 @@ def init_engine():
     print("[vLLM Worker] Error: BASE_MODEL environment variable is required.")
     sys.exit(1)
   else:
-    hf_overrides: dict = {}
-    arch_override = os.getenv("VLLM_ARCHITECTURE_OVERRIDE")
-    if arch_override:
-      hf_overrides["architectures"] = [arch_override]
-
-    engine_kwargs = {
-      "model": model_name,
-      "enable_sleep_mode": is_fft_enabled(),
-      "enable_lora": not is_fft_enabled(),
-      "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", "8192")),
-      "max_num_seqs": int(os.getenv("VLLM_MAX_NUM_SEQS", "64")),
-      "gpu_memory_utilization": float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")),
-      "enable_prefix_caching": False,
-      "enforce_eager": os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
-    }
-    if not is_fft_enabled():
-      engine_kwargs["max_loras"] = 8
-      engine_kwargs["max_lora_rank"] = 64
-    if hf_overrides:
-      engine_kwargs["hf_overrides"] = hf_overrides
-
-    engine_args = AsyncEngineArgs(**engine_kwargs)
+    if architecture_override_missing_for_fft():
+      print(
+        "[vLLM Worker] WARNING: OPEN_RL_ENABLE_FFT is on but VLLM_ARCHITECTURE_OVERRIDE is unset. "
+        "For multimodal base models (e.g. Gemma) the text-only FFT checkpoints will NOT match the "
+        "multimodal graph's weight names and reloads will be silently skipped "
+        "('Following weights were not loaded from checkpoint'). Set VLLM_ARCHITECTURE_OVERRIDE "
+        "(e.g. Gemma4ForCausalLM) unless the base model is already text-only."
+      )
+    engine_args = AsyncEngineArgs(**build_engine_kwargs(model_name))
     engine = AsyncLLMEngine.from_engine_args(engine_args)
 
     print("[vLLM Worker] Engine initialized successfully.")
+
+
+async def warmup_engine() -> None:
+  """Run one throwaway generation so runtime-JIT kernels compile before the
+  worker starts pulling requests.
+
+  vLLM's own startup warmup does not cover every kernel shape: Qwen's
+  GDN/gated-deltanet prefill+decode Triton kernels and the LoRA shrink/expand
+  kernels compile lazily on first use (the JIT monitor logs them as
+  "JIT compilation during inference"). On a cold Triton cache that build takes
+  minutes, and a real request stalling through it reads as a sampler timeout
+  client-side. Disable with OPEN_RL_VLLM_WARMUP=0.
+  """
+  if engine is None or os.getenv("OPEN_RL_VLLM_WARMUP", "1") != "1":
+    return
+  try:
+    from vllm import SamplingParams
+    from vllm.sampling_params import RequestOutputKind
+
+    max_len = int(os.getenv("VLLM_MAX_MODEL_LEN", "8192"))
+    prompt_len = max(8, min(1024, max_len - 16))
+    params = SamplingParams(n=1, temperature=0.0, max_tokens=8, output_kind=RequestOutputKind.FINAL_ONLY)
+    started = time.monotonic()
+    print(f"[vLLM Worker] Warming up ({prompt_len}-token prefill + 8 decode steps) to compile JIT kernels...")
+    async for _ in engine.generate(prompt={"prompt_token_ids": [1] * prompt_len}, sampling_params=params, request_id=f"warmup-{os.getpid()}"):
+      pass
+    print(f"[vLLM Worker] Warmup finished in {time.monotonic() - started:.1f}s.")
+  except Exception as exc:
+    print(f"[vLLM Worker] Warmup generation failed (continuing): {exc}")
+
+
+async def prepare_engine(weights_path: str | None, weights_revision: str | None = None) -> None:
+  """Wake vLLM and load a changed full-model checkpoint in place."""
+  global CURRENT_LOADED_SAMPLER_WEIGHTS
+
+  if engine is None:
+    init_engine()
+
+  if engine is None:
+    return
+
+  sleeping = await engine.is_sleeping()
+  sleep_level = vllm_sleep_level()
+  if sleeping and sleep_level == 2 and not weights_path:
+    raise RuntimeError("A checkpoint path is required to wake vLLM from sleep level 2")
+
+  target_revision = weights_revision or weights_path
+  weights_discarded = sleeping and sleep_level == 2
+  if weights_path and (weights_discarded or target_revision != CURRENT_LOADED_SAMPLER_WEIGHTS):
+    print(f"[vLLM Worker] Loading checkpoint path={weights_path} revision={CURRENT_LOADED_SAMPLER_WEIGHTS} -> {target_revision}")
+    await wait_for_generation_drain()
+    try:
+      if not sleeping:
+        await engine.sleep(level=sleep_level)
+      await engine.wake_up(tags=["weights"])
+      await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+      await engine.wake_up(tags=["kv_cache"])
+      # Cached KV blocks were computed under the previous weights. Prefix
+      # caching is disabled in our engine args, so this is a no-op today, but
+      # reloading weights without it would silently serve stale-cache garbage
+      # if caching is ever enabled.
+      await engine.reset_prefix_cache()
+    except Exception:
+      # A failed transition leaves the engine in an unknown half-woken state
+      # with possibly partially swapped weights. Poison the loaded revision so
+      # the next request forces a full reload instead of trusting it.
+      CURRENT_LOADED_SAMPLER_WEIGHTS = None
+      raise
+    CURRENT_LOADED_SAMPLER_WEIGHTS = target_revision
+    return
+
+  if sleeping:
+    print("[vLLM Worker] Waking engine for sampling...")
+    await engine.wake_up()
 
 
 async def run_generation_backend(
@@ -119,6 +279,22 @@ async def run_generation_backend(
   include_prompt_logprobs: bool,
 ) -> dict[str, Any]:
   try:
+    # The client cannot discover this server's context window, so multi-turn
+    # rollouts can legitimately outgrow it mid-episode (tool outputs append
+    # between the client's own budget checks). Translate "prompt won't fit"
+    # into the length-stop the RL env already treats as graceful truncation,
+    # instead of failing the request and killing the run.
+    max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", "8192"))
+    prompt_len = len(prompt_token_ids or [])
+    if prompt_len >= max_model_len or max_tokens <= 0:
+      print(
+        f"[vLLM Worker] Prompt of {prompt_len} tokens leaves no room in max_model_len={max_model_len} "
+        f"(max_tokens={max_tokens}); returning empty length-stop truncation."
+      )
+      return {"sequences": [{"tokens": [], "logprobs": [], "stop_reason": "length"} for _ in range(num_samples)]}
+    if prompt_len + max_tokens > max_model_len:
+      max_tokens = max_model_len - prompt_len
+
     current_engine = engine
     if current_engine is None:
       # Mocking for local Mac dev
@@ -199,7 +375,6 @@ async def run_generation_backend(
 
 async def process_sampling_request(req: dict, store: Any) -> None:
   global engine
-  global CURRENT_LOADED_SAMPLER_WEIGHTS
 
   request_id = req["request_id"]
   trace_context = req.get("trace_context", {})
@@ -207,49 +382,47 @@ async def process_sampling_request(req: dict, store: Any) -> None:
   parent_span = propagate.extract(trace_context)
   with tracer.start_as_current_span("process_sampling_request", context=parent_span):
     try:
-      # 1. Manage weights reloading
+      # 1. Load the exact full-model checkpoint and wake the engine.
       weights_path = req.get("weights_path")
-      if is_fft_enabled() and weights_path:
+      weights_revision = req.get("weights_revision") or weights_path
+      generation_registered = False
+      if is_fft_enabled():
         async with reload_lock:
-          if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
-            print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
-            if engine is not None:
-              print("[vLLM Worker] Triggering sleep level 2...")
-              await engine.sleep(level=2)
-              print("[vLLM Worker] Waking up weights...")
-              await engine.wake_up(tags=["weights"])
-              print(f"[vLLM Worker] Reloading weights from {weights_path} in-place...")
-              await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
-              print("[vLLM Worker] Waking up KV cache...")
-              await engine.wake_up(tags=["kv_cache"])
-            CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
-            print("[vLLM Worker] Weights reload completed successfully!")
+          await prepare_engine(weights_path, weights_revision)
+          # Register before releasing the lock so a reload for a different
+          # revision cannot slip in between prepare and generate.
+          await begin_generation()
+          generation_registered = True
 
-      # 2. Run inference
-      prompt_token_ids = req.get("prompt_token_ids", [])
-      max_tokens = req.get("max_tokens", 20)
-      temperature = req.get("temperature", 1.0)
-      stop = req.get("stop")
-      top_p = req.get("top_p", 1.0)
-      top_k = req.get("top_k", -1)
-      num_samples = req.get("num_samples", 1)
-      lora_id = req.get("lora_id")
-      lora_path = req.get("lora_path")
-      include_prompt_logprobs = req.get("include_prompt_logprobs", False)
+      try:
+        # 2. Run inference
+        prompt_token_ids = req.get("prompt_token_ids", [])
+        max_tokens = req.get("max_tokens", 20)
+        temperature = req.get("temperature", 1.0)
+        stop = req.get("stop")
+        top_p = req.get("top_p", 1.0)
+        top_k = req.get("top_k", -1)
+        num_samples = req.get("num_samples", 1)
+        lora_id = req.get("lora_id")
+        lora_path = req.get("lora_path")
+        include_prompt_logprobs = req.get("include_prompt_logprobs", False)
 
-      result = await run_generation_backend(
-        request_id=request_id,
-        prompt_token_ids=prompt_token_ids,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        stop=stop,
-        top_p=top_p,
-        top_k=top_k,
-        num_samples=num_samples,
-        lora_id=lora_id,
-        lora_path=lora_path,
-        include_prompt_logprobs=include_prompt_logprobs,
-      )
+        result = await run_generation_backend(
+          request_id=request_id,
+          prompt_token_ids=prompt_token_ids,
+          max_tokens=max_tokens,
+          temperature=temperature,
+          stop=stop,
+          top_p=top_p,
+          top_k=top_k,
+          num_samples=num_samples,
+          lora_id=lora_id,
+          lora_path=lora_path,
+          include_prompt_logprobs=include_prompt_logprobs,
+        )
+      finally:
+        if generation_registered:
+          await end_generation()
 
       if result.get("type") != "RequestFailedResponse":
         result["type"] = "sample"
@@ -262,10 +435,10 @@ async def process_sampling_request(req: dict, store: Any) -> None:
 
 async def run_sampling_worker(model_id: str) -> None:
   global engine
-  global CURRENT_LOADED_SAMPLER_WEIGHTS
   from server.store import get_store
 
   store = get_store()
+  instance_id = os.getenv("OPEN_RL_WORKER_INSTANCE_ID", "1")
   snapshot_registered = False
   workload = None
   if time_slicer is not None:
@@ -281,9 +454,10 @@ async def run_sampling_worker(model_id: str) -> None:
         print("[vLLM Worker] Initializing vLLM engine under parent lock...")
         init_engine()
         print("[vLLM Worker] Engine initialized successfully.")
+        await warmup_engine()
         if engine is not None:
           print("[vLLM Worker] Sleeping engine after init to yield GPU memory...")
-          await engine.sleep(level=2)
+          await engine.sleep(level=vllm_sleep_level())
     except Exception as exc:
       print(f"[vLLM Worker] Failed to perform coordinated initialization: {exc}")
       traceback.print_exc()
@@ -291,10 +465,12 @@ async def run_sampling_worker(model_id: str) -> None:
         init_engine()
   else:
     init_engine()
+    await warmup_engine()
 
   async def exit_gracefully() -> None:
     print(f"[vLLM Worker] Initiating immediate exit for model {model_id} sampler worker...")
     nonlocal snapshot_registered
+    await clear_sampler_ready(store, model_id, instance_id)
     if snapshot_registered and time_slicer is not None:
       assert workload is not None
       try:
@@ -323,9 +499,7 @@ async def run_sampling_worker(model_id: str) -> None:
     except NotImplementedError:
       pass
 
-  if hasattr(store, "redis"):
-    await store.redis.set(f"open_rl:sampler_ready:{model_id}", "1")
-    await store.redis.expire(f"open_rl:sampler_ready:{model_id}", 3600)
+  await publish_sampler_ready(store, model_id, instance_id)
 
   print(f"[vLLM Worker] Listening for sampling requests on queue for model: {model_id}...")
   try:
@@ -354,8 +528,7 @@ async def run_sampling_worker(model_id: str) -> None:
                 await exit_gracefully()
               if engine is not None:
                 print("[vLLM Worker] Exiting batch: sleeping engine to yield GPU memory...")
-                await engine.sleep(level=2)
-                CURRENT_LOADED_SAMPLER_WEIGHTS = None
+                await engine.sleep(level=vllm_sleep_level())
           else:
             tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
             await asyncio.gather(*tasks)
@@ -370,6 +543,7 @@ async def run_sampling_worker(model_id: str) -> None:
         traceback.print_exc()
         await asyncio.sleep(1)
   finally:
+    await clear_sampler_ready(store, model_id, instance_id)
     if time_slicer is not None:
       assert workload is not None
       try:
