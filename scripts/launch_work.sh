@@ -122,7 +122,7 @@ MODEL=${MODEL:-9b}
 case "$MODEL" in
   9b)
     MODEL_NAME=Qwen/Qwen3.5-9B
-    CONTEXT=262144
+    CONTEXT=${CONTEXT:-262144}
     GEN_TOKENS=${GEN_TOKENS:-32768}
     TASK_SET=${TASK_SET:-random}
     RUN_LABEL=${RUN_LABEL:-lab-lora-qwen9b}
@@ -132,7 +132,7 @@ case "$MODEL" in
     # 300/50 split for task diversity — and the 50-task eval's ~3,150
     # criteria cut eval noise to ~±1%, so small gains are detectable.
     MODEL_NAME=Qwen/Qwen3.5-9B
-    CONTEXT=131072
+    CONTEXT=${CONTEXT:-131072}
     GEN_TOKENS=${GEN_TOKENS:-32768}
     TASK_SET=${TASK_SET:-random}
     BATCH_SIZE=${BATCH_SIZE:-8}
@@ -141,7 +141,7 @@ case "$MODEL" in
     ;;
   27b)
     MODEL_NAME=Qwen/Qwen3.5-27B
-    CONTEXT=98304
+    CONTEXT=${CONTEXT:-98304}
     # 32K tool results in a 98K window would let a few parallel document
     # reads overflow the whole trajectory budget; 16K is the proven value.
     GEN_TOKENS=${GEN_TOKENS:-16384}
