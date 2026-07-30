@@ -2,13 +2,112 @@
 
 import math
 import os
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
+import torch.utils.checkpoint
 from pydantic import BaseModel
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
+from training.distributed import all_gather_object, all_reduce_max, all_reduce_sum, is_distributed, local_rank, rank, world_size
+
+
+def chunk_target_logprob(
+  hidden_chunk: torch.Tensor,
+  weight: torch.Tensor,
+  bias: torch.Tensor | None,
+  target_chunk: torch.Tensor,
+  softcap: float | None,
+) -> torch.Tensor:
+  """Project one chunk of hidden states through the vocab and return the selected
+  target logprob (logit[target] - logsumexp). The [chunk, vocab] logits tensor is
+  local to this call, so under activation checkpointing it is never stored for the
+  backward pass -- it is recomputed."""
+  logits = torch.nn.functional.linear(hidden_chunk, weight, bias)
+  if logits.dtype in (torch.float16, torch.bfloat16):
+    logits = logits.float()
+  if softcap is not None:
+    logits = softcap * torch.tanh(logits / softcap)
+  target_logit = logits.gather(dim=-1, index=target_chunk.unsqueeze(-1)).squeeze(-1)
+  return target_logit - torch.logsumexp(logits, dim=-1)
+
+
+FILLER_DATUM_INDEX = -1
+
+
+def shard_datum_indices(count: int, shard_rank: int, shard_count: int) -> list[int]:
+  """Round-robin datum ownership for one data-parallel rank."""
+  if shard_count <= 1:
+    return list(range(count))
+  return list(range(shard_rank, count, shard_count))
+
+
+def project_target_logprobs(model: PreTrainedModel, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+  """Project hidden states in small vocab chunks instead of building full logits."""
+  head = model.get_output_embeddings()
+  config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
+  batch, seq_len, _ = hidden.shape
+  hidden = hidden.reshape(batch * seq_len, -1).to(head.weight.device)
+  targets = targets.reshape(batch * seq_len).to(head.weight.device)
+  chunk_size = max(1, int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "128")))
+
+  def project(start: int) -> torch.Tensor:
+    args = (
+      hidden[start : start + chunk_size],
+      head.weight,
+      getattr(head, "bias", None),
+      targets[start : start + chunk_size],
+      getattr(config, "final_logit_softcapping", None),
+    )
+    if args[0].requires_grad or head.weight.requires_grad:
+      return torch.utils.checkpoint.checkpoint(chunk_target_logprob, *args, use_reentrant=False)
+    return chunk_target_logprob(*args)
+
+  return torch.cat([project(start) for start in range(0, hidden.shape[0], chunk_size)]).reshape(batch, seq_len)
+
+
+
+
+def activation_offload_context(tensor: torch.Tensor):
+  if tensor.is_cuda and os.getenv("OPEN_RL_ACTIVATION_CPU_OFFLOAD", "0") == "1":
+    return torch.autograd.graph.save_on_cpu(pin_memory=True)
+  return nullcontext()
+
+
+def attention_forward_kwargs(config: Any) -> dict[str, Any]:
+  """Use a low-resource FlexAttention tile for unusually wide heads."""
+  config = config.get_text_config()
+  if config._attn_implementation != "flex_attention":
+    return {}
+
+  if max(config.head_dim, getattr(config, "global_head_dim", 0) or 0) <= 256:
+    return {}
+  return {
+    "kernel_options": {
+      "fwd_BLOCK_M": 16,
+      "fwd_BLOCK_N": 16,
+      "fwd_num_stages": 1,
+      "bwd_BLOCK_M1": 16,
+      "bwd_BLOCK_N1": 16,
+      "bwd_BLOCK_M2": 16,
+      "bwd_BLOCK_N2": 16,
+      "bwd_num_stages": 1,
+    }
+  }
+
+
+def attention_backend_context(config: Any, tensor: torch.Tensor):
+  config = config.get_text_config()
+  if config._attn_implementation != "sdpa" or not tensor.is_cuda:
+    return nullcontext()
+  if os.getenv("OPEN_RL_SDPA_NO_MATH", "1") != "1":
+    return nullcontext()
+
+  from torch.nn.attention import SDPBackend, sdpa_kernel
+
+  return sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.CUDNN_ATTENTION])
 
 
 class TensorData(BaseModel):
@@ -21,37 +120,91 @@ class Datum(BaseModel):
 
 
 class BaseTrainerWorker:
+  # FSDP backwards run collectives, so pass counts must match across ranks.
+  backward_runs_collectives = True
+
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
+    self.output_head_is_adapted = False
 
     if torch.cuda.is_available():
-      self.device = torch.device("cuda")
+      self.device = torch.device("cuda", local_rank())
     elif torch.backends.mps.is_available():
       self.device = torch.device("mps")
     else:
       self.device = torch.device("cpu")
 
-  def forward_backward(self, model: PreTrainedModel, data: list[Datum], loss_fn: str, loss_config: dict | None = None) -> dict[str, Any]:
-    """Run a forward/backward pass on model and return Tinker-shaped loss outputs."""
-    total_loss = 0.0
-    loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
+  def forward_backward(
+    self,
+    model: PreTrainedModel,
+    data: list[Datum],
+    loss_fn: str,
+    loss_config: dict | None = None,
+    forward_only: bool = False,
+  ) -> dict[str, Any]:
+    """Run a forward/backward pass on model and return Tinker-shaped loss outputs.
+
+    With forward_only=True (the SDK's TrainingClient.forward()) no gradients are
+    computed or accumulated — the SDK's custom-loss path (e.g. cookbook DPO)
+    fetches logprobs this way with real weights attached and then sends the
+    actual gradient as a second, linearized forward_backward; running backward
+    here would silently corrupt that update with a spurious CE term.
+
+    Under distributed training each rank owns a round-robin shard of the datums
+    and gradients are summed across ranks through FSDP's per-backward averaging
+    (each real pass scales its loss by the shard count to cancel the average).
+    """
+    shard_count = world_size() if is_distributed() else 1
+    local_indices = shard_datum_indices(len(data), rank(), shard_count)
+    local_data = [data[idx] for idx in local_indices]
 
     model.train()
 
-    for batch in self.make_training_batches(data):
-      batch_indices = [idx for idx, _ in batch]
+    total_loss = 0.0
+    loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
+
+    local_batches = self.make_training_batches(local_data)
+    if shard_count > 1 and self.backward_runs_collectives:
+      # Pad short ranks with zero-scaled passes so FSDP collective counts match.
+      total_passes = all_reduce_max(len(local_batches))
+      filler_passes = total_passes - len(local_batches)
+      if filler_passes > 0:
+        filler = local_data[0] if local_data else data[0]
+        local_batches.extend([[(FILLER_DATUM_INDEX, filler)]] * filler_passes)
+
+    for batch in local_batches:
+      batch_positions = [idx for idx, _ in batch]
       batch_data = [datum for _, datum in batch]
+      is_filler = batch_positions == [FILLER_DATUM_INDEX]
+      batch_indices = [] if is_filler else [local_indices[position] for position in batch_positions]
 
       input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
       target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
-      target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+      seq_len = input_ids.shape[1]
+
+      old_logprobs = advantages = None
+      skip_backward = False
+      if loss_fn in ("importance_sampling", "ppo"):
+        old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
+        advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
+        zero_effective_advantages = not bool(((advantages != 0) & (weights != 0)).any())
+        if loss_fn == "importance_sampling":
+          skip_backward = zero_effective_advantages
+        else:
+          has_kl_penalty = bool(loss_config and loss_config.get("kl_coeff", 0.0) > 0 and (weights != 0).any())
+          skip_backward = zero_effective_advantages and not has_kl_penalty
+      skip_backward = (skip_backward and (shard_count == 1 or not self.backward_runs_collectives)) or forward_only
+
+      # A zero-advantage batch contributes no gradient; computing its logprobs
+      # under no_grad avoids building and retaining the autograd graph.
+      grad_context = torch.no_grad() if skip_backward else nullcontext()
+      with self.cuda_memory_phase(f"forward[{len(batch_data)}x{seq_len}]"), grad_context:
+        target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
 
       match loss_fn:
         case "cross_entropy":
           elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
         case "importance_sampling":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
           elementwise_loss = losses.importance_sampling_loss(
             target_logprobs,
             weights,
@@ -59,8 +212,6 @@ class BaseTrainerWorker:
             advantages,
           )
         case "ppo":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
           elementwise_loss = losses.ppo_loss(
             target_logprobs,
             weights,
@@ -73,8 +224,15 @@ class BaseTrainerWorker:
 
       per_datum_loss = elementwise_loss.sum(dim=1)
       loss = per_datum_loss.sum()
-      loss.backward()
-      total_loss += loss.item()
+      if not skip_backward:
+        # FSDP averages gradients over the group on every backward; scaling
+        # each real pass by shard_count recovers the single-process sum, and
+        # filler passes contribute exactly zero.
+        backward_loss = loss * (0.0 if is_filler else float(shard_count)) if shard_count > 1 else loss
+        with self.cuda_memory_phase(f"backward[{len(batch_data)}x{seq_len}]"):
+          backward_loss.backward()
+      if not is_filler:
+        total_loss += loss.item()
 
       detached_logprobs = target_logprobs.detach().cpu()
       for row, original_idx in enumerate(batch_indices):
@@ -82,6 +240,15 @@ class BaseTrainerWorker:
         logprobs_list = detached_logprobs[row, :row_len].tolist()
         logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
         loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
+
+      if skip_backward:
+        del target_logprobs, elementwise_loss, per_datum_loss, loss
+
+    if shard_count > 1:
+      total_loss = all_reduce_sum(total_loss)
+      for part in all_gather_object({idx: loss_fn_outputs[idx] for idx in local_indices}):
+        for idx, output in part.items():
+          loss_fn_outputs[idx] = output
 
     mean_loss = total_loss / max(1, len(data))
     completed_loss_fn_outputs = []
@@ -95,6 +262,39 @@ class BaseTrainerWorker:
       "loss_fn_outputs": completed_loss_fn_outputs,
       "loss_fn_output_type": "ArrayRecord",
     }
+
+  @contextmanager
+  def cuda_memory_phase(self, phase: str):
+    enabled = self.device.type == "cuda" and os.getenv("OPEN_RL_LOG_CUDA_MEMORY", "0") == "1"
+    if enabled:
+      torch.cuda.reset_peak_memory_stats(self.device)
+      self.log_cuda_memory(f"{phase}:start")
+    try:
+      yield
+    except torch.OutOfMemoryError:
+      self.log_cuda_memory(f"{phase}:oom", force=True)
+      print(torch.cuda.memory_summary(self.device, abbreviated=True))
+      raise
+    finally:
+      if enabled:
+        self.log_cuda_memory(f"{phase}:end", include_peak=True)
+
+  def log_cuda_memory(self, phase: str, *, force: bool = False, include_peak: bool = False) -> None:
+    if self.device.type != "cuda" or (not force and os.getenv("OPEN_RL_LOG_CUDA_MEMORY", "0") != "1"):
+      return
+    gib = 1024**3
+    free, total = torch.cuda.mem_get_info(self.device)
+    fields = {
+      "allocated": torch.cuda.memory_allocated(self.device) / gib,
+      "reserved": torch.cuda.memory_reserved(self.device) / gib,
+      "free": free / gib,
+      "total": total / gib,
+    }
+    if include_peak:
+      fields["peak_allocated"] = torch.cuda.max_memory_allocated(self.device) / gib
+      fields["peak_reserved"] = torch.cuda.max_memory_reserved(self.device) / gib
+    stats = " ".join(f"{key}={value:.2f}GiB" for key, value in fields.items())
+    print(f"[CUDA_MEMORY] rank={os.getenv('RANK', '0')} phase={phase} {stats}")
 
   def make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:
     """Group examples for the single padded forward/backward path."""
@@ -185,10 +385,80 @@ class BaseTrainerWorker:
     attention_mask: torch.Tensor,
     target_token_ids: torch.Tensor,
   ) -> torch.Tensor:
-    """Return selected target logprobs with shape [batch, max_target_len]."""
-    outputs = model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
-    logits = outputs.logits[:, : target_token_ids.shape[1], :]
-    return torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
+    """Return selected target logprobs with shape [batch, max_target_len].
+
+    Large-vocab models (e.g. Gemma's ~256K vocab) OOM the GPU holding the lm_head
+    because the full [batch, seq, vocab] logits tensor is materialized twice (once
+    by the head, again by log_softmax upcasting to fp32). We instead run the
+    backbone to get hidden states and project + reduce to the target logprob in
+    vocab-sized chunks, so peak head activation is [chunk, vocab]. Falls back to the
+    standard full-logits path when disabled or when the backbone can't be resolved.
+    """
+    seq_len = target_token_ids.shape[1]
+
+    # project_target_logprobs multiplies by head.weight directly, which would
+    # silently bypass an lm_head LoRA adapter (train_unembed) in both logprobs
+    # and gradients; the full-logits path runs the wrapped head's forward.
+    if os.getenv("OPEN_RL_FUSED_LOGPROB", "1") == "1" and not self.output_head_is_adapted:
+      hidden = self.backbone_hidden_states(model, input_ids, attention_mask)
+      if hidden is None:
+        raise RuntimeError(
+          "Fused logprob head could not resolve the model backbone. The full-logits "
+          "path materializes a [seq, vocab] tensor (tens of GiB at long context) and "
+          "bypasses activation offload; set OPEN_RL_FUSED_LOGPROB=0 to opt into it."
+        )
+      return project_target_logprobs(model, hidden[:, :seq_len, :], target_token_ids)
+
+    # Full-logits path. Use logit - logsumexp rather than log_softmax(...).gather so
+    # we avoid the extra full-size fp32 log_softmax allocation.
+    outputs = model(
+      input_ids,
+      attention_mask=attention_mask,
+      use_cache=False,
+      return_dict=True,
+      **attention_forward_kwargs(model.config),
+    )
+    logits = outputs.logits[:, :seq_len, :]
+    target_logit = logits.gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
+    return target_logit - torch.logsumexp(logits, dim=-1)
+
+  def backbone_hidden_states(
+    self,
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+  ) -> torch.Tensor | None:
+    """Return the transformer backbone's last_hidden_state without running the
+    lm_head. Returns None (so the caller uses the full-logits path) when the
+    backbone can't be resolved.
+
+    PEFT models must be unwrapped through get_base_model(): their attribute
+    delegation resolves `.model` to the full causal LM (lm_head included),
+    whose forward yields logits but no last_hidden_state — the old code then
+    ran a full forward, discarded it, and fell back to the full-logits path,
+    which at long context materializes a [seq, vocab] logits tensor tens of
+    GiB large, outside the activation-offload context. LoRA adapters live on
+    the backbone's submodules, so calling the backbone directly still applies
+    them."""
+    backbone_owner = model.get_base_model() if hasattr(model, "get_base_model") else model
+    backbone = getattr(backbone_owner, "model", None) or getattr(backbone_owner, "transformer", None)
+    if backbone is None or backbone is backbone_owner:
+      return None
+    backbone_attention_mask = attention_mask
+    if attention_mask is not None and bool(attention_mask.all()):
+      # A dense all-ones mask only describes ordinary causal attention. Omitting
+      # it lets SDPA select Flash Attention instead of materializing a quadratic
+      # additive mask for Gemma's global-attention layers.
+      backbone_attention_mask = None
+    with activation_offload_context(input_ids), attention_backend_context(model.config, input_ids):
+      outputs = backbone(
+        input_ids=input_ids,
+        attention_mask=backbone_attention_mask,
+        use_cache=False,
+        return_dict=True,
+        **attention_forward_kwargs(model.config),
+      )
+    return getattr(outputs, "last_hidden_state", None)
 
   def generate(
     self,
@@ -245,7 +515,11 @@ class BaseTrainerWorker:
   def prompt_logprobs(self, model: PreTrainedModel, input_tensor: torch.Tensor) -> list[float | None]:
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
-      outputs = model(input_tensor, attention_mask=attention_mask)
+      outputs = model(
+        input_tensor,
+        attention_mask=attention_mask,
+        **attention_forward_kwargs(model.config),
+      )
       logprob_dist = torch.nn.functional.log_softmax(outputs.logits[0, :-1], dim=-1)
 
     prompt_tokens = input_tensor[0].tolist()
