@@ -32,17 +32,36 @@ cpu = [
 ]
 gpu = [
     "datasets",
+    "flash-linear-attention==0.5.1",
     "numpy",
     "peft",
+    "tilelang>=0.1.9; sys_platform == 'linux'",
     "torch; sys_platform == 'linux'",
     "torchvision; sys_platform == 'linux'",
     "transformers>=5.5.4",
 ]
 vllm = [
     "torch; sys_platform == 'linux'",
+    "torchaudio; sys_platform == 'linux'",
     "torchvision; sys_platform == 'linux'",
     "torch-c-dlpack-ext; sys_platform == 'linux'",
-    "vllm==0.20.0; sys_platform == 'linux'",
+    "vllm==0.25.1.dev29+gf378f79b7.cu129; sys_platform == 'linux'",
+]
+# transformers' Qwen3.5/3.6 GDN fast path gates on causal-conv1d AND the fla
+# kernels together; without it all 48 deltanet layers run the eager torch
+# fallback (2-5x slower training). Building it needs nvcc; it lives in its own
+# extra so a compiler problem cannot take the core gpu sync down with it —
+# setup_vm.sh attempts it and warns loudly on failure.
+fastpath = [
+    "causal-conv1d>=1.4; sys_platform == 'linux'",
+    "torch; sys_platform == 'linux'",
+    # conv1d builds WITHOUT isolation (see tool.uv.no-build-isolation-package)
+    # so it compiles against this env's exact torch — its build requirements
+    # must therefore live in the env.
+    "setuptools; sys_platform == 'linux'",
+    "ninja; sys_platform == 'linux'",
+    "packaging; sys_platform == 'linux'",
+    "psutil; sys_platform == 'linux'",
 ]
 # Kubernetes cluster mode: the k8s API client used to launch FFT worker pods.
 cluster = [
@@ -61,6 +80,11 @@ where = ["src"]
 include = ["server*", "training*", "accel_timeslicer*"]
 
 [tool.uv]
+# causal-conv1d's setup.py imports torch and compiles against its ABI. In an
+# isolated build env the torch comes from PyPI (per-extra index mappings don't
+# apply there), which can mismatch the cu129 runtime torch. Building without
+# isolation compiles against the env's exact torch — mismatch impossible.
+no-build-isolation-package = ["causal-conv1d"]
 override-dependencies = [
     # vLLM still carries an older transformers constraint; keep the project on
     # the newer transformers line declared in our extras.
@@ -74,6 +98,10 @@ conflicts = [
     [
         { extra = "cpu" },
         { extra = "vllm" },
+    ],
+    [
+        { extra = "cpu" },
+        { extra = "fastpath" },
     ],
 ]
 
@@ -94,7 +122,7 @@ explicit = true
 
 [[tool.uv.index]]
 name = "vllm-cu129"
-url = "https://wheels.vllm.ai/0.20.0/cu129"
+url = "https://wheels.vllm.ai/f378f79b7c34d7ca94d53db34837929da2db03ed/cu129"
 explicit = true
 
 [tool.uv.sources]
@@ -102,6 +130,10 @@ explicit = true
 torch = [
     { index = "torch-cpu", extra = "cpu" },
     { index = "torch-gpu", extra = "gpu", marker = "sys_platform == 'linux'" },
+    { index = "torch-gpu", extra = "vllm", marker = "sys_platform == 'linux'" },
+    { index = "torch-gpu", extra = "fastpath", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
     { index = "torch-gpu", extra = "vllm", marker = "sys_platform == 'linux'" },
 ]
 torchvision = [
