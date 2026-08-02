@@ -11,7 +11,7 @@ from pathlib import Path
 import chz
 import tinker
 from env import LabDatasetBuilder
-from tasks import BOOTSTRAP_TASKS, EVAL_TASKS, family_task_split, random_task_split
+from tasks import BOOTSTRAP_TASKS, EVAL_TASKS, family_task_split, random_task_split, three_way_task_split
 from tinker.lib.public_interfaces import training_client as tinker_training_client
 from tinker_cookbook import checkpoint_utils
 
@@ -90,6 +90,9 @@ class RunConfig:
   # curated 100-train/20-eval lists earlier runs used (comparable numbers).
   task: str | None = None
   task_set: str = "random"
+  # Only used by task_set=disjoint: tasks reserved for SFT trace collection,
+  # family-disjoint from the RL train pool (must match collect_traces.py).
+  sft_tasks: int = 100
   train_tasks: int = 300
   eval_tasks: int = 50
   task_split_seed: int = 0
@@ -174,8 +177,12 @@ def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
     train_names, eval_names = random_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
   elif config.task_set == "family":
     train_names, eval_names = family_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
+  elif config.task_set == "disjoint":
+    _, train_names, eval_names = three_way_task_split(
+      config.lab_root, config.sft_tasks, config.train_tasks, config.eval_tasks, config.task_split_seed
+    )
   else:
-    raise ValueError(f"Unknown task_set {config.task_set!r} (use 'random', 'family', or 'bootstrap').")
+    raise ValueError(f"Unknown task_set {config.task_set!r} (use 'random', 'family', 'disjoint', or 'bootstrap').")
   return LabDatasetBuilder(
     lab_root=config.lab_root,
     task_names=train_names,

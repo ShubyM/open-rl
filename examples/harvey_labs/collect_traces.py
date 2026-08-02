@@ -8,7 +8,7 @@ usual judge, and write message-level traces to jsonl.
     endpoint=http://<glm-box>:8000/v1 teacher=zai-org/GLM-5.2-FP8 \
     split=eval rollouts_per_task=1 out=traces/glm_eval.jsonl
 
-Traces are stored as OpenAI-style messages; sft_traces.py re-renders them
+Traces are stored as OpenAI-style messages; sft.py re-renders them
 with the student renderer, so the teacher's chat format never leaks into
 training data. Doubles as a teacher eval: the summary line reports the
 pooled criterion pass rate of the collected episodes.
@@ -35,12 +35,15 @@ class TraceConfig:
   out: str
   lab_root: Path = RECIPE_DIR / "harvey-labs"
   api_key: str = "dummy"
-  split: str = "eval"  # eval | train | task=<name> via `task`
+  split: str = "eval"  # eval | train | sft (sft needs task_set=disjoint) | task=<name> via `task`
   task: str | None = None
-  task_set: str = "random"
+  task_set: str = "random"  # random | family | disjoint (family-disjoint sft/train/eval)
+  sft_tasks: int = 100
   train_tasks: int = 300
   eval_tasks: int = 50
   task_split_seed: int = 0
+  # Dataset repo to auto-upload the finished traces to (gzipped, under jsonl/).
+  hf_repo: str | None = None
   limit: int | None = None
   rollouts_per_task: int = 1
   parallel: int = 6
@@ -58,14 +61,41 @@ class TraceConfig:
 
 
 def select_tasks(config: TraceConfig) -> list[str]:
-  from tasks import family_task_split, random_task_split
+  from tasks import family_task_split, random_task_split, three_way_task_split
 
   if config.task:
     return [config.task]
-  split_fn = {"random": random_task_split, "family": family_task_split}[config.task_set]
-  train_names, eval_names = split_fn(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
-  names = eval_names if config.split == "eval" else train_names
+  if config.task_set == "disjoint":
+    sft_names, train_names, eval_names = three_way_task_split(
+      config.lab_root, config.sft_tasks, config.train_tasks, config.eval_tasks, config.task_split_seed
+    )
+    names = {"sft": sft_names, "train": train_names, "eval": eval_names}[config.split]
+  else:
+    if config.split == "sft":
+      raise ValueError("split=sft requires task_set=disjoint")
+    split_fn = {"random": random_task_split, "family": family_task_split}[config.task_set]
+    train_names, eval_names = split_fn(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
+    names = eval_names if config.split == "eval" else train_names
   return names[: config.limit] if config.limit else names
+
+
+def upload_traces(repo_id: str, out_path: Path) -> None:
+  import gzip
+  import shutil
+
+  from huggingface_hub import HfApi
+
+  gz_path = out_path.with_name(out_path.name + ".gz")
+  with open(out_path, "rb") as src, gzip.open(gz_path, "wb") as dst:
+    shutil.copyfileobj(src, dst)
+  HfApi().upload_file(
+    path_or_fileobj=str(gz_path),
+    path_in_repo=f"jsonl/{gz_path.name}",
+    repo_id=repo_id,
+    repo_type="dataset",
+    commit_message=f"Add {gz_path.name} from collect_traces.py",
+  )
+  print(f"[traces] uploaded hf datasets:{repo_id}/jsonl/{gz_path.name}")
 
 
 async def run_episode(config: TraceConfig, client: httpx.AsyncClient, task, tokenizer, system_prompt: str, rollout: int) -> dict:
@@ -245,6 +275,8 @@ async def collect(config: TraceConfig) -> None:
     f"[traces] teacher mean reward {sum(rewards) / len(rewards):.3f}, "
     f"pooled criteria {passed:.0f}/{total_criteria:.0f} = {passed / max(total_criteria, 1):.1%}"
   )
+  if config.hf_repo:
+    upload_traces(config.hf_repo, out_path)
 
 
 if __name__ == "__main__":

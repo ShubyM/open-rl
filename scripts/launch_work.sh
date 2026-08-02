@@ -6,6 +6,7 @@
 #   MODEL=9b  ./scripts/launch_work.sh                # Qwen3.5-9B, full 262K window (default)
 #   MODEL=27b ./scripts/launch_work.sh                # Qwen3.5-27B, 98K (measured H200 ceiling)
 #   TRAIN_GPUS=4 MODEL=27b ./scripts/launch_work.sh   # data-parallel LoRA trainer on 4 GPUs
+#   WORKLOAD=sft ./scripts/launch_work.sh             # train window types sft.py (RL is the default)
 #
 # Windows:
 #   sampler   vllm serve, data-parallel on the non-trainer GPUs   auto-starts
@@ -240,6 +241,18 @@ batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=20 eval_every=5 
 task_set=$TASK_SET judge_model=$JUDGE_MODEL \
 max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TOOL_TOKENS \
 log_path=artifacts/harvey-labs/$RUN_LABEL"
+
+# WORKLOAD=sft: same stack (the sampler still serves the post-SFT eval), but
+# the train window types the SFT warm-start script instead of RL. Traces
+# default to the public HF dataset inside sft.py.
+WORKLOAD=${WORKLOAD:-rl}
+if [ "$WORKLOAD" = "sft" ]; then
+  TRAIN_CMD="TINKER_API_KEY=tml-dummy uv --project examples run python examples/harvey_labs/sft.py \
+model_name=$MODEL_NAME"
+elif [ "$WORKLOAD" != "rl" ]; then
+  echo "Unknown WORKLOAD=$WORKLOAD (use 'rl' or 'sft')" >&2
+  exit 1
+fi
 
 EVAL_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
 checkpoint=/tmp/open-rl/peft/CHANGE-ME/final model_name=$MODEL_NAME renderer_name=qwen3_5 \

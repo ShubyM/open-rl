@@ -2,9 +2,8 @@
 """SFT a student on collected teacher traces, producing a snapshot that
 train.py can warm-start RL from via load_checkpoint_path.
 
-  uv --project examples run python examples/harvey_labs/sft_traces.py \
-    traces=traces/glm_train.jsonl base_url=http://127.0.0.1:9003 \
-    model_name=Qwen/Qwen3.5-9B
+  uv --project examples run python examples/harvey_labs/sft.py \
+    model_name=Qwen/Qwen3.5-9B  # traces default to the public HF dataset
 
 Traces are message-level (collect_traces.py); they are re-rendered here with
 the student renderer, so training tokens exactly match deployment rendering.
@@ -36,8 +35,10 @@ tinker_training_client.MAX_CHUNK_BYTES_COUNT = 30_000_000
 
 @chz.chz
 class SftConfig:
-  traces: str
-  base_url: str
+  # Default pulls the public trace dataset; pass traces=<path>.jsonl[.gz] for
+  # a local file or another hf:// URI.
+  traces: str = "hf://ShubyM/harvey-lab-glm-traces/jsonl/raw.jsonl.gz"
+  base_url: str = "http://127.0.0.1:9003"
   model_name: str = "Qwen/Qwen3.5-9B"
   renderer_name: str | None = "qwen3_5"
   lora_rank: int = 32
@@ -51,8 +52,26 @@ class SftConfig:
   snapshot_name: str = "sft-traces"
 
 
+def resolve_traces(traces: str) -> Path:
+  """Local path, or hf://<user>/<dataset>/<path-in-repo> (e.g. the jsonl/
+  mirrors collect_traces.py uploads with hf_repo=...)."""
+  if not traces.startswith("hf://"):
+    return Path(traces)
+  from huggingface_hub import hf_hub_download
+
+  parts = traces.removeprefix("hf://").split("/", 2)
+  if len(parts) != 3:
+    raise ValueError(f"Expected hf://<user>/<dataset>/<path-in-repo>, got {traces!r}")
+  return Path(hf_hub_download("/".join(parts[:2]), parts[2], repo_type="dataset"))
+
+
 def load_filtered(config: SftConfig) -> list[dict]:
-  records = [json.loads(line) for line in open(config.traces, encoding="utf-8")]
+  import gzip
+
+  path = resolve_traces(config.traces)
+  opener = gzip.open if path.suffix == ".gz" else open
+  with opener(path, "rt", encoding="utf-8") as f:
+    records = [json.loads(line) for line in f]
   kept = [r for r in records if r["reward"] >= config.min_reward and r["stop_reason"] == "no_tool_call"]
   by_task: dict[str, list[dict]] = {}
   for r in kept:
@@ -133,8 +152,9 @@ async def main(config: SftConfig) -> None:
       step += 1
       print(f"[sft] epoch {epoch} step {step}: {len(batch)} examples metrics={fb_result.metrics}", flush=True)
 
-  sampling_client = await training_client.save_weights_and_get_sampling_client_async(name=config.snapshot_name)
-  path = sampling_client.model_path
+  fut = await training_client.save_weights_for_sampler_async(name=config.snapshot_name)
+  res = await fut.result_async()
+  path = res.path
   print(f"\n[sft] done: {step} steps over {len(datums)} examples x {config.epochs} epochs")
   print(f"[sft] snapshot: {path}")
   print(f"[sft] warm-start RL with: load_checkpoint_path={path}")
