@@ -683,7 +683,10 @@ async def save_weights(req: dict):
         # tinker:// form is what create_model_from_state/load_weights resolve
         # on resume, so it must round-trip.
         "public_path": tinker_state_path(model_id, alias),
-        "include_optimizer": bool(req.get("include_optimizer", False)),
+        # State checkpoints exist to be resumable; the tinker SDK's save_state
+        # sends no include_optimizer field, so defaulting False silently made
+        # every save_every checkpoint adapter-only.
+        "include_optimizer": bool(req.get("include_optimizer", True)),
         "kind": "weights",
       },
       request_id=req_id,
