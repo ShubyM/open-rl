@@ -158,7 +158,20 @@ esac
 TOOL_TOKENS=${TOOL_TOKENS:-16384}
 BATCH_SIZE=${BATCH_SIZE:-5}
 ROLLOUTS=${ROLLOUTS:-2}
-echo "[work] MODEL=$MODEL -> $MODEL_NAME, context $CONTEXT, batch ${BATCH_SIZE}x${ROLLOUTS}, log $RUN_LABEL"
+
+WORKLOAD=${WORKLOAD:-rl}
+if [ "$WORKLOAD" = "sft" ]; then
+  # The trainer packs padded [max_len x count] forwards up to
+  # OPEN_RL_TRAIN_TOKEN_BUDGET (= CONTEXT here). At 262K it packs two ~131K
+  # SFT datums into one forward and OOMs; 163840 matches sft.py max_length,
+  # so the worst packed forward stays at one max-size datum's scale.
+  CONTEXT=${SFT_CONTEXT:-163840}
+fi
+echo "[work] MODEL=$MODEL -> $MODEL_NAME, context $CONTEXT, gen $GEN_TOKENS, tool $TOOL_TOKENS, batch ${BATCH_SIZE}x${ROLLOUTS}, log $RUN_LABEL"
+if [ "$GEN_TOKENS" -lt 32768 ] && [[ "$MODEL" == 9b* ]]; then
+  echo "WARNING: GEN_TOKENS=$GEN_TOKENS < 32768 — the 16K cap killed episodes mid-thought in runs 8-10" >&2
+  echo "         (run 11's record needed 32K). Unset GEN_TOKENS or export GEN_TOKENS=32768." >&2
+fi
 
 # fla kernel backend by architecture: Hopper requires TileLang (Triton>=3.4
 # dropped the deltanet path there); Blackwell runs the proven Triton backend
@@ -245,13 +258,19 @@ log_path=artifacts/harvey-labs/$RUN_LABEL"
 # WORKLOAD=sft: same stack (the sampler still serves the post-SFT eval), but
 # the train window types the SFT warm-start script instead of RL. Traces
 # default to the public HF dataset inside sft.py.
-WORKLOAD=${WORKLOAD:-rl}
 if [ "$WORKLOAD" = "sft" ]; then
   TRAIN_CMD="TINKER_API_KEY=tml-dummy uv --project examples run python examples/harvey_labs/sft.py \
 model_name=$MODEL_NAME"
 elif [ "$WORKLOAD" != "rl" ]; then
   echo "Unknown WORKLOAD=$WORKLOAD (use 'rl' or 'sft')" >&2
   exit 1
+fi
+
+# LOAD_CHECKPOINT=tinker://<id>/sampler_weights/<name> warm-starts RL from an
+# SFT snapshot (weights only, fresh optimizer).
+if [ "$WORKLOAD" = "rl" ] && [ -n "${LOAD_CHECKPOINT:-}" ]; then
+  TRAIN_CMD="$TRAIN_CMD load_checkpoint_path=$LOAD_CHECKPOINT"
+  echo "[work] RL warm start from $LOAD_CHECKPOINT"
 fi
 
 EVAL_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/eval_checkpoint.py \

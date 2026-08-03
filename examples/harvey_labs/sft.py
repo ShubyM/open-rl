@@ -35,10 +35,13 @@ tinker_training_client.MAX_CHUNK_BYTES_COUNT = 30_000_000
 
 @chz.chz
 class SftConfig:
-  # Default pulls the public trace dataset; pass traces=<path>.jsonl[.gz] for
-  # a local file or another hf:// URI.
-  traces: str = "hf://ShubyM/harvey-lab-glm-traces/jsonl/raw.jsonl.gz"
+  # Default pulls the public trace dataset (v2 = with teacher reasoning); pass
+  # traces=<path>.jsonl[.gz] for a local file or another hf:// URI.
+  traces: str = "hf://ShubyM/harvey-lab-glm-traces/jsonl/glm_sft_v2.jsonl.gz"
   base_url: str = "http://127.0.0.1:9003"
+  # SFT on traces without reasoning teaches the student to stop thinking
+  # (eval regression from ~50% to 41%); only override for a deliberate ablation.
+  allow_thought_free: bool = False
   model_name: str = "Qwen/Qwen3.5-9B"
   renderer_name: str | None = "qwen3_5"
   lora_rank: int = 32
@@ -98,7 +101,17 @@ def to_conversation(record: dict, renderer) -> list[dict]:
   call_names: dict[str, str] = {}
   for m in raw[2:]:
     if m["role"] == "assistant":
-      message: dict = {"role": "assistant", "content": m.get("content") or ""}
+      content: str | list[dict] = m.get("content") or ""
+      if m.get("reasoning"):
+        # Teacher reasoning becomes the student's thinking segment; the
+        # qwen3 renderer emits ThinkingPart as <think>...</think> and
+        # lab_renderer keeps it in history (strip_thinking_from_history=False),
+        # matching multi-turn RL deployment.
+        content = [
+          {"type": "thinking", "thinking": m["reasoning"]},
+          {"type": "text", "text": m.get("content") or ""},
+        ]
+      message: dict = {"role": "assistant", "content": content}
       if m.get("tool_calls"):
         calls = []
         for c in m["tool_calls"]:
@@ -130,6 +143,16 @@ async def main(config: SftConfig) -> None:
   records = load_filtered(config)
   if not records:
     raise ValueError("No traces survived filtering")
+  reasoning_turns = sum(1 for r in records for m in r["messages"] if m.get("reasoning"))
+  assistant_turns = sum(1 for r in records for m in r["messages"] if m["role"] == "assistant")
+  if reasoning_turns == 0 and not config.allow_thought_free:
+    raise ValueError(
+      "Traces carry no teacher reasoning — training on them suppresses the student's "
+      "thinking (the run-12 regression). Re-collect with a reasoning-parser-enabled "
+      "endpoint (collect_traces.py require_reasoning=true), or set allow_thought_free=true "
+      "for a deliberate ablation."
+    )
+  print(f"[sft] reasoning on {reasoning_turns}/{assistant_turns} assistant turns")
   datums = [
     conversation_to_datum(to_conversation(r, renderer), renderer, max_length=config.max_length, train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES)
     for r in records

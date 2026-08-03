@@ -55,6 +55,11 @@ class TraceConfig:
   max_tool_result_tokens: int = 16384
   judge_model: str = "gpt-glm-5.2"
   judge_parallel: int = 0
+  # The teacher's reasoning must come back in reasoning_content (serve with a
+  # reasoning parser, e.g. vllm --reasoning-parser glm45) — SFT on thought-free
+  # traces teaches the student to stop thinking. Only disable for teachers
+  # that genuinely do not reason.
+  require_reasoning: bool = True
   # Tokenizer used for tool-result truncation, matched to the student so the
   # observations the student later trains on are truncated identically.
   student_model: str = "Qwen/Qwen3.5-9B"
@@ -133,6 +138,10 @@ async def run_episode(config: TraceConfig, client: httpx.AsyncClient, task, toke
       {"role": "system", "content": system_prompt + artifact_path_prompt(task)},
       {"role": "user", "content": task.instructions},
     ]
+    # Wire messages never carry reasoning (it is not re-sent to the teacher and
+    # must not count against the trajectory budget); the recorded copy keeps it
+    # so sft.py can train the student's thinking on it.
+    recorded: list[dict] = list(messages)
     context_tokens = sum(len(tokenizer.encode(m["content"], add_special_tokens=False)) for m in messages)
     turns = 0
     stop_reason = "no_tool_call"
@@ -164,7 +173,14 @@ async def run_episode(config: TraceConfig, client: httpx.AsyncClient, task, toke
           }
           for call in tool_calls
         ]
+      reasoning = msg.get("reasoning_content") or ""
+      if config.require_reasoning and not reasoning:
+        raise RuntimeError(
+          f"Teacher returned no reasoning_content on {task.name} — enable the server's "
+          "reasoning parser (e.g. vllm serve --reasoning-parser glm45) or set require_reasoning=false."
+        )
       messages.append(assistant)
+      recorded.append({**assistant, "reasoning": reasoning} if reasoning else assistant)
       context_tokens += len(tokenizer.encode(json.dumps(assistant), add_special_tokens=False))
       turns += 1
       if choice.get("finish_reason") == "length":
@@ -183,7 +199,9 @@ async def run_episode(config: TraceConfig, client: httpx.AsyncClient, task, toke
           except json.JSONDecodeError:
             arguments = {}
           result = await asyncio.to_thread(tool._execute_bounded, ToolInput(arguments=arguments, call_id=call["id"]))
-        messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+        tool_message = {"role": "tool", "tool_call_id": call["id"], "content": result}
+        messages.append(tool_message)
+        recorded.append(tool_message)
         context_tokens += len(tokenizer.encode(result, add_special_tokens=False))
     else:
       stop_reason = "max_turns"
@@ -214,7 +232,7 @@ async def run_episode(config: TraceConfig, client: httpx.AsyncClient, task, toke
       "turns": turns,
       "context_tokens": context_tokens,
       "tool_specs": [tool.to_spec() for tool in tools.values()],
-      "messages": messages,
+      "messages": recorded,
     }
   finally:
     try:
@@ -270,10 +288,18 @@ async def collect(config: TraceConfig) -> None:
   rewards = [r for r, _, _ in results]
   passed = sum(p for _, p, _ in results)
   total_criteria = sum(t for _, _, t in results)
+  reasoning_turns = assistant_turns = 0
+  with open(out_path, encoding="utf-8") as f:
+    for line in f:
+      for m in json.loads(line)["messages"]:
+        if m["role"] == "assistant":
+          assistant_turns += 1
+          reasoning_turns += 1 if m.get("reasoning") else 0
   print(
     f"\n[traces] {len(results)} episodes -> {out_path}\n"
     f"[traces] teacher mean reward {sum(rewards) / len(rewards):.3f}, "
-    f"pooled criteria {passed:.0f}/{total_criteria:.0f} = {passed / max(total_criteria, 1):.1%}"
+    f"pooled criteria {passed:.0f}/{total_criteria:.0f} = {passed / max(total_criteria, 1):.1%}\n"
+    f"[traces] reasoning captured on {reasoning_turns}/{assistant_turns} assistant turns"
   )
   if config.hf_repo:
     upload_traces(config.hf_repo, out_path)
