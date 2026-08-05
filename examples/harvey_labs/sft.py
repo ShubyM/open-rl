@@ -101,16 +101,15 @@ def to_conversation(record: dict, renderer) -> list[dict]:
   call_names: dict[str, str] = {}
   for m in raw[2:]:
     if m["role"] == "assistant":
-      content: str | list[dict] = m.get("content") or ""
-      if m.get("reasoning"):
-        # Teacher reasoning becomes the student's thinking segment; the
-        # qwen3 renderer emits ThinkingPart as <think>...</think> and
-        # lab_renderer keeps it in history (strip_thinking_from_history=False),
-        # matching multi-turn RL deployment.
-        content = [
-          {"type": "thinking", "thinking": m["reasoning"]},
-          {"type": "text", "text": m.get("content") or ""},
-        ]
+      # Every trained turn carries Qwen-legal think structure: the teacher's
+      # reasoning when it deliberated, an empty block otherwise (Qwen's own
+      # non-thinking convention). Rendering thoughtless turns with no think
+      # tokens at all taught illegal turn shapes — the run-14 late-run
+      # </think> leakage and mid-work stops.
+      content: list[dict] = [
+        {"type": "thinking", "thinking": m.get("reasoning") or ""},
+        {"type": "text", "text": m.get("content") or ""},
+      ]
       message: dict = {"role": "assistant", "content": content}
       if m.get("tool_calls"):
         calls = []
