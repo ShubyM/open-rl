@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SFT Behavior Report — Harvey LAB</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a887f;
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --rule: #e4e2dc; --card: #f4f3ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8a887f;
+      --s1: #3987e5; --s2: #d95926; --s3: #199e70; --rule: #33322f; --card: #232320;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8a887f;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --rule: #33322f; --card: #232320;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--surface); color: var(--ink);
+         font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 48px 24px 80px; }
+  h1 { font-family: Charter, Georgia, serif; font-size: 2rem; line-height: 1.2;
+       margin: 0 0 4px; text-wrap: balance; }
+  .sub { color: var(--ink-2); margin: 0 0 28px; }
+  h2 { font-family: Charter, Georgia, serif; font-size: 1.3rem; margin: 44px 0 10px; }
+  p { max-width: 76ch; color: var(--ink); }
+  p.note { color: var(--ink-2); font-size: .9rem; }
+  .stats { display: flex; gap: 12px; flex-wrap: wrap; margin: 22px 0 8px; }
+  .stat { background: var(--card); border-radius: 6px; padding: 12px 16px; flex: 1 1 150px; }
+  .stat b { display: block; font-size: 1.5rem; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--ink-2); font-size: .82rem; }
+  figure { margin: 18px 0; }
+  figcaption { color: var(--ink-2); font-size: .88rem; margin-top: 4px; max-width: 76ch; }
+  .grid { stroke: var(--rule); stroke-width: 1; }
+  .tick { fill: var(--ink-3); font: 12px ui-monospace, monospace; }
+  .mtitle { fill: var(--ink-2); font: 13px system-ui, sans-serif; }
+  .dlabel { font: 12.5px system-ui, sans-serif; }
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 640px) { .duo { grid-template-columns: 1fr; } }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; font-size: .9rem; margin: 12px 0;
+           font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 12px; border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--ink-2); font-weight: 600; }
+  .chip { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+           margin-right: 6px; vertical-align: baseline; }
+  code { font: .88em ui-monospace, monospace; background: var(--card);
+          padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+<h1>How SFT changed the student</h1>
+<p class="sub">Behavioral evidence across three distillation generations · Harvey LAB · Qwen3.5-9B ·
+data through run 15 b10 · all numbers recomputed from raw rollout summaries</p>
+
+<div class="stats">
+  <div class="stat"><b>57.9%</b><span>v3 warm-start step-0 — best baseline ever (base ≈ 50)</span></div>
+  <div class="stat"><b>+0 pts</b><span>tool-style change explains of that gain — it is all episode survival</span></div>
+  <div class="stat"><b>19% → 10%</b><span>teacher-style parallel calls washed out by RL (run 14)</span></div>
+  <div class="stat"><b>20×</b><span>sample↔train KL blow-up that erased the v3 head start</span></div>
+</div>
+
+<h2>The arc in one chart</h2>
+<figure>
+<svg viewBox="0 0 860 330" role="img" style="width:100%;height:auto"><line x1="52" y1="252.2" x2="740" y2="252.2" class="grid"/><text x="44" y="256.2" class="tick" text-anchor="end">45%</text><line x1="52" y1="176.7" x2="740" y2="176.7" class="grid"/><text x="44" y="180.7" class="tick" text-anchor="end">55%</text><line x1="52" y1="101.1" x2="740" y2="101.1" class="grid"/><text x="44" y="105.1" class="tick" text-anchor="end">65%</text><line x1="52" y1="25.6" x2="740" y2="25.6" class="grid"/><text x="44" y="29.6" class="tick" text-anchor="end">75%</text><text x="52.0" y="308" class="tick" text-anchor="middle">0</text><text x="189.6" y="308" class="tick" text-anchor="middle">5</text><text x="327.2" y="308" class="tick" text-anchor="middle">10</text><text x="464.8" y="308" class="tick" text-anchor="middle">15</text><text x="602.4" y="308" class="tick" text-anchor="middle">20</text><text x="740.0" y="308" class="tick" text-anchor="middle">25</text><text x="396" y="324" class="tick" text-anchor="middle">step</text><polyline points="52.0,245.4 189.6,134.4 327.2,87.5 464.8,86.0 574.9,73.9 602.4,33.9 740.0,61.8" fill="none" stroke="var(--s1)" stroke-width="2"/><circle cx="52.0" cy="245.4" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 0: 45.9</title></circle><circle cx="189.6" cy="134.4" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 5: 60.6</title></circle><circle cx="327.2" cy="87.5" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 10: 66.8</title></circle><circle cx="464.8" cy="86.0" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 15: 67</title></circle><circle cx="574.9" cy="73.9" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 19: 68.6</title></circle><circle cx="602.4" cy="33.9" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 20: 73.9</title></circle><circle cx="740.0" cy="61.8" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 25: 70.2</title></circle><text x="750.0" y="65.8" class="dlabel" fill="var(--s1)">run 11 · RL-only</text><polyline points="52.0,209.9 189.6,217.5 327.2,169.9 464.8,181.2 574.9,181.2" fill="none" stroke="var(--s2)" stroke-width="2"/><circle cx="52.0" cy="209.9" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 0: 50.6</title></circle><circle cx="189.6" cy="217.5" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 5: 49.6</title></circle><circle cx="327.2" cy="169.9" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 10: 55.9</title></circle><circle cx="464.8" cy="181.2" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 15: 54.4</title></circle><circle cx="574.9" cy="181.2" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 19: 54.4</title></circle><text x="584.9" y="185.2" class="dlabel" fill="var(--s2)">run 14 · v2 warm</text><polyline points="52.0,154.8 189.6,244.7 327.2,252.2" fill="none" stroke="var(--s3)" stroke-width="2"/><circle cx="52.0" cy="154.8" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>run 15 · v3 warm — step 0: 57.9</title></circle><circle cx="189.6" cy="244.7" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>run 15 · v3 warm — step 5: 46</title></circle><circle cx="327.2" cy="252.2" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>run 15 · v3 warm — step 10: 45</title></circle><text x="337.2" y="256.2" class="dlabel" fill="var(--s3)">run 15 · v3 warm</text></svg>
+<figcaption>Live-graded criteria pass (/3,151, identical eval set). RL-only (run 11) climbs to the 73.9%
+record. The v2 warm start (run 14) tracks mid-pack and decays late from a format defect. The v3 warm
+start (run 15) begins 8 points above base — then loses everything to optimizer shock in five steps.
+Run 15 b5/b10 are live-grade readings; run 14's final point (43.7% at b20, not drawn) was
+measurement-damaged by its own no-output episodes.</figcaption>
+</figure>
+
+<h2>1 · What SFT actually changes at step 0: almost no style, some survival</h2>
+<p>Across every generation, the SFT'd student's <em>tool-calling style</em> at step 0 is nearly
+indistinguishable from base — same tool mix, similar turn counts, similar parallelism. What v3
+changed was <strong>episode survival</strong>: mean reward among surviving episodes was identical to
+v2's (0.635 vs 0.639), but four-to-five fewer episodes died. The entire 8-point baseline gain is
+fewer zeros, not better work.</p>
+<div class="tablewrap">
+<table>
+<thead><tr><th>step-0 eval</th><th>turns/ep</th><th>multi-call</th><th>biggest think turn</th>
+<th>wrote deliverable</th><th>zeros</th><th>pooled criteria</th></tr></thead>
+<tbody>
+<tr><td>base (run 11 b0)</td><td>10</td><td>16%</td><td>7,397</td><td>38/50</td><td>13</td><td>~50%</td></tr>
+<tr><td>v1 SFT (run 12 b0)</td><td>10</td><td>18%</td><td>7,576</td><td>—</td><td>9</td><td>—</td></tr>
+<tr><td>v2 SFT (run 14 b0)</td><td>12</td><td>19%</td><td>7,700</td><td>34/50</td><td>9</td><td>50.6%</td></tr>
+<tr><td><b>v3 SFT (run 15 b0)</b></td><td>12</td><td>18%</td><td>7,585</td><td>39/50</td><td><b>5</b></td><td><b>57.9%</b></td></tr>
+<tr><td>teacher (GLM-5.2)</td><td>15</td><td>27%</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>2 · RL keeps what it rewards, discards what SFT taught</h2>
+<figure>
+<svg viewBox="0 0 860 330" role="img" style="width:100%;height:auto"><line x1="52" y1="290.0" x2="740" y2="290.0" class="grid"/><text x="44" y="294.0" class="tick" text-anchor="end">0%</text><line x1="52" y1="222.0" x2="740" y2="222.0" class="grid"/><text x="44" y="226.0" class="tick" text-anchor="end">10%</text><line x1="52" y1="154.0" x2="740" y2="154.0" class="grid"/><text x="44" y="158.0" class="tick" text-anchor="end">20%</text><line x1="52" y1="86.0" x2="740" y2="86.0" class="grid"/><text x="44" y="90.0" class="tick" text-anchor="end">30%</text><line x1="52" y1="18.0" x2="740" y2="18.0" class="grid"/><text x="44" y="22.0" class="tick" text-anchor="end">40%</text><text x="52.0" y="308" class="tick" text-anchor="middle">0</text><text x="224.0" y="308" class="tick" text-anchor="middle">5</text><text x="396.0" y="308" class="tick" text-anchor="middle">10</text><text x="568.0" y="308" class="tick" text-anchor="middle">15</text><text x="740.0" y="308" class="tick" text-anchor="middle">20</text><text x="396" y="324" class="tick" text-anchor="middle">step</text><polyline points="52.0,181.2 568.0,79.2 740.0,38.4" fill="none" stroke="var(--s1)" stroke-width="2"/><circle cx="52.0" cy="181.2" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 0: 16</title></circle><circle cx="568.0" cy="79.2" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 15: 31</title></circle><circle cx="740.0" cy="38.4" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 · RL-only — step 20: 37</title></circle><text x="750.0" y="42.4" class="dlabel" fill="var(--s1)">run 11 · RL-only</text><polyline points="52.0,160.8 224.0,167.6 396.0,201.6 568.0,222.0" fill="none" stroke="var(--s2)" stroke-width="2"/><circle cx="52.0" cy="160.8" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 0: 19</title></circle><circle cx="224.0" cy="167.6" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 5: 18</title></circle><circle cx="396.0" cy="201.6" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 10: 13</title></circle><circle cx="568.0" cy="222.0" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 15: 10</title></circle><text x="578.0" y="226.0" class="dlabel" fill="var(--s2)">run 14 · v2 warm</text></svg>
+<figcaption>Share of tool-calling turns issuing parallel calls. The clearest teacher fingerprint SFT
+implanted (19% at run 14's step 0) decays monotonically under RL — while run 11's RL-only policy
+independently discovered and amplified the same behavior to 37% at its record checkpoint. The
+imitation prior is not sticky.</figcaption>
+</figure>
+<p>The behavior that actually moved scores — <strong>always write the deliverable</strong> — was
+re-learned by RL at full price in both lineages: run 14 went 34→46/50 in fifteen steps, exactly
+mirroring run 11's 38→50/50. SFT never pre-installed it, despite every kept teacher trace containing
+a written deliverable.</p>
+
+<h2>3 · The thinking-format defect (v2), and its repair (v3)</h2>
+<p>GLM marks a non-thinking turn by <em>omitting</em> reasoning; Qwen marks it with an
+<em>empty</em> <code>&lt;think&gt;</code> block — every legal Qwen turn carries think structure. The
+v2 converter mapped absence to absence, so ~47% of trained turns taught tag-free shapes the student
+never produces at inference. RL amplified that latent defect into run 14's late-run failure mode:
+stray <code>&lt;/think&gt;</code> in visible content, turns ending mid-work with no tool call,
+episodes with nothing to grade (<code>has_output</code> 0.96 → 0.83). v3 renders thoughtless turns as
+<code>&lt;think&gt;\n\n&lt;/think&gt;</code> — byte-identical to Qwen's own non-thinking prefill —
+and the canary has stayed at baseline since.</p>
+<figure>
+<svg viewBox="0 0 860 330" role="img" style="width:100%;height:auto"><line x1="52" y1="290.0" x2="740" y2="290.0" class="grid"/><text x="44" y="294.0" class="tick" text-anchor="end">0</text><line x1="52" y1="235.6" x2="740" y2="235.6" class="grid"/><text x="44" y="239.6" class="tick" text-anchor="end">2</text><line x1="52" y1="181.2" x2="740" y2="181.2" class="grid"/><text x="44" y="185.2" class="tick" text-anchor="end">4</text><line x1="52" y1="126.8" x2="740" y2="126.8" class="grid"/><text x="44" y="130.8" class="tick" text-anchor="end">6</text><line x1="52" y1="72.4" x2="740" y2="72.4" class="grid"/><text x="44" y="76.4" class="tick" text-anchor="end">8</text><line x1="52" y1="18.0" x2="740" y2="18.0" class="grid"/><text x="44" y="22.0" class="tick" text-anchor="end">10</text><text x="52.0" y="308" class="tick" text-anchor="middle">0</text><text x="224.0" y="308" class="tick" text-anchor="middle">5</text><text x="396.0" y="308" class="tick" text-anchor="middle">10</text><text x="568.0" y="308" class="tick" text-anchor="middle">15</text><text x="740.0" y="308" class="tick" text-anchor="middle">20</text><text x="396" y="324" class="tick" text-anchor="middle">step</text><polyline points="52.0,262.8 224.0,235.6 396.0,181.2 568.0,208.4 705.6,235.6 740.0,72.4" fill="none" stroke="var(--s2)" stroke-width="2"/><circle cx="52.0" cy="262.8" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 0: 1</title></circle><circle cx="224.0" cy="235.6" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 5: 2</title></circle><circle cx="396.0" cy="181.2" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 10: 4</title></circle><circle cx="568.0" cy="208.4" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 15: 3</title></circle><circle cx="705.6" cy="235.6" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 19: 2</title></circle><circle cx="740.0" cy="72.4" r="4.5" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>run 14 · v2 warm — step 20: 8</title></circle><text x="750.0" y="76.4" class="dlabel" fill="var(--s2)">run 14 · v2 warm</text><polyline points="52.0,235.6 224.0,181.2 396.0,154.0" fill="none" stroke="var(--s3)" stroke-width="2"/><circle cx="52.0" cy="235.6" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>run 15 · v3 warm — step 0: 2</title></circle><circle cx="224.0" cy="181.2" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>run 15 · v3 warm — step 5: 4</title></circle><circle cx="396.0" cy="154.0" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>run 15 · v3 warm — step 10: 5</title></circle><text x="406.0" y="158.0" class="dlabel" fill="var(--s3)">run 15 · v3 warm</text><polyline points="52.0,262.8 740.0,208.4" fill="none" stroke="var(--s1)" stroke-width="2" stroke-dasharray="5 4"/><circle cx="52.0" cy="262.8" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 control — step 0: 1</title></circle><circle cx="740.0" cy="208.4" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>run 11 control — step 20: 3</title></circle><text x="750.0" y="212.4" class="dlabel" fill="var(--s1)">run 11 control</text></svg>
+<figcaption>Episodes (of 50) with <code>&lt;/think&gt;</code> leaking into visible content. Run 14
+degenerates to 8 by step 20; run 15 holds at the run-11 control level (dashed) — the v3 fix survives
+RL pressure even while run 15's scores fell for an unrelated reason.</figcaption>
+</figure>
+
+<h2>4 · The optimizer shock: how run 15 lost 13 points without getting worse</h2>
+<div class="duo">
+<figure><svg viewBox="0 0 400 220" role="img" style="width:100%;height:auto"><text x="46" y="16" class="mtitle">Zero-reward episodes (of 50)</text><line x1="46" y1="186.0" x2="384" y2="186.0" class="grid"/><text x="40" y="190.0" class="tick" text-anchor="end">0</text><line x1="46" y1="130.3" x2="384" y2="130.3" class="grid"/><text x="40" y="134.3" class="tick" text-anchor="end">5</text><line x1="46" y1="74.6" x2="384" y2="74.6" class="grid"/><text x="40" y="78.6" class="tick" text-anchor="end">10</text><text x="46.0" y="202" class="tick" text-anchor="middle">0</text><text x="215.0" y="202" class="tick" text-anchor="middle">5</text><text x="384.0" y="202" class="tick" text-anchor="middle">10</text><polyline points="46.0,130.3 215.0,52.3 384.0,52.3" fill="none" stroke="var(--s3)" stroke-width="2"/><circle cx="46.0" cy="130.3" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>step 0: 5</title></circle><circle cx="215.0" cy="52.3" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>step 5: 12</title></circle><circle cx="384.0" cy="52.3" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>step 10: 12</title></circle></svg></figure>
+<figure><svg viewBox="0 0 400 220" role="img" style="width:100%;height:auto"><text x="46" y="16" class="mtitle">Mean reward among survivors</text><line x1="46" y1="186.0" x2="384" y2="186.0" class="grid"/><text x="40" y="190.0" class="tick" text-anchor="end">0.55</text><line x1="46" y1="134.0" x2="384" y2="134.0" class="grid"/><text x="40" y="138.0" class="tick" text-anchor="end">0.60</text><line x1="46" y1="82.0" x2="384" y2="82.0" class="grid"/><text x="40" y="86.0" class="tick" text-anchor="end">0.65</text><line x1="46" y1="30.0" x2="384" y2="30.0" class="grid"/><text x="40" y="34.0" class="tick" text-anchor="end">0.70</text><text x="46.0" y="202" class="tick" text-anchor="middle">0</text><text x="215.0" y="202" class="tick" text-anchor="middle">5</text><text x="384.0" y="202" class="tick" text-anchor="middle">10</text><polyline points="46.0,97.6 215.0,88.2 384.0,103.8" fill="none" stroke="var(--s3)" stroke-width="2"/><circle cx="46.0" cy="97.6" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>step 0: 0.635</title></circle><circle cx="215.0" cy="88.2" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>step 5: 0.644</title></circle><circle cx="384.0" cy="103.8" r="4.5" fill="var(--s3)" stroke="var(--surface)" stroke-width="2"><title>step 10: 0.629</title></circle></svg></figure>
+</div>
+<figcaption style="color:var(--ink-2);font-size:.88rem;max-width:76ch">Run 15, steps 0→10. Deaths
+more than double while survivor quality never moves — the policy did not get worse at the work; it
+got worse at <em>finishing</em>. Ten of twelve step-5 zeros end with a final turn that announces an
+action and issues no tool call.</figcaption>
+<p>Mechanism: warm-start RL begins with fresh Adam at full lr 2e-4, no warmup, no KL anchor
+(<code>kl_penalty_coef=0</code>). SFT sharpens the policy exactly where it trained — think structure
+and stopping tokens — and sharp distributions are where importance ratios explode.
+<code>optim/kl_sample_train</code> grew to ~20× baseline with rising grad norms: the classic drift
+loop where each update invalidates the data the next gradient is computed from. The damage scaled
+with altitude — the best warm start (57.9) produced the worst collapse (45), while run 14's mediocre
+start shrugged its dip off. Every warm-started run dipped at b5; no RL-only run ever did.</p>
+
+<h2>Verdict and the one experiment left</h2>
+<p><strong>What SFT provably transfers:</strong> episode survival (format legality) and a mild,
+temporary style prior. <strong>What it does not transfer:</strong> the reward-relevant disciplines
+RL learns on its own. <strong>What it risks:</strong> a sharpened policy that full-lr RL destroys in
+five steps. The decisive A/B is queued: relaunch the identical v3 snapshot at
+<code>learning_rate=1e-4</code>, abort early if <code>kl_sample_train</code> exceeds ~3–5× baseline
+by step 3. If b5 holds ≥56, the project has its best-ever trajectory; if it collapses at half lr,
+warm-starting is closed with clean evidence and RL-only stands as the answer.</p>
+
+<p class="note">Sources: raw eval_test_rollout_summaries + metrics.jsonl for runs 11–15 (dump), v1/v2
+trace datasets (HF: ShubyM/harvey-lab-glm-traces). Companion narrative:
+<code>docs/reports/sft-behavior-generations.md</code>. Generated 2026-08-06.</p>
+</main>
+</body>
+</html>
