@@ -106,30 +106,22 @@ class LabRubricReward:
           stdout=log,
           stderr=subprocess.STDOUT,
           env={**os.environ, "PYTHONUNBUFFERED": "1"},
-          timeout=self.timeout_seconds,
+          timeout=self.grading_timeout(),
         )
     except subprocess.TimeoutExpired:
       # An uncaught timeout would escape reward containment entirely and fail
       # the whole rollout group; grade it like any other grading failure.
       (self.run_dir / "reward_error.log").write_text(
-        f"TIMEOUT after {self.timeout_seconds}s\n\n" + grading_log.read_text(encoding="utf-8", errors="replace"),
+        f"TIMEOUT after {self.grading_timeout()}s\n\n" + grading_log.read_text(encoding="utf-8", errors="replace"),
         encoding="utf-8",
       )
-      return self.combine_rewards(0.0, process_reward), {
-        **process_metrics,
-        **self.failure_metrics(),
-        "lab/reward_error": 1.0,
-      }
+      return self.salvage_or_fail(process_reward, process_metrics)
     if result.returncode != 0:
       (self.run_dir / "reward_error.log").write_text(
         grading_log.read_text(encoding="utf-8", errors="replace"),
         encoding="utf-8",
       )
-      return self.combine_rewards(0.0, process_reward), {
-        **process_metrics,
-        **self.failure_metrics(),
-        "lab/reward_error": 1.0,
-      }
+      return self.salvage_or_fail(process_reward, process_metrics)
 
     scores = json.loads((self.run_dir / "scores.json").read_text(encoding="utf-8"))
     rubric_reward, rubric_metrics = reward_from_scores(scores)
@@ -139,6 +131,39 @@ class LabRubricReward:
       "lab/rubric_reward": rubric_reward,
       "lab/graded": 1.0,
       "lab/reward_error": 0.0,
+      "lab/failed_before_grading": 0.0,
+    }
+
+  def grading_timeout(self) -> int:
+    """Big rubrics legitimately grade for a long time under judge load; a
+    105-criterion task at the flat 3600s ceiling was the main producer of
+    killed-after-verdict episodes."""
+    return max(self.timeout_seconds, 90 * self.criteria_count)
+
+  def salvage_or_fail(self, process_reward: float, process_metrics: dict[str, float]) -> tuple[float, dict[str, float]]:
+    """A grading subprocess that timed out or crashed may still have written a
+    complete scores.json (the judge finishes, the wrapper dies). Discarding an
+    existing verdict zeroes genuinely good episodes — and in training, GRPO
+    then punishes the policy's best work on the biggest rubrics. Use the
+    verdict when it exists; fail closed only when it truly does not."""
+    try:
+      scores = json.loads((self.run_dir / "scores.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+      scores = None
+    if not scores or not scores.get("n_criteria"):
+      return self.combine_rewards(0.0, process_reward), {
+        **process_metrics,
+        **self.failure_metrics(),
+        "lab/reward_error": 1.0,
+      }
+    rubric_reward, rubric_metrics = reward_from_scores(scores)
+    return self.combine_rewards(rubric_reward, process_reward), {
+      **process_metrics,
+      **rubric_metrics,
+      "lab/rubric_reward": rubric_reward,
+      "lab/graded": 1.0,
+      "lab/reward_error": 0.0,
+      "lab/grading_salvaged": 1.0,
       "lab/failed_before_grading": 0.0,
     }
 
