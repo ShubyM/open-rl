@@ -74,8 +74,9 @@ class RunConfig:
     "fft-gsm8k-rl-hetero",
     "fft-textsql-rl",
     "fft-textsql-rl-x2",
+    "lora-fft-gsm8k-rl-x4",
   ]
-  sampling_backend: str = "torch"
+  sampling_backend: str = "vllm"
   trainer_gpu: str = "0"
   sampler_gpu: str = "1"
   base_url: str = ""
@@ -253,11 +254,18 @@ def start_backend(config: RunConfig, processes: list[ManagedProcess]) -> str:
   port = config.port or unused_tcp_port()
   base_url = f"http://{config.host}:{port}"
   env = base_env(config)
-  env["CUDA_VISIBLE_DEVICES"] = config.trainer_gpu
+  env["TRAINER_CUDA_VISIBLE_DEVICES"] = config.trainer_gpu
+  env["SAMPLER_CUDA_VISIBLE_DEVICES"] = config.sampler_gpu
+  if config.sampling_backend == "vllm":
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    env["VLLM_GPU_MEMORY_UTILIZATION"] = str(config.vllm_gpu_memory_utilization)
+  else:
+    env["CUDA_VISIBLE_DEVICES"] = config.trainer_gpu
 
-  if "fft" in config.scenario:
+  need_redis = "fft" in config.scenario or config.sampling_backend == "vllm"
+  if need_redis:
     if shutil.which("redis-server") is None:
-      raise RuntimeError("redis-server is required for FFT e2e scenarios")
+      raise RuntimeError("redis-server is required for multi-process e2e scenarios (vLLM sampling or FFT)")
     redis_port = unused_tcp_port()
     launch(
       processes,
@@ -268,6 +276,9 @@ def start_backend(config: RunConfig, processes: list[ManagedProcess]) -> str:
       lambda: redis_ok("127.0.0.1", redis_port),
       timeout=60,
     )
+    env["REDIS_URL"] = f"redis://127.0.0.1:{redis_port}/0"
+
+  if "fft" in config.scenario:
     if shutil.which("cuda-checkpoint") is None:
       raise RuntimeError(
         "cuda-checkpoint is required for FFT e2e scenarios (the snapshot agent checkpoints workers around every batch); "
@@ -285,30 +296,9 @@ def start_backend(config: RunConfig, processes: list[ManagedProcess]) -> str:
       timeout=60,
     )
     env["OPEN_RL_ACCEL_TIMESLICER_SOCKET"] = str(snapshot_socket)
-    env["REDIS_URL"] = f"redis://127.0.0.1:{redis_port}/0"
     env["OPEN_RL_ENABLE_FFT"] = "true"
   else:
-    env.pop("REDIS_URL", None)
     env.pop("OPEN_RL_ENABLE_FFT", None)
-
-  if env.get("SAMPLING_BACKEND") == "vllm":
-    if "fft" in config.scenario:
-      env["SAMPLER_CUDA_VISIBLE_DEVICES"] = config.sampler_gpu
-      env["VLLM_GPU_MEMORY_UTILIZATION"] = str(config.vllm_gpu_memory_utilization)
-    else:
-      vllm_env = env.copy()
-      vllm_env["CUDA_VISIBLE_DEVICES"] = config.sampler_gpu
-      vllm_env["VLLM_GPU_MEMORY_UTILIZATION"] = str(config.vllm_gpu_memory_utilization)
-      base_model = config.base_model
-      launch(
-        processes,
-        "vllm-worker",
-        uv_run(config.eval_uv_extra) + ["python", "-m", "server.vllm_sampler", "--model-id", base_model],
-        vllm_env,
-        log_dir / "vllm_worker.log",
-        lambda: True,
-        timeout=config.startup_timeout,
-      )
 
   launch(
     processes,
@@ -636,6 +626,75 @@ def run_gsm8k_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess
     for job, result in sorted(results.items()):
       if isinstance(result, BaseException):
         raise RuntimeError(f"fft-gsm8k-rl-x2 {job} failed") from result
+  finally:
+    cleanup_remote_models(base_url, [r for r in results.values() if isinstance(r, str)])
+
+
+def run_gsm8k_rl_x4_mixed(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
+  """Run four concurrent RL jobs on GSM8K (2x LoRA Qwen3-0.6B on L4 + 2x FFT Qwen3-8B on H100)."""
+  results: dict[str, str | BaseException] = {}
+
+  fft_model = "Qwen/Qwen3-8B"
+  lora_model = "Qwen/Qwen3-0.6B"
+
+  def train(job: str, mode: str, job_model: str) -> None:
+    try:
+      log_path = str(open_rl_tmp_dir(config) / f"{mode}_gsm8k_rl_{job}")
+      if os.path.exists(log_path):
+        shutil.rmtree(log_path)
+      module_name, renderer_name = _math_rl_train_module_and_renderer(job_model)
+      temp = "1.0"
+      lr = "1e-4" if mode == "lora" else "1e-5"
+      args = [
+        "env=gsm8k",
+        f"model_name={job_model}",
+        f"renderer_name={renderer_name}",
+        f"max_steps={config.steps if config.steps is not None else 10}",
+        f"base_url={base_url}",
+        f"log_path={log_path}",
+        f"group_size={config.group_size}",
+        f"groups_per_batch={config.groups_per_batch}",
+        f"max_tokens={config.max_tokens}",
+        f"learning_rate={lr}",
+        f"temperature={temp}",
+        "eval_every=0",
+        "save_every=0",
+        *clean_cli_extra(config.extra),
+      ]
+      env = examples_env(config).copy()
+      if mode == "lora":
+        env["OPEN_RL_FINE_TUNING_TYPE"] = "lora"
+        env.pop("OPEN_RL_IN_PLACE_DELTA", None)
+      else:
+        env["OPEN_RL_FINE_TUNING_TYPE"] = "full"
+        env["OPEN_RL_IN_PLACE_DELTA"] = "1"
+        env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = "patch_in_place"
+
+      results[job] = run_command(
+        ["uv", "--project", "examples", "run", "python", "-m", module_name, *args],
+        env=env,
+        watch=watch,
+        prefix=f"[{job}] ",
+      )
+    except BaseException as exc:
+      results[job] = exc
+
+  jobs_config = [
+    ("lora-a", "lora", lora_model),
+    ("lora-b", "lora", lora_model),
+    ("fft-a", "fft", fft_model),
+    ("fft-b", "fft", fft_model),
+  ]
+  threads = [threading.Thread(target=train, args=(job, mode, model)) for job, mode, model in jobs_config]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+
+  try:
+    for job, result in sorted(results.items()):
+      if isinstance(result, BaseException):
+        raise RuntimeError(f"lora-fft-gsm8k-rl-x4 {job} failed") from result
   finally:
     cleanup_remote_models(base_url, [r for r in results.values() if isinstance(r, str)])
 
@@ -1042,6 +1101,8 @@ def main() -> None:
       run_gsm8k_rl(config, base_url, processes)
     elif config.scenario in {"fft-gsm8k-rl-x2", "lora-gsm8k-rl-x2"}:
       run_gsm8k_rl_x2(config, base_url, processes)
+    elif config.scenario == "lora-fft-gsm8k-rl-x4":
+      run_gsm8k_rl_x4_mixed(config, base_url, processes)
     elif config.scenario == "fft-gsm8k-rl-x2-compare":
       run_gsm8k_rl_x2_compare(config, base_url, processes)
     elif config.scenario == "fft-gsm8k-rl-x3":

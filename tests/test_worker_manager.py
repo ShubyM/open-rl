@@ -1,8 +1,9 @@
+import json
 import unittest
 from unittest.mock import patch
 
 from server import gateway
-from server.worker_manager import FFTWorkerManager
+from server.worker_manager import LocalWorkerManager
 
 
 class StoreStub:
@@ -11,7 +12,7 @@ class StoreStub:
     self.futures = {}
     self.kv_store = {}
 
-  async def put_request(self, req_data: dict) -> None:
+  async def put_request(self, req_data: dict, active_set_id: str | None = None) -> None:
     self.forwarded_requests.append(req_data)
 
   async def set_future(self, req_id: str, result: dict) -> None:
@@ -25,6 +26,15 @@ class StoreStub:
 
   def get_value_sync(self, key: str) -> str | None:
     return self.kv_store.get(key)
+
+  async def get_model_metadata(self, model_id: str) -> dict | None:
+    val = self.kv_store.get(f"open_rl:model_meta:{model_id}")
+    if val:
+      try:
+        return json.loads(val)
+      except Exception:
+        return None
+    return None
 
 
 class WorkerManagerStub:
@@ -63,14 +73,14 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.store = StoreStub()
     self.worker_manager = WorkerManagerStub()
     self.old_store = gateway.store
-    self.old_manager = gateway.fft_worker_manager
+    self.old_manager = gateway.worker_manager
     gateway.store = self.store
-    gateway.fft_worker_manager = self.worker_manager
+    gateway.worker_manager = self.worker_manager
     self.addCleanup(self._restore)
 
   def _restore(self) -> None:
     gateway.store = self.old_store
-    gateway.fft_worker_manager = self.old_manager
+    gateway.worker_manager = self.old_manager
 
   async def test_create_model_launches_worker_then_enqueues(self) -> None:
     import json
@@ -144,11 +154,12 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual(self.worker_manager.launched_sampler_model_ids, ["model-x"])
 
-  async def test_create_model_without_fft_skips_launcher(self) -> None:
+  async def test_create_model_launches_trainer_when_worker_manager_present(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "false"}):
-      await gateway.create_model({"base_model": "base-model"})
+      result = await gateway.create_model({"base_model": "base-model"})
 
-    self.assertEqual(self.worker_manager.launched_model_ids, [])
+    model_id = result["request_id"]
+    self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
     self.assertEqual(len(self.store.forwarded_requests), 1)
 
 
@@ -159,17 +170,17 @@ class GatewayLifespanTest(unittest.IsolatedAsyncioTestCase):
         pass
 
 
-class FFTWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
+class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
   async def test_requires_redis(self) -> None:
     with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
-      FFTWorkerManager()
+      LocalWorkerManager()
 
   async def test_local_launch_stamps_workload_tags_and_process_group(self) -> None:
     with (
       patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True),
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
-      manager = FFTWorkerManager()
+      manager = LocalWorkerManager()
       manager.launch("Model_A.1")
 
     _, kwargs = popen.call_args
@@ -183,7 +194,7 @@ class FFTWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm"}, clear=True),
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
-      manager = FFTWorkerManager()
+      manager = LocalWorkerManager()
       manager.launch_sampler("Model_A.1")
 
     _, kwargs = popen.call_args
@@ -212,7 +223,7 @@ class FFTWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       patch("server.store.get_store", return_value=s),
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
-      manager = FFTWorkerManager()
+      manager = LocalWorkerManager()
       manager.launch_trainer("Model_A.1")
       _, kwargs = popen.call_args
       self.assertEqual(kwargs["env"].get("BASE_MODEL"), "base-model-a")
@@ -337,6 +348,67 @@ class GatewayFutureTranslationTest(unittest.TestCase):
           gateway.translate_future_result({"type": internal_type, "path": "/tmp/x"}),
           {"type": public_type, "path": "/tmp/x"},
         )
+
+
+class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
+  def setUp(self) -> None:
+    from pathlib import Path
+
+    with patch.dict("os.environ", {"REDIS_URL": "redis://127.0.0.1:6379"}):
+      self.manager = LocalWorkerManager(project_dir=Path("/tmp"))
+    self.store = StoreStub()
+
+  @patch("server.worker_manager._fetch_metadata_from_store")
+  @patch("subprocess.Popen")
+  def test_launch_sampler_lora_uses_base_model_and_reuses_process(self, mock_popen, mock_fetch) -> None:
+    from server.model_metadata import TrainingModelMetadata
+
+    mock_proc = unittest.mock.MagicMock()
+    mock_proc.poll.return_value = None
+    mock_popen.return_value = mock_proc
+
+    mock_fetch.return_value = TrainingModelMetadata(
+      base_model="Qwen/Qwen2.5-0.5B",
+      created_at=100.0,
+      fine_tuning_type="lora",
+    )
+
+    # Launch for first LoRA model ID
+    self.manager.launch_sampler("model-lora-1")
+    self.assertIn("Qwen/Qwen2.5-0.5B", self.manager.sampler_processes)
+    self.assertEqual(mock_popen.call_count, 1)
+
+    cmd_args = mock_popen.call_args[0][0]
+    self.assertIn("server.lora_sampler", cmd_args)
+    self.assertIn("Qwen/Qwen2.5-0.5B", cmd_args)
+
+    # Launch for second LoRA model ID sharing the same base model
+    self.manager.launch_sampler("model-lora-2")
+    # Should reuse existing process and NOT call popen again!
+    self.assertEqual(mock_popen.call_count, 1)
+
+  @patch("server.worker_manager._fetch_metadata_from_store")
+  @patch("subprocess.Popen")
+  def test_launch_sampler_fft_uses_model_id(self, mock_popen, mock_fetch) -> None:
+    from server.model_metadata import TrainingModelMetadata
+
+    mock_proc = unittest.mock.MagicMock()
+    mock_proc.poll.return_value = None
+    mock_popen.return_value = mock_proc
+
+    mock_fetch.return_value = TrainingModelMetadata(
+      base_model="Qwen/Qwen2.5-0.5B",
+      created_at=100.0,
+      fine_tuning_type="full",
+    )
+
+    self.manager.launch_sampler("model-fft-1")
+    self.assertIn("model-fft-1", self.manager.sampler_processes)
+    self.assertEqual(mock_popen.call_count, 1)
+
+    cmd_args = mock_popen.call_args[0][0]
+    self.assertIn("server.vllm_sampler", cmd_args)
+    self.assertIn("model-fft-1", cmd_args)
 
 
 if __name__ == "__main__":
