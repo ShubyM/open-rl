@@ -14,6 +14,10 @@ checkpoint — 3,151 pooled rubric criteria over the 50-task eval split.
 
 ![run 9 training curve](assets/run9.png)
 
+Architecture — the two-VM H200/B200 split, components, and checkpointing:
+[`architecture.html`](architecture.html) (presentation) and
+[ARCHITECTURE.md](ARCHITECTURE.md) (reference detail).
+
 ## Layout
 
 - `train.py` — run config and entrypoint (with grading preflight and final eval).
@@ -125,10 +129,24 @@ uv --project examples run python examples/harvey_labs/train.py \
 ```
 
 **Task selection** is a seeded random split of the whole runnable LAB pool
-(~1,750 tasks): `train_tasks=300 eval_tasks=50 task_split_seed=0` by
+(1,749 tasks): `train_tasks=300 eval_tasks=50 task_split_seed=0` by
 default, disjoint, preflighted for instructions/criteria/documents. The
 same config always reproduces the same split, so the split is the
-benchmark — keep the seed fixed across runs you want to compare.
+benchmark — keep `task_split_seed` *and* `train_tasks` fixed across runs
+you want to compare (the eval slice sits after the first `train_tasks`
+names of the shuffle, so the count is part of the split definition).
+
+To change what the model trains on without moving the benchmark, set
+`train_split_seed=<n>`: eval stays byte-identical, and the 300 train tasks
+are redrawn from everything outside eval's scenario families.
+`train_split_seed=242` is the recommended draw — 293 distinct families
+against the plain seed-0 draw's 282, a practice-area mix a third closer to
+the pool's, and 0 sibling-leaked tasks against seed 0's 8:
+
+```bash
+train_split_seed=242    # eval = task_split_seed=0's 50 tasks, unchanged
+```
+
 `task=<name>` trains a single task (no eval set) for smoke tests:
 `task=immigration/identify-h1b-qualification-issues max_reward_criteria=3`.
 

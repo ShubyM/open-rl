@@ -247,13 +247,34 @@ OPEN_RL_TRAIN_TOKEN_BUDGET=$CONTEXT OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
 OPEN_RL_LOG_CUDA_MEMORY=1 \
 uv run --extra gpu --extra vllm --extra fastpath python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003 |& tee -a $LOGS/gateway.log"
 
+# Overlapping fwd_bwd with sampling cuts ~40% off the median step at 8x6
+# (run10 4778s vs run8/run9 6378-8903s at identical rollout cost) and the
+# gradient is unchanged at num_substeps=1. On by default; STREAM_MINIBATCHES=0
+# to compare against the un-overlapped path.
+STREAM_MINIBATCHES=${STREAM_MINIBATCHES:-1}
+case "$STREAM_MINIBATCHES" in
+  1|true|True) STREAM_ARG="stream_minibatches=True" ;;
+  0|false|False) STREAM_ARG="stream_minibatches=False" ;;
+  *) echo "STREAM_MINIBATCHES must be 0 or 1 (got '$STREAM_MINIBATCHES')" >&2; exit 1 ;;
+esac
+
+# The eval split is the benchmark and stays on task_split_seed=0; 242 redraws
+# only the train pool, excluding scenario siblings of eval tasks. See
+# examples/harvey_labs/ARCHITECTURE.md "Task split".
+TRAIN_SPLIT_SEED=${TRAIN_SPLIT_SEED:-242}
+
 TRAIN_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/train.py \
 model_name=$MODEL_NAME renderer_name=qwen3_5 base_url=http://127.0.0.1:9003 \
 learning_rate=2e-4 lora_rank=32 \
 batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=20 eval_every=5 \
-task_set=$TASK_SET judge_model=$JUDGE_MODEL \
+task_set=$TASK_SET judge_model=$JUDGE_MODEL $STREAM_ARG \
 max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TOOL_TOKENS \
 log_path=artifacts/harvey-labs/$RUN_LABEL"
+
+# train_split_seed only applies to task_set=random; train.py rejects it otherwise.
+if [ "$TASK_SET" = "random" ]; then
+  TRAIN_CMD="$TRAIN_CMD train_split_seed=$TRAIN_SPLIT_SEED"
+fi
 
 # WORKLOAD=sft: same stack (the sampler still serves the post-SFT eval), but
 # the train window types the SFT warm-start script instead of RL. Traces
@@ -271,6 +292,14 @@ fi
 if [ "$WORKLOAD" = "rl" ] && [ -n "${LOAD_CHECKPOINT:-}" ]; then
   TRAIN_CMD="$TRAIN_CMD load_checkpoint_path=$LOAD_CHECKPOINT"
   echo "[work] RL warm start from $LOAD_CHECKPOINT"
+fi
+
+if [ "$WORKLOAD" = "rl" ]; then
+  if [ "$TASK_SET" = "random" ]; then
+    echo "[work] $STREAM_ARG, train_split_seed=$TRAIN_SPLIT_SEED (eval split unchanged)"
+  else
+    echo "[work] $STREAM_ARG"
+  fi
 fi
 
 EVAL_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/eval_checkpoint.py \

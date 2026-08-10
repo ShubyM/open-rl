@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Harvey LAB RL — architecture</title>
+<style>
+  :root {
+    --ink:      #101623;
+    --muted:    #626d80;
+    --faint:    #8b95a6;
+    --line:     #e2e6ec;
+    --surface:  #ffffff;
+    --page:     #f5f6f8;
+    --policy:   #2f6fdd;
+    --policybg: #eef4fe;
+    --judge:    #cf3b2f;
+    --judgebg:  #fdefee;
+    --store:    #12875a;
+    --storebg:  #eaf7f1;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 56px 40px 80px;
+    background: var(--page);
+    color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page { max-width: 1180px; margin: 0 auto; }
+
+  /* ---------- header ---------- */
+  h1 {
+    margin: 0 0 6px;
+    font-size: 30px;
+    font-weight: 640;
+    letter-spacing: -0.022em;
+  }
+  .lede {
+    margin: 0 0 40px;
+    max-width: 720px;
+    font-size: 17px;
+    color: var(--muted);
+  }
+
+  h2 {
+    margin: 56px 0 4px;
+    font-size: 12px;
+    font-weight: 660;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  h2 + .sub {
+    margin: 0 0 20px;
+    max-width: 720px;
+    font-size: 15px;
+    color: var(--muted);
+  }
+
+  /* ---------- the one rectangle ---------- */
+  .stage {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    padding: 26px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: 0 1px 2px rgba(16,22,35,.04), 0 8px 24px rgba(16,22,35,.05);
+  }
+
+  .vm {
+    flex: 1;
+    padding: 18px 20px 20px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #fcfcfd;
+  }
+  .vm.grading { flex: 0 0 300px; }
+
+  .vm-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .vm-name { font-size: 16px; font-weight: 640; letter-spacing: -0.01em; }
+  .vm-spec { font-size: 12.5px; color: var(--faint); }
+  .vm-role {
+    margin-left: auto;
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 3px 9px;
+    border-radius: 20px;
+  }
+  .vm-role.p { color: var(--policy); background: var(--policybg); }
+  .vm-role.j { color: var(--judge);  background: var(--judgebg); }
+
+  .parts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .parts.one { grid-template-columns: 1fr; }
+
+  .part {
+    padding: 13px 14px;
+    border-radius: 9px;
+    border: 1px solid transparent;
+  }
+  .part .t { font-size: 14.5px; font-weight: 620; letter-spacing: -0.005em; }
+  .part .d { margin-top: 3px; font-size: 12.5px; color: var(--muted); }
+
+  .part.p { background: var(--policybg); border-color: #d8e5fb; }
+  .part.p .t { color: #1e51ad; }
+  .part.j { background: var(--judgebg);  border-color: #f7d9d6; }
+  .part.j .t { color: #a72c22; }
+  .part.s { background: var(--storebg);  border-color: #cfeade; }
+  .part.s .t { color: #0c6844; }
+
+  .part.wide { grid-column: 1 / -1; }
+  .part.tall { height: 100%; display: flex; flex-direction: column; justify-content: center; }
+  .part .spec {
+    margin-top: 14px; padding-top: 12px;
+    border-top: 1px solid rgba(167,44,34,.15);
+    display: flex; flex-direction: column; gap: 4px;
+    font-size: 11.5px; color: #a8695f;
+  }
+
+  /* ---------- link between the two VMs ---------- */
+  .link {
+    flex: 0 0 168px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 18px;
+    padding: 0 14px;
+  }
+  .vpc {
+    text-align: center;
+    font-size: 10px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--faint);
+    padding-bottom: 4px;
+  }
+  .wire { text-align: center; }
+  .wire .cap {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .wire .cap .sub2 { display: block; font-weight: 450; color: var(--faint); font-size: 10.5px; }
+  .wire svg { display: block; width: 100%; height: 12px; margin-top: 5px; }
+
+  /* ---------- component write-ups ---------- */
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line);
+          border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .cell { background: var(--surface); padding: 20px; }
+  .cell h3 {
+    margin: 0 0 7px;
+    font-size: 14.5px;
+    font-weight: 640;
+    letter-spacing: -0.005em;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .dot.p { background: var(--policy); }
+  .dot.j { background: var(--judge); }
+  .dot.s { background: var(--store); }
+  .cell p { margin: 0; font-size: 13.5px; color: var(--muted); }
+  .cell code {
+    font: 500 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #f1f3f6; padding: 1.5px 5px; border-radius: 4px; color: #34405a;
+  }
+
+  /* ---------- step strip ---------- */
+  .steps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+  .step {
+    position: relative;
+    padding: 16px 15px 15px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+  }
+  .step .n {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 21px; height: 21px; margin-bottom: 9px;
+    border-radius: 50%;
+    font-size: 11.5px; font-weight: 680; color: #fff;
+    background: var(--policy);
+  }
+  .step.j .n { background: var(--judge); }
+  .step.s .n { background: var(--store); }
+  .step .t { font-size: 14px; font-weight: 620; }
+  .step .d { margin-top: 3px; font-size: 12.5px; color: var(--muted); }
+  .step:not(:last-child)::after {
+    content: "";
+    position: absolute; top: 50%; right: -10px; z-index: 2;
+    width: 10px; height: 1px; background: #c9d0da;
+  }
+  .loopback {
+    margin-top: 10px;
+    padding: 11px 15px;
+    border: 1px dashed #cdd4de;
+    border-radius: 8px;
+    font-size: 12.5px;
+    color: var(--muted);
+    text-align: center;
+    background: #fbfcfd;
+  }
+  .loopback b { color: var(--ink); font-weight: 620; }
+
+  /* ---------- checkpoints ---------- */
+  .ck { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card {
+    padding: 20px 22px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+  }
+  .card .top { display: flex; align-items: baseline; gap: 10px; margin-bottom: 3px; }
+  .card h3 { margin: 0; font-size: 15.5px; font-weight: 650; letter-spacing: -0.01em; }
+  .card .meta { margin-left: auto; font-size: 11.5px; color: var(--faint); }
+  .card .cad {
+    display: inline-block; margin-bottom: 12px;
+    font: 600 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .02em; text-transform: uppercase;
+    padding: 4px 8px; border-radius: 5px;
+    color: #0c6844; background: var(--storebg);
+  }
+  .card p { margin: 0 0 12px; font-size: 13.5px; color: var(--muted); }
+  .card ul { margin: 0; padding-left: 17px; font-size: 13.5px; color: var(--muted); }
+  .card li { margin-bottom: 5px; }
+  .card li b { color: var(--ink); font-weight: 610; }
+  .card .path {
+    margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line);
+    font: 500 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--faint); word-break: break-all;
+  }
+
+  .note {
+    margin-top: 18px; padding: 14px 18px;
+    border-left: 2px solid var(--judge);
+    background: var(--judgebg);
+    border-radius: 0 8px 8px 0;
+    font-size: 13.5px; color: #7d2b22;
+  }
+  .note b { font-weight: 650; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <h1>Harvey LAB RL — architecture</h1>
+  <p class="lede">
+    Two GPU machines. One runs <b>open-rl</b> and trains the policy; the other serves the
+    model that grades it. Everything else is detail.
+  </p>
+
+  <!-- ============ THE RECTANGLE ============ -->
+  <div class="stage">
+
+    <div class="vm">
+      <div class="vm-head">
+        <span class="vm-name">h200</span>
+        <span class="vm-spec">8 × H200 · us-east7-c</span>
+        <span class="vm-role p">Training</span>
+      </div>
+      <div class="parts">
+        <div class="part p wide">
+          <div class="t">open-rl gateway <span style="font-weight:450;color:#5b6a86">· tinker API</span></div>
+          <div class="d">The only thing training code talks to. Queues work, routes sampling.</div>
+        </div>
+        <div class="part p">
+          <div class="t">vLLM sampler</div>
+          <div class="d">Qwen3.5-9B policy<br>GPUs 4–7</div>
+        </div>
+        <div class="part p">
+          <div class="t">LoRA trainer</div>
+          <div class="d">GRPO updates<br>GPUs 0–3</div>
+        </div>
+        <div class="part p">
+          <div class="t">Task sandbox</div>
+          <div class="d">podman · documents, shell, file tools</div>
+        </div>
+        <div class="part s">
+          <div class="t">Checkpoints</div>
+          <div class="d">adapters + optimizer state on local disk</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="link">
+      <div class="vpc">internal VPC</div>
+      <div class="wire">
+        <div class="cap">work product
+          <span class="sub2">the agent's deliverables</span></div>
+        <svg viewBox="0 0 140 12" preserveAspectRatio="none" aria-hidden="true">
+          <line x1="0" y1="6" x2="128" y2="6" stroke="#b9c2ce" stroke-width="1.5"/>
+          <path d="M128 1.5 L136 6 L128 10.5 Z" fill="#b9c2ce"/>
+        </svg>
+      </div>
+      <div class="wire">
+        <div class="cap">reward
+          <span class="sub2">rubric pass rate</span></div>
+        <svg viewBox="0 0 140 12" preserveAspectRatio="none" aria-hidden="true">
+          <line x1="12" y1="6" x2="140" y2="6" stroke="#b9c2ce" stroke-width="1.5"/>
+          <path d="M12 1.5 L4 6 L12 10.5 Z" fill="#b9c2ce"/>
+        </svg>
+      </div>
+    </div>
+
+    <div class="vm grading">
+      <div class="vm-head">
+        <span class="vm-name">b200</span>
+        <span class="vm-spec">8 × B200</span>
+        <span class="vm-role j">Grading</span>
+      </div>
+      <div class="parts one" style="height: calc(100% - 61px)">
+        <div class="part j tall">
+          <div class="t">GLM-5.2 judge</div>
+          <div class="d">Scores each deliverable against the task's rubric, criterion by
+            criterion. Never trained — inference only.</div>
+          <div class="spec">
+            <span>vLLM · tensor-parallel across all 8 GPUs</span>
+            <span>16 episodes graded concurrently</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============ COMPONENTS ============ -->
+  <h2>Components</h2>
+  <p class="sub">What each piece owns, and why it exists as its own piece.</p>
+
+  <div class="grid">
+    <div class="cell">
+      <h3><span class="dot p"></span>open-rl gateway</h3>
+      <p>Presents the tinker API on <code>:9003</code>. The training loop is plain SDK code
+        against it and never learns whether the trainer is in-process or a separate job, or
+        whether sampling is one server or seven. Changing that shape is config, not code.</p>
+    </div>
+    <div class="cell">
+      <h3><span class="dot p"></span>vLLM sampler</h3>
+      <p>Serves the Qwen3.5-9B policy and holds KV cache for long multi-turn episodes. Loads a
+        new LoRA adapter at runtime between steps, so it never restarts mid-run.</p>
+    </div>
+    <div class="cell">
+      <h3><span class="dot p"></span>LoRA trainer</h3>
+      <p>Runs forward/backward and the optimizer step on its own cards. Split from the sampler
+        because gradients and KV cache would otherwise fight for the same memory.</p>
+    </div>
+    <div class="cell">
+      <h3><span class="dot p"></span>Task sandbox</h3>
+      <p>A rootless podman container per episode, holding the matter's documents and the shell
+        and file tools the model works with. Torn down when the episode ends.</p>
+    </div>
+    <div class="cell">
+      <h3><span class="dot j"></span>GLM-5.2 judge</h3>
+      <p>A second large model, on its own machine because it is never trained — colocating it
+        would cost the trainer half its cards to serve inference. Self-hosting it also means
+        a batch's episodes grade concurrently instead of queueing behind an API rate limit.</p>
+    </div>
+    <div class="cell">
+      <h3><span class="dot s"></span>Checkpoints</h3>
+      <p>Two artifacts per save with different jobs — the handoff to the sampler, and the
+        thing that resumes a run. Detailed below.</p>
+    </div>
+  </div>
+
+  <!-- ============ ONE STEP ============ -->
+  <h2>One RL step</h2>
+  <p class="sub">The model does real work, gets graded on it, and the gradient comes from the grade.</p>
+
+  <div class="steps">
+    <div class="step">
+      <div class="n">1</div>
+      <div class="t">Sample</div>
+      <div class="d">The policy takes a turn.</div>
+    </div>
+    <div class="step">
+      <div class="n">2</div>
+      <div class="t">Act</div>
+      <div class="d">Reads documents, runs tools, writes deliverables in the sandbox.</div>
+    </div>
+    <div class="step j">
+      <div class="n">3</div>
+      <div class="t">Grade</div>
+      <div class="d">The judge scores the rubric. Pass fraction is the reward.</div>
+    </div>
+    <div class="step">
+      <div class="n">4</div>
+      <div class="t">Train</div>
+      <div class="d">GRPO turns rewards into a LoRA update.</div>
+    </div>
+    <div class="step s">
+      <div class="n">5</div>
+      <div class="t">Save</div>
+      <div class="d">The new adapter is written to disk.</div>
+    </div>
+  </div>
+  <div class="loopback">
+    ↺ &nbsp;the sampler <b>hot-loads</b> that adapter before step 1 comes round again — which is
+    what keeps the next step on-policy
+  </div>
+
+  <!-- ============ CHECKPOINTS ============ -->
+  <h2>Checkpointing</h2>
+  <p class="sub">Every optimizer step writes an adapter; every fifth also writes full training state.</p>
+
+  <div class="ck">
+    <div class="card">
+      <div class="top">
+        <h3>Adapter snapshot</h3>
+        <span class="meta">~350 MB</span>
+      </div>
+      <span class="cad">every step</span>
+      <p>LoRA weights only. Written under a fresh immutable directory each time, so rollouts
+        still in flight keep reading a complete one.</p>
+      <ul>
+        <li><b>Feeds the sampler</b> — this is the hot-load.</li>
+        <li><b>Warm-starts a new run</b> — weights carry over, optimizer starts fresh. What you
+          want when the objective changes, like SFT → RL.</li>
+        <li><b>Offline eval</b> — point it at any past step.</li>
+      </ul>
+      <div class="path">/tmp/open-rl/peft/&lt;model-id&gt;/&lt;label&gt;/</div>
+    </div>
+
+    <div class="card">
+      <div class="top">
+        <h3>Full checkpoint</h3>
+        <span class="meta">~1 GB</span>
+      </div>
+      <span class="cad">every 5 steps</span>
+      <p>The adapter plus <code>optimizer.pt</code> — the Adam moments the snapshot leaves
+        behind.</p>
+      <ul>
+        <li><b>Resumes a run exactly</b>, momentum intact, rather than re-warming from
+          scratch.</li>
+        <li>The only artifact that can do that, which is why the cadence is worth its
+          disk.</li>
+      </ul>
+      <div class="path">/tmp/open-rl/checkpoints/&lt;model-id&gt;/weights/&lt;label&gt;/</div>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>Both live on local disk, on spot instances.</b> Losing a machine loses every checkpoint
+    on it — anything worth keeping is copied off to HF Hub or GCS.
+  </div>
+
+</div>
+</body>
+</html>

@@ -223,14 +223,41 @@ def discover_lab_tasks(lab_root: Path) -> tuple[list[str], int]:
   return names, skipped
 
 
-def random_task_split(lab_root: Path, num_train: int, num_eval: int, seed: int) -> tuple[list[str], list[str]]:
-  """Seeded disjoint train/eval task split over the whole runnable pool."""
+def random_task_split(
+  lab_root: Path, num_train: int, num_eval: int, seed: int, train_seed: int | None = None
+) -> tuple[list[str], list[str]]:
+  """Seeded disjoint train/eval task split over the whole runnable pool.
+
+  `seed` defines the eval split, which is the benchmark — keep it fixed across
+  runs being compared. The eval slice sits *after* the first `num_train` names
+  of that shuffle, so `train_tasks` is part of the benchmark definition too;
+  changing it moves eval even with `seed` pinned.
+
+  `train_seed` redraws only the train pool, from every task outside eval's
+  scenario families, leaving eval identical. Unset, train is the historical
+  `seed` draw (which is disjoint from eval by task but not by family, so
+  scenario siblings of eval tasks can appear in train).
+  """
   names, skipped = discover_lab_tasks(lab_root)
   if num_train + num_eval > len(names):
     raise ValueError(f"Requested {num_train} train + {num_eval} eval tasks but only {len(names)} runnable tasks exist under {lab_root / 'tasks'}")
-  random.Random(seed).shuffle(names)
-  print(f"[tasks] split seed={seed}: {num_train} train / {num_eval} eval from {len(names)} runnable tasks ({skipped} skipped as broken)")
-  return names[:num_train], names[num_train : num_train + num_eval]
+  shuffled = list(names)
+  random.Random(seed).shuffle(shuffled)
+  eval_names = shuffled[num_train : num_train + num_eval]
+  if train_seed is None:
+    print(f"[tasks] split seed={seed}: {num_train} train / {num_eval} eval from {len(names)} runnable tasks ({skipped} skipped as broken)")
+    return shuffled[:num_train], eval_names
+  eval_families = {task_family(name) for name in eval_names}
+  pool = [name for name in names if task_family(name) not in eval_families]
+  if num_train > len(pool):
+    raise ValueError(f"Requested {num_train} train tasks but only {len(pool)} sit outside eval's {len(eval_families)} scenario families")
+  random.Random(train_seed).shuffle(pool)
+  print(
+    f"[tasks] eval seed={seed} slice [{num_train}:{num_train + num_eval}] ({num_eval} tasks, unchanged) / "
+    f"train seed={train_seed}: {num_train} of {len(pool)} tasks outside eval's {len(eval_families)} families "
+    f"({skipped} skipped as broken)"
+  )
+  return pool[:num_train], eval_names
 
 
 def task_family(name: str) -> str:
