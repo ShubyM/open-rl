@@ -48,12 +48,18 @@ by_iter = {}
 for line in open(os.path.join(HERE, "eval_episodes.jsonl")):
     e = json.loads(line)
     keep = dict(RUNS)[e["run"]]
-    # run_final_eval drops an extra summary at the last completed batch; the
-    # real held-out points are the eval_every ones
-    if not keep(e["iter"]) or e["iter"] % EVAL_EVERY:
+    if not keep(e["iter"]):
         continue
     by_iter.setdefault(e["iter"], []).append(e["metrics"].get("lab/criteria_pass_fraction", 0.0))
+# Two evals land off the eval_every grid at the end, and both are real: the
+# cookbook fires one at the last batch (i_batch == end_batch - 1), then
+# train.py's run_final_eval scores the saved `final` checkpoint one update
+# later. Keep the grid points and that tail; anything else off-grid is an
+# artefact of a crashed run.
+last_step = max(steps) if steps else 0
 for it, cpf in by_iter.items():
+    if it % EVAL_EVERY and it < last_step:
+        continue
     evals[it] = sum(cpf) / len(cpf)
 
 x = sorted(steps)
@@ -73,9 +79,11 @@ ax.plot(ex, ey, "D", color="#d1495b", ms=9, label="held-out eval (50 tasks)", zo
 ax.plot(ex2, ey2, "D", color="#d1495b", ms=9, mfc="none", zorder=5,
         label="same weights, resampled")
 for i, v in zip(ex + ex2, ey + ey2):
-    # duck under the rollout line where it sits just above the diamond
+    # duck under the rollout line where it sits just above the diamond, and
+    # under an eval that sits one step to the right (the 34/35 tail pair)
     near = [b for a, b in zip(x, y) if a == i]
     below = bool(near) and 0 < near[0] - v < 0.03
+    below = below or (i + 1) in evals
     ax.annotate("%.3f" % v, (i, v), textcoords="offset points",
                 xytext=(0, -19 if below else 10), ha="center", color="#d1495b", fontsize=9)
 
@@ -92,7 +100,7 @@ ax.set_ylabel("criteria pass fraction")
 ax.set_title("run19 — Qwen3.5-9B LoRA r32, GRPO 8x6")
 ax.set_xticks(range(0, max(max(x), max(ex)) + 2))
 ax.grid(alpha=0.3)
-ax.legend(loc="upper right", fontsize=8.5, framealpha=0.9)
+ax.legend(loc="upper left", fontsize=8.5, framealpha=0.9)
 fig.tight_layout()
 out = os.path.join(HERE, "run19.png")
 fig.savefig(out, dpi=160)
