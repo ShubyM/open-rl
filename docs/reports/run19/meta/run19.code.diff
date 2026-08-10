@@ -1,0 +1,277 @@
+### repo: /home/shuby_google_com/open-rl @ cdc56e54f485896c1052bb3f3f30a02060fa427a
+modules: tinker_cookbook
+-- repo-wide (vs HEAD, staged+unstaged) --
+diff --git a/examples/harvey_labs/plot_run.py b/examples/harvey_labs/plot_run.py
+index fb56928..bc3b67f 100644
+--- a/examples/harvey_labs/plot_run.py
++++ b/examples/harvey_labs/plot_run.py
+@@ -27,7 +27,8 @@ def load_metrics(path: Path) -> list[dict]:
+ 
+ def rollout_rewards(log_dir: Path) -> list[tuple[int, float]]:
+   points = []
+-  for summary in sorted(log_dir.glob("iterations/iteration_*/train_rollout_summaries.jsonl")):
++  files = list(log_dir.glob("iteration_*/train_rollout_summaries.jsonl")) + list(log_dir.glob("iterations/iteration_*/train_rollout_summaries.jsonl"))
++  for summary in sorted(files):
+     step = int(summary.parent.name.split("_")[-1])
+     for line in summary.read_text().splitlines():
+       if line.strip():
+@@ -36,16 +37,21 @@ def rollout_rewards(log_dir: Path) -> list[tuple[int, float]]:
+ 
+ 
+ def eval_pass_rate(row: dict) -> float | None:
+-  episodes = row.get("test/env/harvey-labs/total_episodes")
+-  passed = row.get("test/env/harvey-labs/lab/criteria_passed")
+-  total = row.get("test/env/harvey-labs/lab/criteria_total")
+-  graded_marker = row.get("test/env/harvey-labs/lab/graded")
+-  if episodes and total and graded_marker is not None:
+-    return (passed * episodes) / (total * episodes)
+-  return row.get("test/env/harvey-labs/lab/criteria_pass_fraction")
+-
+-
+-def ema(values: list[float], alpha: float = 0.4) -> list[float]:
++  for prefix in ("test/env/all", "test/env/harvey-labs"):
++    episodes = row.get(f"{prefix}/total_episodes")
++    passed = row.get(f"{prefix}/lab/criteria_passed")
++    total = row.get(f"{prefix}/lab/criteria_total")
++    graded_marker = row.get(f"{prefix}/lab/graded")
++    if episodes and total and graded_marker is not None:
++      return (passed * episodes) / (total * episodes)
++    if row.get(f"{prefix}/lab/criteria_pass_fraction") is not None:
++      return row.get(f"{prefix}/lab/criteria_pass_fraction")
++    if row.get(f"{prefix}/reward/total") is not None:
++      return row.get(f"{prefix}/reward/total")
++  return None
++
++
++def ema(values: list[float], alpha: float = 0.35) -> list[float]:
+   smoothed = []
+   for value in values:
+     smoothed.append(value if not smoothed else alpha * value + (1 - alpha) * smoothed[-1])
+@@ -65,38 +71,65 @@ def main() -> None:
+ 
+   rows = load_metrics(args.log_dir / "metrics.jsonl")
+   raw = rollout_rewards(args.log_dir)
+-  train_rows = [(r["step"], r["env/harvey-labs/reward/total"]) for r in rows if "env/harvey-labs/reward/total" in r and "step" in r]
+-  evals = [(r["step"], eval_pass_rate(r)) for r in rows if eval_pass_rate(r) is not None and "step" in r]
++  train_rows = []
++  for r in rows:
++    if "step" in r:
++      for k in ("env/all/reward/total", "env/harvey-labs/reward/total"):
++        if k in r:
++          train_rows.append((r["step"], r[k]))
++          break
+ 
+-  fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
++  evals = [(r["step"], eval_pass_rate(r)) for r in rows if eval_pass_rate(r) is not None and "step" in r]
++  eval_map = {step: rate for step, rate in evals}
++  summaries = list(args.log_dir.glob("iterations/iteration_*/eval_test_rollout_summaries.jsonl")) + list(args.log_dir.glob("iteration_*/eval_test_rollout_summaries.jsonl"))
++  for summary in sorted(summaries):
++    try:
++      step = int(summary.parent.name.split("_")[-1])
++      tot_p, tot_t = 0, 0
++      for line in summary.read_text().splitlines():
++        if line.strip():
++          data = json.loads(line)
++          m = data.get("steps", [{}])[-1].get("metrics", {})
++          p = m.get("lab/criteria_passed")
++          t = m.get("lab/criteria_total")
++          if p is not None and t is not None and t > 0:
++            tot_p += p
++            tot_t += t
++      if tot_t > 0:
++        eval_map[step] = tot_p / tot_t
++    except Exception:
++      pass
++  evals = sorted(eval_map.items())
++
++  fig, ax = plt.subplots(figsize=(9, 5.5), dpi=150)
+   rng = random.Random(0)
+   if raw:
+     xs = [step + rng.uniform(-0.18, 0.18) for step, _ in raw]
+-    ax.scatter(xs, [reward for _, reward in raw], s=14, color=RAW_COLOR, alpha=0.6, linewidths=0, label="rollout reward", zorder=2)
++    ax.scatter(xs, [reward for _, reward in raw], s=16, color=RAW_COLOR, alpha=0.55, linewidths=0, label="rollout reward", zorder=2)
+   if train_rows:
+     steps = [step for step, _ in train_rows]
+     smoothed = ema([reward for _, reward in train_rows])
+-    ax.plot(steps, smoothed, color=SMOOTH_COLOR, linewidth=2, label="mean reward (EMA)", zorder=3)
+-    ax.annotate(f"{smoothed[-1]:.2f}", (steps[-1], smoothed[-1]), textcoords="offset points", xytext=(6, -3), color=SMOOTH_COLOR, fontsize=9)
++    ax.plot(steps, smoothed, color=SMOOTH_COLOR, linewidth=2.2, label="mean reward (EMA)", zorder=3)
++    ax.annotate(f"{smoothed[-1]:.2f}", (steps[-1], smoothed[-1]), textcoords="offset points", xytext=(6, -3), color=SMOOTH_COLOR, fontsize=9.5, fontweight="bold")
+   if evals:
+     ex = [step for step, _ in evals]
+     ey = [rate for _, rate in evals]
+     ax.plot(ex, ey, color=EVAL_COLOR, linewidth=2, linestyle=(0, (2, 3)), zorder=3)
+-    ax.scatter(ex, ey, s=64, color=EVAL_COLOR, marker="D", label="held-out criterion pass rate", zorder=4)
++    ax.scatter(ex, ey, s=70, color=EVAL_COLOR, marker="D", label="held-out criterion pass rate", zorder=4)
+     for x, y in evals:
+-      ax.annotate(f"{y:.0%}", (x, y), textcoords="offset points", xytext=(0, 9), ha="center", color=EVAL_COLOR, fontsize=9)
++      ax.annotate(f"{y:.1%}", (x, y), textcoords="offset points", xytext=(0, 9), ha="center", color=EVAL_COLOR, fontsize=9.5, fontweight="bold")
+ 
+   ax.set_ylim(-0.15, 1.05)
+-  ax.set_xlabel("step", color=INK)
+-  ax.set_ylabel("reward / pass rate", color=INK)
+-  ax.set_title(args.log_dir.name, color=INK, fontsize=11, loc="left")
++  ax.set_xlabel("step", color=INK, fontsize=10.5)
++  ax.set_ylabel("reward / pass rate", color=INK, fontsize=10.5)
++  ax.set_title(args.log_dir.name, color=INK, fontsize=12, loc="left", fontweight="bold", pad=10)
+   ax.grid(axis="y", color=MUTED, alpha=0.25, linewidth=0.5)
+   for spine in ("top", "right"):
+     ax.spines[spine].set_visible(False)
+   for spine in ("left", "bottom"):
+     ax.spines[spine].set_color(MUTED)
+-  ax.tick_params(colors=MUTED, labelsize=9)
+-  ax.legend(loc="upper left", frameon=False, fontsize=9, labelcolor=INK)
++  ax.tick_params(colors=MUTED, labelsize=9.5)
++  ax.legend(loc="upper left", frameon=False, fontsize=9.5, labelcolor=INK)
+ 
+   out = args.out or args.log_dir / "run_plot.png"
+   fig.tight_layout()
+diff --git a/examples/harvey_labs/tasks.py b/examples/harvey_labs/tasks.py
+index 1ea8e11..cd74bb0 100644
+--- a/examples/harvey_labs/tasks.py
++++ b/examples/harvey_labs/tasks.py
+@@ -223,14 +223,41 @@ def discover_lab_tasks(lab_root: Path) -> tuple[list[str], int]:
+   return names, skipped
+ 
+ 
+-def random_task_split(lab_root: Path, num_train: int, num_eval: int, seed: int) -> tuple[list[str], list[str]]:
+-  """Seeded disjoint train/eval task split over the whole runnable pool."""
++def random_task_split(
++  lab_root: Path, num_train: int, num_eval: int, seed: int, train_seed: int | None = None
++) -> tuple[list[str], list[str]]:
++  """Seeded disjoint train/eval task split over the whole runnable pool.
++
++  `seed` defines the eval split, which is the benchmark — keep it fixed across
++  runs being compared. The eval slice sits *after* the first `num_train` names
++  of that shuffle, so `train_tasks` is part of the benchmark definition too;
++  changing it moves eval even with `seed` pinned.
++
++  `train_seed` redraws only the train pool, from every task outside eval's
++  scenario families, leaving eval identical. Unset, train is the historical
++  `seed` draw (which is disjoint from eval by task but not by family, so
++  scenario siblings of eval tasks can appear in train).
++  """
+   names, skipped = discover_lab_tasks(lab_root)
+   if num_train + num_eval > len(names):
+     raise ValueError(f"Requested {num_train} train + {num_eval} eval tasks but only {len(names)} runnable tasks exist under {lab_root / 'tasks'}")
+-  random.Random(seed).shuffle(names)
+-  print(f"[tasks] split seed={seed}: {num_train} train / {num_eval} eval from {len(names)} runnable tasks ({skipped} skipped as broken)")
+-  return names[:num_train], names[num_train : num_train + num_eval]
++  shuffled = list(names)
++  random.Random(seed).shuffle(shuffled)
++  eval_names = shuffled[num_train : num_train + num_eval]
++  if train_seed is None:
++    print(f"[tasks] split seed={seed}: {num_train} train / {num_eval} eval from {len(names)} runnable tasks ({skipped} skipped as broken)")
++    return shuffled[:num_train], eval_names
++  eval_families = {task_family(name) for name in eval_names}
++  pool = [name for name in names if task_family(name) not in eval_families]
++  if num_train > len(pool):
++    raise ValueError(f"Requested {num_train} train tasks but only {len(pool)} sit outside eval's {len(eval_families)} scenario families")
++  random.Random(train_seed).shuffle(pool)
++  print(
++    f"[tasks] eval seed={seed} slice [{num_train}:{num_train + num_eval}] ({num_eval} tasks, unchanged) / "
++    f"train seed={train_seed}: {num_train} of {len(pool)} tasks outside eval's {len(eval_families)} families "
++    f"({skipped} skipped as broken)"
++  )
++  return pool[:num_train], eval_names
+ 
+ 
+ def task_family(name: str) -> str:
+diff --git a/examples/harvey_labs/train.py b/examples/harvey_labs/train.py
+index 1c81b59..6d7904e 100644
+--- a/examples/harvey_labs/train.py
++++ b/examples/harvey_labs/train.py
+@@ -96,6 +96,10 @@ class RunConfig:
+   train_tasks: int = 300
+   eval_tasks: int = 50
+   task_split_seed: int = 0
++  # task_set=random only: redraw the train pool from a different seed while
++  # task_split_seed keeps the eval split (the benchmark) byte-identical. Also
++  # excludes scenario siblings of eval tasks, which the plain draw allows.
++  train_split_seed: int | None = None
+   eval_every: int = 20
+   batch_size: int = 1
+   rollouts_per_example: int = 4
+@@ -169,12 +173,16 @@ def preflight_grading(config: RunConfig) -> None:
+ 
+ 
+ def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
++  if config.train_split_seed is not None and (config.task or config.task_set != "random"):
++    raise ValueError(f"train_split_seed only applies to task_set='random' (got task_set={config.task_set!r}, task={config.task!r}).")
+   if config.task:
+     train_names, eval_names = [config.task], []
+   elif config.task_set == "bootstrap":
+     train_names, eval_names = list(BOOTSTRAP_TASKS), list(EVAL_TASKS)
+   elif config.task_set == "random":
+-    train_names, eval_names = random_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
++    train_names, eval_names = random_task_split(
++      config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed, config.train_split_seed
++    )
+   elif config.task_set == "family":
+     train_names, eval_names = family_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
+   elif config.task_set == "disjoint":
+diff --git a/scripts/launch_work.sh b/scripts/launch_work.sh
+index c684453..a8bdbef 100755
+--- a/scripts/launch_work.sh
++++ b/scripts/launch_work.sh
+@@ -247,14 +247,35 @@ OPEN_RL_TRAIN_TOKEN_BUDGET=$CONTEXT OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
+ OPEN_RL_LOG_CUDA_MEMORY=1 \
+ uv run --extra gpu --extra vllm --extra fastpath python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003 |& tee -a $LOGS/gateway.log"
+ 
++# Overlapping fwd_bwd with sampling cuts ~40% off the median step at 8x6
++# (run10 4778s vs run8/run9 6378-8903s at identical rollout cost) and the
++# gradient is unchanged at num_substeps=1. On by default; STREAM_MINIBATCHES=0
++# to compare against the un-overlapped path.
++STREAM_MINIBATCHES=${STREAM_MINIBATCHES:-1}
++case "$STREAM_MINIBATCHES" in
++  1|true|True) STREAM_ARG="stream_minibatches=True" ;;
++  0|false|False) STREAM_ARG="stream_minibatches=False" ;;
++  *) echo "STREAM_MINIBATCHES must be 0 or 1 (got '$STREAM_MINIBATCHES')" >&2; exit 1 ;;
++esac
++
++# The eval split is the benchmark and stays on task_split_seed=0; 242 redraws
++# only the train pool, excluding scenario siblings of eval tasks. See
++# examples/harvey_labs/ARCHITECTURE.md "Task split".
++TRAIN_SPLIT_SEED=${TRAIN_SPLIT_SEED:-242}
++
+ TRAIN_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/train.py \
+ model_name=$MODEL_NAME renderer_name=qwen3_5 base_url=http://127.0.0.1:9003 \
+ learning_rate=2e-4 lora_rank=32 \
+ batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=20 eval_every=5 \
+-task_set=$TASK_SET judge_model=$JUDGE_MODEL \
++task_set=$TASK_SET judge_model=$JUDGE_MODEL $STREAM_ARG \
+ max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TOOL_TOKENS \
+ log_path=artifacts/harvey-labs/$RUN_LABEL"
+ 
++# train_split_seed only applies to task_set=random; train.py rejects it otherwise.
++if [ "$TASK_SET" = "random" ]; then
++  TRAIN_CMD="$TRAIN_CMD train_split_seed=$TRAIN_SPLIT_SEED"
++fi
++
+ # WORKLOAD=sft: same stack (the sampler still serves the post-SFT eval), but
+ # the train window types the SFT warm-start script instead of RL. Traces
+ # default to the public HF dataset inside sft.py.
+@@ -273,6 +294,14 @@ if [ "$WORKLOAD" = "rl" ] && [ -n "${LOAD_CHECKPOINT:-}" ]; then
+   echo "[work] RL warm start from $LOAD_CHECKPOINT"
+ fi
+ 
++if [ "$WORKLOAD" = "rl" ]; then
++  if [ "$TASK_SET" = "random" ]; then
++    echo "[work] $STREAM_ARG, train_split_seed=$TRAIN_SPLIT_SEED (eval split unchanged)"
++  else
++    echo "[work] $STREAM_ARG"
++  fi
++fi
++
+ EVAL_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
+ checkpoint=/tmp/open-rl/peft/CHANGE-ME/final model_name=$MODEL_NAME renderer_name=qwen3_5 \
+ base_url=http://127.0.0.1:9003 task_set=$TASK_SET judge_model=$JUDGE_MODEL \
+diff --git a/src/accel_timeslicer/__pycache__/__init__.cpython-312.pyc b/src/accel_timeslicer/__pycache__/__init__.cpython-312.pyc
+index dbbbb0d..498c874 100644
+Binary files a/src/accel_timeslicer/__pycache__/__init__.cpython-312.pyc and b/src/accel_timeslicer/__pycache__/__init__.cpython-312.pyc differ
+diff --git a/src/accel_timeslicer/__pycache__/time_slicer.cpython-312.pyc b/src/accel_timeslicer/__pycache__/time_slicer.cpython-312.pyc
+index 32993d8..a2d1169 100644
+Binary files a/src/accel_timeslicer/__pycache__/time_slicer.cpython-312.pyc and b/src/accel_timeslicer/__pycache__/time_slicer.cpython-312.pyc differ
+diff --git a/src/accel_timeslicer/__pycache__/workload.cpython-312.pyc b/src/accel_timeslicer/__pycache__/workload.cpython-312.pyc
+index 4eaf26c..b2b6d76 100644
+Binary files a/src/accel_timeslicer/__pycache__/workload.cpython-312.pyc and b/src/accel_timeslicer/__pycache__/workload.cpython-312.pyc differ

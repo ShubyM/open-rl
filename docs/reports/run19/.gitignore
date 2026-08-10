@@ -1,0 +1,7 @@
+# Full eval transcripts (~46 MB) and the slim training index (~26 MB).
+# Run data stays out of git (see /.gitignore `runs/`); both rebuild from the
+# artifact mirror with `python docs/reports/run19/build.py`. The report, the
+# metrics and eval_episodes.jsonl are committed, so every number here is
+# reproducible without them.
+evals/
+train_episodes.jsonl.gz
