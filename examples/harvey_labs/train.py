@@ -100,6 +100,11 @@ class RunConfig:
   # task_split_seed keeps the eval split (the benchmark) byte-identical. Also
   # excludes scenario siblings of eval tasks, which the plain draw allows.
   train_split_seed: int | None = None
+  # task_set=random only: extra train tasks appended after the first
+  # `train_tasks`, leaving the eval slice — and therefore every earlier batch —
+  # untouched. `max_steps` clamps to ceil(len(train)/batch_size), so this is the
+  # knob that buys more batches without redefining the benchmark.
+  train_tasks_extra: int = 0
   eval_every: int = 20
   batch_size: int = 1
   rollouts_per_example: int = 4
@@ -175,13 +180,15 @@ def preflight_grading(config: RunConfig) -> None:
 def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
   if config.train_split_seed is not None and (config.task or config.task_set != "random"):
     raise ValueError(f"train_split_seed only applies to task_set='random' (got task_set={config.task_set!r}, task={config.task!r}).")
+  if config.train_tasks_extra and (config.task or config.task_set != "random"):
+    raise ValueError(f"train_tasks_extra only applies to task_set='random' (got task_set={config.task_set!r}, task={config.task!r}).")
   if config.task:
     train_names, eval_names = [config.task], []
   elif config.task_set == "bootstrap":
     train_names, eval_names = list(BOOTSTRAP_TASKS), list(EVAL_TASKS)
   elif config.task_set == "random":
     train_names, eval_names = random_task_split(
-      config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed, config.train_split_seed
+      config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed, config.train_split_seed, config.train_tasks_extra
     )
   elif config.task_set == "family":
     train_names, eval_names = family_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)

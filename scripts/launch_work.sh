@@ -263,17 +263,28 @@ esac
 # examples/harvey_labs/ARCHITECTURE.md "Task split".
 TRAIN_SPLIT_SEED=${TRAIN_SPLIT_SEED:-242}
 
+# max_steps clamps to ceil(train_tasks / batch_size), so past 300/8 = 38 batches
+# more steps need more train tasks. TRAIN_EXTRA appends them *after* the eval
+# slice, which leaves eval and every earlier batch byte-identical — raising
+# TRAIN_TASKS instead would slide the eval window and change the benchmark.
+MAX_STEPS=${MAX_STEPS:-20}
+TRAIN_EXTRA=${TRAIN_EXTRA:-0}
+
 TRAIN_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/train.py \
 model_name=$MODEL_NAME renderer_name=qwen3_5 base_url=http://127.0.0.1:9003 \
 learning_rate=2e-4 lora_rank=32 \
-batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=20 eval_every=5 \
+batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=$MAX_STEPS eval_every=5 \
 task_set=$TASK_SET judge_model=$JUDGE_MODEL $STREAM_ARG \
 max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TOOL_TOKENS \
 log_path=artifacts/harvey-labs/$RUN_LABEL"
 
-# train_split_seed only applies to task_set=random; train.py rejects it otherwise.
+# train_split_seed / train_tasks_extra only apply to task_set=random; train.py
+# rejects them otherwise.
 if [ "$TASK_SET" = "random" ]; then
   TRAIN_CMD="$TRAIN_CMD train_split_seed=$TRAIN_SPLIT_SEED"
+  if [ "$TRAIN_EXTRA" -gt 0 ]; then
+    TRAIN_CMD="$TRAIN_CMD train_tasks_extra=$TRAIN_EXTRA"
+  fi
 fi
 
 # WORKLOAD=sft: same stack (the sampler still serves the post-SFT eval), but
