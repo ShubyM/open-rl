@@ -5,6 +5,7 @@
 #
 #   MODEL=9b  ./scripts/launch_work.sh                # Qwen3.5-9B, full 262K window (default)
 #   MODEL=27b ./scripts/launch_work.sh                # Qwen3.5-27B, 98K (measured H200 ceiling)
+#   MODEL=e4b ./scripts/launch_work.sh                # Gemma-4-E4B-it, 131K (its full window)
 #   TRAIN_GPUS=4 MODEL=27b ./scripts/launch_work.sh   # data-parallel LoRA trainer on 4 GPUs
 #   WORKLOAD=sft ./scripts/launch_work.sh             # train window types sft.py (RL is the default)
 #
@@ -111,12 +112,6 @@ if [[ "$JUDGE_MODEL" == glm* ]]; then
   echo "[work] JUDGE_MODEL=$JUDGE_MODEL via $VERTEX_JUDGE_ENDPOINT (ADC ok)"
 fi
 
-FP=$(uv run --no-sync python -c "from transformers.models.qwen3_5 import modeling_qwen3_5 as m; print(m.is_fast_path_available)" 2>/dev/null)
-if [ "$FP" != "True" ]; then
-  echo "WARNING: Qwen deltanet fast path is NOT available — training runs the eager" >&2
-  echo "         fallback (2-5x slower). Run ./scripts/setup_vm.sh to build causal-conv1d." >&2
-fi
-
 # The 27B ceiling on a 141GB H200 is 98K tokens (measured, activation offload
 # on); 9B fits its full 262K window with room to spare.
 MODEL=${MODEL:-9b}
@@ -140,6 +135,28 @@ case "$MODEL" in
     ROLLOUTS=${ROLLOUTS:-6}
     RUN_LABEL=${RUN_LABEL:-lab-lora-qwen9b-128k}
     ;;
+  e4b)
+    # Gemma-4-E4B against the same 8x6 / seed-242 shape as the 9B runs, so the
+    # two curves are directly comparable. 131,072 is Gemma's full window, so
+    # unlike the Qwen runs there is no headroom to trade: max_trajectory_tokens
+    # lands at the architectural ceiling rather than a chosen budget.
+    MODEL_NAME=google/gemma-4-E4B-it
+    CONTEXT=${CONTEXT:-131072}
+    GEN_TOKENS=${GEN_TOKENS:-32768}
+    TASK_SET=${TASK_SET:-random}
+    BATCH_SIZE=${BATCH_SIZE:-8}
+    ROLLOUTS=${ROLLOUTS:-6}
+    RENDERER=gemma4
+    # The trainer loads Gemma's nested text model directly, so its adapters
+    # carry text-only keys. --language-model-only only disables multimodal
+    # *inputs*; the graph stays multimodal and the keys miss. This is the stock
+    # vllm-serve spelling of VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM,
+    # which the in-repo worker sets for exactly this reason.
+    # single-quoted: the command is typed into a tmux pane, so the pane's shell
+    # would otherwise strip the double quotes and hand vLLM invalid JSON.
+    SAMPLER_EXTRA="${SAMPLER_EXTRA:-} --hf-overrides '{\"architectures\":[\"Gemma4ForCausalLM\"]}'"
+    RUN_LABEL=${RUN_LABEL:-lab-lora-gemma4-e4b}
+    ;;
   27b)
     MODEL_NAME=Qwen/Qwen3.5-27B
     CONTEXT=${CONTEXT:-98304}
@@ -151,13 +168,27 @@ case "$MODEL" in
     RUN_LABEL=${RUN_LABEL:-lab-lora-qwen27b}
     ;;
   *)
-    echo "Unknown MODEL=$MODEL (use 9b, 9b-128k, or 27b)" >&2
+    echo "Unknown MODEL=$MODEL (use 9b, 9b-128k, e4b, or 27b)" >&2
     exit 1
     ;;
 esac
 TOOL_TOKENS=${TOOL_TOKENS:-16384}
 BATCH_SIZE=${BATCH_SIZE:-5}
 ROLLOUTS=${ROLLOUTS:-2}
+RENDERER=${RENDERER:-qwen3_5}
+SAMPLER_EXTRA=${SAMPLER_EXTRA:-}
+
+# Deltanet is a Qwen3.5 hybrid-attention path; Gemma has no equivalent, and the
+# import fails there for the boring reason that the module does not exist.
+case "$MODEL_NAME" in
+  Qwen/*)
+    FP=$(uv run --no-sync python -c "from transformers.models.qwen3_5 import modeling_qwen3_5 as m; print(m.is_fast_path_available)" 2>/dev/null)
+    if [ "$FP" != "True" ]; then
+      echo "WARNING: Qwen deltanet fast path is NOT available — training runs the eager" >&2
+      echo "         fallback (2-5x slower). Run ./scripts/setup_vm.sh to build causal-conv1d." >&2
+    fi
+    ;;
+esac
 
 WORKLOAD=${WORKLOAD:-rl}
 if [ "$WORKLOAD" = "sft" ]; then
@@ -219,7 +250,7 @@ if [ "$AFFINITY" = "1" ]; then
 uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
 --port $PORT --enable-lora --max-lora-rank 64 --max-loras 2 --enable-prefix-caching \
 --max-model-len $CONTEXT --gpu-memory-utilization 0.92 \
---language-model-only |& tee -a $LOGS/sampler-$i.log &"
+--language-model-only $SAMPLER_EXTRA |& tee -a $LOGS/sampler-$i.log &"
   done
   SAMPLER_CMD="${SAMPLER_CMD} wait"
   SAMPLER_URLS="${SAMPLER_URLS#,}"
@@ -235,7 +266,7 @@ uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
 --port 8000 --enable-lora --max-lora-rank 64 --max-loras 2 --enable-prefix-caching \
 --data-parallel-size $SAMPLER_DP --api-server-count 1 \
 --max-model-len $CONTEXT --gpu-memory-utilization 0.92 \
---language-model-only |& tee -a $LOGS/sampler.log"
+--language-model-only $SAMPLER_EXTRA |& tee -a $LOGS/sampler.log"
 fi
 
 GATEWAY_DEV=0
@@ -271,7 +302,7 @@ MAX_STEPS=${MAX_STEPS:-20}
 TRAIN_EXTRA=${TRAIN_EXTRA:-0}
 
 TRAIN_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/train.py \
-model_name=$MODEL_NAME renderer_name=qwen3_5 base_url=http://127.0.0.1:9003 \
+model_name=$MODEL_NAME renderer_name=$RENDERER base_url=http://127.0.0.1:9003 \
 learning_rate=2e-4 lora_rank=32 \
 batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=$MAX_STEPS eval_every=5 \
 task_set=$TASK_SET judge_model=$JUDGE_MODEL $STREAM_ARG \
@@ -314,7 +345,7 @@ if [ "$WORKLOAD" = "rl" ]; then
 fi
 
 EVAL_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
-checkpoint=/tmp/open-rl/peft/CHANGE-ME/final model_name=$MODEL_NAME renderer_name=qwen3_5 \
+checkpoint=/tmp/open-rl/peft/CHANGE-ME/final model_name=$MODEL_NAME renderer_name=$RENDERER \
 base_url=http://127.0.0.1:9003 task_set=$TASK_SET judge_model=$JUDGE_MODEL \
 max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TOOL_TOKENS"
 
