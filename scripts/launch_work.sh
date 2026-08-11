@@ -138,23 +138,34 @@ case "$MODEL" in
   e4b)
     # Gemma-4-E4B against the same 8x6 / seed-242 shape as the 9B runs, so the
     # two curves are directly comparable. 131,072 is Gemma's full window, so
-    # unlike the Qwen runs there is no headroom to trade: max_trajectory_tokens
-    # lands at the architectural ceiling rather than a chosen budget.
+    # unlike the Qwen runs max_trajectory_tokens lands at the architectural
+    # ceiling rather than a chosen budget -- the only headroom left to trade is
+    # the generation reserve, which is what GEN_TOKENS below is about.
     MODEL_NAME=google/gemma-4-E4B-it
     CONTEXT=${CONTEXT:-131072}
-    GEN_TOKENS=${GEN_TOKENS:-32768}
+    # message_env.py:94 reserves max_tokens from the trajectory budget on every
+    # turn (observation + generation_reserve > max_trajectory_tokens), so the
+    # real observation ceiling is CONTEXT - GEN_TOKENS. At 32K that fenced off a
+    # quarter of Gemma's window before turn one: run20's longest observation was
+    # 98,301 against a computed ceiling of 98,304, and no episode ever saw the
+    # last 32K. The reserve was ~50x oversized -- over 902 run20 turns the
+    # generation length was p50 336, p99 3,874, max 7,639, and nothing crossed
+    # 8,192. 16,384 is 2.1x the observed max and still lifts the ceiling to
+    # 114,688 (+16.7%). Not 8,192 (+25%): it also truncates nothing measured,
+    # but leaves only 7% over the observed max, and a cap that clips a turn
+    # mid-thought is the failure that cost runs 8-10 (see the 9b warning below).
+    GEN_TOKENS=${GEN_TOKENS:-16384}
     TASK_SET=${TASK_SET:-random}
     BATCH_SIZE=${BATCH_SIZE:-8}
     ROLLOUTS=${ROLLOUTS:-6}
     RENDERER=gemma4
-    # The trainer loads Gemma's nested text model directly, so its adapters
-    # carry text-only keys. --language-model-only only disables multimodal
-    # *inputs*; the graph stays multimodal and the keys miss. This is the stock
-    # vllm-serve spelling of VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM,
-    # which the in-repo worker sets for exactly this reason.
-    # single-quoted: the command is typed into a tmux pane, so the pane's shell
-    # would otherwise strip the double quotes and hand vLLM invalid JSON.
-    SAMPLER_EXTRA="${SAMPLER_EXTRA:-} --hf-overrides '{\"architectures\":[\"Gemma4ForCausalLM\"]}'"
+    # NB: do NOT set --hf-overrides Gemma4ForCausalLM here. That is the right
+    # move for FFT, where text-only checkpoint keys must match the graph, but
+    # LoRA is the opposite: _remap_adapter_to_hub_layout deliberately emits
+    # hub-layout adapter keys (model.language_model.*) because vLLM resolves
+    # adapters through the *multimodal* model's hf_to_vllm_mapper. Forcing the
+    # text graph makes those keys match nothing, and vLLM applies no adapter at
+    # all — sampling silently serves the base model for the whole run.
     RUN_LABEL=${RUN_LABEL:-lab-lora-gemma4-e4b}
     ;;
   27b)

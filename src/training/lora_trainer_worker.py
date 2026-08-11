@@ -67,9 +67,26 @@ class LoraTrainingWorker(BaseTrainerWorker):
     # Multimodal checkpoints (Qwen3.5/3.6, Gemma) load as a text-only causal LM
     # here; saved adapters then need their keys mapped back to the hub layout
     # so the vLLM sampler can match them (see _remap_adapter_to_hub_layout).
-    self.base_is_multimodal = getattr(AutoConfig.from_pretrained(base_model_name), "text_config", None) is not None
+    base_config = AutoConfig.from_pretrained(base_model_name)
+    self.base_is_multimodal = getattr(base_config, "text_config", None) is not None
 
-    self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
+    # Gemma's global heads are 512-wide with GQA (8 query vs 2 KV heads), which
+    # every fused SDPA kernel rejects — flash caps head_dim at 256, and the
+    # dense path wants matching num_heads. That leaves only the quadratic math
+    # fallback, which OPEN_RL_SDPA_NO_MATH blocks, so the step dies with
+    # "No available kernel" rather than silently OOMing. FlexAttention handles
+    # both (attention_forward_kwargs supplies the low-resource tiles for the
+    # wide heads). This mirrors model_loading.load_text_causal_lm, which the
+    # full-parameter trainers use; the LoRA path never got the same wiring.
+    text_model_types = {"gemma3n", "gemma3n_text", "gemma4", "gemma4_text"}
+    attn_implementation = os.getenv("OPEN_RL_ATTN_IMPLEMENTATION") or (
+      "flex_attention" if base_config.model_type in text_model_types else "sdpa"
+    )
+    print(f"LoRA base attention backend: {attn_implementation}")
+
+    self.base_model = AutoModelForCausalLM.from_pretrained(
+      base_model_name, dtype=dtype, device_map=self.device, attn_implementation=attn_implementation
+    )
     # Captured before any peft wrapping: get_peft_model mutates the module
     # tree in place, so later isinstance(nn.Linear) scans would miss every
     # already-adapted projection and a second adapter would silently train
