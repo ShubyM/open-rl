@@ -1,0 +1,98 @@
+{"split": "train", "turns": 11, "final_ob": 93568, "ac_lens": [513, 153, 359, 89, 257, 79, 331, 73, 409, 328, 440], "reward": -0.1, "flags": {"context_overflow": 1}}
+{"split": "train", "turns": 1, "final_ob": 7907, "ac_lens": [1488], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 8, "final_ob": 86617, "ac_lens": [830, 390, 102, 232, 59, 210, 91, 243], "reward": -0.1, "flags": {"context_overflow": 1}}
+{"split": "train", "turns": 6, "final_ob": 62199, "ac_lens": [721, 248, 308, 192, 277, 67], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 8, "final_ob": 86699, "ac_lens": [731, 336, 470, 191, 402, 186, 173, 1064], "reward": -0.1, "flags": {"context_overflow": 1}}
+{"split": "train", "turns": 1, "final_ob": 7963, "ac_lens": [1544], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 9, "final_ob": 83638, "ac_lens": [517, 351, 173, 114, 163, 186, 132, 51, 3639], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 9, "final_ob": 78065, "ac_lens": [204, 322, 177, 70, 191, 86, 205, 3029, 221], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 5, "final_ob": 7604, "ac_lens": [346, 117, 117, 296, 202], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 2, "final_ob": 7040, "ac_lens": [379, 211], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 10, "final_ob": 57881, "ac_lens": [489, 164, 67, 442, 124, 126, 168, 3104, 160, 178], "reward": 0.19718309859154928, "flags": {"has_output": 1}}
+{"split": "train", "turns": 8, "final_ob": 65790, "ac_lens": [290, 310, 147, 57, 177, 205, 363, 4505], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "train", "turns": 2, "final_ob": 7923, "ac_lens": [1352, 189], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 3, "final_ob": 7794, "ac_lens": [778, 186, 473], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 2, "final_ob": 7182, "ac_lens": [633, 216], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 12, "final_ob": 86752, "ac_lens": [602, 672, 292, 223, 307, 412, 378, 267, 200, 661, 168, 3015], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "train", "turns": 7, "final_ob": 25851, "ac_lens": [907, 247, 136, 108, 444, 371, 1007], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 7, "final_ob": 85231, "ac_lens": [924, 837, 115, 350, 471, 183, 7639], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "train", "turns": 10, "final_ob": 67304, "ac_lens": [1059, 115, 281, 454, 120, 245, 473, 329, 1377, 2419], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 3, "final_ob": 8134, "ac_lens": [774, 309, 559], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 1, "final_ob": 7377, "ac_lens": [947], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 1, "final_ob": 7526, "ac_lens": [1095], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 9, "final_ob": 69075, "ac_lens": [615, 415, 221, 170, 366, 128, 685, 580, 3266], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "train", "turns": 8, "final_ob": 63106, "ac_lens": [388, 274, 211, 163, 127, 173, 959, 595], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 1, "final_ob": 7956, "ac_lens": [1619], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 1, "final_ob": 7646, "ac_lens": [1309], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 12, "final_ob": 87466, "ac_lens": [1518, 406, 218, 389, 278, 123, 223, 125, 535, 255, 575, 834], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 1, "final_ob": 8052, "ac_lens": [1714], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 8, "final_ob": 58873, "ac_lens": [487, 92, 164, 633, 201, 341, 223, 2977], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "train", "turns": 10, "final_ob": 89843, "ac_lens": [369, 192, 697, 257, 304, 562, 268, 918, 978, 6308], "reward": -0.1, "flags": {"context_overflow": 1}}
+{"split": "train", "turns": 14, "final_ob": 11955, "ac_lens": [365, 572, 171, 344, 573, 385, 223, 236, 255, 343, 369, 312, 424, 565], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 15, "final_ob": 39526, "ac_lens": [530, 64, 681, 396, 292, 1499, 218, 322, 165, 181, 315, 254, 336, 373, 729], "reward": 0.4576271186440678, "flags": {"has_output": 1}}
+{"split": "train", "turns": 7, "final_ob": 12075, "ac_lens": [377, 580, 701, 454, 399, 454, 447], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 1, "final_ob": 7000, "ac_lens": [726], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 7, "final_ob": 37639, "ac_lens": [428, 216, 489, 79, 1557, 224, 1853], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 15, "final_ob": 63784, "ac_lens": [606, 194, 154, 669, 281, 178, 344, 231, 179, 583, 1606, 157, 311, 306, 582], "reward": 0.4576271186440678, "flags": {"has_output": 1}}
+{"split": "train", "turns": 10, "final_ob": 66876, "ac_lens": [437, 83, 165, 336, 198, 254, 270, 195, 2679, 524], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 21, "final_ob": 82507, "ac_lens": [340, 341, 109, 238, 217, 221, 3057, 121, 299, 156, 2248, 2008, 1947, 2007, 2044, 1942, 274, 243, 186, 269, 2084], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "train", "turns": 9, "final_ob": 46134, "ac_lens": [430, 153, 192, 289, 499, 493, 353, 432, 2602], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "train", "turns": 12, "final_ob": 67983, "ac_lens": [334, 335, 325, 648, 246, 223, 2964, 217, 169, 217, 163, 423], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 10, "final_ob": 66918, "ac_lens": [511, 390, 85, 241, 236, 516, 2810, 193, 70, 209], "reward": 0.603448275862069, "flags": {"has_output": 1}}
+{"split": "train", "turns": 11, "final_ob": 69591, "ac_lens": [536, 225, 81, 204, 324, 281, 2883, 2469, 214, 237, 301], "reward": 0.6206896551724138, "flags": {"has_output": 1}}
+{"split": "train", "turns": 10, "final_ob": 79590, "ac_lens": [1030, 373, 217, 211, 216, 235, 259, 248, 337, 2239], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "train", "turns": 13, "final_ob": 88136, "ac_lens": [874, 315, 459, 342, 174, 420, 84, 372, 240, 107, 2406, 2193, 199], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 3, "final_ob": 7895, "ac_lens": [820, 218, 328], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 25, "final_ob": 91436, "ac_lens": [617, 211, 119, 344, 173, 263, 305, 112, 1170, 1891, 935, 1003, 899, 1021, 2080, 1139, 954, 1406, 1604, 1256, 1380, 1222, 1201, 1192, 469], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 6, "final_ob": 41569, "ac_lens": [797, 339, 460, 366, 222, 296], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "train", "turns": 5, "final_ob": 17017, "ac_lens": [791, 144, 111, 351, 607], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 20, "final_ob": 36164, "ac_lens": [517, 455, 174, 410, 221, 233, 428, 252, 453, 157, 367, 181, 127, 2186, 2045, 210, 532, 284, 99, 337], "reward": 0.576271186440678, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 8, "final_ob": 32873, "ac_lens": [290, 152, 390, 1976, 318, 518, 143, 2438], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 13, "final_ob": 25072, "ac_lens": [398, 196, 122, 2819, 1324, 366, 261, 158, 182, 150, 427, 289, 905], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 16, "final_ob": 97620, "ac_lens": [421, 376, 475, 157, 286, 219, 263, 408, 348, 353, 358, 511, 120, 4938, 3894, 3748], "reward": -0.1, "flags": {"context_overflow": 1}}
+{"split": "eval", "turns": 7, "final_ob": 39333, "ac_lens": [404, 466, 742, 3106, 2705, 192, 274], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 13, "final_ob": 11066, "ac_lens": [406, 53, 44, 1081, 510, 255, 416, 347, 330, 299, 305, 287, 1154], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 10, "final_ob": 32967, "ac_lens": [432, 217, 182, 85, 2653, 133, 1008, 281, 634, 306], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 17, "final_ob": 98301, "ac_lens": [977, 417, 267, 214, 129, 226, 318, 295, 65, 588, 122, 297, 427, 3155, 133, 355, 259], "reward": -0.1, "flags": {"context_overflow": 1}}
+{"split": "eval", "turns": 7, "final_ob": 71237, "ac_lens": [472, 453, 218, 372, 417, 1417, 2463], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 7, "final_ob": 44337, "ac_lens": [481, 83, 451, 144, 1133, 193, 3874], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 10, "final_ob": 32617, "ac_lens": [306, 108, 162, 241, 2935, 194, 268, 146, 133, 355], "reward": 0.45454545454545453, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 12, "final_ob": 62218, "ac_lens": [297, 281, 145, 53, 113, 150, 158, 2750, 110, 256, 141, 427], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 7, "final_ob": 53411, "ac_lens": [498, 144, 239, 1048, 1970, 124, 161], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 5, "final_ob": 43894, "ac_lens": [249, 784, 112, 5749, 332], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 6, "final_ob": 68284, "ac_lens": [594, 264, 279, 233, 224, 3377], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 3, "final_ob": 7457, "ac_lens": [494, 124, 351], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 1, "final_ob": 6718, "ac_lens": [466], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 3, "final_ob": 8678, "ac_lens": [293, 1906, 1208], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 27, "final_ob": 59289, "ac_lens": [824, 285, 127, 186, 106, 2358, 2545, 174, 2600, 2345, 2390, 189, 267, 229, 256, 307, 303, 310, 389, 379, 256, 293, 349, 290, 298, 469, 727], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 2, "final_ob": 7507, "ac_lens": [513, 508], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 1, "final_ob": 7639, "ac_lens": [1292], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 40, "final_ob": 93486, "ac_lens": [308, 339, 127, 2078, 1628, 1473, 1419, 1158, 1246, 1241, 1134, 896, 1039, 931, 1308, 1656, 1609, 1719, 1479, 1538, 1549, 1545, 1617, 1464, 1657, 1509, 1563, 1554, 1662, 1461, 1666, 1374, 1479, 1404, 1851, 1627, 1586, 1438, 1529, 1727], "reward": 0.0, "flags": {"max_turns": 1, "has_output": 1}}
+{"split": "eval", "turns": 16, "final_ob": 47671, "ac_lens": [865, 515, 560, 299, 302, 404, 259, 504, 550, 490, 2083, 1233, 1143, 201, 230, 1811], "reward": 0.061224489795918366, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 2, "final_ob": 7854, "ac_lens": [773, 587], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 6, "final_ob": 30887, "ac_lens": [1103, 221, 312, 129, 152, 3004], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 5, "final_ob": 51342, "ac_lens": [398, 279, 84, 372, 3902], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 13, "final_ob": 29994, "ac_lens": [198, 73, 510, 380, 194, 2010, 151, 305, 217, 1698, 160, 140, 454], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 9, "final_ob": 35139, "ac_lens": [425, 357, 378, 178, 508, 1932, 111, 121, 314], "reward": 0.46551724137931033, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 6, "final_ob": 9208, "ac_lens": [1279, 160, 141, 192, 442, 416], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 4, "final_ob": 8428, "ac_lens": [624, 270, 591, 381], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 6, "final_ob": 28808, "ac_lens": [727, 127, 373, 164, 182, 4915], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 9, "final_ob": 64689, "ac_lens": [981, 210, 493, 267, 117, 368, 2237, 577, 2747], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 7, "final_ob": 53071, "ac_lens": [276, 298, 364, 125, 287, 234, 619], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 14, "final_ob": 81466, "ac_lens": [266, 275, 196, 889, 202, 194, 193, 2112, 149, 2096, 225, 155, 2402, 610], "reward": 0.6, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 9, "final_ob": 21738, "ac_lens": [501, 89, 282, 2510, 147, 321, 304, 219, 229], "reward": 0.09333333333333334, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 17, "final_ob": 49800, "ac_lens": [510, 228, 139, 239, 2928, 2474, 271, 351, 226, 281, 260, 234, 147, 334, 365, 236, 822], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 7, "final_ob": 28696, "ac_lens": [249, 165, 129, 64, 115, 242, 2522], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 12, "final_ob": 65955, "ac_lens": [1419, 518, 370, 281, 366, 412, 234, 1140, 3327, 255, 229, 394], "reward": 0.1044776119402985, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 33, "final_ob": 87280, "ac_lens": [519, 130, 635, 290, 222, 192, 166, 257, 1047, 505, 488, 508, 1739, 1693, 1881, 453, 1661, 262, 359, 437, 351, 297, 291, 335, 378, 306, 216, 192, 573, 289, 277, 341, 834], "reward": 0.6888888888888889, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 3, "final_ob": 7588, "ac_lens": [406, 232, 468], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 8, "final_ob": 28742, "ac_lens": [395, 95, 427, 199, 2925, 236, 415, 251], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 10, "final_ob": 43344, "ac_lens": [453, 282, 208, 538, 650, 482, 382, 232, 440, 842], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 8, "final_ob": 36147, "ac_lens": [871, 188, 260, 70, 4852, 190, 237, 397], "reward": 0.7719298245614035, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 2, "final_ob": 7016, "ac_lens": [387, 182], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 13, "final_ob": 97116, "ac_lens": [326, 161, 170, 91, 192, 596, 3007, 2532, 2305, 2195, 2273, 2305, 2243], "reward": -0.1, "flags": {"context_overflow": 1}}
+{"split": "eval", "turns": 11, "final_ob": 44340, "ac_lens": [816, 364, 279, 184, 599, 1564, 168, 288, 1537, 200, 1933], "reward": -0.1, "flags": {"parse_error": 1}}
+{"split": "eval", "turns": 9, "final_ob": 44266, "ac_lens": [560, 189, 263, 441, 185, 125, 159, 2666, 289], "reward": 0.0, "flags": {"lab/no_output": 1}}
+{"split": "eval", "turns": 5, "final_ob": 26953, "ac_lens": [430, 267, 1827, 1031, 439], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 18, "final_ob": 43096, "ac_lens": [492, 758, 120, 140, 103, 3058, 126, 1435, 290, 1300, 1219, 235, 235, 306, 225, 181, 280, 217], "reward": 0.0, "flags": {"has_output": 1}}
+{"split": "eval", "turns": 35, "final_ob": 82340, "ac_lens": [440, 320, 174, 169, 125, 130, 3242, 194, 2827, 2577, 171, 218, 198, 241, 249, 130, 206, 458, 310, 310, 321, 360, 263, 253, 390, 334, 283, 523, 241, 242, 302, 243, 221, 426, 594], "reward": 0.0, "flags": {"has_output": 1}}
