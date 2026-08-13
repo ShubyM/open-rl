@@ -1,0 +1,41 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The smoke overlay: the shipped manifests plus exactly what a smoke run
+# needs -- the locally built image, the fake DRA driver's device class, and
+# sleep-only worker pod templates. Applied by controller/hack/kind-smoke.sh,
+# so the smoke test validates the real manifests instead of shell fixups.
+resources:
+  - ../scheduler
+
+images:
+  - name: ghcr.io/gke-labs/open-rl/placement-controller
+    newName: open-rl/placement-controller
+    newTag: smoke
+
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-scheduler
+      spec:
+        template:
+          spec:
+            containers:
+              - name: manager
+                # The kind-loaded image must not be re-pulled from a registry.
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: OPEN_RL_DEVICE_CLASS
+                    value: gpu.example.com
+                  - name: OPEN_RL_DEVICE_DRIVER
+                    value: gpu.example.com
+
+configMapGenerator:
+  - name: open-rl-trainer-worker-pod-template
+    files: [worker-pod.yaml]
+    options: {disableNameSuffixHash: true}
+  - name: open-rl-sampler-worker-pod-template
+    files: [worker-pod.yaml]
+    options: {disableNameSuffixHash: true}
