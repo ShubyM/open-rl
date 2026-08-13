@@ -6,12 +6,27 @@ from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
+import torch._dynamo
 import torch.utils.checkpoint
 from pydantic import BaseModel
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
 from training.distributed import all_gather_object, all_reduce_max, all_reduce_sum, is_distributed, local_rank, rank, world_size
+
+# FlexAttention recompiles for shapes dynamo cannot generalise, and once a frame
+# hits recompile_limit (default 8) skip_code_recursive_on_recompile_limit_hit
+# retires it to eager for the rest of the process. Eager flex_attention is
+# sdpa_dense, which materialises the whole [heads, q_len, kv_len] score matrix:
+# 8 x 47398^2 x fp32 = 67 GiB, an instant OOM. That is how run20 died at step 14
+# after fourteen healthy steps -- the failure is silent, unbounded in memory, and
+# arrives only once a run has been going long enough to exhaust the cache.
+# Recompiling is merely slow, so the ceiling belongs well past any real run.
+torch._dynamo.config.recompile_limit = int(os.getenv("OPEN_RL_RECOMPILE_LIMIT", "64"))
+torch._dynamo.config.accumulated_recompile_limit = max(
+  torch._dynamo.config.accumulated_recompile_limit,
+  8 * torch._dynamo.config.recompile_limit,
+)
 
 
 def chunk_target_logprob(
