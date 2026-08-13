@@ -14,7 +14,6 @@ not level. Panel 2 is that slope: three steps in, the thing that was killing
 the run is already coming apart.
 """
 
-import json
 import os
 
 import matplotlib
@@ -23,19 +22,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
+from _series import load, resume_steps
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 R19 = os.path.join(os.path.dirname(HERE), "run19", "meta")
 BLUE, LIGHT, RED, ORANGE = "#1f6fb2", "#9cc4e4", "#d1495b", "#e07b39"
 
 TRAIN = "env/all/lab/criteria_pass_fraction"
 EVAL = "test/env/all/lab/criteria_pass_fraction"
-
-
-def load(path):
-    # The step-None rows are end-of-run evals with no training step attached;
-    # they would plot at x=0 and misread as a starting score.
-    return [r for r in (json.loads(l) for l in open(path)) if r.get("step") is not None]
-
 
                                              # alpha on the thin train series:
                                              # run20 only has three points and
@@ -66,9 +60,22 @@ for name, path, col, alpha in RUNS:
 ax1.annotate("run19 collapses\n(frac_all_bad 0.88)", (18.6, 0.0), xytext=(26, 30),
              textcoords="offset points", ha="left", fontsize=8.2, color=RED,
              arrowprops=dict(arrowstyle="->", color=RED, lw=0.9))
-ax1.annotate("run20 is here\nstep 2 of 40", (2, 0.156), xytext=(26, 30),
-             textcoords="offset points", ha="left", fontsize=8.2, color=ORANGE,
-             arrowprops=dict(arrowstyle="->", color=ORANGE, lw=0.9))
+_p20 = os.path.join(HERE, "meta", "run20.metrics.jsonl")
+_r20, _res = load(_p20), resume_steps(_p20)
+_last = _r20[-1]
+if _res:
+    # Steps after the line were retrained from an older checkpoint rather than
+    # continued, which no amount of curve-reading would reveal.
+    ax1.axvline(_res[-1], color=ORANGE, ls=(0, (3, 3)), lw=1.1, zorder=1)
+    ax1.annotate("FlexAttention OOM at step 14\nresumed from checkpoint %d" % _res[-1],
+                 (_res[-1], _last[TRAIN]), xytext=(24, 34), textcoords="offset points",
+                 ha="left", fontsize=8.2, color=ORANGE,
+                 arrowprops=dict(arrowstyle="->", color=ORANGE, lw=0.9))
+else:
+    ax1.annotate("run 20 is here\nstep %d of 40" % _last["step"],
+                 (_last["step"], _last[TRAIN]), xytext=(26, 30),
+                 textcoords="offset points", ha="left", fontsize=8.2, color=ORANGE,
+                 arrowprops=dict(arrowstyle="->", color=ORANGE, lw=0.9))
 ax1.set_xlim(-0.6, 40)
 ax1.set_ylim(-0.03, 0.82)
 ax1.set_xlabel("training step", fontsize=9.5, labelpad=6)
@@ -97,10 +104,11 @@ for key, name, col, ls, lw in SERIES:
     ax2.annotate("%.2f" % ys[-1], (xs[-1], ys[-1]), xytext=(7, -2),
                  textcoords="offset points", fontsize=8.2, color=col, va="center")
 ax2.set_xticks(xs)
-ax2.set_xlim(-0.12, 2.55)
-ax2.set_ylim(0, 0.78)
+ax2.set_xlim(xs[0] - 0.3, xs[-1] + 0.9)
+ax2.set_ylim(0, 1.0)
 ax2.set_xlabel("training step", fontsize=9.5, labelpad=6)
-ax2.set_title("run 20, first three steps — the no-output failure is unwinding", fontsize=11, pad=10)
+ax2.set_title("run 20, steps %d–%d — the no-output failure unwinding" % (xs[0], xs[-1]),
+              fontsize=11, pad=10)
 ax2.legend(fontsize=8.5, loc="upper left", framealpha=0.95, edgecolor="0.85")
 
 for ax in (ax1, ax2):

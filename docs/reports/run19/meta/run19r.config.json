@@ -302,7 +302,27 @@
       "contracts/financing/subscription-agreement-first-draft/scenario-02",
       "contracts/commercial-channel-partnerships/channel-distribution-first-turn-redline/scenario-03",
       "contracts/healthcare/payer-managed-care-contract-playbook-escalation",
-      "contracts/financing/credit-lending-counterparty-paper-review/scenario-03"
+      "contracts/financing/credit-lending-counterparty-paper-review/scenario-03",
+      "contracts/commercial-vendor-customer/vendor-services-agreement-counterparty-paper-review/scenario-03",
+      "contracts/pe-funds/general-partner-management-company-agreement-term-negotiation",
+      "employment-labor/draft-reduction-in-force-selection-memorandum",
+      "environmental-esg/identify-issues-in-notice-of-violation",
+      "corporate-ma/draft-evergreen-capital-fund-v",
+      "contracts/commercial-channel-partnerships/strategic-partnership-co-sell-counterparty-paper-review/scenario-01",
+      "contracts/commercial-vendor-customer/vendor-services-agreement-term-negotiation/scenario-04",
+      "energy-natural-resources/draft-markup-of-intercreditor-agreement",
+      "contracts/pe-funds/general-partner-management-company-agreement-subsequent-turn-redline",
+      "trusts-estates-private-client/review-multigenerational-estate-plan/scenario-01",
+      "contracts/ip-licensing/license-agreement-subsequent-turn-redline/scenario-03",
+      "insurance/draft-insurance-acquisition-agreement",
+      "bankruptcy-restructuring/extract-loan-agreement-terms/scenario-02",
+      "energy-natural-resources/draft-credit-agreement",
+      "antitrust-competition/identify-antitrust-issues-in-counterparty-complaint",
+      "corporate-ma/draft-transaction-nda/scenario-01",
+      "trusts-estates-private-client/extract-key-exhibits-from-document-production",
+      "contracts/commercial-vendor-customer/saas-api-subscription-playbook-escalation/scenario-01",
+      "funds-asset-management/extract-pricing-terms-from-transfer-agreement",
+      "corporate-governance/analyze-flsa-overtime-rule-gap-against-current-employee-classifications"
     ],
     "eval_task_names": [
       "banking-finance/extract-lien-and-debt-information-from-ucc-filings",
@@ -406,5 +426,5 @@
   "rolling_ttl_seconds": 7200,
   "num_groups_to_log": 1,
   "rollout_json_export": true,
-  "max_steps": 35
+  "max_steps": 40
 }

@@ -31,16 +31,28 @@ METRIC = "env/all/lab/criteria_pass_fraction"
 EVAL_METRIC = "test/env/all/lab/criteria_pass_fraction"
 ALPHA = 0.4
 
-steps, evals = {}, {}
+# metrics.jsonl is append-only across resumes, so after run20 crashed at step
+# 14 and was resumed from checkpoint 000010 the step column reads
+# ...12, 13, 10, 11. Replaying in file order and dropping every step at or past
+# a restart keeps the branch actually being trained; reading the file as a flat
+# series splices the dead attempt's 12-13 onto the resumed run.
+steps, evals, resumes = {}, {}, []
 for line in open(os.path.join(HERE, "meta", "run20.metrics.jsonl")):
     r = json.loads(line)
     # The step-None rows are end-of-run evals with no training step attached.
     if r.get("step") is None:
         continue
+    s = r["step"]
+    if any(k >= s for k in steps):
+        resumes.append(s)
+        for stale in [k for k in steps if k >= s]:
+            del steps[stale]
+        for stale in [k for k in evals if k >= s]:
+            del evals[stale]
     if METRIC in r:
-        steps[r["step"]] = r[METRIC]
+        steps[s] = r[METRIC]
     if EVAL_METRIC in r:
-        evals[r["step"]] = r[EVAL_METRIC]
+        evals[s] = r[EVAL_METRIC]
 
 x = sorted(steps)
 y = [steps[i] for i in x]
@@ -76,6 +88,13 @@ ax.axvspan(max(x) + 0.5, TOTAL_STEPS + 0.8, color="0.94", zorder=0)
 ax.text((max(x) + TOTAL_STEPS) / 2, (lo + hi) / 2, "steps %d–%d not yet run"
         % (max(x) + 1, TOTAL_STEPS - 1), color="0.6", fontsize=9,
         ha="center", va="center", style="italic")
+
+# A resume is the one discontinuity a reader cannot infer from the curve: the
+# steps after it were retrained from an older checkpoint, not continued.
+for rs in resumes:
+    ax.axvline(rs, color="#d1495b", ls=(0, (3, 3)), lw=1.1, zorder=2)
+    ax.annotate("step-14 OOM\nresumed from %d" % rs, (rs, hi + 0.055),
+                fontsize=8, color="#d1495b", ha="center", va="top")
 
 ax.set_xlabel("step", fontsize=10, labelpad=8)
 ax.set_ylabel("criteria pass fraction", fontsize=10, labelpad=8)
