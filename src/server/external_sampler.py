@@ -10,7 +10,10 @@
 # /v1/load_lora_adapter using the snapshot's unique session name, so a
 # long-lived server never serves stale adapter weights. The vLLM process must
 # see the same filesystem paths as the trainer (adapters live under
-# $OPEN_RL_TMP_DIR/peft). Full fine-tuning is NOT supported through this path:
+# OPEN_RL_SNAPSHOT_DIR, which defaults to $OPEN_RL_TMP_DIR/peft and may be
+# tmpfs -- see src/training/paths.py, and note that tmpfs is node-local, so a
+# vLLM server off-box needs that root on a shared filesystem instead).
+# Full fine-tuning is NOT supported through this path:
 # stock vLLM has no checkpoint hot-reload; FFT keeps the managed queue workers.
 
 import asyncio

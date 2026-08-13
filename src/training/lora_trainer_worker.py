@@ -13,6 +13,7 @@ from peft import PeftModelForCausalLM, get_peft_model
 from pydantic import BaseModel
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
+from training import paths
 from training.distributed import all_reduce_gradients, barrier, broadcast_parameters, is_primary
 from training.trainer_worker import BaseTrainerWorker, Datum
 
@@ -259,8 +260,7 @@ class LoraTrainingWorker(BaseTrainerWorker):
     propagate to the caller (the training future) instead of logging a
     success-shaped response over a broken adapter dir.
     """
-    tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-    adapter_root = os.path.join(tmp_dir, "peft", adapter_id)
+    adapter_root = os.path.join(paths.snapshot_root(), adapter_id)
     final_dir = os.path.join(adapter_root, session_label or adapter_id)
     staging_root = os.path.join(adapter_root, f".staging-{os.getpid()}-{time.time_ns()}")
     os.makedirs(staging_root, exist_ok=True)

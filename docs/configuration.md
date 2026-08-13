@@ -53,7 +53,9 @@ stock server for the `SAMPLER_BASE_URL` mode.
 
 | Env var | Default | What it does |
 | --- | --- | --- |
-| `OPEN_RL_TMP_DIR` | `/tmp/open-rl` | Root directory for adapter snapshots under `peft/` and saved states under `checkpoints/`. |
+| `OPEN_RL_TMP_DIR` | `/tmp/open-rl` | Root directory for adapter snapshots under `peft/` and saved states under `checkpoints/`. Both of the two settings below default to a subdirectory of this. |
+| `OPEN_RL_SNAPSHOT_DIR` | `$OPEN_RL_TMP_DIR/peft` | Where the trainer writes sampler adapter snapshots. Rewritten every optimizer step and pruned to the last four, so nothing here needs to survive a restart — `/dev/shm/open-rl/peft` puts the handoff on tmpfs. **Node-local when set to tmpfs:** the sampler must share a kernel with the trainer. Samplers in their own pods need this on a shared filesystem. |
+| `OPEN_RL_CHECKPOINT_DIR` | `$OPEN_RL_TMP_DIR/checkpoints` | Where training state (adapter plus optimizer) is written. This is what a resume reads, so on a preemptible machine point it at persistent storage — under the default, a reboot that clears `/tmp` leaves every `state_path` in `checkpoints.jsonl` dangling and the run restarts from scratch. |
 | `OPEN_RL_TRAIN_TOKEN_BUDGET` | `0` | Maximum `batch_size * max_sequence_length` for padded trainer chunks inside one `forward_backward` request. `0` keeps the previous one-datum-at-a-time execution path. |
 | `OPEN_RL_FUSED_LOGPROB` | `1` | Compute target logprobs by running the backbone and projecting through the vocabulary in chunks, so the full `[batch, seq, vocab]` logits tensor is never materialized. `0` falls back to full logits. |
 | `OPEN_RL_LOGPROB_CHUNK` | `128` | Token rows per vocabulary projection chunk in the fused logprob path. Lower values trade speed for less peak memory on large-vocab models. |

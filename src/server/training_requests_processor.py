@@ -18,6 +18,7 @@ from opentelemetry import propagate, trace
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.store import RequestStore, get_store
+from training import paths
 from training.distributed import barrier, broadcast_object, is_distributed, is_primary
 from training.distributed import close as close_distributed
 from training.distributed import initialize as initialize_distributed
@@ -474,7 +475,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     if not ref:
       raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
     rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
-    local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
+    local_path = os.path.join(paths.tmp_dir(), "sampler_full", rel_path)
     await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
     return {
       "path": payload.get("path"),
@@ -512,7 +513,8 @@ def start_request_processing_loop() -> None:
   print("=" * 50)
   cuda_devs = os.getenv("CUDA_VISIBLE_DEVICES", "ALL")
   print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
-  print(f"-> FFT enabled: {is_fft_enabled()}\n")
+  print(f"-> FFT enabled: {is_fft_enabled()}")
+  print(f"-> {paths.describe_roots()}\n")
 
   worker: TrainingWorker = FFTTrainingWorker() if is_fft_enabled() else LoraTrainingWorker()
   preload_target = os.getenv("BASE_MODEL")

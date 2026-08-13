@@ -15,6 +15,7 @@ import torch
 from pydantic import BaseModel
 from transformers import AutoTokenizer, PreTrainedModel
 
+from training import paths
 from training.distributed import barrier, fsdp_group, is_distributed, is_primary
 from training.model_loading import load_text_causal_lm
 from training.trainer_worker import (
@@ -240,7 +241,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     return {"path": path}
 
   def save_model(self, alias: str | None = None) -> dict[str, Any]:
-    tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+    tmp_dir = paths.tmp_dir()
     name = alias or "fft-model"
     save_path = name if os.path.isabs(name) else os.path.join(tmp_dir, "fft", name)
     metadata = {

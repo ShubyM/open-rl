@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from server import gateway
 from server.store import InMemoryStore
+from training import paths
 
 
 class GetInfoTest(unittest.TestCase):
@@ -39,12 +40,24 @@ class GetInfoTest(unittest.TestCase):
     self.assertEqual(queued[0]["payload"]["base_model"], "my-model")
 
 
+def use_roots(test: unittest.TestCase, **env: str) -> None:
+  """Point the storage roots somewhere temporary for one test.
+
+  The roots resolve from the environment on every call (src/training/paths.py),
+  so the environment is the only thing worth patching -- an earlier version of
+  these tests overrode gateway.TMP_DIR, which stopped meaning anything the
+  moment resolution moved behind paths.py and would have let the split ship
+  green while resolving everything to the real /tmp.
+  """
+  patcher = patch.dict(os.environ, env, clear=True)
+  patcher.start()
+  test.addCleanup(patcher.stop)
+
+
 class GatewayPathTest(unittest.TestCase):
   def test_checkpoint_state_paths_are_model_scoped(self) -> None:
-    old_tmp_dir = gateway.TMP_DIR
     with tempfile.TemporaryDirectory() as tmp_dir:
-      gateway.TMP_DIR = tmp_dir
-      self.addCleanup(setattr, gateway, "TMP_DIR", old_tmp_dir)
+      use_roots(self, OPEN_RL_TMP_DIR=tmp_dir)
 
       self.assertEqual(
         gateway.checkpoint_state_path("job-a", "final"),
@@ -59,9 +72,7 @@ class GatewayPathTest(unittest.TestCase):
     self.assertEqual(gateway.checkpoint_state_path("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
 
   def test_sampler_adapter_paths_are_per_snapshot(self) -> None:
-    old_tmp_dir = gateway.TMP_DIR
-    gateway.TMP_DIR = "/tmp/orl-test"
-    self.addCleanup(setattr, gateway, "TMP_DIR", old_tmp_dir)
+    use_roots(self, OPEN_RL_TMP_DIR="/tmp/orl-test")
 
     self.assertEqual(
       gateway.sampler_adapter_path("tinker://model-1/sampler_weights/sampler-42"),
@@ -76,14 +87,66 @@ class GatewayPathTest(unittest.TestCase):
     )
 
 
+class SplitStorageRootTest(unittest.TestCase):
+  """Snapshots and checkpoints must be independently placeable.
+
+  They default together to /tmp/open-rl, which gives durable optimizer state
+  the lifetime of scratch space. On a spot VM that is a data-loss path: the
+  instance is preempted, /tmp is cleared at boot, and every state_path in
+  checkpoints.jsonl points at a directory that no longer exists.
+  """
+
+  def test_roots_are_independently_configurable(self) -> None:
+    use_roots(self, OPEN_RL_SNAPSHOT_DIR="/dev/shm/orl/peft", OPEN_RL_CHECKPOINT_DIR="/persistent/ckpt")
+
+    self.assertEqual(
+      gateway.sampler_adapter_path("tinker://model-1/sampler_weights/sampler-42"),
+      "/dev/shm/orl/peft/model-1/sampler-42",
+    )
+    self.assertEqual(
+      gateway.checkpoint_state_path("job-a", "final"),
+      "/persistent/ckpt/job-a/weights/final",
+    )
+
+  def test_checkpoint_root_is_unaffected_by_snapshot_root(self) -> None:
+    # The whole point: losing the snapshot root must not cost a resume.
+    use_roots(self, OPEN_RL_TMP_DIR="/scratch", OPEN_RL_SNAPSHOT_DIR="/dev/shm/orl/peft")
+    self.assertEqual(gateway.checkpoint_state_path("job-a", "final"), "/scratch/checkpoints/job-a/weights/final")
+    self.assertTrue(gateway.sampler_adapter_path("tinker://m/sampler_weights/s-1").startswith("/dev/shm/"))
+
+  def test_legacy_tmp_dir_still_moves_both(self) -> None:
+    # Deployments that only ever set OPEN_RL_TMP_DIR must not change behaviour.
+    use_roots(self, OPEN_RL_TMP_DIR="/mnt/shared/open-rl")
+    self.assertEqual(paths.snapshot_root(), "/mnt/shared/open-rl/peft")
+    self.assertEqual(paths.checkpoint_root(), "/mnt/shared/open-rl/checkpoints")
+
+  def test_unconfigured_defaults_are_unchanged(self) -> None:
+    use_roots(self)
+    self.assertEqual(paths.snapshot_root(), "/tmp/open-rl/peft")
+    self.assertEqual(paths.checkpoint_root(), "/tmp/open-rl/checkpoints")
+
+  def test_gateway_resolves_refs_under_the_same_roots_it_reports(self) -> None:
+    """The trainer writes adapters to paths.snapshot_root(); the gateway hands
+    the sampler a path resolved from the same function. If those two ever
+    disagree the sampler silently loads a stale adapter, so pin the shared
+    owner rather than either caller's copy."""
+    use_roots(self, OPEN_RL_SNAPSHOT_DIR="/dev/shm/orl/peft", OPEN_RL_CHECKPOINT_DIR="/persistent/ckpt")
+    self.assertTrue(
+      gateway.sampler_adapter_path("tinker://m/sampler_weights/s-1").startswith(paths.snapshot_root())
+    )
+    self.assertTrue(gateway.checkpoint_state_path("m", "final").startswith(paths.checkpoint_root()))
+    self.assertTrue(gateway.resolve_state_ref("tinker://m/weights/final").startswith(paths.checkpoint_root()))
+    self.assertTrue(
+      gateway.resolve_state_ref("tinker://m/sampler_weights/s-1").startswith(paths.snapshot_root())
+    )
+
+
 class StatePathRoundTripTest(unittest.TestCase):
   """save_weights returns tinker:// paths and resume must resolve them back."""
 
   def _tmp_dir(self):
-    old_tmp_dir = gateway.TMP_DIR
     tmp = tempfile.mkdtemp()
-    gateway.TMP_DIR = tmp
-    self.addCleanup(setattr, gateway, "TMP_DIR", old_tmp_dir)
+    use_roots(self, OPEN_RL_TMP_DIR=tmp)
     return tmp
 
   def test_tinker_state_path_forms(self) -> None:
@@ -99,10 +162,20 @@ class StatePathRoundTripTest(unittest.TestCase):
       os.path.join(tmp, "checkpoints", "job-a", "weights", "step-42"),
     )
 
-  def test_resolve_state_ref_ignores_non_state_refs(self) -> None:
-    self.assertIsNone(gateway.resolve_state_ref("tinker://job-a/sampler_weights/sampler-1"))
+  def test_resolve_state_ref_ignores_non_tinker_refs(self) -> None:
     self.assertIsNone(gateway.resolve_state_ref("/abs/path"))
     self.assertIsNone(gateway.resolve_state_ref(None))
+    self.assertIsNone(gateway.resolve_state_ref("tinker://job-a/unknown-kind/x"))
+
+  def test_resolve_state_ref_resolves_sampler_snapshots(self) -> None:
+    # f35395b ("Warm-start from sampler snapshots") made adapter-only snapshots
+    # valid weights-only start points, so these resolve rather than returning
+    # None. This test asserted the opposite for a year without being run.
+    tmp = self._tmp_dir()
+    self.assertEqual(
+      gateway.resolve_state_ref("tinker://job-a/sampler_weights/sampler-1"),
+      os.path.join(tmp, "peft", "job-a", "sampler-1"),
+    )
 
   def test_checkpoint_state_path_accepts_tinker_refs(self) -> None:
     tmp = self._tmp_dir()
@@ -126,7 +199,8 @@ class StatePathRoundTripTest(unittest.TestCase):
         self.futures[req_id] = result
 
     store = StoreStub()
-    with patch.object(gateway, "store", store), patch.dict(os.environ, {}, clear=True):
+    # clear=True would drop the root _tmp_dir just set and resolve to real /tmp.
+    with patch.object(gateway, "store", store), patch.dict(os.environ, {"OPEN_RL_TMP_DIR": tmp}, clear=True):
       asyncio.run(gateway.create_model_from_state({"state_path": "tinker://job-a/weights/final"}))
 
     self.assertEqual(
@@ -135,7 +209,7 @@ class StatePathRoundTripTest(unittest.TestCase):
     )
 
   def test_save_weights_payload_carries_round_trippable_public_path(self) -> None:
-    self._tmp_dir()
+    tmp = self._tmp_dir()
 
     class StoreStub:
       def __init__(self):
@@ -149,7 +223,7 @@ class StatePathRoundTripTest(unittest.TestCase):
         self.futures[req_id] = result
 
     store = StoreStub()
-    with patch.object(gateway, "store", store), patch.dict(os.environ, {}, clear=True):
+    with patch.object(gateway, "store", store), patch.dict(os.environ, {"OPEN_RL_TMP_DIR": tmp}, clear=True):
       asyncio.run(gateway.save_weights({"model_id": "job-a", "path": "step-7"}))
 
     payload = store.requests[0]["payload"]

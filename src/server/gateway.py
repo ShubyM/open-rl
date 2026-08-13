@@ -23,6 +23,7 @@ from server import external_sampler
 from server.external_sampler import get_sampler_base_url
 from server.store import get_store
 from server.worker_manager import WorkerManager, create_fft_worker_manager
+from training import paths
 
 
 @dataclass
@@ -66,7 +67,7 @@ class FilterNoisyEndpoints(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
-TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+TMP_DIR = paths.tmp_dir()
 
 
 # *** Helpers ***
@@ -113,10 +114,10 @@ def resolve_state_ref(ref: str | None) -> str | None:
     return None
   parts = ref[len("tinker://") :].split("/")
   if len(parts) >= 3 and parts[1] == "weights":
-    return os.path.join(TMP_DIR, "checkpoints", parts[0], "weights", *parts[2:])
+    return os.path.join(paths.checkpoint_root(), parts[0], "weights", *parts[2:])
   if len(parts) >= 3 and parts[1] == "sampler_weights":
     # Adapter-only sampler snapshots are valid weights-only warm-start sources.
-    return os.path.join(TMP_DIR, "peft", parts[0], *parts[2:])
+    return os.path.join(paths.snapshot_root(), parts[0], *parts[2:])
   return None
 
 
@@ -126,7 +127,7 @@ def checkpoint_state_path(model_id: str, name: str) -> str:
     return resolved
   if os.path.isabs(name):
     return name
-  return os.path.join(TMP_DIR, "checkpoints", model_id, "weights", name)
+  return os.path.join(paths.checkpoint_root(), model_id, "weights", name)
 
 
 def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
@@ -151,7 +152,7 @@ def sampler_adapter_path(session_ref: str) -> str:
   stable, fully written adapter dir.
   """
   parts = session_ref[len("tinker://") :].split("/")
-  return os.path.join(TMP_DIR, "peft", parts[0], parts[2])
+  return os.path.join(paths.snapshot_root(), parts[0], parts[2])
 
 
 def is_sampler_weights_ref(model_id: str | None) -> bool:
@@ -467,8 +468,8 @@ async def create_model_from_state(req: dict):
   state_path = req.get("state_path")
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "state_path is required"})
-  # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
-  resolved_path = resolve_state_ref(state_path) or (state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path))
+  # Resolve relative names under the checkpoint root, leave absolute paths alone.
+  resolved_path = resolve_state_ref(state_path) or (state_path if os.path.isabs(state_path) else os.path.join(paths.checkpoint_root(), state_path))
   model_id = str(uuid.uuid4())
   base_model = req.get("base_model")
   s = get_store()
@@ -931,7 +932,7 @@ async def list_adapters():
   """CLI `list` — scan the peft directory for saved adapters."""
   import json
 
-  peft_dir = os.path.join(TMP_DIR, "peft")
+  peft_dir = paths.snapshot_root()
   adapters = []
 
   if os.path.exists(peft_dir):

@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import torch
 from safetensors import safe_open
 
+from training import paths
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
 from training.trainer_worker import Datum, TensorData
 
@@ -137,7 +138,7 @@ b_moved = sum(
 check("adapter lora_B weights moved off zero", b_moved > 0, f"sum|B|={b_moved:.3e}")
 
 # --- 5. saved adapter sanity ---
-snap_root = os.path.join(w.tmp_dir if hasattr(w, "tmp_dir") else os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "peft", "probe")
+snap_root = os.path.join(paths.snapshot_root(), "probe")
 snaps = sorted(os.listdir(snap_root)) if os.path.isdir(snap_root) else []
 check("adapter snapshot dir exists", bool(snaps), f"{snap_root}: {snaps[-3:]}")
 if snaps:

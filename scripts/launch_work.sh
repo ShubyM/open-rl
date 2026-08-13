@@ -32,6 +32,21 @@ LOGS="$REPO/artifacts/box-logs"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export PATH="$CUDA_HOME/bin:$HOME/.local/bin:$PATH"
 
+# Storage roots. These default together to /tmp/open-rl, which on a spot VM
+# means a preemption clears the optimizer checkpoints and every state_path in
+# checkpoints.jsonl dangles -- run20 came within one backup of losing five
+# steps that way. Split them: snapshots are a trainer->sampler handoff worth a
+# few hundred MB that is regenerated every optim step, so tmpfs is ideal and
+# losing them costs nothing; checkpoints are the only thing a resume can read,
+# so they belong on the boot disk. See src/training/paths.py.
+#
+# /dev/shm is node-local. This is correct only because the trainer and the
+# samplers are processes on one box; if samplers ever move to their own nodes,
+# OPEN_RL_SNAPSHOT_DIR has to go back to a shared filesystem.
+export OPEN_RL_SNAPSHOT_DIR="${OPEN_RL_SNAPSHOT_DIR:-/dev/shm/open-rl/peft}"
+export OPEN_RL_CHECKPOINT_DIR="${OPEN_RL_CHECKPOINT_DIR:-$HOME/open-rl-checkpoints}"
+mkdir -p "$OPEN_RL_SNAPSHOT_DIR" "$OPEN_RL_CHECKPOINT_DIR"
+
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "session '$SESSION' already running — attaching (tmux kill-session -t $SESSION to reset)"
   if [ -t 1 ]; then
@@ -363,6 +378,15 @@ max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TO
 # set-option needs a running tmux server, so the session must exist first.
 tmux new-session -d -s "$SESSION" -n sampler -c "$REPO"
 tmux set-option -t "$SESSION" history-limit 100000
+# Panes get a fresh interactive shell, so they inherit this script's exports
+# only when new-session also started the tmux server. If a server was already
+# up for some unrelated session, the panes get that server's much older
+# environment instead and the storage roots silently revert to /tmp. Setting
+# them on the session covers every window created below. The sampler pane is
+# already running and does not need them: it is handed absolute lora_paths in
+# each request and never derives a root itself.
+tmux set-environment -t "$SESSION" OPEN_RL_SNAPSHOT_DIR "$OPEN_RL_SNAPSHOT_DIR"
+tmux set-environment -t "$SESSION" OPEN_RL_CHECKPOINT_DIR "$OPEN_RL_CHECKPOINT_DIR"
 tmux send-keys -t "$SESSION:sampler" "$SAMPLER_CMD" C-m
 
 tmux new-window -t "$SESSION" -n gateway -c "$REPO"
