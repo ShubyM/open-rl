@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from functools import cache
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import tinker
 import tinker_cookbook.renderers as renderers
@@ -24,8 +24,18 @@ from tinker_cookbook.renderers.base import (
 )
 
 # chat_template.jinja is pinned from Gemma 4 discussion #36 at HF revision
-# 4e34fcbc4c9a95b92d6a8a97c2faed16dd783f91.
-GEMMA4_CHAT_TEMPLATE_SHA256 = "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5"
+# 4e34fcbc4c9a95b92d6a8a97c2faed16dd783f91, with one local edit: the thinking
+# block is gated on `is not none` rather than truthiness, so an empty thought
+# channel round-trips as '<|channel>thought\n<channel|>'.
+#
+# Upstream needs this because after a tool response the template pre-opens
+# <|channel>thought in the generation prompt; a model that closes it immediately
+# produced a blank thought the re-render then dropped, breaking the prefix chain
+# that trajectory merging depends on. The encoding matches upstream's own -- HF
+# revision 707f0a3b emits exactly '<|channel>thought\n<channel|>' for the empty
+# case on its `not enable_thinking` branch. That revision is otherwise identical
+# to this one for tool-calling paths, so the pin stays on #36.
+GEMMA4_CHAT_TEMPLATE_SHA256 = "ca51a48d0fe20cfe36f480d6cb0a691a60cf1bb4a34475183868e7d24eb8cd38"
 
 _TOOL_CALL = re.compile(
   r"<\|tool_call>(?P<body>call:(?P<name>\w+)\{.*?\})"
@@ -187,7 +197,13 @@ class Gemma4ToolRenderer(renderers.Renderer):
       )
 
     parts: list[TextPart | ThinkingPart] = []
-    if thinking := parsed.get("thinking"):
+    # An empty thought is not the same as no thought. After a tool response the
+    # template pre-opens <|channel>thought, so a model that closes it right away
+    # still emitted a (blank) thought channel, and the re-render has to reproduce
+    # it or the observation stops being a prefix of the next one. Only None --
+    # the channel never opened -- means there is nothing to carry.
+    thinking = parsed.get("thinking")
+    if thinking is not None:
       parts.append(ThinkingPart(type="thinking", thinking=thinking))
     if content := parsed.get("content"):
       parts.append(TextPart(type="text", text=content))
@@ -226,7 +242,42 @@ class Gemma4ToolRenderer(renderers.Renderer):
     return [Message(role="system", content=rendered[len(prefix) : -len(suffix)])]
 
   def to_openai_message(self, message: Message) -> dict[str, Any]:
+    # Thinking must travel as reasoning_content, not as inline <think> tags.
+    # The base implementation flattens content parts and wraps ThinkingPart in
+    # <think>...</think>; Gemma 4 has no such tag. Its template reads thinking
+    # from reasoning/reasoning_content and emits <|channel>thought ... <channel|>.
+    # Left inline the tags land verbatim in the model channel, and because the
+    # template renders tool_calls before content they land *after* the tool call
+    # the thought was meant to precede.
+    #
+    # This also broke trajectory prefix merging. build_generation_prompt
+    # re-renders the whole history every turn, so a thought block that migrates
+    # across <|tool_response>| between turns stops observation k+1 from being a
+    # token prefix of observation k, and data_processing flushes the accumulator
+    # and starts a new training sequence -- run24 emitted 429 sequences for 48
+    # trajectories over 469 env steps, ~8.9x the tokens it needed. Emitting
+    # reasoning_content restores the canonical block, which also matches the
+    # <|channel>thought opener the template appends to the generation prompt
+    # after a tool response, so the chain holds across turns.
+    content = message["content"]
+    thinking: str | None = None
+    if not isinstance(content, str) and any(p["type"] == "thinking" for p in content):
+      # Pass the parser's text through verbatim, including the newline it keeps
+      # from the closing delimiter. The template appends '\n' only when the text
+      # does not already end in one, so raw round-trips exactly and an external
+      # caller writing plain prose still gets the canonical form.
+      thinking = "".join(p["thinking"] for p in content if p["type"] == "thinking")
+      # Drop the parts unconditionally, even when what is left is empty or pure
+      # whitespace. Leaving them for the base implementation to flatten puts a
+      # literal <think> tag back into the model channel, which is the failure
+      # this override exists to prevent.
+      message = cast(Message, {**message, "content": [p for p in content if p["type"] != "thinking"]})
+
     result = super().to_openai_message(message)
+    if thinking is not None:
+      # Pass "" through as well: the template distinguishes none (no channel)
+      # from empty (channel opened and closed immediately).
+      result["reasoning_content"] = thinking
     if result["role"] == "model":
       result["role"] = "assistant"
     for tool_call in result.get("tool_calls", []):

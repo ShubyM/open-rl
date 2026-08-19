@@ -235,10 +235,10 @@
     {%- endif -%}
 
     {#- Render reasoning/reasoning_content as thinking channel -#}
-    {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}
+    {%- set thinking_text = message.get('reasoning') if message.get('reasoning') is not none else message.get('reasoning_content') -%}
     {%- set thinking_gate = (loop.index0 > ns_turn.last_user_idx) or (preserve_thinking and message.get('tool_calls')) -%}
-    {%- if thinking_text and thinking_gate -%}
-        {{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}
+    {%- if thinking_text is not none and thinking_gate -%}
+        {{- '<|channel>thought\n' + (thinking_text if not thinking_text or thinking_text.endswith('\n') else thinking_text + '\n') + '<channel|>' -}}
     {%- endif -%}
 
             {%- if message.get('tool_calls') -%}
