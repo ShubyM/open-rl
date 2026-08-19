@@ -16,6 +16,7 @@
 # Full fine-tuning is NOT supported through this path:
 # stock vLLM has no checkpoint hot-reload; FFT keeps the managed queue workers.
 
+import array
 import asyncio
 import os
 import zlib
@@ -58,8 +59,25 @@ _placement_counter = 0
 _MAX_ROUTES = 4096
 
 
+# Hash the token ids as fixed-width binary, not as their repr. The old
+# `bytes(str(token_ids[:length]), "utf-8")` built a decimal string of the whole
+# prefix on every call: ~1.9 ms at 40k tokens, and pick_base_url called it once
+# per registered prefix length. With a few hundred lengths in the table that is
+# 100-500 ms of synchronous CPU per routing decision, and _MAX_ROUTES=4096
+# allows ~3 s. It runs on the gateway's event loop, so 48 concurrent rollouts
+# serialize behind it -- which is what made AFFINITY=1 unstable: redis reads and
+# 30 s TCP connects to vLLM both timed out while redis and vLLM were each
+# answering in ~1 ms, and it worsened as the table grew. The single-URL path
+# returns above, so AFFINITY=0 never hit this.
+_TOKEN_WIDTH = array.array("q").itemsize
+
+
+def _token_bytes(token_ids: list[int]) -> bytes:
+  return array.array("q", token_ids).tobytes()
+
+
 def _crc(token_ids: list[int], length: int) -> int:
-  return zlib.crc32(bytes(str(token_ids[:length]), "utf-8"))
+  return zlib.crc32(_token_bytes(token_ids[:length]))
 
 
 def pick_base_url(prompt_token_ids: list[int]) -> str:
@@ -71,9 +89,26 @@ def pick_base_url(prompt_token_ids: list[int]) -> str:
   if len(urls) == 1:
     return urls[0]
   length = len(prompt_token_ids)
-  for prefix_len, by_crc in _episode_routes.items():
-    if prefix_len <= length:
-      url = by_crc.get(_crc(prompt_token_ids, prefix_len))
+  # One pass over the prompt covers every candidate length: crc32 chains, so
+  # extending the running crc by the next slice equals hashing that whole
+  # prefix from scratch. Cost is O(len(prompt)) for the table instead of
+  # O(sum of all registered lengths).
+  candidates_by_len = sorted(prefix_len for prefix_len in _episode_routes if prefix_len <= length)
+  if candidates_by_len:
+    buf = _token_bytes(prompt_token_ids)
+    running = 0
+    consumed = 0
+    crc_at: list[tuple[int, int]] = []
+    for prefix_len in candidates_by_len:
+      running = zlib.crc32(buf[consumed * _TOKEN_WIDTH : prefix_len * _TOKEN_WIDTH], running)
+      crc_at.append((prefix_len, running))
+      consumed = prefix_len
+    # Longest match wins. The old code took whichever length dict iteration
+    # reached first, which on this recipe is a real hazard: LAB tasks share up
+    # to 6,413 of their ~6,434 first-turn tokens, so a short prefix can match a
+    # different rollout and send the turn to an instance holding none of its KV.
+    for prefix_len, crc in reversed(crc_at):
+      url = _episode_routes[prefix_len].get(crc)
       if url is not None and url in urls:
         return url
   global _placement_counter
