@@ -327,9 +327,21 @@ TRAIN_SPLIT_SEED=${TRAIN_SPLIT_SEED:-242}
 MAX_STEPS=${MAX_STEPS:-20}
 TRAIN_EXTRA=${TRAIN_EXTRA:-0}
 
+# 2e-4 diverges. It held for four steps and then ran away: across run26 steps
+# 3-6 entropy went 0.222 -> 2.127, KL 0.0012 -> 0.0516 and reward 0.324 -> 0.073,
+# i.e. below where step 0 started. The mechanism is a feedback loop -- a looser
+# policy writes longer turns (ac_tokens_per_turn 780 -> 2955), those hit the
+# max_tokens cap (6% -> 54% of episodes), capped episodes end at the -0.1 floor
+# without ever reaching the judge (failed_before_grading 0.125 -> 0.604), and the
+# thinner reward signal loosens the policy further. No earlier run at 2e-4 ever
+# got past step 4 to show this: run22 died at 1 step, run24 at 2, run25 at 4, all
+# on infrastructure faults, so the LR looked survivable when it never had been.
+# 2e-5 is a 10x cut and still ~7x the recipe default in train.py.
+LEARNING_RATE=${LEARNING_RATE:-2e-5}
+
 TRAIN_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/train.py \
 model_name=$MODEL_NAME renderer_name=$RENDERER base_url=http://127.0.0.1:9003 \
-learning_rate=2e-4 lora_rank=32 \
+learning_rate=$LEARNING_RATE lora_rank=32 \
 batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=$MAX_STEPS eval_every=5 \
 task_set=$TASK_SET judge_model=$JUDGE_MODEL $STREAM_ARG \
 max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TOOL_TOKENS \

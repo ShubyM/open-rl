@@ -21,11 +21,69 @@ from tinker_cookbook import checkpoint_utils
 # stalled the gateway loop and reset connections).
 tinker_training_client.MAX_CHUNK_BYTES_COUNT = 30_000_000
 
+from tinker_cookbook.rl import message_env as rl_message_env
 from tinker_cookbook.rl import train as rl_train
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator
 from tinker_cookbook.stores.storage import LocalStorage
 from tinker_cookbook.stores.training_store import TrainingRunStore
 from tinker_utils import force_rich_log_colors, resolve_base_url
+
+# Give optim_step a gradient clip. The cookbook builds its AdamParams as
+# AdamParams(learning_rate=..., beta1=.9, beta2=.95, eps=1e-8) at two call sites
+# and never passes grad_clip_norm, which defaults to 0.0; lora_trainer_worker
+# reads that as `adam_params.get("grad_clip_norm") or math.inf`, so nothing is
+# ever clipped. The knob is implemented on both ends -- it is simply not
+# reachable from a recipe, and rl_train.Config has no field for it either, so a
+# patch here is the only place to set it without forking a pinned dependency.
+#
+# 1e5 sits just above the healthy range rather than at the usual O(1): observed
+# grad norms on this recipe are 5e4-2e5 on steps that train fine. Clipping is
+# only useful against spikes anyway -- Adam is scale-invariant to a *constant*
+# gradient rescale (m and sqrt(v) scale together), so a clip low enough to bind
+# on every step would buy nothing and only discard the relative-magnitude signal
+# Adam runs on. run26 hit 7.6e5 and 1.3e6 on the two steps where it came apart,
+# which is what this is meant to catch.
+GRAD_CLIP_NORM = 1e5
+
+_BaseAdamParams = tinker.AdamParams
+
+
+class _AdamParamsWithClip(_BaseAdamParams):
+  def __init__(self, **kwargs):
+    kwargs.setdefault("grad_clip_norm", GRAD_CLIP_NORM)
+    super().__init__(**kwargs)
+
+
+tinker.AdamParams = _AdamParamsWithClip
+
+# Report the terminal-condition flags as rates instead of the constant 1.0.
+# message_env emits context_overflow / parse_error / max_tokens_reached only on
+# the transition that trips them, and only ever as 1.0. dict_mean averages a key
+# over just the dicts that carry it ("missing keys are not treated as zero"), so
+# each one reads exactly 1.000 whenever >=1 episode trips it and is absent
+# otherwise -- it encodes presence, never frequency. That hid the failure mode
+# in run26: max_tokens_reached went 6% -> 54% of episodes across seven steps
+# while logging 1.000 throughout, and context_overflow logged the same 1.000
+# while falling 33% -> 0%.
+#
+# Defaulting them to 0.0 makes the mean a real rate. Note the denominator is
+# transitions, not episodes: these flags all end the episode, so each episode
+# trips at most one once, and the per-episode rate is the logged value times
+# total_turns / total_episodes (both already in the metrics).
+_TERMINAL_FLAG_METRICS = ("context_overflow", "parse_error", "max_tokens_reached")
+_base_env_step = rl_message_env.EnvFromMessageEnv.step
+
+
+async def _step_with_flag_rates(self, action, *, extra=None):
+  result = await _base_env_step(self, action, extra=extra)
+  metrics = dict(result.metrics or {})
+  for key in _TERMINAL_FLAG_METRICS:
+    metrics.setdefault(key, 0.0)
+  result.metrics = metrics
+  return result
+
+
+rl_message_env.EnvFromMessageEnv.step = _step_with_flag_rates
 
 MODEL_NAME = "google/gemma-4-E4B-it"
 COMMAND_TIMEOUT = 60
