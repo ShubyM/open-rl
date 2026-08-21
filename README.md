@@ -1,5 +1,7 @@
 # OpenRL: self-hosted API for your RL Infrastructure
 
+[![Release](https://img.shields.io/github/v/release/gke-labs/open-rl?label=release)](https://github.com/gke-labs/open-rl/releases/latest)
+
 > **Research preview.** OpenRL is an early-stage project from GKE Labs. Expect the API surface
 > and architecture to keep evolving.
 
