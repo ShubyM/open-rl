@@ -1,8 +1,9 @@
 import json
+import sys
 import unittest
 from unittest.mock import patch
 
-from server import gateway
+from server import gateway, worker_manager
 from server.worker_manager import LocalWorkerManager
 
 
@@ -417,6 +418,56 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
     cmd_args = mock_popen.call_args[0][0]
     self.assertIn("server.vllm_sampler", cmd_args)
     self.assertIn("model-fft-1", cmd_args)
+
+
+class EstimateMemoryTierTest(unittest.TestCase):
+  """Tier selection for full fine-tuning is driven by the known-model table."""
+
+  def test_small_models_fit_the_24gb_tier(self) -> None:
+    for model in ("Qwen/Qwen3-0.6B", "Qwen/Qwen2.5-0.5B", "Qwen/Qwen2.5-1.5B", "google/gemma-3-1b-pt"):
+      self.assertEqual(worker_manager.estimate_memory_tier(model, "full"), "24gb", model)
+
+  def test_large_models_need_the_80gb_tier(self) -> None:
+    for model in ("Qwen/Qwen3-4B", "Qwen/Qwen3-8B", "Qwen/Qwen3.5-27B", "google/gemma-4-e4b"):
+      self.assertEqual(worker_manager.estimate_memory_tier(model, "full"), "80gb", model)
+
+  def test_effective_size_names_are_sized_by_their_raw_weights(self) -> None:
+    # `gemma-4-e2b` states its *effective* size; the raw weights an FFT has to
+    # hold are ~5B. Reading "2b" off the name is what puts it on a 24 GB card.
+    self.assertEqual(worker_manager.estimate_memory_tier("google/gemma-4-e2b", "full"), "80gb")
+
+  def test_unknown_models_stay_on_the_conservative_tier(self) -> None:
+    with self.assertLogs("server.worker_manager", level="WARNING"):
+      self.assertEqual(worker_manager.estimate_memory_tier("acme/mystery-model", "full"), "80gb")
+
+  def test_variant_and_release_tags_resolve_to_the_base_entry(self) -> None:
+    cases = {
+      "Qwen/Qwen2.5-0.5B-Instruct": "24gb",
+      "Qwen/Qwen3-4B-Instruct-2507": "80gb",
+      "google/gemma-4-E2B-it": "80gb",
+      "google/gemma-3-1b-it": "24gb",
+      "qwen3-0.6b": "24gb",  # bare id, no org prefix
+    }
+    for model, tier in cases.items():
+      self.assertEqual(worker_manager.estimate_memory_tier(model, "full"), tier, model)
+
+  def test_sizing_needs_no_network_or_hub_client(self) -> None:
+    # The launch path must not depend on the Hub being reachable, so a missing
+    # huggingface_hub must not change any verdict.
+    with patch.dict(sys.modules, {"huggingface_hub": None}):
+      self.assertEqual(worker_manager.estimate_memory_tier("Qwen/Qwen3-0.6B", "full"), "24gb")
+      self.assertEqual(worker_manager.estimate_memory_tier("Qwen/Qwen3-8B", "full"), "80gb")
+
+  def test_table_entries_agree_with_the_documented_budget(self) -> None:
+    # The 24gb tier admits ~1.7B params at 12 bytes each; guard the boundary so
+    # a future budget change has to be made deliberately.
+    threshold = worker_manager.TIER_24GB_FFT_BUDGET_BYTES / worker_manager.FFT_VRAM_BYTES_PER_PARAM
+    self.assertLess(worker_manager.KNOWN_PARAMETER_COUNTS["qwen3-1.7b"], threshold)
+    self.assertGreater(worker_manager.KNOWN_PARAMETER_COUNTS["qwen3-4b"], threshold)
+
+  def test_lora_tiers_are_unchanged(self) -> None:
+    self.assertEqual(worker_manager.estimate_memory_tier("Qwen/Qwen3-8B", "lora"), "24gb")
+    self.assertEqual(worker_manager.estimate_memory_tier("meta-llama/Llama-3-70B", "lora"), "80gb")
 
 
 if __name__ == "__main__":
