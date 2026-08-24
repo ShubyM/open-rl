@@ -116,5 +116,39 @@ class NativeToolCallArgsTest(unittest.TestCase):
       self.assertEqual(_normalize()(body), body)
 
 
+class ToolCallBoundaryTest(unittest.TestCase):
+  """A malformed call must not consume the calls next to it.
+
+  With a plain `.*?` body an unterminated call kept scanning for a `}`, found
+  the *next* call's, and swallowed it -- so a `write` that lost its brace to a
+  truncated document also destroyed a valid `bash`. Replaying run29's 70
+  captured parse errors, fixing this recovers 37 of them (52.9%).
+  """
+
+  GOOD = '<|tool_call>call:bash{"command":"ls"}<tool_call|>'
+  GOOD2 = '<|tool_call>call:read{"file_path":"a.docx"}<tool_call|>'
+  BAD = '<|tool_call>call:write{"file_path":"x.docx","content":"hello`)'
+
+  def _names(self, text):
+    sys.path.insert(0, str(PROMPTS_PATH.parent))
+    from gemma4_renderer import _TOOL_CALL
+
+    return [m.group("name") for m in _TOOL_CALL.finditer(text)]
+
+  def test_unterminated_call_does_not_swallow_the_next_one(self) -> None:
+    self.assertEqual(self._names(self.BAD + self.GOOD), ["bash"])
+    self.assertEqual(self._names(self.GOOD + self.BAD + self.GOOD2), ["bash", "read"])
+
+  def test_well_formed_calls_are_all_found(self) -> None:
+    self.assertEqual(self._names(self.GOOD + self.GOOD2), ["bash", "read"])
+
+  def test_unterminated_call_alone_matches_nothing(self) -> None:
+    self.assertEqual(self._names(self.BAD), [])
+
+  def test_long_unterminated_body_does_not_blow_up(self) -> None:
+    big = '<|tool_call>call:write{"file_path":"big.docx","content":"' + "x" * 60000
+    self.assertEqual(self._names(big + self.GOOD), ["bash"])
+
+
 if __name__ == "__main__":
   unittest.main()

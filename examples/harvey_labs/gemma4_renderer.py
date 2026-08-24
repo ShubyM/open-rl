@@ -37,8 +37,14 @@ from tinker_cookbook.renderers.base import (
 # to this one for tool-calling paths, so the pin stays on #36.
 GEMMA4_CHAT_TEMPLATE_SHA256 = "ca51a48d0fe20cfe36f480d6cb0a691a60cf1bb4a34475183868e7d24eb8cd38"
 
+# The body must not run past the next call's opener. With a plain `.*?` an
+# unterminated call swallows the following one whole -- it keeps scanning for a
+# `}` and finds the *next* call's, then finds that call's `<tool_call|>` right
+# where it wants a closer, so both are consumed as one malformed call. A `write`
+# that lost its brace to a truncated document therefore took a valid `bash` with
+# it. No real body can contain the opener, so refusing to cross it is free.
 _TOOL_CALL = re.compile(
-  r"<\|tool_call>(?P<body>call:(?P<name>\w+)\{.*?\})"
+  r"<\|tool_call>(?P<body>call:(?P<name>\w+)\{(?:(?!<\|tool_call>).)*?\})"
   r"(?:<tool_call\|>|<eos>|(?=<\|tool_response>)|$)",
   re.DOTALL,
 )
@@ -267,30 +273,35 @@ class Gemma4ToolRenderer(renderers.Renderer):
       # call. That channel order is outside the response schema even when the
       # call block itself is complete and valid. Parse complete call blocks in
       # isolation so useful actions are not discarded with their prose.
-      def call_block(normalize: bool) -> str:
-        blocks = []
-        for match in _TOOL_CALL.finditer(parse_input):
-          name = match.group("name")
-          if name not in self.tool_names:
-            continue
-          args = match.group("body")[len("call:") + len(name) :]
-          if normalize:
-            args = normalize_tool_call_args(args)
-          blocks.append(f"<|tool_call>call:{name}{args}<tool_call|>")
-        return "".join(blocks)
-
-      # Raw first, so a call that already parses is never touched; the lenient
-      # rewrite only ever runs on text the tokenizer has already rejected.
-      for normalize in (False, True):
-        block = call_block(normalize)
-        if not block:
+      #
+      # One call at a time, and keep whichever ones survive. Handing the whole
+      # turn to the parser as a single concatenated block let one unrecoverable
+      # call discard every valid call beside it: measured on run29 eval-0,
+      # `good` alone parsed to 1 call and `bad` alone to 0, but `good`+`bad`
+      # parsed to 0 in either order. Two of that eval's seven parse errors were
+      # turns whose calls were individually well-formed.
+      recovered: list[dict[str, Any]] = []
+      for match in _TOOL_CALL.finditer(parse_input):
+        name = match.group("name")
+        if name not in self.tool_names:
           continue
-        try:
-          tool_calls = _valid_tool_calls(self.tokenizer.parse_response(block))
-        except Exception:
-          tool_calls = []
-        if tool_calls:
-          break
+        raw = match.group("body")[len("call:") + len(name) :]
+        # Raw first, so a call that already parses is never touched; the lenient
+        # rewrite only ever runs on text the tokenizer has already rejected.
+        candidates = [raw]
+        if (normalized := normalize_tool_call_args(raw)) != raw:
+          candidates.append(normalized)
+        for args in candidates:
+          try:
+            one = _valid_tool_calls(
+              self.tokenizer.parse_response(f"<|tool_call>call:{name}{args}<tool_call|>")
+            )
+          except Exception:
+            one = []
+          if one:
+            recovered.extend(one)
+            break
+      tool_calls = recovered
 
     parsed_tool_calls = []
     for tool_call in tool_calls:

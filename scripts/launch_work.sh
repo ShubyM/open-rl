@@ -183,6 +183,141 @@ case "$MODEL" in
     # all — sampling silently serves the base model for the whole run.
     RUN_LABEL=${RUN_LABEL:-lab-lora-gemma4-e4b}
     ;;
+  12b)
+    # Gemma-4-12B, the dense sibling of the E-series. Same 8x6 / seed-242 shape
+    # as run20 so the curve is directly comparable to the E4B one.
+    MODEL_NAME=google/gemma-4-12B-it
+    # Trainer backward is the binding constraint, not the sampler and not the
+    # model -- Gemma-4-12B itself does 262,144 (max_position_embeddings), so
+    # everything below is a memory budget, not an architectural limit.
+    #
+    # Refit on 178 clean backward samples from run22 (the earlier 244-sample fit
+    # off run21 is superseded; it read the ceiling ~26k tokens too low):
+    #   peak_GiB ~= 0.7437 * ktokens + 22.46,  worst-case residual +8.63
+    # against 139.80 GiB of H200, putting the OOM line near 146k tokens. The
+    # worst backward actually observed was 109.84 GiB at 114,352 tokens -- 78.6%
+    # of the card, ~30 GiB free -- so 114,688 was leaving real headroom unused.
+    #
+    # Why the two fits disagree so much: peak tracks the longest sequence in the
+    # microbatch, not just its token total, because gradient checkpointing
+    # recomputes a whole sequence at a time. run21 packed 4x32296 and peaked at
+    # 136.64 GiB; run22 packs 1x79154 at a similar total and peaks at 109.84.
+    # Same tokens, very different peaks. Treat any ceiling here as shape-
+    # dependent and keep the margin.
+    #
+    # Raised 131,072 -> 143,360 after run27-29. A third fit, this one over 14,097
+    # `[CUDA_MEMORY] phase=backward[NxM]:end` samples binned by N*M, reads
+    #   p99 peak_allocated ~= 0.691 * ktokens + 27.4
+    # which is the run22 line within noise (0.7437 / 22.46) and independently
+    # puts the ceiling in the same place. At 143,360 the two fits give 126.5 and
+    # 129.1 GiB of 139.80; adding run22's worst-case residual of 8.63 still lands
+    # under the card. 147,456 sits *on* the run22 OOM line, so it is not taken.
+    #
+    # Read `peak_allocated` and nothing else. `allocated` at :end is post-free
+    # (~25 GiB in every bin) and `peak_reserved` is the caching allocator's pool
+    # high-water mark under expandable_segments (138.5-138.8 GiB in every bin,
+    # including 0-16k). Both are flat in sequence length and both are wrong;
+    # each one has already produced a confidently wrong ceiling here.
+    #
+    # Where the 0.69 GiB/ktoken goes: gradient checkpointing saves one input per
+    # layer, 48 x 3,840 x 2 bytes = 0.37 GiB/ktoken, and the per-layer recompute
+    # working set (intermediate_size 15,360) is most of the rest. The 262,144
+    # vocab is not implicated -- the fused chunked logprob head is live
+    # (OPEN_RL_FUSED_LOGPROB=1, chunk 128) with no fallback warnings. To go
+    # meaningfully past this, activation offload (trainer_worker.py:423, today
+    # mutually exclusive with the fused head) or sequence parallelism across the
+    # six trainer ranks, not another tuning pass.
+    #
+    # Separately, 9 of the 14,097 backwards OOM'd (0.06%) inside
+    # torch/utils/checkpoint.py recompute_fn, and they are length-INDEPENDENT --
+    # one at 6,464 tokens while holding 123 GiB. Something transient reaches
+    # ~110 GiB regardless of shape; cause unknown. That spike, not the fit, is
+    # what the remaining ~10 GiB of margin is for.
+    #
+    # This raise moves SAMPLER_CONTEXT too, so it needs a vLLM restart. The KV
+    # cache is 1,844,349 tokens, so the window costs nothing: 14.07x concurrency
+    # at 131,072 becomes 12.86x at 143,360.
+    #
+    # The intercept is 22.46 GiB of *frozen base weights* replicated on all four
+    # ranks (12B x 2 bytes bf16 = 22.35 GiB) -- the LoRA path has no FSDP wrap.
+    # That, not optimizer state, is the only large thing left to attack; Adam's
+    # moments for 131M rank-32 params are under 1 GiB (see OPEN_RL_OPTIM_CPU_STEP).
+    #
+    # A single trajectory cannot be split across microbatches -- the packer only
+    # refuses to *add* to a non-empty batch -- so max_trajectory_tokens is bounded
+    # by one backward, which is why CONTEXT and SAMPLER_CONTEXT must differ.
+    CONTEXT=${CONTEXT:-143360}
+    # The sampler window deliberately matches CONTEXT rather than reaching for
+    # 12B's 256K. A bigger window would buy nothing: the KV cache is sized from
+    # --gpu-memory-utilization, not --max-model-len (run21: 0.92 -> 128.62 GiB,
+    # less 23.83 weights / 1.99 activation / 1.25 CUDA-graph / 0.22 non-torch =
+    # 102.57 GiB = 1,837,317 tokens, the same number at any window), and the env
+    # already caps a prompt at CONTEXT - GEN_TOKENS = 110,592, so nothing above
+    # CONTEXT is reachable.
+    #
+    # Matching also keeps a guardrail. The trainer cannot split one trajectory
+    # across microbatches, so a prompt longer than CONTEXT is an OOM later; with
+    # the windows equal vLLM rejects it at the sampler with a 400 instead. That
+    # is the failure that killed run21, and it arrived as an unrelated-looking
+    # "did not produce one loss_fn_output per input datum" three hours in.
+    SAMPLER_CONTEXT=${SAMPLER_CONTEXT:-$CONTEXT}
+    # 16,384 was sized at ~2x E4B's observed max (p99 3,874, max 7,639). 12B is
+    # a different animal: it writes whole documents inline as `write` arguments
+    # and ran a single turn straight into the cap. In run21's step-0 eval that
+    # killed 15 of 50 episodes -- stop_reason=="length" ends the episode at
+    # message_env.py:119 with -0.1 and no grading at all, so 30% of the batch
+    # was pure negative noise the judge never saw. Doubling to 32,768 leaves a
+    # 98,304-token observation ceiling; context_overflow was only 1/50, so
+    # spending trajectory budget on generation is the right side of the trade.
+    #
+    # !! run22 says this trade did not pay off and should probably be reverted.
+    # Its step-0 eval, same weights and same 50 tasks as run21, moved the
+    # failures rather than removing them: gen-cap kills 15 -> 8 but overflow
+    # 1 -> 5 and parse 5 -> 7, so episodes reaching the judge went 29 -> 30 of
+    # 50 and mean reward 0.1246 -> 0.1192 (noise). See docs/reports/run22/.
+    # Worse, on the *training* split 17 of 48 rollouts still ran the full 32,768
+    # and 29 of 48 returned -0.100, and each one costs twice the sampling and
+    # backward of a 16,384 cap -- step 0 took ~2.5h. The verbosity is a tool-use
+    # problem (12B writes whole documents inline as `write` arguments), and no
+    # value of GEN_TOKENS fixes it. Consider 16384 plus a write-tool fix.
+    #
+    # run27 settles it: reverting to 16384. Over 21 training steps and 5 evals
+    # the generation cap went almost unused -- max_tokens_reached was 0% of
+    # episodes on both of the last two evals and under 6% on most training steps
+    # -- while context_overflow cost a steady 10-19% of episodes. The 32,768
+    # reserve was being held for a failure mode that had stopped happening, and
+    # charged against the one that had not.
+    #
+    # run28 ran that experiment for 40 steps and refuted it, so this is back at
+    # 32768. Halving the cap did kill context overflow (18% -> 2% of episodes)
+    # but max_tokens_reached rose to fill the gap and overshot, 4% -> 32%. Total
+    # truncation went from run27's ~14-22% to 34% and the fraction of episodes
+    # reaching the judge never moved (0.64-0.74 in both runs). The generation
+    # length distribution is adaptive, not fixed: p99 is only 9,260 tokens, so a
+    # 16,384 cap should have bound on ~1% of turns and instead bound on a third
+    # of episodes. Context overflow is the cheaper of the two failures.
+    #
+    # That leaves the observation ceiling at CONTEXT - 32,768, which the CONTEXT
+    # raise above takes from 98,304 to 110,592 (+12.5%). The claim that used to
+    # sit here -- that CONTEXT could not move, from a 6,419-sample fit of
+    # 0.657 * ktokens + 5.4 on a 31.3 GiB baseline -- was measured off the wrong
+    # allocator field and is retracted; see the CONTEXT block.
+    GEN_TOKENS=${GEN_TOKENS:-32768}
+    TASK_SET=${TASK_SET:-random}
+    BATCH_SIZE=${BATCH_SIZE:-8}
+    ROLLOUTS=${ROLLOUTS:-6}
+    RENDERER=gemma4
+    # !! VERIFY THE ADAPTER IS ACTUALLY APPLIED BEFORE TRUSTING A 12B CURVE.
+    # E4B routes LoRA through the multimodal model's hf_to_vllm_mapper, which is
+    # why _remap_adapter_to_hub_layout emits model.language_model.* keys. 12B is
+    # encoder-free -- image and audio project straight into the decoder -- so it
+    # is a different graph and there is no reason to assume the same key layout.
+    # If the keys match nothing, vLLM applies no adapter and silently samples the
+    # base model for the entire run, which is a curve that looks like "no
+    # learning" rather than an error. Check step 0 sampling against the base
+    # model before letting it run overnight.
+    RUN_LABEL=${RUN_LABEL:-lab-lora-gemma4-12b}
+    ;;
   27b)
     MODEL_NAME=Qwen/Qwen3.5-27B
     CONTEXT=${CONTEXT:-98304}
@@ -194,7 +329,7 @@ case "$MODEL" in
     RUN_LABEL=${RUN_LABEL:-lab-lora-qwen27b}
     ;;
   *)
-    echo "Unknown MODEL=$MODEL (use 9b, 9b-128k, e4b, or 27b)" >&2
+    echo "Unknown MODEL=$MODEL (use 9b, 9b-128k, e4b, 12b, or 27b)" >&2
     exit 1
     ;;
 esac
@@ -203,6 +338,33 @@ BATCH_SIZE=${BATCH_SIZE:-5}
 ROLLOUTS=${ROLLOUTS:-2}
 RENDERER=${RENDERER:-qwen3_5}
 SAMPLER_EXTRA=${SAMPLER_EXTRA:-}
+
+# Speculative decoding. Rollout generation is the wall-clock bottleneck on the
+# 12B LAB runs: run22's step 0 took ~2.5h, and 17 of its 48 rollouts emitted the
+# full 32,768-token cap one token per target forward pass. A draft model
+# proposes SPEC_TOKENS at a time and the target verifies them in a single pass,
+# so the win scales with exactly the long, low-entropy, document-shaped output
+# that is making these runs slow.
+#
+#   SPEC_MODEL=google/gemma-4-12B-it-assistant ./scripts/launch_work.sh
+#
+# Off unless SPEC_MODEL is set, because the failure mode is a hard one: vLLM
+# resolves the draft model at startup and exits if the name does not exist, and
+# the sampler is the slowest part of the stack to bring back (~3-5 min to reload
+# 12B across 4 ranks). Two things to confirm the first time this is used on a
+# given box, neither of which can be checked from here:
+#   - the draft repo actually exists and is pullable (it is not a HF-canonical
+#     name pattern, so it may be an internal or gated artifact)
+#   - the installed vLLM supports speculative decoding *together with*
+#     --enable-lora and --data-parallel-size; several releases reject that
+#     combination outright, and this stack needs both
+# Verify against a throwaway serve before committing a run to it.
+SPEC_MODEL=${SPEC_MODEL:-}
+SPEC_TOKENS=${SPEC_TOKENS:-4}
+if [ -n "$SPEC_MODEL" ]; then
+  SAMPLER_EXTRA="$SAMPLER_EXTRA --speculative-config '{\"model\":\"$SPEC_MODEL\",\"num_speculative_tokens\":$SPEC_TOKENS}'"
+  echo "[work] speculative decoding: $SPEC_MODEL, $SPEC_TOKENS draft tokens"
+fi
 
 # Deltanet is a Qwen3.5 hybrid-attention path; Gemma has no equivalent, and the
 # import fails there for the boring reason that the module does not exist.
@@ -224,7 +386,29 @@ if [ "$WORKLOAD" = "sft" ]; then
   # so the worst packed forward stays at one max-size datum's scale.
   CONTEXT=${SFT_CONTEXT:-163840}
 fi
-echo "[work] MODEL=$MODEL -> $MODEL_NAME, context $CONTEXT, gen $GEN_TOKENS, tool $TOOL_TOKENS, batch ${BATCH_SIZE}x${ROLLOUTS}, log $RUN_LABEL"
+
+# CONTEXT used to drive three unrelated limits at once: the sampler's window,
+# the trainer's microbatch packing budget, and the episode's trajectory cap.
+# They are bounded by different hardware -- KV cache on the sampler GPUs versus
+# backward activations on the trainer GPUs -- and on 12B those bounds are an
+# order of magnitude apart (1.8M tokens of KV against ~120K of backward). Tying
+# them together meant every run had to pick the minimum and waste the rest.
+#
+# Both still default to CONTEXT, so every existing model case and every
+# CONTEXT=... invocation behaves exactly as before; only a case or caller that
+# sets them explicitly sees a difference.
+SAMPLER_CONTEXT=${SAMPLER_CONTEXT:-$CONTEXT}
+TRAIN_TOKEN_BUDGET=${TRAIN_TOKEN_BUDGET:-$CONTEXT}
+
+# A trajectory the trainer cannot fwd_bwd in one microbatch is an OOM waiting
+# for the one long episode that reaches it, and it fails mid-run rather than at
+# launch. Catch it here instead.
+if [ "$CONTEXT" -gt "$TRAIN_TOKEN_BUDGET" ]; then
+  echo "WARNING: CONTEXT=$CONTEXT exceeds TRAIN_TOKEN_BUDGET=$TRAIN_TOKEN_BUDGET — a single" >&2
+  echo "         max-length trajectory cannot be split across microbatches and will OOM" >&2
+  echo "         the trainer. Lower CONTEXT or raise TRAIN_TOKEN_BUDGET." >&2
+fi
+echo "[work] MODEL=$MODEL -> $MODEL_NAME, context $CONTEXT (sampler $SAMPLER_CONTEXT, train budget $TRAIN_TOKEN_BUDGET), gen $GEN_TOKENS, tool $TOOL_TOKENS, batch ${BATCH_SIZE}x${ROLLOUTS}, log $RUN_LABEL"
 if [ "$GEN_TOKENS" -lt 32768 ] && [[ "$MODEL" == 9b* ]]; then
   echo "WARNING: GEN_TOKENS=$GEN_TOKENS < 32768 — the 16K cap killed episodes mid-thought in runs 8-10" >&2
   echo "         (run 11's record needed 32K). Unset GEN_TOKENS or export GEN_TOKENS=32768." >&2
@@ -275,7 +459,7 @@ if [ "$AFFINITY" = "1" ]; then
     SAMPLER_CMD="$SAMPLER_CMD CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_ALLOW_RUNTIME_LORA_UPDATING=true \
 uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
 --port $PORT --enable-lora --max-lora-rank 64 --max-loras 2 --enable-prefix-caching \
---max-model-len $CONTEXT --gpu-memory-utilization 0.92 \
+--max-model-len $SAMPLER_CONTEXT --gpu-memory-utilization 0.92 \
 --language-model-only $SAMPLER_EXTRA |& tee -a $LOGS/sampler-$i.log &"
   done
   SAMPLER_CMD="${SAMPLER_CMD} wait"
@@ -291,7 +475,7 @@ else
 uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
 --port 8000 --enable-lora --max-lora-rank 64 --max-loras 2 --enable-prefix-caching \
 --data-parallel-size $SAMPLER_DP --api-server-count 1 \
---max-model-len $CONTEXT --gpu-memory-utilization 0.92 \
+--max-model-len $SAMPLER_CONTEXT --gpu-memory-utilization 0.92 \
 --language-model-only $SAMPLER_EXTRA |& tee -a $LOGS/sampler.log"
 fi
 
@@ -300,7 +484,8 @@ GATEWAY_DEV=0
 GATEWAY_CMD="$SAMPLER_WAIT; \
 CUDA_VISIBLE_DEVICES=$GATEWAY_DEV $QUEUE_ENV FLA_TILELANG=$FLA_TILELANG BASE_MODEL=$MODEL_NAME $SAMPLER_ENV \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-OPEN_RL_TRAIN_TOKEN_BUDGET=$CONTEXT OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
+OPEN_RL_TRAIN_TOKEN_BUDGET=$TRAIN_TOKEN_BUDGET OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
+OPEN_RL_OPTIM_CPU_STEP=${OPTIM_CPU_STEP:-1} \
 OPEN_RL_LOG_CUDA_MEMORY=1 \
 uv run --extra gpu --extra vllm --extra fastpath python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003 |& tee -a $LOGS/gateway.log"
 
@@ -408,7 +593,8 @@ if [ "$TRAIN_GPUS" -gt 1 ]; then
   TRAINER_CMD="CUDA_VISIBLE_DEVICES=$TRAIN_DEV FLA_TILELANG=$FLA_TILELANG REDIS_URL=redis://127.0.0.1:6379 \
 OPEN_RL_FSDP_WORLD_SIZE=$TRAIN_GPUS OPEN_RL_WORKER_PROBE_PORT=8090 \
 BASE_MODEL=$MODEL_NAME PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-OPEN_RL_TRAIN_TOKEN_BUDGET=$CONTEXT OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
+OPEN_RL_TRAIN_TOKEN_BUDGET=$TRAIN_TOKEN_BUDGET OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
+OPEN_RL_OPTIM_CPU_STEP=${OPTIM_CPU_STEP:-1} \
 OPEN_RL_LOG_CUDA_MEMORY=1 \
 uv run --extra gpu --extra fastpath torchrun --standalone --nproc-per-node=$TRAIN_GPUS -m server.training_requests_processor |& tee -a $LOGS/trainer.log"
   tmux new-window -t "$SESSION" -n trainer -c "$REPO"
