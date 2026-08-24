@@ -170,6 +170,14 @@ class GatewayLifespanTest(unittest.IsolatedAsyncioTestCase):
         pass
 
 
+class CreateWorkerManagerTest(unittest.TestCase):
+  def test_none_mode_disables_worker_manager(self) -> None:
+    from server.worker_manager import create_worker_manager
+
+    with patch.dict("os.environ", {"OPEN_RL_WORKER_MANAGER": "none", "REDIS_URL": "redis://localhost:6379"}, clear=True):
+      self.assertIsNone(create_worker_manager())
+
+
 class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
   async def test_requires_redis(self) -> None:
     with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
@@ -177,7 +185,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_local_launch_stamps_workload_tags_and_process_group(self) -> None:
     with (
-      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True),
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_ENABLE_FFT": "true"}, clear=True),
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
@@ -191,7 +199,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_local_sampler_launch_stamps_workload_tags_and_process_group(self) -> None:
     with (
-      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm"}, clear=True),
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}, clear=True),
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()

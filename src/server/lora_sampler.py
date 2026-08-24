@@ -175,8 +175,16 @@ async def main():
     await store.redis.expire(f"open_rl:sampler_ready:{model_id}", 3600)
     print(f"[LoRA Sampler] Registered ready signal for model {model_id} in Redis.")
 
+  last_ready_refresh = asyncio.get_running_loop().time()
   while True:
     try:
+      # Standing deployments outlive the 3600s ready-key TTL; keep it fresh so
+      # new sampling sessions don't time out waiting on a sampler that is live.
+      now = asyncio.get_running_loop().time()
+      if hasattr(store, "redis") and now - last_ready_refresh > 60:
+        await store.redis.set(f"open_rl:sampler_ready:{model_id}", "1")
+        await store.redis.expire(f"open_rl:sampler_ready:{model_id}", 3600)
+        last_ready_refresh = now
       sampling_reqs = await store.get_sampling_requests_for_model(model_id)
       if not sampling_reqs:
         await asyncio.sleep(0.05)

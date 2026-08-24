@@ -132,7 +132,8 @@ class KubernetesWorkerManagerTest(unittest.TestCase):
 
   def test_launch_stamps_name_labels_args_and_job_id_env(self) -> None:
     api = _FakeCoreApi()
-    self._manager(api).launch("Model_A.1")
+    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
+      self._manager(api).launch("Model_A.1")
 
     self.assertEqual(len(api.created), 1)
     namespace, body = api.created[0]
@@ -162,7 +163,8 @@ class KubernetesWorkerManagerTest(unittest.TestCase):
     manager.pod_template["spec"]["containers"][0]["env"].append({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": "stale-job"})
     manager.pod_template["spec"]["containers"][0]["env"].append({"name": "OPEN_RL_TIME_SLICE_GROUP", "value": "stale-group"})
 
-    manager.launch("Model_A.1")
+    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
+      manager.launch("Model_A.1")
 
     container = api.created[0][1]["spec"]["containers"][0]
     env = {item["name"]: item["value"] for item in container["env"] if "value" in item}
@@ -171,7 +173,8 @@ class KubernetesWorkerManagerTest(unittest.TestCase):
 
   def test_launch_sampler_stamps_sampler_identity(self) -> None:
     api = _FakeCoreApi()
-    self._manager(api).launch_sampler("Model_A.1")
+    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
+      self._manager(api).launch_sampler("Model_A.1")
 
     self.assertEqual(len(api.created), 1)
     _, body = api.created[0]

@@ -55,7 +55,11 @@ COPY . .
 
 ENV PATH="/usr/local/cuda/bin:$PATH" \
     CUDA_HOME="/usr/local/cuda" \
-    PYTHONPATH="/app/src:/app:$PYTHONPATH"
+    PYTHONPATH="/app/src:/app:$PYTHONPATH" \
+    # GKE's device plugin mounts the NVIDIA driver (libcuda.so) at
+    # /usr/local/nvidia; the 12.9.0-devel base image dropped it from
+    # LD_LIBRARY_PATH, silently leaving torch/vLLM CPU-only on GKE.
+    LD_LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib:$LD_LIBRARY_PATH"
 
 # Expose ports (Gateway: 8000, vLLM Worker: 8001)
 EXPOSE 8000

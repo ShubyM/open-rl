@@ -81,7 +81,13 @@ def get_model_target_info(model_id: str) -> tuple[TrainingModelMetadata, str, bo
   """Retrieve model metadata, target_id, and is_lora flag cleanly from the canonical store."""
   meta = _fetch_metadata_from_store(model_id)
   if meta is None:
-    meta = TrainingModelMetadata(base_model=model_id, created_at=0.0, fine_tuning_type="full")
+    # Without metadata we cannot know the fine-tuning type (e.g. a sampling
+    # session opened directly on a base-model name). Only assume FFT when this
+    # deployment has FFT enabled: a LoRA deployment must never spawn FFT
+    # workers — the FFT vllm_sampler drains the same per-base-model sampling
+    # queue but ignores LoRA adapters, silently sampling base weights.
+    fallback_type = "full" if os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true" else "lora"
+    meta = TrainingModelMetadata(base_model=model_id, created_at=0.0, fine_tuning_type=fallback_type)
   is_lora = meta.fine_tuning_type == "lora"
   target_id = meta.base_model if is_lora else model_id
   return meta, target_id, is_lora
@@ -169,7 +175,11 @@ class LocalWorkerManager:
       if proc is not None and proc.poll() is None:
         return
 
-      env = {**os.environ, "OPEN_RL_ENABLE_FFT": "true"}
+      env = {
+        **os.environ,
+        "OPEN_RL_ENABLE_FFT": "false" if is_lora else "true",
+        "OPEN_RL_FINE_TUNING_TYPE": "lora" if is_lora else "full",
+      }
       if meta.base_model:
         env["BASE_MODEL"] = meta.base_model
 
@@ -220,8 +230,12 @@ class LocalWorkerManager:
       self.shutdown(model_id)
 
 
-def create_worker_manager() -> WorkerManager:
+def create_worker_manager() -> WorkerManager | None:
   mode = os.getenv("OPEN_RL_WORKER_MANAGER", "local").lower()
+  if mode in {"none", "disabled"}:
+    # Standing worker deployments (e.g. k8s/deploy/distributed-shared) own the
+    # trainer and sampler lifecycles; the gateway must not spawn its own.
+    return None
   if mode in {"kubernetes", "k8s"}:
     from server.k8s_worker_manager import KubernetesWorkerManager
 
