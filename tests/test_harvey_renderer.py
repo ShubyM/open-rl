@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import types
 import unittest
@@ -72,6 +73,47 @@ class HarveyRendererTest(unittest.TestCase):
 
     with self.assertRaisesRegex(ValueError, "prefix-extending renderer"):
       prompts.lab_renderer("example/model", "broken_renderer")
+
+
+def _normalize():
+  sys.path.insert(0, str(PROMPTS_PATH.parent))
+  from gemma4_renderer import normalize_tool_call_args
+
+  return normalize_tool_call_args
+
+
+class NativeToolCallArgsTest(unittest.TestCase):
+  """Gemma 4 emits tool arguments in an encoding its own parser rejects.
+
+  Strings are delimited by the <|"|> special token and keys are left bare, so
+  parse_response raises and the call is discarded as MALFORMED. run28 lost 83%
+  of its parse errors this way, on calls that named a real tool.
+  """
+
+  Q = '<|"|>'
+
+  def test_strict_json_is_left_alone(self) -> None:
+    for body in ('{"command":"ls"}', '{"file_path":"a.docx","limit":5}', "{}"):
+      self.assertEqual(_normalize()(body), body)
+
+  def test_native_quotes_and_bare_keys_become_json(self) -> None:
+    body = "{glob:%sb.docx%s,pattern:\\[.*\\]}" % (self.Q, self.Q)
+    self.assertEqual(json.loads(_normalize()(body)), {"glob": "b.docx", "pattern": "\\[.*\\]"})
+
+  def test_unclosed_string_keeps_the_arguments_own_quotes(self) -> None:
+    # The trailing quote belongs to the shell command, not to the encoding.
+    body = '{command:%sfind . -name "*.docx"}' % self.Q
+    self.assertEqual(json.loads(_normalize()(body)), {"command": 'find . -name "*.docx"'})
+
+  def test_mixed_closer_is_trusted_only_when_another_key_follows(self) -> None:
+    body = '{file_path:%sa.docx",limit:500,offset:10}' % self.Q
+    self.assertEqual(json.loads(_normalize()(body)), {"file_path": "a.docx", "limit": 500, "offset": 10})
+    self.assertEqual(json.loads(_normalize()('{file_path:%sa.docx"}' % self.Q)), {"file_path": "a.docx"})
+
+  def test_corrupt_bodies_are_returned_unchanged(self) -> None:
+    # A space injected mid-key is a broken generation, not a format we decode.
+    for body in ('{file_ apath:%sa.docx%s}' % (self.Q, self.Q), "not an object"):
+      self.assertEqual(_normalize()(body), body)
 
 
 if __name__ == "__main__":

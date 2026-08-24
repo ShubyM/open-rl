@@ -55,6 +55,99 @@ def _valid_tool_calls(parsed: Any) -> list[dict[str, Any]]:
   ]
 
 
+_NATIVE_QUOTE = '<|"|>'
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+_JSON_SCALAR = re.compile(r"(?:-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|true|false|null)$")
+_MIXED_CLOSER = re.compile(r'"\s*,\s*[A-Za-z_]\w*\s*:')
+
+
+def _read_native_string(text: str, i: int) -> tuple[str, int]:
+  """Read a <|"|>-delimited string at i, tolerating a missing or mixed closer."""
+  i += len(_NATIVE_QUOTE)
+  end = text.find(_NATIVE_QUOTE, i)
+  if end != -1:
+    return text[i:end], end + len(_NATIVE_QUOTE)
+  # Opened with the native token and closed with a plain quote, or not closed at
+  # all. Only trust a plain quote that a further key follows -- a quote before
+  # the final brace is usually the argument's own, as in
+  # {command:<|"|>find . -name "*.docx"}.
+  mixed = _MIXED_CLOSER.search(text, i)
+  if mixed:
+    return text[i : mixed.start()], mixed.start() + 1
+  end = len(text.rstrip())
+  if end > i and text[end - 1] == "}":
+    end -= 1
+  value = text[i:end].rstrip()
+  if value.endswith('"') and value.count('"') % 2:
+    # An unpaired trailing quote is the closer; a balanced pair is the value's.
+    value = value[:-1]
+  return value, end
+
+
+def _read_bare_value(text: str, i: int) -> tuple[Any, int]:
+  """Read an unquoted value up to the top-level ',' or the closing '}'."""
+  depth, start = 0, i
+  while i < len(text):
+    ch = text[i]
+    if ch in "{[":
+      depth += 1
+    elif ch in "]}":
+      if depth == 0:
+        break
+      depth -= 1
+    elif ch == "," and depth == 0:
+      break
+    i += 1
+  raw = text[start:i].strip()
+  if _JSON_SCALAR.fullmatch(raw) or (raw[:1] in '"[{' and raw[-1:] in '"]}'):
+    try:
+      return json.loads(raw), i
+    except ValueError:
+      pass
+  return raw, i
+
+
+def normalize_tool_call_args(body: str) -> str:
+  """Rebuild one `{...}` argument object leniently as strict JSON.
+
+  Gemma 4 emits string arguments delimited by the <|"|> special token and leaves
+  object keys bare -- {command:<|"|>find . -name "*.docx"}. That is the encoding
+  the tokenizer produces, but its own parse_response rejects it, so run28 threw
+  away 83% of its parse errors on calls that named a real tool and had a proper
+  closing delimiter. Returns the input unchanged when it does not look like this
+  encoding; callers must try the raw body first regardless.
+  """
+  text = body.strip()
+  if not text.startswith("{"):
+    return body
+  i, out = 1, {}
+  while i < len(text):
+    while i < len(text) and text[i] in " \n\t,":
+      i += 1
+    if i >= len(text) or text[i] == "}":
+      break
+    if text.startswith(_NATIVE_QUOTE, i):
+      key, i = _read_native_string(text, i)
+    else:
+      match = _IDENT.match(text, i)
+      if not match:
+        return body
+      key, i = match.group(0), match.end()
+    while i < len(text) and text[i] in " \n\t":
+      i += 1
+    if i >= len(text) or text[i] != ":":
+      return body
+    i += 1
+    while i < len(text) and text[i] in " \n\t":
+      i += 1
+    if text.startswith(_NATIVE_QUOTE, i):
+      value, i = _read_native_string(text, i)
+    else:
+      value, i = _read_bare_value(text, i)
+    out[str(key)] = value
+  return json.dumps(out, separators=(",", ":")) if out else body
+
+
 @cache
 def gemma4_chat_template() -> str:
   """Return the pinned canonical Gemma 4 tool-calling template."""
@@ -174,14 +267,30 @@ class Gemma4ToolRenderer(renderers.Renderer):
       # call. That channel order is outside the response schema even when the
       # call block itself is complete and valid. Parse complete call blocks in
       # isolation so useful actions are not discarded with their prose.
-      tool_call_input = "".join(
-        f"<|tool_call>{match.group('body')}<tool_call|>" for match in _TOOL_CALL.finditer(parse_input) if match.group("name") in self.tool_names
-      )
-      try:
-        tool_call_parse = self.tokenizer.parse_response(tool_call_input)
-      except Exception:
-        tool_call_parse = {}
-      tool_calls = _valid_tool_calls(tool_call_parse)
+      def call_block(normalize: bool) -> str:
+        blocks = []
+        for match in _TOOL_CALL.finditer(parse_input):
+          name = match.group("name")
+          if name not in self.tool_names:
+            continue
+          args = match.group("body")[len("call:") + len(name) :]
+          if normalize:
+            args = normalize_tool_call_args(args)
+          blocks.append(f"<|tool_call>call:{name}{args}<tool_call|>")
+        return "".join(blocks)
+
+      # Raw first, so a call that already parses is never touched; the lenient
+      # rewrite only ever runs on text the tokenizer has already rejected.
+      for normalize in (False, True):
+        block = call_block(normalize)
+        if not block:
+          continue
+        try:
+          tool_calls = _valid_tool_calls(self.tokenizer.parse_response(block))
+        except Exception:
+          tool_calls = []
+        if tool_calls:
+          break
 
     parsed_tool_calls = []
     for tool_call in tool_calls:
