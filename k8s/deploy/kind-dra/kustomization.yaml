@@ -1,0 +1,115 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# kind variant of the FFT/DRA deployment, for running the workload scheduler
+# against real GPUs on a single Linux GPU VM. See dev/kind/README.md.
+#
+# Differences from the GKE deployment:
+#   - local-path PVC instead of an RWX Filestore class
+#   - DCGM/PodMonitoring dropped (GKE-release image, gke-accelerator node
+#     selector, and a Google Managed Prometheus CRD that does not exist here)
+#   - images point at locally built tags in the cluster-local registry
+#
+# Images are set with explicit patches rather than an `images:` transformer.
+# The base kustomization runs its own transformer first, retagging everything to
+# gcr.io, so an `images:` entry here matching ghcr.io/gke-labs/... would silently
+# match nothing and deploy the wrong images. Patching the two containers by name
+# does not care what the base retagged them to.
+#
+# The pod templates' nodeSelectors are left alone: dev/kind/kind-cluster.yaml
+# labels the single node as both a trainer and a sampler host, so the GKE
+# manifests apply unmodified.
+resources:
+  - ../distributed-fft-timeslice
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: open-rl-config
+    behavior: merge
+    literals:
+      # No Cloud Trace exporter on a local cluster.
+      - ENABLE_GCP_TRACE="0"
+
+patches:
+  - path: pvc-local.yaml
+
+  - target:
+      kind: DaemonSet
+      name: nvidia-dcgm-exporter
+    patch: |
+      $patch: delete
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: nvidia-dcgm-exporter
+  - target:
+      kind: ConfigMap
+      name: dcgm-exporter-metrics
+    patch: |
+      $patch: delete
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: dcgm-exporter-metrics
+  - target:
+      kind: PodMonitoring
+      name: nvidia-dcgm-exporter-scraper
+    patch: |
+      $patch: delete
+      apiVersion: monitoring.googleapis.com/v1
+      kind: PodMonitoring
+      metadata:
+        name: nvidia-dcgm-exporter-scraper
+
+  # Must match what dev/kind/load-images.sh builds and pushes.
+  #
+  # imagePullPolicy: Always throughout. The tag is mutable -- every iteration
+  # republishes :kind-dev -- so the base's IfNotPresent would leave the kubelet
+  # on the build it already cached and silently test the previous code. The
+  # registry is one docker network away, so re-pulling costs nothing.
+  - target:
+      kind: DaemonSet
+      name: open-rl-accel-timeslicer
+    patch: |
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: open-rl-accel-timeslicer
+      spec:
+        template:
+          spec:
+            containers:
+              - name: accel-timeslicer
+                image: localhost:5001/open-rl-server:kind-dev
+                imagePullPolicy: Always
+
+  - target:
+      kind: Deployment
+      name: open-rl-gateway
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-gateway
+      spec:
+        template:
+          spec:
+            containers:
+              - name: gateway
+                image: localhost:5001/open-rl-gateway:kind-dev
+                imagePullPolicy: Always
+                env:
+                  # The worker and sampler pod templates live inside ConfigMaps
+                  # as YAML strings, out of reach of any image transformer. The
+                  # gateway overrides that image at render time from this var
+                  # (k8s_worker_manager.py:506), so this is what actually decides
+                  # the image every launched worker runs.
+                  - name: OPEN_RL_WORKER_IMAGE
+                    value: localhost:5001/open-rl-server:kind-dev
+                  # Same reason as the containers patched above, but the worker
+                  # templates are ConfigMap strings a patch cannot reach, so the
+                  # gateway stamps this at render time.
+                  - name: OPEN_RL_WORKER_IMAGE_PULL_POLICY
+                    value: Always

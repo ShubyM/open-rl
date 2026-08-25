@@ -1,0 +1,51 @@
+# kind cluster for exercising the Open-RL DRA workload scheduler against real GPUs.
+#
+# Single node on purpose: kind drops the control-plane NoSchedule taint when
+# there are no workers, so every GPU on the host is schedulable and there is one
+# less container to inject devices into.
+#
+# The node image must be v1.34 or newer. k8s_worker_manager.py talks to
+# resource.k8s.io/v1, which only reached GA in 1.34 -- on a 1.33 node image the
+# API server serves v1beta1 and every claim call 404s. v1.35 is pinned to track
+# the GKE cluster (1.35.x) this is meant to stand in for.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: open-rl-dra
+# Point the node's containerd at the cluster-local registry (dev/kind/registry.sh).
+# The host pushes to localhost:5001 through the registry's published port; the
+# node cannot use that loopback, so the mirror rewrites the same reference to the
+# registry container's name on the kind docker network. One image reference works
+# from both sides, which is why the manifests can name localhost:5001 directly.
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5001"]
+      endpoint = ["http://kind-registry:5000"]
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.35.5
+    extraMounts:
+      # Requests every GPU on the host for this node container. The nvidia
+      # container runtime interprets a mount under /var/run/nvidia-container-devices
+      # as a device request, which is why host-setup.sh sets
+      # accept-nvidia-visible-devices-as-volume-mounts=true. The source is
+      # /dev/null because only the destination path carries meaning.
+      - hostPath: /dev/null
+        containerPath: /var/run/nvidia-container-devices/all
+    kubeadmConfigPatches:
+      # node-labels covers two separate needs:
+      #
+      # group.timeslice.io/{trainers,samplers} -- the pod templates in
+      #   k8s/deploy/distributed-fft-timeslice/ select on these and the
+      #   accel-timeslicer DaemonSet requires at least one, so setting both here
+      #   lets the GKE manifests apply unpatched.
+      #
+      # nvidia.com/gpu.present -- the DRA driver's kubelet-plugin DaemonSet has a
+      #   required nodeAffinity matching one of several Node Feature Discovery
+      #   labels. NFD is not installed on kind, so without this the DaemonSet
+      #   sits at desired=0, no ResourceSlices are ever published, and every
+      #   claim stays Pending with nothing in the logs to explain it.
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "group.timeslice.io/trainers=true,group.timeslice.io/samplers=true,nvidia.com/gpu.present=true"
