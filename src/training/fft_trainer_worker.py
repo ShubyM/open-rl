@@ -94,6 +94,8 @@ def trainable_model_parameters(model: PreTrainedModel) -> list[torch.nn.Paramete
 
 
 class FFTTrainingWorker(BaseTrainerWorker):
+  config_class = FFTConfig
+
   def __init__(self):
     super().__init__()
     self.model: torch.nn.Module | None = None
