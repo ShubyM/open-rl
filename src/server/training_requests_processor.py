@@ -25,14 +25,31 @@ from training import paths
 from training.distributed import barrier, broadcast_object, is_distributed, is_primary, local_rank
 from training.distributed import close as close_distributed
 from training.distributed import initialize as initialize_distributed
-from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
+from training.fft_trainer_worker import FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
+from training.megatron_worker import MegatronTrainingWorker
 from training.trainer_worker import Datum
 
 tracer = trace.get_tracer(__name__)
 
 
-TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
+TrainingWorker = FFTTrainingWorker | LoraTrainingWorker | MegatronTrainingWorker
+
+# Full-parameter backends. Both load their model from create_model rather than
+# BASE_MODEL, both run one torchrun process per GPU, and both take the
+# time-sliced GPU lease -- everything start_request_processing_loop and
+# run_training_requests_processor branch on.
+FULL_PARAMETER_WORKERS = (FFTTrainingWorker, MegatronTrainingWorker)
+
+
+def trainer_backend() -> str:
+  """Which trainer worker to run: "lora", "fft", or "megatron"."""
+  backend = os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower()
+  if backend:
+    if backend not in ("lora", "fft", "megatron"):
+      raise RuntimeError(f"Unknown OPEN_RL_TRAINER_BACKEND={backend!r}; expected lora, fft, or megatron")
+    return backend
+  return "fft" if is_fft_enabled() else "lora"
 
 
 def is_fft_enabled() -> bool:
@@ -312,7 +329,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
-    worker: FFTTrainingWorker,
+    worker: FFTTrainingWorker | MegatronTrainingWorker,
     model_id: str | None,
     time_slicer: TimeSlicerClient | None,
   ):
@@ -456,7 +473,8 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     base_model, raw_config, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")
-    full_config = FFTConfig(**{k: v for k, v in raw_config.items() if k in FFTConfig.model_fields})
+    config_class = type(self.worker).config_class
+    full_config = config_class(**{k: v for k, v in raw_config.items() if k in config_class.model_fields})
     await asyncio.to_thread(self.worker.create_model, base_model, model_id, full_config)
     return {
       "base_model": base_model,
@@ -597,7 +615,7 @@ async def run_training_requests_processor(
 ) -> None:
   pin_worker_threads_to_this_rank()
   store = get_store()
-  if isinstance(worker, FFTTrainingWorker):
+  if isinstance(worker, FULL_PARAMETER_WORKERS):
     time_slicer = (time_slicer or time_slicer_client_from_env()) if is_primary() else None
     processor = FFTTrainingRequestsProcessor(store, worker, model_id, time_slicer)
   else:
@@ -618,22 +636,30 @@ async def main_async(args: argparse.Namespace) -> None:
       print(f"[WORKER] Failed to fetch model metadata for {args.model_id}: {exc}")
 
   is_lora = fine_tuning_type == "lora"
-  print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")
+  # OPEN_RL_TRAINER_BACKEND overrides the metadata-derived choice (it is how
+  # launch_work.sh selects Megatron); otherwise the fine-tuning type decides.
+  backend = trainer_backend() if os.getenv("OPEN_RL_TRAINER_BACKEND") else ("lora" if is_lora else "fft")
+  print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora}), trainer backend: {backend}\n")
 
-  worker: TrainingWorker = LoraTrainingWorker() if is_lora else FFTTrainingWorker()
+  worker: TrainingWorker = {
+    "megatron": MegatronTrainingWorker,
+    "fft": FFTTrainingWorker,
+    "lora": LoraTrainingWorker,
+  }[backend]()
+  full_parameter = isinstance(worker, FULL_PARAMETER_WORKERS)
   preload_target = os.getenv("BASE_MODEL")
   is_ready = False
-  if preload_target and is_lora:
+  if preload_target and not full_parameter:
     worker.load_base_model(preload_target)
     is_ready = True
   else:
-    if not is_lora:
-      print("[WORKER] Full fine-tuning mode loads its model from the create_model request.")
+    if full_parameter:
+      print(f"[WORKER] {backend} mode loads its model from the create_model request.")
     else:
       print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
     is_ready = True
 
-  if is_lora and is_primary():
+  if not full_parameter and is_primary():
     probe_app = FastAPI()
 
     @probe_app.get("/healthz")

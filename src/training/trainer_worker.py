@@ -156,6 +156,29 @@ class BaseTrainerWorker:
     else:
       self.device = torch.device("cpu")
 
+  # Data-parallel geometry, as five overridable hooks.
+  #
+  # forward_backward assumes every rank is an independent data shard, which is
+  # true for FSDP and for the single-GPU LoRA path. It is not true in general:
+  # a tensor-parallel backend splits one model across several ranks, so those
+  # ranks must be fed the *same* datums and their losses must not be summed
+  # twice. A backend whose data-parallel group is a subset of the world
+  # overrides these to shard and reduce over that subgroup instead.
+  def shard_rank(self) -> int:
+    return rank()
+
+  def shard_count(self) -> int:
+    return world_size() if is_distributed() else 1
+
+  def shard_all_reduce_max(self, value: int) -> int:
+    return all_reduce_max(value)
+
+  def shard_all_reduce_sum(self, value: float) -> float:
+    return all_reduce_sum(value)
+
+  def shard_all_gather_object(self, value: Any) -> list[Any]:
+    return all_gather_object(value)
+
   def forward_backward(
     self,
     model: PreTrainedModel,
@@ -176,8 +199,8 @@ class BaseTrainerWorker:
     and gradients are summed across ranks through FSDP's per-backward averaging
     (each real pass scales its loss by the shard count to cancel the average).
     """
-    shard_count = world_size() if is_distributed() else 1
-    local_indices = shard_datum_indices(len(data), rank(), shard_count)
+    shard_count = self.shard_count()
+    local_indices = shard_datum_indices(len(data), self.shard_rank(), shard_count)
     local_data = [data[idx] for idx in local_indices]
 
     model.train()
@@ -188,7 +211,7 @@ class BaseTrainerWorker:
     local_batches = self.make_training_batches(local_data)
     if shard_count > 1 and self.backward_runs_collectives:
       # Pad short ranks with zero-scaled passes so FSDP collective counts match.
-      total_passes = all_reduce_max(len(local_batches))
+      total_passes = self.shard_all_reduce_max(len(local_batches))
       filler_passes = total_passes - len(local_batches)
       if filler_passes > 0:
         filler = local_data[0] if local_data else data[0]
@@ -267,8 +290,8 @@ class BaseTrainerWorker:
         del target_logprobs, elementwise_loss, per_datum_loss, loss
 
     if shard_count > 1:
-      total_loss = all_reduce_sum(total_loss)
-      for part in all_gather_object({idx: loss_fn_outputs[idx] for idx in local_indices}):
+      total_loss = self.shard_all_reduce_sum(total_loss)
+      for part in self.shard_all_gather_object({idx: loss_fn_outputs[idx] for idx in local_indices}):
         for idx, output in part.items():
           loss_fn_outputs[idx] = output
 

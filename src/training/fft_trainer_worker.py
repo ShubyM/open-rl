@@ -102,6 +102,8 @@ from server.model_metadata import WeightSyncConfig
 
 
 class FFTTrainingWorker(BaseTrainerWorker):
+  config_class = FFTConfig
+
   def __init__(self):
     super().__init__()
     self.model: torch.nn.Module | None = None

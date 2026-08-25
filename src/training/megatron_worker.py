@@ -1,0 +1,646 @@
+# Megatron-LM trainer worker lifecycle.
+"""Tensor-parallel training backend, interface-compatible with the FSDP worker.
+
+Why this exists next to fft_trainer_worker
+------------------------------------------
+FSDP shards *parameters*; it does not shard activations. Every rank still runs
+the whole sequence at the whole hidden dimension, so peak memory grows with
+context at ~0.69 GiB/ktoken on the 12B model and the 143,360-token window sits
+at ~126 GiB of 139.8. Adding GPUs buys throughput, never a longer context.
+
+Megatron's tensor parallelism shards the hidden dimension, so per-rank
+activations fall by roughly the TP degree, sequence parallelism shards the
+LayerNorm/dropout activations TP cannot, and the vocab-parallel loss keeps the
+262k-entry logit tensor split across the group instead of gathering it onto one
+device. TP is the knob that moves the context ceiling. FSDP has no equivalent.
+
+What is supported
+-----------------
+Tensor parallelism and data parallelism, in any product that equals WORLD_SIZE.
+
+Pipeline parallelism is not supported, and that is structural rather than an
+omission. BaseTrainerWorker.forward_backward computes target logprobs, builds a
+loss from them, and calls .backward() -- it needs the logits on every rank.
+Under PP only the last stage has them and Megatron drives the whole schedule
+from get_forward_backward_func(), which owns the loop this class already owns.
+Supporting PP means rewriting forward_backward around Megatron's scheduler, not
+adding a flag. Context parallelism is out for a related reason: it shards the
+sequence, so the [batch, seq] logprob tensor this interface hands back would
+have to be re-gathered per micro-batch.
+
+How to turn it on
+-----------------
+    OPEN_RL_ENABLE_FFT=true            # still required, see below
+    OPEN_RL_TRAINER_BACKEND=megatron
+    OPEN_RL_MEGATRON_TP=2
+    OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl
+
+OPEN_RL_ENABLE_FFT is not redundant. It is read independently by gateway.py,
+worker_manager.py and vllm_sampler.py, where it means "full weights, not LoRA":
+launch a dedicated trainer per model, report is_lora=False, and start the
+sampler in sleep-mode reloading whole checkpoints instead of applying adapters.
+Setting only OPEN_RL_TRAINER_BACKEND would give a Megatron trainer feeding a
+sampler that still expects adapter files. The worker_manager passes the whole
+environment to its children, so both variables reach the trainer process.
+
+Version-sensitive seam
+----------------------
+Weight import and HF export go through Megatron-Bridge (`AutoBridge`), which is
+the only sane way to get an HF checkpoint into Megatron's layout and back out
+again for the vLLM sampler. Neither megatron-core nor megatron-bridge is in
+pyproject.toml, so every import here is lazy and this module imports cleanly
+without them. The three bridge calls -- from_hf_pretrained,
+to_megatron_provider/provide_distributed_model, save_hf_pretrained -- are the
+part most likely to need renaming against whichever megatron-bridge is
+installed; everything else uses megatron-core APIs that have been stable.
+"""
+
+import gc
+import json
+import math
+import os
+import shutil
+import time
+from datetime import datetime
+from typing import Any
+
+import torch
+import torch.distributed as dist
+from pydantic import BaseModel
+from transformers import AutoTokenizer
+
+from training import paths
+from training.distributed import barrier, is_primary
+from training.trainer_worker import BaseTrainerWorker, Datum
+
+ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
+MEGATRON_TP = int(os.getenv("OPEN_RL_MEGATRON_TP", "1"))
+MEGATRON_PP = int(os.getenv("OPEN_RL_MEGATRON_PP", "1"))
+MEGATRON_CP = int(os.getenv("OPEN_RL_MEGATRON_CP", "1"))
+MEGATRON_SEQUENCE_PARALLEL = os.getenv("OPEN_RL_MEGATRON_SEQUENCE_PARALLEL", "1") == "1"
+MEGATRON_DISTRIBUTED_OPTIMIZER = os.getenv("OPEN_RL_MEGATRON_DISTRIBUTED_OPTIMIZER", "1") == "1"
+
+OPTIMIZER_SUBDIR = "megatron_optimizer"
+
+# Where a Megatron optimizer keeps its fp32 master weights. The distributed
+# optimizer uses the shard_* names, the plain mixed-precision one the last.
+# Each is a list of lists of tensors, and none of them live inside the DDP
+# parameter buffers, so an offload has to move them separately.
+MASTER_PARAM_GROUPS = (
+  "shard_fp32_from_float16_groups",
+  "shard_float16_groups",
+  "shard_fp32_groups",
+  "fp32_from_float16_groups",
+)
+
+
+class MegatronConfig(BaseModel):
+  seed: int | None = None
+  cpu_offload: bool = True
+
+
+def require_megatron():
+  """Import megatron-core and megatron-bridge, or explain how to get them."""
+  try:
+    from megatron.bridge import AutoBridge
+    from megatron.core import parallel_state
+  except ImportError as exc:
+    raise RuntimeError(
+      "OPEN_RL_TRAINER_BACKEND=megatron needs megatron-core and megatron-bridge. Neither is a "
+      "dependency of this project (no extra in pyproject.toml installs them), so they must be "
+      f"installed into the trainer environment first. Import failed with: {exc}"
+    ) from exc
+  return AutoBridge, parallel_state
+
+
+class MegatronTrainingWorker(BaseTrainerWorker):
+  config_class = MegatronConfig
+
+  def __init__(self):
+    super().__init__()
+    if MEGATRON_PP != 1 or MEGATRON_CP != 1:
+      raise RuntimeError(
+        f"The Megatron backend supports tensor and data parallelism only (got PP={MEGATRON_PP}, "
+        f"CP={MEGATRON_CP}). Both change which rank holds the logits, and forward_backward needs "
+        "them on every rank to build the loss it differentiates; see this module's docstring."
+      )
+    self.model_chunks: list[torch.nn.Module] = []
+    self.bridge: Any = None
+    self.base_model_name: str | None = None
+    self.trainable_params: list[torch.nn.Parameter] = []
+    self.optimizer: Any = None
+    self.tp_size = MEGATRON_TP
+    self.sequence_parallel = MEGATRON_TP > 1 and MEGATRON_SEQUENCE_PARALLEL
+    self.cpu_offload: bool = True
+    self._is_offloaded: bool = False
+    # Megatron's DDP reduces gradients in finish_grad_sync(), which optim_step
+    # calls, not during backward. Ranks may therefore run different numbers of
+    # passes without deadlocking, so the base class does not need to pad short
+    # ranks with filler passes. Tensor-parallel peers all-reduce inside every
+    # backward, but they share a data shard and so always agree on the count.
+    self.backward_runs_collectives = False
+
+  # -- parallel state -------------------------------------------------------
+
+  def initialize_parallel_state(self) -> None:
+    _, parallel_state = require_megatron()
+    if parallel_state.model_parallel_is_initialized():
+      return
+    if not dist.is_initialized():
+      raise RuntimeError("The Megatron backend must be launched under torchrun; no process group is initialized.")
+
+    # Megatron's tensor-parallel collectives are on CUDA tensors, so the default
+    # group has to speak NCCL. This project defaults it to gloo because the
+    # gateway broadcasts pickled request batches over it, and the device-mapped
+    # backend string keeps both working from one group.
+    backend = str(dist.get_backend())
+    if "nccl" not in backend:
+      raise RuntimeError(
+        f"The Megatron backend needs NCCL for tensor-parallel collectives but the default process "
+        f"group speaks {backend!r}. Launch the trainer with "
+        "OPEN_RL_CONTROL_BACKEND='cpu:gloo,cuda:nccl' so object broadcasts stay on gloo and tensor "
+        "collectives use NCCL."
+      )
+
+    world = dist.get_world_size()
+    if world % self.tp_size:
+      raise RuntimeError(f"WORLD_SIZE={world} is not divisible by OPEN_RL_MEGATRON_TP={self.tp_size}")
+
+    torch.cuda.set_device(self.device)
+    parallel_state.initialize_model_parallel(
+      tensor_model_parallel_size=self.tp_size,
+      pipeline_model_parallel_size=1,
+      context_parallel_size=1,
+    )
+    print(f"Megatron parallel state: TP={self.tp_size} DP={world // self.tp_size} sequence_parallel={self.sequence_parallel}")
+
+  def data_parallel_group(self):
+    _, parallel_state = require_megatron()
+    return parallel_state.get_data_parallel_group()
+
+  # -- data-parallel geometry (BaseTrainerWorker hooks) ---------------------
+  #
+  # The base class shards datums by global rank, which would hand tensor-parallel
+  # peers different data -- they hold different slices of one model and must see
+  # the same tokens. Every hook below is therefore scoped to the DP group. When
+  # TP == WORLD_SIZE the DP group has one member and forward_backward degenerates
+  # to "every rank computes everything", which is exactly right.
+
+  def shard_rank(self) -> int:
+    _, parallel_state = require_megatron()
+    return parallel_state.get_data_parallel_rank() if parallel_state.model_parallel_is_initialized() else 0
+
+  def shard_count(self) -> int:
+    _, parallel_state = require_megatron()
+    return parallel_state.get_data_parallel_world_size() if parallel_state.model_parallel_is_initialized() else 1
+
+  def shard_all_reduce_max(self, value: int) -> int:
+    tensor = torch.tensor([value], dtype=torch.long, device=self.device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=self.data_parallel_group())
+    return int(tensor.item())
+
+  def shard_all_reduce_sum(self, value: float) -> float:
+    tensor = torch.tensor([value], dtype=torch.float64, device=self.device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.data_parallel_group())
+    return float(tensor.item())
+
+  def shard_all_gather_object(self, value: Any) -> list[Any]:
+    # all_gather_object pickles to a CUDA tensor when the group is NCCL, so this
+    # needs no separate gloo group.
+    gathered: list[Any] = [None] * self.shard_count()
+    dist.all_gather_object(gathered, value, group=self.data_parallel_group())
+    return gathered
+
+  # -- model lifecycle ------------------------------------------------------
+
+  def load_base_model(self, base_model_name: str) -> None:
+    if self.model_chunks and self.base_model_name == base_model_name:
+      print(f"Megatron model {base_model_name} already loaded.")
+      return
+
+    AutoBridge, _ = require_megatron()
+    self.initialize_parallel_state()
+    print(f"Loading Megatron model {base_model_name} (rank {os.getenv('RANK', '0')}/{os.getenv('WORLD_SIZE', '1')}, TP={self.tp_size})...")
+
+    self.base_model_name = base_model_name
+    self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+
+    # The version-sensitive seam. AutoBridge reads the HF checkpoint, hands back
+    # a provider carrying the equivalent TransformerConfig, and streams the
+    # weights into Megatron's sharded layout as the model is built.
+    self.bridge = AutoBridge.from_hf_pretrained(base_model_name, torch_dtype=dtype)
+    provider = self.bridge.to_megatron_provider(load_weights=True)
+    provider.tensor_model_parallel_size = self.tp_size
+    provider.pipeline_model_parallel_size = 1
+    provider.context_parallel_size = 1
+    provider.sequence_parallel = self.sequence_parallel
+    provider.params_dtype = dtype
+    provider.bf16 = dtype == torch.bfloat16
+    if ENABLE_GRADIENT_CHECKPOINTING:
+      provider.recompute_granularity = "full"
+      provider.recompute_method = "uniform"
+      provider.recompute_num_layers = 1
+    provider.finalize()
+    chunks = provider.provide_distributed_model(wrap_with_ddp=False)
+    self.model_chunks = self.wrap_with_ddp(chunks, provider)
+    print(f"Successfully loaded Megatron model ({len(self.model_chunks)} chunk(s), gradient checkpointing={ENABLE_GRADIENT_CHECKPOINTING}).")
+
+  def wrap_with_ddp(self, chunks: list[torch.nn.Module], config: Any) -> list[torch.nn.Module]:
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+
+    # average_in_collective is what makes the base class's arithmetic come out
+    # right: forward_backward scales each real pass by shard_count precisely
+    # because it expects the data-parallel reduction to average, so summing here
+    # would inflate every gradient by the DP size.
+    #
+    # overlap_grad_reduce stays off. With it on the reduce-scatter fires inside
+    # backward, which turns every backward into a cross-DP collective and forces
+    # every rank to run the same number of passes -- the filler-pass padding this
+    # backend just switched off.
+    ddp_config = DistributedDataParallelConfig(
+      grad_reduce_in_fp32=True,
+      overlap_grad_reduce=False,
+      use_distributed_optimizer=MEGATRON_DISTRIBUTED_OPTIMIZER,
+      check_for_nan_in_grad=True,
+      average_in_collective=True,
+    )
+    return [DistributedDataParallel(config, ddp_config, chunk) for chunk in chunks]
+
+  def create_model(self, base_model_name: str, model_id: str | None = None, config: MegatronConfig | None = None) -> None:
+    if config is not None:
+      self.cpu_offload = config.cpu_offload
+    self.load_base_model(base_model_name)
+    if config is not None and config.seed is not None:
+      torch.manual_seed(config.seed)
+    self.prepare_model_for_training()
+
+  def prepare_model_for_training(self) -> None:
+    assert self.model_chunks, "Model is not loaded. Call load_base_model first."
+    for chunk in self.model_chunks:
+      chunk.train()
+      chunk.zero_grad_buffer()
+    self.trainable_params = [param for chunk in self.model_chunks for param in chunk.parameters() if param.requires_grad]
+    if not self.trainable_params:
+      raise ValueError("No trainable parameters found in the Megatron model")
+
+  def gpt_model(self) -> torch.nn.Module:
+    """The unwrapped GPTModel, out from behind Megatron's DDP."""
+    assert self.model_chunks
+    return self.model_chunks[0].module
+
+  # -- forward / backward ---------------------------------------------------
+
+  def forward_backward(
+    self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
+  ) -> dict[str, Any]:
+    assert self.model_chunks, "Model must be loaded first."
+    res = super().forward_backward(self.model_chunks[0], data, loss_fn, loss_config, forward_only=forward_only)
+    if torch.cuda.is_available():
+      torch.cuda.empty_cache()
+    return res
+
+  def compute_target_logprobs(
+    self,
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    target_token_ids: torch.Tensor,
+  ) -> torch.Tensor:
+    """Return [batch, seq] target logprobs from Megatron's vocab-parallel loss.
+
+    GPTModel with labels= runs tensor_parallel.vocab_parallel_cross_entropy,
+    which keeps the logits sharded over the TP group and all-reduces only the
+    two scalars per position it needs (the target logit and the logsumexp). That
+    is the same trick as the fused chunked head in trainer_worker, done across
+    devices instead of across chunks, and it is why the 262k vocab stops being a
+    memory problem: each rank only ever holds vocab/TP columns.
+
+    Targets are already aligned with inputs position-for-position by the Tinker
+    client -- input_ids[t] predicts target_token_ids[t] -- and Megatron's loss
+    does no shifting either, so they pass straight through.
+    """
+    seq_len = target_token_ids.shape[1]
+    input_ids = input_ids[:, :seq_len]
+    batch = input_ids.shape[0]
+
+    # Sequence parallelism scatters the sequence across the TP group, so the
+    # length has to divide by it. Padding here and slicing the result back is
+    # cheaper than rejecting the batch; the extra positions are dropped before
+    # any caller sees them.
+    padded_len = seq_len
+    if self.sequence_parallel and seq_len % self.tp_size:
+      padded_len = ((seq_len // self.tp_size) + 1) * self.tp_size
+      pad_id = self.tokenizer.pad_token_id if self.tokenizer and self.tokenizer.pad_token_id is not None else 0
+      input_ids = torch.nn.functional.pad(input_ids, (0, padded_len - seq_len), value=pad_id)
+      target_token_ids = torch.nn.functional.pad(target_token_ids, (0, padded_len - seq_len), value=0)
+
+    position_ids = torch.arange(padded_len, device=input_ids.device).unsqueeze(0).expand(batch, padded_len)
+
+    # attention_mask=None means plain causal. pad_model_inputs right-pads, so a
+    # real token never attends to a pad, and the pad rows' logprobs are dropped
+    # by the caller's [:, :length] slice. Passing the dense mask instead would
+    # make Megatron materialize [batch, 1, seq, seq] and lose the fused kernel.
+    losses = self.gpt_model()(input_ids, position_ids, None, labels=target_token_ids)
+    return -losses[:, :seq_len]
+
+  # -- optimizer ------------------------------------------------------------
+
+  def build_optimizer(self, adam_params: dict[str, Any]) -> None:
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+
+    lr = adam_params.get("learning_rate", 1e-4)
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    print(f"Initializing Megatron AdamW (lr={lr}, distributed_optimizer={MEGATRON_DISTRIBUTED_OPTIMIZER})")
+    optimizer_config = OptimizerConfig(
+      optimizer="adam",
+      lr=lr,
+      min_lr=lr,
+      adam_beta1=adam_params.get("beta1", 0.9),
+      adam_beta2=adam_params.get("beta2", 0.95),
+      adam_eps=adam_params.get("eps", 1e-12),
+      weight_decay=adam_params.get("weight_decay", 0.0),
+      # Clipping is re-read from adam_params on every step; 0.0 disables it.
+      clip_grad=0.0,
+      bf16=dtype == torch.bfloat16,
+      fp16=False,
+      params_dtype=dtype,
+      use_distributed_optimizer=MEGATRON_DISTRIBUTED_OPTIMIZER,
+    )
+    self.optimizer = get_megatron_optimizer(optimizer_config, self.model_chunks)
+
+  def optim_step(self, adam_params: dict[str, Any], model_id: str | None = None) -> dict[str, Any]:
+    assert self.model_chunks, "Model must be loaded first."
+    if torch.cuda.is_available():
+      torch.cuda.empty_cache()
+    if self.optimizer is None:
+      self.build_optimizer(adam_params)
+
+    learning_rate = adam_params.get("learning_rate")
+    if learning_rate is not None:
+      for param_group in self.optimizer.param_groups:
+        param_group["lr"] = learning_rate
+
+    max_grad_norm = adam_params.get("grad_clip_norm") or 0.0
+    if max_grad_norm <= 0.0 or math.isinf(max_grad_norm):
+      max_grad_norm = 0.0
+    for optimizer in self.chained_optimizers():
+      optimizer.config.clip_grad = max_grad_norm
+
+    # With overlap_grad_reduce off, nothing has reduced gradients across the
+    # data-parallel group yet; this is where it happens.
+    for chunk in self.model_chunks:
+      chunk.finish_grad_sync()
+
+    success, grad_norm, _num_zeros = self.optimizer.step()
+
+    for chunk in self.model_chunks:
+      chunk.zero_grad_buffer()
+    self.optimizer.zero_grad()
+
+    return {
+      "metrics": {
+        "grad_norm:mean": self.sanitize_float(float(grad_norm) if grad_norm is not None else 0.0),
+        # Megatron skips the update on a non-finite gradient and says so only in
+        # this return value. Unreported, a run would keep spending GPU hours
+        # while the weights sat still.
+        "optim_step_skipped:mean": 0.0 if success else 1.0,
+      },
+    }
+
+  def chained_optimizers(self) -> list[Any]:
+    """Megatron returns a ChainedOptimizer when the model has several param groups."""
+    return list(getattr(self.optimizer, "chained_optimizers", None) or [self.optimizer])
+
+  # -- checkpointing --------------------------------------------------------
+
+  def save_checkpoint(self, path: str, metadata: dict[str, Any], include_optimizer: bool = False) -> dict[str, Any]:
+    assert self.model_chunks, "Model must be loaded first."
+    # Same atomic staging as the FSDP worker: a save killed mid-write must never
+    # leave a half-overwritten directory that vLLM or a resume can load as a mix
+    # of old and new shards.
+    staging_path = f"{path}.staging-{os.getpid()}"
+    previous_path = f"{path}.previous-{os.getpid()}"
+    if is_primary():
+      shutil.rmtree(staging_path, ignore_errors=True)
+      os.makedirs(staging_path, exist_ok=True)
+    barrier()
+
+    # HF format, not a Megatron checkpoint: this is what the vLLM sampler loads
+    # and what load_from_state reads back. save_hf_pretrained gathers the
+    # tensor-parallel shards, so it is collective -- every rank calls it.
+    self.bridge.save_hf_pretrained(self.model_chunks, staging_path)
+    if is_primary() and self.tokenizer is not None:
+      self.tokenizer.save_pretrained(staging_path)
+
+    if include_optimizer and self.optimizer is not None:
+      self.save_optimizer(os.path.join(staging_path, OPTIMIZER_SUBDIR))
+
+    if is_primary():
+      with open(os.path.join(staging_path, "metadata.json"), "w") as f:
+        json.dump(metadata, f)
+      shutil.rmtree(previous_path, ignore_errors=True)
+      if os.path.exists(path):
+        os.rename(path, previous_path)
+      os.rename(staging_path, path)
+      shutil.rmtree(previous_path, ignore_errors=True)
+    barrier()
+    print(f"Saved Megatron state to {path}")
+    return {"path": path}
+
+  def model_sharded_state_dict(self) -> dict[str, Any]:
+    sharded: dict[str, Any] = {}
+    for chunk in self.model_chunks:
+      sharded.update(chunk.sharded_state_dict())
+    return sharded
+
+  def save_optimizer(self, optimizer_path: str) -> None:
+    """Write optimizer state through Megatron's distributed checkpointing.
+
+    Not torch.save: with use_distributed_optimizer each rank holds a different
+    1/DP slice of the moments, so a per-rank save would be unloadable at any
+    other parallel layout. dist_checkpointing records the sharding.
+    """
+    from megatron.core import dist_checkpointing
+
+    if is_primary():
+      os.makedirs(optimizer_path, exist_ok=True)
+    barrier()
+    state = self.optimizer.sharded_state_dict(self.model_sharded_state_dict(), is_loading=False)
+    dist_checkpointing.save(state, optimizer_path)
+
+  def load_optimizer(self, optimizer_path: str, adam_params: dict[str, Any]) -> None:
+    from megatron.core import dist_checkpointing
+
+    if self.optimizer is None:
+      self.build_optimizer(adam_params)
+    state = self.optimizer.sharded_state_dict(self.model_sharded_state_dict(), is_loading=True)
+    self.optimizer.load_state_dict(dist_checkpointing.load(state, optimizer_path))
+    print(f"Restored Megatron optimizer state from {optimizer_path}")
+
+  def save_model(self, alias: str | None = None) -> dict[str, Any]:
+    name = alias or "megatron-model"
+    save_path = name if os.path.isabs(name) else os.path.join(paths.tmp_dir(), "megatron", name)
+    metadata = {
+      "base_model": self.base_model_name,
+      "created_at": datetime.now().isoformat(),
+      "kind": "weights",
+      "model_id": alias,
+      "timestamp": time.time(),
+    }
+    return self.save_checkpoint(save_path, metadata)
+
+  def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
+    metadata = {
+      "base_model": self.base_model_name,
+      "created_at": datetime.now().isoformat(),
+      "kind": kind,
+      "has_optimizer": include_optimizer and self.optimizer is not None,
+      "model_id": model_id,
+      "timestamp": time.time(),
+    }
+    return self.save_checkpoint(state_path, metadata, include_optimizer)
+
+  def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
+    metadata_path = os.path.join(state_path, "metadata.json")
+    if not os.path.exists(metadata_path):
+      raise FileNotFoundError(f"No metadata.json found at {state_path}")
+    with open(metadata_path) as f:
+      metadata = json.load(f)
+
+    base_model = metadata.get("base_model")
+    if not base_model:
+      raise ValueError(f"metadata.json at {state_path} missing base_model")
+
+    # save_checkpoint wrote HF format, so the same bridge path that imports a hub
+    # checkpoint reads our own back.
+    self.model_chunks = []
+    self.load_base_model(state_path)
+    self.base_model_name = base_model
+    self.prepare_model_for_training()
+
+    if restore_optimizer and metadata.get("has_optimizer"):
+      optimizer_path = os.path.join(state_path, OPTIMIZER_SUBDIR)
+      if os.path.exists(optimizer_path):
+        self.load_optimizer(optimizer_path, {})
+
+    print(f"Loaded Megatron state from {state_path}")
+    return {"model_id": model_id, "base_model": base_model}
+
+  def generate(
+    self,
+    prompt_tokens: list[int],
+    max_tokens: int,
+    num_samples: int = 1,
+    temperature: float = 0.0,
+    model_id: str | None = None,
+    include_prompt_logprobs: bool = False,
+  ) -> dict[str, Any]:
+    raise RuntimeError("Sampling from a Megatron trainer is unsupported; use the vLLM sampler worker")
+
+  # -- sleep / wake ---------------------------------------------------------
+  #
+  # Same contract as FFTTrainingWorker: the time-slicer calls wake_up() inside
+  # the trainer's GPU lease and sleep() in the finally, both duck-typed by
+  # FFTTrainingRequestsProcessor.run_once. Anything the trainer leaves resident
+  # is memory the co-located vLLM sampler cannot have.
+
+  def sleep(self) -> None:
+    """Move weights, gradients and optimizer moments to host RAM."""
+    if not self.cpu_offload or not self.model_chunks or self._is_offloaded or not torch.cuda.is_available():
+      return
+    if self.flat_buffers() is None:
+      # Refusing loudly beats a silent half-offload: if the buffers are not the
+      # shape we know how to move, the params would end up aliasing storage the
+      # allocator has already handed back.
+      self.cpu_offload = False
+      print("[Megatron Worker] DDP buffer layout not recognised; CPU offload disabled for this process.")
+      return
+    start_t = time.perf_counter()
+    self.move_flat_buffers("cpu")
+    self.move_optimizer_state("cpu")
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    self._is_offloaded = True
+    print(f"[Megatron Worker] Moved weights and optimizer to CPU in {(time.perf_counter() - start_t) * 1000:.1f} ms.")
+
+  def wake_up(self, include_optimizer: bool = True) -> None:
+    if not self.cpu_offload or not self.model_chunks or not self._is_offloaded or not torch.cuda.is_available():
+      return
+    start_t = time.perf_counter()
+    self.move_flat_buffers(self.device)
+    if include_optimizer:
+      self.move_optimizer_state(self.device)
+    self._is_offloaded = False
+    print(f"[Megatron Worker] Restored weights and optimizer to CUDA in {(time.perf_counter() - start_t) * 1000:.1f} ms.")
+
+  def flat_buffers(self) -> list[Any] | None:
+    """Megatron's contiguous per-bucket parameter and gradient storages.
+
+    Returns None if this megatron-core exposes them differently, which is the
+    signal to disable offload rather than guess.
+    """
+    buffers = []
+    for chunk in self.model_chunks:
+      groups = list(getattr(chunk, "buffers", None) or []) + list(getattr(chunk, "expert_parallel_buffers", None) or [])
+      for buf in groups:
+        if not hasattr(buf, "param_data"):
+          return None
+        buffers.append(buf)
+    return buffers or None
+
+  def move_flat_buffers(self, device: torch.device | str) -> None:
+    """Move the DDP buffers and re-point every view into them.
+
+    nn.Module.to() is wrong here, which is the whole reason this method exists.
+    Megatron's DDP allocates one flat tensor per bucket group and every
+    parameter's .data is a view into it, so .to() would copy each view somewhere
+    new and leave the flat buffer -- the tensor that actually holds the memory --
+    exactly where it was. The offload would free nothing and the next
+    finish_grad_sync() would reduce into storage no parameter reads.
+
+    So move the flat tensor, then rebuild the views by pointer arithmetic
+    against the old base. Recovering offsets from data_ptr rather than from
+    Megatron's internal index map means this keeps working across versions that
+    rename the map, and it catches the bucket-level views too.
+    """
+    target = torch.device(device) if isinstance(device, str) else device
+    for buf in self.flat_buffers() or []:
+      for attr in ("param_data", "grad_data"):
+        flat = getattr(buf, attr, None)
+        if flat is None or flat.device == target:
+          continue
+        moved = flat.to(target)
+        base, span, itemsize = flat.data_ptr(), flat.numel() * flat.element_size(), flat.element_size()
+        for view in self.views_into(buf, base, base + span):
+          offset = (view.data_ptr() - base) // itemsize
+          view.data = moved[offset : offset + view.numel()].view(view.shape)
+        setattr(buf, attr, moved)
+
+  def views_into(self, buf: Any, low: int, high: int) -> list[torch.Tensor]:
+    """Every tensor aliasing [low, high) of one flat buffer."""
+    candidates: list[torch.Tensor | None] = []
+    for chunk in self.model_chunks:
+      for param in chunk.parameters():
+        candidates.extend([param.data, param.grad])
+    for bucket in getattr(buf, "buckets", None) or []:
+      candidates.extend([getattr(bucket, "param_data", None), getattr(bucket, "grad_data", None)])
+    return [tensor for tensor in candidates if tensor is not None and low <= tensor.data_ptr() < high]
+
+  def move_optimizer_state(self, device: torch.device | str) -> None:
+    """Move Adam moments and fp32 master weights, which live outside the buffers."""
+    if self.optimizer is None:
+      return
+    target = torch.device(device) if isinstance(device, str) else device
+    for optimizer in self.chained_optimizers():
+      inner = getattr(optimizer, "optimizer", None)
+      for state in getattr(inner, "state", {}).values():
+        for key, value in state.items():
+          if isinstance(value, torch.Tensor) and (key != "step" or target.type == "cpu"):
+            state[key] = value.to(target)
+      for attr in MASTER_PARAM_GROUPS:
+        for group in getattr(optimizer, attr, None) or []:
+          for tensor in group:
+            if isinstance(tensor, torch.Tensor):
+              tensor.data = tensor.data.to(target)
