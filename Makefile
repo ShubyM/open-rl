@@ -1,4 +1,6 @@
-.PHONY: server vllm test lint fmt help render release-bundle push-vm pull-vm cluster-eval
+.PHONY: server vllm test lint fmt help render release-bundle push-vm pull-vm cluster-eval \
+	kind-host-setup kind-create kind-gateway kind-deploy \
+	kind-client kind-e2e kind-status kind-logs kind-prune kind-delete
 
 # ---------------------------------------------------------------------------
 # Knobs (override on the command line: make server BASE_MODEL=... SAMPLING_BACKEND=...)
@@ -27,6 +29,10 @@ EVAL_NAMESPACE ?=
 E2E_SCENARIO ?=
 E2E_ARGS ?=
 E2E_NAMESPACE ?=
+# The client image cluster-e2e runs. Overridden by kind-e2e to the
+# cluster-local registry; the pull policy is left to the manifest by default.
+E2E_IMAGE ?= gcr.io/$(GCP_PROJECT)/open-rl-client:$(IMAGE_TAG)
+E2E_IMAGE_PULL_POLICY ?=
 
 # CUDA_VISIBLE_DEVICES can be provided either as an environment variable or as a
 # Make variable, and is inherited by the backend/eval subprocesses.
@@ -134,6 +140,55 @@ push-images:
 	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
 	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
 
+# --- kind on a GPU VM -------------------------------------------------------
+# These run against the local docker daemon and kube context, so run them on the
+# GPU VM itself. Get your working tree there the usual way -- `make push-vm
+# REMOTE_HOST=<host>` from the workstation -- then ssh in and invoke the target,
+# or drive it from the workstation with `ssh <host> 'cd ~/open-rl && make ...'`.
+# See dev/kind/README.md.
+
+kind-host-setup:
+	./dev/kind/host-setup.sh
+
+kind-create:
+	./dev/kind/create-cluster.sh
+
+# Rebuild and republish only the slim gateway image -- the fast inner loop.
+kind-gateway:
+	./dev/kind/load-images.sh gateway
+	kubectl rollout restart deployment/open-rl-gateway
+
+kind-deploy:
+	./dev/kind/load-images.sh
+	kubectl apply -k k8s/deploy/kind-dra/
+
+kind-client:
+	./dev/kind/load-images.sh client
+
+# The same target as cluster-e2e, pointed at the cluster-local registry. Always
+# is deliberate: :kind-dev is republished on every iteration, so IfNotPresent
+# would run whatever the kubelet cached last time. The registry sits on the kind
+# docker network, so the pull is local.
+kind-e2e:
+	@$(MAKE) --no-print-directory cluster-e2e \
+	  E2E_IMAGE=localhost:5001/open-rl-client:kind-dev \
+	  E2E_IMAGE_PULL_POLICY=Always
+
+kind-status:
+	kubectl get pods,resourceclaims,resourceslices
+
+kind-logs:
+	kubectl logs deployment/open-rl-gateway --tail=100
+
+# Reclaim what republishing a mutable tag leaves behind: superseded registry
+# blobs and untagged node images. Leaves the BuildKit cache alone -- see the
+# script. Do not run it mid-build; a push racing the collector can lose blobs.
+kind-prune:
+	./dev/kind/prune.sh
+
+kind-delete:
+	kind delete cluster --name open-rl-dra
+
 deploy:
 	kubectl apply -k k8s/deploy/distributed-lustre/
 
@@ -165,7 +220,8 @@ cluster-e2e:
 	  echo "  make cluster-e2e E2E_SCENARIO=fft-gsm8k-rl-x2 E2E_ARGS=\"base_model=Qwen/Qwen3-8B steps=30 jitter_sec=5\""; \
 	  exit 2; \
 	fi; \
-	set -- --scenario "$(E2E_SCENARIO)" --image "gcr.io/$(GCP_PROJECT)/open-rl-client:$(IMAGE_TAG)"; \
+	set -- --scenario "$(E2E_SCENARIO)" --image "$(E2E_IMAGE)"; \
+	if [ -n "$(E2E_IMAGE_PULL_POLICY)" ]; then set -- "$$@" --image-pull-policy "$(E2E_IMAGE_PULL_POLICY)"; fi; \
 	if [ -n "$(E2E_ARGS)" ]; then set -- "$$@" --args "$(E2E_ARGS)"; fi; \
 	if [ -n "$(E2E_NAMESPACE)" ]; then set -- "$$@" --namespace "$(E2E_NAMESPACE)"; fi; \
 	if [ -n "$(WEIGHT_SYNC_STRATEGY)" ]; then set -- "$$@" --weight-sync-strategy "$(WEIGHT_SYNC_STRATEGY)"; fi; \
