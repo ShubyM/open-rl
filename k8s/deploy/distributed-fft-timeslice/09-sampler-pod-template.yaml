@@ -39,6 +39,12 @@ data:
           value: "/mnt/shared/open-rl"
         - name: HF_HOME
           value: "/mnt/shared/open-rl/huggingface"
+        # torch.compile/inductor artifacts, on the shared volume for the same
+        # reason HF_HOME is: the default lands in the container filesystem and
+        # dies with the pod, so every sampler launch recompiles the graph from
+        # scratch -- measured at 15.2s for Qwen3-0.6B on an L4.
+        - name: VLLM_CACHE_ROOT
+          value: "/mnt/shared/open-rl/vllm-cache"
         - name: OPEN_RL_ACCEL_TIMESLICER_HOST
           valueFrom:
             fieldRef:
@@ -60,8 +66,13 @@ data:
       - name: shared-storage
         persistentVolumeClaim:
           claimName: open-rl-shared-pvc
-      nodeSelector:
-        group.timeslice.io/samplers: "true"
+      # No nodeSelector: the ResourceClaim decides placement. Its CEL selector
+      # constrains the scheduler to nodes publishing a matching device, so a
+      # second constraint here can only disagree with it -- pinning samplers to
+      # a pool whose GPUs the claim rejects leaves the Pod unschedulable, which
+      # is what a 24gb claim did once small models stopped demanding an H100.
+      # The accel-timeslicer DaemonSet is unscoped and runs on every GPU node,
+      # so a worker finds one wherever its claim lands.
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"

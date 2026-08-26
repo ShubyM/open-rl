@@ -1,4 +1,7 @@
 .PHONY: server vllm test lint fmt help render release-bundle push-vm pull-vm cluster-eval \
+	cloud-build-gateway cloud-build-server cloud-build-client \
+	cloud-deploy-gateway cloud-deploy-server \
+	cloud-rollout-gateway cloud-rollout-server cloud-rollout \
 	kind-host-setup kind-create kind-gateway kind-deploy \
 	kind-client kind-e2e kind-status kind-logs kind-prune kind-delete
 
@@ -139,6 +142,52 @@ push-images:
 	kubectl set image deployment/open-rl-gateway gateway=gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) 2>/dev/null || true
 	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
 	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
+
+# --- Cloud Build ------------------------------------------------------------
+# Builds in GCP instead of locally: `gcloud builds submit` uploads only the
+# tracked source (~7 MB after .dockerignore) and the CUDA base layers are pulled
+# inside Google's network. Useful when the workstation is far from the cluster
+# or has no Docker daemon.
+#
+#   make cloud-rollout-gateway   # slim gateway image, ~2 min -- covers gateway.py,
+#                                #   k8s_worker_manager.py, store.py
+#   make cloud-rollout-server    # CUDA worker image, ~20-40 min
+#   make cloud-rollout           # both, plus the client image
+#
+# Tag for cloud-built images. A dirty tree gets a unique -dev<stamp> suffix so
+# uncommitted work never reuses the committed sha's tag, and so the kubelet is
+# forced to pull rather than reuse a cached layer under the same name.
+CLOUD_IMAGE_TAG ?= $(shell test -z "$$(git status --porcelain 2>/dev/null)" && echo "$(IMAGE_TAG)" || echo "$(IMAGE_TAG)-dev$$(date +%m%d%H%M%S)")
+# Snapshot it. Left recursive, the shell above would re-run -- and re-stamp the
+# time -- on every reference within a single make invocation.
+CLOUD_IMAGE_TAG := $(CLOUD_IMAGE_TAG)
+
+CLOUD_BUILD = gcloud builds submit --project=$(GCP_PROJECT) --config=cloudbuild.yaml
+
+cloud-build-gateway:
+	$(CLOUD_BUILD) --substitutions=_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-gateway,_DOCKERFILE=src/server/Dockerfile.gateway,_TAG=$(CLOUD_IMAGE_TAG) .
+
+cloud-build-server:
+	$(CLOUD_BUILD) --substitutions=_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server,_DOCKERFILE=src/server/Dockerfile,_TAG=$(CLOUD_IMAGE_TAG) .
+
+cloud-build-client:
+	$(CLOUD_BUILD) --substitutions=_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-client,_DOCKERFILE=src/server/Dockerfile.client,_TAG=$(CLOUD_IMAGE_TAG) .
+
+# Point the running workloads at the freshly built tag. Split from the build
+# steps so a tag built earlier can be re-deployed with
+# `make cloud-deploy-gateway CLOUD_IMAGE_TAG=<tag>`.
+cloud-deploy-gateway:
+	kubectl set image deployment/open-rl-gateway gateway=gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(CLOUD_IMAGE_TAG)
+	@echo "gateway -> gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(CLOUD_IMAGE_TAG)"
+
+cloud-deploy-server:
+	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=gcr.io/$(GCP_PROJECT)/open-rl-server:$(CLOUD_IMAGE_TAG) 2>/dev/null || true
+	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(CLOUD_IMAGE_TAG)
+	@echo "workers -> gcr.io/$(GCP_PROJECT)/open-rl-server:$(CLOUD_IMAGE_TAG)"
+
+cloud-rollout-gateway: cloud-build-gateway cloud-deploy-gateway
+cloud-rollout-server: cloud-build-server cloud-deploy-server
+cloud-rollout: cloud-build-gateway cloud-build-server cloud-build-client cloud-deploy-gateway cloud-deploy-server
 
 # --- kind on a GPU VM -------------------------------------------------------
 # These run against the local docker daemon and kube context, so run them on the

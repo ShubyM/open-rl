@@ -6,7 +6,9 @@ separate launch queue: the subprocess table / the Kubernetes API already hold
 the launched-worker state, and both launchers are idempotent per model_id.
 """
 
+import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +19,8 @@ from typing import Protocol
 from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
+
+logger = logging.getLogger(__name__)
 
 
 def _py_cmd(extras: list[str], module: str, model_id: str, active_tenant_set_id: str | None = None) -> list[str]:
@@ -52,6 +56,91 @@ def _fetch_metadata_from_store(model_id: str) -> TrainingModelMetadata | None:
   return None
 
 
+# A bf16 full fine-tune holds 2 bytes of weights, 2 of gradients and 8 of fp32
+# AdamW moments per parameter. Activations, the sampler's KV cache and reload
+# buffers come on top, so only part of a tier's VRAM is budgeted here. The
+# pinned-DRAM weight shadow is host memory and does not count.
+FFT_VRAM_BYTES_PER_PARAM = 12
+# Of the 24gb tier's 23 GiB usable, leave headroom for everything above. 20 GiB
+# admits FFT up to ~1.7B params, which keeps the Qwen2.5-1.5B anchor on an L4.
+TIER_24GB_FFT_BUDGET_BYTES = 20 * 1024**3
+
+# Raw parameter counts for the models this project runs. Approximate on purpose:
+# they only have to land on the correct side of the 24gb budget below (~1.7B).
+#
+# A table rather than a Hub lookup. Sizing happens on the worker-launch path,
+# which should not depend on network reachability or on huggingface_hub being
+# installed, and the ids that actually matter cannot be sized by parsing them:
+# `gemma-4-e2b` states its *effective* size while holding roughly 5B raw
+# weights, so reading "2b" out of the name puts a 5B fine-tune on a 24 GB card
+# and OOMs it mid-run. Keys are normalized by _normalize_model_id.
+#
+# A model missing from this table is treated as large. Add an entry to let it
+# run on a smaller GPU; the count is the raw weight count, not an active or
+# effective parameter count.
+KNOWN_PARAMETER_COUNTS: dict[str, int] = {
+  # Qwen
+  "qwen2.5-0.5b": 494_000_000,
+  "qwen3-0.6b": 596_049_920,
+  "qwen2.5-1.5b": 1_540_000_000,
+  "qwen3-1.7b": 1_720_000_000,
+  "qwen3-4b": 4_020_000_000,
+  "qwen2.5-7b": 7_620_000_000,
+  "qwen3-8b": 8_190_000_000,
+  "qwen3.5-9b": 9_000_000_000,
+  "qwen3.5-27b": 27_000_000_000,
+  # Gemma. The e-prefixed ids are effective sizes; these are the raw weights.
+  "gemma-3-1b": 1_000_000_000,
+  "gemma-4-e2b": 5_440_000_000,
+  "gemma-4-e4b": 8_000_000_000,
+}
+
+# Fine-tune/variant tags that do not change the weight count.
+_VARIANT_SUFFIXES = ("-instruct", "-it", "-pt", "-base", "-chat")
+
+
+def _normalize_model_id(base_model: str) -> str:
+  """Reduce a model id to its KNOWN_PARAMETER_COUNTS key.
+
+  Drops the org prefix, lowercases, and strips variant and release-date tags,
+  so `Qwen/Qwen3-4B-Instruct-2507` and `google/gemma-4-E2B-it` both resolve.
+  """
+  name = (base_model or "").strip().lower().rsplit("/", 1)[-1]
+  while True:
+    stripped = re.sub(r"-\d{3,}$", "", name)
+    for suffix in _VARIANT_SUFFIXES:
+      if stripped.endswith(suffix):
+        stripped = stripped[: -len(suffix)]
+    if stripped == name:
+      return name
+    name = stripped
+
+
+def known_parameter_count(base_model: str) -> int | None:
+  """Raw parameter count for a known model, or None if it is not in the table."""
+  return KNOWN_PARAMETER_COUNTS.get(_normalize_model_id(base_model))
+
+
+def _fits_24gb_fft(params: int) -> bool:
+  return params * FFT_VRAM_BYTES_PER_PARAM <= TIER_24GB_FFT_BUDGET_BYTES
+
+
+def _fft_memory_tier(base_model: str) -> str:
+  """Tier for a full fine-tune, sized from the model's parameter count.
+
+  An unknown model resolves to '80gb'. That is the direction that cannot end a
+  run: too large a GPU wastes capacity, too small a one OOMs mid-training.
+  """
+  params = known_parameter_count(base_model)
+  if params is None:
+    logger.warning(
+      "No known parameter count for %r; using the 80gb tier. Add it to KNOWN_PARAMETER_COUNTS to run it on a smaller GPU.",
+      base_model,
+    )
+    return "80gb"
+  return "24gb" if _fits_24gb_fft(params) else "80gb"
+
+
 def estimate_memory_tier(base_model: str, fine_tuning_type: str = "lora") -> str:
   """Estimate VRAM memory tier ('24gb' or '80gb') based on base model scale and fine-tuning type.
 
@@ -60,15 +149,15 @@ def estimate_memory_tier(base_model: str, fine_tuning_type: str = "lora") -> str
     - Qwen3-8B / Qwen2.5-7B (LoRA): '24gb' (NVIDIA L4)
     - Qwen3-8B / Qwen2.5-7B (Full Fine-Tuning): '80gb' (NVIDIA H100)
     - 14B+ models (LoRA or FFT): '80gb' (NVIDIA H100)
+
+  Full fine-tuning is sized from the model's parameter count. When that cannot
+  be established the tier stays '80gb': an FFT sent to too small a GPU dies on
+  an OOM mid-run, while one sent to too large a GPU merely wastes it.
   """
   model_lower = (base_model or "").lower()
 
-  # Full fine-tuning always maps to the 80gb tier: FFT of any
-  # multi-billion-param model (bf16 params + grads + AdamW states +
-  # pinned-DRAM shadow) exceeds the 24gb tier, and name-based size
-  # sniffing misses many model naming schemes (e.g. gemma-4-e2b).
   if fine_tuning_type == "full":
-    return "80gb"
+    return _fft_memory_tier(base_model)
 
   # LoRA fine-tuning memory scaling
   if any(size in model_lower for size in ["14b", "32b", "70b"]):

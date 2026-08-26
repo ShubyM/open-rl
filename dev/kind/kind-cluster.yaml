@@ -34,10 +34,10 @@ nodes:
     kubeadmConfigPatches:
       # node-labels covers two separate needs:
       #
-      # group.timeslice.io/{trainers,samplers} -- the pod templates in
-      #   k8s/deploy/distributed-fft-timeslice/ select on these and the
-      #   accel-timeslicer DaemonSet requires at least one, so setting both here
-      #   lets the GKE manifests apply unpatched.
+      # group.timeslice.io/{trainers,samplers} -- the accel-timeslicer DaemonSet
+      #   requires at least one of them to exist, so setting both here lets the
+      #   GKE manifests apply unpatched. Worker Pods no longer select on them:
+      #   their ResourceClaim decides placement.
       #
       # nvidia.com/gpu.present -- the DRA driver's kubelet-plugin DaemonSet has a
       #   required nodeAffinity matching one of several Node Feature Discovery
