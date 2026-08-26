@@ -127,6 +127,12 @@ if [[ "$JUDGE_MODEL" == glm* ]]; then
   echo "[work] JUDGE_MODEL=$JUDGE_MODEL via $VERTEX_JUDGE_ENDPOINT (ADC ok)"
 fi
 
+# fsdp (default): the data-parallel LoRA trainer every run so far has used.
+# megatron: tensor-parallel trainer, src/training/megatron_worker.py. It changes
+# what fits -- see the 12b CONTEXT block -- so it is read before the model cases.
+# It is not yet runnable from here; see the weight-sync guard below.
+TRAINER_BACKEND=${TRAINER_BACKEND:-fsdp}
+
 # The 27B ceiling on a 141GB H200 is 98K tokens (measured, activation offload
 # on); 9B fits its full 262K window with room to spare.
 MODEL=${MODEL:-9b}
@@ -246,7 +252,29 @@ case "$MODEL" in
     # A single trajectory cannot be split across microbatches -- the packer only
     # refuses to *add* to a non-empty batch -- so max_trajectory_tokens is bounded
     # by one backward, which is why CONTEXT and SAMPLER_CONTEXT must differ.
-    CONTEXT=${CONTEXT:-143360}
+    #
+    # All of the above measures the FSDP path. TRAINER_BACKEND=megatron removes
+    # both of its large terms: TP=4 shards the 22.35 GiB of frozen weights four
+    # ways instead of replicating them, and FlexAttention never materializes the
+    # [batch, heads, seq, seq] score matrix. Re-measured on the real
+    # forward_backward at TP=4 with LoRA r16, one trajectory per microbatch, the
+    # cost is linear at 0.411 GiB per 1K tokens over a 2.7 GiB intercept:
+    # 143,360 -> 60.3 GiB, 241,664 -> 99.5, 274,432 -> 112.8, 307,200 -> 126.1
+    # (137.2 reserved, 98% of the card), and 339,968 OOMs. 262,144 is the model's
+    # own window, lands at ~108 GiB with ~123 reserved, and is bracketed by two
+    # measured-passing points either side.
+    #
+    # Longer is strictly slower, not faster: attention is the only quadratic term
+    # left, so one 143,360-token trajectory takes 86.6s of forward_backward while
+    # 307,200 takes 400.1s. At a fixed 143,360 tokens per microbatch, cutting the
+    # same tokens into 140 x 1,024 instead of 1 x 143,360 runs 6.7x faster for
+    # identical memory (13.0s vs 86.7s, ~60 GiB either way). Memory tracks total
+    # tokens in the batch; time tracks the longest single trajectory in it.
+    if [ "$TRAINER_BACKEND" = "megatron" ]; then
+      CONTEXT=${CONTEXT:-262144}
+    else
+      CONTEXT=${CONTEXT:-143360}
+    fi
     # The sampler window deliberately matches CONTEXT rather than reaching for
     # 12B's 256K. A bigger window would buy nothing: the KV cache is sized from
     # --gpu-memory-utilization, not --max-model-len (run21: 0.92 -> 128.62 GiB,
@@ -444,6 +472,39 @@ if [ "$TRAIN_GPUS" -gt 1 ]; then
   echo "[work] TRAIN_GPUS=$TRAIN_GPUS -> torchrun trainer on GPUs $TRAIN_DEV, sampler DP$SAMPLER_DP on $SAMPLER_DEV"
 fi
 
+# Megatron is tensor-parallel across the whole trainer group, DP=1: TP has to
+# divide gemma-4's 16 attention heads and 8 KV groups, so it must be 1, 2, 4 or
+# 8, and TRAIN_GPUS=4 is the configuration the context numbers were measured on.
+# gloo for the control plane because the worker exchanges Python objects.
+BACKEND_ENV=""
+if [ "$TRAINER_BACKEND" = "megatron" ]; then
+  # Refuse rather than train into a void. This script serves with `vllm serve`,
+  # and external_sampler.py can only push a LoRA adapter through
+  # /v1/load_lora_adapter -- stock vLLM has no checkpoint hot-reload, which is
+  # why OPEN_RL_ENABLE_FFT is documented as keeping the managed queue workers.
+  # The Megatron worker exports the other shape: apply_lora's export merges the
+  # adapter into the base weights and writes a whole HF checkpoint. So the
+  # trainer would train, every optim step would produce a checkpoint no sampler
+  # here can load, and rollouts would keep coming from the untouched base model
+  # -- a flat reward curve at full 8-GPU cost, diagnosable only by noticing that
+  # nothing ever changed. Lift this once the worker can write an unmerged
+  # adapter in vLLM's layout (see _remap_adapter_to_hub_layout in
+  # lora_trainer_worker.py for the naming vLLM silently requires).
+  echo "ERROR: TRAINER_BACKEND=megatron has no working weight sync in this stack yet." >&2
+  echo "  The trainer is measured and works (TP=4, 262K context); the gap is export." >&2
+  echo "  Megatron writes a merged full checkpoint; vllm serve can only load an adapter." >&2
+  exit 1
+  MEGATRON_TP=${MEGATRON_TP:-$TRAIN_GPUS}
+  case "$MEGATRON_TP" in
+    1|2|4|8) ;;
+    *) echo "ERROR: MEGATRON_TP=$MEGATRON_TP must divide 16 heads and 8 KV groups (1, 2, 4 or 8)." >&2; exit 1 ;;
+  esac
+  BACKEND_ENV="OPEN_RL_TRAINER_BACKEND=megatron OPEN_RL_ENABLE_FFT=true \
+OPEN_RL_MEGATRON_TP=$MEGATRON_TP OPEN_RL_MEGATRON_LORA_RANK=${MEGATRON_LORA_RANK:-16} \
+OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl"
+  echo "[work] TRAINER_BACKEND=megatron -> TP=$MEGATRON_TP, LoRA rank ${MEGATRON_LORA_RANK:-16}"
+fi
+
 # AFFINITY=1: one single-GPU vllm serve per sampler GPU (ports 8000+i) and
 # prefix-hash routing in the gateway, so every turn of an episode hits the
 # instance that already holds its KV/prefix cache. Default: one DP server
@@ -482,7 +543,7 @@ fi
 GATEWAY_DEV=0
 [ "$TRAIN_GPUS" -gt 1 ] && GATEWAY_DEV=""
 GATEWAY_CMD="$SAMPLER_WAIT; \
-CUDA_VISIBLE_DEVICES=$GATEWAY_DEV $QUEUE_ENV FLA_TILELANG=$FLA_TILELANG BASE_MODEL=$MODEL_NAME $SAMPLER_ENV \
+CUDA_VISIBLE_DEVICES=$GATEWAY_DEV $QUEUE_ENV FLA_TILELANG=$FLA_TILELANG BASE_MODEL=$MODEL_NAME $SAMPLER_ENV $BACKEND_ENV \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 OPEN_RL_TRAIN_TOKEN_BUDGET=$TRAIN_TOKEN_BUDGET OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
 OPEN_RL_OPTIM_CPU_STEP=${OPTIM_CPU_STEP:-1} \
@@ -591,7 +652,7 @@ tmux send-keys -t "$SESSION:gateway" "$GATEWAY_CMD" C-m
 
 if [ "$TRAIN_GPUS" -gt 1 ]; then
   TRAINER_CMD="CUDA_VISIBLE_DEVICES=$TRAIN_DEV FLA_TILELANG=$FLA_TILELANG REDIS_URL=redis://127.0.0.1:6379 \
-OPEN_RL_FSDP_WORLD_SIZE=$TRAIN_GPUS OPEN_RL_WORKER_PROBE_PORT=8090 \
+OPEN_RL_FSDP_WORLD_SIZE=$TRAIN_GPUS OPEN_RL_WORKER_PROBE_PORT=8090 $BACKEND_ENV \
 BASE_MODEL=$MODEL_NAME PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 OPEN_RL_TRAIN_TOKEN_BUDGET=$TRAIN_TOKEN_BUDGET OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
 OPEN_RL_OPTIM_CPU_STEP=${OPTIM_CPU_STEP:-1} \
