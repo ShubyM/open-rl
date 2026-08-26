@@ -66,8 +66,13 @@ data:
       - name: shared-storage
         persistentVolumeClaim:
           claimName: open-rl-shared-pvc
-      nodeSelector:
-        group.timeslice.io/samplers: "true"
+      # No nodeSelector: the ResourceClaim decides placement. Its CEL selector
+      # constrains the scheduler to nodes publishing a matching device, so a
+      # second constraint here can only disagree with it -- pinning samplers to
+      # a pool whose GPUs the claim rejects leaves the Pod unschedulable, which
+      # is what a 24gb claim did once small models stopped demanding an H100.
+      # The accel-timeslicer DaemonSet is unscoped and runs on every GPU node,
+      # so a worker finds one wherever its claim lands.
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"
