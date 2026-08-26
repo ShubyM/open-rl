@@ -34,6 +34,7 @@ How to turn it on
     OPEN_RL_TRAINER_BACKEND=megatron
     OPEN_RL_MEGATRON_TP=2
     OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl
+    OPEN_RL_MEGATRON_LORA_RANK=16       # optional; 0 (default) trains all weights
 
 OPEN_RL_ENABLE_FFT is not redundant. It is read independently by gateway.py,
 worker_manager.py and vllm_sampler.py, where it means "full weights, not LoRA":
@@ -92,6 +93,16 @@ MEGATRON_SEED = int(os.getenv("OPEN_RL_MEGATRON_SEED", "1234"))
 # Apex was built from source. Megatron does not degrade gracefully: it raises at
 # layer construction. Default them off and let a box with Apex opt back in.
 MEGATRON_APEX_FUSIONS = os.getenv("OPEN_RL_MEGATRON_APEX_FUSIONS", "0") == "1"
+# LoRA. Rank 0 keeps the full-parameter behaviour; any positive rank freezes the
+# base weights and trains adapters instead. See apply_lora for why this does not
+# change how checkpoints are published.
+MEGATRON_LORA_RANK = int(os.getenv("OPEN_RL_MEGATRON_LORA_RANK", "0"))
+MEGATRON_LORA_ALPHA = int(os.getenv("OPEN_RL_MEGATRON_LORA_ALPHA", "32"))
+# Default 0, matching LoraConfig: dropout during logprob computation makes
+# trainer logprobs stochastic while the sampler's are deterministic, biasing
+# every importance-sampling ratio.
+MEGATRON_LORA_DROPOUT = float(os.getenv("OPEN_RL_MEGATRON_LORA_DROPOUT", "0.0"))
+MEGATRON_LORA_TARGETS = os.getenv("OPEN_RL_MEGATRON_LORA_TARGETS", "linear_qkv,linear_proj,linear_fc1,linear_fc2")
 
 OPTIMIZER_SUBDIR = "megatron_optimizer"
 
@@ -307,8 +318,42 @@ class MegatronTrainingWorker(BaseTrainerWorker):
       provider.recompute_num_layers = 1
     provider.finalize()
     chunks = provider.provide_distributed_model(wrap_with_ddp=False)
+    chunks = self.apply_lora(chunks)
     self.model_chunks = self.wrap_with_ddp(chunks, provider)
     print(f"Successfully loaded Megatron model ({len(self.model_chunks)} chunk(s), gradient checkpointing={ENABLE_GRADIENT_CHECKPOINTING}).")
+
+  def apply_lora(self, chunks: list[torch.nn.Module]) -> list[torch.nn.Module]:
+    """Freeze the base weights and attach LoRA adapters, if a rank is set.
+
+    Ordering is load-bearing: this runs between provide_distributed_model and
+    wrap_with_ddp because DistributedDataParallel sizes its flat gradient
+    buckets from the parameters that require grad. Wrap first and the buckets
+    cover all 12B frozen weights -- allocating (and all-reducing) gradient
+    memory for tensors that never get one.
+
+    This deliberately does not make the worker a LoRA worker as far as the rest
+    of the system is concerned, and it stays in FULL_PARAMETER_WORKERS. The
+    bridge's export path merges adapters into the base weights by default
+    (export_hf_weights(merge_adapter_weights=True), which save_hf_pretrained
+    calls), so save_checkpoint keeps emitting an ordinary whole HF checkpoint.
+    The sampler reloads it as it already does and never learns an adapter
+    existed. LoRA here is purely a training-memory decision.
+    """
+    if MEGATRON_LORA_RANK <= 0:
+      return chunks
+
+    from megatron.bridge.peft.lora import LoRA
+
+    targets = [target.strip() for target in MEGATRON_LORA_TARGETS.split(",") if target.strip()]
+    lora = LoRA(dim=MEGATRON_LORA_RANK, alpha=MEGATRON_LORA_ALPHA, dropout=MEGATRON_LORA_DROPOUT, target_modules=targets)
+    chunks = lora(chunks, training=True)
+    trainable = sum(param.numel() for chunk in chunks for param in chunk.parameters() if param.requires_grad)
+    total = sum(param.numel() for chunk in chunks for param in chunk.parameters())
+    print(
+      f"[Megatron Worker] LoRA rank={MEGATRON_LORA_RANK} alpha={MEGATRON_LORA_ALPHA} on {targets}: "
+      f"{trainable:,} trainable of {total:,} ({100 * trainable / total:.3f}%)."
+    )
+    return chunks
 
   def wrap_with_ddp(self, chunks: list[torch.nn.Module], config: Any) -> list[torch.nn.Module]:
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
