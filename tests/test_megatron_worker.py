@@ -291,6 +291,70 @@ class ChunkedProjectionTest(unittest.TestCase):
     self.assertFalse(self.output_layer.disable_grad_reduce)
 
 
+class FlexBlockMaskTest(unittest.TestCase):
+  """The block mask is the whole definition of who attends to whom.
+
+  FlexAttention has no separate mask; get the predicate wrong and attention is
+  silently wrong -- a window one token short, or a causal layer that peeks --
+  with no shape error to catch it. create_block_mask itself is torch's, so what
+  is worth testing is the predicate handed to it and the cache around it.
+  """
+
+  def setUp(self) -> None:
+    self.built: list[tuple] = []
+
+    def fake_create_block_mask(keep, *, B, H, Q_LEN, KV_LEN, device):  # noqa: N803
+      self.built.append((keep, Q_LEN, KV_LEN))
+      return f"mask{len(self.built)}"
+
+    patcher = unittest.mock.patch.object(megatron_worker, "_create_block_mask_compiled", fake_create_block_mask)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    cache = unittest.mock.patch.object(megatron_worker, "_flex_block_masks", {})
+    cache.start()
+    self.addCleanup(cache.stop)
+
+  def allowed(self, window: int | None, seq: int = 8) -> torch.Tensor:
+    megatron_worker.gemma4_flex_block_mask(window, seq, seq, "cpu")
+    keep = self.built[-1][0]
+    q_idx = torch.arange(seq).unsqueeze(1)
+    kv_idx = torch.arange(seq).unsqueeze(0)
+    return keep(None, None, q_idx, kv_idx)
+
+  def test_causal_layers_attend_to_every_earlier_token(self) -> None:
+    seq = 8
+    expected = torch.arange(seq).unsqueeze(1) >= torch.arange(seq).unsqueeze(0)
+    torch.testing.assert_close(self.allowed(None, seq), expected)
+
+  def test_sliding_layers_keep_the_window_inclusive_of_both_ends(self) -> None:
+    # Megatron's own get_sliding_window_causal_mask keeps kv in [q - w, q], so a
+    # window of 3 is four tokens wide. Off by one here and the two paths differ.
+    allowed = self.allowed(3, seq=8)
+    self.assertEqual(allowed[7].tolist(), [False, False, False, False, True, True, True, True])
+    self.assertEqual(allowed[0].tolist(), [True] + [False] * 7)
+
+  def test_masks_are_built_once_per_window_and_shape(self) -> None:
+    first = megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu")
+    again = megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu")
+    self.assertIs(first, again)
+    self.assertEqual(len(self.built), 1, "a cache hit must not rebuild the mask")
+
+    # The two things that make a mask different: the window and the shape.
+    megatron_worker.gemma4_flex_block_mask(None, 4096, 4096, "cpu")
+    megatron_worker.gemma4_flex_block_mask(1023, 8192, 8192, "cpu")
+    self.assertEqual(len(self.built), 3)
+
+  def test_disabling_the_knob_leaves_megatrons_attention_alone(self) -> None:
+    with unittest.mock.patch.object(megatron_worker, "MEGATRON_FLEX_ATTENTION", False):
+      self.assertFalse(megatron_worker.install_gemma4_flex_attention())
+
+  def test_a_missing_megatron_is_not_fatal(self) -> None:
+    # Best-effort by contract: without the bridge the run should fall back to
+    # megatron's attention, not fail to load the model.
+    with unittest.mock.patch.object(megatron_worker, "MEGATRON_FLEX_ATTENTION", True):
+      self.assertFalse(megatron_worker.install_gemma4_flex_attention())
+
+
 class BackendGuardTest(unittest.TestCase):
   def test_pipeline_parallelism_is_refused_at_construction(self) -> None:
     import training.megatron_worker as megatron_worker

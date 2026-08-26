@@ -18,6 +18,12 @@ logit tensor across the group but still keeps [seq, batch, vocab/TP] in fp32 for
 the whole sequence, which measured out as the dominant term and capped TP=8 at
 64k. chunked_target_logprobs below removes it.
 
+That exposes the second term: Gemma-4's layer spec uses megatron's own core
+attention, which materializes the [batch, heads, seq, seq] scores, and no amount
+of TP shrinks a term that grows with seq^2. install_gemma4_flex_attention
+replaces it. With both gone, TP=4 runs the full 143,360-token context at 61.5
+GiB of 139.8 -- on four GPUs, leaving four for samplers.
+
 What is supported
 -----------------
 Tensor parallelism and data parallelism, in any product that equals WORLD_SIZE.
@@ -113,6 +119,11 @@ MEGATRON_LORA_TARGETS = os.getenv("OPEN_RL_MEGATRON_LORA_TARGETS", "linear_qkv,l
 # nothing; at 1024 rows the transient fp32 logit tensor is 1 GiB at TP=1 and
 # 128 MiB at TP=8.
 MEGATRON_LOGPROB_CHUNK = int(os.getenv("OPEN_RL_MEGATRON_LOGPROB_CHUNK", "1024"))
+# Gemma-4 only, and on by default: megatron's own core attention materializes the
+# [batch, heads, seq, seq] score matrix, which is what caps context once
+# chunked_target_logprobs has removed the logit term. Set to 0 to compare against
+# the stock path. See install_gemma4_flex_attention.
+MEGATRON_FLEX_ATTENTION = os.getenv("OPEN_RL_MEGATRON_FLEX_ATTENTION", "1") == "1"
 
 OPTIMIZER_SUBDIR = "megatron_optimizer"
 
@@ -183,6 +194,188 @@ def register_gemma4_unified_bridge() -> None:
     )(Gemma4VLBridge)
   except Exception as exc:  # already registered upstream, or the registry moved
     print(f"[Megatron Worker] Did not register {source}: {exc}")
+
+
+# torch.compile caches per callable, so compile once for the process rather than
+# once per layer. Populated by install_gemma4_flex_attention, which is the only
+# place that may import torch.nn.attention.flex_attention.
+_flex_attention_compiled: Any = None
+_create_block_mask_compiled: Any = None
+_flex_block_masks: dict[tuple[int | None, int, int], Any] = {}
+
+
+def gemma4_flex_block_mask(window: int | None, seq_q: int, seq_kv: int, device) -> Any:
+  """Block mask for one causal (window=None) or sliding-window attention layer.
+
+  Compiling create_block_mask is not a speed tweak, it is the difference between
+  linear and quadratic memory. Uncompiled it evaluates the predicate over a
+  dense [seq_q, seq_kv] grid, and the sliding predicate's ``q_idx - kv_idx`` is
+  int64, so describing the 143,360-token window would cost 153 GiB to build a
+  mask that only needs a bit per 128x128 block. Measured on the 12B model at
+  TP=4: 96k tokens peaked at 115.6 GiB uncompiled against 43.6 GiB compiled,
+  and only the compiled form grows linearly with context.
+
+  One cache for the whole process: all 48 layers share two masks per shape.
+  """
+  key = (window, seq_q, seq_kv)
+  if key not in _flex_block_masks:
+    if window is None:
+
+      def keep(_batch, _head, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    else:
+
+      def keep(_batch, _head, q_idx, kv_idx, _window=window):
+        return (q_idx >= kv_idx) & (q_idx - kv_idx <= _window)
+
+    _flex_block_masks[key] = _create_block_mask_compiled(
+      keep, B=None, H=None, Q_LEN=seq_q, KV_LEN=seq_kv, device=device
+    )
+  return _flex_block_masks[key]
+
+
+def gemma4_flex_attention_class() -> type:
+  """Build the FlexAttention replacement for megatron's core attention.
+
+  Defined inside a function because it subclasses a megatron class, and this
+  module imports without megatron installed.
+  """
+  from megatron.core.transformer.dot_product_attention import DotProductAttention
+  from megatron.core.transformer.utils import is_layer_window_attention
+
+  class FlexDotProductAttention(DotProductAttention):
+    """Core attention that never materializes the [batch, heads, seq, seq] scores.
+
+    This is the second half of the context ceiling, the half chunked_target_logprobs
+    does not touch. Gemma-4's dense layer spec hardcodes a LocalSpecProvider, so
+    core attention is megatron's own DotProductAttention, which is correct --
+    it does apply the per-layer sliding window -- but builds the full score
+    matrix, and that term grows with seq^2 no matter how high TP goes.
+
+    Transformer Engine cannot fix it here. Gemma-4's eight global layers project
+    to head_dim 512, past cuDNN 9.17's 256 limit on sm90, and with flash-attn
+    absent TE selects its own unfused kernel for exactly those layers: measured
+    on the 12B model, TE topped out at 32k against the local path's 64k.
+
+    FlexAttention is Triton, has no head_dim ceiling, and takes the sliding
+    window as a block mask, which is what megatron-bridge already does for
+    Gemma-2 (Gemma2FlexDotProductAttention). Measured against an fp32 reference
+    on all 48 layers, it is also the more accurate of the two: ~0.3% relative
+    error per layer against the local path's 1-3%, because megatron keeps this
+    softmax in bf16 (attention_softmax_in_fp32 defaults off) and Flex
+    accumulates in fp32.
+
+    Subclassing rather than replacing keeps the parent available for the inputs
+    Flex cannot express, and use_flex=False makes the two paths comparable on
+    one set of weights.
+    """
+
+    def __init__(self, config, layer_number, attn_mask_type, attention_type, attention_dropout=None, **kwargs):
+      super().__init__(config, layer_number, attn_mask_type, attention_type, attention_dropout, **kwargs)
+      self.use_flex = True
+      # The same predicate the parent hands to FusedScaleMaskSoftmax, read from
+      # the same helper, so the two paths cannot disagree about which layers slide.
+      self.flex_window = (
+        config.window_size[0]
+        if is_layer_window_attention(config.window_size, config.window_attn_skip_freq, layer_number)
+        else None
+      )
+      # Gemma-4's global layers carry head_dim 512. FlexAttention's default
+      # 128-row tiles then want 256 KiB of shared memory against sm90's 227 KiB
+      # and Triton refuses to compile; halving the tiles is not enough on its
+      # own, because the default ~3 pipeline stages trible the K/V tile budget.
+      self.flex_kernel_options = (
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32, "num_stages": 1}
+        if config.kv_channels > 256
+        else None
+      )
+
+    def forward(
+      self, query, key, value, attention_mask, attn_mask_type=None, attention_bias=None, packed_seq_params=None
+    ):
+      # Everything the block mask cannot express falls back to the parent. An
+      # explicit mask is the one that matters in practice: the parent overrides
+      # it with its own causal/sliding mask anyway, but only when it is None can
+      # this path be sure the block mask is the whole story.
+      eligible = (
+        self.use_flex
+        and attention_mask is None
+        and attention_bias is None
+        and packed_seq_params is None
+        and self.softmax_offset is None
+        and not (self.training and self.config.attention_dropout > 0)
+      )
+      if not eligible:
+        return super().forward(
+          query,
+          key,
+          value,
+          attention_mask,
+          attn_mask_type=attn_mask_type,
+          attention_bias=attention_bias,
+          packed_seq_params=packed_seq_params,
+        )
+
+      # Megatron lays attention out as [seq, batch, heads, head_dim]; Flex wants
+      # [batch, heads, seq, head_dim]. enable_gqa maps query head i to key group
+      # i // (heads / groups), which is what the parent's repeat_interleave does.
+      seq_q, batch, heads, head_dim = query.shape
+      context = _flex_attention_compiled(
+        query.permute(1, 2, 0, 3),
+        key.permute(1, 2, 0, 3),
+        value.permute(1, 2, 0, 3),
+        block_mask=gemma4_flex_block_mask(self.flex_window, seq_q, key.shape[0], query.device),
+        scale=self.softmax_scale,
+        enable_gqa=key.shape[2] != heads,
+        kernel_options=self.flex_kernel_options,
+      )
+      return context.permute(2, 0, 1, 3).contiguous().view(seq_q, batch, heads * head_dim)
+
+  return FlexDotProductAttention
+
+
+def install_gemma4_flex_attention() -> bool:
+  """Point Gemma-4's dense layer spec at FlexAttention. Returns whether it took.
+
+  The seam is narrow. Gemma4DenseProvider.provide calls the module-level
+  get_gemma4_layer_spec directly and ignores its own transformer_layer_spec
+  field, so rebinding that name in the provider's namespace is the only way in
+  without reimplementing the spec. Wrapping the stock spec rather than writing
+  one keeps every other submodule -- the Gemma-4 norms, the shared-KV
+  attention class -- exactly as the bridge built it.
+
+  Best-effort by design: a checkpoint that is not Gemma-4 never imports this
+  module, and a megatron-bridge that moved the symbol should cost a slower
+  context ceiling, not a failed run.
+  """
+  global _flex_attention_compiled, _create_block_mask_compiled
+  if not MEGATRON_FLEX_ATTENTION:
+    return False
+  try:
+    import megatron.bridge.models.gemma.gemma4_provider as gemma4_provider
+    from megatron.bridge.models.gemma.modeling_gemma4 import get_gemma4_layer_spec
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+  except ImportError as exc:
+    print(f"[Megatron Worker] FlexAttention unavailable, keeping megatron's core attention: {exc}")
+    return False
+
+  if getattr(gemma4_provider.get_gemma4_layer_spec, "_open_rl_flex", False):
+    return True
+
+  _flex_attention_compiled = torch.compile(flex_attention)
+  _create_block_mask_compiled = torch.compile(create_block_mask)
+  flex_class = gemma4_flex_attention_class()
+
+  def flex_layer_spec(config=None):
+    spec = get_gemma4_layer_spec(config)
+    spec.submodules.self_attention.submodules.core_attention = flex_class
+    return spec
+
+  flex_layer_spec._open_rl_flex = True
+  gemma4_provider.get_gemma4_layer_spec = flex_layer_spec
+  print("[Megatron Worker] Gemma-4 core attention: FlexAttention (block-mask sliding window).")
+  return True
 
 
 def chunked_target_logprobs(
@@ -376,6 +569,9 @@ class MegatronTrainingWorker(BaseTrainerWorker):
 
     AutoBridge, _ = require_megatron()
     register_gemma4_unified_bridge()
+    # Before the provider builds any layer: the spec is read inside
+    # provide_distributed_model below.
+    install_gemma4_flex_attention()
     self.initialize_parallel_state()
     print(f"Loading Megatron model {base_model_name} (rank {os.getenv('RANK', '0')}/{os.getenv('WORLD_SIZE', '1')}, TP={self.tp_size})...")
 
