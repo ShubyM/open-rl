@@ -49,10 +49,17 @@ Weight import and HF export go through Megatron-Bridge (`AutoBridge`), which is
 the only sane way to get an HF checkpoint into Megatron's layout and back out
 again for the vLLM sampler. Neither megatron-core nor megatron-bridge is in
 pyproject.toml, so every import here is lazy and this module imports cleanly
-without them. The three bridge calls -- from_hf_pretrained,
-to_megatron_provider/provide_distributed_model, save_hf_pretrained -- are the
-part most likely to need renaming against whichever megatron-bridge is
-installed; everything else uses megatron-core APIs that have been stable.
+without them.
+
+Verified against megatron-core 0.19.0 / megatron-bridge 0.6.0 on 2026-08-26:
+from_hf_pretrained, to_megatron_provider, provide_distributed_model and
+save_hf_pretrained all exist with these signatures, and AutoBridge dispatches to
+a Gemma4DenseProvider carrying the right 12B geometry once
+register_gemma4_unified_bridge has run. What that pairing needs, all handled
+below and none of it discoverable from the docs: model_parallel_cuda_manual_seed
+after initialize_model_parallel, the two Apex fusions off, and the
+architecture-name shim. The bridge also wants transformer-engine, whose torch
+extension ships only as an sdist and must be compiled against the box's nvcc.
 """
 
 import gc
@@ -79,6 +86,12 @@ MEGATRON_PP = int(os.getenv("OPEN_RL_MEGATRON_PP", "1"))
 MEGATRON_CP = int(os.getenv("OPEN_RL_MEGATRON_CP", "1"))
 MEGATRON_SEQUENCE_PARALLEL = os.getenv("OPEN_RL_MEGATRON_SEQUENCE_PARALLEL", "1") == "1"
 MEGATRON_DISTRIBUTED_OPTIMIZER = os.getenv("OPEN_RL_MEGATRON_DISTRIBUTED_OPTIMIZER", "1") == "1"
+MEGATRON_SEED = int(os.getenv("OPEN_RL_MEGATRON_SEED", "1234"))
+# Two Megatron fusions call into Apex CUDA extensions (fused_weight_gradient_mlp_cuda,
+# scaled_masked_softmax_cuda) that are not pip-installable and are absent unless
+# Apex was built from source. Megatron does not degrade gracefully: it raises at
+# layer construction. Default them off and let a box with Apex opt back in.
+MEGATRON_APEX_FUSIONS = os.getenv("OPEN_RL_MEGATRON_APEX_FUSIONS", "0") == "1"
 
 OPTIMIZER_SUBDIR = "megatron_optimizer"
 
@@ -111,6 +124,44 @@ def require_megatron():
       f"installed into the trainer environment first. Import failed with: {exc}"
     ) from exc
   return AutoBridge, parallel_state
+
+
+def register_gemma4_unified_bridge() -> None:
+  """Teach megatron-bridge the architecture name our Gemma-4 checkpoints use.
+
+  transformers 5.10 renamed Gemma-4's model_type from "gemma4" to
+  "gemma4_unified" (the same rename src/training/model_loading.py works around),
+  so google/gemma-4-12B-it declares architectures=["Gemma4UnifiedForConditionalGeneration"].
+  megatron-bridge 0.6.x registers only "Gemma4ForCausalLM" and
+  "Gemma4ForConditionalGeneration", so AutoBridge.can_handle returns False and
+  dispatch fails with a "write your own bridge" error.
+
+  Nothing but the name is missing. Gemma4VLBridge already reads the nested
+  text_config and already expects the multimodal ``model.language_model.*``
+  weight layout our checkpoints carry, and with GEMMA4_CONVERSION_MODE=text it
+  builds a plain text-only Gemma4DenseProvider and drops the vision tower --
+  which is exactly the text-only model this trainer wants. So re-register the
+  existing class under the new name rather than defining a bridge.
+
+  Harmless once upstream adds the name: the register call is skipped.
+  """
+  from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+  from megatron.bridge.models.gemma_vl.gemma4_vl_bridge import Gemma4VLBridge
+  from megatron.bridge.models.gemma_vl.gemma4_vl_provider import Gemma4VLModelProvider
+  from megatron.bridge.models.gemma_vl.modeling_gemma4_vl import Gemma4VLModel
+
+  # Text-only conversion: language tower to a GPTModel provider, vision dropped.
+  os.environ.setdefault("GEMMA4_CONVERSION_MODE", "text")
+  source = "Gemma4UnifiedForConditionalGeneration"
+  try:
+    MegatronModelBridge.register_bridge(
+      source=source,
+      target=Gemma4VLModel,
+      provider=Gemma4VLModelProvider,
+      model_type="gemma4_vl",
+    )(Gemma4VLBridge)
+  except Exception as exc:  # already registered upstream, or the registry moved
+    print(f"[Megatron Worker] Did not register {source}: {exc}")
 
 
 class MegatronTrainingWorker(BaseTrainerWorker):
@@ -172,6 +223,15 @@ class MegatronTrainingWorker(BaseTrainerWorker):
       pipeline_model_parallel_size=1,
       context_parallel_size=1,
     )
+    # Not optional. Megatron's tensor-parallel layers initialize their weight
+    # shards under get_cuda_rng_tracker().fork(), which raises "cuda rng state
+    # model-parallel-rng is not added" until this seeds the tracker. It also
+    # gives tensor-parallel ranks *different* offsets for the same logical
+    # tensor, which is what makes a sharded initialization equivalent to an
+    # unsharded one.
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    model_parallel_cuda_manual_seed(MEGATRON_SEED)
     print(f"Megatron parallel state: TP={self.tp_size} DP={world // self.tp_size} sequence_parallel={self.sequence_parallel}")
 
   def data_parallel_group(self):
@@ -219,6 +279,7 @@ class MegatronTrainingWorker(BaseTrainerWorker):
       return
 
     AutoBridge, _ = require_megatron()
+    register_gemma4_unified_bridge()
     self.initialize_parallel_state()
     print(f"Loading Megatron model {base_model_name} (rank {os.getenv('RANK', '0')}/{os.getenv('WORLD_SIZE', '1')}, TP={self.tp_size})...")
 
@@ -237,6 +298,9 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     provider.sequence_parallel = self.sequence_parallel
     provider.params_dtype = dtype
     provider.bf16 = dtype == torch.bfloat16
+    if not MEGATRON_APEX_FUSIONS:
+      provider.gradient_accumulation_fusion = False
+      provider.masked_softmax_fusion = False
     if ENABLE_GRADIENT_CHECKPOINTING:
       provider.recompute_granularity = "full"
       provider.recompute_method = "uniform"
