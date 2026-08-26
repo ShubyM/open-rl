@@ -344,6 +344,33 @@ class FlexBlockMaskTest(unittest.TestCase):
     megatron_worker.gemma4_flex_block_mask(1023, 8192, 8192, "cpu")
     self.assertEqual(len(self.built), 3)
 
+  def test_the_cache_is_bounded_because_every_step_brings_a_new_length(self) -> None:
+    # The packer pads to a multiple of TP, so lengths rarely repeat and an
+    # unbounded cache is a leak of quadratically-sized masks.
+    for seq in range(1024, 1024 * 40, 1024):
+      megatron_worker.gemma4_flex_block_mask(1023, seq, seq, "cpu")
+    self.assertEqual(len(megatron_worker._flex_block_masks), megatron_worker._FLEX_BLOCK_MASK_CACHE_SIZE)
+
+  def test_the_shape_in_flight_survives_eviction(self) -> None:
+    # A single forward alternates the sliding and global masks of one shape
+    # across 48 layers. Evicting either mid-pass would rebuild it 24 times.
+    size = megatron_worker._FLEX_BLOCK_MASK_CACHE_SIZE
+    for _layer in range(size * 3):
+      megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu")
+      megatron_worker.gemma4_flex_block_mask(None, 4096, 4096, "cpu")
+    self.assertEqual(len(self.built), 2, "the pair in use must never be evicted")
+
+  def test_eviction_is_least_recently_used_not_first_inserted(self) -> None:
+    size = megatron_worker._FLEX_BLOCK_MASK_CACHE_SIZE
+    oldest = megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu")
+    for seq in range(8192, 8192 + 1024 * (size - 1), 1024):
+      megatron_worker.gemma4_flex_block_mask(1023, seq, seq, "cpu")
+    # Touch the oldest entry, then overflow by one: the untouched one goes.
+    self.assertIs(megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu"), oldest)
+    megatron_worker.gemma4_flex_block_mask(1023, 999424, 999424, "cpu")
+    self.assertIn((1023, 4096, 4096), megatron_worker._flex_block_masks)
+    self.assertNotIn((1023, 8192, 8192), megatron_worker._flex_block_masks)
+
   def test_disabling_the_knob_leaves_megatrons_attention_alone(self) -> None:
     with unittest.mock.patch.object(megatron_worker, "MEGATRON_FLEX_ATTENTION", False):
       self.assertFalse(megatron_worker.install_gemma4_flex_attention())

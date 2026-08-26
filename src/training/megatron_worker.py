@@ -203,6 +203,19 @@ _flex_attention_compiled: Any = None
 _create_block_mask_compiled: Any = None
 _flex_block_masks: dict[tuple[int | None, int, int], Any] = {}
 
+# The cache has to be bounded, because make_training_batches packs to a token
+# budget and compute_target_logprobs pads only to a multiple of tp_size, so
+# almost every step hands attention a sequence length it has never seen: a
+# packing probe over eight batch shapes cached eighteen masks. An entry is
+# quadratic in length -- measured 19.2 MiB at 143,360 tokens, 1.0 MiB at 32,768,
+# and a sliding mask costs the same as a global one because kv_indices spans the
+# whole block grid either way -- so a few hundred steps of an unbounded cache is
+# tens of GiB of leak. Bound it by count, which caps it at 8 * 2 * 19.2 MiB even
+# if every entry is worst-case. Evicting is cheap: rebuilding is one compiled
+# kernel launch. Eight is four steps of history, and a step needs at most two
+# entries (one shape, one sliding mask and one global), so hot masks survive.
+_FLEX_BLOCK_MASK_CACHE_SIZE = 8
+
 
 def gemma4_flex_block_mask(window: int | None, seq_q: int, seq_kv: int, device) -> Any:
   """Block mask for one causal (window=None) or sliding-window attention layer.
@@ -215,10 +228,14 @@ def gemma4_flex_block_mask(window: int | None, seq_q: int, seq_kv: int, device) 
   TP=4: 96k tokens peaked at 115.6 GiB uncompiled against 43.6 GiB compiled,
   and only the compiled form grows linearly with context.
 
-  One cache for the whole process: all 48 layers share two masks per shape.
+  One cache for the whole process: all 48 layers share two masks per shape. It
+  is a least-recently-used cache of _FLEX_BLOCK_MASK_CACHE_SIZE entries; see the
+  note there for why an unbounded one leaks.
   """
   key = (window, seq_q, seq_kv)
-  if key not in _flex_block_masks:
+  # pop-then-reinsert, so dict insertion order is least-recently-used order.
+  mask = _flex_block_masks.pop(key, None)
+  if mask is None:
     if window is None:
 
       def keep(_batch, _head, q_idx, kv_idx):
@@ -229,10 +246,13 @@ def gemma4_flex_block_mask(window: int | None, seq_q: int, seq_kv: int, device) 
       def keep(_batch, _head, q_idx, kv_idx, _window=window):
         return (q_idx >= kv_idx) & (q_idx - kv_idx <= _window)
 
-    _flex_block_masks[key] = _create_block_mask_compiled(
+    mask = _create_block_mask_compiled(
       keep, B=None, H=None, Q_LEN=seq_q, KV_LEN=seq_kv, device=device
     )
-  return _flex_block_masks[key]
+    while len(_flex_block_masks) >= _FLEX_BLOCK_MASK_CACHE_SIZE:
+      _flex_block_masks.pop(next(iter(_flex_block_masks)))
+  _flex_block_masks[key] = mask
+  return mask
 
 
 def gemma4_flex_attention_class() -> type:
