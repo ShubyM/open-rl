@@ -1,18 +1,23 @@
 """Megatron backend pieces that do not need megatron installed.
 
 Neither megatron-core nor megatron-bridge is a dependency, so most of the worker
-cannot run here. Two parts can, and they are the two that would fail silently:
-the data-parallel sharding hooks (wrong shard -> tensor-parallel peers train on
-different tokens) and the DDP buffer offload's pointer arithmetic (wrong offset
--> parameters alias the wrong weights after a wake_up).
+cannot run here. Three parts can, and they are the three that would fail
+silently: the data-parallel sharding hooks (wrong shard -> tensor-parallel peers
+train on different tokens), the DDP buffer offload's pointer arithmetic (wrong
+offset -> parameters alias the wrong weights after a wake_up), and the chunked
+logprob head's sequence-first/batch-first bookkeeping (wrong transpose ->
+training on shifted labels).
 """
 
+import sys
+import types
 import unittest
 import unittest.mock
 
 import torch
 
-from training.megatron_worker import MegatronTrainingWorker
+import training.megatron_worker as megatron_worker
+from training.megatron_worker import MegatronTrainingWorker, chunked_target_logprobs
 from training.trainer_worker import BaseTrainerWorker, Datum
 
 
@@ -164,6 +169,126 @@ class BufferOffloadTest(unittest.TestCase):
     pointers = [param.data.data_ptr() for param in self.chunk.parameters()]
     self.worker.move_flat_buffers("cpu")
     self.assertEqual([param.data.data_ptr() for param in self.chunk.parameters()], pointers)
+
+
+class FakeOutputLayer:
+  """A ColumnParallelLinear as chunked_target_logprobs uses it: called with
+  [rows, 1, hidden], handed an explicit weight, returning (logits, bias)."""
+
+  def __init__(self):
+    self.sequence_parallel = False
+    self.disable_grad_reduce = False
+    self.weight = None
+    self.row_counts: list[int] = []
+
+  def __call__(self, hidden, weight):
+    self.row_counts.append(hidden.shape[0])
+    return torch.nn.functional.linear(hidden, weight), None
+
+
+def cross_entropy(labels: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+  """Megatron's compute_language_model_loss: labels [batch, seq], logits [seq, batch, vocab]."""
+  labels = labels.transpose(0, 1)
+  loss = torch.logsumexp(logits, dim=-1) - logits.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+  return loss.transpose(0, 1)
+
+
+class ChunkedProjectionTest(unittest.TestCase):
+  """The chunked head must agree with an unchunked one, values and gradients.
+
+  Everything risky here is bookkeeping. Megatron is sequence-first and this
+  interface is batch-first, so the flatten/transpose pair has to line each row
+  of hidden state up with the right target; get it wrong and the loss is still
+  finite, still decreases, and trains the model on shifted labels. The chunk
+  boundary and the checkpointed backward are the other two ways it can be
+  quietly wrong, so the sizes below deliberately do not divide evenly.
+  """
+
+  seq_len, batch, hidden_size, vocab, chunk = 5, 2, 4, 7, 3
+
+  def setUp(self) -> None:
+    torch.manual_seed(0)
+    self.hidden = torch.randn(self.seq_len, self.batch, self.hidden_size, requires_grad=True)
+    self.weight = torch.randn(self.vocab, self.hidden_size, requires_grad=True)
+    self.labels = torch.randint(0, self.vocab, (self.batch, self.seq_len))
+    self.output_layer = FakeOutputLayer()
+    # Patched for the whole test, not just the forward call: checkpointing
+    # re-runs the projection from inside backward().
+    patcher = unittest.mock.patch.object(megatron_worker, "MEGATRON_LOGPROB_CHUNK", self.chunk)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def reference(self) -> torch.Tensor:
+    logits = torch.nn.functional.linear(self.hidden, self.weight)
+    return -cross_entropy(self.labels, logits)
+
+  def run_chunked(self, output_weight: torch.Tensor | None = None) -> torch.Tensor:
+    return chunked_target_logprobs(
+      hidden_states=self.hidden,
+      output_layer=self.output_layer,
+      output_weight=output_weight,
+      labels=self.labels,
+      config=types.SimpleNamespace(sequence_parallel=False),
+      compute_language_model_loss=cross_entropy,
+      scale_logits=lambda logits: logits,
+    )
+
+  def test_values_match_an_unchunked_projection(self) -> None:
+    self.output_layer.weight = self.weight
+    chunked = self.run_chunked()
+
+    self.assertEqual(chunked.shape, (self.batch, self.seq_len))
+    # 10 rows in chunks of 3: the last one is short, which is the boundary that
+    # a stop index computed from the chunk size rather than the tensor gets wrong.
+    self.assertEqual(self.output_layer.row_counts, [3, 3, 3, 1])
+    torch.testing.assert_close(chunked, self.reference())
+
+  def test_gradients_survive_checkpointing(self) -> None:
+    self.output_layer.weight = self.weight
+    self.run_chunked().sum().backward()
+    chunked_grads = (self.hidden.grad.clone(), self.weight.grad.clone())
+
+    self.hidden.grad = self.weight.grad = None
+    self.reference().sum().backward()
+
+    torch.testing.assert_close(chunked_grads[0], self.hidden.grad)
+    torch.testing.assert_close(chunked_grads[1], self.weight.grad)
+
+  def test_tied_embedding_weight_is_preferred(self) -> None:
+    # Gemma ties embeddings, so the output layer allocates no weight of its own
+    # and GPTModel hands the shared one to the processor instead.
+    self.assertIsNone(self.output_layer.weight)
+    torch.testing.assert_close(self.run_chunked(output_weight=self.weight), self.reference())
+
+  def test_sequence_parallel_flags_are_restored(self) -> None:
+    # The layer must not be left with the overrides the projection sets, or the
+    # next unchunked caller silently skips the gather and the dgrad reduction.
+    self.output_layer.weight = self.weight
+    self.output_layer.sequence_parallel = True
+    gathered = []
+
+    mappings = types.ModuleType("megatron.core.tensor_parallel.mappings")
+    mappings.gather_from_sequence_parallel_region = lambda hidden: gathered.append(hidden) or hidden
+    modules = {
+      "megatron": types.ModuleType("megatron"),
+      "megatron.core": types.ModuleType("megatron.core"),
+      "megatron.core.tensor_parallel": types.ModuleType("megatron.core.tensor_parallel"),
+      "megatron.core.tensor_parallel.mappings": mappings,
+    }
+    with unittest.mock.patch.dict(sys.modules, modules):
+      chunked_target_logprobs(
+        hidden_states=self.hidden,
+        output_layer=self.output_layer,
+        output_weight=None,
+        labels=self.labels,
+        config=types.SimpleNamespace(sequence_parallel=True),
+        compute_language_model_loss=cross_entropy,
+        scale_logits=lambda logits: logits,
+      )
+
+    self.assertEqual(len(gathered), 1, "the gather must happen once, not once per chunk")
+    self.assertTrue(self.output_layer.sequence_parallel)
+    self.assertFalse(self.output_layer.disable_grad_reduce)
 
 
 class BackendGuardTest(unittest.TestCase):

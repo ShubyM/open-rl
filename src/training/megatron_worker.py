@@ -9,10 +9,14 @@ context at ~0.69 GiB/ktoken on the 12B model and the 143,360-token window sits
 at ~126 GiB of 139.8. Adding GPUs buys throughput, never a longer context.
 
 Megatron's tensor parallelism shards the hidden dimension, so per-rank
-activations fall by roughly the TP degree, sequence parallelism shards the
-LayerNorm/dropout activations TP cannot, and the vocab-parallel loss keeps the
-262k-entry logit tensor split across the group instead of gathering it onto one
-device. TP is the knob that moves the context ceiling. FSDP has no equivalent.
+activations fall by roughly the TP degree, and sequence parallelism shards the
+LayerNorm/dropout activations TP cannot. TP is the knob that moves the context
+ceiling. FSDP has no equivalent.
+
+TP alone is not enough, though: the vocab-parallel loss splits the 262k-entry
+logit tensor across the group but still keeps [seq, batch, vocab/TP] in fp32 for
+the whole sequence, which measured out as the dominant term and capped TP=8 at
+64k. chunked_target_logprobs below removes it.
 
 What is supported
 -----------------
@@ -103,6 +107,12 @@ MEGATRON_LORA_ALPHA = int(os.getenv("OPEN_RL_MEGATRON_LORA_ALPHA", "32"))
 # every importance-sampling ratio.
 MEGATRON_LORA_DROPOUT = float(os.getenv("OPEN_RL_MEGATRON_LORA_DROPOUT", "0.0"))
 MEGATRON_LORA_TARGETS = os.getenv("OPEN_RL_MEGATRON_LORA_TARGETS", "linear_qkv,linear_proj,linear_fc1,linear_fc2")
+# Rows of hidden state projected through the vocabulary at a time. Larger than
+# the FSDP path's OPEN_RL_LOGPROB_CHUNK because each chunk here carries the
+# cross-entropy's TP collectives, so very small chunks pay launch latency for
+# nothing; at 1024 rows the transient fp32 logit tensor is 1 GiB at TP=1 and
+# 128 MiB at TP=8.
+MEGATRON_LOGPROB_CHUNK = int(os.getenv("OPEN_RL_MEGATRON_LOGPROB_CHUNK", "1024"))
 
 OPTIMIZER_SUBDIR = "megatron_optimizer"
 
@@ -173,6 +183,81 @@ def register_gemma4_unified_bridge() -> None:
     )(Gemma4VLBridge)
   except Exception as exc:  # already registered upstream, or the registry moved
     print(f"[Megatron Worker] Did not register {source}: {exc}")
+
+
+def chunked_target_logprobs(
+  *, hidden_states, output_layer, output_weight, labels, config, compute_language_model_loss, scale_logits, **_
+) -> torch.Tensor:
+  """GPTModel output_processor that never materializes the full logit tensor.
+
+  Passing labels= to GPTModel runs the whole sequence through the output layer in
+  one shot. Even with the vocab sharded over the TP group that is
+  [seq, batch, vocab/TP] in fp32, and Gemma-4's logit softcapping keeps more
+  tensors that size alive for the backward pass. Measured on the 12B model at
+  TP=1 and 16k tokens, a no-grad forward with no loss at all cost 55.7 GiB above
+  the weights -- which is why this backend OOMed at 32k while the FSDP worker,
+  whose head is chunked, reaches 143k.
+
+  We only need one scalar per position, so the projection runs in
+  MEGATRON_LOGPROB_CHUNK-row slices under activation checkpointing: the
+  [chunk, vocab/TP] logits are never held for backward, peak drops from
+  O(seq x vocab) to O(chunk x vocab), and it stops scaling with context.
+
+  Every numeric step is still Megatron's own -- the output layer module, which
+  carries Gemma's logit softcapping, and compute_language_model_loss, which
+  dispatches to whichever fused cross-entropy the config asks for. That is
+  load-bearing, not tidiness. Hand-rolling the head with the unfused
+  vocab_parallel_cross_entropy reproduced the stock forward bit for bit but moved
+  the gradients by 3% relative, which nothing downstream would have caught. As
+  written the gradients are bit-identical to the labels= path at TP=2; at TP=1
+  they differ by ~1%, because the 262k-wide dgrad GEMM splits its reduction
+  differently for 1024 rows than for the whole sequence.
+
+  Returns [batch, seq] logprobs, so GPTModel.forward hands them back in place of
+  the usual per-token loss.
+  """
+  if config.sequence_parallel:
+    # The decoder leaves the sequence sharded across the TP group and the output
+    # layer would normally gather it. Gathering once here instead of once per
+    # chunk is also what makes the chunks correct: this op's backward
+    # reduce-scatters, summing each rank's partial hidden gradient. Without
+    # sequence parallelism the output layer's own dgrad all-reduce still covers
+    # that, so there is nothing to arrange.
+    from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+    hidden_states = gather_from_sequence_parallel_region(hidden_states)
+
+  # Megatron is sequence-first, the Tinker interface batch-first. Chunks are rows
+  # of the flattened [seq * batch] axis; cross-entropy is per-row, so a chunk
+  # does not have to respect the batch boundary.
+  batch, seq_len = labels.shape
+  hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+  targets = labels.transpose(0, 1).reshape(-1)
+  weight = output_weight if output_weight is not None else output_layer.weight
+
+  def project(hidden_chunk: torch.Tensor, weight: torch.Tensor, target_chunk: torch.Tensor) -> torch.Tensor:
+    saved = output_layer.sequence_parallel, output_layer.disable_grad_reduce
+    if config.sequence_parallel:
+      # We gathered above and that gather's backward owns the gradient
+      # reduction; disable_grad_reduce stops the layer adding a second one.
+      # Set here rather than around the loop because checkpointing re-runs this
+      # from backward, long after an outer restore would have happened.
+      output_layer.sequence_parallel, output_layer.disable_grad_reduce = False, True
+    try:
+      logits, _ = output_layer(hidden_chunk.unsqueeze(1), weight=weight)
+    finally:
+      output_layer.sequence_parallel, output_layer.disable_grad_reduce = saved
+    return -compute_language_model_loss(target_chunk.unsqueeze(0), scale_logits(logits)).squeeze(0)
+
+  def chunk(start: int) -> torch.Tensor:
+    stop = start + MEGATRON_LOGPROB_CHUNK
+    args = (hidden[start:stop], weight, targets[start:stop])
+    if hidden.requires_grad or weight.requires_grad:
+      return torch.utils.checkpoint.checkpoint(project, *args, use_reentrant=False)
+    return project(*args)
+
+  rows = torch.cat([chunk(start) for start in range(0, hidden.shape[0], MEGATRON_LOGPROB_CHUNK)])
+  return rows.view(seq_len, batch).transpose(0, 1)
 
 
 class MegatronTrainingWorker(BaseTrainerWorker):
@@ -416,14 +501,12 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     attention_mask: torch.Tensor,
     target_token_ids: torch.Tensor,
   ) -> torch.Tensor:
-    """Return [batch, seq] target logprobs from Megatron's vocab-parallel loss.
+    """Return [batch, seq] target logprobs, projecting the vocab in chunks.
 
-    GPTModel with labels= runs tensor_parallel.vocab_parallel_cross_entropy,
-    which keeps the logits sharded over the TP group and all-reduces only the
-    two scalars per position it needs (the target logit and the logsumexp). That
-    is the same trick as the fused chunked head in trainer_worker, done across
-    devices instead of across chunks, and it is why the 262k vocab stops being a
-    memory problem: each rank only ever holds vocab/TP columns.
+    labels= is still passed because GPTModel forwards it to the output_processor
+    hook; the stock loss path it would otherwise drive is never reached. See
+    chunked_target_logprobs for what that hook does and why the default path
+    cannot hold a long context.
 
     Targets are already aligned with inputs position-for-position by the Tinker
     client -- input_ids[t] predicts target_token_ids[t] -- and Megatron's loss
@@ -450,8 +533,8 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     # real token never attends to a pad, and the pad rows' logprobs are dropped
     # by the caller's [:, :length] slice. Passing the dense mask instead would
     # make Megatron materialize [batch, 1, seq, seq] and lose the fused kernel.
-    losses = self.gpt_model()(input_ids, position_ids, None, labels=target_token_ids)
-    return -losses[:, :seq_len]
+    logprobs = self.gpt_model()(input_ids, position_ids, None, labels=target_token_ids, output_processor=chunked_target_logprobs)
+    return logprobs[:, :seq_len]
 
   # -- optimizer ------------------------------------------------------------
 
