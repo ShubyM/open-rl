@@ -543,9 +543,21 @@ fi
 # the other and the serve looks healthy while every POST returns 404.
 WT_ENV=""
 WT_ARG=""
+NCCL_NET_ENV=""
 if [ "$MEGATRON_WEIGHT_TRANSFER" = "1" ]; then
   WT_ENV="VLLM_SERVER_DEV_MODE=1"
   WT_ARG="--weight-transfer-config '{\"backend\":\"nccl\"}'"
+  # /etc/profile.d/nccl_env.sh on GCP A3 images exports NCCL_ENV_PLUGIN=gcp and
+  # an NCCL_CONF_FILE that pins NCCL_NET=gIB -- the GPUDirect-RDMA plugin for
+  # multi-node A3 Ultra. This box has one ordinary vNIC and no IB device, so the
+  # plugin finds nothing and NCCL 2.28 aborts ("Failed to initialize any NET
+  # plugin") instead of falling back, on the first tensor-parallel broadcast.
+  # env -u, not an empty assignment: NCCL reads these by presence.
+  #
+  # Applied to the samplers as well as the trainer. Intra-node TP never touches
+  # the net path, but the weight-transfer group spans both processes over
+  # loopback and does, and the two ends have to pick the same transport.
+  NCCL_NET_ENV="env -u NCCL_ENV_PLUGIN -u NCCL_CONF_FILE NCCL_NET=Socket"
 fi
 
 if [ "$AFFINITY" = "1" ]; then
@@ -555,7 +567,7 @@ if [ "$AFFINITY" = "1" ]; then
     GPU_ID=$((TRAIN_GPUS + i))
     PORT=$((8000 + i))
     SAMPLER_URLS="$SAMPLER_URLS,http://127.0.0.1:$PORT"
-    SAMPLER_CMD="$SAMPLER_CMD CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_ALLOW_RUNTIME_LORA_UPDATING=true $WT_ENV \
+    SAMPLER_CMD="$SAMPLER_CMD CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_ALLOW_RUNTIME_LORA_UPDATING=true $WT_ENV $NCCL_NET_ENV \
 uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
 --port $PORT --enable-lora --max-lora-rank 64 --max-loras 2 --enable-prefix-caching \
 --max-model-len $SAMPLER_CONTEXT --gpu-memory-utilization 0.92 \
@@ -693,7 +705,7 @@ if [ "$TRAIN_GPUS" -gt 1 ]; then
   # is not the project venv, so the package comes off PYTHONPATH rather than an
   # install and torchrun is spelled as the module it actually is.
   if [ "$TRAINER_BACKEND" = "megatron" ]; then
-    TRAINER_RUNNER="PYTHONPATH=$REPO/src $MEGATRON_PYTHON -m torch.distributed.run"
+    TRAINER_RUNNER="PYTHONPATH=$REPO/src $NCCL_NET_ENV $MEGATRON_PYTHON -m torch.distributed.run"
   else
     TRAINER_RUNNER="uv run --extra gpu --extra fastpath torchrun"
   fi
