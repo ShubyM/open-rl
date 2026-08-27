@@ -383,6 +383,50 @@ class FlexBlockMaskTest(unittest.TestCase):
       self.assertFalse(gemma4.install_flex_attention())
 
 
+class TensorParallelAgreementTest(unittest.TestCase):
+  """A TP-group batch mismatch must raise here, not hang in NCCL.
+
+  This is the check that would have named the run31 deadlock in a second
+  instead of eight minutes: the ranks entered attention with different
+  sequence lengths and sat in an all-reduce that could never match.
+  """
+
+  def worker_seeing(self, peers: list[tuple[int, int]]) -> MegatronTrainingWorker:
+    worker = MegatronTrainingWorker()
+    worker.tp_size = len(peers)
+    worker.device = torch.device("cpu")
+
+    def fake_all_gather(out_list, _tensor, group=None):
+      for slot, peer in zip(out_list, peers):
+        slot.copy_(torch.tensor(peer, dtype=torch.long))
+
+    self.enterContext(unittest.mock.patch.object(megatron_worker.dist, "is_initialized", return_value=True))
+    self.enterContext(unittest.mock.patch.object(megatron_worker.dist, "all_gather", fake_all_gather))
+    self.enterContext(unittest.mock.patch.object(megatron_worker, "require_megatron", return_value=(None, unittest.mock.MagicMock())))
+    return worker
+
+  def test_matching_ranks_pass(self) -> None:
+    worker = self.worker_seeing([(3, 6), (3, 6)])
+    worker.assert_tp_ranks_agree([datum(i) for i in range(3)])
+
+  def test_a_different_datum_count_is_reported(self) -> None:
+    worker = self.worker_seeing([(3, 6), (4, 8)])
+    with self.assertRaisesRegex(RuntimeError, r"different batches.*\(3, 6\).*\(4, 8\)"):
+      worker.assert_tp_ranks_agree([datum(i) for i in range(3)])
+
+  def test_same_count_different_lengths_is_reported(self) -> None:
+    # The run31 shape: equal datum counts, different token totals.
+    worker = self.worker_seeing([(3, 6), (3, 9)])
+    with self.assertRaisesRegex(RuntimeError, "different batches"):
+      worker.assert_tp_ranks_agree([datum(i) for i in range(3)])
+
+  def test_tp1_does_not_collective(self) -> None:
+    worker = MegatronTrainingWorker()
+    worker.tp_size = 1
+    with unittest.mock.patch.object(megatron_worker.dist, "all_gather", side_effect=AssertionError("collective")):
+      worker.assert_tp_ranks_agree([datum(0)])
+
+
 class BackendGuardTest(unittest.TestCase):
   def test_pipeline_parallelism_is_refused_at_construction(self) -> None:
     import training.megatron_worker as megatron_worker
