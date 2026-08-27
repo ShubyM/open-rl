@@ -337,6 +337,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
 
     self.store = store
+    self.worker = worker
     # Two deployments, distinguished by whether --model-id was given. With one,
     # this is a per-model worker the gateway launched and it drains that model's
     # queue. Without one -- how launch_work.sh starts the Megatron trainer -- it
