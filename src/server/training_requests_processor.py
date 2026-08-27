@@ -335,13 +335,20 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   ):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
-    if not model_id:
-      raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
 
     self.store = store
-    self.worker = worker
+    # Two deployments, distinguished by whether --model-id was given. With one,
+    # this is a per-model worker the gateway launched and it drains that model's
+    # queue. Without one -- how launch_work.sh starts the Megatron trainer -- it
+    # is the only trainer on the box, so it drains the shared round-robin queue
+    # like the LoRA worker does and takes whatever model_id the requests carry.
+    # Nothing else changes: the per-model launcher is off in that mode
+    # (gateway.gateway_launches_trainers), so there is no second trainer to
+    # contend with, and the time slicer is a no-op on a box it owns outright.
     self.model_id = model_id
-    self.workload = workload_from_env(os.getpid(), job_id=workload_job_id("trainer", model_id), group=TRAINER_TIME_SLICE_GROUP)
+    self.workload = workload_from_env(
+      os.getpid(), job_id=workload_job_id("trainer", model_id or "shared"), group=TRAINER_TIME_SLICE_GROUP
+    )
     self.time_slicer = time_slicer
     self.snapshot_registered = False
 
@@ -387,7 +394,12 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         close_distributed()
 
   async def run_once(self) -> None:
-    batch = await self.store.get_requests_for_model(self.model_id) if is_primary() else None
+    if is_primary():
+      batch = await (
+        self.store.get_requests_for_model(self.model_id) if self.model_id else self.store.get_requests()
+      )
+    else:
+      batch = None
     if is_distributed():
       batch = await asyncio.to_thread(broadcast_object, batch)
     if not batch:
@@ -395,6 +407,9 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         await asyncio.sleep(0.1)
       return
 
+    # get_requests() batches one tenant at a time, so a batch is single-model
+    # either way and the ops below can share one id.
+    model_id = self.model_id or batch[0].get("model_id", "default")
     has_shutdown = False
     training_reqs = []
     for req in batch:
@@ -405,10 +420,10 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
     with tracer.start_as_current_span("training_requests_batch") as batch_span:
       batch_span.set_attribute("batch_size", len(training_reqs))
-      batch_span.set_attribute("model_id", self.model_id)
+      batch_span.set_attribute("model_id", model_id)
 
       if training_reqs:
-        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}")
+        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {model_id}")
         results = []
         # FSDP checkpoint consolidation is collective GPU work, so distributed
         # saves remain inside the trainer lease. Single-GPU CPU-offloaded saves
@@ -422,12 +437,12 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
           async with self.gpu_lease():
             lease_wait = time.monotonic() - lease_started
             batch_span.set_attribute("gpu_lease_wait_seconds", lease_wait)
-            print(f"[TIMING] model={self.model_id} phase=gpu_lease_wait duration={lease_wait:.3f}s")
+            print(f"[TIMING] model={model_id} phase=gpu_lease_wait duration={lease_wait:.3f}s")
             if hasattr(self.worker, "wake_up"):
               await self.transition_worker("wake_up", self.worker.wake_up)
             try:
               for request in gpu_reqs:
-                results.append(await self.handle_request(request, self.model_id))
+                results.append(await self.handle_request(request, model_id))
             finally:
               if hasattr(self.worker, "sleep"):
                 await self.transition_worker("sleep", self.worker.sleep)
@@ -435,10 +450,10 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload and save_reqs:
           async with self.time_slicer.acquire(self.workload):
             for request in save_reqs:
-              results.append(await self.handle_request(request, self.model_id))
+              results.append(await self.handle_request(request, model_id))
         else:
           for request in save_reqs:
-            results.append(await self.handle_request(request, self.model_id))
+            results.append(await self.handle_request(request, model_id))
 
         for request_id, result in results:
           if is_primary() and request_id is not None:
@@ -468,8 +483,8 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       await asyncio.to_thread(transition, *args)
       elapsed = time.monotonic() - started
       span.set_attribute("duration_seconds", elapsed)
-      span.set_attribute("model_id", self.model_id)
-      print(f"[TIMING] model={self.model_id} phase={phase} duration={elapsed:.3f}s")
+      span.set_attribute("model_id", self.model_id or "shared")
+      print(f"[TIMING] model={self.model_id or 'shared'} phase={phase} duration={elapsed:.3f}s")
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     base_model, raw_config, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")
