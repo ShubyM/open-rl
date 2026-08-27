@@ -483,10 +483,43 @@ class MegatronTrainingWorker(BaseTrainerWorker):
 
   # -- forward / backward ---------------------------------------------------
 
+  def assert_tp_ranks_agree(self, data: list[Datum]) -> None:
+    """Fail fast if tensor-parallel peers were handed different datums.
+
+    TP ranks hold different slices of one model and all-reduce inside every
+    attention and MLP, so they have to run identical shapes in identical order.
+    Hand them different data and nothing raises: the first all-reduce simply
+    never matches, the ranks sit in it, and eight minutes later NCCL's watchdog
+    aborts the process with a stack trace that points at the collective rather
+    than at the mismatch that caused it. One two-integer all-gather per call
+    turns that into an immediate error naming the disagreement.
+
+    The batch reaches every rank the same way -- rank 0 pops it and broadcasts
+    -- and the DP-shard hooks above return 1 when TP spans the whole world, so
+    agreement is an invariant of two separate mechanisms. This checks it rather
+    than assuming it, on the group whose collectives would hang.
+    """
+    if self.tp_size <= 1 or not dist.is_initialized():
+      return
+    _, parallel_state = require_megatron()
+    fingerprint = torch.tensor([len(data), sum(len(datum.model_input) for datum in data)], dtype=torch.long, device=self.device)
+    gathered = [torch.empty_like(fingerprint) for _ in range(self.tp_size)]
+    dist.all_gather(gathered, fingerprint, group=parallel_state.get_tensor_model_parallel_group())
+    seen = [tuple(int(v) for v in tensor.tolist()) for tensor in gathered]
+    if len(set(seen)) > 1:
+      raise RuntimeError(
+        f"Tensor-parallel ranks were handed different batches: (datums, tokens) per TP rank = {seen}. "
+        f"They share one model and must see identical data. Either the request batch did not reach "
+        f"every rank identically, or the data-parallel shard hooks split it -- shard_rank="
+        f"{self.shard_rank()} shard_count={self.shard_count()} on this rank, and shard_count must be 1 "
+        f"when TP spans the whole world."
+      )
+
   def forward_backward(
     self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
   ) -> dict[str, Any]:
     assert self.model_chunks, "Model must be loaded first."
+    self.assert_tp_ranks_agree(data)
     res = super().forward_backward(self.model_chunks[0], data, loss_fn, loss_config, forward_only=forward_only)
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
