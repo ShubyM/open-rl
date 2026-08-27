@@ -18,6 +18,7 @@ import torch
 
 import training.megatron_worker as megatron_worker
 from training.megatron_worker import MegatronTrainingWorker, chunked_target_logprobs
+from training.models import gemma4
 from training.trainer_worker import BaseTrainerWorker, Datum
 
 
@@ -307,15 +308,15 @@ class FlexBlockMaskTest(unittest.TestCase):
       self.built.append((keep, Q_LEN, KV_LEN))
       return f"mask{len(self.built)}"
 
-    patcher = unittest.mock.patch.object(megatron_worker, "_create_block_mask_compiled", fake_create_block_mask)
+    patcher = unittest.mock.patch.object(gemma4, "_create_block_mask_compiled", fake_create_block_mask)
     patcher.start()
     self.addCleanup(patcher.stop)
-    cache = unittest.mock.patch.object(megatron_worker, "_flex_block_masks", {})
+    cache = unittest.mock.patch.object(gemma4, "_flex_block_masks", {})
     cache.start()
     self.addCleanup(cache.stop)
 
   def allowed(self, window: int | None, seq: int = 8) -> torch.Tensor:
-    megatron_worker.gemma4_flex_block_mask(window, seq, seq, "cpu")
+    gemma4.flex_block_mask(window, seq, seq, "cpu")
     keep = self.built[-1][0]
     q_idx = torch.arange(seq).unsqueeze(1)
     kv_idx = torch.arange(seq).unsqueeze(0)
@@ -334,52 +335,52 @@ class FlexBlockMaskTest(unittest.TestCase):
     self.assertEqual(allowed[0].tolist(), [True] + [False] * 7)
 
   def test_masks_are_built_once_per_window_and_shape(self) -> None:
-    first = megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu")
-    again = megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu")
+    first = gemma4.flex_block_mask(1023, 4096, 4096, "cpu")
+    again = gemma4.flex_block_mask(1023, 4096, 4096, "cpu")
     self.assertIs(first, again)
     self.assertEqual(len(self.built), 1, "a cache hit must not rebuild the mask")
 
     # The two things that make a mask different: the window and the shape.
-    megatron_worker.gemma4_flex_block_mask(None, 4096, 4096, "cpu")
-    megatron_worker.gemma4_flex_block_mask(1023, 8192, 8192, "cpu")
+    gemma4.flex_block_mask(None, 4096, 4096, "cpu")
+    gemma4.flex_block_mask(1023, 8192, 8192, "cpu")
     self.assertEqual(len(self.built), 3)
 
   def test_the_cache_is_bounded_because_every_step_brings_a_new_length(self) -> None:
     # The packer pads to a multiple of TP, so lengths rarely repeat and an
     # unbounded cache is a leak of quadratically-sized masks.
     for seq in range(1024, 1024 * 40, 1024):
-      megatron_worker.gemma4_flex_block_mask(1023, seq, seq, "cpu")
-    self.assertEqual(len(megatron_worker._flex_block_masks), megatron_worker._FLEX_BLOCK_MASK_CACHE_SIZE)
+      gemma4.flex_block_mask(1023, seq, seq, "cpu")
+    self.assertEqual(len(gemma4._flex_block_masks), gemma4._FLEX_BLOCK_MASK_CACHE_SIZE)
 
   def test_the_shape_in_flight_survives_eviction(self) -> None:
     # A single forward alternates the sliding and global masks of one shape
     # across 48 layers. Evicting either mid-pass would rebuild it 24 times.
-    size = megatron_worker._FLEX_BLOCK_MASK_CACHE_SIZE
+    size = gemma4._FLEX_BLOCK_MASK_CACHE_SIZE
     for _layer in range(size * 3):
-      megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu")
-      megatron_worker.gemma4_flex_block_mask(None, 4096, 4096, "cpu")
+      gemma4.flex_block_mask(1023, 4096, 4096, "cpu")
+      gemma4.flex_block_mask(None, 4096, 4096, "cpu")
     self.assertEqual(len(self.built), 2, "the pair in use must never be evicted")
 
   def test_eviction_is_least_recently_used_not_first_inserted(self) -> None:
-    size = megatron_worker._FLEX_BLOCK_MASK_CACHE_SIZE
-    oldest = megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu")
+    size = gemma4._FLEX_BLOCK_MASK_CACHE_SIZE
+    oldest = gemma4.flex_block_mask(1023, 4096, 4096, "cpu")
     for seq in range(8192, 8192 + 1024 * (size - 1), 1024):
-      megatron_worker.gemma4_flex_block_mask(1023, seq, seq, "cpu")
+      gemma4.flex_block_mask(1023, seq, seq, "cpu")
     # Touch the oldest entry, then overflow by one: the untouched one goes.
-    self.assertIs(megatron_worker.gemma4_flex_block_mask(1023, 4096, 4096, "cpu"), oldest)
-    megatron_worker.gemma4_flex_block_mask(1023, 999424, 999424, "cpu")
-    self.assertIn((1023, 4096, 4096), megatron_worker._flex_block_masks)
-    self.assertNotIn((1023, 8192, 8192), megatron_worker._flex_block_masks)
+    self.assertIs(gemma4.flex_block_mask(1023, 4096, 4096, "cpu"), oldest)
+    gemma4.flex_block_mask(1023, 999424, 999424, "cpu")
+    self.assertIn((1023, 4096, 4096), gemma4._flex_block_masks)
+    self.assertNotIn((1023, 8192, 8192), gemma4._flex_block_masks)
 
   def test_disabling_the_knob_leaves_megatrons_attention_alone(self) -> None:
-    with unittest.mock.patch.object(megatron_worker, "MEGATRON_FLEX_ATTENTION", False):
-      self.assertFalse(megatron_worker.install_gemma4_flex_attention())
+    with unittest.mock.patch.object(gemma4, "MEGATRON_FLEX_ATTENTION", False):
+      self.assertFalse(gemma4.install_flex_attention())
 
   def test_a_missing_megatron_is_not_fatal(self) -> None:
     # Best-effort by contract: without the bridge the run should fall back to
     # megatron's attention, not fail to load the model.
-    with unittest.mock.patch.object(megatron_worker, "MEGATRON_FLEX_ATTENTION", True):
-      self.assertFalse(megatron_worker.install_gemma4_flex_attention())
+    with unittest.mock.patch.object(gemma4, "MEGATRON_FLEX_ATTENTION", True):
+      self.assertFalse(gemma4.install_flex_attention())
 
 
 class BackendGuardTest(unittest.TestCase):

@@ -130,7 +130,7 @@ fi
 # fsdp (default): the data-parallel LoRA trainer every run so far has used.
 # megatron: tensor-parallel trainer, src/training/megatron_worker.py. It changes
 # what fits -- see the 12b CONTEXT block -- so it is read before the model cases.
-# It is not yet runnable from here; see the weight-sync guard below.
+# It needs AFFINITY=1 and its own environment; see the backend block below.
 TRAINER_BACKEND=${TRAINER_BACKEND:-fsdp}
 
 # The 27B ceiling on a 141GB H200 is 98K tokens (measured, activation offload
@@ -472,28 +472,52 @@ if [ "$TRAIN_GPUS" -gt 1 ]; then
   echo "[work] TRAIN_GPUS=$TRAIN_GPUS -> torchrun trainer on GPUs $TRAIN_DEV, sampler DP$SAMPLER_DP on $SAMPLER_DEV"
 fi
 
+# AFFINITY=1: one single-GPU vllm serve per sampler GPU (ports 8000+i) and
+# prefix-hash routing in the gateway, so every turn of an episode hits the
+# instance that already holds its KV/prefix cache. Default: one DP server
+# (per-request round-robin, no cross-turn cache reuse). Read before the backend
+# block below, which requires it.
+AFFINITY=${AFFINITY:-0}
+
 # Megatron is tensor-parallel across the whole trainer group, DP=1: TP has to
 # divide gemma-4's 16 attention heads and 8 KV groups, so it must be 1, 2, 4 or
 # 8, and TRAIN_GPUS=4 is the configuration the context numbers were measured on.
 # gloo for the control plane because the worker exchanges Python objects.
 BACKEND_ENV=""
+MEGATRON_WEIGHT_TRANSFER=0
 if [ "$TRAINER_BACKEND" = "megatron" ]; then
-  # Refuse rather than train into a void. This script serves with `vllm serve`,
-  # and external_sampler.py can only push a LoRA adapter through
-  # /v1/load_lora_adapter -- stock vLLM has no checkpoint hot-reload, which is
-  # why OPEN_RL_ENABLE_FFT is documented as keeping the managed queue workers.
-  # The Megatron worker exports the other shape: apply_lora's export merges the
-  # adapter into the base weights and writes a whole HF checkpoint. So the
-  # trainer would train, every optim step would produce a checkpoint no sampler
-  # here can load, and rollouts would keep coming from the untouched base model
-  # -- a flat reward curve at full 8-GPU cost, diagnosable only by noticing that
-  # nothing ever changed. Lift this once the worker can write an unmerged
-  # adapter in vLLM's layout (see _remap_adapter_to_hub_layout in
-  # lora_trainer_worker.py for the naming vLLM silently requires).
-  echo "ERROR: TRAINER_BACKEND=megatron has no working weight sync in this stack yet." >&2
-  echo "  The trainer is measured and works (TP=4, 262K context); the gap is export." >&2
-  echo "  Megatron writes a merged full checkpoint; vllm serve can only load an adapter." >&2
-  exit 1
+  # How the weights reach the samplers, because it is not the way every other
+  # backend here does it. external_sampler.py pushes a LoRA adapter through
+  # /v1/load_lora_adapter, and the Megatron worker cannot produce one: the
+  # bridge's export merges the adapter into the base weights and yields a whole
+  # HF checkpoint, which stock vLLM has no way to hot-reload. Wiring the two
+  # anyway used to be an `exit 1` here, because the failure is silent -- the
+  # trainer trains, every step writes a 24 GiB checkpoint nothing reads, and
+  # every rollout still comes from the untouched base model.
+  #
+  # So the samplers below take their weights over NCCL instead
+  # (src/training/weight_transfer.py), which needs both of the flags added to
+  # the serve command and a trainer that can reach the ports. AFFINITY=1 is
+  # required: a data-parallel server has one engine core per replica and the
+  # RLHF router addresses one, so DP>1 would update a single replica and leave
+  # the others stale -- the same silent-staleness bug in a smaller box.
+  if [ "$AFFINITY" != "1" ]; then
+    echo "ERROR: TRAINER_BACKEND=megatron needs AFFINITY=1 (one server per sampler GPU)." >&2
+    echo "  Weight transfer addresses one engine; a DP server would leave replicas stale." >&2
+    exit 1
+  fi
+  MEGATRON_WEIGHT_TRANSFER=1
+  # The trainer runs out of its own interpreter, not the project venv. megatron-core,
+  # megatron-bridge and transformer-engine are all installed --no-deps (they pin
+  # torch and transformers ranges that would drag the whole resolution around),
+  # so they cannot be a uv extra without breaking every other backend's sync.
+  # scripts/setup_megatron_env.sh builds it; nothing else in the stack uses it.
+  MEGATRON_PYTHON=${MEGATRON_PYTHON:-$HOME/megatron-probe/.venv/bin/python}
+  if [ ! -x "$MEGATRON_PYTHON" ]; then
+    echo "ERROR: no megatron interpreter at $MEGATRON_PYTHON." >&2
+    echo "  Build it with ./scripts/setup_megatron_env.sh, or set MEGATRON_PYTHON." >&2
+    exit 1
+  fi
   MEGATRON_TP=${MEGATRON_TP:-$TRAIN_GPUS}
   case "$MEGATRON_TP" in
     1|2|4|8) ;;
@@ -502,14 +526,21 @@ if [ "$TRAINER_BACKEND" = "megatron" ]; then
   BACKEND_ENV="OPEN_RL_TRAINER_BACKEND=megatron OPEN_RL_ENABLE_FFT=true \
 OPEN_RL_MEGATRON_TP=$MEGATRON_TP OPEN_RL_MEGATRON_LORA_RANK=${MEGATRON_LORA_RANK:-16} \
 OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl"
-  echo "[work] TRAINER_BACKEND=megatron -> TP=$MEGATRON_TP, LoRA rank ${MEGATRON_LORA_RANK:-16}"
+  echo "[work] TRAINER_BACKEND=megatron -> TP=$MEGATRON_TP, LoRA rank ${MEGATRON_LORA_RANK:-16}, NCCL weight transfer"
 fi
 
-# AFFINITY=1: one single-GPU vllm serve per sampler GPU (ports 8000+i) and
-# prefix-hash routing in the gateway, so every turn of an episode hits the
-# instance that already holds its KV/prefix cache. Default: one DP server
-# (per-request round-robin, no cross-turn cache reuse).
-AFFINITY=${AFFINITY:-0}
+# Weight-transfer flags, only under the Megatron backend. The router that
+# serves /init_weight_transfer_engine and /update_weights is registered only
+# when both are set: --weight-transfer-config builds the engine,
+# VLLM_SERVER_DEV_MODE=1 is what mounts the RLHF routes at all. Set one without
+# the other and the serve looks healthy while every POST returns 404.
+WT_ENV=""
+WT_ARG=""
+if [ "$MEGATRON_WEIGHT_TRANSFER" = "1" ]; then
+  WT_ENV="VLLM_SERVER_DEV_MODE=1"
+  WT_ARG="--weight-transfer-config '{\"backend\":\"nccl\"}'"
+fi
+
 if [ "$AFFINITY" = "1" ]; then
   SAMPLER_CMD=""
   SAMPLER_URLS=""
@@ -517,11 +548,11 @@ if [ "$AFFINITY" = "1" ]; then
     GPU_ID=$((TRAIN_GPUS + i))
     PORT=$((8000 + i))
     SAMPLER_URLS="$SAMPLER_URLS,http://127.0.0.1:$PORT"
-    SAMPLER_CMD="$SAMPLER_CMD CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_ALLOW_RUNTIME_LORA_UPDATING=true \
+    SAMPLER_CMD="$SAMPLER_CMD CUDA_VISIBLE_DEVICES=$GPU_ID VLLM_ALLOW_RUNTIME_LORA_UPDATING=true $WT_ENV \
 uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
 --port $PORT --enable-lora --max-lora-rank 64 --max-loras 2 --enable-prefix-caching \
 --max-model-len $SAMPLER_CONTEXT --gpu-memory-utilization 0.92 \
---language-model-only $SAMPLER_EXTRA |& tee -a $LOGS/sampler-$i.log &"
+--language-model-only $WT_ARG $SAMPLER_EXTRA |& tee -a $LOGS/sampler-$i.log &"
   done
   SAMPLER_CMD="${SAMPLER_CMD} wait"
   SAMPLER_URLS="${SAMPLER_URLS#,}"
@@ -651,13 +682,24 @@ tmux new-window -t "$SESSION" -n gateway -c "$REPO"
 tmux send-keys -t "$SESSION:gateway" "$GATEWAY_CMD" C-m
 
 if [ "$TRAIN_GPUS" -gt 1 ]; then
+  # The Megatron trainer runs on the interpreter that has megatron-bridge, which
+  # is not the project venv, so the package comes off PYTHONPATH rather than an
+  # install and torchrun is spelled as the module it actually is.
+  if [ "$TRAINER_BACKEND" = "megatron" ]; then
+    TRAINER_RUNNER="PYTHONPATH=$REPO/src $MEGATRON_PYTHON -m torch.distributed.run"
+  else
+    TRAINER_RUNNER="uv run --extra gpu --extra fastpath torchrun"
+  fi
+  # SAMPLER_ENV reaches the trainer too, not just the gateway: under the Megatron
+  # backend the worker is the one that opens the NCCL groups, so it needs the
+  # same sampler list the gateway routes with.
   TRAINER_CMD="CUDA_VISIBLE_DEVICES=$TRAIN_DEV FLA_TILELANG=$FLA_TILELANG REDIS_URL=redis://127.0.0.1:6379 \
-OPEN_RL_FSDP_WORLD_SIZE=$TRAIN_GPUS OPEN_RL_WORKER_PROBE_PORT=8090 $BACKEND_ENV \
+OPEN_RL_FSDP_WORLD_SIZE=$TRAIN_GPUS OPEN_RL_WORKER_PROBE_PORT=8090 $BACKEND_ENV $SAMPLER_ENV \
 BASE_MODEL=$MODEL_NAME PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 OPEN_RL_TRAIN_TOKEN_BUDGET=$TRAIN_TOKEN_BUDGET OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
 OPEN_RL_OPTIM_CPU_STEP=${OPTIM_CPU_STEP:-1} \
 OPEN_RL_LOG_CUDA_MEMORY=1 \
-uv run --extra gpu --extra fastpath torchrun --standalone --nproc-per-node=$TRAIN_GPUS -m server.training_requests_processor |& tee -a $LOGS/trainer.log"
+$TRAINER_RUNNER --standalone --nproc-per-node=$TRAIN_GPUS -m server.training_requests_processor |& tee -a $LOGS/trainer.log"
   tmux new-window -t "$SESSION" -n trainer -c "$REPO"
   tmux send-keys -t "$SESSION:trainer" "$TRAINER_CMD" C-m
 fi
