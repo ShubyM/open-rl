@@ -20,16 +20,36 @@ from training.distributed import initialize as initialize_distributed
 from training.distributed import shutdown as shutdown_distributed
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
+from training.megatron_worker import MegatronConfig, MegatronTrainingWorker
 from training.trainer_worker import Datum
 
 tracer = trace.get_tracer(__name__)
 
 
-TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
+TrainingWorker = FFTTrainingWorker | LoraTrainingWorker | MegatronTrainingWorker
+
+# Backends that publish whole checkpoints rather than adapters. They share the
+# dedicated-worker request loop: one process (or torchrun group) per model,
+# draining a per-model queue.
+FULL_PARAMETER_WORKERS = (FFTTrainingWorker, MegatronTrainingWorker)
 
 
 def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
+
+
+def trainer_backend() -> str:
+  """Which trainer worker to run: "lora", "fft", or "megatron"."""
+  backend = os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower() or ("fft" if is_fft_enabled() else "lora")
+  if backend not in ("lora", "fft", "megatron"):
+    raise RuntimeError(f"Unknown OPEN_RL_TRAINER_BACKEND={backend!r}; expected lora, fft, or megatron")
+  if backend != "lora" and not is_fft_enabled():
+    # OPEN_RL_ENABLE_FFT is read independently by the gateway and the sampler,
+    # where it means "whole weights, not adapters". Setting only the backend
+    # would give a full-parameter trainer feeding a sampler still waiting for
+    # adapter files, and the run would train happily against stale weights.
+    raise RuntimeError(f"OPEN_RL_TRAINER_BACKEND={backend} also needs OPEN_RL_ENABLE_FFT=true so the gateway and sampler agree")
+  return backend
 
 
 def create_snapshot_agent_client(socket_path: str) -> SnapshotAgentClient:
@@ -248,7 +268,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
-    worker: FFTTrainingWorker,
+    worker: FFTTrainingWorker | MegatronTrainingWorker,
     model_id: str | None,
     snapshot_client: SnapshotAgentClient,
   ):
@@ -315,7 +335,10 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     raw_config = payload.get("full_config") or {}
-    full_config = FFTConfig(**{k: v for k, v in raw_config.items() if k in FFTConfig.model_fields})
+    # The gateway sends one full_config for every full-parameter backend; each
+    # reads the fields it knows and ignores the rest.
+    config_class = MegatronConfig if isinstance(self.worker, MegatronTrainingWorker) else FFTConfig
+    full_config = config_class(**{k: v for k, v in raw_config.items() if k in config_class.model_fields})
     await asyncio.to_thread(self.worker.create_model, payload["base_model"], model_id, full_config)
     return {
       "base_model": payload["base_model"],
@@ -411,7 +434,7 @@ async def run_training_requests_processor(
   snapshot_client: SnapshotAgentClient | None = None,
 ) -> None:
   store = get_store()
-  if isinstance(worker, FFTTrainingWorker):
+  if isinstance(worker, FULL_PARAMETER_WORKERS):
     if snapshot_client is None:
       snapshot_socket = os.getenv("OPEN_RL_SNAPSHOT_AGENT_SOCKET", "/tmp/open-rl/snapshot-agent.sock")
       snapshot_client = create_snapshot_agent_client(snapshot_socket)
@@ -429,27 +452,33 @@ def start_request_processing_loop() -> None:
   print("\n" + "=" * 50)
   print("      Open-RL PyTorch Training Worker")
   print("=" * 50)
+  backend = trainer_backend()
   cuda_devs = os.getenv("CUDA_VISIBLE_DEVICES", "ALL")
   print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
-  print(f"-> FFT enabled: {is_fft_enabled()}\n")
+  print(f"-> Backend  : {backend} (FFT enabled: {is_fft_enabled()})")
+  if is_distributed():
+    print(f"-> Rank     : {os.getenv('RANK')}/{os.getenv('WORLD_SIZE')} (local {os.getenv('LOCAL_RANK')})")
+  print()
 
-  # No-op unless the worker was launched under torchrun, which nothing does yet.
+  # No-op unless the worker was launched under torchrun; the Megatron backend is
+  # the only one that is.
   initialize_distributed()
 
-  worker: TrainingWorker = FFTTrainingWorker() if is_fft_enabled() else LoraTrainingWorker()
+  worker: TrainingWorker = {"lora": LoraTrainingWorker, "fft": FFTTrainingWorker, "megatron": MegatronTrainingWorker}[backend]()
+  full_parameter = isinstance(worker, FULL_PARAMETER_WORKERS)
   preload_target = os.getenv("BASE_MODEL")
   is_ready = False
-  if preload_target and not is_fft_enabled():
+  if preload_target and not full_parameter:
     worker.load_base_model(preload_target)
     is_ready = True
   else:
-    if is_fft_enabled():
-      print("[WORKER] Full fine-tuning mode loads its model from the create_model request.")
+    if full_parameter:
+      print("[WORKER] Full-parameter mode loads its model from the create_model request.")
     else:
       print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
     is_ready = True
 
-  if not is_fft_enabled():
+  if not full_parameter:
     probe_app = FastAPI()
 
     @probe_app.get("/healthz")
