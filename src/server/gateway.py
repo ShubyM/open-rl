@@ -93,6 +93,31 @@ def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
+def gateway_launches_trainers() -> bool:
+  """Whether this gateway starts a trainer subprocess per model.
+
+  Only FFT does -- LoRA models all share the one in-gateway worker -- and only
+  when nothing else already owns the queue. OPEN_RL_EXTERNAL_TRAINER=1 means a
+  dedicated torchrun trainer is draining it, and every launch below is
+  idempotent per *model_id*, which cannot see a trainer it did not start: the
+  two would race for requests with a full copy of the model each.
+  """
+  return is_fft_enabled() and os.getenv("OPEN_RL_EXTERNAL_TRAINER") != "1"
+
+
+def trainer_pushes_weights() -> bool:
+  """Whether the trainer publishes weights into the samplers itself.
+
+  The Megatron worker does: it holds a NCCL group with each `vllm serve` and
+  writes the new weights straight into engine memory every optim step
+  (src/training/weight_transfer.py). That is what makes an externally managed
+  server usable under full-weight training at all -- everywhere else, FFT has
+  to fall back to the managed queue workers because a stock server can load an
+  adapter but not a checkpoint.
+  """
+  return os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower() == "megatron"
+
+
 def sampler_session_id(model_id: str, seq_id: int | str) -> str:
   return f"tinker://{model_id}/sampler_weights/sampler-{seq_id}"
 
@@ -445,7 +470,7 @@ async def create_model(req: dict):
     },
     request_id=model_id,
   )
-  req_id = await launch_worker_and_enqueue(command) if is_fft_enabled() else await enqueue(command)
+  req_id = await launch_worker_and_enqueue(command) if gateway_launches_trainers() else await enqueue(command)
   return {"request_id": req_id}
 
 
@@ -491,7 +516,7 @@ async def create_model_from_state(req: dict):
     },
     request_id=model_id,
   )
-  req_id = await launch_worker_and_enqueue(command) if is_fft_enabled() else await enqueue(command)
+  req_id = await launch_worker_and_enqueue(command) if gateway_launches_trainers() else await enqueue(command)
   return {"request_id": req_id}
 
 
@@ -757,7 +782,7 @@ async def load_weights(req: dict):
   if (replayed := absorb_retry("load_weights", req)) is not None:
     return {"request_id": replayed}
   resolved_path = checkpoint_state_path(model_id, state_path)
-  if is_fft_enabled() and fft_worker_manager is not None:
+  if gateway_launches_trainers() and fft_worker_manager is not None:
     # A resumed client can address a model whose trainer worker died with the
     # original run; without a worker the request sits in the model's queue
     # forever and the SDK polls "try again" indefinitely. launch_trainer is
@@ -891,9 +916,11 @@ async def asample(req: dict):
     "trace_context": carrier,
   }
 
-  # Externally managed `vllm serve` (LoRA only — stock vLLM cannot hot-reload
-  # FFT checkpoints, so FFT always uses the managed queue workers).
-  if get_sampler_base_url() and not is_fft_enabled():
+  # Externally managed `vllm serve`. FFT normally cannot use one — stock vLLM
+  # hot-reloads an adapter but not a checkpoint, so it falls back to the managed
+  # queue workers — unless the trainer pushes the weights in over NCCL, which
+  # leaves nothing for the sampler side to load.
+  if get_sampler_base_url() and (not is_fft_enabled() or trainer_pushes_weights()):
     task = asyncio.create_task(_sample_via_external_server(req_id, sampling_req))
     _external_sampler_tasks.add(task)
     task.add_done_callback(_external_sampler_tasks.discard)
