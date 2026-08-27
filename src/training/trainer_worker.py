@@ -9,6 +9,16 @@ from pydantic import BaseModel
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
+from training.distributed import all_gather_object, all_reduce_max, all_reduce_sum, is_distributed, local_rank, rank, world_size
+
+FILLER_DATUM_INDEX = -1
+
+
+def shard_datum_indices(count: int, shard_rank: int, shard_count: int) -> list[int]:
+  """Round-robin datum ownership for one data-parallel rank."""
+  if shard_count <= 1:
+    return list(range(count))
+  return list(range(shard_rank, count, shard_count))
 
 
 class TensorData(BaseModel):
@@ -21,26 +31,70 @@ class Datum(BaseModel):
 
 
 class BaseTrainerWorker:
+  # Whether .backward() itself runs cross-rank collectives. FSDP reduces
+  # gradients during backward, so every rank must run the same number of
+  # passes. A backend that defers the reduction to the optimizer step (Megatron
+  # does) sets this False and skips the filler padding below.
+  backward_runs_collectives = True
+
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
 
     if torch.cuda.is_available():
-      self.device = torch.device("cuda")
+      self.device = torch.device("cuda", local_rank())
     elif torch.backends.mps.is_available():
       self.device = torch.device("mps")
     else:
       self.device = torch.device("cpu")
 
+  # Data-parallel geometry, as three overridable hooks.
+  #
+  # forward_backward assumes every rank is an independent data shard, which is
+  # true for FSDP and for the single-process path. It is not true in general: a
+  # tensor-parallel backend splits one model across several ranks, so those
+  # ranks must be fed the *same* datums and their losses must not be summed
+  # twice. A backend whose data-parallel group is a subset of the world
+  # overrides these to shard and reduce over that subgroup instead.
+  def shard_rank(self) -> int:
+    return rank()
+
+  def shard_count(self) -> int:
+    return world_size() if is_distributed() else 1
+
+  def shard_group(self) -> Any:
+    """The process group the hooks above describe. None means the default one."""
+    return None
+
   def forward_backward(self, model: PreTrainedModel, data: list[Datum], loss_fn: str, loss_config: dict | None = None) -> dict[str, Any]:
-    """Run a forward/backward pass on model and return Tinker-shaped loss outputs."""
+    """Run a forward/backward pass on model and return Tinker-shaped loss outputs.
+
+    Under distributed training each rank owns a round-robin shard of the datums
+    and gradients are combined across ranks by the backend's own data-parallel
+    reduction, which averages; each real pass scales its loss by the shard count
+    to cancel that average and recover the single-process sum.
+    """
+    shard_count = self.shard_count()
+    local_indices = shard_datum_indices(len(data), self.shard_rank(), shard_count)
+    local_data = [data[idx] for idx in local_indices]
+
     total_loss = 0.0
     loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
 
     model.train()
 
-    for batch in self.make_training_batches(data):
-      batch_indices = [idx for idx, _ in batch]
+    local_batches = self.make_training_batches(local_data)
+    if shard_count > 1 and self.backward_runs_collectives:
+      # Pad short ranks with zero-scaled passes so collective counts match.
+      filler_passes = all_reduce_max(len(local_batches), self.shard_group()) - len(local_batches)
+      if filler_passes > 0:
+        filler = local_data[0] if local_data else data[0]
+        local_batches.extend([[(FILLER_DATUM_INDEX, filler)]] * filler_passes)
+
+    for batch in local_batches:
+      batch_positions = [idx for idx, _ in batch]
       batch_data = [datum for _, datum in batch]
+      is_filler = batch_positions == [FILLER_DATUM_INDEX]
+      batch_indices = [] if is_filler else [local_indices[position] for position in batch_positions]
 
       input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
       target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
@@ -73,8 +127,13 @@ class BaseTrainerWorker:
 
       per_datum_loss = elementwise_loss.sum(dim=1)
       loss = per_datum_loss.sum()
-      loss.backward()
-      total_loss += loss.item()
+      # The data-parallel reduction averages over the group, so scaling each
+      # real pass by shard_count recovers the single-process sum. Filler passes
+      # are scaled to zero and contribute nothing but a matching collective.
+      backward_loss = loss * (0.0 if is_filler else float(shard_count)) if shard_count > 1 else loss
+      backward_loss.backward()
+      if not is_filler:
+        total_loss += loss.item()
 
       detached_logprobs = target_logprobs.detach().cpu()
       for row, original_idx in enumerate(batch_indices):
@@ -82,6 +141,14 @@ class BaseTrainerWorker:
         logprobs_list = detached_logprobs[row, :row_len].tolist()
         logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
         loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
+
+    if shard_count > 1:
+      # Each rank only produced outputs for its own shard; the response owes the
+      # caller one per datum, in the caller's order.
+      total_loss = all_reduce_sum(total_loss, self.shard_group())
+      for part in all_gather_object({idx: loss_fn_outputs[idx] for idx in local_indices}, self.shard_group()):
+        for idx, output in part.items():
+          loss_fn_outputs[idx] = output
 
     mean_loss = total_loss / max(1, len(data))
     completed_loss_fn_outputs = []

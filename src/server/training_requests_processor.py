@@ -5,6 +5,7 @@ import asyncio
 import os
 import threading
 import traceback
+from contextlib import nullcontext
 from typing import Any, Protocol
 
 import uvicorn
@@ -14,6 +15,9 @@ from opentelemetry import propagate, trace
 
 from server.store import RequestStore, get_store
 from snapshot_agent.client import SnapshotAgentClient
+from training.distributed import broadcast_object, is_distributed, is_primary
+from training.distributed import initialize as initialize_distributed
+from training.distributed import shutdown as shutdown_distributed
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
 from training.trainer_worker import Datum
@@ -61,12 +65,17 @@ class TrainingRequestsProcessor(Protocol):
       token = otel_context.attach(ctx) if ctx else None
 
       result = await self.dispatch_operation(op, raw_request.get("payload", {}), resolved_model_id)
-      await self.store.set_future(request_id, result)
+      # Every rank ran the operation, because the operations are collective. Only
+      # one of them owns the reply: the gateway is waiting on a single future and
+      # a second write to it would resolve someone else's request.
+      if is_primary():
+        await self.store.set_future(request_id, result)
     except Exception as exc:
       traceback.print_exc()
       if request_id is None:
         raise
-      await self.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
+      if is_primary():
+        await self.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
     finally:
       if token:
         otel_context.detach(token)
@@ -252,15 +261,19 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     self.worker = worker
     self.model_id = model_id
     self.pid = os.getpid()
-    self.snapshot_client = snapshot_client
+    # Rank 0 alone holds the GPU lease. The other ranks of a multi-rank worker are
+    # part of the same tenant, and registering each of them would have one job
+    # bidding against itself for its own GPUs.
+    self.snapshot_client = snapshot_client if is_primary() else None
     self.snapshot_registered = False
 
   async def run(self) -> None:
     print("[WORKER] Full fine-tuning training requests processor started.")
 
     try:
-      await self.snapshot_client.register(self.pid)
-      self.snapshot_registered = True
+      if self.snapshot_client:
+        await self.snapshot_client.register(self.pid)
+        self.snapshot_registered = True
       while True:
         try:
           await self.run_once()
@@ -271,14 +284,21 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
           traceback.print_exc()
           await asyncio.sleep(1)
     finally:
-      try:
-        if self.snapshot_registered:
-          await self.snapshot_client.unregister(self.pid)
-      finally:
-        await self.snapshot_client.close()
+      if self.snapshot_client:
+        try:
+          if self.snapshot_registered:
+            await self.snapshot_client.unregister(self.pid)
+        finally:
+          await self.snapshot_client.close()
+      shutdown_distributed()
 
   async def run_once(self) -> None:
-    batch = await self.store.get_requests_for_model(self.model_id)
+    batch = await self.store.get_requests_for_model(self.model_id) if is_primary() else None
+    if is_distributed():
+      # The operations below are collective, so every rank has to run the same
+      # requests in the same order. Rank 0 owns the queue and fans the batch out;
+      # a rank popping for itself would drift and hang the group in a collective.
+      batch = await asyncio.to_thread(broadcast_object, batch)
     if not batch:
       await asyncio.sleep(0.1)
       return
@@ -287,8 +307,9 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       batch_span.set_attribute("batch_size", len(batch))
       batch_span.set_attribute("model_id", self.model_id)
 
-      print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {self.model_id}")
-      async with self.snapshot_client.acquire(self.pid):
+      if is_primary():
+        print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {self.model_id}")
+      async with self.snapshot_client.acquire(self.pid) if self.snapshot_client else nullcontext():
         for request in batch:
           await self.process_request(request, self.model_id)
 
@@ -411,6 +432,9 @@ def start_request_processing_loop() -> None:
   cuda_devs = os.getenv("CUDA_VISIBLE_DEVICES", "ALL")
   print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
   print(f"-> FFT enabled: {is_fft_enabled()}\n")
+
+  # No-op unless the worker was launched under torchrun, which nothing does yet.
+  initialize_distributed()
 
   worker: TrainingWorker = FFTTrainingWorker() if is_fft_enabled() else LoraTrainingWorker()
   preload_target = os.getenv("BASE_MODEL")
