@@ -20,10 +20,91 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config
 from server.store import get_store
-from server.worker_manager import WorkerManager, create_worker_manager
+from server.worker_manager import WorkerManager, create_worker_manager, get_model_target_info
 
 store = get_store()
 worker_manager: WorkerManager | None = None
+
+
+class SessionRegistry:
+  """Binds tinker sessions to the models they drive, so a job's end tears
+  its workers down.
+
+  create_model and create_sampling_session record which models a session
+  uses; the client heartbeats every ten seconds for as long as it runs. A
+  session silent past the TTL releases its models, and a model no live
+  session drives anymore is handed to the reaper -- clients that never call
+  delete_model still stop heartbeating when their process exits.
+  """
+
+  def __init__(self, ttl_seconds: float = 120.0):
+    self.ttl_seconds = ttl_seconds
+    self._sessions: dict[str, dict] = {}
+
+  def open(self, session_id: str) -> None:
+    self._sessions[session_id] = {"last_seen": time.monotonic(), "models": set()}
+
+  def touch(self, session_id: str) -> None:
+    if not session_id:
+      return
+    session = self._sessions.get(session_id)
+    if session is None:
+      # A gateway restart forgets sessions. Recreate on heartbeat so the
+      # session stays live; its pre-restart model bindings are gone, so the
+      # reaper leaves those models alone rather than guessing.
+      self.open(session_id)
+      return
+    session["last_seen"] = time.monotonic()
+
+  def bind(self, session_id: str | None, model_id: str | None) -> None:
+    if not session_id or not model_id:
+      return
+    session = self._sessions.get(session_id)
+    if session is not None:
+      session["models"].add(model_id)
+
+  def live_models(self) -> set[str]:
+    models: set[str] = set()
+    for session in self._sessions.values():
+      models |= session["models"]
+    return models
+
+  def expire(self) -> set[str]:
+    """Drop sessions past the TTL; return the models left with no session."""
+    now = time.monotonic()
+    dead = [sid for sid, s in self._sessions.items() if now - s["last_seen"] > self.ttl_seconds]
+    released: set[str] = set()
+    for sid in dead:
+      released |= self._sessions.pop(sid)["models"]
+    return released - self.live_models()
+
+
+session_registry = SessionRegistry()
+SESSION_REAP_INTERVAL_SEC = 30
+
+
+def _workers_to_teardown() -> list[str]:
+  """Expire dead sessions and pick the released models whose workers can go.
+
+  LoRA workers are shared per base model: while any live session still
+  drives an adapter on the same target, the worker stays.
+  """
+  released = session_registry.expire()
+  if not released:
+    return []
+  live_lora_targets = set()
+  for live in session_registry.live_models():
+    _, target_id, is_lora = get_model_target_info(live)
+    if is_lora:
+      live_lora_targets.add(target_id)
+  ready = []
+  for model_id in sorted(released):
+    _, target_id, is_lora = get_model_target_info(model_id)
+    if is_lora and target_id in live_lora_targets:
+      continue
+    ready.append(model_id)
+  return ready
+
 
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
@@ -325,14 +406,33 @@ def start_claim_reconciler(manager: WorkerManager | None) -> asyncio.Task | None
   return asyncio.create_task(run_claim_reconciler(manager, interval))
 
 
+async def reap_dead_sessions():
+  """Tear down workers whose sessions stopped heartbeating.
+
+  The blocking pieces -- store reads in get_model_target_info, the worker
+  manager's Kubernetes calls -- run on threads to keep the loop responsive.
+  """
+  while True:
+    await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
+    try:
+      for model_id in await asyncio.to_thread(_workers_to_teardown):
+        print(f"[GATEWAY] Sessions for model {model_id} expired; tearing down its workers")
+        if worker_manager is not None:
+          await asyncio.to_thread(worker_manager.shutdown, model_id)
+    except Exception:
+      traceback.print_exc()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
   global worker_manager
   task = None
   reconcile_task = None
+  reap_task = None
   if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER"):
     worker_manager = create_worker_manager()
     reconcile_task = start_claim_reconciler(worker_manager)
+    reap_task = asyncio.create_task(reap_dead_sessions())
   if is_single_process_mode():
     base_model = os.getenv("BASE_MODEL")
     print("\n" + "=" * 50)
@@ -357,6 +457,8 @@ async def lifespan(_: FastAPI):
       task.cancel()
     if reconcile_task is not None:
       reconcile_task.cancel()
+    if reap_task is not None:
+      reap_task.cancel()
     if worker_manager is not None:
       worker_manager.shutdown_all()
       worker_manager = None
@@ -394,11 +496,14 @@ async def client_config(_: dict):
 
 @app.post("/api/v1/create_session")
 async def create_session(_: dict):
-  return {"session_id": "sess-real-123", "type": "create_session"}
+  session_id = f"sess-{uuid.uuid4().hex[:12]}"
+  session_registry.open(session_id)
+  return {"session_id": session_id, "type": "create_session"}
 
 
 @app.post("/api/v1/session_heartbeat")
-async def session_heartbeat(_: dict):
+async def session_heartbeat(req: dict):
+  session_registry.touch(str(req.get("session_id") or ""))
   return {"type": "session_heartbeat"}
 
 
@@ -416,6 +521,7 @@ async def create_model(
     model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="lora")
   except ValueError as exc:
     return JSONResponse(status_code=400, content={"error": str(exc)})
+  session_registry.bind(req.get("session_id"), model_id)
 
   command = make_training_request(
     "create_model",
@@ -464,6 +570,7 @@ async def create_model_from_state(
     model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="restored")
   except ValueError as exc:
     return JSONResponse(status_code=400, content={"error": str(exc)})
+  session_registry.bind(req.get("session_id"), model_id)
 
   command = make_training_request(
     "create_model_from_state",
@@ -675,6 +782,7 @@ async def create_sampling_session(req: dict):
   model_meta = await store.get_model_metadata(target_model_id) if target_model_id else None
   fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
   ready_check_id = (model_meta.get("base_model") or target_model_id) if (fine_tuning_type == "lora" and model_meta) else target_model_id
+  session_registry.bind(req.get("session_id"), ready_check_id or target_model_id)
 
   if get_sampler_backend() == "vllm" and ready_check_id:
     await ensure_sampler_launched(ready_check_id)

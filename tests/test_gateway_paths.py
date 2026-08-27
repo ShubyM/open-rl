@@ -110,5 +110,74 @@ class ClaimReconcilerTest(unittest.IsolatedAsyncioTestCase):
       self.assertIsNone(gateway.start_claim_reconciler(self._K8sManager()))
 
 
+class SessionRegistryTest(unittest.TestCase):
+  def test_expiring_last_session_releases_its_models(self) -> None:
+    registry = gateway.SessionRegistry(ttl_seconds=-1.0)
+    registry.open("sess-a")
+    registry.bind("sess-a", "model-1")
+
+    self.assertEqual(registry.expire(), {"model-1"})
+    self.assertEqual(registry.expire(), set())
+
+  def test_live_session_holds_a_shared_model(self) -> None:
+    registry = gateway.SessionRegistry(ttl_seconds=3600)
+    registry.open("sess-a")
+    registry.open("sess-b")
+    registry.bind("sess-a", "model-1")
+    registry.bind("sess-b", "model-1")
+    registry._sessions["sess-a"]["last_seen"] -= 7200
+
+    self.assertEqual(registry.expire(), set())
+
+  def test_heartbeat_recreates_a_forgotten_session(self) -> None:
+    registry = gateway.SessionRegistry(ttl_seconds=3600)
+    registry.touch("sess-after-restart")
+    self.assertIn("sess-after-restart", registry._sessions)
+
+  def test_bind_without_a_known_session_is_ignored(self) -> None:
+    registry = gateway.SessionRegistry()
+    registry.bind(None, "model-1")
+    registry.bind("sess-missing", "model-1")
+    self.assertEqual(registry.live_models(), set())
+
+
+class SessionTeardownTest(unittest.TestCase):
+  def setUp(self) -> None:
+    self.registry = gateway.SessionRegistry(ttl_seconds=3600)
+    patcher = patch.object(gateway, "session_registry", self.registry)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def _age_out(self, session_id: str) -> None:
+    self.registry._sessions[session_id]["last_seen"] -= 7200
+
+  def test_shared_lora_worker_survives_until_the_last_adapter_leaves(self) -> None:
+    info = patch.object(gateway, "get_model_target_info", side_effect=lambda m: (None, "qwen-base", True))
+    info.start()
+    self.addCleanup(info.stop)
+
+    self.registry.open("sess-a")
+    self.registry.bind("sess-a", "lora-job-1")
+    self.registry.open("sess-b")
+    self.registry.bind("sess-b", "lora-job-2")
+
+    self._age_out("sess-a")
+    self.assertEqual(gateway._workers_to_teardown(), [])
+
+    self._age_out("sess-b")
+    self.assertEqual(gateway._workers_to_teardown(), ["lora-job-2"])
+
+  def test_fft_model_tears_down_as_soon_as_its_session_dies(self) -> None:
+    info = patch.object(gateway, "get_model_target_info", side_effect=lambda m: (None, m, False))
+    info.start()
+    self.addCleanup(info.stop)
+
+    self.registry.open("sess-a")
+    self.registry.bind("sess-a", "fft-job-1")
+    self._age_out("sess-a")
+
+    self.assertEqual(gateway._workers_to_teardown(), ["fft-job-1"])
+
+
 if __name__ == "__main__":
   unittest.main()
