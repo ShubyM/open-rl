@@ -87,6 +87,7 @@ import torch.distributed as dist
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 
+from accel_timeslicer.time_slicer import is_time_slicing_enabled
 from training import paths
 from training.distributed import barrier, is_primary, local_rank
 from training.models import gemma4
@@ -129,6 +130,14 @@ SAMPLER_BASE_URLS = os.getenv("SAMPLER_BASE_URLS") or os.getenv("SAMPLER_BASE_UR
 WEIGHT_TRANSFER_HOST = os.getenv("OPEN_RL_WEIGHT_TRANSFER_HOST", "127.0.0.1")
 WEIGHT_TRANSFER_PORT = int(os.getenv("OPEN_RL_WEIGHT_TRANSFER_PORT", "29511"))
 
+# Offloading exists to hand the GPU to a co-tenant between batches, and time
+# slicing is what does the handing -- see sleep(). With OPEN_RL_TIME_SLICING=off
+# the trainer owns its GPUs for the whole run, so evicting ~24 GiB of weights
+# and optimizer state to host RAM and pulling it back every batch costs two PCIe
+# round trips per step and frees memory nobody is waiting for. Reuse the time
+# slicer's own switch rather than a second variable that could disagree with it.
+MEGATRON_CPU_OFFLOAD = is_time_slicing_enabled()
+
 OPTIMIZER_SUBDIR = "megatron_optimizer"
 
 # Where a Megatron optimizer keeps its fp32 master weights. The distributed
@@ -145,7 +154,8 @@ MASTER_PARAM_GROUPS = (
 
 class MegatronConfig(BaseModel):
   seed: int | None = None
-  cpu_offload: bool = True
+  # An explicit cpu_offload in the create_model payload still wins.
+  cpu_offload: bool = MEGATRON_CPU_OFFLOAD
 
 
 def require_megatron():
@@ -255,7 +265,7 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     self.optimizer: Any = None
     self.tp_size = MEGATRON_TP
     self.sequence_parallel = MEGATRON_TP > 1 and MEGATRON_SEQUENCE_PARALLEL
-    self.cpu_offload: bool = True
+    self.cpu_offload: bool = MEGATRON_CPU_OFFLOAD
     self._is_offloaded: bool = False
     # Megatron's DDP reduces gradients in finish_grad_sync(), which optim_step
     # calls, not during backward. Ranks may therefore run different numbers of
@@ -779,7 +789,9 @@ class MegatronTrainingWorker(BaseTrainerWorker):
   # Same contract as FFTTrainingWorker: the time-slicer calls wake_up() inside
   # the trainer's GPU lease and sleep() in the finally, both duck-typed by
   # FFTTrainingRequestsProcessor.run_once. Anything the trainer leaves resident
-  # is memory the co-located vLLM sampler cannot have.
+  # is memory the co-located vLLM sampler cannot have -- which is why both are
+  # no-ops when cpu_offload is off: with the samplers on their own GPUs there is
+  # no co-tenant to free the memory for. See MEGATRON_CPU_OFFLOAD.
 
   def sleep(self) -> None:
     """Move weights, gradients and optimizer moments to host RAM."""

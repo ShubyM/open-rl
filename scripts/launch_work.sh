@@ -523,9 +523,16 @@ if [ "$TRAINER_BACKEND" = "megatron" ]; then
     1|2|4|8) ;;
     *) echo "ERROR: MEGATRON_TP=$MEGATRON_TP must divide 16 heads and 8 KV groups (1, 2, 4 or 8)." >&2; exit 1 ;;
   esac
+  # Time slicing off: it exists to hand one GPU back and forth between a trainer
+  # and a sampler that share it, and here they do not -- the trainer owns
+  # $TRAIN_DEV and the samplers own the rest. Left on, the processor tries to
+  # register with an accel-timeslicer daemon over a unix socket that this
+  # topology never starts, and rank 0 dies with FileNotFoundError before it
+  # reads a single request. It also stops the worker cpu-offloading its weights
+  # and optimizer state to host RAM between batches, for GPUs nobody else wants.
   BACKEND_ENV="OPEN_RL_TRAINER_BACKEND=megatron OPEN_RL_ENABLE_FFT=true \
 OPEN_RL_MEGATRON_TP=$MEGATRON_TP OPEN_RL_MEGATRON_LORA_RANK=${MEGATRON_LORA_RANK:-16} \
-OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl"
+OPEN_RL_TIME_SLICING=off OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl"
   echo "[work] TRAINER_BACKEND=megatron -> TP=$MEGATRON_TP, LoRA rank ${MEGATRON_LORA_RANK:-16}, NCCL weight transfer"
 fi
 
