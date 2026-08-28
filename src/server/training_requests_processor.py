@@ -7,9 +7,11 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any, Protocol
 
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from opentelemetry import context as otel_context
@@ -19,7 +21,7 @@ from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_fr
 from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.store import RequestStore, get_store
 from training import paths
-from training.distributed import barrier, broadcast_object, is_distributed, is_primary
+from training.distributed import barrier, broadcast_object, is_distributed, is_primary, local_rank
 from training.distributed import close as close_distributed
 from training.distributed import initialize as initialize_distributed
 from training.fft_trainer_worker import FFTTrainingWorker
@@ -522,11 +524,40 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     return {"status": "ok", "type": "weights_saved"}
 
 
+def pin_worker_threads_to_this_rank() -> None:
+  """Give every executor thread this rank's CUDA device.
+
+  Torch's current device is thread-local, and every worker call here is handed
+  to a thread with asyncio.to_thread. set_device() is only reached once, deep
+  inside create_model, so exactly one pool thread -- whichever served that
+  request -- ends up pointing at this rank's GPU. Any thread the pool spawns
+  afterwards still points at cuda:0, and a device-less allocation on one of them
+  lands there: correct on rank 0, wrong on every other rank.
+
+  run33 died of this. Four steps ran on the single warm thread that had run
+  create_model; the pool then grew a second thread and rank 2 hit
+  `cuda:0 and cuda:2` in a forward. The cuda:0 buffer then reached a NCCL
+  communicator bound to cuda:2, which is an illegal access, and the watchdog
+  aborted the rank -- so it reads as a NCCL fault rather than a device bug.
+  """
+  if not torch.cuda.is_available():
+    return
+  device = local_rank()
+  torch.cuda.set_device(device)
+  # An initializer, not a call at each entry point: the pool creates threads
+  # lazily and on demand, so the only place guaranteed to run once per thread is
+  # the thread's own startup.
+  asyncio.get_running_loop().set_default_executor(
+    ThreadPoolExecutor(thread_name_prefix="trainer-worker", initializer=torch.cuda.set_device, initargs=(device,))
+  )
+
+
 async def run_training_requests_processor(
   worker: TrainingWorker,
   model_id: str | None = None,
   time_slicer: TimeSlicerClient | None = None,
 ) -> None:
+  pin_worker_threads_to_this_rank()
   store = get_store()
   if isinstance(worker, FULL_PARAMETER_WORKERS):
     time_slicer = (time_slicer or time_slicer_client_from_env()) if is_primary() else None
