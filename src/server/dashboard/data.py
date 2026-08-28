@@ -110,6 +110,16 @@ def k8s_custom_objects() -> tuple[Any, str | None]:
   return client.CustomObjectsApi(), None
 
 
+@functools.cache
+def k8s_workload_apis() -> tuple[Any, Any, str | None]:
+  _, err = k8s_core_v1()
+  if err:
+    return None, None, err
+  from kubernetes import client
+
+  return client.AppsV1Api(), client.BatchV1Api(), None
+
+
 def object_age_seconds(timestamp: str | None) -> int | None:
   if not timestamp:
     return None
@@ -140,6 +150,16 @@ def empty_resource_metrics(*, installed: bool | None, error: str | None = None) 
     "nodes_available": False,
     "pods": {},
     "nodes": {},
+  }
+
+
+def empty_rollout_snapshot(*, available: bool = False, error: str | None = None) -> dict:
+  return {
+    "available": available,
+    "error": error,
+    "items": [],
+    "sources": {},
+    "summary": {"total": 0, "state_counts": {}, "kind_counts": {}, "problem_count": 0},
   }
 
 
@@ -410,6 +430,155 @@ def k8s_timestamp(value: Any) -> str | None:
   return value.isoformat() if value and hasattr(value, "isoformat") else str(value) if value else None
 
 
+def controller_conditions(resource: Any) -> list[dict]:
+  return [
+    {
+      "type": condition.type,
+      "status": condition.status,
+      "reason": condition.reason,
+      "message": condition.message,
+      "last_transition_at": k8s_timestamp(condition.last_transition_time),
+    }
+    for condition in (getattr(resource.status, "conditions", None) or [])
+  ]
+
+
+def condition_matching(conditions: list[dict], condition_type: str, status: str = "True") -> dict | None:
+  return next((condition for condition in conditions if condition["type"] == condition_type and condition["status"] == status), None)
+
+
+def controller_to_dict(resource: Any, kind: str) -> dict:
+  metadata = resource.metadata
+  spec = resource.spec
+  status = resource.status
+  conditions = controller_conditions(resource)
+  created_at = k8s_timestamp(metadata.creation_timestamp)
+  generation = metadata.generation or 0
+  observed_generation = getattr(status, "observed_generation", None) or 0
+  current = observed_generation >= generation
+  reason = message = None
+  desired = ready = updated = available = active = succeeded = failed = 0
+
+  if kind == "Deployment":
+    desired = spec.replicas or 0
+    ready = status.ready_replicas or 0
+    updated = status.updated_replicas or 0
+    available = status.available_replicas or 0
+    if stalled := condition_matching(conditions, "Progressing", "False"):
+      state, reason, message = "failed", stalled["reason"], stalled["message"]
+    elif unavailable := condition_matching(conditions, "Available", "False"):
+      state, reason, message = "degraded", unavailable["reason"], unavailable["message"]
+    elif current and ready >= desired and available >= desired and updated >= desired:
+      state = "healthy"
+    else:
+      state = "progressing"
+  elif kind == "DaemonSet":
+    desired = status.desired_number_scheduled or 0
+    ready = status.number_ready or 0
+    updated = status.updated_number_scheduled or 0
+    available = status.number_available or 0
+    if current and updated >= desired and ready >= desired and available >= desired:
+      state = "healthy"
+    elif current and updated >= desired and ready < desired:
+      state = "degraded"
+    else:
+      state = "progressing"
+  elif kind == "StatefulSet":
+    desired = spec.replicas or 0
+    ready = status.ready_replicas or 0
+    updated = status.updated_replicas or 0
+    available = getattr(status, "available_replicas", None) or ready
+    current_replicas = status.current_replicas or 0
+    if current and ready >= desired and current_replicas >= desired and updated >= desired:
+      state = "healthy"
+    elif current and updated >= desired and ready < desired:
+      state = "degraded"
+    else:
+      state = "progressing"
+  else:
+    desired = spec.completions or 1
+    active = status.active or 0
+    succeeded = status.succeeded or 0
+    failed = status.failed or 0
+    if terminal := condition_matching(conditions, "Failed") or condition_matching(conditions, "FailureTarget"):
+      state, reason, message = "failed", terminal["reason"], terminal["message"]
+    elif condition_matching(conditions, "Complete") or succeeded >= desired:
+      state = "complete"
+    elif active:
+      state = "running"
+    else:
+      state = "pending"
+
+  return {
+    "kind": kind,
+    "name": metadata.name,
+    "state": state,
+    "reason": reason,
+    "message": message,
+    "desired": desired,
+    "ready": ready,
+    "updated": updated,
+    "available": available,
+    "active": active,
+    "succeeded": succeeded,
+    "failed": failed,
+    "generation": generation,
+    "observed_generation": observed_generation,
+    "current": current,
+    "created_at": created_at,
+    "age_seconds": object_age_seconds(created_at),
+    "conditions": conditions,
+  }
+
+
+def workload_controllers_snapshot(namespace: str) -> dict:
+  apps, batch, err = k8s_workload_apis()
+  if err:
+    return empty_rollout_snapshot(error=err)
+
+  calls = {
+    "deployments": (apps.list_namespaced_deployment, "Deployment"),
+    "daemonsets": (apps.list_namespaced_daemon_set, "DaemonSet"),
+    "statefulsets": (apps.list_namespaced_stateful_set, "StatefulSet"),
+    "jobs": (batch.list_namespaced_job, "Job"),
+  }
+  items = []
+  sources = {}
+  with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as executor:
+    futures = {
+      name: (executor.submit(measured_call, call, namespace, _request_timeout=K8S_REQUEST_TIMEOUT), kind) for name, (call, kind) in calls.items()
+    }
+    for name, (future, kind) in futures.items():
+      result, error, collection_ms = future.result()
+      observed = [] if error is not None else [controller_to_dict(resource, kind) for resource in result.items]
+      sources[name] = {
+        "available": error is None,
+        "error": str(error) if error is not None else None,
+        "collection_ms": collection_ms,
+        "count": len(observed),
+      }
+      items.extend(observed)
+
+  state_counts: dict[str, int] = {}
+  kind_counts: dict[str, int] = {}
+  for item in items:
+    state_counts[item["state"]] = state_counts.get(item["state"], 0) + 1
+    kind_counts[item["kind"]] = kind_counts.get(item["kind"], 0) + 1
+  errors = [f"{name}: {source['error']}" for name, source in sources.items() if source["error"]]
+  return {
+    "available": any(source["available"] for source in sources.values()),
+    "error": "; ".join(errors) or None,
+    "items": sorted(items, key=lambda item: (item["kind"], item["name"])),
+    "sources": sources,
+    "summary": {
+      "total": len(items),
+      "state_counts": state_counts,
+      "kind_counts": kind_counts,
+      "problem_count": sum(state in {"degraded", "failed"} for state in (item["state"] for item in items)),
+    },
+  }
+
+
 def terminated_state(state: Any) -> dict | None:
   if state is None:
     return None
@@ -628,6 +797,7 @@ def _collect_k8s_snapshot() -> dict:
       "nodes": [],
       "metrics": empty_resource_metrics(installed=None, error=err),
       "scheduler": empty_scheduler_snapshot(installed=None, error=err),
+      "rollouts": empty_rollout_snapshot(error=err),
     }
   pod_list, pod_error, pod_ms = measured_call(api.list_namespaced_pod, namespace, _request_timeout=K8S_REQUEST_TIMEOUT)
   component_ms = {"pods": pod_ms}
@@ -641,12 +811,14 @@ def _collect_k8s_snapshot() -> dict:
       "nodes": [],
       "metrics": empty_resource_metrics(installed=None, error=error),
       "scheduler": empty_scheduler_snapshot(installed=None, error=error),
+      "rollouts": empty_rollout_snapshot(error=error),
       "_component_ms": component_ms,
     }
   pods = [pod_to_dict(p) for p in pod_list.items]
-  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+  with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
     nodes_future = executor.submit(measured_call, api.list_node, _request_timeout=K8S_REQUEST_TIMEOUT)
     scheduler_future = executor.submit(measured_call, scheduler_snapshot, namespace)
+    rollouts_future = executor.submit(measured_call, workload_controllers_snapshot, namespace)
     events_future = executor.submit(
       measured_call,
       api.list_namespaced_event,
@@ -669,6 +841,10 @@ def _collect_k8s_snapshot() -> dict:
     scheduler, scheduler_error, component_ms["scheduler"] = scheduler_future.result()
     if scheduler_error is not None:
       scheduler = empty_scheduler_snapshot(installed=True, error=f"scheduler snapshot failed: {scheduler_error}")
+
+    rollouts, rollouts_error, component_ms["rollouts"] = rollouts_future.result()
+    if rollouts_error is not None:
+      rollouts = empty_rollout_snapshot(error=f"workload controller snapshot failed: {rollouts_error}")
 
     event_list, event_error, component_ms["events"] = events_future.result()
     if event_error is not None:
@@ -698,6 +874,7 @@ def _collect_k8s_snapshot() -> dict:
     "events_error": events_error,
     "metrics": metrics,
     "scheduler": scheduler,
+    "rollouts": rollouts,
     "_component_ms": component_ms,
   }
 
@@ -973,6 +1150,7 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
     },
     "gateway": gateway_card,
     "scheduler": k8s.get("scheduler") or empty_scheduler_snapshot(installed=None),
+    "rollouts": k8s.get("rollouts") or empty_rollout_snapshot(),
     "services": services,
     "edges": edges,
     "pools": sorted(pools.values(), key=lambda p: (p["id"] == "cpu", p["id"] == "unscheduled", p["id"])),
@@ -2002,6 +2180,22 @@ async def operational_stats(
           ),
         ]
       )
+    rollouts = k8s.get("rollouts") or {}
+    if rollouts.get("available"):
+      summary = rollouts["summary"]
+      states = " · ".join(f"{count} {state}" for state, count in sorted(summary["state_counts"].items())) or "none observed"
+      stats.append(
+        stat_entry(
+          "kubernetes.rollouts",
+          "Kubernetes rollouts",
+          f"{summary['problem_count']}/{summary['total']} issues",
+          states,
+          value_number=summary["problem_count"],
+          unit="controllers",
+          context={"total": summary["total"], "state_counts": summary["state_counts"], "kind_counts": summary["kind_counts"]},
+          status="warn" if summary["problem_count"] else "ok",
+        )
+      )
   return stats, queues
 
 
@@ -2099,6 +2293,19 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
   elif scheduler["installed"] is True:
     checks.append(check_entry("scheduler", "Scheduler", "Placement API", "error", scheduler["error"] or "scheduler API unavailable"))
 
+  rollouts = k8s.get("rollouts") or empty_rollout_snapshot()
+  if rollouts["available"]:
+    summary = rollouts["summary"]
+    status = "warn" if rollouts["error"] else "ok"
+    detail = f"{summary['total']} workload controllers · {summary['problem_count']} degraded or failed"
+    if rollouts["error"]:
+      detail += f" · partial visibility: {rollouts['error']}"
+    checks.append(check_entry("visibility.rollouts", "Visibility", "Workload controllers", status, detail))
+  elif not k8s["available"]:
+    checks.append(check_entry("visibility.rollouts", "Visibility", "Workload controllers", "off", "Kubernetes is unavailable"))
+  else:
+    checks.append(check_entry("visibility.rollouts", "Visibility", "Workload controllers", "warn", rollouts["error"] or "unavailable"))
+
   if os.getenv("ENABLE_GCP_TRACE", "0") == "1":
     checks.append(check_entry("visibility.trace", "Visibility", "Trace export", "ok", "GCP Cloud Trace exporter configured"))
   else:
@@ -2127,6 +2334,8 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
         actions.append({"label": "Verify event visibility", "command": f"kubectl auth can-i list events -n {k8s['namespace']}"})
       elif check["id"] == "visibility.nodes":
         actions.append({"label": "Verify node visibility", "command": "kubectl auth can-i list nodes"})
+      elif check["id"] == "visibility.rollouts":
+        actions.append({"label": "Verify rollout visibility", "command": f"kubectl auth can-i list deployments -n {k8s['namespace']}"})
       elif check["id"] == "visibility.metrics":
         actions.append({"label": "Verify Metrics API visibility", "command": f"kubectl auth can-i list pods.metrics.k8s.io -n {k8s['namespace']}"})
       problems.append(
@@ -2318,6 +2527,31 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
             ],
           )
         )
+
+  rollouts = k8s.get("rollouts") or {}
+  for rollout in rollouts.get("items") or []:
+    if rollout["state"] not in {"degraded", "failed"}:
+      continue
+    kind = rollout["kind"]
+    name = rollout["name"]
+    problems.append(
+      diagnostic_entry(
+        f"kubernetes.{kind.lower()}_{rollout['state']}",
+        "error" if rollout["state"] == "failed" else "warn",
+        f"{kind.lower()}/{name}",
+        rollout["message"] or rollout["reason"] or f"{rollout['ready']} of {rollout['desired']} replicas ready",
+        resource={"kind": kind, "name": name, "namespace": k8s["namespace"]},
+        evidence={key: rollout[key] for key in rollout if key not in {"kind", "name", "message"}},
+        actions=[
+          {
+            "label": f"Describe {kind}",
+            "method": "GET",
+            "path": "/api/v1/dashboard/cluster",
+            "command": f"kubectl describe {kind.lower()} {name} -n {k8s['namespace']}",
+          }
+        ],
+      )
+    )
   priority = {"error": 0, "warn": 1, "info": 2}
   problems.sort(key=lambda problem: (priority.get(problem["severity"], 3), problem["id"]))
   return problems

@@ -517,7 +517,7 @@ function renderCluster(data) {
   const podsByName = new Map(data.pods.map((p) => [p.name, p]));
 
   // Control column: gateway + configured services.
-  const controlItems = [{ id: "gateway" }, { id: "scheduler" }, ...data.services];
+  const controlItems = [{ id: "gateway" }, { id: "scheduler" }, { id: "rollouts" }, ...data.services];
   sync(
     $("control-col"),
     controlItems,
@@ -546,6 +546,18 @@ function renderCluster(data) {
             bad: scheduler.installed !== false && !scheduler.available,
           },
           { k: "ledgers", v: scheduler.available ? `${summary.ledgers || 0} · ${summary.seats || 0} seats` : "—" },
+        ]);
+      } else if (item.id === "rollouts") {
+        const rollouts = data.rollouts || {};
+        const summary = rollouts.summary || {};
+        const kinds = Object.entries(summary.kind_counts || {}).map(([kind, count]) => `${count} ${kind}`).join(" · ") || "none";
+        const states = Object.entries(summary.state_counts || {}).map(([state, count]) => `${count} ${state}`).join(" · ") || "none";
+        const problems = summary.problem_count || 0;
+        const state = !rollouts.available ? "unavailable" : problems ? `${problems} unhealthy` : "healthy";
+        updateCard(card, "rollouts", state, [
+          { k: "controllers", v: rollouts.available ? kinds : rollouts.error || "not visible", bad: !rollouts.available },
+          { k: "states", v: states, bad: problems > 0 },
+          { k: "visibility", v: rollouts.error || "complete", bad: Boolean(rollouts.error) },
         ]);
       } else {
         const state = item.ok === false ? "unreachable" : item.ok === true ? "connected" : item.configured ? "configured" : "not configured";

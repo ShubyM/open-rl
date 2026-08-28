@@ -25,7 +25,9 @@ experiment analysis; nothing here duplicates metrics.
 
   When the `openrl.io/v1alpha1` placement API from the GPU scheduler is installed, the control column
   also shows Workload phases, ClaimLedger and seat totals. Missing scheduler CRDs are treated as an
-  optional feature being off; installed-but-unreadable CRDs are a health error.
+  optional feature being off; installed-but-unreadable CRDs are a health error. The same column reports
+  desired-versus-ready state for Deployments, DaemonSets, StatefulSets, and Jobs, including partial RBAC
+  visibility instead of silently treating unreadable controllers as absent.
 - **Runs** — launch by base model without leaving the page. Every row has an observed lifecycle verdict
   and an expandable inspection showing queue depth, current GPU claims by pool, pod phase counts,
   gateway request counts/failures/latency, latest worker-reported loss and gradient metrics with their
@@ -35,10 +37,11 @@ experiment analysis; nothing here duplicates metrics.
   process, queued work, or labeled pods).
 - **Health** — current problems first, then a **Load** section of measured stats (active runs, queued
   requests per run, oldest request and worker-launch wait, Redis memory and clients, gateway RSS, disk free, pod and
-  GPU totals, optional Metrics Server CPU/memory usage, CPU/memory scheduling reservations, scheduler workload phases, and ClaimLedger seats), then gateway / storage / Kubernetes /
+  GPU totals, optional Metrics Server CPU/memory usage, CPU/memory scheduling reservations, rollout health, scheduler workload phases, and ClaimLedger seats), then gateway / storage / Kubernetes /
   scheduler / visibility checks. Node `MemoryPressure` and `DiskPressure` conditions surface under
   Problems. Failed or slow placement, stale observed generations, assignment/seat mismatches, and stale
-  ClaimLedger seats include exact `kubectl` inspection commands.
+  ClaimLedger seats include exact `kubectl` inspection commands. Failed Jobs and stalled or unavailable
+  workload controllers retain their Kubernetes conditions and include exact `kubectl describe` commands.
 
 The page polls one coherent snapshot every 8 seconds and updates in place — canvas position, selection,
 and open log panels survive refreshes. A refresh lists Kubernetes state once, so every view describes the

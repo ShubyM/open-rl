@@ -52,6 +52,8 @@ curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/pods/${dashboard_pod}/logs?
   python3 -c 'import json,sys; assert "text" in json.load(sys.stdin)'
 kubectl --context "$CONTEXT" auth can-i delete pods --as system:serviceaccount:default:open-rl-dashboard | grep -Fxq yes
 kubectl --context "$CONTEXT" auth can-i list events --as system:serviceaccount:default:open-rl-dashboard | grep -Fxq yes
+kubectl --context "$CONTEXT" auth can-i list deployments.apps --as system:serviceaccount:default:open-rl-dashboard | grep -Fxq yes
+kubectl --context "$CONTEXT" auth can-i list jobs.batch --as system:serviceaccount:default:open-rl-dashboard | grep -Fxq yes
 
 # `kubectl auth can-i` requires API discovery, but vanilla Kind deliberately
 # has no Metrics Server. A SubjectAccessReview verifies the RBAC independently.
@@ -84,7 +86,7 @@ observation = cluster["kubernetes"]["observation"]
 assert observation["source"] == "live", observation
 assert observation["age_seconds"] == 0, observation
 assert observation["collection_ms"] >= 0, observation
-assert set(observation["components_ms"]) == {"pods", "nodes", "events", "scheduler", "metrics"}, observation
+assert set(observation["components_ms"]) == {"pods", "nodes", "events", "scheduler", "rollouts", "metrics"}, observation
 assert all(value >= 0 for value in observation["components_ms"].values()), observation
 assert cluster["kubernetes"]["nodes_error"] is None, cluster["kubernetes"]
 assert cluster["gateway"]["build"]["revision"] == sys.argv[2], cluster["gateway"]["build"]
@@ -106,14 +108,21 @@ assert dashboard["resources"] == {
   "limits": {"cpu_cores": None, "memory_bytes": 512 * 2**20},
 }, dashboard["resources"]
 assert cluster["scheduler"]["installed"] is False, cluster["scheduler"]
+assert cluster["rollouts"]["available"], cluster["rollouts"]
+assert cluster["rollouts"]["error"] is None, cluster["rollouts"]
+dashboard_rollout = next(item for item in cluster["rollouts"]["items"] if item["kind"] == "Deployment" and item["name"] == "open-rl-dashboard")
+assert dashboard_rollout["state"] == "healthy", dashboard_rollout
+assert dashboard_rollout["desired"] == dashboard_rollout["ready"] == dashboard_rollout["available"] == 1, dashboard_rollout
 checks = {check["id"]: check for check in snapshot["health"]["checks"]}
 assert checks["kubernetes"]["status"] == "ok", checks["kubernetes"]
 assert checks["scheduler"]["status"] == "off", checks["scheduler"]
 assert checks["visibility.events"]["status"] == "ok", checks["visibility.events"]
 assert checks["visibility.metrics"]["status"] == "off", checks["visibility.metrics"]
+assert checks["visibility.rollouts"]["status"] == "ok", checks["visibility.rollouts"]
 stats = {stat["id"]: stat for stat in snapshot["health"]["stats"]}
 assert stats["kubernetes.collection"]["value_number"] == observation["collection_ms"], stats["kubernetes.collection"]
 assert stats["kubernetes.collection"]["unit"] == "milliseconds", stats["kubernetes.collection"]
+assert stats["kubernetes.rollouts"]["value_number"] == 0, stats["kubernetes.rollouts"]
 assert stats["cluster.cpu_requests"]["value_number"] == 0.1, stats["cluster.cpu_requests"]
 assert stats["cluster.memory_requests"]["value_number"] == 128 * 2**20, stats["cluster.memory_requests"]
 assert "cluster.cpu" not in stats, "requests must not be mislabeled as measured usage"

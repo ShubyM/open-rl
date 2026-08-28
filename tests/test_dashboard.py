@@ -159,16 +159,18 @@ class DashboardEndpointsTest(unittest.TestCase):
 
     metrics = data.empty_resource_metrics(installed=False)
     scheduler = data.empty_scheduler_snapshot(installed=False)
+    rollouts = data.empty_rollout_snapshot(available=True)
     with (
       mock.patch.object(data, "k8s_core_v1", return_value=(CoreApi(), None)),
       mock.patch.object(data, "scheduler_snapshot", return_value=scheduler),
+      mock.patch.object(data, "workload_controllers_snapshot", return_value=rollouts),
       mock.patch.object(data, "resource_metrics_snapshot", return_value=metrics),
     ):
       observed = data._collect_k8s_snapshot()
 
     self.assertTrue(observed["available"], "pod visibility keeps the namespaced observation usable")
     self.assertIn("nodes is forbidden", observed["nodes_error"])
-    self.assertEqual(set(observed["_component_ms"]), {"pods", "nodes", "events", "scheduler", "metrics"})
+    self.assertEqual(set(observed["_component_ms"]), {"pods", "nodes", "events", "scheduler", "rollouts", "metrics"})
     self.assertTrue(all(value >= 0 for value in observed["_component_ms"].values()))
 
   def test_snapshot_reads_each_queue_observation_once(self) -> None:
@@ -592,6 +594,82 @@ class DashboardEndpointsTest(unittest.TestCase):
     problem = next(problem for problem in data.derive_problems([], k8s, stats) if problem["code"] == "metric.kubernetes_collection")
     self.assertEqual(problem["evidence"]["components_ms"]["events"], 1200.0)
     self.assertEqual(problem["actions"][1]["command"], "make ops inspect")
+
+  def test_rollout_snapshot_preserves_partial_visibility_and_failed_controller_evidence(self) -> None:
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from server.store import InMemoryStore
+
+    failed_condition = NS(
+      type="Progressing",
+      status="False",
+      reason="ProgressDeadlineExceeded",
+      message="ReplicaSet did not become ready before the deadline",
+      last_transition_time=None,
+    )
+    deployment = NS(
+      metadata=NS(name="gateway", generation=3, creation_timestamp=None),
+      spec=NS(replicas=2),
+      status=NS(
+        conditions=[failed_condition],
+        observed_generation=3,
+        ready_replicas=1,
+        updated_replicas=2,
+        available_replicas=1,
+      ),
+    )
+    job_condition = NS(
+      type="Failed",
+      status="True",
+      reason="BackoffLimitExceeded",
+      message="Job has reached its backoff limit",
+      last_transition_time=None,
+    )
+    job = NS(
+      metadata=NS(name="eval", generation=1, creation_timestamp=None),
+      spec=NS(completions=1),
+      status=NS(conditions=[job_condition], active=0, succeeded=0, failed=4),
+    )
+
+    class AppsApi:
+      def list_namespaced_deployment(self, *_args, **_kwargs):
+        return NS(items=[deployment])
+
+      def list_namespaced_daemon_set(self, *_args, **_kwargs):
+        raise PermissionError("daemonsets is forbidden")
+
+      def list_namespaced_stateful_set(self, *_args, **_kwargs):
+        return NS(items=[])
+
+    class BatchApi:
+      def list_namespaced_job(self, *_args, **_kwargs):
+        return NS(items=[job])
+
+    with mock.patch.object(data, "k8s_workload_apis", return_value=(AppsApi(), BatchApi(), None)):
+      rollouts = data.workload_controllers_snapshot("open-rl")
+
+    self.assertTrue(rollouts["available"])
+    self.assertIn("daemonsets is forbidden", rollouts["error"])
+    self.assertFalse(rollouts["sources"]["daemonsets"]["available"])
+    self.assertEqual(rollouts["summary"]["state_counts"], {"failed": 2})
+    self.assertEqual(rollouts["summary"]["problem_count"], 2)
+    by_kind = {item["kind"]: item for item in rollouts["items"]}
+    self.assertEqual(by_kind["Deployment"]["reason"], "ProgressDeadlineExceeded")
+    self.assertEqual(by_kind["Job"]["failed"], 4)
+
+    k8s = {"available": True, "namespace": "open-rl", "error": None, "pods": [], "nodes": [], "rollouts": rollouts}
+    stats, _ = asyncio.run(data.operational_stats(InMemoryStore(), k8s, None))
+    rollout_stat = next(stat for stat in stats if stat["id"] == "kubernetes.rollouts")
+    self.assertEqual(rollout_stat["value_number"], 2)
+    self.assertEqual(rollout_stat["status"], "warn")
+    problems = data.derive_problems([], k8s, stats)
+    codes = {problem["code"] for problem in problems}
+    self.assertLessEqual({"kubernetes.deployment_failed", "kubernetes.job_failed"}, codes)
+    self.assertNotIn("metric.kubernetes_rollouts", codes, "specific controller evidence should not be duplicated by the aggregate")
+    job_problem = next(problem for problem in problems if problem["code"] == "kubernetes.job_failed")
+    self.assertEqual(job_problem["evidence"]["failed"], 4)
+    self.assertEqual(job_problem["actions"][0]["command"], "kubectl describe job eval -n open-rl")
 
   def test_problems_have_stable_codes_evidence_and_next_actions(self) -> None:
     checks = [{"id": "storage.shared", "group": "Storage", "label": "Shared filesystem", "status": "warn", "detail": "/tmp missing"}]
