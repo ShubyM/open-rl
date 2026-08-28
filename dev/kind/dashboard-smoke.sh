@@ -22,9 +22,10 @@ kubectl --context "$CONTEXT" rollout status deployment/open-rl-dashboard --timeo
 
 forward_log=$(mktemp)
 snapshot_file=$(mktemp)
+detail_file=$(mktemp)
 kubectl --context "$CONTEXT" port-forward service/open-rl-dashboard "${PORT}:8000" >"$forward_log" 2>&1 &
 forward_pid=$!
-trap 'kill "$forward_pid" 2>/dev/null || true; rm -f "$forward_log" "$snapshot_file"' EXIT
+trap 'kill "$forward_pid" 2>/dev/null || true; rm -f "$forward_log" "$snapshot_file" "$detail_file"' EXIT
 
 for _ in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:${PORT}/api/v1/healthz" >/dev/null 2>&1; then
@@ -52,6 +53,7 @@ import sys
 with open(sys.argv[1]) as f:
   snapshot = json.load(f)
 
+assert snapshot["schema_version"] == 1, snapshot.get("schema_version")
 cluster = snapshot["cluster"]
 assert cluster["kubernetes"]["available"], cluster["kubernetes"]
 assert cluster["kubernetes"]["namespace"] == "default", cluster["kubernetes"]
@@ -59,6 +61,8 @@ assert cluster["pools"], "expected the Kind node in a cluster pool"
 assert any(pod["name"].startswith("open-rl-dashboard-") for pod in cluster["pods"]), cluster["pods"]
 checks = {check["id"]: check for check in snapshot["health"]["checks"]}
 assert checks["kubernetes"]["status"] == "ok", checks["kubernetes"]
+for stat in snapshot["health"]["stats"]:
+  assert {"value_number", "unit", "context", "status"} <= stat.keys(), stat
 assert not snapshot["problems"]["problems"], snapshot["problems"]
 print("Kind dashboard smoke passed:", len(cluster["pods"]), "pod(s),", len(cluster["pools"]), "pool(s)")
 PY
@@ -68,13 +72,23 @@ run_id=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/v1/dashboard/runs" \
   -d '{"base_model":"Qwen/Qwen3-0.6B"}' |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["request_id"])')
 curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/snapshot" >"$snapshot_file"
-python3 - "$snapshot_file" "$run_id" <<'PY'
+curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/runs/${run_id}" >"$detail_file"
+python3 - "$snapshot_file" "$detail_file" "$run_id" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1]) as f:
   snapshot = json.load(f)
-assert any(run["run_id"] == sys.argv[2] for run in snapshot["runs"]["runs"]), snapshot["runs"]
+with open(sys.argv[2]) as f:
+  detail = json.load(f)
+run_id = sys.argv[3]
+run = next(run for run in snapshot["runs"]["runs"] if run["run_id"] == run_id)
+assert run["state"]["phase"] in {"queued", "starting", "ready", "failed"}, run
+assert isinstance(run["queue_depth"], int), run
+assert detail["run_id"] == run_id, detail
+assert detail["state"]["phase"] == run["state"]["phase"], (run, detail)
+assert isinstance(detail["gpu_devices"], int), detail
+assert isinstance(detail["diagnostics"], list), detail
 PY
 
-echo "Dashboard UI, launch, cluster snapshot, pod logs, and stop permission verified in Kind"
+echo "Dashboard UI, persistent launch inspection, metrics schema, pod logs, and stop permission verified in Kind"

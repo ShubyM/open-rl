@@ -127,11 +127,28 @@ def make_training_request(
   return request
 
 
+async def record_model_request(request: dict) -> None:
+  if request.get("op") not in {"create_model", "create_model_from_state"} or not request.get("model_id"):
+    return
+  payload = request.get("payload") or {}
+  await store.set_model_metadata(
+    request["model_id"],
+    {
+      "operation": request["op"],
+      "base_model": payload.get("base_model"),
+      "state_path": payload.get("state_path"),
+      "created_at": time.time(),
+      "status": "queued",
+    },
+  )
+
+
 async def enqueue(request: dict) -> str:
   """Create a pending future, inject trace context, push to store. Returns req_id."""
   request_id = request["request_id"]
   carrier: dict = {}
   propagate.inject(carrier)
+  await record_model_request(request)
   await store.set_future(request_id, {"status": "pending"})
   await store.put_request({**request, "trace_context": carrier})
   return request_id
@@ -142,6 +159,7 @@ async def enqueue_worker_launch(request: dict) -> str:
   request_id = request["request_id"]
   carrier: dict = {}
   propagate.inject(carrier)
+  await record_model_request(request)
   await store.set_future(request_id, {"status": "pending"})
   await store.put_worker_launch_request({**request, "trace_context": carrier})
   return request_id

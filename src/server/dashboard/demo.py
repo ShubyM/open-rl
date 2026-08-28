@@ -5,6 +5,8 @@
 import math
 import time
 
+from server.dashboard.data import derive_problems, run_diagnostics
+
 DEMO_NOTICE = "Demo data — every machine, pod, and run on this page is fictional."
 
 
@@ -191,6 +193,10 @@ def demo_runs() -> dict:
         "wandb_url": "https://wandb.ai/example/open-rl/runs/demo-run-1",
         "stoppable": True,
         "sources": ["worker", "queue"],
+        "pods": ["open-rl-trainer-demo-run-1", "open-rl-sampler-demo-run-1"],
+        "queue_depth": 5,
+        "worker_alive": True,
+        "state": {"phase": "running", "status": "ok", "reason": "2 running pods", "pod_phase_counts": {"Running": 2}},
       },
       {
         "run_id": "demo-run-2",
@@ -199,7 +205,16 @@ def demo_runs() -> dict:
         "created_at": "2026-07-29T07:41:00+00:00",
         "wandb_url": None,
         "stoppable": True,
-        "sources": ["worker"],
+        "sources": ["worker", "queue"],
+        "pods": ["open-rl-trainer-demo-run-2", "open-rl-sampler-demo-run-2"],
+        "queue_depth": 2,
+        "worker_alive": True,
+        "state": {
+          "phase": "failed",
+          "status": "error",
+          "reason": "CrashLoopBackOff: CUDA out of memory",
+          "pod_phase_counts": {"Pending": 1, "Failed": 1},
+        },
       },
       {
         "run_id": "demo-run-3",
@@ -209,6 +224,15 @@ def demo_runs() -> dict:
         "wandb_url": "https://wandb.ai/example/open-rl/runs/demo-run-3",
         "stoppable": False,
         "sources": ["checkpoint"],
+        "pods": [],
+        "queue_depth": 0,
+        "worker_alive": None,
+        "state": {
+          "phase": "saved",
+          "status": "off",
+          "reason": "saved artifacts are present; no active worker is visible",
+          "pod_phase_counts": {},
+        },
       },
     ],
   }
@@ -344,14 +368,18 @@ def demo_health() -> dict:
 
 
 def demo_problems() -> dict:
+  cluster = demo_cluster()
   return {
     "demo": True,
     "notice": DEMO_NOTICE,
-    "problems": [
-      {"severity": "error", "source": "pod/open-rl-sampler-demo-run-2", "message": "CrashLoopBackOff: CUDA out of memory (4 restarts)"},
-      {"severity": "warn", "source": "pod/open-rl-trainer-demo-run-2", "message": "Pending: waiting for a free GPU claim"},
-      {"severity": "warn", "source": "node/demo-l4-node-2", "message": "Node not ready"},
-    ],
+    "problems": derive_problems(
+      demo_health()["checks"],
+      {
+        "namespace": cluster["kubernetes"]["namespace"],
+        "pods": cluster["pods"],
+        "nodes": [node for pool in cluster["pools"] for node in pool["nodes"]],
+      },
+    ),
   }
 
 
@@ -366,8 +394,18 @@ def demo_run_detail(run_id: str, log_tail: int = 0) -> dict | None:
     duty = pool.get("duty")
     if duty and duty["series"] and duty["series"][-1][1].get(run_id):
       gpu_claims[pool["id"]] = duty["series"][-1][1][run_id]
-  queue_depth = next((q["depth"] for q in demo_health()["queues"] if q["model_id"] == run_id), 0)
-  detail = {**run, "demo": True, "notice": DEMO_NOTICE, "pods": pods, "queue_depth": queue_depth, "gpu_claims": gpu_claims}
+  queue_depth = run["queue_depth"]
+  k8s = {"available": True, "namespace": cluster["kubernetes"]["namespace"], "error": None, "pods": cluster["pods"], "nodes": []}
+  detail = {
+    **run,
+    "demo": True,
+    "notice": DEMO_NOTICE,
+    "pods": pods,
+    "queue_depth": queue_depth,
+    "gpu_claims": gpu_claims,
+    "gpu_devices": sum(gpu_claims.values()),
+    "diagnostics": run_diagnostics(run_id, run["state"], pods, queue_depth, k8s),
+  }
   if log_tail:
     detail["logs"] = {pod["name"]: demo_pod_logs(pod["name"])["text"] for pod in pods}
   return detail

@@ -47,6 +47,25 @@ class RequestStore(ABC):
     """Block until the future resolves or the timeout is reached."""
     pass
 
+  @abstractmethod
+  async def set_model_metadata(self, model_id: str, metadata: dict[str, Any]) -> None:
+    """Persist dashboard-visible model lifecycle metadata."""
+    pass
+
+  @abstractmethod
+  async def list_model_metadata(self) -> dict[str, dict[str, Any]]:
+    """Return every model lifecycle record keyed by model ID."""
+    pass
+
+
+def model_result_update(result: dict[str, Any]) -> dict[str, Any]:
+  result_type = result.get("type")
+  if result_type in {"model_created", "model_loaded_from_state"}:
+    return {"status": "ready", "ready_at": time.time()}
+  if result_type == "RequestFailedResponse":
+    return {"status": "failed", "error": result.get("error_message"), "failed_at": time.time()}
+  return {}
+
 
 class InMemoryStore(RequestStore):
   def __init__(self):
@@ -57,6 +76,7 @@ class InMemoryStore(RequestStore):
     self.active_tenants_cv = asyncio.Condition()
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, asyncio.Event] = {}
+    self.model_metadata: dict[str, dict[str, Any]] = {}
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
@@ -105,6 +125,8 @@ class InMemoryStore(RequestStore):
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
     self.futures_store[req_id] = result
+    if req_id in self.model_metadata:
+      self.model_metadata[req_id].update(model_result_update(result))
     if req_id in self.futures_events:
       self.futures_events[req_id].set()
 
@@ -124,6 +146,12 @@ class InMemoryStore(RequestStore):
       return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
     finally:
       self.futures_events.pop(req_id, None)
+
+  async def set_model_metadata(self, model_id: str, metadata: dict[str, Any]) -> None:
+    self.model_metadata[model_id] = {**self.model_metadata.get(model_id, {}), **metadata}
+
+  async def list_model_metadata(self) -> dict[str, dict[str, Any]]:
+    return {model_id: dict(metadata) for model_id, metadata in self.model_metadata.items()}
 
 
 class RedisStore(RequestStore):
@@ -232,6 +260,11 @@ class RedisStore(RequestStore):
     return batch
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
+    update = model_result_update(result)
+    if update:
+      key = f"open_rl:model_meta:{req_id}"
+      if raw := await self.redis.get(key):
+        await self.redis.set(key, json.dumps({**json.loads(raw), **update}))
     if result.get("status") == "pending":
       return
 
@@ -260,6 +293,20 @@ class RedisStore(RequestStore):
         await self.redis.rpush(key, result[1])
         await self.redis.expire(key, 300)
         return payload
+
+  async def set_model_metadata(self, model_id: str, metadata: dict[str, Any]) -> None:
+    key = f"open_rl:model_meta:{model_id}"
+    existing = json.loads(await self.redis.get(key) or "{}")
+    await self.redis.set(key, json.dumps({**existing, **metadata}))
+
+  async def list_model_metadata(self) -> dict[str, dict[str, Any]]:
+    metadata = {}
+    async for key in self.redis.scan_iter(match="open_rl:model_meta:*", count=200):
+      try:
+        metadata[key.removeprefix("open_rl:model_meta:")] = json.loads(await self.redis.get(key) or "{}")
+      except (TypeError, json.JSONDecodeError):
+        continue
+    return metadata
 
 
 # Global singleton factory

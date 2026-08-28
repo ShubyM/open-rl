@@ -399,29 +399,31 @@ def filesystem_runs() -> dict[str, dict]:
 
 async def redis_runs(store: RequestStore) -> dict[str, dict]:
   found: dict[str, dict] = {}
+  try:
+    for model_id, meta in (await store.list_model_metadata()).items():
+      info = found.setdefault(model_id, {"sources": set()})
+      info["sources"].add("registered")
+      for field in ("base_model", "created_at", "wandb_url", "status", "error", "operation", "state_path", "ready_at", "failed_at", "stopped_at"):
+        if meta.get(field) is not None:
+          info[field] = iso_timestamp(meta[field]) if field in {"created_at", "ready_at", "failed_at", "stopped_at"} else meta[field]
+  except Exception:
+    pass
   if isinstance(store, RedisStore):
     try:
       async for key in store.redis.scan_iter(match="open_rl:queue:*", count=200):
         model_id = key.removeprefix("open_rl:queue:")
         if model_id != "default":
-          found.setdefault(model_id, {"sources": set()})["sources"].add("queue")
-      async for key in store.redis.scan_iter(match="open_rl:model_meta:*", count=200):
-        model_id = key.removeprefix("open_rl:model_meta:")
-        info = found.setdefault(model_id, {"sources": set()})
-        info["sources"].add("registered")
-        try:
-          meta = json.loads(await store.redis.get(key) or "{}")
-          info.setdefault("base_model", meta.get("base_model"))
-          info.setdefault("created_at", iso_timestamp(meta.get("created_at")))
-          info.setdefault("wandb_url", meta.get("wandb_url"))
-        except Exception:
-          pass
+          info = found.setdefault(model_id, {"sources": set()})
+          info["sources"].add("queue")
+          info["queue_depth"] = await store.redis.llen(key)
     except Exception:
       return found
   elif isinstance(store, InMemoryStore):
     for model_id, queue in store.queues.items():
       if model_id != "default" and not queue.empty():
-        found.setdefault(model_id, {"sources": set()})["sources"].add("queue")
+        info = found.setdefault(model_id, {"sources": set()})
+        info["sources"].add("queue")
+        info["queue_depth"] = queue.qsize()
   return found
 
 
@@ -445,6 +447,162 @@ def model_pods(model_id: str, pods: list[dict]) -> list[dict]:
   return [p for p in pods if (p.get("labels") or {}).get("timeslice.io/job-id") in wanted]
 
 
+def summarize_run(
+  pods: list[dict],
+  queue_depth: int,
+  worker_alive: bool | None,
+  sources: set[str] | list[str],
+  model_status: str | None = None,
+  model_error: str | None = None,
+) -> dict:
+  """Derive a compact lifecycle verdict from observable state without pretending an artifact
+  is a currently running process. The verdict is shared by the list and detail endpoints."""
+  phases: dict[str, int] = {}
+  for pod in pods:
+    phase = pod.get("phase") or "Unknown"
+    phases[phase] = phases.get(phase, 0) + 1
+
+  failed = next(
+    (
+      pod
+      for pod in pods
+      if pod.get("phase") == "Failed" or any(marker in (pod.get("problem") or "") for marker in ("BackOff", "OOM", "Error", "Failed"))
+    ),
+    None,
+  )
+  waiting = next((pod for pod in pods if pod.get("problem") or pod.get("phase") == "Pending"), None)
+  running = phases.get("Running", 0)
+  if failed or model_status == "failed":
+    reason = (failed.get("problem") or f"pod {failed['name']} failed") if failed else model_error or "model creation failed"
+    phase, status = "failed", "error"
+  elif waiting and running:
+    phase, status, reason = "degraded", "warn", waiting.get("problem") or f"pod {waiting['name']} is pending"
+  elif waiting:
+    phase, status, reason = "waiting", "warn", waiting.get("problem") or f"pod {waiting['name']} is pending"
+  elif worker_alive or running:
+    count = running or 1
+    phase, status, reason = "running", "ok", f"{count} running {'pod' if count == 1 else 'pods'}" if running else "local worker process is alive"
+  elif queue_depth:
+    phase, status, reason = "queued", "ok", f"{queue_depth} queued {'request' if queue_depth == 1 else 'requests'}"
+  elif model_status == "queued":
+    phase, status, reason = "starting", "ok", "model creation is in progress"
+  elif model_status == "ready":
+    phase, status, reason = "ready", "ok", "model is ready in the gateway"
+  elif model_status == "stopped":
+    phase, status, reason = "stopped", "off", "run was stopped by an operator"
+  elif phases.get("Succeeded"):
+    phase, status, reason = "succeeded", "ok", f"{phases['Succeeded']} pod{'s' if phases['Succeeded'] != 1 else ''} succeeded"
+  elif set(sources) & {"adapter", "checkpoint"}:
+    phase, status, reason = "saved", "off", "saved artifacts are present; no active worker is visible"
+  else:
+    phase, status, reason = "inactive", "off", "no active worker, queued work, or pod is visible"
+  return {"phase": phase, "status": status, "reason": reason, "pod_phase_counts": phases}
+
+
+def current_gpu_claims(pods: list[dict], nodes: list[dict]) -> dict[str, int]:
+  """Current GPU claims for one run grouped by the same pool identifiers as Cluster."""
+  pools_by_node = {node["name"]: node["accelerator"] or ("gpu" if node["gpu_capacity"] else "cpu") for node in nodes}
+  claims: dict[str, int] = {}
+  for pod in pods:
+    if not pod.get("node") or pod.get("phase") in TERMINAL_POD_PHASES or not pod.get("gpus"):
+      continue
+    pool = pools_by_node.get(pod["node"], "unknown")
+    claims[pool] = claims.get(pool, 0) + pod["gpus"]
+  return claims
+
+
+def diagnostic_entry(
+  code: str,
+  severity: str,
+  source: str,
+  message: str,
+  *,
+  resource: dict,
+  evidence: dict | None = None,
+  actions: list[dict] | None = None,
+) -> dict:
+  resource_id = f"{resource['kind'].lower()}/{resource['name']}"
+  return {
+    "id": f"{code}:{resource_id}",
+    "code": code,
+    "severity": severity,
+    "source": source,
+    "resource": resource,
+    "message": message,
+    "evidence": evidence or {},
+    "actions": actions or [],
+  }
+
+
+def pod_diagnostic(pod: dict, namespace: str | None = None) -> dict | None:
+  source = f"pod/{pod['name']}"
+  resource = {"kind": "Pod", "name": pod["name"], "namespace": namespace or k8s_namespace()}
+  action = {
+    "label": "Read pod logs",
+    "method": "GET",
+    "path": f"/api/v1/dashboard/pods/{pod['name']}/logs?tail=500",
+    "command": f"make ops logs {pod['name']}",
+  }
+  problem = pod.get("problem")
+  if problem:
+    severity = "error" if pod.get("phase") == "Failed" or any(marker in problem for marker in ("BackOff", "OOM", "Error")) else "warn"
+    code = "pod.unschedulable" if "Unschedulable" in problem else "pod.failed" if severity == "error" else "pod.waiting"
+    return diagnostic_entry(
+      code,
+      severity,
+      source,
+      problem,
+      resource=resource,
+      evidence={"phase": pod.get("phase"), "node": pod.get("node"), "restarts": pod.get("restarts", 0)},
+      actions=[action],
+    )
+  if pod.get("restarts", 0) >= 3:
+    return diagnostic_entry(
+      "pod.restarts",
+      "warn",
+      source,
+      f"{pod['restarts']} container restarts",
+      resource=resource,
+      evidence={"phase": pod.get("phase"), "node": pod.get("node"), "restarts": pod["restarts"]},
+      actions=[action],
+    )
+  return None
+
+
+def run_diagnostics(run_id: str, state: dict, pods: list[dict], queue_depth: int, k8s: dict) -> list[dict]:
+  diagnostics = []
+  if not k8s["available"]:
+    diagnostics.append(
+      diagnostic_entry(
+        "kubernetes.unavailable",
+        "warn",
+        "kubernetes",
+        k8s.get("error") or "Kubernetes is unavailable; pod state cannot be inspected",
+        resource={"kind": "Cluster", "name": k8s.get("namespace") or "unknown"},
+        evidence={"available": False, "namespace": k8s.get("namespace")},
+        actions=[{"label": "Check dashboard health", "method": "GET", "path": "/api/v1/dashboard/health", "command": "make ops health"}],
+      )
+    )
+  for pod in pods:
+    if diagnostic := pod_diagnostic(pod, k8s.get("namespace")):
+      diagnostics.append(diagnostic)
+  if state["phase"] == "queued" and queue_depth:
+    diagnostics.append(
+      diagnostic_entry(
+        "run.queued",
+        "info",
+        f"run/{run_id}",
+        state["reason"],
+        resource={"kind": "Run", "name": run_id},
+        evidence={"queue_depth": queue_depth},
+        actions=[
+          {"label": "Refresh run inspection", "method": "GET", "path": f"/api/v1/dashboard/runs/{run_id}", "command": f"make ops run {run_id}"}
+        ],
+      )
+    )
+  return diagnostics
+
+
 async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | None, pods: list[dict]) -> dict:
   found = await redis_runs(store)
   for model_id, info in filesystem_runs().items():
@@ -462,6 +620,8 @@ async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | 
   runs = []
   for model_id, info in found.items():
     run_pods = model_pods(model_id, pods)
+    queue_depth = int(info.get("queue_depth") or 0)
+    worker_alive = info.get("worker_alive")
     stoppable = bool(info.get("worker_alive") or "queue" in info["sources"] or run_pods)
     runs.append(
       {
@@ -473,6 +633,18 @@ async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | 
         "stoppable": stoppable,
         "sources": sorted(info["sources"]),
         "pods": [p["name"] for p in run_pods],
+        "queue_depth": queue_depth,
+        "worker_alive": worker_alive,
+        "model_status": info.get("status"),
+        "lifecycle": {
+          "operation": info.get("operation"),
+          "status": info.get("status"),
+          "error": info.get("error"),
+          "ready_at": info.get("ready_at"),
+          "failed_at": info.get("failed_at"),
+          "stopped_at": info.get("stopped_at"),
+        },
+        "state": summarize_run(run_pods, queue_depth, worker_alive, info["sources"], info.get("status"), info.get("error")),
       }
     )
   runs.sort(key=lambda r: (r["created_at"] is not None, r["created_at"] or "", r["run_id"]), reverse=True)
@@ -493,31 +665,28 @@ async def run_detail(
   if run is None:
     return None
 
-  queue_depth = 0
-  if isinstance(store, RedisStore):
-    try:
-      queue_depth = await store.redis.llen(f"open_rl:queue:{run_id}")
-    except Exception:
-      pass
-  elif isinstance(store, InMemoryStore):
-    queue = store.queues.get(run_id)
-    queue_depth = queue.qsize() if queue else 0
-
-  gpu_claims = {}
-  for pool_id, series in duty_tracker.series.items():
-    if series and series[-1][1].get(run_id):
-      gpu_claims[pool_id] = series[-1][1][run_id]
-
   pods = model_pods(run_id, k8s["pods"])
-  detail = {**run, "demo": False, "pods": pods, "queue_depth": queue_depth, "gpu_claims": gpu_claims}
+  queue_depth = run["queue_depth"]
+  gpu_claims = current_gpu_claims(pods, k8s["nodes"])
+  detail = {
+    **run,
+    "demo": False,
+    "pods": pods,
+    "queue_depth": queue_depth,
+    "gpu_claims": gpu_claims,
+    "gpu_devices": sum(gpu_claims.values()),
+    "diagnostics": run_diagnostics(run_id, run["state"], pods, queue_depth, k8s),
+  }
   if log_tail:
-    logs = {}
-    for pod in pods:
+
+    async def read_log(pod: dict) -> tuple[str, str]:
       try:
-        logs[pod["name"]] = (await asyncio.to_thread(k8s_pod_logs, pod["name"], None, log_tail))["text"]
+        text = (await asyncio.to_thread(k8s_pod_logs, pod["name"], None, log_tail))["text"]
       except Exception as exc:
-        logs[pod["name"]] = f"(logs unavailable: {exc})"
-    detail["logs"] = logs
+        text = f"(logs unavailable: {exc})"
+      return pod["name"], text
+
+    detail["logs"] = dict(await asyncio.gather(*(read_log(pod) for pod in pods)))
   return detail
 
 
@@ -525,11 +694,14 @@ async def stop_run(store: RequestStore, worker_manager: FFTWorkerManager | None,
   """Stop everything we can truthfully stop for a run: the gateway-launched worker process,
   queued work in Redis, and any pods labeled for the model. Reports each action taken."""
   actions = []
+  errors = []
+  changed = False
 
   proc = worker_manager.processes.get(model_id) if worker_manager is not None else None
   if proc is not None and proc.poll() is None:
     proc.terminate()
     actions.append("terminated local worker process")
+    changed = True
 
   if isinstance(store, RedisStore):
     try:
@@ -542,13 +714,15 @@ async def stop_run(store: RequestStore, worker_manager: FFTWorkerManager | None,
       await store.redis.srem(store.active_set, model_id)
       if removed:
         actions.append(f"cleared {removed} queue key(s) in Redis")
+        changed = True
     except Exception as exc:
-      actions.append(f"redis cleanup failed: {exc}")
+      errors.append(f"redis cleanup failed: {exc}")
   elif isinstance(store, InMemoryStore):
     async with store.active_tenants_cv:
       if model_id in store.queues:
         del store.queues[model_id]
         actions.append("cleared in-memory queue")
+        changed = True
       if model_id in store.active_tenants:
         store.active_tenants.remove(model_id)
 
@@ -559,10 +733,16 @@ async def stop_run(store: RequestStore, worker_manager: FFTWorkerManager | None,
       for pod in model_pods(model_id, k8s["pods"]):
         api.delete_namespaced_pod(pod["name"], k8s["namespace"], _request_timeout=K8S_REQUEST_TIMEOUT)
         actions.append(f"deleted pod {pod['name']}")
+        changed = True
     except Exception as exc:
-      actions.append(f"pod deletion failed: {exc}")
+      errors.append(f"pod deletion failed: {exc}")
 
-  return {"run_id": model_id, "stopped": bool(actions), "actions": actions}
+  if changed:
+    try:
+      await store.set_model_metadata(model_id, {"status": "stopped", "stopped_at": time.time()})
+    except Exception as exc:
+      errors.append(f"lifecycle update failed: {exc}")
+  return {"run_id": model_id, "stopped": changed, "actions": actions, "errors": errors}
 
 
 # *** Operational load stats ***
@@ -788,19 +968,54 @@ def derive_problems(checks: list[dict], k8s: dict) -> list[dict]:
   problems = []
   for check in checks:
     if check["status"] in {"warn", "error"}:
-      problems.append({"severity": check["status"], "source": check["label"], "message": check["detail"]})
+      actions = [{"label": "Refresh health checks", "method": "GET", "path": "/api/v1/dashboard/health", "command": "make ops health"}]
+      if check["id"] == "kubernetes":
+        actions.append({"label": "Verify pod visibility", "command": f"kubectl auth can-i list pods -n {k8s['namespace']}"})
+      problems.append(
+        diagnostic_entry(
+          f"check.{check['id']}",
+          check["status"],
+          check["label"],
+          check["detail"],
+          resource={"kind": "Check", "name": check["id"]},
+          evidence={"group": check["group"], "status": check["status"]},
+          actions=actions,
+        )
+      )
   for pod in k8s["pods"]:
-    if pod["problem"]:
-      severity = "error" if pod["phase"] == "Failed" or "BackOff" in pod["problem"] else "warn"
-      problems.append({"severity": severity, "source": f"pod/{pod['name']}", "message": pod["problem"]})
-    elif pod["restarts"] >= 3:
-      problems.append({"severity": "warn", "source": f"pod/{pod['name']}", "message": f"{pod['restarts']} container restarts"})
+    if diagnostic := pod_diagnostic(pod, k8s.get("namespace")):
+      problems.append(diagnostic)
   for node in k8s["nodes"]:
-    if not node["ready"]:
-      problems.append({"severity": "warn", "source": f"node/{node['name']}", "message": "Node not ready"})
-    if node["memory_pressure"]:
-      problems.append({"severity": "warn", "source": f"node/{node['name']}", "message": "Node under memory pressure"})
-    if node["disk_pressure"]:
-      problems.append({"severity": "warn", "source": f"node/{node['name']}", "message": "Node under disk pressure"})
-  problems.sort(key=lambda p: p["severity"] != "error")
+    conditions = [
+      (not node.get("ready"), "node.not_ready", "Node not ready"),
+      (node.get("memory_pressure"), "node.memory_pressure", "Node under memory pressure"),
+      (node.get("disk_pressure"), "node.disk_pressure", "Node under disk pressure"),
+    ]
+    for active, code, message in conditions:
+      if not active:
+        continue
+      problems.append(
+        diagnostic_entry(
+          code,
+          "warn",
+          f"node/{node['name']}",
+          message,
+          resource={"kind": "Node", "name": node["name"]},
+          evidence={
+            "ready": node.get("ready"),
+            "memory_pressure": bool(node.get("memory_pressure")),
+            "disk_pressure": bool(node.get("disk_pressure")),
+          },
+          actions=[
+            {
+              "label": "Describe node",
+              "method": "GET",
+              "path": "/api/v1/dashboard/cluster",
+              "command": f"kubectl describe node {node['name']}",
+            }
+          ],
+        )
+      )
+  priority = {"error": 0, "warn": 1, "info": 2}
+  problems.sort(key=lambda problem: (priority.get(problem["severity"], 3), problem["id"]))
   return problems

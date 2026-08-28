@@ -12,12 +12,16 @@ class StoreStub:
   def __init__(self):
     self.forwarded_requests = []
     self.futures = {}
+    self.model_metadata = {}
 
   async def put_request(self, req_data: dict) -> None:
     self.forwarded_requests.append(req_data)
 
   async def set_future(self, req_id: str, result: dict) -> None:
     self.futures[req_id] = result
+
+  async def set_model_metadata(self, model_id: str, metadata: dict) -> None:
+    self.model_metadata[model_id] = metadata
 
 
 class WorkerManagerStub:
@@ -141,6 +145,8 @@ class GatewayWorkerLaunchQueueTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(store.worker_launch_requests[0]["op"], "create_model")
     self.assertEqual(store.worker_launch_requests[0]["payload"]["base_model"], "base-model")
     self.assertEqual(store.forwarded_requests, [])
+    self.assertEqual(store.model_metadata[result["request_id"]]["base_model"], "base-model")
+    self.assertEqual(store.model_metadata[result["request_id"]]["status"], "queued")
 
 
 class GatewayFutureTranslationTest(unittest.TestCase):

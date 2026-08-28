@@ -22,8 +22,10 @@ experiment analysis; nothing here duplicates metrics.
   breakdown at that point in time; the pool's nodes are listed below. Back, Escape, or the Cluster tab
   returns to the canvas with pan/zoom intact. This is truthful scheduler state, not device utilization;
   DCGM owns that.
-- **Runs** — launch by base model without leaving the page, then inspect name, run ID, base model, and a
-  W&B link when one is recorded. A Stop button appears when there is something to stop (a worker
+- **Runs** — launch by base model without leaving the page. Every row has an observed lifecycle verdict
+  and an expandable inspection showing queue depth, current GPU claims by pool, pod phase counts,
+  structured diagnostics, and recent logs for every pod. Clicking a pod opens its live log panel. A
+  W&B link appears when one is recorded, and Stop appears when there is something to stop (a worker
   process, queued work, or labeled pods).
 - **Health** — current problems first, then a **Load** section of measured stats (active runs, queued
   requests per run, worker-launch backlog, Redis memory and clients, gateway RSS, disk free, pod and
@@ -46,15 +48,17 @@ The UI serves humans; the same primitives are exposed as JSON for agents and scr
 | problems | `GET /api/v1/dashboard/problems` | `make ops problems` |
 | inspect | `GET /api/v1/dashboard/cluster` | `make ops inspect` |
 | runs | `GET /api/v1/dashboard/runs` | `make ops runs` |
-| run detail | `GET /api/v1/dashboard/runs/{run_id}?logs=N` | `make ops run <run_id> --logs N` |
-| logs | `GET /api/v1/dashboard/pods/{pod}/logs` | `make ops logs <pod>` |
-| launch | `POST /api/v1/dashboard/runs` | `make ops launch --base-model <model>` |
+| run detail | `GET /api/v1/dashboard/runs/{run_id}?logs=N` | `make ops run <run_id> N` |
+| logs | `GET /api/v1/dashboard/pods/{pod}/logs` | `make ops logs <pod> [lines]` |
+| launch | `POST /api/v1/dashboard/runs` | `make ops launch <model>` |
 | stop | `POST /api/v1/dashboard/runs/{run_id}/stop` | `make ops stop <run_id>` |
 
 `dev/tools/ops.py` is stdlib-only and always prints JSON; point it at a remote gateway with
 `BASE_URL=http://host:9003`. The diagnostic snapshot is schema-versioned. Every load stat includes
 the human display string plus `value_number`, `unit`, structured `context`, and `status`, so agents do
 not need to parse text such as byte sizes or GPU fractions.
+Problems and per-run diagnostics carry a stable `id` and `code`, the affected `resource`, structured
+`evidence`, and concrete `actions` containing both API paths and copyable CLI or `kubectl` commands.
 
 ## Kind smoke test
 
@@ -74,7 +78,11 @@ left running for inspection; remove it with `make kind-dashboard-clean`.
   verb.
 - **Runs** are discovered from Redis queues and model metadata keys, the shared filesystem
   (`$OPEN_RL_TMP_DIR/peft`, `$OPEN_RL_TMP_DIR/checkpoints`), and the gateway's own FFT worker processes.
-  A W&B URL is shown when adapter `metadata.json` or model metadata records `wandb_url`.
+  Every create-model request now records lifecycle metadata before enqueueing, then transitions it to
+  ready or failed when the future resolves. In-memory mode keeps that record for the gateway lifetime;
+  Redis mode preserves it across gateway restarts. This prevents runs from disappearing after their
+  create request drains. A W&B URL is shown when adapter `metadata.json` or model metadata records
+  `wandb_url`.
 - **Stop** does only what is truthfully stoppable: terminates the gateway-launched worker process,
   clears the run's Redis queues, and deletes pods labeled `timeslice.io/job-id` for the model. It
   reports exactly which actions it took.

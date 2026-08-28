@@ -6,6 +6,7 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
+from dev.tools import ops
 from server import gateway
 from server.dashboard import data
 
@@ -105,6 +106,22 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertTrue(resp.json()["demo"])
     self.assertFalse(resp.json()["launched"])
 
+  def test_ops_make_friendly_positional_arguments(self) -> None:
+    cases = [
+      (["ops.py", "run", "run-a", "120"], ("GET", "/api/v1/dashboard/runs/run-a?logs=120"), None),
+      (["ops.py", "logs", "pod-a", "42"], ("GET", "/api/v1/dashboard/pods/pod-a/logs?tail=42"), None),
+      (["ops.py", "launch", "Qwen/Qwen3-0.6B"], ("POST", "/api/v1/dashboard/runs"), {"base_model": "Qwen/Qwen3-0.6B"}),
+    ]
+    for argv, call, payload in cases:
+      with (
+        self.subTest(argv=argv),
+        mock.patch("sys.argv", argv),
+        mock.patch.object(ops, "request", return_value={}) as request,
+        mock.patch.object(ops, "emit"),
+      ):
+        ops.main()
+        request.assert_called_once_with(*call, *(() if payload is None else (payload,)))
+
   def test_run_detail_bundles_run_state(self) -> None:
     old_tmp_dir = os.environ.get("OPEN_RL_TMP_DIR")
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -119,13 +136,77 @@ class DashboardEndpointsTest(unittest.TestCase):
       self.assertEqual(detail["queue_depth"], 0)
       self.assertEqual(detail["pods"], [])
       self.assertEqual(detail["gpu_claims"], {})
+      self.assertEqual(detail["gpu_devices"], 0)
+      self.assertEqual(detail["state"]["phase"], "saved")
+      self.assertEqual(detail["diagnostics"], [])
       self.assertNotIn("logs", detail, "logs are only included when requested")
 
     self.assertEqual(self.client.get("/api/v1/dashboard/runs/no-such-run").status_code, 404)
 
+  def test_run_detail_explains_failed_pods_and_current_gpu_claims(self) -> None:
+    old_tmp_dir = os.environ.get("OPEN_RL_TMP_DIR")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      os.environ["OPEN_RL_TMP_DIR"] = tmp_dir
+      self.addCleanup(lambda: os.environ.update({"OPEN_RL_TMP_DIR": old_tmp_dir}) if old_tmp_dir else os.environ.pop("OPEN_RL_TMP_DIR", None))
+      os.makedirs(os.path.join(tmp_dir, "checkpoints", "model-broken"))
+      k8s = {
+        "available": True,
+        "namespace": "open-rl",
+        "error": None,
+        "nodes": [{"name": "gpu-node", "accelerator": "nvidia-l4", "gpu_capacity": 2}],
+        "pods": [
+          {
+            "name": "trainer-model-broken",
+            "labels": {"timeslice.io/job-id": "trainer-model-broken"},
+            "phase": "Pending",
+            "node": "gpu-node",
+            "gpus": 1,
+            "problem": "Unschedulable: waiting for a free GPU claim",
+            "restarts": 0,
+          },
+          {
+            "name": "sampler-model-broken",
+            "labels": {"timeslice.io/job-id": "sampler-model-broken"},
+            "phase": "Failed",
+            "node": "gpu-node",
+            "gpus": 1,
+            "problem": "CrashLoopBackOff: CUDA out of memory",
+            "restarts": 4,
+          },
+        ],
+      }
+      with mock.patch.object(data, "k8s_snapshot", return_value=k8s):
+        detail = self.client.get("/api/v1/dashboard/runs/model-broken").json()
+
+    self.assertEqual(detail["state"]["phase"], "failed")
+    self.assertEqual(detail["state"]["status"], "error")
+    self.assertEqual(detail["state"]["pod_phase_counts"], {"Pending": 1, "Failed": 1})
+    self.assertEqual(detail["gpu_claims"], {"nvidia-l4": 1}, "terminal pods must not count as current claims")
+    self.assertEqual(detail["gpu_devices"], 1)
+    self.assertEqual({item["code"] for item in detail["diagnostics"]}, {"pod.unschedulable", "pod.failed"})
+    self.assertTrue(all(item["actions"][0]["command"].startswith("make ops logs") for item in detail["diagnostics"]))
+
   def test_stop_unknown_run_conflicts(self) -> None:
     resp = self.client.post("/api/v1/dashboard/runs/does-not-exist/stop")
     self.assertEqual(resp.status_code, 409)
+
+  def test_stop_marks_persistent_run_lifecycle(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    store = InMemoryStore()
+    asyncio.run(store.set_model_metadata("run-stop", {"status": "ready", "created_at": 100.0}))
+    asyncio.run(store.put_request({"model_id": "run-stop", "op": "optim_step"}))
+    with mock.patch.object(data, "k8s_core_v1", return_value=(None, "off")):
+      result = asyncio.run(data.stop_run(store, None, "run-stop"))
+
+    self.assertTrue(result["stopped"])
+    self.assertEqual(result["actions"], ["cleared in-memory queue"])
+    self.assertEqual(result["errors"], [])
+    metadata = asyncio.run(store.list_model_metadata())["run-stop"]
+    self.assertEqual(metadata["status"], "stopped")
+    self.assertIn("stopped_at", metadata)
 
   def test_demo_mode_flags_every_payload(self) -> None:
     os.environ["OPEN_RL_DASHBOARD_DEMO"] = "1"
@@ -232,6 +313,34 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(gpu["context"], {"capacity_devices": 1, "allocation_ratio": 2.0, "overcommitted": True})
     self.assertEqual(gpu["status"], "warn")
 
+  def test_problems_have_stable_codes_evidence_and_next_actions(self) -> None:
+    checks = [{"id": "storage.shared", "group": "Storage", "label": "Shared filesystem", "status": "warn", "detail": "/tmp missing"}]
+    k8s = {
+      "namespace": "open-rl",
+      "pods": [
+        {
+          "name": "broken-pod",
+          "phase": "Failed",
+          "node": "node-a",
+          "problem": "CrashLoopBackOff: CUDA out of memory",
+          "restarts": 4,
+        }
+      ],
+      "nodes": [{"name": "node-a", "ready": False, "memory_pressure": True, "disk_pressure": False}],
+    }
+    problems = data.derive_problems(checks, k8s)
+
+    self.assertEqual(problems[0]["severity"], "error", "errors sort before warnings")
+    self.assertEqual(len({problem["id"] for problem in problems}), len(problems))
+    for problem in problems:
+      self.assertTrue(problem["code"])
+      self.assertIn("kind", problem["resource"])
+      self.assertIsInstance(problem["evidence"], dict)
+      self.assertTrue(problem["actions"])
+    pod_problem = next(problem for problem in problems if problem["code"] == "pod.failed")
+    self.assertEqual(pod_problem["resource"], {"kind": "Pod", "name": "broken-pod", "namespace": "open-rl"})
+    self.assertEqual(pod_problem["actions"][0]["command"], "make ops logs broken-pod")
+
   def test_runs_with_unknown_created_at_sort_last(self) -> None:
     import asyncio
 
@@ -248,6 +357,27 @@ class DashboardEndpointsTest(unittest.TestCase):
       snapshot = asyncio.run(data.runs_snapshot(store, None, pods=[]))
       order = [run["run_id"] for run in snapshot["runs"]]
       self.assertEqual(order, ["run-with-date", "run-no-date"], "runs without created_at belong at the end")
+
+  def test_registered_run_survives_queue_drain_and_tracks_readiness(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    store = InMemoryStore()
+    asyncio.run(store.set_model_metadata("run-persistent", {"base_model": "Qwen/Qwen3-0.6B", "created_at": 100.0, "status": "queued"}))
+    asyncio.run(store.put_request({"request_id": "run-persistent", "model_id": "run-persistent", "op": "create_model"}))
+    asyncio.run(store.get_requests())
+
+    starting = asyncio.run(data.runs_snapshot(store, None, pods=[]))["runs"][0]
+    self.assertEqual(starting["run_id"], "run-persistent")
+    self.assertEqual(starting["queue_depth"], 0)
+    self.assertEqual(starting["state"]["phase"], "starting")
+
+    asyncio.run(store.set_future("run-persistent", {"type": "model_created", "model_id": "run-persistent"}))
+    ready = asyncio.run(data.runs_snapshot(store, None, pods=[]))["runs"][0]
+    self.assertEqual(ready["state"]["phase"], "ready")
+    self.assertEqual(ready["lifecycle"]["status"], "ready")
+    self.assertIsNotNone(ready["lifecycle"]["ready_at"])
 
 
 if __name__ == "__main__":

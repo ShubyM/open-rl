@@ -50,15 +50,18 @@ def main() -> None:
 
   run = sub.add_parser("run", help="Everything about one run: state, pods, queue depth, GPU claims, optional logs")
   run.add_argument("run_id")
-  run.add_argument("--logs", type=int, default=0, metavar="N", help="Include the last N log lines per pod")
+  run.add_argument("log_lines", type=int, nargs="?", default=None, metavar="LOG_LINES", help="Include the last N log lines per pod")
+  run.add_argument("--logs", dest="log_lines_flag", type=int, default=None, metavar="N", help=argparse.SUPPRESS)
 
   logs = sub.add_parser("logs", help="Fetch logs for a pod")
   logs.add_argument("pod")
+  logs.add_argument("tail_lines", type=int, nargs="?", default=None, metavar="TAIL_LINES")
   logs.add_argument("--container")
-  logs.add_argument("--tail", type=int, default=500)
+  logs.add_argument("--tail", dest="tail_lines_flag", type=int, default=None)
 
   launch = sub.add_parser("launch", help="Launch a run (create_model)")
-  launch.add_argument("--base-model", required=True)
+  launch.add_argument("base_model", nargs="?", metavar="BASE_MODEL")
+  launch.add_argument("--base-model", dest="base_model_flag", help=argparse.SUPPRESS)
 
   stop = sub.add_parser("stop", help="Stop a run: its worker, queued work, and pods")
   stop.add_argument("run_id")
@@ -77,16 +80,21 @@ def main() -> None:
     emit(request("GET", "/api/v1/dashboard/runs"))
   elif args.command == "run":
     path = f"/api/v1/dashboard/runs/{urllib.parse.quote(args.run_id)}"
-    if args.logs:
-      path += f"?logs={args.logs}"
+    log_lines = args.log_lines_flag if args.log_lines_flag is not None else args.log_lines
+    if log_lines:
+      path += f"?logs={log_lines}"
     emit(request("GET", path))
   elif args.command == "logs":
-    params = {"tail": str(args.tail)}
+    tail_lines = args.tail_lines_flag if args.tail_lines_flag is not None else args.tail_lines
+    params = {"tail": str(tail_lines if tail_lines is not None else 500)}
     if args.container:
       params["container"] = args.container
     emit(request("GET", f"/api/v1/dashboard/pods/{urllib.parse.quote(args.pod)}/logs?{urllib.parse.urlencode(params)}"))
   elif args.command == "launch":
-    emit(request("POST", "/api/v1/dashboard/runs", {"base_model": args.base_model}))
+    base_model = args.base_model_flag or args.base_model
+    if not base_model:
+      parser.error("launch requires BASE_MODEL")
+    emit(request("POST", "/api/v1/dashboard/runs", {"base_model": base_model}))
   elif args.command == "stop":
     emit(request("POST", f"/api/v1/dashboard/runs/{urllib.parse.quote(args.run_id)}/stop"))
 

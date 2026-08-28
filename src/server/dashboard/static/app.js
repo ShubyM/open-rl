@@ -16,6 +16,8 @@ const S = {
   problems: null,
   canvas: JSON.parse(sessionStorage.getItem("canvas") || '{"x":0,"y":0,"k":1}'),
   panel: { pod: null, container: null },
+  openRun: sessionStorage.getItem("open-run") || null,
+  runDetails: new Map(),
   stopConfirm: null,
   stopNotes: new Map(),
 };
@@ -72,6 +74,18 @@ function el(tag, className, text) {
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(value);
+  const input = el("textarea");
+  input.value = value;
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.append(input);
+  input.select();
+  document.execCommand("copy");
+  input.remove();
 }
 
 function relTime(iso) {
@@ -585,6 +599,10 @@ function drawEdges() {
 
 function renderRuns(data) {
   const runs = data.runs || [];
+  if (S.openRun && !runs.some((run) => run.run_id === S.openRun)) {
+    S.openRun = null;
+    sessionStorage.removeItem("open-run");
+  }
   setText($("runs-count"), String(runs.length || ""));
   $("runs-empty").hidden = runs.length > 0;
   sync(
@@ -592,19 +610,34 @@ function renderRuns(data) {
     runs,
     (run) => run.run_id,
     (run) => {
-      const row = el("div");
+      const row = el("div", "run-row");
       const main = el("div", "run");
       const info = el("div", "run-info");
-      info.append(el("div", "run-name"), el("div", "run-ids"));
+      const meta = el("div", "run-meta");
+      meta.append(el("span", "run-state"), el("span", "run-reason"));
+      info.append(el("div", "run-name"), el("div", "run-ids"), meta);
       const actions = el("div", "run-actions");
       main.append(info, actions);
-      row.append(main, el("div", "run-note"));
+      row.append(main, el("div", "run-note"), el("div", "run-detail"));
       return row;
     },
     (row, run) => {
       setText(row.querySelector(".run-name"), run.name);
       setText(row.querySelector(".run-ids"), run.base_model ? `${run.run_id} · ${run.base_model}` : run.run_id);
+      const state = run.state || { phase: "unknown", status: "off", reason: "state unavailable" };
+      const stateEl = row.querySelector(".run-state");
+      setText(stateEl, state.phase);
+      setClass(stateEl, `run-state ${state.status}`);
+      setText(row.querySelector(".run-reason"), state.reason);
       const actions = row.querySelector(".run-actions");
+
+      let inspect = actions.querySelector(".inspect");
+      if (!inspect) {
+        inspect = el("button", "inspect btn", "Inspect");
+        inspect.addEventListener("click", () => toggleRunDetail(run.run_id));
+        actions.prepend(inspect);
+      }
+      setText(inspect, S.openRun === run.run_id ? "Close" : "Inspect");
 
       let wandb = actions.querySelector(".wandb");
       if (run.wandb_url) {
@@ -642,8 +675,106 @@ function renderRuns(data) {
       const note = row.querySelector(".run-note");
       setText(note, S.stopNotes.get(run.run_id) || "");
       note.hidden = !S.stopNotes.get(run.run_id);
+
+      const detail = row.querySelector(".run-detail");
+      detail.hidden = S.openRun !== run.run_id;
+      if (!detail.hidden) renderRunDetail(detail, run, S.runDetails.get(run.run_id));
     }
   );
+}
+
+function metric(label, value, detail = "") {
+  const item = el("div", "run-metric");
+  item.append(el("div", "run-metric-value", value), el("div", "run-metric-label", label));
+  if (detail) item.append(el("div", "run-metric-detail", detail));
+  return item;
+}
+
+function renderRunDetail(container, run, detail) {
+  if (!detail) {
+    container.replaceChildren(el("div", "run-detail-loading", "Loading run state, pods, and logs…"));
+    return;
+  }
+  if (detail.error) {
+    const retry = el("button", "btn", "Retry");
+    retry.addEventListener("click", () => loadRunDetail(run.run_id));
+    container.replaceChildren(el("div", "run-detail-error", `Inspection failed: ${detail.error}`), retry);
+    return;
+  }
+
+  const head = el("div", "run-detail-head");
+  head.append(el("div", "eyebrow", "Live inspection"));
+  const refreshButton = el("button", "btn", "Refresh inspection");
+  refreshButton.addEventListener("click", () => loadRunDetail(run.run_id));
+  head.append(refreshButton);
+
+  const claims = Object.entries(detail.gpu_claims || {});
+  const claimsText = claims.length ? claims.map(([pool, count]) => `${count} on ${pool}`).join(" · ") : "none visible";
+  const metrics = el("div", "run-metrics");
+  metrics.append(
+    metric("Queue", String(detail.queue_depth || 0), "requests"),
+    metric("GPU claims", String(detail.gpu_devices || 0), claimsText),
+    metric("Pods", String(detail.pods?.length || 0), Object.entries(detail.state?.pod_phase_counts || {}).map(([phase, count]) => `${count} ${phase}`).join(" · ") || "none visible"),
+    metric("Sources", String(detail.sources?.length || 0), (detail.sources || []).join(" · ") || "none")
+  );
+
+  const diagnostics = el("div", "run-diagnostics");
+  if (detail.diagnostics?.length) {
+    diagnostics.append(el("div", "eyebrow", "Diagnostics"));
+    for (const diagnostic of detail.diagnostics) {
+      const row = el("div", `run-diagnostic ${diagnostic.severity}`);
+      row.append(el("span", "run-diagnostic-code", diagnostic.code), el("span", "run-diagnostic-message", diagnostic.message));
+      diagnostics.append(row);
+    }
+  }
+
+  const podSection = el("div", "run-pods");
+  podSection.append(el("div", "eyebrow", "Pods and recent logs"));
+  if (!detail.pods?.length) {
+    podSection.append(el("div", "run-detail-empty", "No run pods are visible."));
+  }
+  for (const pod of detail.pods || []) {
+    const card = el("div", "run-pod-card");
+    const podButton = el("button", "run-pod");
+    podButton.append(el("span", "run-pod-name", pod.name), el("span", podStateClass(pod), podStateText(pod)));
+    podButton.addEventListener("click", () => openPanel(pod.name));
+    const podMeta = el(
+      "div",
+      "run-pod-meta",
+      [pod.node || "not scheduled", pod.ready ? `${pod.ready} ready` : null, pod.gpus ? `${pod.gpus} GPU` : null, pod.restarts ? `${pod.restarts} restarts` : null]
+        .filter(Boolean)
+        .join(" · ")
+    );
+    card.append(podButton, podMeta);
+    if (pod.problem) card.append(el("div", "run-pod-problem", pod.problem));
+    if (detail.logs && Object.hasOwn(detail.logs, pod.name)) card.append(el("pre", "run-log-preview", detail.logs[pod.name] || "(no log output)"));
+    podSection.append(card);
+  }
+  container.replaceChildren(head, metrics, diagnostics, podSection);
+}
+
+async function loadRunDetail(runId) {
+  S.runDetails.delete(runId);
+  if (S.runs) renderRuns(S.runs);
+  try {
+    const detail = await fetchJSON(`/api/v1/dashboard/runs/${encodeURIComponent(runId)}?logs=120`);
+    S.runDetails.set(runId, detail);
+  } catch (err) {
+    S.runDetails.set(runId, { error: err.message });
+  }
+  if (S.runs && S.openRun === runId) renderRuns(S.runs);
+}
+
+function toggleRunDetail(runId) {
+  if (S.openRun === runId) {
+    S.openRun = null;
+    sessionStorage.removeItem("open-run");
+  } else {
+    S.openRun = runId;
+    sessionStorage.setItem("open-run", runId);
+    if (!S.runDetails.has(runId)) loadRunDetail(runId);
+  }
+  if (S.runs) renderRuns(S.runs);
 }
 
 $("launch-form").addEventListener("submit", async (event) => {
@@ -688,7 +819,8 @@ async function onStopClick(runId, btn) {
   btn.disabled = true;
   try {
     const result = await fetchJSON(`/api/v1/dashboard/runs/${encodeURIComponent(runId)}/stop`, { method: "POST" });
-    S.stopNotes.set(runId, `Stopped: ${result.actions.join("; ")}`);
+    const errors = result.errors?.length ? ` Errors: ${result.errors.join("; ")}` : "";
+    S.stopNotes.set(runId, `Stopped: ${result.actions.join("; ")}.${errors}`);
   } catch (err) {
     S.stopNotes.set(runId, `Stop failed: ${err.message}`);
   }
@@ -705,10 +837,14 @@ function renderHealth(health, problems) {
   sync(
     $("problems-list"),
     list,
-    (p, i) => `${p.source}:${p.message}`,
+    (p) => p.id || `${p.source}:${p.message}`,
     () => {
       const row = el("div", "problem");
-      row.append(el("span", "problem-sev"), el("span", "problem-src"), el("span", "problem-msg"));
+      const body = el("div", "problem-body");
+      const summary = el("div", "problem-summary");
+      summary.append(el("span", "problem-src"), el("span", "problem-msg"));
+      body.append(summary, el("div", "problem-actions"));
+      row.append(el("span", "problem-sev"), body);
       return row;
     },
     (row, p) => {
@@ -717,6 +853,37 @@ function renderHealth(health, problems) {
       setClass(sev, `problem-sev ${p.severity}`);
       setText(row.querySelector(".problem-src"), p.source);
       setText(row.querySelector(".problem-msg"), p.message);
+      sync(
+        row.querySelector(".problem-actions"),
+        p.actions || [],
+        (action, i) => `${action.method || "command"}:${action.path || action.command || i}`,
+        () => {
+          const button = el("button", "problem-action");
+          button.addEventListener("click", async () => {
+            const action = button._action;
+            const problem = button._problem;
+            if (problem.resource?.kind === "Pod" && action.path?.includes("/pods/")) {
+              openPanel(problem.resource.name);
+              return;
+            }
+            if (action.command) {
+              await copyText(action.command);
+              const old = button.textContent;
+              setText(button, "Copied command");
+              setTimeout(() => setText(button, old), 1200);
+              return;
+            }
+            if (action.path) window.open(action.path, "_blank", "noopener");
+          });
+          return button;
+        },
+        (button, action) => {
+          button._action = action;
+          button._problem = p;
+          setText(button, p.resource?.kind === "Pod" && action.path?.includes("/pods/") ? "Open logs" : action.command ? `Copy: ${action.label}` : action.label);
+          button.title = action.command || action.path || "";
+        }
+      );
     }
   );
 
@@ -820,7 +987,7 @@ document.addEventListener("keydown", (e) => {
   else if (S.pool) showTab("cluster");
 });
 document.addEventListener("pointerdown", (e) => {
-  if (!panel.hidden && !e.target.closest("#panel") && !e.target.closest(".pod")) closePanel();
+  if (!panel.hidden && !e.target.closest("#panel") && !e.target.closest(".pod, .run-pod")) closePanel();
 });
 
 function updatePanel() {
