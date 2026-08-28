@@ -32,7 +32,7 @@ experiment analysis; nothing here duplicates metrics.
   W&B link appears when one is recorded, and Stop appears when there is something to stop (a worker
   process, queued work, or labeled pods).
 - **Health** — current problems first, then a **Load** section of measured stats (active runs, queued
-  requests per run, worker-launch backlog, Redis memory and clients, gateway RSS, disk free, pod and
+  requests per run, oldest request and worker-launch wait, Redis memory and clients, gateway RSS, disk free, pod and
   GPU totals, scheduler workload phases, and ClaimLedger seats), then gateway / storage / Kubernetes /
   scheduler / visibility checks. Node `MemoryPressure` and `DiskPressure` conditions surface under
   Problems. Failed or slow placement, stale observed generations, assignment/seat mismatches, and stale
@@ -65,6 +65,10 @@ the human display string plus `value_number`, `unit`, structured `context`, and 
 not need to parse text such as byte sizes or GPU fractions.
 Problems and per-run diagnostics carry a stable `id` and `code`, the affected `resource`, structured
 `evidence`, and concrete `actions` containing both API paths and copyable CLI or `kubectl` commands.
+Queue entries are timestamped at first enqueue (the timestamp survives the FFT worker-launch hop), so
+depth is paired with actual oldest-wait seconds. Request waits warn after 300 seconds and worker-launch
+waits after 60 seconds by default; tune them with `OPEN_RL_QUEUE_WARN_SECONDS` and
+`OPEN_RL_LAUNCH_WARN_SECONDS`.
 
 ## Kind smoke test
 

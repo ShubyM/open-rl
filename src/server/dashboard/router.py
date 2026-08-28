@@ -97,12 +97,13 @@ async def dashboard_health(request: Request):
 
 
 @router.get("/problems")
-async def dashboard_problems():
+async def dashboard_problems(request: Request):
   if data.demo_mode_enabled():
     return demo.demo_problems()
   k8s = await asyncio.to_thread(data.k8s_snapshot)
   checks = await data.health_checks(get_store(), k8s)
-  return {"demo": False, "problems": data.derive_problems(checks, k8s)}
+  stats, _ = await data.operational_stats(get_store(), k8s, request.app.state.fft_worker_manager)
+  return {"demo": False, "problems": data.derive_problems(checks, k8s, stats)}
 
 
 @router.get("/pods/{pod}/logs")

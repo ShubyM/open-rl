@@ -525,11 +525,15 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
 
 async def diagnostic_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | None, k8s: dict) -> dict:
   """Build one coherent dashboard payload from one Kubernetes observation."""
+  try:
+    queues, launch = await asyncio.gather(store.queue_stats(), store.worker_launch_stats())
+  except Exception:
+    queues, launch = [], {"depth": 0, "oldest_enqueued_at": None, "oldest_age_seconds": None}
   cluster, runs, checks, operational = await asyncio.gather(
     cluster_snapshot(store, k8s),
-    runs_snapshot(store, worker_manager, k8s["pods"], k8s.get("scheduler")),
+    runs_snapshot(store, worker_manager, k8s["pods"], k8s.get("scheduler"), queues),
     health_checks(store, k8s),
-    operational_stats(store, k8s, worker_manager),
+    operational_stats(store, k8s, worker_manager, queues, launch),
   )
   stats, queues = operational
   return {
@@ -538,7 +542,7 @@ async def diagnostic_snapshot(store: RequestStore, worker_manager: FFTWorkerMana
     "cluster": cluster,
     "runs": runs,
     "health": {"demo": False, "checks": checks, "stats": stats, "queues": queues},
-    "problems": {"demo": False, "problems": derive_problems(checks, k8s)},
+    "problems": {"demo": False, "problems": derive_problems(checks, k8s, stats)},
   }
 
 
@@ -575,7 +579,7 @@ def filesystem_runs() -> dict[str, dict]:
   return found
 
 
-async def redis_runs(store: RequestStore) -> dict[str, dict]:
+async def redis_runs(store: RequestStore, queues: list[dict] | None = None) -> dict[str, dict]:
   found: dict[str, dict] = {}
   try:
     for model_id, meta in (await store.list_model_metadata()).items():
@@ -586,22 +590,17 @@ async def redis_runs(store: RequestStore) -> dict[str, dict]:
           info[field] = iso_timestamp(meta[field]) if field in {"created_at", "ready_at", "failed_at", "stopped_at"} else meta[field]
   except Exception:
     pass
-  if isinstance(store, RedisStore):
-    try:
-      async for key in store.redis.scan_iter(match="open_rl:queue:*", count=200):
-        model_id = key.removeprefix("open_rl:queue:")
-        if model_id != "default":
-          info = found.setdefault(model_id, {"sources": set()})
-          info["sources"].add("queue")
-          info["queue_depth"] = await store.redis.llen(key)
-    except Exception:
-      return found
-  elif isinstance(store, InMemoryStore):
-    for model_id, queue in store.queues.items():
-      if model_id != "default" and not queue.empty():
+  try:
+    for queue in queues if queues is not None else await store.queue_stats():
+      model_id = queue["model_id"]
+      if model_id != "default":
         info = found.setdefault(model_id, {"sources": set()})
         info["sources"].add("queue")
-        info["queue_depth"] = queue.qsize()
+        info["queue_depth"] = queue["depth"]
+        info["queue_oldest_at"] = iso_timestamp(queue["oldest_enqueued_at"])
+        info["queue_oldest_seconds"] = queue["oldest_age_seconds"]
+  except Exception:
+    pass
   return found
 
 
@@ -782,7 +781,14 @@ def pod_diagnostic(pod: dict, namespace: str | None = None) -> dict | None:
   return None
 
 
-def run_diagnostics(run_id: str, state: dict, pods: list[dict], queue_depth: int, k8s: dict) -> list[dict]:
+def run_diagnostics(
+  run_id: str,
+  state: dict,
+  pods: list[dict],
+  queue_depth: int,
+  k8s: dict,
+  queue_age_seconds: float | None = None,
+) -> list[dict]:
   diagnostics = []
   if not k8s["available"]:
     diagnostics.append(
@@ -800,14 +806,16 @@ def run_diagnostics(run_id: str, state: dict, pods: list[dict], queue_depth: int
     if diagnostic := pod_diagnostic(pod, k8s.get("namespace")):
       diagnostics.append(diagnostic)
   if state["phase"] == "queued" and queue_depth:
+    warn_after = float(os.getenv("OPEN_RL_QUEUE_WARN_SECONDS", "300"))
+    stalled = queue_age_seconds is not None and queue_age_seconds >= warn_after
     diagnostics.append(
       diagnostic_entry(
-        "run.queued",
-        "info",
+        "run.queue_stalled" if stalled else "run.queued",
+        "warn" if stalled else "info",
         f"run/{run_id}",
-        state["reason"],
+        f"oldest request has waited {format_duration(queue_age_seconds)}" if stalled else state["reason"],
         resource={"kind": "Run", "name": run_id},
-        evidence={"queue_depth": queue_depth},
+        evidence={"queue_depth": queue_depth, "oldest_age_seconds": queue_age_seconds, "warn_after_seconds": warn_after},
         actions=[
           {"label": "Refresh run inspection", "method": "GET", "path": f"/api/v1/dashboard/runs/{run_id}", "command": f"make ops run {run_id}"}
         ],
@@ -835,8 +843,9 @@ async def runs_snapshot(
   worker_manager: FFTWorkerManager | None,
   pods: list[dict],
   scheduler: dict | None = None,
+  queues: list[dict] | None = None,
 ) -> dict:
-  found = await redis_runs(store)
+  found = await redis_runs(store, queues)
   for workload in (scheduler or {}).get("workloads", []):
     model_id = workload.get("model_id")
     if not model_id:
@@ -884,6 +893,8 @@ async def runs_snapshot(
           },
         },
         "queue_depth": queue_depth,
+        "queue_oldest_at": info.get("queue_oldest_at"),
+        "queue_oldest_seconds": info.get("queue_oldest_seconds"),
         "worker_alive": worker_alive,
         "model_status": info.get("status"),
         "lifecycle": {
@@ -921,7 +932,7 @@ async def run_detail(
   claim_names = {workload["claim_name"] for workload in workloads if workload.get("claim_name")}
   ledgers = [ledger for ledger in (scheduler or {}).get("ledgers", []) if ledger.get("claim_name") in claim_names]
   queue_depth = run["queue_depth"]
-  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s)
+  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s, run.get("queue_oldest_seconds"))
   diagnostics.extend(scheduler_run_diagnostics(workloads, ledgers, k8s))
   gpu_claims = current_gpu_claims(pods, k8s["nodes"])
   detail = {
@@ -980,6 +991,7 @@ async def stop_run(store: RequestStore, worker_manager: FFTWorkerManager | None,
     async with store.active_tenants_cv:
       if model_id in store.queues:
         del store.queues[model_id]
+        store.queue_oldest_at.pop(model_id, None)
         actions.append("cleared in-memory queue")
         changed = True
       if model_id in store.active_tenants:
@@ -1013,6 +1025,15 @@ def format_bytes(n: float) -> str:
       return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
     n /= 1024
   return f"{n:.1f} TiB"
+
+
+def format_duration(seconds: float | None) -> str:
+  seconds = max(0, int(seconds or 0))
+  if seconds < 60:
+    return f"{seconds}s"
+  if seconds < 3600:
+    return f"{seconds // 60}m {seconds % 60}s"
+  return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
 
 def gateway_rss_bytes() -> int | None:
@@ -1049,19 +1070,29 @@ def stat_entry(
   }
 
 
-async def operational_stats(store: RequestStore, k8s: dict, worker_manager: FFTWorkerManager | None) -> tuple[list[dict], list[dict]]:
+async def operational_stats(
+  store: RequestStore,
+  k8s: dict,
+  worker_manager: FFTWorkerManager | None,
+  queues: list[dict] | None = None,
+  launch: dict | None = None,
+) -> tuple[list[dict], list[dict]]:
   """Load numbers for the Health screen: queue depths, active runs, Redis and gateway memory,
   disk, and pod totals. Everything is measured, never estimated."""
-  queues: list[dict] = []
-  launch_depth = 0
+  queues_provided = queues is not None
+  launch_provided = launch is not None
+  queues = queues or []
+  launch = launch or {"depth": 0, "oldest_enqueued_at": None, "oldest_age_seconds": None}
   redis_stats: list[dict] = []
+  try:
+    if not queues_provided:
+      queues = await store.queue_stats()
+    if not launch_provided:
+      launch = await store.worker_launch_stats()
+  except Exception:
+    pass
   if isinstance(store, RedisStore):
     try:
-      async for key in store.redis.scan_iter(match="open_rl:queue:*", count=200):
-        depth = await store.redis.llen(key)
-        if depth:
-          queues.append({"model_id": key.removeprefix("open_rl:queue:"), "depth": depth})
-      launch_depth = await store.redis.llen(store.worker_launch_queue)
       memory = await store.redis.info("memory")
       used = memory.get("used_memory", 0)
       maxmemory = memory.get("maxmemory", 0)
@@ -1086,12 +1117,16 @@ async def operational_stats(store: RequestStore, k8s: dict, worker_manager: FFTW
       redis_stats.append(stat_entry("redis.clients", "Redis clients", str(connected), "connected", value_number=connected, unit="clients"))
     except Exception:
       pass
-  elif isinstance(store, InMemoryStore):
-    queues = [{"model_id": model_id, "depth": queue.qsize()} for model_id, queue in store.queues.items() if queue.qsize()]
   queues.sort(key=lambda q: -q["depth"])
 
   workers = worker_processes(worker_manager)
   active = {model_id for model_id, alive in workers.items() if alive} | {q["model_id"] for q in queues if q["model_id"] != "default"}
+  queue_warn_seconds = float(os.getenv("OPEN_RL_QUEUE_WARN_SECONDS", "300"))
+  launch_warn_seconds = float(os.getenv("OPEN_RL_LAUNCH_WARN_SECONDS", "60"))
+  oldest_queue = max(queues, key=lambda queue: queue["oldest_age_seconds"] or 0, default=None)
+  oldest_queue_seconds = (oldest_queue or {}).get("oldest_age_seconds") or 0
+  launch_depth = launch["depth"]
+  launch_age = launch["oldest_age_seconds"] or 0
 
   stats = [
     stat_entry("runs.active", "Active runs", str(len(active)), "live worker or queued work", value_number=len(active), unit="runs"),
@@ -1102,9 +1137,43 @@ async def operational_stats(store: RequestStore, k8s: dict, worker_manager: FFTW
       f"across {len(queues)} queue{'' if len(queues) == 1 else 's'}",
       value_number=sum(q["depth"] for q in queues),
       unit="requests",
-      context={"queue_count": len(queues)},
+      context={
+        "queue_count": len(queues),
+        "oldest_model_id": oldest_queue["model_id"] if oldest_queue else None,
+        "oldest_age_seconds": oldest_queue_seconds,
+      },
+      status="warn" if oldest_queue_seconds >= queue_warn_seconds else "ok",
     ),
-    stat_entry("queue.launch", "Launches pending", str(launch_depth), "worker launch queue", value_number=launch_depth, unit="runs"),
+    stat_entry(
+      "queue.request_age",
+      "Oldest request wait",
+      format_duration(oldest_queue_seconds),
+      oldest_queue["model_id"] if oldest_queue else "no queued requests",
+      value_number=oldest_queue_seconds,
+      unit="seconds",
+      context={"model_id": oldest_queue["model_id"] if oldest_queue else None, "warn_after_seconds": queue_warn_seconds},
+      status="warn" if oldest_queue_seconds >= queue_warn_seconds else "ok",
+    ),
+    stat_entry(
+      "queue.launch",
+      "Launches pending",
+      str(launch_depth),
+      f"oldest waiting {format_duration(launch_age)}" if launch_depth else "worker launch queue",
+      value_number=launch_depth,
+      unit="runs",
+      context={"oldest_age_seconds": launch_age},
+      status="warn" if launch_age >= launch_warn_seconds else "ok",
+    ),
+    stat_entry(
+      "queue.launch_age",
+      "Oldest launch wait",
+      format_duration(launch_age),
+      "worker launch queue" if launch_depth else "no pending launches",
+      value_number=launch_age,
+      unit="seconds",
+      context={"warn_after_seconds": launch_warn_seconds},
+      status="warn" if launch_age >= launch_warn_seconds else "ok",
+    ),
     *redis_stats,
   ]
   rss = gateway_rss_bytes()
@@ -1268,7 +1337,7 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
   return checks
 
 
-def derive_problems(checks: list[dict], k8s: dict) -> list[dict]:
+def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = None) -> list[dict]:
   problems = []
   for check in checks:
     if check["status"] in {"warn", "error"}:
@@ -1286,6 +1355,31 @@ def derive_problems(checks: list[dict], k8s: dict) -> list[dict]:
           actions=actions,
         )
       )
+  alerting_stats = {"queue.request_age", "queue.launch_age", "redis.memory", "storage.disk"}
+  for stat in stats or []:
+    if stat["status"] != "warn" or stat["id"] not in alerting_stats:
+      continue
+    actions = [{"label": "Inspect load metrics", "method": "GET", "path": "/api/v1/dashboard/health", "command": "make ops health"}]
+    if (model_id := stat["context"].get("model_id")) and model_id != "default":
+      actions.append(
+        {
+          "label": "Inspect waiting run",
+          "method": "GET",
+          "path": f"/api/v1/dashboard/runs/{model_id}",
+          "command": f"make ops run {model_id}",
+        }
+      )
+    problems.append(
+      diagnostic_entry(
+        f"metric.{stat['id'].replace('.', '_')}",
+        "warn",
+        stat["label"],
+        f"{stat['value']} — {stat['detail']}",
+        resource={"kind": "Metric", "name": stat["id"]},
+        evidence={"value_number": stat["value_number"], "unit": stat["unit"], **stat["context"]},
+        actions=actions,
+      )
+    )
   for pod in k8s["pods"]:
     if diagnostic := pod_diagnostic(pod, k8s.get("namespace")):
       problems.append(diagnostic)

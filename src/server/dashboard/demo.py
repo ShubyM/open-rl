@@ -284,6 +284,8 @@ def demo_runs() -> dict:
         "sources": ["worker", "queue"],
         "pods": ["open-rl-trainer-demo-run-1", "open-rl-sampler-demo-run-1"],
         "queue_depth": 5,
+        "queue_oldest_at": "2026-07-29T08:01:42+00:00",
+        "queue_oldest_seconds": 18,
         "worker_alive": True,
         "state": {
           "phase": "running",
@@ -303,6 +305,8 @@ def demo_runs() -> dict:
         "sources": ["worker", "queue"],
         "pods": ["open-rl-trainer-demo-run-2", "open-rl-sampler-demo-run-2"],
         "queue_depth": 2,
+        "queue_oldest_at": "2026-07-29T07:59:15+00:00",
+        "queue_oldest_seconds": 75,
         "worker_alive": True,
         "state": {
           "phase": "failed",
@@ -322,6 +326,8 @@ def demo_runs() -> dict:
         "sources": ["checkpoint"],
         "pods": [],
         "queue_depth": 0,
+        "queue_oldest_at": None,
+        "queue_oldest_seconds": None,
         "worker_alive": None,
         "state": {
           "phase": "saved",
@@ -384,7 +390,17 @@ def demo_health() -> dict:
         "value_number": 7,
         "unit": "requests",
         "detail": "across 2 queues",
-        "context": {"queue_count": 2},
+        "context": {"queue_count": 2, "oldest_model_id": "demo-run-2", "oldest_age_seconds": 75},
+        "status": "ok",
+      },
+      {
+        "id": "queue.request_age",
+        "label": "Oldest request wait",
+        "value": "1m 15s",
+        "value_number": 75,
+        "unit": "seconds",
+        "detail": "demo-run-2",
+        "context": {"model_id": "demo-run-2", "warn_after_seconds": 300},
         "status": "ok",
       },
       {
@@ -394,7 +410,17 @@ def demo_health() -> dict:
         "value_number": 0,
         "unit": "runs",
         "detail": "worker launch queue",
-        "context": {},
+        "context": {"oldest_age_seconds": 0},
+        "status": "ok",
+      },
+      {
+        "id": "queue.launch_age",
+        "label": "Oldest launch wait",
+        "value": "0s",
+        "value_number": 0,
+        "unit": "seconds",
+        "detail": "no pending launches",
+        "context": {"warn_after_seconds": 60},
         "status": "ok",
       },
       {
@@ -479,8 +505,8 @@ def demo_health() -> dict:
       },
     ],
     "queues": [
-      {"model_id": "demo-run-1", "depth": 5},
-      {"model_id": "demo-run-2", "depth": 2},
+      {"model_id": "demo-run-1", "depth": 5, "oldest_enqueued_at": "2026-07-29T08:01:42+00:00", "oldest_age_seconds": 18},
+      {"model_id": "demo-run-2", "depth": 2, "oldest_enqueued_at": "2026-07-29T07:59:15+00:00", "oldest_age_seconds": 75},
     ],
   }
 
@@ -498,6 +524,7 @@ def demo_problems() -> dict:
         "nodes": [node for pool in cluster["pools"] for node in pool["nodes"]],
         "scheduler": cluster["scheduler"],
       },
+      demo_health()["stats"],
     ),
   }
 
@@ -526,7 +553,7 @@ def demo_run_detail(run_id: str, log_tail: int = 0) -> dict | None:
     "nodes": [],
     "scheduler": scheduler,
   }
-  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s)
+  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s, run.get("queue_oldest_seconds"))
   diagnostics.extend(scheduler_run_diagnostics(workloads, ledgers, k8s))
   detail = {
     **run,

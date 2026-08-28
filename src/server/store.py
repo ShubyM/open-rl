@@ -57,6 +57,16 @@ class RequestStore(ABC):
     """Return every model lifecycle record keyed by model ID."""
     pass
 
+  @abstractmethod
+  async def queue_stats(self) -> list[dict[str, Any]]:
+    """Return request queue depth and oldest-enqueue timestamps by model."""
+    pass
+
+  @abstractmethod
+  async def worker_launch_stats(self) -> dict[str, Any]:
+    """Return worker-launch queue depth and oldest-enqueue timestamp."""
+    pass
+
 
 def model_result_update(result: dict[str, Any]) -> dict[str, Any]:
   result_type = result.get("type")
@@ -77,13 +87,19 @@ class InMemoryStore(RequestStore):
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, asyncio.Event] = {}
     self.model_metadata: dict[str, dict[str, Any]] = {}
+    self.queue_oldest_at: dict[str, float] = {}
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
+    req_data = {**req_data}
+    req_data.setdefault("enqueued_at", time.time())
     model_id = req_data.get("model_id", "default")
 
     async with self.active_tenants_cv:
       if model_id not in self.queues:
         self.queues[model_id] = asyncio.Queue()
+
+      if self.queues[model_id].empty():
+        self.queue_oldest_at[model_id] = float(req_data["enqueued_at"])
 
       await self.queues[model_id].put(req_data)
 
@@ -114,6 +130,7 @@ class InMemoryStore(RequestStore):
       # If completely empty, remove from rotation
       if queue.empty():
         self.active_tenants.remove(model_id)
+        self.queue_oldest_at.pop(model_id, None)
 
       return batch
 
@@ -153,6 +170,22 @@ class InMemoryStore(RequestStore):
   async def list_model_metadata(self) -> dict[str, dict[str, Any]]:
     return {model_id: dict(metadata) for model_id, metadata in self.model_metadata.items()}
 
+  async def queue_stats(self) -> list[dict[str, Any]]:
+    now = time.time()
+    return [
+      {
+        "model_id": model_id,
+        "depth": queue.qsize(),
+        "oldest_enqueued_at": self.queue_oldest_at.get(model_id),
+        "oldest_age_seconds": max(0.0, now - self.queue_oldest_at[model_id]) if model_id in self.queue_oldest_at else None,
+      }
+      for model_id, queue in self.queues.items()
+      if not queue.empty()
+    ]
+
+  async def worker_launch_stats(self) -> dict[str, Any]:
+    return {"depth": 0, "oldest_enqueued_at": None, "oldest_age_seconds": None}
+
 
 class RedisStore(RequestStore):
   def __init__(self, redis_url: str):
@@ -163,6 +196,8 @@ class RedisStore(RequestStore):
     self.worker_launch_queue = "open_rl:worker_launch_queue"
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
+    req_data = {**req_data}
+    req_data.setdefault("enqueued_at", time.time())
     model_id = req_data.get("model_id", "default")
     queue_key = f"open_rl:queue:{model_id}"
 
@@ -176,6 +211,8 @@ class RedisStore(RequestStore):
       await self.redis.rpush(self.active_list, model_id)
 
   async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
+    req_data = {**req_data}
+    req_data.setdefault("enqueued_at", time.time())
     await self.redis.rpush(self.worker_launch_queue, json.dumps(req_data))
 
   async def get_requests(self) -> list[dict[str, Any]]:
@@ -307,6 +344,42 @@ class RedisStore(RequestStore):
       except (TypeError, json.JSONDecodeError):
         continue
     return metadata
+
+  async def queue_stats(self) -> list[dict[str, Any]]:
+    now = time.time()
+    stats = []
+    async for key in self.redis.scan_iter(match="open_rl:queue:*", count=200):
+      depth = await self.redis.llen(key)
+      if not depth:
+        continue
+      oldest_at = None
+      try:
+        oldest_at = float(json.loads(await self.redis.lindex(key, 0) or "{}").get("enqueued_at"))
+      except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+      stats.append(
+        {
+          "model_id": key.removeprefix("open_rl:queue:"),
+          "depth": depth,
+          "oldest_enqueued_at": oldest_at,
+          "oldest_age_seconds": max(0.0, now - oldest_at) if oldest_at is not None else None,
+        }
+      )
+    return stats
+
+  async def worker_launch_stats(self) -> dict[str, Any]:
+    depth = await self.redis.llen(self.worker_launch_queue)
+    oldest_at = None
+    if depth:
+      try:
+        oldest_at = float(json.loads(await self.redis.lindex(self.worker_launch_queue, 0) or "{}").get("enqueued_at"))
+      except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return {
+      "depth": depth,
+      "oldest_enqueued_at": oldest_at,
+      "oldest_age_seconds": max(0.0, time.time() - oldest_at) if oldest_at is not None else None,
+    }
 
 
 # Global singleton factory

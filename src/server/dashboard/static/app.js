@@ -97,6 +97,13 @@ function relTime(iso) {
   return `${Math.round(secs / 86400)}d ago`;
 }
 
+function duration(seconds) {
+  seconds = Math.max(0, Math.round(seconds || 0));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
 // *** Theme ***
 
 function applyTheme(theme) {
@@ -727,7 +734,7 @@ function renderRunDetail(container, run, detail) {
   const metrics = el("div", "run-metrics");
   const workloadPhases = Object.entries(detail.state?.workload_phase_counts || {}).map(([phase, count]) => `${count} ${phase}`).join(" · ") || "none";
   metrics.append(
-    metric("Queue", String(detail.queue_depth || 0), "requests"),
+    metric("Queue", String(detail.queue_depth || 0), detail.queue_depth ? `oldest waiting ${duration(detail.queue_oldest_seconds)}` : "requests"),
     metric("GPU claims", String(detail.gpu_devices || 0), claimsText),
     metric("Pods", String(detail.pods?.length || 0), Object.entries(detail.state?.pod_phase_counts || {}).map(([phase, count]) => `${count} ${phase}`).join(" · ") || "none visible"),
     metric("Workloads", String(detail.workloads?.length || 0), workloadPhases),
@@ -955,7 +962,8 @@ function renderHealth(health, problems) {
     },
     (row, q) => {
       setText(row.querySelector(".queue-model"), q.model_id);
-      setText(row.querySelector(".queue-depth"), `${q.depth} request${q.depth === 1 ? "" : "s"}`);
+      const wait = q.oldest_age_seconds == null ? "" : ` · oldest ${duration(q.oldest_age_seconds)}`;
+      setText(row.querySelector(".queue-depth"), `${q.depth} request${q.depth === 1 ? "" : "s"}${wait}`);
     }
   );
 

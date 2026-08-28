@@ -62,6 +62,36 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertIn("problems", body["problems"])
     snapshot.assert_called_once_with()
 
+  def test_snapshot_reads_each_queue_observation_once(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    class CountingStore(InMemoryStore):
+      def __init__(self) -> None:
+        super().__init__()
+        self.queue_reads = 0
+        self.launch_reads = 0
+
+      async def queue_stats(self) -> list[dict]:
+        self.queue_reads += 1
+        return await super().queue_stats()
+
+      async def worker_launch_stats(self) -> dict:
+        self.launch_reads += 1
+        return await super().worker_launch_stats()
+
+    store = CountingStore()
+    asyncio.run(store.put_request({"model_id": "run-a", "op": "forward_backward"}))
+    k8s = {"available": False, "namespace": "default", "error": "off", "pods": [], "nodes": []}
+
+    snapshot = asyncio.run(data.diagnostic_snapshot(store, None, k8s))
+
+    self.assertEqual(store.queue_reads, 1)
+    self.assertEqual(store.launch_reads, 1)
+    self.assertEqual(snapshot["runs"]["runs"][0]["queue_depth"], 1)
+    self.assertEqual(snapshot["health"]["queues"][0]["depth"], 1)
+
   def test_cluster_degrades_without_kubernetes(self) -> None:
     resp = self.client.get("/api/v1/dashboard/cluster")
     self.assertEqual(resp.status_code, 200)
@@ -265,7 +295,52 @@ class DashboardEndpointsTest(unittest.TestCase):
     by_id = {stat["id"]: stat for stat in stats}
     self.assertEqual(by_id["runs.active"]["value"], "1")
     self.assertEqual(by_id["queue.requests"]["value"], "2")
-    self.assertEqual(queues, [{"model_id": "run-a", "depth": 2}])
+    self.assertEqual(queues[0]["model_id"], "run-a")
+    self.assertEqual(queues[0]["depth"], 2)
+    self.assertGreaterEqual(queues[0]["oldest_age_seconds"], 0)
+
+  def test_old_queue_age_becomes_an_actionable_metric_and_problem(self) -> None:
+    import asyncio
+    import time
+
+    from server.store import InMemoryStore
+
+    store = InMemoryStore()
+    asyncio.run(store.put_request({"model_id": "run-stalled", "op": "forward_backward", "enqueued_at": time.time() - 600}))
+    k8s = {"available": False, "namespace": "default", "error": "off", "pods": [], "nodes": []}
+    with mock.patch.dict("os.environ", {"OPEN_RL_QUEUE_WARN_SECONDS": "300"}):
+      stats, _ = asyncio.run(data.operational_stats(store, k8s, worker_manager=None))
+      run = asyncio.run(data.runs_snapshot(store, None, pods=[]))["runs"][0]
+      detail = asyncio.run(data.run_detail(store, None, "run-stalled", k8s))
+
+    by_id = {stat["id"]: stat for stat in stats}
+    self.assertEqual(by_id["queue.request_age"]["status"], "warn")
+    self.assertGreaterEqual(by_id["queue.request_age"]["value_number"], 599)
+    self.assertEqual(by_id["queue.request_age"]["context"]["model_id"], "run-stalled")
+    self.assertGreaterEqual(run["queue_oldest_seconds"], 599)
+    stalled = next(item for item in detail["diagnostics"] if item["code"] == "run.queue_stalled")
+    self.assertEqual(stalled["actions"][0]["command"], "make ops run run-stalled")
+    problems = data.derive_problems([], k8s, stats)
+    metric = next(problem for problem in problems if problem["code"] == "metric.queue_request_age")
+    self.assertEqual(metric["evidence"]["model_id"], "run-stalled")
+    self.assertEqual(metric["actions"][1]["command"], "make ops run run-stalled")
+
+  def test_old_worker_launch_becomes_an_actionable_metric(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    launch = {"depth": 2, "oldest_enqueued_at": 1.0, "oldest_age_seconds": 120.0}
+    k8s = {"available": False, "namespace": "default", "error": "off", "pods": [], "nodes": []}
+    with mock.patch.dict("os.environ", {"OPEN_RL_LAUNCH_WARN_SECONDS": "60"}):
+      stats, _ = asyncio.run(data.operational_stats(InMemoryStore(), k8s, worker_manager=None, queues=[], launch=launch))
+
+    by_id = {stat["id"]: stat for stat in stats}
+    self.assertEqual(by_id["queue.launch"]["status"], "warn")
+    self.assertEqual(by_id["queue.launch_age"]["value_number"], 120.0)
+    problems = data.derive_problems([], k8s, stats)
+    metric = next(problem for problem in problems if problem["code"] == "metric.queue_launch_age")
+    self.assertEqual(metric["evidence"]["warn_after_seconds"], 60.0)
 
   def test_model_pods_match_timeslice_labels(self) -> None:
     pods = [
