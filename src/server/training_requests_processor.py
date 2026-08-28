@@ -60,6 +60,11 @@ class TrainingRequestsProcessor(Protocol):
       ctx = propagate.extract(carrier) if carrier else None
       token = otel_context.attach(ctx) if ctx else None
 
+      try:
+        await self.store.mark_request_started(request_id, resolved_model_id, op)
+      except Exception as exc:
+        # Telemetry must not turn a healthy training request into a failure.
+        print(f"Could not record active request {request_id}: {exc}")
       result = await self.dispatch_operation(op, raw_request.get("payload", {}), resolved_model_id)
       await self.store.set_future(request_id, result)
     except Exception as exc:

@@ -768,16 +768,24 @@ function renderRunDetail(container, run, detail) {
 
   const telemetrySection = el("div", "run-telemetry");
   const telemetry = detail.telemetry || {};
-  if (telemetry.requests_completed) {
+  if (telemetry.requests_completed || telemetry.active_request) {
     telemetrySection.append(el("div", "eyebrow", "Gateway request telemetry"));
     const requestMetrics = el("div", "run-metrics");
     const failures = telemetry.requests_failed || 0;
+    if (telemetry.active_request) {
+      const active = telemetry.active_request;
+      requestMetrics.append(metric("Executing", active.operation || "request", `${duration(active.age_seconds)} active · queued ${latency(active.queue_wait_seconds)}`));
+    }
     requestMetrics.append(
-      metric("Completed", String(telemetry.requests_completed), Object.entries(telemetry.operation_counts || {}).map(([op, count]) => `${op} ${count}`).join(" · ")),
-      metric("Failures", String(failures), `${((telemetry.failure_rate || 0) * 100).toFixed(1)}% of requests`),
-      metric("Last latency", latency(telemetry.last_latency_seconds), telemetry.last_operation || "request"),
-      metric("Mean latency", latency(telemetry.mean_latency_seconds), `max ${latency(telemetry.max_latency_seconds)}`)
+      metric("Completed", String(telemetry.requests_completed || 0), Object.entries(telemetry.operation_counts || {}).map(([op, count]) => `${op} ${count}`).join(" · ")),
+      metric("Failures", String(failures), `${((telemetry.failure_rate || 0) * 100).toFixed(1)}% of requests`)
     );
+    if (telemetry.requests_completed) {
+      requestMetrics.append(
+        metric("Last latency", latency(telemetry.last_latency_seconds), telemetry.last_operation || "request"),
+        metric("Mean latency", latency(telemetry.mean_latency_seconds), `max ${latency(telemetry.max_latency_seconds)}`)
+      );
+    }
     telemetrySection.append(requestMetrics);
 
     const latest = Object.entries(telemetry.latest_metrics || {}).sort(([a], [b]) => a.localeCompare(b));

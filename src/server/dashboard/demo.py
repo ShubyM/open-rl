@@ -297,6 +297,13 @@ def demo_runs() -> dict:
           "last_latency_seconds": 3.42,
           "mean_latency_seconds": 2.18,
           "max_latency_seconds": 7.91,
+          "active_request": {
+            "request_id": "demo-request-active",
+            "operation": "forward_backward",
+            "started_at": 1785333775.0,
+            "queue_wait_seconds": 0.18,
+            "age_seconds": 4.2,
+          },
           "latest_metrics": {"loss:mean": 0.7981, "grad_norm:mean": 0.42},
           "metric_series": {
             "loss:mean": [

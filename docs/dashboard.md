@@ -100,7 +100,10 @@ left running for inspection; remove it with `make kind-dashboard-clean`.
   `wandb_url`. Request telemetry is joined by request and model ID at the queue/future boundary: the
   model record keeps exact completion and failure counts, end-to-end latency, operation counts, and the
   latest numeric worker metrics (with at most 20 points per metric). It remains available after the
-  request queue drains and, with Redis, after a gateway restart.
+  request queue drains and, with Redis, after a gateway restart. Once a worker begins dispatch, its
+  current operation, queue wait, and execution age remain visible until the future resolves; operations
+  still active after 600 seconds become `run.request_stalled` problems. Tune that threshold with
+  `OPEN_RL_OPERATION_WARN_SECONDS`.
 - **Stop** does only what is truthfully stoppable: terminates the gateway-launched worker process,
   clears the run's Redis queues, and deletes pods labeled `timeslice.io/job-id` for the model. It
   reports exactly which actions it took.

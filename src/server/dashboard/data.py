@@ -834,40 +834,68 @@ def run_diagnostics(
         ],
       )
     )
-  if diagnostic := run_telemetry_diagnostic(run_id, telemetry or {}):
-    diagnostics.append(diagnostic)
+  diagnostics.extend(run_telemetry_diagnostics(run_id, telemetry or {}))
   return diagnostics
 
 
-def run_telemetry_diagnostic(run_id: str, telemetry: dict) -> dict | None:
+def run_telemetry_diagnostics(run_id: str, telemetry: dict) -> list[dict]:
+  diagnostics = []
   completed = int(telemetry.get("requests_completed") or 0)
   failures = int(telemetry.get("requests_failed") or 0)
   last_failed = telemetry.get("last_outcome") == "error"
   elevated_failures = completed >= 5 and failures / completed >= 0.2
-  if not last_failed and not elevated_failures:
-    return None
-  return diagnostic_entry(
-    "run.request_failed" if last_failed else "run.request_errors",
-    "error" if last_failed else "warn",
-    f"run/{run_id}",
-    telemetry.get("last_error") or f"{failures} of {completed} completed requests failed",
-    resource={"kind": "Run", "name": run_id},
-    evidence={
-      "requests_completed": completed,
-      "requests_failed": failures,
-      "failure_rate": failures / completed if completed else 0,
-      "last_operation": telemetry.get("last_operation"),
-      "last_error_at": iso_timestamp(telemetry.get("last_error_at")),
-    },
-    actions=[
-      {
-        "label": "Inspect run and pod logs",
-        "method": "GET",
-        "path": f"/api/v1/dashboard/runs/{run_id}?logs=100",
-        "command": f"make ops run {run_id} 100",
-      }
-    ],
-  )
+  action = {
+    "label": "Inspect run and pod logs",
+    "method": "GET",
+    "path": f"/api/v1/dashboard/runs/{run_id}?logs=100",
+    "command": f"make ops run {run_id} 100",
+  }
+  if last_failed or elevated_failures:
+    diagnostics.append(
+      diagnostic_entry(
+        "run.request_failed" if last_failed else "run.request_errors",
+        "error" if last_failed else "warn",
+        f"run/{run_id}",
+        telemetry.get("last_error") or f"{failures} of {completed} completed requests failed",
+        resource={"kind": "Run", "name": run_id},
+        evidence={
+          "requests_completed": completed,
+          "requests_failed": failures,
+          "failure_rate": failures / completed if completed else 0,
+          "last_operation": telemetry.get("last_operation"),
+          "last_error_at": iso_timestamp(telemetry.get("last_error_at")),
+        },
+        actions=[action],
+      )
+    )
+  active = telemetry.get("active_request") or {}
+  active_age = active.get("age_seconds") or 0
+  warn_after = float(os.getenv("OPEN_RL_OPERATION_WARN_SECONDS", "600"))
+  if active and active_age >= warn_after:
+    diagnostics.append(
+      diagnostic_entry(
+        "run.request_stalled",
+        "warn",
+        f"run/{run_id}",
+        f"{active.get('operation') or 'request'} has been executing for {format_duration(active_age)}",
+        resource={"kind": "Run", "name": run_id},
+        evidence={**active, "warn_after_seconds": warn_after},
+        actions=[action],
+      )
+    )
+  return diagnostics
+
+
+def telemetry_snapshot(raw: dict | None) -> dict:
+  telemetry = {**(raw or {})}
+  if active := telemetry.get("active_request"):
+    active = {**active}
+    try:
+      active["age_seconds"] = max(0.0, time.time() - float(active["started_at"]))
+    except (KeyError, TypeError, ValueError):
+      active["age_seconds"] = None
+    telemetry["active_request"] = active
+  return telemetry
 
 
 def scheduler_run_diagnostics(workloads: list[dict], ledgers: list[dict], k8s: dict) -> list[dict]:
@@ -941,7 +969,7 @@ async def runs_snapshot(
         "queue_depth": queue_depth,
         "queue_oldest_at": info.get("queue_oldest_at"),
         "queue_oldest_seconds": info.get("queue_oldest_seconds"),
-        "telemetry": info.get("telemetry") or {},
+        "telemetry": telemetry_snapshot(info.get("telemetry")),
         "worker_alive": worker_alive,
         "model_status": info.get("status"),
         "lifecycle": {
@@ -1428,8 +1456,7 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
       )
     )
   for run in runs or []:
-    if diagnostic := run_telemetry_diagnostic(run["run_id"], run.get("telemetry") or {}):
-      problems.append(diagnostic)
+    problems.extend(run_telemetry_diagnostics(run["run_id"], run.get("telemetry") or {}))
   for pod in k8s["pods"]:
     if diagnostic := pod_diagnostic(pod, k8s.get("namespace")):
       problems.append(diagnostic)

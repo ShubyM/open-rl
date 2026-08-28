@@ -478,6 +478,12 @@ class DashboardEndpointsTest(unittest.TestCase):
       )
     )
     asyncio.run(store.get_requests())
+    asyncio.run(store.mark_request_started("request-ok", "run-metrics", "forward_backward"))
+    active_runs = asyncio.run(data.runs_snapshot(store, None, pods=[]))["runs"]
+    active = next(run for run in active_runs if run["run_id"] == "run-metrics")["telemetry"]["active_request"]
+    self.assertEqual(active["operation"], "forward_backward")
+    self.assertGreaterEqual(active["queue_wait_seconds"], 1.9)
+    self.assertGreaterEqual(active["age_seconds"], 0)
     asyncio.run(store.set_future("request-ok", {"type": "forward_backward_completed", "metrics": {"loss:mean": 0.75, "ignored": float("nan")}}))
     asyncio.run(store.put_request({"request_id": "request-failed", "model_id": "run-metrics", "op": "optim_step", "enqueued_at": time.time() - 1}))
     asyncio.run(store.get_requests())
@@ -490,6 +496,7 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(telemetry["operation_counts"], {"forward_backward": 1, "optim_step": 1})
     self.assertEqual(telemetry["latest_metrics"], {"loss:mean": 0.75})
     self.assertEqual(len(telemetry["metric_series"]["loss:mean"]), 1)
+    self.assertNotIn("active_request", telemetry)
     self.assertGreaterEqual(telemetry["mean_latency_seconds"], 1.0)
     self.assertEqual(telemetry["last_error"], "gradient overflow")
 
@@ -517,6 +524,25 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(len(series), 20)
     self.assertEqual(series[0]["value"], 0.5)
     self.assertEqual(series[-1]["value"], 2.4)
+
+  def test_stalled_active_request_is_a_global_problem(self) -> None:
+    telemetry = {
+      "active_request": {
+        "request_id": "request-stalled",
+        "operation": "forward_backward",
+        "started_at": 1.0,
+        "queue_wait_seconds": 4.0,
+        "age_seconds": 700.0,
+      }
+    }
+    k8s = {"available": True, "namespace": "default", "error": None, "pods": [], "nodes": []}
+    with mock.patch.dict("os.environ", {"OPEN_RL_OPERATION_WARN_SECONDS": "600"}):
+      problems = data.derive_problems([], k8s, runs=[{"run_id": "run-stalled", "telemetry": telemetry}])
+
+    problem = next(item for item in problems if item["code"] == "run.request_stalled")
+    self.assertEqual(problem["evidence"]["operation"], "forward_backward")
+    self.assertEqual(problem["evidence"]["warn_after_seconds"], 600.0)
+    self.assertEqual(problem["actions"][0]["command"], "make ops run run-stalled 100")
 
   def test_scheduler_snapshot_drives_run_state_and_consistency_diagnostics(self) -> None:
     import asyncio

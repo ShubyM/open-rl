@@ -157,6 +157,10 @@ class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker
 class _FutureStoreStub:
   def __init__(self):
     self.results = {}
+    self.started_requests = []
+
+  async def mark_request_started(self, request_id, model_id, operation):
+    self.started_requests.append((request_id, model_id, operation))
 
   async def set_future(self, req_id, result):
     self.results[req_id] = result
@@ -354,6 +358,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result["rank"], 2)
     self.assertEqual(result["training_kind"], "lora")
     self.assertEqual(result["type"], "model_created")
+    self.assertEqual(store.started_requests, [("req-a", "adapter-a", "create_model")])
 
   def test_parse_datum_flattens_chunked_model_input(self) -> None:
     datum = training_requests_processor_module.parse_datum(

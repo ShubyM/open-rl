@@ -68,6 +68,11 @@ class RequestStore(ABC):
     """Return worker-launch queue depth and oldest-enqueue timestamp."""
     pass
 
+  @abstractmethod
+  async def mark_request_started(self, request_id: str, model_id: str, operation: str) -> None:
+    """Persist the operation currently executing after it leaves the queue."""
+    pass
+
 
 def model_result_update(result: dict[str, Any]) -> dict[str, Any]:
   result_type = result.get("type")
@@ -134,6 +139,8 @@ def record_request_result(
   if failed:
     telemetry["last_error"] = str(result.get("error_message") or "request failed")[:500]
     telemetry["last_error_at"] = completed_at
+  if (telemetry.get("active_request") or {}).get("request_id") == observation.get("request_id"):
+    telemetry.pop("active_request", None)
   return {**metadata, "telemetry": telemetry}
 
 
@@ -254,6 +261,23 @@ class InMemoryStore(RequestStore):
 
   async def worker_launch_stats(self) -> dict[str, Any]:
     return {"depth": 0, "oldest_enqueued_at": None, "oldest_age_seconds": None}
+
+  async def mark_request_started(self, request_id: str, model_id: str, operation: str) -> None:
+    started_at = time.time()
+    observation = self.request_observations.get(request_id) or {
+      "request_id": request_id,
+      "model_id": model_id,
+      "operation": operation,
+      "enqueued_at": started_at,
+    }
+    telemetry = {**(self.model_metadata.get(model_id, {}).get("telemetry") or {})}
+    telemetry["active_request"] = {
+      "request_id": request_id,
+      "operation": operation,
+      "started_at": started_at,
+      "queue_wait_seconds": max(0.0, started_at - observation["enqueued_at"]),
+    }
+    self.model_metadata[model_id] = {**self.model_metadata.get(model_id, {}), "telemetry": telemetry}
 
 
 class RedisStore(RequestStore):
@@ -381,6 +405,8 @@ class RedisStore(RequestStore):
       return
 
     observation_key = f"open_rl:request_observation:{req_id}"
+    metadata_write: tuple[str, str] | None = None
+    delete_observation = False
     if raw_observation := await self.redis.get(observation_key):
       try:
         observation = json.loads(raw_observation)
@@ -390,18 +416,24 @@ class RedisStore(RequestStore):
         metadata = record_request_result(metadata, observation, result)
         if observation["operation"] in {"create_model", "create_model_from_state"}:
           metadata.update(model_result_update(result))
-        await self.redis.set(metadata_key, json.dumps(metadata))
-        await self.redis.delete(observation_key)
+        metadata_write = (metadata_key, json.dumps(metadata))
+        delete_observation = True
       except (KeyError, TypeError, json.JSONDecodeError):
         pass
     elif update := model_result_update(result):
       key = f"open_rl:model_meta:{req_id}"
       if raw := await self.redis.get(key):
-        await self.redis.set(key, json.dumps({**json.loads(raw), **update}))
+        metadata_write = (key, json.dumps({**json.loads(raw), **update}))
 
     key = f"open_rl:future:{req_id}"
-    await self.redis.rpush(key, json.dumps(result))
-    await self.redis.expire(key, 300)
+    pipeline = self.redis.pipeline()
+    if metadata_write:
+      pipeline.set(*metadata_write)
+    if delete_observation:
+      pipeline.delete(observation_key)
+    pipeline.rpush(key, json.dumps(result))
+    pipeline.expire(key, 300)
+    await pipeline.execute()
 
   async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     key = f"open_rl:future:{req_id}"
@@ -485,6 +517,24 @@ class RedisStore(RequestStore):
       "oldest_enqueued_at": oldest_at,
       "oldest_age_seconds": max(0.0, time.time() - oldest_at) if oldest_at is not None else None,
     }
+
+  async def mark_request_started(self, request_id: str, model_id: str, operation: str) -> None:
+    started_at = time.time()
+    observation_key = f"open_rl:request_observation:{request_id}"
+    try:
+      observation = json.loads(await self.redis.get(observation_key) or "{}")
+    except (TypeError, json.JSONDecodeError):
+      observation = {}
+    metadata_key = f"open_rl:model_meta:{model_id}"
+    metadata = json.loads(await self.redis.get(metadata_key) or "{}")
+    telemetry = {**(metadata.get("telemetry") or {})}
+    telemetry["active_request"] = {
+      "request_id": request_id,
+      "operation": operation,
+      "started_at": started_at,
+      "queue_wait_seconds": max(0.0, started_at - float(observation.get("enqueued_at", started_at))),
+    }
+    await self.redis.set(metadata_key, json.dumps({**metadata, "telemetry": telemetry}))
 
 
 # Global singleton factory
