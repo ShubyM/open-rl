@@ -57,6 +57,11 @@ def main() -> None:
       for tab in ("cluster", "runs", "health"):
         page.click(f'[data-tab="{tab}"]')
         assert_fits(f"{width}px {tab}", dimensions(page))
+        if tab == "health":
+          assert not page.locator("#traffic-block").is_hidden()
+          assert page.locator(".traffic-group").count() == 3
+          assert page.locator(".traffic-route").count() > 0
+          assert "/api/v1/healthz" in page.locator("#traffic-routes").text_content()
         if screenshots:
           page.screenshot(path=screenshots / f"{tab}-{width}.png", full_page=True)
 

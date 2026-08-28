@@ -43,6 +43,8 @@ experiment analysis; nothing here duplicates metrics.
   Problems. Failed or slow placement, stale observed generations, assignment/seat mismatches, and stale
   ClaimLedger seats include exact `kubectl` inspection commands. Failed Jobs and stalled or unavailable
   workload controllers retain their Kubernetes conditions and include exact `kubectl describe` commands.
+  Gateway traffic expands into application, background, and diagnostic summaries plus the busiest, slowest,
+  or failing normalized routes, so the p95 and 5xx tiles have visible evidence without exposing request data.
 
 The page polls one coherent snapshot every 8 seconds and updates in place — canvas position, selection,
 and open log panels survive refreshes. A refresh lists Kubernetes state once, so every view describes the

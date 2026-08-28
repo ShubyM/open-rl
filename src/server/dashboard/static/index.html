@@ -91,6 +91,13 @@
         <div class="health-section">
           <div class="eyebrow">Load</div>
           <div id="stats-grid" class="stats-grid"></div>
+          <div id="traffic-block" class="traffic-block" hidden>
+            <div class="eyebrow">Gateway traffic by route</div>
+            <div id="traffic-groups" class="traffic-groups"></div>
+            <div id="traffic-routes" class="traffic-routes"></div>
+            <p id="traffic-empty" class="empty" hidden>No completed HTTP requests in this window.</p>
+            <p id="traffic-note" class="traffic-note"></p>
+          </div>
           <div id="queues-block" hidden>
             <div class="eyebrow">Queued work by run</div>
             <div id="queue-list"></div>

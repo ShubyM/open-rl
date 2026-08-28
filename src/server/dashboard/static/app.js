@@ -989,7 +989,67 @@ async function onStopClick(runId, btn) {
 
 // *** Health view ***
 
-function renderHealth(health, problems) {
+function renderTraffic(http) {
+  const block = $("traffic-block");
+  block.hidden = !http;
+  if (!http) return;
+
+  const groups = Object.entries(http.groups || {}).map(([name, summary]) => ({ name, ...summary }));
+  sync(
+    $("traffic-groups"),
+    groups,
+    (group) => group.name,
+    () => {
+      const item = el("div", "traffic-group");
+      item.append(el("span", "traffic-group-name"), el("span", "traffic-group-value"), el("span", "traffic-group-meta"));
+      return item;
+    },
+    (item, group) => {
+      setClass(item, `traffic-group${group.in_window_server_errors ? " warn" : ""}`);
+      setText(item.querySelector(".traffic-group-name"), group.name);
+      setText(item.querySelector(".traffic-group-value"), `${group.requests || 0} req`);
+      setText(item.querySelector(".traffic-group-meta"), `p95 ${latency(group.p95_latency_seconds)} · ${group.in_window_server_errors || 0} 5xx`);
+    }
+  );
+
+  const routes = (http.routes || []).slice(0, 12);
+  $("traffic-empty").hidden = routes.length > 0;
+  sync(
+    $("traffic-routes"),
+    routes,
+    (route) => `${route.group}:${route.method}:${route.route}`,
+    () => {
+      const row = el("div", "traffic-route");
+      row.append(
+        el("span", "traffic-route-group"),
+        el("span", "traffic-route-method"),
+        el("code", "traffic-route-path"),
+        el("span", "traffic-route-count"),
+        el("span", "traffic-route-latency"),
+        el("span", "traffic-route-errors")
+      );
+      return row;
+    },
+    (row, route) => {
+      setText(row.querySelector(".traffic-route-group"), route.group);
+      setText(row.querySelector(".traffic-route-method"), route.method);
+      setText(row.querySelector(".traffic-route-path"), route.route);
+      setText(row.querySelector(".traffic-route-count"), `${route.requests} req`);
+      setText(row.querySelector(".traffic-route-latency"), `p95 ${latency(route.p95_latency_seconds)}`);
+      const errors = row.querySelector(".traffic-route-errors");
+      setText(errors, `${route.server_errors || 0} 5xx`);
+      setClass(errors, `traffic-route-errors${route.server_errors ? " bad" : ""}`);
+    }
+  );
+
+  const note = http.window_truncated
+    ? `Window truncated: showing the latest ${http.sample_capacity} samples; ${http.dropped_samples} dropped since startup.`
+    : `${http.sample_count} / ${http.sample_capacity} samples · ${duration(http.window_seconds)} window · ${http.in_flight} in flight`;
+  setText($("traffic-note"), note);
+  setClass($("traffic-note"), `traffic-note${http.window_truncated ? " warn" : ""}`);
+}
+
+function renderHealth(health, problems, http) {
   const list = problems?.problems || [];
   $("problems-empty").hidden = list.length > 0;
   $("problem-dot").hidden = !list.some((p) => p.severity === "error");
@@ -1062,6 +1122,7 @@ function renderHealth(health, problems) {
       setText(tile.querySelector(".stat-detail"), s.detail || "");
     }
   );
+  renderTraffic(http);
   const queues = health?.queues || [];
   $("queues-block").hidden = queues.length === 0;
   sync(
@@ -1292,7 +1353,7 @@ async function refresh() {
     updatePanel();
     renderPool();
     renderRuns(S.runs);
-    renderHealth(S.health, S.problems);
+    renderHealth(S.health, S.problems, S.cluster?.gateway?.http);
     $("demo-banner").hidden = !snapshot.demo;
     const build = snapshot.cluster?.gateway?.build;
     setText($("build-at"), `build ${revisionLabel(build?.revision)}`);

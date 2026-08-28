@@ -76,7 +76,12 @@ def is_fft_enabled() -> bool:
 
 
 def http_request_group(route: str) -> str:
-  if route.startswith("/api/v1/dashboard") or route.startswith("/dashboard") or route in {"/api/v1/healthz", "/openapi.json", "/docs"}:
+  if (
+    route == "<unmatched>"
+    or route.startswith("/api/v1/dashboard")
+    or route.startswith("/dashboard")
+    or route in {"/api/v1/healthz", "/openapi.json", "/docs"}
+  ):
     return "diagnostic"
   if route in {"/api/v1/retrieve_future", "/api/v1/session_heartbeat", "/api/v1/telemetry"}:
     return "background"

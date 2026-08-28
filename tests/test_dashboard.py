@@ -39,13 +39,16 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(self.client.post("/api/v1/create_model", json={}).status_code, 400)
     self.assertEqual(self.client.get("/api/v1/dashboard/runs/not-a-real-run").status_code, 404)
     self.assertEqual(self.client.get("/api/v1/healthz").status_code, 200)
+    self.assertEqual(self.client.get("/definitely-missing/secret-id").status_code, 404)
 
     observed = http_metrics.snapshot()
     routes = {(route["group"], route["method"], route["route"]) for route in observed["routes"]}
     self.assertIn(("application", "POST", "/api/v1/create_model"), routes)
     self.assertIn(("diagnostic", "GET", "/api/v1/dashboard/runs/{run_id}"), routes)
     self.assertIn(("diagnostic", "GET", "/api/v1/healthz"), routes)
+    self.assertIn(("diagnostic", "GET", "<unmatched>"), routes)
     self.assertNotIn("not-a-real-run", json.dumps(observed), "raw path IDs must never enter telemetry")
+    self.assertNotIn("secret-id", json.dumps(observed), "unmatched raw paths must never enter telemetry")
 
   def test_http_metrics_are_bounded_windowed_and_numeric(self) -> None:
     metrics = HTTPMetrics(max_samples=4)
@@ -458,6 +461,11 @@ class DashboardEndpointsTest(unittest.TestCase):
       self.assertTrue(body["demo"], path)
       if path == "snapshot":
         self.assertEqual(body["schema_version"], 1)
+        http = body["cluster"]["gateway"]["http"]
+        self.assertEqual(set(http["groups"]), {"application", "background", "diagnostic"})
+        self.assertEqual(
+          {route["route"] for route in http["routes"]}, {"/api/v1/forward_backward", "/api/v1/retrieve_future", "/api/v1/dashboard/snapshot"}
+        )
         for stat in body["health"]["stats"]:
           self.assertIn("value_number", stat)
           self.assertIn("unit", stat)

@@ -494,6 +494,45 @@ main { flex: 1; min-height: 0; display: flex; }
 .stat-label { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .stat-detail { color: var(--faint); font-size: 11px; margin-top: 1px; }
 
+.traffic-block { margin: 20px 0; }
+.traffic-groups { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 8px; }
+.traffic-group {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+.traffic-group.warn { border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); }
+.traffic-group-name { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+.traffic-group-value { font: 600 13px var(--mono); font-variant-numeric: tabular-nums; }
+.traffic-group-meta { grid-column: 1 / -1; color: var(--faint); font: 11px var(--mono); }
+.traffic-routes { border-top: 1px solid var(--border); }
+.traffic-route {
+  display: grid;
+  grid-template-columns: 76px 44px minmax(140px, 1fr) 60px 76px 48px;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+.traffic-route-group { color: var(--faint); overflow: hidden; text-overflow: ellipsis; }
+.traffic-route-method { color: var(--muted); font-family: var(--mono); }
+.traffic-route-path { min-width: 0; color: var(--fg); overflow-wrap: anywhere; }
+.traffic-route-count, .traffic-route-latency, .traffic-route-errors { color: var(--muted); font-family: var(--mono); text-align: right; white-space: nowrap; }
+.traffic-route-errors.bad, .traffic-note.warn { color: var(--warn); }
+.traffic-note { margin: 7px 0 0; color: var(--faint); font-size: 11px; }
+
+@media (max-width: 620px) {
+  .traffic-groups { grid-template-columns: 1fr; }
+  .traffic-route { grid-template-columns: auto auto 1fr auto auto; }
+  .traffic-route-path { grid-column: 1 / -1; grid-row: 1; }
+  .traffic-route-group, .traffic-route-method, .traffic-route-count, .traffic-route-latency, .traffic-route-errors { grid-row: 2; }
+}
+
 .queue-row { display: flex; justify-content: space-between; gap: 14px; padding: 5px 0; border-bottom: 1px solid var(--border); }
 .queue-model { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .queue-depth { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
