@@ -407,6 +407,7 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     # Gemma-4 setup in one place.
     gemma4.install_flex_attention()
     gemma4.install_tied_kv_qkv_split()
+    gemma4.install_multimodal_export_passthrough()
     self.initialize_parallel_state()
     print(f"Loading Megatron model {base_model_name} (rank {os.getenv('RANK', '0')}/{os.getenv('WORLD_SIZE', '1')}, TP={self.tp_size})...")
 

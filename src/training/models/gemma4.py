@@ -1,7 +1,7 @@
 # Gemma-4 workarounds for the Megatron backend.
 """What Gemma-4 needs that the generic Megatron path does not provide.
 
-Gemma-4 is unusual on three axes at once, and each one breaks a different piece
+Gemma-4 is unusual on four axes at once, and each one breaks a different piece
 of the stack:
 
   * Heterogeneous attention. Five layers in six are sliding-window grouped-query
@@ -11,14 +11,17 @@ of the stack:
     limit on sm90, so both megatron's core attention and Transformer Engine fall
     back to materializing [batch, heads, seq, seq] scores.
   * A renamed architecture string, from transformers 5.10.
+  * A multimodal checkpoint we convert text-only, shipped as a single unsharded
+    safetensors file. The vision and audio weights have nowhere to come from,
+    and the writer needs every key in a shard before it writes any of it.
 
 install_flex_attention is the one that buys context (see its docstring); the
-other three are correctness fixes without which the LoRA export cannot complete
+other four are correctness fixes without which the LoRA export cannot complete
 at all, which takes save_checkpoint and weight sync with it.
 
 Verified against megatron-core 0.19.0 / megatron-bridge 0.6.0 and
 transformers 5.10 on 2026-08-26. Every one of these is a monkeypatch against a
-pinned dependency, so all four are written to fail loudly and locally if the
+pinned dependency, so all five are written to fail loudly and locally if the
 seam moves -- except install_flex_attention, which degrades to the stock
 attention and only costs a lower context ceiling.
 """
@@ -155,6 +158,106 @@ def install_tied_kv_qkv_split() -> bool:
 
   Gemma4Bridge._is_fused_qkv = is_fused_qkv
   Gemma4Bridge._open_rl_tied_kv_qkv = True
+  return True
+
+
+# -- Multimodal weights on a text-only export ---------------------------------
+
+# The only weights a text-mode conversion is allowed to leave unproduced. Every
+# other name is a language tensor, and a language tensor missing from the export
+# is a real bug that has to keep raising -- filling one of those in from the base
+# snapshot would silently ship a checkpoint with untrained weights in it.
+MULTIMODAL_SOURCE_PREFIXES = (
+  "model.embed_audio.",
+  "model.embed_vision.",
+  "model.vision_embedder.",
+  "model.vision_tower.",
+  "model.audio_tower.",
+)
+
+
+def install_multimodal_export_passthrough() -> bool:
+  """Copy the vision/audio weights through the export, so its one shard completes.
+
+  register_unified_bridge sets GEMMA4_CONVERSION_MODE=text, so the Megatron model
+  holds the language tower and nothing else, and the export yields 666 of the
+  checkpoint's 677 tensors. google/gemma-4-12B-it ships as a single unsharded
+  model.safetensors with no index, so SafeTensorsStateSource maps all 677 keys to
+  that one file -- and SafeTensorsStateSource.save_generator writes a shard only
+  once every key in it has arrived. Eleven never do. The shard never completes,
+  all 666 converted language tensors are dropped on the floor, and the save
+  raises for 677 missing tensors having been handed 666 correct ones.
+
+  That is what killed run34 at its first checkpoint, and it is why the Megatron
+  save path had never once succeeded: it is not reachable at all for a text-only
+  export of a multimodal checkpoint that is not sharded.
+
+  The eleven are provably unchanged by training -- there is no vision or audio
+  module anywhere in the Megatron model to change them -- so read them from the
+  base snapshot and append them. Preferred over save_generator's strict=False,
+  which would write the 666 and skip the rest: save_artifacts copies the original
+  multimodal config.json, which advertises a vision tower, and the vLLM eval job
+  loads what that config describes. Passing the weights through keeps the
+  checkpoint matching its own config, and keeps the completeness check armed.
+
+  Upstream hits the identical mechanism for MTP heads and solves it the same way,
+  with save_generator's ignored_source_key_prefixes -- but auto_bridge populates
+  that for MTP only and exposes no kwarg, so there is nothing to hook.
+
+  Patched on Gemma4VLBridge, not on MegatronModelBridge, so no other
+  architecture's export can be completed out of its own base checkpoint.
+  """
+  from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
+  from megatron.bridge.models.gemma_vl.gemma4_vl_bridge import Gemma4VLBridge
+
+  if getattr(Gemma4VLBridge, "_open_rl_multimodal_passthrough", False):
+    return True
+  original = Gemma4VLBridge.stream_weights_megatron_to_hf
+
+  # Mirrors the upstream signature rather than taking *args, so a seam that moves
+  # raises here instead of quietly passing the wrong argument through.
+  def stream_weights_megatron_to_hf(
+    self,
+    megatron_model,  # noqa: ANN001
+    hf_pretrained,  # noqa: ANN001
+    cpu: bool = True,
+    show_progress: bool = True,
+    conversion_tasks=None,  # noqa: ANN001
+    merge_adapter_weights: bool = True,
+    weight_dtype=None,  # noqa: ANN001
+  ):
+    exported = set()
+    for name, weight in original(
+      self,
+      megatron_model,
+      hf_pretrained,
+      cpu=cpu,
+      show_progress=show_progress,
+      conversion_tasks=conversion_tasks,
+      merge_adapter_weights=merge_adapter_weights,
+      weight_dtype=weight_dtype,
+    ):
+      exported.add(name)
+      yield HFWeightTuple(name, weight)
+
+    source = getattr(getattr(hf_pretrained, "state", None), "source", None)
+    if source is None or not hasattr(source, "get_all_keys"):
+      return
+    missing = [key for key in source.get_all_keys() if key not in exported]
+    if not missing:
+      return
+    unexpected = sorted(key for key in missing if not key.startswith(MULTIMODAL_SOURCE_PREFIXES))
+    if unexpected:
+      raise RuntimeError(
+        f"Gemma-4 export is missing {len(unexpected)} language tensor(s), which this "
+        f"passthrough must not fill in from the base checkpoint: {unexpected[:8]}"
+      )
+    print(f"[Megatron Worker] Copying {len(missing)} vision/audio tensor(s) through the text-only export.")
+    for name, weight in source.load_tensors(missing).items():
+      yield HFWeightTuple(name, weight.to(weight_dtype) if weight_dtype is not None else weight)
+
+  Gemma4VLBridge.stream_weights_megatron_to_hf = stream_weights_megatron_to_hf
+  Gemma4VLBridge._open_rl_multimodal_passthrough = True
   return True
 
 
