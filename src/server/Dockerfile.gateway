@@ -21,17 +21,18 @@ COPY uv.lock .
 
 # Configure uv for Docker and caching
 ENV UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_NO_SYNC=1
 
 # Install ONLY core dependencies using uv (ignoring massive ML extras)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project
+    uv sync --frozen --no-install-project --extra cluster
 
 # Copy source code
 COPY . .
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen
+# Source is mounted directly instead of rebuilding the project when the pod starts.
+ENV PYTHONPATH="/app/src:/app"
 
 EXPOSE 8000
 

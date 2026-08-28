@@ -1,4 +1,4 @@
-.PHONY: server vllm test lint fmt help push-vm pull-vm
+.PHONY: server vllm test lint fmt help push-vm pull-vm kind-dashboard-smoke kind-dashboard-clean
 
 # ---------------------------------------------------------------------------
 # Knobs (override on the command line: make server BASE_MODEL=... SAMPLING_BACKEND=...)
@@ -38,7 +38,9 @@ help:
 	@echo "make test e2e tiny-fft TRAINING_TEST_ARGS='steps=20'"
 	@echo "make test e2e fft-gsm8k TRAINING_TEST_ARGS='steps=10 eval_examples=8 extra=\"batch=2\"'"
 	@echo "make test piglatin                      # pig-latin example end-to-end tests"
-	@echo "make ops health|problems|inspect|runs   # cluster ops as JSON (dashboard at $(BASE_URL)/dashboard)"
+	@echo "make ops diagnose                      # one-call cluster triage as JSON"
+	@echo "make ops health|problems|inspect|runs   # focused cluster ops (dashboard at $(BASE_URL)/dashboard)"
+	@echo "make kind-dashboard-smoke              # build, deploy, and verify the dashboard in Kind"
 	@echo "make lint | fmt"
 
 # ---------------------------------------------------------------------------
@@ -47,7 +49,7 @@ help:
 server:
 	@-kill -9 $$(lsof -ti:$(PORT)) 2>/dev/null || true
 	BASE_MODEL="$(BASE_MODEL)" SAMPLING_BACKEND="$(SAMPLING_BACKEND)" \
-	  uv run --extra $(if $(filter vllm,$(SAMPLING_BACKEND)),gpu,cpu) \
+	  uv run --extra $(if $(filter vllm,$(SAMPLING_BACKEND)),gpu,cpu) --extra cluster \
 	  python -m uvicorn server.gateway:app --host $(HOST) --port $(PORT)
 
 vllm:
@@ -89,7 +91,7 @@ test:
 	@mode="$(TEST_MODE)"; \
 	scenario="$(TEST_SCENARIO)"; \
 	if [ -z "$$mode" ] || [ "$$mode" = "unit" ]; then \
-	  uv run --frozen --exact --extra cpu python -m unittest $(UNIT_TESTS); \
+	  uv run --frozen --exact --extra cpu --extra cluster python -m unittest $(UNIT_TESTS); \
 	elif [ "$$mode" = "e2e" ]; then \
 	  if [ -z "$$scenario" ]; then \
 	    echo "Missing e2e scenario. Expected tiny-lora, tiny-fft, tiny-rl, lora-textsql, fft-gsm8k, or fft-gsm8k-x2."; \
@@ -146,6 +148,12 @@ rollout:
 
 dashboard-apply:
 	@dev/monitoring/apply_dashboard.sh $(GCP_PROJECT)
+
+kind-dashboard-smoke:
+	@dev/kind/dashboard-smoke.sh
+
+kind-dashboard-clean:
+	kind delete cluster --name open-rl-dashboard
 
 # ---------------------------------------------------------------------------
 # Misc

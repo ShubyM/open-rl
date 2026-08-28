@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLUSTER_NAME=${KIND_CLUSTER_NAME:-open-rl-dashboard}
+IMAGE=${DASHBOARD_IMAGE:-open-rl-dashboard:dev}
+PORT=${DASHBOARD_PORT:-9013}
+CONTEXT="kind-${CLUSTER_NAME}"
+
+for command in kind kubectl docker curl python3; do
+  command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 1; }
+done
+
+if ! kind get clusters | grep -Fxq "$CLUSTER_NAME"; then
+  kind create cluster --name "$CLUSTER_NAME" --wait 90s
+fi
+
+docker build -f src/server/Dockerfile.gateway -t "$IMAGE" .
+kind load docker-image "$IMAGE" --name "$CLUSTER_NAME"
+kubectl --context "$CONTEXT" apply -k dev/kind/dashboard
+kubectl --context "$CONTEXT" rollout restart deployment/open-rl-dashboard
+kubectl --context "$CONTEXT" rollout status deployment/open-rl-dashboard --timeout=120s
+
+forward_log=$(mktemp)
+snapshot_file=$(mktemp)
+kubectl --context "$CONTEXT" port-forward service/open-rl-dashboard "${PORT}:8000" >"$forward_log" 2>&1 &
+forward_pid=$!
+trap 'kill "$forward_pid" 2>/dev/null || true; rm -f "$forward_log" "$snapshot_file"' EXIT
+
+for _ in $(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:${PORT}/api/v1/healthz" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/snapshot" >"$snapshot_file"
+curl -fsS "http://127.0.0.1:${PORT}/dashboard" | grep -Fq "open-rl operations"
+
+dashboard_pod=$(kubectl --context "$CONTEXT" get pods -l app=open-rl-dashboard -o jsonpath='{.items[0].metadata.name}')
+curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/pods/${dashboard_pod}/logs?tail=5" |
+  python3 -c 'import json,sys; assert "text" in json.load(sys.stdin)'
+kubectl --context "$CONTEXT" auth can-i delete pods --as system:serviceaccount:default:open-rl-dashboard | grep -Fxq yes
+if kubectl --context "$CONTEXT" logs deployment/open-rl-dashboard | grep -Fq "Building open-rl"; then
+  echo "gateway performed an unexpected runtime package rebuild" >&2
+  exit 1
+fi
+
+python3 - "$snapshot_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+  snapshot = json.load(f)
+
+cluster = snapshot["cluster"]
+assert cluster["kubernetes"]["available"], cluster["kubernetes"]
+assert cluster["kubernetes"]["namespace"] == "default", cluster["kubernetes"]
+assert cluster["pools"], "expected the Kind node in a cluster pool"
+assert any(pod["name"].startswith("open-rl-dashboard-") for pod in cluster["pods"]), cluster["pods"]
+checks = {check["id"]: check for check in snapshot["health"]["checks"]}
+assert checks["kubernetes"]["status"] == "ok", checks["kubernetes"]
+assert not snapshot["problems"]["problems"], snapshot["problems"]
+print("Kind dashboard smoke passed:", len(cluster["pods"]), "pod(s),", len(cluster["pools"]), "pool(s)")
+PY
+
+run_id=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/v1/dashboard/runs" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_model":"Qwen/Qwen3-0.6B"}' |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["request_id"])')
+curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/snapshot" >"$snapshot_file"
+python3 - "$snapshot_file" "$run_id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+  snapshot = json.load(f)
+assert any(run["run_id"] == sys.argv[2] for run in snapshot["runs"]["runs"]), snapshot["runs"]
+PY
+
+echo "Dashboard UI, launch, cluster snapshot, pod logs, and stop permission verified in Kind"

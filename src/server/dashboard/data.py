@@ -345,6 +345,25 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
   }
 
 
+async def diagnostic_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | None, k8s: dict) -> dict:
+  """Build one coherent dashboard payload from one Kubernetes observation."""
+  cluster, runs, checks, operational = await asyncio.gather(
+    cluster_snapshot(store, k8s),
+    runs_snapshot(store, worker_manager, k8s["pods"]),
+    health_checks(store, k8s),
+    operational_stats(store, k8s, worker_manager),
+  )
+  stats, queues = operational
+  return {
+    "demo": False,
+    "generated_at": iso_timestamp(time.time()),
+    "cluster": cluster,
+    "runs": runs,
+    "health": {"demo": False, "checks": checks, "stats": stats, "queues": queues},
+    "problems": {"demo": False, "problems": derive_problems(checks, k8s)},
+  }
+
+
 # *** Runs ***
 
 
@@ -627,7 +646,9 @@ async def operational_stats(store: RequestStore, k8s: dict, worker_manager: FFTW
     total_gpus = sum(node["gpu_capacity"] for node in k8s["nodes"])
     if total_gpus:
       claimed = sum(pod.get("gpus", 0) for pod in k8s["pods"] if pod["node"] and pod["phase"] not in TERMINAL_POD_PHASES)
-      stats.append(stat_entry("gpus.claimed", "GPUs claimed", f"{min(claimed, total_gpus)}/{total_gpus}", "across all pools"))
+      ratio = claimed / total_gpus
+      detail = "across all pools" if ratio <= 1 else f"{ratio:.1f}× allocation overcommit across all pools"
+      stats.append(stat_entry("gpus.claimed", "GPUs claimed", f"{claimed}/{total_gpus}", detail))
   return stats, queues
 
 

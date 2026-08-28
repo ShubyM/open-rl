@@ -646,6 +646,32 @@ function renderRuns(data) {
   );
 }
 
+$("launch-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("launch-model");
+  const button = $("launch-button");
+  const baseModel = input.value.trim();
+  if (!baseModel) return;
+
+  localStorage.setItem("openrl-base-model", baseModel);
+  button.disabled = true;
+  setText($("launch-note"), "Launching…");
+  try {
+    const result = await fetchJSON("/api/v1/dashboard/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base_model: baseModel }),
+    });
+    setText($("launch-note"), result.launched === false ? "Demo mode — nothing launched" : `Queued ${result.request_id}`);
+    if (result.launched !== false) await refresh();
+  } catch (err) {
+    setText($("launch-note"), `Launch failed: ${err.message}`);
+  } finally {
+    button.disabled = false;
+  }
+});
+$("launch-model").value = localStorage.getItem("openrl-base-model") || "";
+
 async function onStopClick(runId, btn) {
   if (S.stopConfirm !== runId) {
     S.stopConfirm = runId;
@@ -872,29 +898,21 @@ async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
-    const [cluster, runs, health, problems] = await Promise.allSettled([
-      fetchJSON("/api/v1/dashboard/cluster"),
-      fetchJSON("/api/v1/dashboard/runs"),
-      fetchJSON("/api/v1/dashboard/health"),
-      fetchJSON("/api/v1/dashboard/problems"),
-    ]);
-    if (cluster.status === "fulfilled") {
-      S.cluster = cluster.value;
-      renderCluster(S.cluster);
-      updatePanel();
-      renderPool();
-    }
-    if (runs.status === "fulfilled") {
-      S.runs = runs.value;
-      renderRuns(S.runs);
-    }
-    if (health.status === "fulfilled") S.health = health.value;
-    if (problems.status === "fulfilled") S.problems = problems.value;
+    const snapshot = await fetchJSON("/api/v1/dashboard/snapshot");
+    S.cluster = snapshot.cluster;
+    S.runs = snapshot.runs;
+    S.health = snapshot.health;
+    S.problems = snapshot.problems;
+    renderCluster(S.cluster);
+    updatePanel();
+    renderPool();
+    renderRuns(S.runs);
     renderHealth(S.health, S.problems);
-    const demo = [S.cluster, S.runs, S.health].some((d) => d?.demo);
-    $("demo-banner").hidden = !demo;
-    const anyOk = [cluster, runs, health, problems].some((r) => r.status === "fulfilled");
-    setText($("updated-at"), anyOk ? `updated ${new Date().toLocaleTimeString()}` : "gateway unreachable");
+    $("demo-banner").hidden = !snapshot.demo;
+    const updated = snapshot.generated_at ? new Date(snapshot.generated_at) : new Date();
+    setText($("updated-at"), `updated ${updated.toLocaleTimeString()}`);
+  } catch (err) {
+    setText($("updated-at"), `refresh failed: ${err.message}`);
   } finally {
     refreshing = false;
   }

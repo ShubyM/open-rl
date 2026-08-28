@@ -16,6 +16,21 @@ STATIC_DIR = Path(__file__).parent / "static"
 router = APIRouter(prefix="/api/v1/dashboard")
 
 
+@router.get("/snapshot")
+async def dashboard_snapshot(request: Request):
+  if data.demo_mode_enabled():
+    return {
+      "demo": True,
+      "notice": demo.DEMO_NOTICE,
+      "cluster": demo.demo_cluster(),
+      "runs": demo.demo_runs(),
+      "health": demo.demo_health(),
+      "problems": demo.demo_problems(),
+    }
+  k8s = await asyncio.to_thread(data.k8s_snapshot)
+  return await data.diagnostic_snapshot(get_store(), request.app.state.fft_worker_manager, k8s)
+
+
 @router.get("/cluster")
 async def dashboard_cluster():
   if data.demo_mode_enabled():
@@ -30,6 +45,20 @@ async def dashboard_runs(request: Request):
     return demo.demo_runs()
   k8s = await asyncio.to_thread(data.k8s_snapshot)
   return await data.runs_snapshot(get_store(), request.app.state.fft_worker_manager, k8s["pods"])
+
+
+@router.post("/runs")
+async def dashboard_launch_run(payload: dict):
+  if data.demo_mode_enabled():
+    return {
+      "demo": True,
+      "notice": demo.DEMO_NOTICE,
+      "request_id": "demo-run-not-created",
+      "launched": False,
+    }
+  from server import gateway
+
+  return await gateway.create_model(payload)
 
 
 @router.get("/runs/{run_id}")

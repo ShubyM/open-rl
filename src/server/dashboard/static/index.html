@@ -68,8 +68,14 @@
           <h1>Runs</h1>
           <span id="runs-count" class="page-count"></span>
         </div>
+        <form id="launch-form" class="launch-form">
+          <label for="launch-model">Base model</label>
+          <input id="launch-model" name="base-model" autocomplete="off" placeholder="Qwen/Qwen3-8B" required>
+          <button id="launch-button" class="btn" type="submit">Launch run</button>
+          <span id="launch-note" class="launch-note" aria-live="polite"></span>
+        </form>
         <div id="runs-list" class="runs-list"></div>
-        <p id="runs-empty" class="empty" hidden>No runs. Launch one with the SDK, or <code>ops.py launch --base-model &lt;model&gt;</code>.</p>
+        <p id="runs-empty" class="empty" hidden>No runs yet.</p>
       </div>
     </section>
 

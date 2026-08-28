@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: open-rl-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: open-rl-dashboard
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: open-rl-dashboard
+subjects:
+  - kind: ServiceAccount
+    name: open-rl-dashboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: open-rl-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: open-rl-dashboard-node-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: open-rl-dashboard-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: open-rl-dashboard
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: open-rl-dashboard-node-reader
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-rl-dashboard
+spec:
+  selector:
+    app: open-rl-dashboard
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-rl-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: open-rl-dashboard
+  template:
+    metadata:
+      labels:
+        app: open-rl-dashboard
+    spec:
+      serviceAccountName: open-rl-dashboard
+      containers:
+        - name: gateway
+          image: open-rl-dashboard:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: ENABLE_GCP_TRACE
+              value: "0"
+            - name: OPEN_RL_WORKER_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          readinessProbe:
+            httpGet:
+              path: /api/v1/healthz
+              port: 8000
+            periodSeconds: 2
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: dashboard-state
+              mountPath: /tmp/open-rl
+      volumes:
+        - name: dashboard-state
+          emptyDir: {}

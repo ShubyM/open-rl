@@ -405,6 +405,35 @@ main { flex: 1; min-height: 0; display: flex; }
 .queue-model { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .queue-depth { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
+.launch-form {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 1fr) auto;
+  align-items: center;
+  gap: 8px 10px;
+  margin-bottom: 18px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.launch-form label { color: var(--muted); font-size: 12px; }
+.launch-form input {
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--fg);
+  font: 12px var(--mono);
+}
+.launch-form input:focus { outline: 2px solid var(--border-strong); outline-offset: 1px; }
+.launch-note { grid-column: 2 / -1; min-height: 16px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+
+@media (max-width: 620px) {
+  .launch-form { grid-template-columns: 1fr; }
+  .launch-note { grid-column: 1; }
+}
+
 .problem { display: flex; gap: 10px; padding: 6px 0; align-items: baseline; }
 .problem-sev { font-family: var(--mono); font-size: 11px; text-transform: uppercase; flex: none; width: 44px; }
 .problem-sev.error { color: var(--error); }

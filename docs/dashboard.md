@@ -22,15 +22,18 @@ experiment analysis; nothing here duplicates metrics.
   breakdown at that point in time; the pool's nodes are listed below. Back, Escape, or the Cluster tab
   returns to the canvas with pan/zoom intact. This is truthful scheduler state, not device utilization;
   DCGM owns that.
-- **Runs** — minimal lifecycle control: name, run ID, base model, a W&B link when one is recorded, and a
-  Stop button when there is something to stop (a worker process, queued work, or labeled pods).
+- **Runs** — launch by base model without leaving the page, then inspect name, run ID, base model, and a
+  W&B link when one is recorded. A Stop button appears when there is something to stop (a worker
+  process, queued work, or labeled pods).
 - **Health** — current problems first, then a **Load** section of measured stats (active runs, queued
   requests per run, worker-launch backlog, Redis memory and clients, gateway RSS, disk free, pod and
   GPU totals), then gateway / storage / Kubernetes / visibility checks. Node `MemoryPressure` and
   `DiskPressure` conditions surface under Problems.
 
-The page polls every 8 seconds and updates in place — canvas position, selection, and open log panels
-survive refreshes. Manual refresh and a light/dark toggle are in the top bar.
+The page polls one coherent snapshot every 8 seconds and updates in place — canvas position, selection,
+and open log panels survive refreshes. A refresh lists Kubernetes state once, so every view describes the
+same observation while avoiding redundant API-server work. Manual refresh and a light/dark toggle are in
+the top bar.
 
 ## JSON API and ops CLI
 
@@ -38,17 +41,27 @@ The UI serves humans; the same primitives are exposed as JSON for agents and scr
 
 | Primitive | Endpoint | CLI |
 | --- | --- | --- |
+| diagnose | `GET /api/v1/dashboard/snapshot` | `make ops diagnose` |
 | health | `GET /api/v1/dashboard/health` | `make ops health` |
 | problems | `GET /api/v1/dashboard/problems` | `make ops problems` |
 | inspect | `GET /api/v1/dashboard/cluster` | `make ops inspect` |
 | runs | `GET /api/v1/dashboard/runs` | `make ops runs` |
 | run detail | `GET /api/v1/dashboard/runs/{run_id}?logs=N` | `make ops run <run_id> --logs N` |
 | logs | `GET /api/v1/dashboard/pods/{pod}/logs` | `make ops logs <pod>` |
-| launch | `POST /api/v1/create_model` | `make ops launch --base-model <model>` |
+| launch | `POST /api/v1/dashboard/runs` | `make ops launch --base-model <model>` |
 | stop | `POST /api/v1/dashboard/runs/{run_id}/stop` | `make ops stop <run_id>` |
 
 `dev/tools/ops.py` is stdlib-only and always prints JSON; point it at a remote gateway with
 `BASE_URL=http://host:9003`.
+
+## Kind smoke test
+
+`make kind-dashboard-smoke` creates (or reuses) an `open-rl-dashboard` Kind cluster, builds and
+loads the local gateway image, deploys the dashboard with its real service account and RBAC, and
+verifies that the gateway can list its namespace, see the Kind node, serve the UI, and return a
+coherent diagnostic snapshot with no reported problems. It also exercises pod logs and the stop
+permission while rejecting images that rebuild the Python project at pod startup. The cluster is
+left running for inspection; remove it with `make kind-dashboard-clean`.
 
 ## Data sources — everything degrades gracefully
 

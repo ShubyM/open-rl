@@ -44,6 +44,7 @@ def main() -> None:
 
   sub.add_parser("health", help="Gateway, storage, Kubernetes, and visibility checks")
   sub.add_parser("problems", help="Everything currently wrong, most severe first")
+  sub.add_parser("diagnose", help="One coherent snapshot of cluster, runs, load, health, and problems")
   sub.add_parser("inspect", help="Cluster snapshot: pools, nodes, pods, gateway, services")
   sub.add_parser("runs", help="List runs with lifecycle state")
 
@@ -68,6 +69,8 @@ def main() -> None:
     emit(request("GET", "/api/v1/dashboard/health"))
   elif args.command == "problems":
     emit(request("GET", "/api/v1/dashboard/problems"))
+  elif args.command == "diagnose":
+    emit(request("GET", "/api/v1/dashboard/snapshot"))
   elif args.command == "inspect":
     emit(request("GET", "/api/v1/dashboard/cluster"))
   elif args.command == "runs":
@@ -83,7 +86,7 @@ def main() -> None:
       params["container"] = args.container
     emit(request("GET", f"/api/v1/dashboard/pods/{urllib.parse.quote(args.pod)}/logs?{urllib.parse.urlencode(params)}"))
   elif args.command == "launch":
-    emit(request("POST", "/api/v1/create_model", {"base_model": args.base_model}))
+    emit(request("POST", "/api/v1/dashboard/runs", {"base_model": args.base_model}))
   elif args.command == "stop":
     emit(request("POST", f"/api/v1/dashboard/runs/{urllib.parse.quote(args.run_id)}/stop"))
 

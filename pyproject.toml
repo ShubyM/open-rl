@@ -44,6 +44,9 @@ vllm = [
     "torch-c-dlpack-ext; sys_platform == 'linux'",
     "vllm==0.20.0; sys_platform == 'linux'",
 ]
+cluster = [
+    "kubernetes>=29",
+]
 
 [tool.setuptools.package-dir]
 "" = "src"

@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -39,6 +40,21 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertLessEqual({"runs.active", "queue.requests", "queue.launch"}, stat_ids)
     self.assertIsInstance(body["queues"], list)
 
+  def test_snapshot_reads_kubernetes_once_and_bundles_triage_state(self) -> None:
+    k8s = {"available": True, "namespace": "test", "error": None, "pods": [], "nodes": []}
+    with mock.patch.object(data, "k8s_snapshot", return_value=k8s) as snapshot:
+      resp = self.client.get("/api/v1/dashboard/snapshot")
+
+    self.assertEqual(resp.status_code, 200)
+    body = resp.json()
+    self.assertFalse(body["demo"])
+    self.assertIsNotNone(body["generated_at"])
+    self.assertEqual({"cluster", "runs", "health", "problems"}, set(body) & {"cluster", "runs", "health", "problems"})
+    self.assertEqual(body["cluster"]["kubernetes"]["namespace"], "test")
+    self.assertIn("checks", body["health"])
+    self.assertIn("problems", body["problems"])
+    snapshot.assert_called_once_with()
+
   def test_cluster_degrades_without_kubernetes(self) -> None:
     resp = self.client.get("/api/v1/dashboard/cluster")
     self.assertEqual(resp.status_code, 200)
@@ -71,6 +87,18 @@ class DashboardEndpointsTest(unittest.TestCase):
       self.assertIn("model-def-456", runs)
       self.assertIn("checkpoint", runs["model-def-456"]["sources"])
 
+  def test_dashboard_launch_validates_base_model(self) -> None:
+    resp = self.client.post("/api/v1/dashboard/runs", json={})
+    self.assertEqual(resp.status_code, 400)
+    self.assertEqual(resp.json()["error"], "base_model is required")
+
+  def test_dashboard_demo_launch_is_non_mutating(self) -> None:
+    os.environ["OPEN_RL_DASHBOARD_DEMO"] = "1"
+    resp = self.client.post("/api/v1/dashboard/runs", json={"base_model": "Qwen/Qwen3-8B"})
+    self.assertEqual(resp.status_code, 200)
+    self.assertTrue(resp.json()["demo"])
+    self.assertFalse(resp.json()["launched"])
+
   def test_run_detail_bundles_run_state(self) -> None:
     old_tmp_dir = os.environ.get("OPEN_RL_TMP_DIR")
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -95,7 +123,7 @@ class DashboardEndpointsTest(unittest.TestCase):
 
   def test_demo_mode_flags_every_payload(self) -> None:
     os.environ["OPEN_RL_DASHBOARD_DEMO"] = "1"
-    for path in ("cluster", "runs", "health", "problems", "pods/any-pod/logs", "runs/demo-run-1?logs=5"):
+    for path in ("snapshot", "cluster", "runs", "health", "problems", "pods/any-pod/logs", "runs/demo-run-1?logs=5"):
       body = self.client.get(f"/api/v1/dashboard/{path}").json()
       self.assertTrue(body["demo"], path)
       self.assertIn("fictional", body["notice"], path)
@@ -166,6 +194,26 @@ class DashboardEndpointsTest(unittest.TestCase):
     tracker.record(pools, pods, now=100.0)
     duty = tracker.duty(pools[0])
     self.assertEqual(duty["current"], 2.0, "time-sliced overcommit must not be clamped to 100%")
+
+  def test_operational_stats_report_gpu_overcommit_honestly(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    k8s = {
+      "available": True,
+      "namespace": "test",
+      "error": None,
+      "nodes": [{"gpu_capacity": 1}],
+      "pods": [
+        {"node": "n1", "phase": "Running", "gpus": 1},
+        {"node": "n1", "phase": "Running", "gpus": 1},
+      ],
+    }
+    stats, _ = asyncio.run(data.operational_stats(InMemoryStore(), k8s, worker_manager=None))
+    gpu = next(stat for stat in stats if stat["id"] == "gpus.claimed")
+    self.assertEqual(gpu["value"], "2/1")
+    self.assertIn("2.0× allocation overcommit", gpu["detail"])
 
   def test_runs_with_unknown_created_at_sort_last(self) -> None:
     import asyncio
