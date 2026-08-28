@@ -1,4 +1,4 @@
-.PHONY: server vllm test lint fmt help push-vm pull-vm kind-dashboard-smoke kind-dashboard-clean
+.PHONY: server vllm test lint fmt help push-vm pull-vm kind-dashboard-smoke kind-dashboard-ui-smoke kind-dashboard-clean
 
 # ---------------------------------------------------------------------------
 # Knobs (override on the command line: make server BASE_MODEL=... SAMPLING_BACKEND=...)
@@ -45,6 +45,7 @@ help:
 	@echo "make ops logs POD --previous            # read a restarted container's prior logs"
 	@echo "make ops launch Qwen/Qwen3-0.6B        # launch without Make swallowing CLI flags"
 	@echo "make kind-dashboard-smoke              # build, deploy, and verify the dashboard in Kind"
+	@echo "make kind-dashboard-ui-smoke           # real-browser layout smoke against the running Kind dashboard"
 	@echo "make lint | fmt"
 
 # ---------------------------------------------------------------------------
@@ -155,6 +156,9 @@ dashboard-apply:
 
 kind-dashboard-smoke:
 	@dev/kind/dashboard-smoke.sh
+
+kind-dashboard-ui-smoke:
+	@dev/kind/dashboard-ui-smoke.sh
 
 kind-dashboard-clean:
 	kind delete cluster --name open-rl-dashboard

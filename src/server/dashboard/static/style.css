@@ -112,8 +112,21 @@ button { font: inherit; color: inherit; }
   background: var(--error);
 }
 
-.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
-.updated-at { color: var(--faint); font-size: 11px; font-family: var(--mono); }
+.topbar-right { min-width: 0; margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.updated-at { color: var(--faint); font-size: 11px; font-family: var(--mono); white-space: nowrap; }
+
+@media (max-width: 720px) {
+  .topbar { gap: 8px; padding: 0 8px; }
+  .tab { padding: 0 8px; }
+  .tab.active::after { left: 8px; right: 8px; }
+  #build-at { display: none; }
+  #updated-at { font-size: 0; }
+  #updated-at::after { content: attr(data-compact); font-size: 11px; }
+}
+
+@media (max-width: 360px) {
+  #updated-at { display: none; }
+}
 
 .icon-btn {
   display: inline-flex;
@@ -131,7 +144,7 @@ button { font: inherit; color: inherit; }
 .icon-btn:hover { color: var(--fg); border-color: var(--border-strong); }
 
 main { flex: 1; min-height: 0; display: flex; }
-.view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .view[hidden] { display: none; }
 
 /* *** Cluster canvas *** */
@@ -546,6 +559,13 @@ main { flex: 1; min-height: 0; display: flex; }
 .check-status.error { color: var(--error); font-weight: 600; }
 .check-status.warn { color: var(--warn); font-weight: 600; }
 .check-detail { color: var(--muted); overflow-wrap: anywhere; }
+
+@media (max-width: 620px) {
+  .check { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; align-items: baseline; }
+  .check-label { width: auto; min-width: 0; }
+  .check-status { width: auto; }
+  .check-detail { grid-column: 1 / -1; }
+}
 
 /* *** Pod side panel *** */
 

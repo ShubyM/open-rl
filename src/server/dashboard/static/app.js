@@ -1299,9 +1299,18 @@ async function refresh() {
     const observed = observation
       ? ` · k8s ${observation.source} · ${compactNumber(observation.age_seconds)}s old · ${compactNumber(observation.collection_ms)} ms collect`
       : "";
-    setText($("updated-at"), `updated ${updated.toLocaleTimeString()}${observed}`);
+    const updatedAt = $("updated-at");
+    setText(updatedAt, `updated ${updated.toLocaleTimeString()}${observed}`);
+    updatedAt.dataset.compact = observation ? `k8s ${observation.source} ${compactNumber(observation.collection_ms)}ms` : updated.toLocaleTimeString();
+    const components = Object.entries(observation?.components_ms || {}).map(([name, milliseconds]) => `${name} ${compactNumber(milliseconds)}ms`).join(" · ");
+    updatedAt.title = observation
+      ? `observed ${observation.observed_at} · ${compactNumber(observation.age_seconds)}s old · total ${compactNumber(observation.collection_ms)}ms${components ? ` · ${components}` : ""}`
+      : `updated ${updated.toLocaleString()}`;
   } catch (err) {
-    setText($("updated-at"), `refresh failed: ${err.message}`);
+    const updatedAt = $("updated-at");
+    setText(updatedAt, `refresh failed: ${err.message}`);
+    updatedAt.dataset.compact = "refresh failed";
+    updatedAt.title = err.message;
   } finally {
     refreshing = false;
   }
