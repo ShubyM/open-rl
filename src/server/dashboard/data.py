@@ -155,6 +155,74 @@ def usage_values(usage: dict | None) -> dict:
   return {"cpu_cores": quantity_number(usage.get("cpu")), "memory_bytes": int(quantity_number(usage.get("memory")))}
 
 
+def container_resource_summary(container: Any | None) -> dict:
+  resources = getattr(container, "resources", None)
+  requests = (getattr(resources, "requests", None) or {}) if resources else {}
+  limits = (getattr(resources, "limits", None) or {}) if resources else {}
+  return {
+    "requests": {
+      "cpu_cores": quantity_number(requests.get("cpu")),
+      "memory_bytes": int(quantity_number(requests.get("memory"))),
+    },
+    "limits": {
+      "cpu_cores": quantity_number(limits["cpu"]) if "cpu" in limits else None,
+      "memory_bytes": int(quantity_number(limits["memory"])) if "memory" in limits else None,
+    },
+  }
+
+
+def pod_resource_summary(pod: Any) -> dict:
+  """Effective CPU/memory reservation with pod-level precedence and peak-init semantics.
+
+  Requests omitted by a container are zero. A missing limit means the pod is unbounded for
+  that resource and remains None instead of being presented as a zero-byte limit.
+  """
+  app = [container_resource_summary(container) for container in (pod.spec.containers or [])]
+  init = [container_resource_summary(container) for container in (getattr(pod.spec, "init_containers", None) or [])]
+  overhead = usage_values(getattr(pod.spec, "overhead", None))
+  pod_resources = getattr(pod.spec, "resources", None)
+  pod_requests = (getattr(pod_resources, "requests", None) or {}) if pod_resources else {}
+  pod_limits = (getattr(pod_resources, "limits", None) or {}) if pod_resources else {}
+
+  def effective_request(key: str) -> float:
+    app_sum = sum(container["requests"][key] for container in app)
+    init_peak = max((container["requests"][key] for container in init), default=0)
+    return max(app_sum, init_peak) + overhead[key]
+
+  def effective_limit(key: str) -> float | None:
+    app_limits = [container["limits"][key] for container in app]
+    init_limits = [container["limits"][key] for container in init]
+    if any(value is None for value in (*app_limits, *init_limits)):
+      return None
+    app_sum = sum(app_limits)
+    init_peak = max(init_limits, default=0)
+    return max(app_sum, init_peak) + overhead[key]
+
+  def request(key: str, resource_name: str) -> float:
+    if resource_name in pod_requests:
+      return quantity_number(pod_requests[resource_name]) + overhead[key]
+    return effective_request(key)
+
+  def limit(key: str, resource_name: str) -> float | None:
+    if resource_name in pod_limits:
+      return quantity_number(pod_limits[resource_name]) + overhead[key]
+    return effective_limit(key)
+
+  cpu_limit = limit("cpu_cores", "cpu")
+  memory_limit = limit("memory_bytes", "memory")
+
+  return {
+    "requests": {
+      "cpu_cores": request("cpu_cores", "cpu"),
+      "memory_bytes": int(request("memory_bytes", "memory")),
+    },
+    "limits": {
+      "cpu_cores": cpu_limit,
+      "memory_bytes": int(memory_limit) if memory_limit is not None else None,
+    },
+  }
+
+
 def resource_metrics_snapshot(namespace: str) -> dict:
   api, err = k8s_custom_objects()
   if api is None:
@@ -397,6 +465,11 @@ def pod_gpu_count(pod: Any) -> int:
 
 def pod_to_dict(pod: Any) -> dict:
   statuses = pod.status.container_statuses or []
+  specs = {
+    (kind, container.name): container
+    for kind, items in (("app", pod.spec.containers or []), ("init", getattr(pod.spec, "init_containers", None) or []))
+    for container in items
+  }
   containers = []
   for kind, items in (("app", statuses), ("init", pod.status.init_container_statuses or [])):
     for cs in items:
@@ -430,6 +503,7 @@ def pod_to_dict(pod: Any) -> dict:
           "kind": kind,
           "image": cs.image,
           "image_id": getattr(cs, "image_id", None),
+          "resources": container_resource_summary(specs.get((kind, cs.name))),
           "ready": bool(cs.ready),
           "state": state,
           "reason": reason,
@@ -449,6 +523,7 @@ def pod_to_dict(pod: Any) -> dict:
         "kind": "app",
         "image": c.image,
         "image_id": None,
+        "resources": container_resource_summary(c),
         "ready": False,
         "state": "unknown",
         "reason": None,
@@ -488,6 +563,7 @@ def pod_to_dict(pod: Any) -> dict:
     ],
     "events": [],
     "gpus": pod_gpu_count(pod),
+    "resources": pod_resource_summary(pod),
   }
 
 
@@ -1036,6 +1112,32 @@ def current_gpu_claims(pods: list[dict], nodes: list[dict]) -> dict[str, int]:
   return claims
 
 
+def aggregate_pod_resources(pods: list[dict]) -> dict:
+  requests = {
+    "cpu_cores": sum(((pod.get("resources") or {}).get("requests") or {}).get("cpu_cores") or 0 for pod in pods),
+    "memory_bytes": sum(((pod.get("resources") or {}).get("requests") or {}).get("memory_bytes") or 0 for pod in pods),
+  }
+
+  def aggregate_limit(key: str) -> float | None:
+    values = [((pod.get("resources") or {}).get("limits") or {}).get(key) for pod in pods]
+    return None if any(value is None for value in values) else sum(values)
+
+  measured = [pod for pod in pods if pod.get("usage")]
+  return {
+    "requests": requests,
+    "limits": {
+      "cpu_cores": aggregate_limit("cpu_cores"),
+      "memory_bytes": aggregate_limit("memory_bytes"),
+    },
+    "usage": {
+      "cpu_cores": sum(pod["usage"]["cpu_cores"] for pod in measured),
+      "memory_bytes": sum(pod["usage"]["memory_bytes"] for pod in measured),
+      "measured_pods": len(measured),
+      "total_pods": len(pods),
+    },
+  }
+
+
 def diagnostic_entry(
   code: str,
   severity: str,
@@ -1097,6 +1199,7 @@ def pod_diagnostic(pod: dict, namespace: str | None = None) -> dict | None:
   event_reasons = {event.get("reason") for event in pod.get("events") or []}
   combined = reasons | event_reasons | ({pod.get("reason")} if pod.get("reason") else set())
   problem_lower = (problem or "").lower()
+  resource_evidence = {"resources": pod.get("resources") or {}, "usage": pod.get("usage")}
   code = None
   severity = "warn"
   if "OOMKilled" in combined or "oom" in problem_lower or "out of memory" in problem_lower:
@@ -1131,7 +1234,21 @@ def pod_diagnostic(pod: dict, namespace: str | None = None) -> dict | None:
         "containers": containers,
         "conditions": pod.get("conditions") or [],
         "events": pod.get("events") or [],
+        **resource_evidence,
       },
+      actions=actions,
+    )
+  memory_limit = ((pod.get("resources") or {}).get("limits") or {}).get("memory_bytes")
+  memory_used = (pod.get("usage") or {}).get("memory_bytes")
+  if memory_limit and memory_used is not None and memory_used / memory_limit >= 0.9:
+    ratio = memory_used / memory_limit
+    return diagnostic_entry(
+      "pod.memory_limit_near",
+      "warn",
+      source,
+      f"memory working set is {ratio:.0%} of the pod limit",
+      resource=resource,
+      evidence={"utilization": ratio, **resource_evidence},
       actions=actions,
     )
   if pod.get("restarts", 0) >= 3:
@@ -1141,7 +1258,7 @@ def pod_diagnostic(pod: dict, namespace: str | None = None) -> dict | None:
       source,
       f"{pod['restarts']} container restarts",
       resource=resource,
-      evidence={"phase": pod.get("phase"), "node": pod.get("node"), "restarts": pod["restarts"], "containers": containers},
+      evidence={"phase": pod.get("phase"), "node": pod.get("node"), "restarts": pod["restarts"], "containers": containers, **resource_evidence},
       actions=actions,
     )
   return None
@@ -1297,6 +1414,8 @@ async def runs_snapshot(
   runs = []
   for model_id, info in found.items():
     run_pods = model_pods(model_id, pods)
+    active_resource_pods = [pod for pod in run_pods if pod.get("phase") not in TERMINAL_POD_PHASES]
+    resource_pods = active_resource_pods or run_pods
     run_workloads = model_workloads(model_id, scheduler)
     queue_depth = int(info.get("queue_depth") or 0)
     worker_alive = info.get("worker_alive")
@@ -1319,6 +1438,10 @@ async def runs_snapshot(
             phase: sum(workload["phase"] == phase for workload in run_workloads)
             for phase in sorted({workload["phase"] for workload in run_workloads})
           },
+        },
+        "resources": {
+          **aggregate_pod_resources(resource_pods),
+          "scope": "active" if active_resource_pods else "terminal" if run_pods else "none",
         },
         "queue_depth": queue_depth,
         "queue_oldest_at": info.get("queue_oldest_at"),
@@ -1691,6 +1814,55 @@ async def operational_stats(
           status="warn" if memory_ratio is not None and memory_ratio >= 0.9 else "ok",
         )
       )
+    visible_nodes = {node.get("name") for node in k8s["nodes"] if node.get("name")}
+    scheduled_pods = [pod for pod in k8s["pods"] if pod.get("node") in visible_nodes and pod.get("phase") not in TERMINAL_POD_PHASES]
+    unscheduled_pods = [pod for pod in k8s["pods"] if not pod.get("node") and pod.get("phase") not in TERMINAL_POD_PHASES]
+    reservations = aggregate_pod_resources(scheduled_pods)
+    waiting_reservations = aggregate_pod_resources(unscheduled_pods)
+    cpu_allocatable = sum(node.get("cpu_allocatable_cores") or 0 for node in k8s["nodes"])
+    if cpu_allocatable:
+      cpu_requested = reservations["requests"]["cpu_cores"]
+      cpu_waiting = waiting_reservations["requests"]["cpu_cores"]
+      cpu_request_ratio = cpu_requested / cpu_allocatable
+      stats.append(
+        stat_entry(
+          "cluster.cpu_requests",
+          "CPU requested",
+          f"{cpu_requested:.2f}/{cpu_allocatable:.2f} cores",
+          f"{cpu_request_ratio:.0%} reserved" + (f" · {cpu_waiting:.2f} cores unscheduled" if cpu_waiting else ""),
+          value_number=cpu_requested,
+          unit="cores",
+          context={
+            "allocatable_cores": cpu_allocatable,
+            "request_ratio": cpu_request_ratio,
+            "scheduled_pods": len(scheduled_pods),
+            "unscheduled_request_cores": cpu_waiting,
+          },
+          status="warn" if cpu_request_ratio >= 0.9 else "ok",
+        )
+      )
+    memory_allocatable = sum(node.get("memory_allocatable_bytes") or 0 for node in k8s["nodes"])
+    if memory_allocatable:
+      memory_requested = reservations["requests"]["memory_bytes"]
+      memory_waiting = waiting_reservations["requests"]["memory_bytes"]
+      memory_request_ratio = memory_requested / memory_allocatable
+      stats.append(
+        stat_entry(
+          "cluster.memory_requests",
+          "Memory requested",
+          f"{format_bytes(memory_requested)}/{format_bytes(memory_allocatable)}",
+          f"{memory_request_ratio:.0%} reserved" + (f" · {format_bytes(memory_waiting)} unscheduled" if memory_waiting else ""),
+          value_number=memory_requested,
+          unit="bytes",
+          context={
+            "allocatable_bytes": memory_allocatable,
+            "request_ratio": memory_request_ratio,
+            "scheduled_pods": len(scheduled_pods),
+            "unscheduled_request_bytes": memory_waiting,
+          },
+          status="warn" if memory_request_ratio >= 0.9 else "ok",
+        )
+      )
     scheduler = k8s.get("scheduler") or {}
     if scheduler.get("available"):
       summary = scheduler["summary"]
@@ -1848,7 +2020,16 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
           actions=actions,
         )
       )
-  alerting_stats = {"queue.request_age", "queue.launch_age", "redis.memory", "storage.disk", "cluster.cpu", "cluster.memory"}
+  alerting_stats = {
+    "queue.request_age",
+    "queue.launch_age",
+    "redis.memory",
+    "storage.disk",
+    "cluster.cpu",
+    "cluster.memory",
+    "cluster.cpu_requests",
+    "cluster.memory_requests",
+  }
   for stat in stats or []:
     if stat["status"] != "warn" or stat["id"] not in alerting_stats:
       continue

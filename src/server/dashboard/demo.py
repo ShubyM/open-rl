@@ -5,7 +5,7 @@
 import math
 import time
 
-from server.dashboard.data import derive_problems, run_diagnostics, scheduler_run_diagnostics
+from server.dashboard.data import TERMINAL_POD_PHASES, aggregate_pod_resources, derive_problems, run_diagnostics, scheduler_run_diagnostics
 
 DEMO_NOTICE = "Demo data — every machine, pod, and run on this page is fictional."
 
@@ -331,9 +331,23 @@ def demo_cluster() -> dict:
     "open-rl-sampler-demo-run-1": (3.1, 46 * 2**30),
     "open-rl-sampler-demo-run-2": (0.2, 2 * 2**30),
   }
+  pod_resources = {
+    "open-rl-gateway-7f9c4": ((0.1, 128 * 2**20), (None, 512 * 2**20)),
+    "demo-redis-0": ((0.1, 128 * 2**20), (0.5, 512 * 2**20)),
+    "open-rl-trainer-demo-run-1": ((8, 64 * 2**30), (16, 120 * 2**30)),
+    "open-rl-trainer-demo-run-2": ((8, 64 * 2**30), (16, 120 * 2**30)),
+    "open-rl-sampler-demo-run-1": ((4, 48 * 2**30), (8, 100 * 2**30)),
+    "open-rl-sampler-demo-run-2": ((2, 16 * 2**30), (4, 24 * 2**30)),
+  }
   for pod in snapshot["pods"]:
+    request, limit = pod_resources[pod["name"]]
+    pod["resources"] = {
+      "requests": {"cpu_cores": request[0], "memory_bytes": request[1]},
+      "limits": {"cpu_cores": limit[0], "memory_bytes": limit[1]},
+    }
     for container in pod.get("containers", []):
       container["image_id"] = "ghcr.io/gke-labs/open-rl/demo@sha256:fictional"
+      container["resources"] = pod["resources"]
     if pod["name"] in pod_usage:
       cpu, memory = pod_usage[pod["name"]]
       pod["usage"] = {"cpu_cores": cpu, "memory_bytes": memory}
@@ -343,7 +357,7 @@ def demo_cluster() -> dict:
 
 
 def demo_runs() -> dict:
-  return {
+  snapshot = {
     "demo": True,
     "notice": DEMO_NOTICE,
     "runs": [
@@ -458,6 +472,15 @@ def demo_runs() -> dict:
       },
     ],
   }
+  pods = demo_cluster()["pods"]
+  for run in snapshot["runs"]:
+    run_pods = [pod for pod in pods if pod["name"] in run["pods"]]
+    active = [pod for pod in run_pods if pod["phase"] not in TERMINAL_POD_PHASES]
+    run["resources"] = {
+      **aggregate_pod_resources(active or run_pods),
+      "scope": "active" if active else "terminal" if run_pods else "none",
+    }
+  return snapshot
 
 
 def demo_health() -> dict:
@@ -618,6 +641,26 @@ def demo_health() -> dict:
         "unit": "bytes",
         "detail": "22% of 1.3 TiB allocatable",
         "context": {"allocatable_bytes": 1429365116108, "utilization": 0.2178, "measured_nodes": 5},
+        "status": "ok",
+      },
+      {
+        "id": "cluster.cpu_requests",
+        "label": "CPU requested",
+        "value": "20.20/184.00 cores",
+        "value_number": 20.2,
+        "unit": "cores",
+        "detail": "11% reserved",
+        "context": {"allocatable_cores": 184.0, "request_ratio": 0.1098, "scheduled_pods": 5, "unscheduled_request_cores": 0},
+        "status": "ok",
+      },
+      {
+        "id": "cluster.memory_requests",
+        "label": "Memory requested",
+        "value": "176.2 GiB/1.3 TiB",
+        "value_number": 189246996480,
+        "unit": "bytes",
+        "detail": "13% reserved",
+        "context": {"allocatable_bytes": 1429365116108, "request_ratio": 0.1324, "scheduled_pods": 5, "unscheduled_request_bytes": 0},
         "status": "ok",
       },
       {

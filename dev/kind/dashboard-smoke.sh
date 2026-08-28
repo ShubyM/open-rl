@@ -92,12 +92,20 @@ assert cluster["pools"], "expected the Kind node in a cluster pool"
 assert any(pod["name"].startswith("open-rl-dashboard-") for pod in cluster["pods"]), cluster["pods"]
 dashboard = next(pod for pod in cluster["pods"] if pod["name"].startswith("open-rl-dashboard-"))
 assert dashboard["containers"][0]["image_id"], dashboard["containers"]
+assert dashboard["resources"] == {
+  "requests": {"cpu_cores": 0.1, "memory_bytes": 128 * 2**20},
+  "limits": {"cpu_cores": None, "memory_bytes": 512 * 2**20},
+}, dashboard["resources"]
 assert cluster["scheduler"]["installed"] is False, cluster["scheduler"]
 checks = {check["id"]: check for check in snapshot["health"]["checks"]}
 assert checks["kubernetes"]["status"] == "ok", checks["kubernetes"]
 assert checks["scheduler"]["status"] == "off", checks["scheduler"]
 assert checks["visibility.events"]["status"] == "ok", checks["visibility.events"]
 assert checks["visibility.metrics"]["status"] == "off", checks["visibility.metrics"]
+stats = {stat["id"]: stat for stat in snapshot["health"]["stats"]}
+assert stats["cluster.cpu_requests"]["value_number"] == 0.1, stats["cluster.cpu_requests"]
+assert stats["cluster.memory_requests"]["value_number"] == 128 * 2**20, stats["cluster.memory_requests"]
+assert "cluster.cpu" not in stats, "requests must not be mislabeled as measured usage"
 for stat in snapshot["health"]["stats"]:
   assert {"value_number", "unit", "context", "status"} <= stat.keys(), stat
 assert not snapshot["problems"]["problems"], snapshot["problems"]
@@ -127,6 +135,7 @@ assert detail["run_id"] == run_id, detail
 assert detail["state"]["phase"] == run["state"]["phase"], (run, detail)
 assert isinstance(detail["gpu_devices"], int), detail
 assert isinstance(detail["diagnostics"], list), detail
+assert {"requests", "limits", "usage", "scope"} <= detail["resources"].keys(), detail["resources"]
 assert detail["telemetry"] == run["telemetry"], (run, detail)
 PY
 

@@ -29,12 +29,13 @@ experiment analysis; nothing here duplicates metrics.
 - **Runs** — launch by base model without leaving the page. Every row has an observed lifecycle verdict
   and an expandable inspection showing queue depth, current GPU claims by pool, pod phase counts,
   gateway request counts/failures/latency, latest worker-reported loss and gradient metrics with their
-  bounded recent trend, structured diagnostics, and recent logs for every pod. Clicking a pod opens its live log panel. A
+  bounded recent trend, measured CPU/memory, declared requests and limits, structured diagnostics,
+  and recent logs for every pod. Clicking a pod opens its live log panel. A
   W&B link appears when one is recorded, and Stop appears when there is something to stop (a worker
   process, queued work, or labeled pods).
 - **Health** — current problems first, then a **Load** section of measured stats (active runs, queued
   requests per run, oldest request and worker-launch wait, Redis memory and clients, gateway RSS, disk free, pod and
-  GPU totals, optional Metrics Server CPU/memory usage, scheduler workload phases, and ClaimLedger seats), then gateway / storage / Kubernetes /
+  GPU totals, optional Metrics Server CPU/memory usage, CPU/memory scheduling reservations, scheduler workload phases, and ClaimLedger seats), then gateway / storage / Kubernetes /
   scheduler / visibility checks. Node `MemoryPressure` and `DiskPressure` conditions surface under
   Problems. Failed or slow placement, stale observed generations, assignment/seat mismatches, and stale
   ClaimLedger seats include exact `kubectl` inspection commands.
@@ -99,7 +100,9 @@ left running for inspection; remove it with `make kind-dashboard-clean`.
   CPU cores and memory working-set bytes are joined into the same snapshot and shown in run, pod, node,
   and Health views. A missing Metrics Server is reported as an optional feature being off; the dashboard
   snapshot also exposes per-scope availability and observed-object counts so automation can distinguish
-  absent, partial, and empty telemetry. The dashboard never substitutes requests or limits for utilization.
+  absent, partial, and empty telemetry. Scheduling reservations follow an observed pod-level resource
+  budget when present; otherwise they use summed app-container requests versus peak init-container
+  requests, plus pod overhead. The dashboard never substitutes requests or limits for utilization.
 - **Scheduler placement** is read directly from optional namespaced `Workload` and `ClaimLedger` CRDs.
   Run inspection joins them by exact `spec.modelId`, showing requested accelerator memory, placement
   phase and reason, chosen claim/node/device count, and ledger seat count. The gateway service account

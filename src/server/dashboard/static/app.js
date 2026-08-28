@@ -131,6 +131,10 @@ function bytes(value) {
   return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
 }
 
+function cores(value) {
+  return Number.isFinite(Number(value)) ? `${compactNumber(value)} cores` : "—";
+}
+
 function revisionLabel(value) {
   if (!value || value === "unknown") return "unknown";
   const dirty = value.endsWith("-dirty");
@@ -770,9 +774,10 @@ function renderRunDetail(container, run, detail) {
   const claims = Object.entries(detail.gpu_claims || {});
   const claimsText = claims.length ? claims.map(([pool, count]) => `${count} on ${pool}`).join(" · ") : "none visible";
   const metrics = el("div", "run-metrics");
-  const measuredPods = (detail.pods || []).filter((pod) => pod.usage);
-  const cpuUsage = measuredPods.reduce((total, pod) => total + pod.usage.cpu_cores, 0);
-  const memoryUsage = measuredPods.reduce((total, pod) => total + pod.usage.memory_bytes, 0);
+  const resources = detail.resources || {};
+  const requests = resources.requests || {};
+  const limits = resources.limits || {};
+  const usage = resources.usage || {};
   const workloadPhases = Object.entries(detail.state?.workload_phase_counts || {}).map(([phase, count]) => `${count} ${phase}`).join(" · ") || "none";
   metrics.append(
     metric("Queue", String(detail.queue_depth || 0), detail.queue_depth ? `oldest waiting ${duration(detail.queue_oldest_seconds)}` : "requests"),
@@ -781,9 +786,22 @@ function renderRunDetail(container, run, detail) {
     metric("Workloads", String(detail.workloads?.length || 0), workloadPhases),
     metric("Sources", String(detail.sources?.length || 0), (detail.sources || []).join(" · ") || "none")
   );
-  if (measuredPods.length) {
-    metrics.append(metric("CPU usage", `${compactNumber(cpuUsage)} cores`, `${measuredPods.length} measured pod${measuredPods.length === 1 ? "" : "s"}`));
-    metrics.append(metric("Memory usage", bytes(memoryUsage), "Metrics Server working set"));
+  if (usage.total_pods) {
+    const measured = usage.measured_pods ? `${usage.measured_pods}/${usage.total_pods} pods measured` : "usage unavailable";
+    const cpuLimit = limits.cpu_cores == null ? "no limit" : `${cores(limits.cpu_cores)} limit`;
+    const memoryLimit = limits.memory_bytes == null ? "no limit" : `${bytes(limits.memory_bytes)} limit`;
+    metrics.append(
+      metric(
+        "CPU",
+        usage.measured_pods ? `${cores(usage.cpu_cores)} used` : `${cores(requests.cpu_cores)} requested`,
+        `${cores(requests.cpu_cores)} requested · ${cpuLimit} · ${measured}`
+      ),
+      metric(
+        "Memory",
+        usage.measured_pods ? `${bytes(usage.memory_bytes)} used` : `${bytes(requests.memory_bytes)} requested`,
+        `${bytes(requests.memory_bytes)} requested · ${memoryLimit} · ${measured}`
+      )
+    );
   }
 
   const diagnostics = el("div", "run-diagnostics");
@@ -1131,6 +1149,8 @@ function updatePanel() {
     return;
   }
   sub.replaceChildren(el("span", pod.problem ? "bad" : "", pod.problem || pod.phase));
+  const requests = pod.resources?.requests || {};
+  const limits = pod.resources?.limits || {};
   sync(
     $("panel-meta"),
     [
@@ -1138,8 +1158,22 @@ function updatePanel() {
       { k: "app", v: pod.app || "—" },
       { k: "ready", v: pod.ready },
       { k: "restarts", v: String(pod.restarts) },
-      { k: "cpu", v: pod.usage ? `${compactNumber(pod.usage.cpu_cores)} cores` : "—" },
-      { k: "memory", v: pod.usage ? bytes(pod.usage.memory_bytes) : "—" },
+      {
+        k: "cpu",
+        v: [
+          pod.usage ? `${cores(pod.usage.cpu_cores)} used` : null,
+          `${cores(requests.cpu_cores || 0)} requested`,
+          limits.cpu_cores == null ? "no limit" : `${cores(limits.cpu_cores)} limit`,
+        ].filter(Boolean).join(" · "),
+      },
+      {
+        k: "memory",
+        v: [
+          pod.usage ? `${bytes(pod.usage.memory_bytes)} used` : null,
+          `${bytes(requests.memory_bytes || 0)} requested`,
+          limits.memory_bytes == null ? "no limit" : `${bytes(limits.memory_bytes)} limit`,
+        ].filter(Boolean).join(" · "),
+      },
       { k: "created", v: pod.created_at ? `${relTime(pod.created_at)}` : "—" },
     ],
     (r) => r.k,

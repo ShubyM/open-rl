@@ -531,6 +531,74 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertIn("--previous", diagnostic["actions"][2]["command"])
     self.assertEqual(diagnostic["evidence"]["events"][0]["reason"], "BackOff")
 
+  def test_pod_resources_use_peak_init_request_and_preserve_unbounded_limits(self) -> None:
+    from types import SimpleNamespace as NS
+
+    app_a = NS(name="trainer", image="trainer:test", resources=NS(requests={"cpu": "500m", "memory": "1Gi"}, limits={"cpu": "1", "memory": "2Gi"}))
+    app_b = NS(name="sidecar", image="sidecar:test", resources=NS(requests={"cpu": "250m", "memory": "512Mi"}, limits={"memory": "1Gi"}))
+    init = NS(name="prepare", image="prepare:test", resources=NS(requests={"cpu": "2", "memory": "256Mi"}, limits={"cpu": "2", "memory": "512Mi"}))
+    pod = NS(
+      metadata=NS(name="trainer-a", labels={}, creation_timestamp=None),
+      spec=NS(
+        node_name=None,
+        containers=[app_a, app_b],
+        init_containers=[init],
+        resource_claims=[],
+        overhead={"cpu": "100m", "memory": "64Mi"},
+      ),
+      status=NS(phase="Pending", reason=None, message=None, init_container_statuses=[], container_statuses=[], conditions=[]),
+    )
+
+    observed = data.pod_to_dict(pod)
+
+    self.assertAlmostEqual(observed["resources"]["requests"]["cpu_cores"], 2.1)
+    self.assertEqual(observed["resources"]["requests"]["memory_bytes"], 1600 * 2**20)
+    self.assertIsNone(observed["resources"]["limits"]["cpu_cores"])
+    self.assertEqual(observed["resources"]["limits"]["memory_bytes"], 3136 * 2**20)
+    self.assertEqual(observed["containers"][0]["resources"]["requests"]["memory_bytes"], 2**30)
+
+  def test_pod_level_resources_take_precedence_over_container_sums(self) -> None:
+    from types import SimpleNamespace as NS
+
+    container = NS(
+      name="worker",
+      image="worker:test",
+      resources=NS(requests={"cpu": "500m", "memory": "1Gi"}, limits={"cpu": "1", "memory": "2Gi"}),
+    )
+    pod = NS(
+      spec=NS(
+        containers=[container],
+        init_containers=[],
+        resources=NS(requests={"cpu": "2", "memory": "3Gi"}, limits={"cpu": "3", "memory": "4Gi"}),
+        overhead={"cpu": "100m", "memory": "64Mi"},
+      )
+    )
+
+    resources = data.pod_resource_summary(pod)
+
+    self.assertAlmostEqual(resources["requests"]["cpu_cores"], 2.1)
+    self.assertEqual(resources["requests"]["memory_bytes"], 3136 * 2**20)
+    self.assertAlmostEqual(resources["limits"]["cpu_cores"], 3.1)
+    self.assertEqual(resources["limits"]["memory_bytes"], 4160 * 2**20)
+
+  def test_pod_diagnostic_warns_near_declared_memory_limit(self) -> None:
+    pod = {
+      "name": "trainer-a",
+      "phase": "Running",
+      "node": "node-a",
+      "problem": None,
+      "restarts": 0,
+      "containers": [],
+      "events": [],
+      "resources": {"requests": {"cpu_cores": 1, "memory_bytes": 2**30}, "limits": {"cpu_cores": 2, "memory_bytes": 4 * 2**30}},
+      "usage": {"cpu_cores": 0.8, "memory_bytes": int(3.8 * 2**30)},
+    }
+
+    diagnostic = data.pod_diagnostic(pod, "open-rl")
+
+    self.assertEqual(diagnostic["code"], "pod.memory_limit_near")
+    self.assertGreater(diagnostic["evidence"]["utilization"], 0.9)
+
   def test_pod_diagnostics_distinguish_image_pull_and_volume_mount(self) -> None:
     base = {"name": "pod-a", "phase": "Pending", "node": None, "restarts": 0, "conditions": []}
     image = {
@@ -632,6 +700,43 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(by_id["cluster.memory"]["status"], "warn")
     problems = data.derive_problems([], k8s, stats)
     self.assertLessEqual({"metric.cluster_cpu", "metric.cluster_memory"}, {problem["code"] for problem in problems})
+
+  def test_operational_stats_separate_requests_from_usage_and_include_unscheduled_demand(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    k8s = {
+      "available": True,
+      "namespace": "open-rl",
+      "error": None,
+      "nodes": [{"name": "node-a", "gpu_capacity": 0, "cpu_allocatable_cores": 8, "memory_allocatable_bytes": 16 * 2**30}],
+      "pods": [
+        {
+          "name": "running-a",
+          "node": "node-a",
+          "phase": "Running",
+          "resources": {"requests": {"cpu_cores": 7.5, "memory_bytes": 15 * 2**30}, "limits": {"cpu_cores": None, "memory_bytes": None}},
+          "usage": {"cpu_cores": 2, "memory_bytes": 4 * 2**30},
+        },
+        {
+          "name": "pending-a",
+          "node": None,
+          "phase": "Pending",
+          "resources": {"requests": {"cpu_cores": 2, "memory_bytes": 4 * 2**30}, "limits": {"cpu_cores": 4, "memory_bytes": 8 * 2**30}},
+          "usage": None,
+        },
+      ],
+    }
+
+    stats, _ = asyncio.run(data.operational_stats(InMemoryStore(), k8s, None))
+    by_id = {stat["id"]: stat for stat in stats}
+
+    self.assertEqual(by_id["cluster.cpu_requests"]["status"], "warn")
+    self.assertEqual(by_id["cluster.cpu_requests"]["value_number"], 7.5)
+    self.assertEqual(by_id["cluster.cpu_requests"]["context"]["unscheduled_request_cores"], 2)
+    self.assertEqual(by_id["cluster.memory_requests"]["context"]["unscheduled_request_bytes"], 4 * 2**30)
+    self.assertNotIn("cluster.cpu", by_id, "node usage must not be inferred from pod requests")
 
   def test_runs_with_unknown_created_at_sort_last(self) -> None:
     import asyncio
