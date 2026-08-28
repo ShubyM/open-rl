@@ -41,6 +41,7 @@ dashboard_pod=$(kubectl --context "$CONTEXT" get pods -l app=open-rl-dashboard -
 curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/pods/${dashboard_pod}/logs?tail=5" |
   python3 -c 'import json,sys; assert "text" in json.load(sys.stdin)'
 kubectl --context "$CONTEXT" auth can-i delete pods --as system:serviceaccount:default:open-rl-dashboard | grep -Fxq yes
+kubectl --context "$CONTEXT" auth can-i list events --as system:serviceaccount:default:open-rl-dashboard | grep -Fxq yes
 if kubectl --context "$CONTEXT" logs deployment/open-rl-dashboard | grep -Fq "Building open-rl"; then
   echo "gateway performed an unexpected runtime package rebuild" >&2
   exit 1
@@ -63,6 +64,7 @@ assert cluster["scheduler"]["installed"] is False, cluster["scheduler"]
 checks = {check["id"]: check for check in snapshot["health"]["checks"]}
 assert checks["kubernetes"]["status"] == "ok", checks["kubernetes"]
 assert checks["scheduler"]["status"] == "off", checks["scheduler"]
+assert checks["visibility.events"]["status"] == "ok", checks["visibility.events"]
 for stat in snapshot["health"]["stats"]:
   assert {"value_number", "unit", "context", "status"} <= stat.keys(), stat
 assert not snapshot["problems"]["problems"], snapshot["problems"]

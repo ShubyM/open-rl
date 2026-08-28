@@ -28,6 +28,14 @@ class DashboardEndpointsTest(unittest.TestCase):
       resp = self.client.get(f"/dashboard/static/{asset}")
       self.assertEqual(resp.status_code, 200, asset)
 
+  def test_pod_logs_can_read_previous_container_instance(self) -> None:
+    with mock.patch.object(data, "k8s_pod_logs", return_value={"demo": False, "pod": "pod-a", "previous": True, "text": "prior"}) as logs:
+      resp = self.client.get("/api/v1/dashboard/pods/pod-a/logs?tail=40&previous=true")
+
+    self.assertEqual(resp.status_code, 200)
+    self.assertEqual(resp.json()["text"], "prior")
+    logs.assert_called_once_with("pod-a", None, 40, True)
+
   def test_health_reports_all_groups(self) -> None:
     resp = self.client.get("/api/v1/dashboard/health")
     self.assertEqual(resp.status_code, 200)
@@ -140,6 +148,11 @@ class DashboardEndpointsTest(unittest.TestCase):
     cases = [
       (["ops.py", "run", "run-a", "120"], ("GET", "/api/v1/dashboard/runs/run-a?logs=120"), None),
       (["ops.py", "logs", "pod-a", "42"], ("GET", "/api/v1/dashboard/pods/pod-a/logs?tail=42"), None),
+      (
+        ["ops.py", "logs", "pod-a", "42", "--container", "trainer", "--previous"],
+        ("GET", "/api/v1/dashboard/pods/pod-a/logs?tail=42&container=trainer&previous=true"),
+        None,
+      ),
       (["ops.py", "launch", "Qwen/Qwen3-0.6B"], ("POST", "/api/v1/dashboard/runs"), {"base_model": "Qwen/Qwen3-0.6B"}),
     ]
     for argv, call, payload in cases:
@@ -213,7 +226,7 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(detail["state"]["pod_phase_counts"], {"Pending": 1, "Failed": 1})
     self.assertEqual(detail["gpu_claims"], {"nvidia-l4": 1}, "terminal pods must not count as current claims")
     self.assertEqual(detail["gpu_devices"], 1)
-    self.assertEqual({item["code"] for item in detail["diagnostics"]}, {"pod.unschedulable", "pod.failed"})
+    self.assertEqual({item["code"] for item in detail["diagnostics"]}, {"pod.unschedulable", "pod.oom_killed"})
     self.assertTrue(all(item["actions"][0]["command"].startswith("make ops logs") for item in detail["diagnostics"]))
 
   def test_stop_unknown_run_conflicts(self) -> None:
@@ -417,9 +430,76 @@ class DashboardEndpointsTest(unittest.TestCase):
       self.assertIn("kind", problem["resource"])
       self.assertIsInstance(problem["evidence"], dict)
       self.assertTrue(problem["actions"])
-    pod_problem = next(problem for problem in problems if problem["code"] == "pod.failed")
+    pod_problem = next(problem for problem in problems if problem["code"] == "pod.oom_killed")
     self.assertEqual(pod_problem["resource"], {"kind": "Pod", "name": "broken-pod", "namespace": "open-rl"})
     self.assertEqual(pod_problem["actions"][0]["command"], "make ops logs broken-pod")
+
+  def test_pod_evidence_preserves_oom_termination_and_previous_logs_action(self) -> None:
+    from types import SimpleNamespace as NS
+
+    terminated = NS(
+      reason="OOMKilled",
+      message="memory cgroup out of memory",
+      exit_code=137,
+      signal=0,
+      started_at=None,
+      finished_at=None,
+    )
+    container_status = NS(
+      name="trainer",
+      image="open-rl:test",
+      ready=False,
+      restart_count=2,
+      state=NS(running=None, waiting=NS(reason="CrashLoopBackOff", message="back-off restarting"), terminated=None),
+      last_state=NS(running=None, waiting=None, terminated=terminated),
+    )
+    condition = NS(type="Ready", status="False", reason="ContainersNotReady", message="trainer is not ready", last_transition_time=None)
+    container = NS(name="trainer", image="open-rl:test", resources=NS(requests={}, limits={}))
+    pod = NS(
+      metadata=NS(name="trainer-run-a", labels={"app": "trainer"}, creation_timestamp=None),
+      spec=NS(node_name="gpu-node", containers=[container], resource_claims=[]),
+      status=NS(
+        phase="Running",
+        reason=None,
+        message=None,
+        init_container_statuses=[],
+        container_statuses=[container_status],
+        conditions=[condition],
+      ),
+    )
+
+    observed = data.pod_to_dict(pod)
+    observed["events"] = [
+      {"reason": "BackOff", "message": "Back-off restarting failed container", "type": "Warning", "count": 2, "last_seen_at": None}
+    ]
+    diagnostic = data.pod_diagnostic(observed, "open-rl")
+
+    self.assertEqual(observed["problem"], "CrashLoopBackOff: back-off restarting")
+    self.assertEqual(observed["containers"][0]["last_termination"]["exit_code"], 137)
+    self.assertEqual(diagnostic["code"], "pod.oom_killed")
+    self.assertEqual(diagnostic["evidence"]["containers"][0]["last_termination"]["reason"], "OOMKilled")
+    self.assertIn("--previous", diagnostic["actions"][2]["command"])
+    self.assertEqual(diagnostic["evidence"]["events"][0]["reason"], "BackOff")
+
+  def test_pod_diagnostics_distinguish_image_pull_and_volume_mount(self) -> None:
+    base = {"name": "pod-a", "phase": "Pending", "node": None, "restarts": 0, "conditions": []}
+    image = {
+      **base,
+      "problem": "ImagePullBackOff: image not found",
+      "containers": [{"name": "worker", "reason": "ImagePullBackOff", "last_termination": None}],
+      "events": [],
+    }
+    volume = {
+      **base,
+      "problem": "Pending",
+      "containers": [],
+      "events": [{"reason": "FailedMount", "message": "persistentvolumeclaim missing", "type": "Warning", "count": 3}],
+    }
+
+    self.assertEqual(data.pod_diagnostic(image, "open-rl")["code"], "pod.image_pull")
+    volume_diagnostic = data.pod_diagnostic(volume, "open-rl")
+    self.assertEqual(volume_diagnostic["code"], "pod.volume_mount")
+    self.assertEqual(volume_diagnostic["evidence"]["events"][0]["count"], 3)
 
   def test_runs_with_unknown_created_at_sort_last(self) -> None:
     import asyncio

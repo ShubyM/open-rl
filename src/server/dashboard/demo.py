@@ -262,8 +262,34 @@ def demo_cluster() -> dict:
         "ready": "0/1",
         "restarts": 4,
         "created_at": "2026-07-28T22:17:00+00:00",
+        "reason": "Error",
+        "message": "sampler repeatedly exceeded its GPU memory limit",
         "problem": "CrashLoopBackOff: CUDA out of memory",
-        "containers": [{"name": "sampler", "image": "gcr.io/demo/open-rl-server:demo", "ready": False, "state": "terminated"}],
+        "containers": [
+          {
+            "name": "sampler",
+            "kind": "app",
+            "image": "gcr.io/demo/open-rl-server:demo",
+            "ready": False,
+            "state": "waiting",
+            "reason": "CrashLoopBackOff",
+            "message": "back-off restarting failed container",
+            "exit_code": None,
+            "restart_count": 4,
+            "last_termination": {"reason": "OOMKilled", "message": None, "exit_code": 137, "signal": 0},
+          }
+        ],
+        "conditions": [{"type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": "sampler is not ready"}],
+        "events": [
+          {
+            "reason": "BackOff",
+            "message": "Back-off restarting failed container sampler",
+            "type": "Warning",
+            "count": 4,
+            "source": "kubelet",
+            "last_seen_at": "2026-07-29T08:02:00+00:00",
+          }
+        ],
       },
     ],
   }
@@ -410,6 +436,7 @@ def demo_health() -> dict:
         "status": "off",
         "detail": "ENABLE_GCP_TRACE=0 — tracing not configured",
       },
+      {"id": "visibility.events", "group": "Visibility", "label": "Pod events", "status": "ok", "detail": "4 recent events visible"},
       {
         "id": "visibility.sampler",
         "group": "Visibility",

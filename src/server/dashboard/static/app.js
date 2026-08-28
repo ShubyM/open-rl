@@ -1062,6 +1062,7 @@ let logTimer = null;
 function openPanel(podName) {
   S.panel.pod = podName;
   S.panel.container = null;
+  $("log-previous").checked = false;
   panel.hidden = false;
   $("panel-logs").textContent = "loading…";
   updatePanel();
@@ -1096,6 +1097,7 @@ function updatePanel() {
     sub.replaceChildren(el("span", "bad", "pod no longer exists"));
     $("panel-meta").replaceChildren();
     $("panel-containers").replaceChildren();
+    $("panel-evidence").replaceChildren();
     return;
   }
   sub.replaceChildren(el("span", pod.problem ? "bad" : "", pod.problem || pod.phase));
@@ -1129,9 +1131,43 @@ function updatePanel() {
     (chip, c) => {
       setText(chip, c.name);
       chip.classList.toggle("active", (S.panel.container || pod.containers[0].name) === c.name);
+      chip.classList.toggle("bad", Boolean(c.reason || c.last_termination?.reason));
+      chip.title = [c.kind, c.state, c.reason, c.message].filter(Boolean).join(" · ");
     }
   );
+  const selected = pod.containers.find((container) => container.name === S.panel.container) || pod.containers.find((container) => container.kind === "app") || pod.containers[0];
+  const evidence = [];
+  if (selected) {
+    const current = [selected.state, selected.reason, selected.exit_code != null ? `exit ${selected.exit_code}` : null, selected.message].filter(Boolean).join(" · ");
+    evidence.push({ key: `container/${selected.name}`, value: current || "state unavailable" });
+    if (selected.last_termination) {
+      const prior = selected.last_termination;
+      evidence.push({ key: "previous", value: [prior.reason, prior.exit_code != null ? `exit ${prior.exit_code}` : null, prior.message].filter(Boolean).join(" · ") });
+    }
+  }
+  for (const event of (pod.events || []).slice(-5).reverse()) {
+    evidence.push({ key: event.reason || event.type || "event", value: `${event.message || ""}${event.count > 1 ? ` · ×${event.count}` : ""}` });
+  }
+  sync(
+    $("panel-evidence"),
+    evidence,
+    (item) => `${item.key}:${item.value}`,
+    () => {
+      const row = el("div", "panel-evidence-row");
+      row.append(el("span", "panel-evidence-key"), el("span", "panel-evidence-value"));
+      return row;
+    },
+    (row, item) => {
+      setText(row.querySelector(".panel-evidence-key"), item.key);
+      setText(row.querySelector(".panel-evidence-value"), item.value);
+    }
+  );
+  const previousWrap = $("log-previous-wrap");
+  previousWrap.hidden = !selected?.last_termination;
+  if (previousWrap.hidden) $("log-previous").checked = false;
 }
+
+$("log-previous").addEventListener("change", pollLogs);
 
 async function pollLogs() {
   clearTimeout(logTimer);
@@ -1141,6 +1177,7 @@ async function pollLogs() {
   const podInfo = S.cluster?.pods.find((p) => p.name === pod);
   const container = S.panel.container || (podInfo?.containers.length > 1 ? podInfo.containers[0].name : null);
   if (container) params.set("container", container);
+  if ($("log-previous").checked) params.set("previous", "true");
   try {
     const data = await fetchJSON(`/api/v1/dashboard/pods/${encodeURIComponent(pod)}/logs?${params}`);
     if (S.panel.pod !== pod) return;

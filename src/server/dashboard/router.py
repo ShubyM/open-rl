@@ -116,11 +116,11 @@ async def dashboard_problems(request: Request):
 
 
 @router.get("/pods/{pod}/logs")
-async def dashboard_pod_logs(pod: str, container: str | None = None, tail: int = 500):
+async def dashboard_pod_logs(pod: str, container: str | None = None, tail: int = 500, previous: bool = False):
   if data.demo_mode_enabled():
     return demo.demo_pod_logs(pod)
   try:
-    return await asyncio.to_thread(data.k8s_pod_logs, pod, container, min(max(tail, 1), 5000))
+    return await asyncio.to_thread(data.k8s_pod_logs, pod, container, min(max(tail, 1), 5000), previous)
   except Exception as exc:
     return JSONResponse(status_code=503, content={"error": str(exc)})
 

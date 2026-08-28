@@ -66,6 +66,10 @@ the human display string plus `value_number`, `unit`, structured `context`, and 
 not need to parse text such as byte sizes or GPU fractions.
 Problems and per-run diagnostics carry a stable `id` and `code`, the affected `resource`, structured
 `evidence`, and concrete `actions` containing both API paths and copyable CLI or `kubectl` commands.
+Pod evidence includes current and previous container termination state, exit code, condition messages,
+and up to 10 recent Kubernetes events. Use `make ops logs <pod> --container <name> --previous` (or the
+**previous** toggle in the pod panel) after a restart; diagnoses distinguish OOM kills, crash loops,
+image-pull failures, evictions, volume mounts, and failed scheduling.
 Queue entries are timestamped at first enqueue (the timestamp survives the FFT worker-launch hop), so
 depth is paired with actual oldest-wait seconds. Request waits warn after 300 seconds and worker-launch
 waits after 60 seconds by default; tune them with `OPEN_RL_QUEUE_WARN_SECONDS` and
@@ -86,7 +90,9 @@ left running for inspection; remove it with `make kind-dashboard-clean`.
   without it (the Cluster view then shows only gateway-local components and says so). In-cluster
   credentials are tried first, then the local kubeconfig. Listing nodes requires cluster-scope RBAC and
   is skipped when denied; fetching pod logs from the gateway's service account requires the `pods/log`
-  verb.
+  verb. One bounded namespaced Event list is fetched alongside nodes and scheduler state; `events`
+  read permission is included in the supplied manifests, and missing permission is an actionable
+  visibility warning rather than a snapshot failure.
 - **Scheduler placement** is read directly from optional namespaced `Workload` and `ClaimLedger` CRDs.
   Run inspection joins them by exact `spec.modelId`, showing requested accelerator memory, placement
   phase and reason, chosen claim/node/device count, and ledger seat count. The gateway service account

@@ -216,14 +216,42 @@ def scheduler_snapshot(namespace: str) -> dict:
   }
 
 
+def k8s_timestamp(value: Any) -> str | None:
+  return value.isoformat() if value and hasattr(value, "isoformat") else str(value) if value else None
+
+
+def terminated_state(state: Any) -> dict | None:
+  if state is None:
+    return None
+  return {
+    "reason": state.reason,
+    "message": state.message,
+    "exit_code": state.exit_code,
+    "signal": state.signal,
+    "started_at": k8s_timestamp(state.started_at),
+    "finished_at": k8s_timestamp(state.finished_at),
+  }
+
+
+def pod_container_statuses(pod: Any) -> list[Any]:
+  return [*(pod.status.init_container_statuses or []), *(pod.status.container_statuses or [])]
+
+
 def pod_problem(pod: Any) -> str | None:
   phase = pod.status.phase or "Unknown"
   if phase == "Failed":
-    return f"Failed: {pod.status.reason or 'see logs'}"
-  for cs in pod.status.container_statuses or []:
+    detail = ": ".join(part for part in (pod.status.reason, pod.status.message) if part)
+    return f"Failed: {detail or 'see logs'}"
+  for cs in pod_container_statuses(pod):
     waiting = cs.state.waiting if cs.state else None
     if waiting and waiting.reason not in (None, "ContainerCreating", "PodInitializing"):
       return f"{waiting.reason}: {waiting.message or ''}".strip(": ")
+    terminated = cs.state.terminated if cs.state else None
+    if terminated and (terminated.exit_code or terminated.reason not in (None, "Completed")):
+      return f"{terminated.reason or 'Terminated'}: exit code {terminated.exit_code}{f' — {terminated.message}' if terminated.message else ''}"
+    previous = cs.last_state.terminated if cs.last_state else None
+    if previous and (cs.restart_count or 0) and previous.reason in {"OOMKilled", "Error", "ContainerCannotRun"}:
+      return f"{previous.reason}: {cs.name} exited {previous.exit_code} and restarted"
   if phase == "Pending":
     for cond in pod.status.conditions or []:
       if cond.type == "PodScheduled" and cond.status != "True":
@@ -249,13 +277,68 @@ def pod_gpu_count(pod: Any) -> int:
 def pod_to_dict(pod: Any) -> dict:
   statuses = pod.status.container_statuses or []
   containers = []
-  for cs in statuses:
-    state = "unknown"
-    if cs.state:
-      state = "running" if cs.state.running else "waiting" if cs.state.waiting else "terminated" if cs.state.terminated else "unknown"
-    containers.append({"name": cs.name, "image": cs.image, "ready": bool(cs.ready), "state": state})
+  for kind, items in (("app", statuses), ("init", pod.status.init_container_statuses or [])):
+    for cs in items:
+      state = "unknown"
+      reason = None
+      message = None
+      started_at = None
+      finished_at = None
+      exit_code = None
+      signal = None
+      if cs.state:
+        if cs.state.running:
+          state = "running"
+          started_at = k8s_timestamp(cs.state.running.started_at)
+        elif cs.state.waiting:
+          state = "waiting"
+          reason = cs.state.waiting.reason
+          message = cs.state.waiting.message
+        elif cs.state.terminated:
+          state = "terminated"
+          terminated = terminated_state(cs.state.terminated) or {}
+          reason = terminated.get("reason")
+          message = terminated.get("message")
+          started_at = terminated.get("started_at")
+          finished_at = terminated.get("finished_at")
+          exit_code = terminated.get("exit_code")
+          signal = terminated.get("signal")
+      containers.append(
+        {
+          "name": cs.name,
+          "kind": kind,
+          "image": cs.image,
+          "ready": bool(cs.ready),
+          "state": state,
+          "reason": reason,
+          "message": message,
+          "started_at": started_at,
+          "finished_at": finished_at,
+          "exit_code": exit_code,
+          "signal": signal,
+          "restart_count": cs.restart_count or 0,
+          "last_termination": terminated_state(cs.last_state.terminated if cs.last_state else None),
+        }
+      )
   if not containers:
-    containers = [{"name": c.name, "image": c.image, "ready": False, "state": "unknown"} for c in pod.spec.containers or []]
+    containers = [
+      {
+        "name": c.name,
+        "kind": "app",
+        "image": c.image,
+        "ready": False,
+        "state": "unknown",
+        "reason": None,
+        "message": None,
+        "started_at": None,
+        "finished_at": None,
+        "exit_code": None,
+        "signal": None,
+        "restart_count": 0,
+        "last_termination": None,
+      }
+      for c in pod.spec.containers or []
+    ]
   ready_count = sum(1 for c in statuses if c.ready)
   return {
     "name": pod.metadata.name,
@@ -264,11 +347,39 @@ def pod_to_dict(pod: Any) -> dict:
     "app": (pod.metadata.labels or {}).get("app"),
     "labels": pod.metadata.labels or {},
     "ready": f"{ready_count}/{len(pod.spec.containers or [])}",
-    "restarts": sum(cs.restart_count or 0 for cs in statuses),
+    "restarts": sum(cs.restart_count or 0 for cs in pod_container_statuses(pod)),
     "created_at": pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else None,
+    "reason": pod.status.reason,
+    "message": pod.status.message,
     "problem": pod_problem(pod),
     "containers": containers,
+    "conditions": [
+      {
+        "type": condition.type,
+        "status": condition.status,
+        "reason": condition.reason,
+        "message": condition.message,
+        "last_transition_at": k8s_timestamp(condition.last_transition_time),
+      }
+      for condition in pod.status.conditions or []
+    ],
+    "events": [],
     "gpus": pod_gpu_count(pod),
+  }
+
+
+def event_to_dict(event: Any) -> dict:
+  series = event.series
+  source = event.source
+  return {
+    "reason": event.reason,
+    "message": event.message,
+    "type": event.type,
+    "count": event.count or (series.count if series else None) or 1,
+    "source": event.reporting_component or (source.component if source else None),
+    "first_seen_at": k8s_timestamp(event.first_timestamp or event.metadata.creation_timestamp),
+    "last_seen_at": k8s_timestamp((series.last_observed_time if series else None) or event.event_time or event.last_timestamp),
+    "pod_name": event.involved_object.name,
   }
 
 
@@ -315,9 +426,16 @@ def k8s_snapshot() -> dict:
       "nodes": [],
       "scheduler": empty_scheduler_snapshot(installed=None, error=error),
     }
-  with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+  with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     nodes_future = executor.submit(api.list_node, _request_timeout=K8S_REQUEST_TIMEOUT)
     scheduler_future = executor.submit(scheduler_snapshot, namespace)
+    events_future = executor.submit(
+      api.list_namespaced_event,
+      namespace,
+      field_selector="involvedObject.kind=Pod",
+      limit=200,
+      _request_timeout=K8S_REQUEST_TIMEOUT,
+    )
     try:
       nodes = [node_to_dict(n) for n in nodes_future.result().items]
     except Exception:
@@ -327,17 +445,28 @@ def k8s_snapshot() -> dict:
       scheduler = scheduler_future.result()
     except Exception as exc:
       scheduler = empty_scheduler_snapshot(installed=True, error=f"scheduler snapshot failed: {exc}")
+    events_error = None
+    try:
+      events = [event_to_dict(event) for event in events_future.result().items]
+    except Exception as exc:
+      events, events_error = [], f"event list failed: {exc}"
+  events_by_pod: dict[str, list[dict]] = {}
+  for event in events:
+    events_by_pod.setdefault(event["pod_name"], []).append(event)
+  for pod in pods:
+    pod["events"] = sorted(events_by_pod.get(pod["name"], []), key=lambda event: event["last_seen_at"] or "")[-10:]
   return {
     "available": True,
     "namespace": namespace,
     "error": None,
     "pods": pods,
     "nodes": nodes,
+    "events_error": events_error,
     "scheduler": scheduler,
   }
 
 
-def k8s_pod_logs(pod: str, container: str | None, tail: int) -> dict:
+def k8s_pod_logs(pod: str, container: str | None, tail: int, previous: bool = False) -> dict:
   api, err = k8s_core_v1()
   if api is None:
     raise RuntimeError(err or "kubernetes unavailable")
@@ -345,10 +474,11 @@ def k8s_pod_logs(pod: str, container: str | None, tail: int) -> dict:
     pod,
     k8s_namespace(),
     container=container,
+    previous=previous,
     tail_lines=tail,
     _request_timeout=K8S_REQUEST_TIMEOUT + 4,
   )
-  return {"demo": False, "pod": pod, "container": container, "text": text}
+  return {"demo": False, "pod": pod, "container": container, "previous": previous, "text": text}
 
 
 # *** GPU duty cycle ***
@@ -760,25 +890,78 @@ def diagnostic_entry(
 
 def pod_diagnostic(pod: dict, namespace: str | None = None) -> dict | None:
   source = f"pod/{pod['name']}"
-  resource = {"kind": "Pod", "name": pod["name"], "namespace": namespace or k8s_namespace()}
+  namespace = namespace or k8s_namespace()
+  resource = {"kind": "Pod", "name": pod["name"], "namespace": namespace}
   action = {
     "label": "Read pod logs",
     "method": "GET",
     "path": f"/api/v1/dashboard/pods/{pod['name']}/logs?tail=500",
     "command": f"make ops logs {pod['name']}",
   }
+  actions = [
+    action,
+    {
+      "label": "Describe pod and events",
+      "command": f"kubectl describe pod {pod['name']} -n {namespace}",
+    },
+  ]
+  containers = pod.get("containers") or []
+  affected = next(
+    (
+      container for container in containers if (container.get("last_termination") or {}).get("reason") in {"OOMKilled", "Error", "ContainerCannotRun"}
+    ),
+    None,
+  ) or next((container for container in containers if container.get("reason")), None)
+  if affected and affected.get("last_termination"):
+    actions.append(
+      {
+        "label": f"Read previous {affected['name']} logs",
+        "command": f"kubectl logs {pod['name']} -n {namespace} -c {affected['name']} --previous --tail=500",
+      }
+    )
   problem = pod.get("problem")
+  reasons = {
+    reason for container in containers for reason in (container.get("reason"), (container.get("last_termination") or {}).get("reason")) if reason
+  }
+  event_reasons = {event.get("reason") for event in pod.get("events") or []}
+  combined = reasons | event_reasons | ({pod.get("reason")} if pod.get("reason") else set())
+  problem_lower = (problem or "").lower()
+  code = None
+  severity = "warn"
+  if "OOMKilled" in combined or "oom" in problem_lower or "out of memory" in problem_lower:
+    code, severity = "pod.oom_killed", "error"
+  elif "Evicted" in combined:
+    code, severity = "pod.evicted", "error"
+  elif combined & {"ImagePullBackOff", "ErrImagePull", "InvalidImageName"}:
+    code, severity = "pod.image_pull", "error"
+  elif "CrashLoopBackOff" in combined or "CrashLoopBackOff" in (problem or ""):
+    code, severity = "pod.crash_loop", "error"
+  elif combined & {"FailedMount", "FailedAttachVolume", "FailedMapVolume"}:
+    code = "pod.volume_mount"
+  elif "FailedScheduling" in combined or "Unschedulable" in (problem or ""):
+    code = "pod.unschedulable"
   if problem:
-    severity = "error" if pod.get("phase") == "Failed" or any(marker in problem for marker in ("BackOff", "OOM", "Error")) else "warn"
-    code = "pod.unschedulable" if "Unschedulable" in problem else "pod.failed" if severity == "error" else "pod.waiting"
+    severity = (
+      "error" if severity == "error" or pod.get("phase") == "Failed" or any(marker in problem for marker in ("BackOff", "OOM", "Error")) else "warn"
+    )
+    code = code or ("pod.failed" if severity == "error" else "pod.waiting")
     return diagnostic_entry(
       code,
       severity,
       source,
       problem,
       resource=resource,
-      evidence={"phase": pod.get("phase"), "node": pod.get("node"), "restarts": pod.get("restarts", 0)},
-      actions=[action],
+      evidence={
+        "phase": pod.get("phase"),
+        "reason": pod.get("reason"),
+        "message": pod.get("message"),
+        "node": pod.get("node"),
+        "restarts": pod.get("restarts", 0),
+        "containers": containers,
+        "conditions": pod.get("conditions") or [],
+        "events": pod.get("events") or [],
+      },
+      actions=actions,
     )
   if pod.get("restarts", 0) >= 3:
     return diagnostic_entry(
@@ -787,8 +970,8 @@ def pod_diagnostic(pod: dict, namespace: str | None = None) -> dict | None:
       source,
       f"{pod['restarts']} container restarts",
       resource=resource,
-      evidence={"phase": pod.get("phase"), "node": pod.get("node"), "restarts": pod["restarts"]},
-      actions=[action],
+      evidence={"phase": pod.get("phase"), "node": pod.get("node"), "restarts": pod["restarts"], "containers": containers},
+      actions=actions,
     )
   return None
 
@@ -1374,6 +1557,11 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
 
   if k8s["available"]:
     checks.append(check_entry("kubernetes", "Kubernetes", "API server", "ok", f"{len(k8s['pods'])} pods visible in namespace {k8s['namespace']}"))
+    if event_error := k8s.get("events_error"):
+      checks.append(check_entry("visibility.events", "Visibility", "Pod events", "warn", event_error))
+    else:
+      event_count = sum(len(pod.get("events") or []) for pod in k8s["pods"])
+      checks.append(check_entry("visibility.events", "Visibility", "Pod events", "ok", f"{event_count} recent events visible"))
   else:
     status = "off" if "not installed" in (k8s["error"] or "") or "credentials" in (k8s["error"] or "") else "error"
     checks.append(check_entry("kubernetes", "Kubernetes", "API server", status, k8s["error"] or "unavailable"))
@@ -1419,6 +1607,8 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
       actions = [{"label": "Refresh health checks", "method": "GET", "path": "/api/v1/dashboard/health", "command": "make ops health"}]
       if check["id"] == "kubernetes":
         actions.append({"label": "Verify pod visibility", "command": f"kubectl auth can-i list pods -n {k8s['namespace']}"})
+      elif check["id"] == "visibility.events":
+        actions.append({"label": "Verify event visibility", "command": f"kubectl auth can-i list events -n {k8s['namespace']}"})
       problems.append(
         diagnostic_entry(
           f"check.{check['id']}",

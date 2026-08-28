@@ -591,6 +591,12 @@ main { flex: 1; min-height: 0; display: flex; }
   cursor: pointer;
 }
 .container-chip.active { border-color: var(--fg); color: var(--fg); }
+.container-chip.bad { border-color: var(--error); color: var(--error); }
+
+.panel-evidence { padding: 8px 16px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 11px; }
+.panel-evidence:empty { display: none; }
+.panel-evidence-row { margin: 3px 0; overflow-wrap: anywhere; }
+.panel-evidence-key { color: var(--faint); font-family: var(--mono); margin-right: 6px; }
 
 .panel-logs-head { display: flex; align-items: center; gap: 12px; padding: 8px 16px 4px; }
 .panel-logs-head .eyebrow { margin: 0; }

@@ -58,6 +58,7 @@ def main() -> None:
   logs.add_argument("tail_lines", type=int, nargs="?", default=None, metavar="TAIL_LINES")
   logs.add_argument("--container")
   logs.add_argument("--tail", dest="tail_lines_flag", type=int, default=None)
+  logs.add_argument("--previous", action="store_true", help="Read the previous terminated container instance")
 
   launch = sub.add_parser("launch", help="Launch a run (create_model)")
   launch.add_argument("base_model", nargs="?", metavar="BASE_MODEL")
@@ -89,6 +90,8 @@ def main() -> None:
     params = {"tail": str(tail_lines if tail_lines is not None else 500)}
     if args.container:
       params["container"] = args.container
+    if args.previous:
+      params["previous"] = "true"
     emit(request("GET", f"/api/v1/dashboard/pods/{urllib.parse.quote(args.pod)}/logs?{urllib.parse.urlencode(params)}"))
   elif args.command == "launch":
     base_model = args.base_model_flag or args.base_model

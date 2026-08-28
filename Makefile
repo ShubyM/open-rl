@@ -41,6 +41,7 @@ help:
 	@echo "make ops diagnose                      # one-call cluster triage as JSON"
 	@echo "make ops health|problems|inspect|runs   # focused cluster ops (dashboard at $(BASE_URL)/dashboard)"
 	@echo "make ops run RUN_ID 120                # inspect a run with 120 log lines per pod"
+	@echo "make ops logs POD --previous            # read a restarted container's prior logs"
 	@echo "make ops launch Qwen/Qwen3-0.6B        # launch without Make swallowing CLI flags"
 	@echo "make kind-dashboard-smoke              # build, deploy, and verify the dashboard in Kind"
 	@echo "make lint | fmt"
