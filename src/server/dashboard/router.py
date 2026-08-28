@@ -112,7 +112,7 @@ async def dashboard_problems(request: Request):
     data.operational_stats(store, k8s, request.app.state.fft_worker_manager, queues, launch),
   )
   stats, _ = operational
-  return {"demo": False, "problems": data.derive_problems(checks, k8s, stats, runs["runs"])}
+  return data.problems_payload(data.derive_problems(checks, k8s, stats, runs["runs"]))
 
 
 @router.get("/pods/{pod}/logs")

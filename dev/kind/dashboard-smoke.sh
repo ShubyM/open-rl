@@ -46,6 +46,7 @@ done
 # health and dashboard polling above must remain in the diagnostic group.
 curl -fsS "http://127.0.0.1:${PORT}/api/v1/get_server_capabilities" >/dev/null
 curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/snapshot" >"$snapshot_file"
+BASE_URL="http://127.0.0.1:${PORT}" python3 dev/tools/ops.py check >/dev/null
 curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/cluster" |
   python3 -c 'import json,sys; observation=json.load(sys.stdin)["kubernetes"]["observation"]; assert observation["source"] == "cache", observation; assert 0 <= observation["age_seconds"] < 1, observation'
 curl -fsS "http://127.0.0.1:${PORT}/dashboard" | grep -Fq "open-rl operations"
@@ -146,6 +147,7 @@ assert "cluster.cpu" not in stats, "requests must not be mislabeled as measured 
 for stat in snapshot["health"]["stats"]:
   assert {"value_number", "unit", "context", "status"} <= stat.keys(), stat
 assert not snapshot["problems"]["problems"], snapshot["problems"]
+assert snapshot["problems"]["summary"] == {"status": "ok", "total": 0, "errors": 0, "warnings": 0}, snapshot["problems"]
 print("Kind dashboard smoke passed:", len(cluster["pods"]), "pod(s),", len(cluster["pools"]), "pool(s)")
 PY
 

@@ -32,10 +32,12 @@ def request(method: str, path: str, body: dict | None = None) -> dict:
     return {"error": True, "message": f"gateway unreachable at {base_url()}: {exc.reason}"}
 
 
-def emit(payload: dict) -> None:
+def emit(payload: dict, *, exit_code: int = 0) -> None:
   print(json.dumps(payload, indent=2))
   if payload.get("error"):
     sys.exit(1)
+  if exit_code:
+    sys.exit(exit_code)
 
 
 def main() -> None:
@@ -44,6 +46,7 @@ def main() -> None:
 
   sub.add_parser("health", help="Gateway, storage, Kubernetes, and visibility checks")
   sub.add_parser("problems", help="Everything currently wrong, most severe first")
+  sub.add_parser("check", help="Health gate: print problems as JSON and fail when any exist")
   sub.add_parser("diagnose", help="One coherent snapshot of cluster, runs, load, health, and problems")
   sub.add_parser("inspect", help="Cluster snapshot: pools, nodes, pods, gateway, services")
   sub.add_parser("runs", help="List runs with lifecycle state")
@@ -73,6 +76,12 @@ def main() -> None:
     emit(request("GET", "/api/v1/dashboard/health"))
   elif args.command == "problems":
     emit(request("GET", "/api/v1/dashboard/problems"))
+  elif args.command == "check":
+    payload = request("GET", "/api/v1/dashboard/problems")
+    total = payload.get("summary", {}).get("total")
+    if total is None:
+      total = len(payload.get("problems", []))
+    emit(payload, exit_code=1 if total else 0)
   elif args.command == "diagnose":
     emit(request("GET", "/api/v1/dashboard/snapshot"))
   elif args.command == "inspect":

@@ -1174,13 +1174,14 @@ async def diagnostic_snapshot(store: RequestStore, worker_manager: FFTWorkerMana
     operational_stats(store, k8s, worker_manager, queues, launch, http_observation),
   )
   stats, queues = operational
+  problems = derive_problems(checks, k8s, stats, runs["runs"])
   return {
     "demo": False,
     "generated_at": iso_timestamp(time.time()),
     "cluster": cluster,
     "runs": runs,
     "health": {"demo": False, "checks": checks, "stats": stats, "queues": queues},
-    "problems": {"demo": False, "problems": derive_problems(checks, k8s, stats, runs["runs"])},
+    "problems": problems_payload(problems),
   }
 
 
@@ -2640,3 +2641,22 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
   priority = {"error": 0, "warn": 1, "info": 2}
   problems.sort(key=lambda problem: (priority.get(problem["severity"], 3), problem["id"]))
   return problems
+
+
+def problems_payload(problems: list[dict], *, demo: bool = False, notice: str | None = None) -> dict:
+  """Wrap diagnostics with stable counts so automation need not infer health from prose."""
+  errors = sum(problem["severity"] == "error" for problem in problems)
+  warnings = sum(problem["severity"] == "warn" for problem in problems)
+  payload = {
+    "demo": demo,
+    "summary": {
+      "status": "error" if errors else "warn" if warnings else "ok",
+      "total": len(problems),
+      "errors": errors,
+      "warnings": warnings,
+    },
+    "problems": problems,
+  }
+  if notice is not None:
+    payload["notice"] = notice
+  return payload

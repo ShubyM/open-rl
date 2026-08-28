@@ -143,6 +143,10 @@ class DashboardEndpointsTest(unittest.TestCase):
     )
     self.assertIn("checks", body["health"])
     self.assertIn("problems", body["problems"])
+    problem_items = body["problems"]["problems"]
+    self.assertEqual(body["problems"]["summary"]["total"], len(problem_items))
+    self.assertEqual(body["problems"]["summary"]["errors"], sum(item["severity"] == "error" for item in problem_items))
+    self.assertEqual(body["problems"]["summary"]["warnings"], sum(item["severity"] == "warn" for item in problem_items))
     snapshot.assert_called_once_with()
 
   def test_kubernetes_observation_cache_coalesces_concurrent_reads_and_forces_refresh(self) -> None:
@@ -333,6 +337,27 @@ class DashboardEndpointsTest(unittest.TestCase):
       ):
         ops.main()
         request.assert_called_once_with(*call, *(() if payload is None else (payload,)))
+
+  def test_ops_check_uses_problem_count_as_exit_status(self) -> None:
+    for total, exit_code in ((0, 0), (2, 1)):
+      payload = {"summary": {"status": "warn" if total else "ok", "total": total, "errors": 0, "warnings": total}, "problems": []}
+      with (
+        self.subTest(total=total),
+        mock.patch("sys.argv", ["ops.py", "check"]),
+        mock.patch.object(ops, "request", return_value=payload) as request,
+        mock.patch.object(ops, "emit") as emit,
+      ):
+        ops.main()
+        request.assert_called_once_with("GET", "/api/v1/dashboard/problems")
+        emit.assert_called_once_with(payload, exit_code=exit_code)
+
+  def test_problem_payload_has_stable_machine_summary(self) -> None:
+    payload = data.problems_payload([{"severity": "warn"}, {"severity": "error"}, {"severity": "warn"}])
+    self.assertEqual(payload["summary"], {"status": "error", "total": 3, "errors": 1, "warnings": 2})
+    self.assertFalse(payload["demo"])
+    with mock.patch("builtins.print"), self.assertRaises(SystemExit) as raised:
+      ops.emit(payload, exit_code=1)
+    self.assertEqual(raised.exception.code, 1)
 
   def test_run_detail_bundles_run_state(self) -> None:
     old_tmp_dir = os.environ.get("OPEN_RL_TMP_DIR")

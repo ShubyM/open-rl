@@ -74,6 +74,7 @@ The UI serves humans; the same primitives are exposed as JSON for agents and scr
 | diagnose | `GET /api/v1/dashboard/snapshot` | `make ops diagnose` |
 | health | `GET /api/v1/dashboard/health` | `make ops health` |
 | problems | `GET /api/v1/dashboard/problems` | `make ops problems` |
+| health gate | `GET /api/v1/dashboard/problems` | `make ops check` |
 | inspect | `GET /api/v1/dashboard/cluster` | `make ops inspect` |
 | runs | `GET /api/v1/dashboard/runs` | `make ops runs` |
 | run detail | `GET /api/v1/dashboard/runs/{run_id}?logs=N` | `make ops run <run_id> N` |
@@ -87,6 +88,9 @@ the human display string plus `value_number`, `unit`, structured `context`, and 
 not need to parse text such as byte sizes or GPU fractions.
 Problems and per-run diagnostics carry a stable `id` and `code`, the affected `resource`, structured
 `evidence`, and concrete `actions` containing both API paths and copyable CLI or `kubectl` commands.
+The problems payload includes exact error/warning/total counts and an `ok`, `warn`, or `error` status.
+`make ops check` prints that same JSON and exits nonzero whenever the total is nonzero, making it suitable
+for agents, CI steps, and shell health gates without parsing display text.
 Pod evidence includes current and previous container termination state, exit code, condition messages,
 the configured image, runtime image digest, and up to 10 recent Kubernetes events. Configured service
 endpoints are reduced to scheme, host, and port; credentials, paths, queries, and fragments never enter

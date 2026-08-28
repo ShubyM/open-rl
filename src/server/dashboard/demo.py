@@ -5,7 +5,14 @@
 import math
 import time
 
-from server.dashboard.data import TERMINAL_POD_PHASES, aggregate_pod_resources, derive_problems, run_diagnostics, scheduler_run_diagnostics
+from server.dashboard.data import (
+  TERMINAL_POD_PHASES,
+  aggregate_pod_resources,
+  derive_problems,
+  problems_payload,
+  run_diagnostics,
+  scheduler_run_diagnostics,
+)
 
 DEMO_NOTICE = "Demo data — every machine, pod, and run on this page is fictional."
 
@@ -917,10 +924,8 @@ def demo_health() -> dict:
 
 def demo_problems() -> dict:
   cluster = demo_cluster()
-  return {
-    "demo": True,
-    "notice": DEMO_NOTICE,
-    "problems": derive_problems(
+  return problems_payload(
+    derive_problems(
       demo_health()["checks"],
       {
         "namespace": cluster["kubernetes"]["namespace"],
@@ -932,7 +937,9 @@ def demo_problems() -> dict:
       demo_health()["stats"],
       demo_runs()["runs"],
     ),
-  }
+    demo=True,
+    notice=DEMO_NOTICE,
+  )
 
 
 def demo_run_detail(run_id: str, log_tail: int = 0) -> dict | None:

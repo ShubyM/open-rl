@@ -40,6 +40,7 @@ help:
 	@echo "make test e2e fft-gsm8k TRAINING_TEST_ARGS='steps=10 eval_examples=8 extra=\"batch=2\"'"
 	@echo "make test piglatin                      # pig-latin example end-to-end tests"
 	@echo "make ops diagnose                      # one-call cluster triage as JSON"
+	@echo "make ops check                         # JSON health gate; nonzero when problems exist"
 	@echo "make ops health|problems|inspect|runs   # focused cluster ops (dashboard at $(BASE_URL)/dashboard)"
 	@echo "make ops run RUN_ID 120                # inspect a run with 120 log lines per pod"
 	@echo "make ops logs POD --previous            # read a restarted container's prior logs"
