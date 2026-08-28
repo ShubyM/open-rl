@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 
+from server.http_metrics import http_metrics
 from server.store import InMemoryStore, RedisStore, RequestStore
 from server.worker_launch_processor import FFTWorkerManager
 
@@ -1032,7 +1033,7 @@ duty_tracker = DutyTracker()
 # *** Cluster assembly ***
 
 
-def gateway_summary() -> dict:
+def gateway_summary(http_observation: dict | None = None) -> dict:
   from server import gateway
 
   return {
@@ -1043,6 +1044,7 @@ def gateway_summary() -> dict:
     "vllm_url": safe_endpoint(gateway.VLLM_URL) if gateway.get_sampler_backend() == "vllm" else None,
     "sampler_backend": gateway.get_sampler_backend(),
     "build": build_summary(),
+    "http": http_observation if http_observation is not None else http_metrics.snapshot(),
   }
 
 
@@ -1056,8 +1058,8 @@ async def ping_redis(store: RequestStore) -> bool | None:
     return False
 
 
-async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
-  gateway_card = gateway_summary()
+async def cluster_snapshot(store: RequestStore, k8s: dict, http_observation: dict | None = None) -> dict:
+  gateway_card = gateway_summary(http_observation)
   redis_ok = await ping_redis(store)
 
   shared = tmp_dir()
@@ -1160,15 +1162,16 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
 
 async def diagnostic_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | None, k8s: dict) -> dict:
   """Build one coherent dashboard payload from one Kubernetes observation."""
+  http_observation = http_metrics.snapshot()
   try:
     queues, launch = await asyncio.gather(store.queue_stats(), store.worker_launch_stats())
   except Exception:
     queues, launch = [], {"depth": 0, "oldest_enqueued_at": None, "oldest_age_seconds": None}
   cluster, runs, checks, operational = await asyncio.gather(
-    cluster_snapshot(store, k8s),
+    cluster_snapshot(store, k8s, http_observation),
     runs_snapshot(store, worker_manager, k8s["pods"], k8s.get("scheduler"), queues),
     health_checks(store, k8s),
-    operational_stats(store, k8s, worker_manager, queues, launch),
+    operational_stats(store, k8s, worker_manager, queues, launch, http_observation),
   )
   stats, queues = operational
   return {
@@ -1890,6 +1893,7 @@ async def operational_stats(
   worker_manager: FFTWorkerManager | None,
   queues: list[dict] | None = None,
   launch: dict | None = None,
+  http_observation: dict | None = None,
 ) -> tuple[list[dict], list[dict]]:
   """Load numbers for the Health screen: queue depths, active runs, Redis and gateway memory,
   disk, and pod totals. Everything is measured, never estimated."""
@@ -1990,6 +1994,75 @@ async def operational_stats(
     ),
     *redis_stats,
   ]
+  http_observation = http_observation if http_observation is not None else http_metrics.snapshot()
+  application_http = http_observation["groups"]["application"]
+  request_count = application_http["requests"]
+  p95_seconds = application_http["p95_latency_seconds"]
+  p95_ms = (p95_seconds or 0.0) * 1000
+  latency_warn_seconds = float(os.getenv("OPEN_RL_HTTP_LATENCY_WARN_SECONDS", "2"))
+  server_errors = application_http["in_window_server_errors"]
+  recent_application_errors = [error for error in http_observation["recent_server_errors"] if error["group"] == "application"]
+  stats.extend(
+    [
+      stat_entry(
+        "gateway.http_requests",
+        "Gateway requests",
+        str(request_count),
+        (
+          f"latest {http_observation['sample_capacity']} samples; window truncated"
+          if http_observation["window_truncated"]
+          else f"last {format_duration(http_observation['window_seconds'])} · {http_observation['in_flight']} in flight"
+        ),
+        value_number=request_count,
+        unit="requests",
+        context={
+          "window_seconds": http_observation["window_seconds"],
+          "requests_per_second": application_http["requests_per_second"],
+          "in_flight": http_observation["in_flight"],
+          "sample_capacity": http_observation["sample_capacity"],
+          "sample_count": http_observation["sample_count"],
+          "dropped_samples": http_observation["dropped_samples"],
+          "window_truncated": http_observation["window_truncated"],
+          "group_requests": {name: group["requests"] for name, group in http_observation["groups"].items()},
+        },
+        status="warn" if http_observation["window_truncated"] else "ok",
+      ),
+      stat_entry(
+        "gateway.http_latency",
+        "Gateway p95 latency",
+        f"{p95_ms:.1f} ms" if p95_seconds is not None else "—",
+        f"p50 {((application_http['p50_latency_seconds'] or 0) * 1000):.1f} ms · max {((application_http['max_latency_seconds'] or 0) * 1000):.1f} ms"
+        if request_count
+        else "no application requests in the window",
+        value_number=p95_ms,
+        unit="milliseconds",
+        context={
+          "requests": request_count,
+          "p50_latency_seconds": application_http["p50_latency_seconds"],
+          "p95_latency_seconds": p95_seconds,
+          "max_latency_seconds": application_http["max_latency_seconds"],
+          "warn_after_seconds": latency_warn_seconds,
+          "routes": [route for route in http_observation["routes"] if route["group"] == "application"][:20],
+        },
+        status="warn" if request_count >= 5 and p95_seconds is not None and p95_seconds >= latency_warn_seconds else "ok",
+      ),
+      stat_entry(
+        "gateway.http_errors",
+        "Gateway server errors",
+        str(server_errors),
+        f"{application_http['server_error_rate']:.1%} of application requests",
+        value_number=server_errors,
+        unit="errors",
+        context={
+          "requests": request_count,
+          "server_error_rate": application_http["server_error_rate"],
+          "client_errors": application_http["in_window_client_errors"],
+          "recent_errors": recent_application_errors,
+        },
+        status="warn" if server_errors else "ok",
+      ),
+    ]
+  )
   if observation := k8s.get("observation"):
     collection_ms = observation["collection_ms"]
     components_ms = observation.get("components_ms") or {}
@@ -2359,6 +2432,9 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
     "cluster.cpu_requests",
     "cluster.memory_requests",
     "kubernetes.collection",
+    "gateway.http_latency",
+    "gateway.http_errors",
+    "gateway.http_requests",
   }
   for stat in stats or []:
     if stat["status"] != "warn" or stat["id"] not in alerting_stats:
@@ -2380,6 +2456,15 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
           "method": "GET",
           "path": "/api/v1/dashboard/cluster",
           "command": "make ops inspect",
+        }
+      )
+    elif stat["id"] in {"gateway.http_latency", "gateway.http_errors", "gateway.http_requests"}:
+      actions.append(
+        {
+          "label": "Inspect gateway traffic",
+          "method": "GET",
+          "path": "/api/v1/dashboard/snapshot",
+          "command": "make ops diagnose",
         }
       )
     problems.append(

@@ -36,7 +36,8 @@ experiment analysis; nothing here duplicates metrics.
   W&B link appears when one is recorded, and Stop appears when there is something to stop (a worker
   process, queued work, or labeled pods).
 - **Health** — current problems first, then a **Load** section of measured stats (active runs, queued
-  requests per run, oldest request and worker-launch wait, Redis memory and clients, gateway RSS, disk free, pod and
+  requests per run, oldest request and worker-launch wait, gateway request throughput/p95 latency/5xx rate,
+  Redis memory and clients, gateway RSS, disk free, pod and
   GPU totals, optional Metrics Server CPU/memory usage, CPU/memory scheduling reservations, rollout health, scheduler workload phases, and ClaimLedger seats), then gateway / storage / Kubernetes /
   scheduler / visibility checks. Node `MemoryPressure` and `DiskPressure` conditions surface under
   Problems. Failed or slow placement, stale observed generations, assignment/seat mismatches, and stale
@@ -53,6 +54,14 @@ Collections slower than one second become a warning; tune that with `OPEN_RL_K8S
 Manual refresh and a light/dark toggle are in
 the top bar. The top bar and gateway card show the exact image build revision; pod inspection includes
 the runtime image digest, so an agent can prove a rebuilt fix is actually deployed rather than trusting a tag.
+
+Gateway HTTP telemetry is a bounded five-minute in-process ring. It records only method, normalized FastAPI
+route template, status, traffic group, timestamp, and latency—never URL parameters, request IDs, headers,
+queries, or bodies. Diagnostic polling and long-poll/background routes are reported separately so they do not
+distort application p95 or 5xx alerts. Responses expose the ring capacity, lifetime dropped-sample count, and
+whether an overflow truncated the current window, so high traffic cannot silently produce partial statistics.
+Tune the application latency warning with
+`OPEN_RL_HTTP_LATENCY_WARN_SECONDS` and the observation window with `OPEN_RL_HTTP_WINDOW_SECONDS`.
 
 ## JSON API and ops CLI
 
@@ -92,7 +101,8 @@ waits after 60 seconds by default; tune them with `OPEN_RL_QUEUE_WARN_SECONDS` a
 `make kind-dashboard-smoke` creates (or reuses) an `open-rl-dashboard` Kind cluster, builds and
 loads the local gateway image, deploys the dashboard with its real service account and RBAC, and
 verifies that the gateway can list its namespace, see the Kind node, serve the UI, and return a
-coherent diagnostic snapshot with no reported problems. It also exercises pod logs and the stop
+coherent diagnostic snapshot with no reported problems. It also proves HTTP traffic grouping against a
+real FastAPI route, exercises pod logs and the stop
 permission while rejecting images that rebuild the Python project at pod startup. The cluster is
 left running for inspection; remove it with `make kind-dashboard-clean`.
 

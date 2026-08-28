@@ -42,6 +42,9 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
+# Exercise one harmless application route before observing the dashboard. The
+# health and dashboard polling above must remain in the diagnostic group.
+curl -fsS "http://127.0.0.1:${PORT}/api/v1/get_server_capabilities" >/dev/null
 curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/snapshot" >"$snapshot_file"
 curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/cluster" |
   python3 -c 'import json,sys; observation=json.load(sys.stdin)["kubernetes"]["observation"]; assert observation["source"] == "cache", observation; assert 0 <= observation["age_seconds"] < 1, observation'
@@ -90,6 +93,17 @@ assert set(observation["components_ms"]) == {"pods", "nodes", "events", "schedul
 assert all(value >= 0 for value in observation["components_ms"].values()), observation
 assert cluster["kubernetes"]["nodes_error"] is None, cluster["kubernetes"]
 assert cluster["gateway"]["build"]["revision"] == sys.argv[2], cluster["gateway"]["build"]
+http = cluster["gateway"]["http"]
+assert http["window_seconds"] == 300, http
+assert http["sample_capacity"] == 5000, http
+assert http["sample_count"] >= 2, http
+assert http["dropped_samples"] == 0, http
+assert http["window_truncated"] is False, http
+assert http["groups"]["application"]["requests"] >= 1, http
+assert http["groups"]["diagnostic"]["requests"] >= 1, http
+capabilities = next(route for route in http["routes"] if route["route"] == "/api/v1/get_server_capabilities")
+assert capabilities["group"] == "application", capabilities
+assert capabilities["server_errors"] == 0, capabilities
 assert cluster["kubernetes"]["metrics"] == {
   "installed": False,
   "available": False,
@@ -125,6 +139,9 @@ assert stats["kubernetes.collection"]["unit"] == "milliseconds", stats["kubernet
 assert stats["kubernetes.rollouts"]["value_number"] == 0, stats["kubernetes.rollouts"]
 assert stats["cluster.cpu_requests"]["value_number"] == 0.1, stats["cluster.cpu_requests"]
 assert stats["cluster.memory_requests"]["value_number"] == 128 * 2**20, stats["cluster.memory_requests"]
+assert stats["gateway.http_requests"]["value_number"] == http["groups"]["application"]["requests"], stats["gateway.http_requests"]
+assert stats["gateway.http_latency"]["value_number"] >= 0, stats["gateway.http_latency"]
+assert stats["gateway.http_errors"]["value_number"] == 0, stats["gateway.http_errors"]
 assert "cluster.cpu" not in stats, "requests must not be mislabeled as measured usage"
 for stat in snapshot["health"]["stats"]:
   assert {"value_number", "unit", "context", "status"} <= stat.keys(), stat

@@ -526,11 +526,14 @@ function renderCluster(data) {
     (card, item) => {
       if (item.id === "gateway") {
         const g = data.gateway;
+        const http = g.http?.groups?.application || {};
         updateCard(card, "gateway", g.mode, [
           { k: "build", v: revisionLabel(g.build?.revision) },
           { k: "uptime", v: duration(g.build?.uptime_seconds) },
           { k: "sampler", v: g.sampler_backend },
           { k: "fft", v: g.fft_enabled ? "enabled" : "off" },
+          { k: "traffic", v: `${http.requests || 0} req · p95 ${latency(http.p95_latency_seconds)}` },
+          { k: "5xx", v: String(http.in_window_server_errors || 0), bad: (http.in_window_server_errors || 0) > 0 },
           { k: "namespace", v: data.kubernetes.namespace || "—" },
         ]);
       } else if (item.id === "scheduler") {

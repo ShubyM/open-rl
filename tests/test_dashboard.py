@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from dev.tools import ops
 from server import gateway
 from server.dashboard import data
+from server.http_metrics import HTTPMetrics, http_metrics
 
 
 class DashboardEndpointsTest(unittest.TestCase):
@@ -30,6 +31,47 @@ class DashboardEndpointsTest(unittest.TestCase):
     for asset in ("style.css", "app.js"):
       resp = self.client.get(f"/dashboard/static/{asset}")
       self.assertEqual(resp.status_code, 200, asset)
+
+  def test_http_middleware_uses_route_templates_and_separates_diagnostic_traffic(self) -> None:
+    http_metrics.clear()
+    self.addCleanup(http_metrics.clear)
+
+    self.assertEqual(self.client.post("/api/v1/create_model", json={}).status_code, 400)
+    self.assertEqual(self.client.get("/api/v1/dashboard/runs/not-a-real-run").status_code, 404)
+    self.assertEqual(self.client.get("/api/v1/healthz").status_code, 200)
+
+    observed = http_metrics.snapshot()
+    routes = {(route["group"], route["method"], route["route"]) for route in observed["routes"]}
+    self.assertIn(("application", "POST", "/api/v1/create_model"), routes)
+    self.assertIn(("diagnostic", "GET", "/api/v1/dashboard/runs/{run_id}"), routes)
+    self.assertIn(("diagnostic", "GET", "/api/v1/healthz"), routes)
+    self.assertNotIn("not-a-real-run", json.dumps(observed), "raw path IDs must never enter telemetry")
+
+  def test_http_metrics_are_bounded_windowed_and_numeric(self) -> None:
+    metrics = HTTPMetrics(max_samples=4)
+    metrics.record("GET", "/api/v1/a", 200, 0.01, completed_at=100.0)
+    metrics.record("POST", "/api/v1/a", 500, 0.20, completed_at=101.0)
+    metrics.record("GET", "/api/v1/b", 200, 0.10, completed_at=102.0)
+    metrics.record("GET", "/api/v1/dashboard/snapshot", 200, 0.50, "diagnostic", completed_at=103.0)
+    observed = metrics.snapshot(now=104.0, window_seconds=10.0)
+
+    application = observed["groups"]["application"]
+    self.assertEqual(application["requests"], 3)
+    self.assertEqual(application["in_window_server_errors"], 1)
+    self.assertAlmostEqual(application["server_error_rate"], 1 / 3)
+    self.assertEqual(application["p50_latency_seconds"], 0.1)
+    self.assertEqual(application["p95_latency_seconds"], 0.2)
+    self.assertEqual(observed["recent_server_errors"][0]["route"], "/api/v1/a")
+    self.assertEqual(observed["sample_capacity"], 4)
+    self.assertFalse(observed["window_truncated"])
+    metrics.record("GET", "/api/v1/c", 200, 0.02, completed_at=105.0)
+    overflowed = metrics.snapshot(now=105.0, window_seconds=10.0)
+    self.assertEqual(overflowed["sample_count"], 4)
+    self.assertEqual(overflowed["dropped_samples"], 1)
+    self.assertTrue(overflowed["window_truncated"])
+    expired = metrics.snapshot(now=200.0, window_seconds=10.0)
+    self.assertEqual(expired["sample_count"], 0)
+    self.assertFalse(expired["window_truncated"])
 
   def test_pod_logs_can_read_previous_container_instance(self) -> None:
     with mock.patch.object(data, "k8s_pod_logs", return_value={"demo": False, "pod": "pod-a", "previous": True, "text": "prior"}) as logs:
@@ -594,6 +636,57 @@ class DashboardEndpointsTest(unittest.TestCase):
     problem = next(problem for problem in data.derive_problems([], k8s, stats) if problem["code"] == "metric.kubernetes_collection")
     self.assertEqual(problem["evidence"]["components_ms"]["events"], 1200.0)
     self.assertEqual(problem["actions"][1]["command"], "make ops inspect")
+
+  def test_gateway_http_latency_and_server_errors_are_actionable_metrics(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    metrics = HTTPMetrics()
+    for index, latency_seconds in enumerate((0.05, 0.1, 0.2, 2.5, 3.0)):
+      metrics.record(
+        "POST",
+        "/api/v1/forward_backward",
+        500 if index == 4 else 200,
+        latency_seconds,
+        completed_at=100.0 + index,
+      )
+    http = metrics.snapshot(now=105.0, window_seconds=300.0)
+    k8s = {"available": False, "namespace": "default", "error": "off", "pods": [], "nodes": []}
+    with mock.patch.dict(os.environ, {"OPEN_RL_HTTP_LATENCY_WARN_SECONDS": "2"}):
+      stats, _ = asyncio.run(data.operational_stats(InMemoryStore(), k8s, None, http_observation=http))
+
+    by_id = {stat["id"]: stat for stat in stats}
+    self.assertEqual(by_id["gateway.http_requests"]["value_number"], 5)
+    self.assertEqual(by_id["gateway.http_latency"]["value_number"], 3000.0)
+    self.assertEqual(by_id["gateway.http_latency"]["status"], "warn")
+    self.assertEqual(by_id["gateway.http_errors"]["value_number"], 1)
+    self.assertEqual(by_id["gateway.http_errors"]["status"], "warn")
+    codes = {problem["code"] for problem in data.derive_problems([], k8s, stats)}
+    self.assertLessEqual({"metric.gateway_http_latency", "metric.gateway_http_errors"}, codes)
+    error_problem = next(problem for problem in data.derive_problems([], k8s, stats) if problem["code"] == "metric.gateway_http_errors")
+    self.assertEqual(error_problem["evidence"]["recent_errors"][0]["route"], "/api/v1/forward_backward")
+    self.assertEqual(error_problem["actions"][1]["command"], "make ops diagnose")
+
+  def test_gateway_http_sample_overflow_is_an_actionable_problem(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    metrics = HTTPMetrics(max_samples=2)
+    for index in range(3):
+      metrics.record("GET", "/api/v1/get_server_capabilities", 200, 0.01, completed_at=100.0 + index)
+    http = metrics.snapshot(now=103.0, window_seconds=300.0)
+    k8s = {"available": False, "namespace": "default", "error": "off", "pods": [], "nodes": []}
+    stats, _ = asyncio.run(data.operational_stats(InMemoryStore(), k8s, None, http_observation=http))
+
+    requests = next(stat for stat in stats if stat["id"] == "gateway.http_requests")
+    self.assertEqual(requests["status"], "warn")
+    self.assertTrue(requests["context"]["window_truncated"])
+    self.assertEqual(requests["context"]["dropped_samples"], 1)
+    problem = next(problem for problem in data.derive_problems([], k8s, stats) if problem["code"] == "metric.gateway_http_requests")
+    self.assertEqual(problem["evidence"]["sample_capacity"], 2)
+    self.assertEqual(problem["actions"][1]["command"], "make ops diagnose")
 
   def test_rollout_snapshot_preserves_partial_visibility_and_failed_controller_evidence(self) -> None:
     import asyncio

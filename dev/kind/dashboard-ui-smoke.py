@@ -46,6 +46,9 @@ def main() -> None:
 
       cards = page.locator("#control-col .card-title").all_text_contents()
       assert "gateway" in cards and "rollouts" in cards, cards
+      gateway_card = page.locator("#control-col .card").filter(has=page.locator(".card-title", has_text="gateway")).first
+      gateway_text = gateway_card.text_content()
+      assert "traffic" in gateway_text and "5xx" in gateway_text, gateway_text
       freshness = page.locator("#updated-at")
       assert freshness.get_attribute("data-compact").startswith("k8s ")
       tooltip = freshness.get_attribute("title")

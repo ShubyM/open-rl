@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -17,6 +17,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from server.dashboard import mount_dashboard
+from server.http_metrics import http_metrics
 from server.store import get_store
 from server.worker_launch_processor import (
   FFTWorkerManager,
@@ -72,6 +73,14 @@ def get_default_model_name() -> str | None:
 
 def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
+
+
+def http_request_group(route: str) -> str:
+  if route.startswith("/api/v1/dashboard") or route.startswith("/dashboard") or route in {"/api/v1/healthz", "/openapi.json", "/docs"}:
+    return "diagnostic"
+  if route in {"/api/v1/retrieve_future", "/api/v1/session_heartbeat", "/api/v1/telemetry"}:
+    return "background"
+  return "application"
 
 
 def sampler_session_id(model_id: str, seq_id: int | str) -> str:
@@ -261,6 +270,19 @@ async def lifespan(served_app: FastAPI):
 app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
 FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat,/api/v1/dashboard/.*,/dashboard.*")
 mount_dashboard(app)
+
+
+@app.middleware("http")
+async def observe_http_request(request: Request, call_next):
+  started = http_metrics.begin()
+  status = 500
+  try:
+    response = await call_next(request)
+    status = response.status_code
+    return response
+  finally:
+    route = getattr(request.scope.get("route"), "path", None) or "<unmatched>"
+    http_metrics.finish(started, request.method, route, status, http_request_group(route))
 
 
 # *** ServiceClient endpoints ***
