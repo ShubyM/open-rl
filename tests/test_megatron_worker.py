@@ -1,15 +1,25 @@
 """Megatron backend pieces that do not need megatron installed.
 
 Neither megatron-core nor megatron-bridge is a dependency, so most of the worker
-cannot run here. Three parts can, and they are the three that would fail
-silently: the data-parallel sharding hooks (wrong shard -> tensor-parallel peers
-train on different tokens), the DDP buffer offload's pointer arithmetic (wrong
-offset -> parameters alias the wrong weights after a wake_up), and the chunked
-logprob head's sequence-first/batch-first bookkeeping (wrong transpose ->
-training on shifted labels).
+cannot run here. The parts that can are the ones that would fail silently: the
+data-parallel sharding hooks (wrong shard -> tensor-parallel peers train on
+different tokens), the DDP buffer offload's pointer arithmetic (wrong offset ->
+parameters alias the wrong weights after a wake_up), and the chunked logprob
+head's sequence-first/batch-first bookkeeping (wrong transpose -> training on
+shifted labels).
+
+The checkpoint cases are here for a different reason. They do not fail silently
+at all -- they kill the run -- but they only fire at a save boundary, so on a
+long run the failure arrives hours after the commit that caused it and takes the
+training with it. A stub bridge runs the same path in milliseconds.
 """
 
+import importlib
+import json
+import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 import unittest.mock
@@ -425,6 +435,257 @@ class TensorParallelAgreementTest(unittest.TestCase):
     worker.tp_size = 1
     with unittest.mock.patch.object(megatron_worker.dist, "all_gather", side_effect=AssertionError("collective")):
       worker.assert_tp_ranks_agree([datum(0)])
+
+
+class BlockModeloptImport(unittest.mock.MagicMock):
+  """A meta_path finder that makes `import modelopt` fail as it does in prod.
+
+  Without this the tests would pass or fail depending on whether the machine
+  running them happens to have modelopt installed, which is exactly the
+  difference between the box and CI that let run32 ship.
+  """
+
+  def find_spec(self, name, path=None, target=None):
+    if name == "modelopt" or name.startswith("modelopt."):
+      raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+    return None
+
+
+def modelopt_module(**attrs) -> types.ModuleType:
+  module = types.ModuleType("modelopt.torch.quantization.utils")
+  for key, value in attrs.items():
+    setattr(module, key, value)
+  return module
+
+
+class ModeloptGuardTest(unittest.TestCase):
+  """ensure_modelopt_importable has to hold in all three dependency states.
+
+  megatron-bridge's save_hf_weights does an unguarded `from
+  modelopt.torch.quantization.utils import is_quantized` and uses the answer only
+  to decide whether to strip `_quantizer.` tensors. A bf16 run needs False and
+  cannot get it without the package, so every save dies. The guard supplies the
+  symbol -- but only when it is genuinely missing, or it would shadow a real
+  modelopt and answer False for a model that really is quantized.
+  """
+
+  def setUp(self) -> None:
+    saved = {name: module for name, module in sys.modules.items() if name.split(".")[0] == "modelopt"}
+
+    def restore() -> None:
+      for name in [name for name in sys.modules if name.split(".")[0] == "modelopt"]:
+        del sys.modules[name]
+      sys.modules.update(saved)
+
+    self.addCleanup(restore)
+    for name in saved:
+      del sys.modules[name]
+
+  def block_disk_imports(self) -> None:
+    finder = BlockModeloptImport()
+    sys.meta_path.insert(0, finder)
+    self.addCleanup(sys.meta_path.remove, finder)
+
+  def resolve(self):
+    from modelopt.torch.quantization.utils import is_quantized
+
+    return is_quantized
+
+  def test_a_missing_modelopt_gets_the_one_symbol_the_save_path_reads(self) -> None:
+    self.block_disk_imports()
+    with self.assertRaises(ModuleNotFoundError):
+      self.resolve()
+
+    megatron_worker.ensure_modelopt_importable()
+
+    # False is the answer, not a placeholder: with no modelopt installed nothing
+    # could have quantized this model in the first place.
+    self.assertFalse(self.resolve()(object()))
+
+  def test_a_partial_install_is_repaired_rather_than_trusted(self) -> None:
+    # The box's actual state, left by a half-finished shim: the package imports
+    # and satisfies find_spec, and the symbol still is not there. A probe on the
+    # package would return early here and the save would die anyway.
+    self.block_disk_imports()
+    for name in ("modelopt", "modelopt.torch", "modelopt.torch.quantization"):
+      sys.modules[name] = types.ModuleType(name)
+    sys.modules["modelopt.torch.quantization.utils"] = modelopt_module()
+    # The package imports; only the name inside it is missing. Anything that
+    # probes at package granularity sees a working modelopt here.
+    importlib.import_module("modelopt")
+    with self.assertRaises(ImportError):
+      self.resolve()
+
+    megatron_worker.ensure_modelopt_importable()
+
+    self.assertFalse(self.resolve()(object()))
+
+  def test_a_real_modelopt_is_left_alone(self) -> None:
+    for name in ("modelopt", "modelopt.torch", "modelopt.torch.quantization"):
+      sys.modules[name] = types.ModuleType(name)
+    sys.modules["modelopt.torch.quantization.utils"] = modelopt_module(is_quantized=lambda _model: True)
+
+    megatron_worker.ensure_modelopt_importable()
+
+    # Shadowing a real install would answer False for a genuinely quantized
+    # model and silently write `_quantizer.` tensors into the checkpoint.
+    self.assertTrue(self.resolve()(object()))
+
+  def test_calling_it_twice_is_stable(self) -> None:
+    self.block_disk_imports()
+    megatron_worker.ensure_modelopt_importable()
+    first = self.resolve()
+    megatron_worker.ensure_modelopt_importable()
+    self.assertIs(self.resolve(), first)
+
+
+class UpstreamBridge:
+  """save_hf_pretrained as megatron-bridge actually implements it.
+
+  The unguarded import is the whole point: this is the line that killed run32 at
+  its first checkpoint, five and a half hours in.
+  """
+
+  def __init__(self, calls: list[str], fail: bool = False):
+    self.calls = calls
+    self.fail = fail
+
+  def save_hf_pretrained(self, _chunks, path: str) -> None:
+    from modelopt.torch.quantization.utils import is_quantized
+
+    self.calls.append(f"save_hf_pretrained(is_quantized={is_quantized(None)})")
+    if self.fail:
+      raise RuntimeError("write failed")
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "model.safetensors"), "w") as handle:
+      handle.write("weights")
+
+
+class CheckpointSaveTest(unittest.TestCase):
+  """The save path, exercised without megatron, a GPU, or four hours of training.
+
+  Every Megatron run so far has died at a checkpoint boundary rather than in
+  training, and always after enough steps that the failure cost the whole run.
+  save_every decides how late that test runs; these cases run it at import time.
+  """
+
+  def setUp(self) -> None:
+    saved = {name: module for name, module in sys.modules.items() if name.split(".")[0] == "modelopt"}
+
+    def restore() -> None:
+      for name in [name for name in sys.modules if name.split(".")[0] == "modelopt"]:
+        del sys.modules[name]
+      sys.modules.update(saved)
+
+    self.addCleanup(restore)
+    for name in saved:
+      del sys.modules[name]
+    finder = BlockModeloptImport()
+    sys.meta_path.insert(0, finder)
+    self.addCleanup(sys.meta_path.remove, finder)
+
+    self.calls: list[str] = []
+    self.root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, self.root, True)
+    self.enterContext(unittest.mock.patch.object(megatron_worker, "is_primary", return_value=True))
+    self.enterContext(unittest.mock.patch.object(megatron_worker, "barrier", lambda: None))
+
+  def worker(self, fail: bool = False, optimizer=None) -> MegatronTrainingWorker:
+    worker = MegatronTrainingWorker.__new__(MegatronTrainingWorker)
+    worker.model_chunks = [object()]
+    worker.bridge = UpstreamBridge(self.calls, fail=fail)
+    worker.tokenizer = None
+    worker.optimizer = optimizer
+    worker.base_model_name = "google/gemma-4-12B-it"
+    return worker
+
+  def read_metadata(self, path: str) -> dict:
+    with open(os.path.join(path, "metadata.json")) as handle:
+      return json.load(handle)
+
+  def test_a_save_survives_a_machine_without_modelopt(self) -> None:
+    # Delete the guard and this case is run32: ModuleNotFoundError, no
+    # checkpoint, four steps of training with nowhere to land.
+    path = os.path.join(self.root, "state")
+    self.worker().save_checkpoint(path, {"kind": "state"})
+
+    self.assertEqual(self.calls, ["save_hf_pretrained(is_quantized=False)"])
+    self.assertTrue(os.path.exists(os.path.join(path, "model.safetensors")))
+    self.assertEqual(self.read_metadata(path), {"kind": "state"})
+
+  def test_no_staging_directory_is_left_where_a_loader_would_find_it(self) -> None:
+    path = os.path.join(self.root, "state")
+    self.worker().save_checkpoint(path, {})
+    self.assertEqual(os.listdir(self.root), ["state"])
+
+  def test_a_failed_save_does_not_damage_the_previous_checkpoint(self) -> None:
+    # The reason for the staging dance: a save killed mid-write must not leave a
+    # directory that vLLM or a resume can load as a mix of old and new shards.
+    path = os.path.join(self.root, "state")
+    os.makedirs(path)
+    with open(os.path.join(path, "model.safetensors"), "w") as handle:
+      handle.write("old weights")
+
+    with self.assertRaises(RuntimeError):
+      self.worker(fail=True).save_checkpoint(path, {})
+
+    with open(os.path.join(path, "model.safetensors")) as handle:
+      self.assertEqual(handle.read(), "old weights")
+
+  def test_a_second_save_replaces_the_first(self) -> None:
+    path = os.path.join(self.root, "state")
+    worker = self.worker()
+    worker.save_checkpoint(path, {"step": 1})
+    worker.save_checkpoint(path, {"step": 2})
+
+    self.assertEqual(self.read_metadata(path), {"step": 2})
+    self.assertEqual(os.listdir(self.root), ["state"])
+
+  def test_save_state_records_what_load_from_state_requires(self) -> None:
+    # load_from_state refuses a checkpoint without base_model and skips the
+    # optimizer unless has_optimizer says it is there, so both are load-bearing.
+    path = os.path.join(self.root, "state")
+    worker = self.worker(optimizer=unittest.mock.MagicMock())
+    with unittest.mock.patch.object(worker, "save_optimizer") as save_optimizer:
+      worker.save_state("model-1", path, include_optimizer=True)
+
+    metadata = self.read_metadata(path)
+    self.assertEqual(metadata["base_model"], "google/gemma-4-12B-it")
+    self.assertEqual(metadata["model_id"], "model-1")
+    self.assertTrue(metadata["has_optimizer"])
+    save_optimizer.assert_called_once()
+
+  def test_include_optimizer_without_an_optimizer_is_recorded_honestly(self) -> None:
+    path = os.path.join(self.root, "state")
+    self.worker().save_state("model-1", path, include_optimizer=True)
+    # Claiming an optimizer that was never written would make a resume restore
+    # nothing and report success.
+    self.assertFalse(self.read_metadata(path)["has_optimizer"])
+
+  def test_publishing_sampler_weights_never_reaches_the_save_path(self) -> None:
+    # This is why run32 looked healthy for four steps: with NCCL transfer
+    # configured, the per-step sampler publish goes over the wire and only the
+    # every-fifth-step save_state touches save_hf_pretrained. A backend without
+    # the fast path exercises the broken line at step 0 instead.
+    worker = self.worker()
+    with (
+      unittest.mock.patch.object(worker, "sampler_urls", return_value=["http://127.0.0.1:8000"]),
+      unittest.mock.patch.object(worker, "sync_weights_to_samplers", return_value=666) as sync,
+    ):
+      worker.save_state("model-1", os.path.join(self.root, "sampler"), kind="sampler")
+
+    sync.assert_called_once()
+    self.assertEqual(self.calls, [])
+    self.assertFalse(os.path.exists(os.path.join(self.root, "sampler")))
+
+  def test_without_samplers_a_sampler_save_still_writes_to_disk(self) -> None:
+    path = os.path.join(self.root, "sampler")
+    worker = self.worker()
+    with unittest.mock.patch.object(worker, "sampler_urls", return_value=[]):
+      worker.save_state("model-1", path, kind="sampler")
+
+    self.assertEqual(self.read_metadata(path)["kind"], "sampler")
+    self.assertEqual(self.calls, ["save_hf_pretrained(is_quantized=False)"])
 
 
 class BackendGuardTest(unittest.TestCase):

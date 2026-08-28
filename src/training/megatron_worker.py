@@ -78,7 +78,9 @@ import json
 import math
 import os
 import shutil
+import sys
 import time
+import types
 from datetime import datetime
 from typing import Any
 
@@ -170,6 +172,38 @@ def require_megatron():
       f"installed into the trainer environment first. Import failed with: {exc}"
     ) from exc
   return AutoBridge, parallel_state
+
+
+def ensure_modelopt_importable() -> None:
+  """Work around megatron-bridge importing modelopt on the plain save path.
+
+  save_hf_weights() does an unguarded `from modelopt.torch.quantization.utils
+  import is_quantized`, then uses the result only to decide whether to strip
+  `_quantizer.` tensors out of the weight stream. An unquantized bf16 run needs
+  that call to answer False, but it cannot even reach the call without the
+  package, so save_state fails outright and the run dies at its first
+  checkpoint. Upstream should be doing this in a try/except.
+
+  Installing the real nvidia-modelopt is not a fix available here: it resolves
+  torch 2.13 / CUDA 13 over the torch 2.11+cu129 this stack is built against,
+  which would take Megatron, TE and flash-attn with it. So supply the one symbol
+  the plain path reads, and only when it is genuinely missing.
+  """
+  try:
+    # Probe the exact symbol, not just the package: this runs immediately before
+    # bridge imports it, so a real modelopt registers its hooks no earlier than
+    # it otherwise would, and a package present but missing the symbol (a broken
+    # partial install) is caught here rather than at the call site.
+    from modelopt.torch.quantization.utils import is_quantized  # noqa: F401
+  except ImportError:
+    pass
+  else:
+    return
+  for name in ("modelopt", "modelopt.torch", "modelopt.torch.quantization", "modelopt.torch.quantization.utils"):
+    sys.modules.setdefault(name, types.ModuleType(name))
+  # Answering False is the correct answer, not a placeholder: without modelopt
+  # installed nothing could have quantized this model in the first place.
+  sys.modules["modelopt.torch.quantization.utils"].is_quantized = lambda _model: False
 
 
 def chunked_target_logprobs(
@@ -652,6 +686,7 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     # HF format, not a Megatron checkpoint: this is what the vLLM sampler loads
     # and what load_from_state reads back. save_hf_pretrained gathers the
     # tensor-parallel shards, so it is collective -- every rank calls it.
+    ensure_modelopt_importable()
     self.bridge.save_hf_pretrained(self.model_chunks, staging_path)
     if is_primary() and self.tokenizer is not None:
       self.tokenizer.save_pretrained(staging_path)
