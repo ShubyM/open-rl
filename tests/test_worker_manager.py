@@ -470,5 +470,27 @@ class EstimateMemoryTierTest(unittest.TestCase):
     self.assertEqual(worker_manager.estimate_memory_tier("meta-llama/Llama-3-70B", "lora"), "80gb")
 
 
+class VllmUtilizationTest(unittest.TestCase):
+  """vLLM's device share is sized to the model, floored at 0.30."""
+
+  def test_small_models_take_the_floor(self) -> None:
+    # 0.6B holds 1.2GB of weights; the floor leaves the rest of the card
+    # to co-tenants instead of an idle KV cache.
+    self.assertEqual(worker_manager.vllm_gpu_memory_utilization("Qwen/Qwen3-0.6B", "lora"), "0.30")
+
+  def test_weights_push_the_fraction_up(self) -> None:
+    # 4B LoRA on the 24gb tier: 8GB of weights needs more than the floor.
+    self.assertEqual(worker_manager.vllm_gpu_memory_utilization("Qwen/Qwen3-4B", "lora"), "0.56")
+    # 8B LoRA sits on the 24gb tier today; sized to its weights it takes
+    # nearly the whole card rather than failing to load at a flat fraction.
+    self.assertEqual(worker_manager.vllm_gpu_memory_utilization("Qwen/Qwen3-8B", "lora"), "0.89")
+
+  def test_the_cap_holds_for_oversized_models(self) -> None:
+    self.assertEqual(worker_manager.vllm_gpu_memory_utilization("Qwen/Qwen3.5-27B", "lora"), "0.90")
+
+  def test_unknown_models_keep_the_flat_default(self) -> None:
+    self.assertEqual(worker_manager.vllm_gpu_memory_utilization("some/unknown-model", "lora"), "0.70")
+
+
 if __name__ == "__main__":
   unittest.main()

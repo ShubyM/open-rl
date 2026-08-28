@@ -58,8 +58,11 @@ spec:
           value: "vllm"
         - name: OPEN_RL_ENABLE_FFT
           value: "true"
+        # "scheduler": one OpenRLWorker object per worker; the placement
+        # controller picks the claim and renders the pod. "kubernetes" is the
+        # old path where the gateway rendered pods itself.
         - name: OPEN_RL_WORKER_MANAGER
-          value: "kubernetes"
+          value: "scheduler"
         - name: OPEN_RL_WORKER_NAMESPACE
           valueFrom:
             fieldRef:

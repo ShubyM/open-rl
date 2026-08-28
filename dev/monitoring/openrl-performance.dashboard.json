@@ -28,209 +28,76 @@
         }
       },
       {
-        "yPos": 4,
         "xPos": 0,
-        "width": 24,
-        "height": 16,
-        "widget": {
-          "title": "Kubernetes Container - Accelerator duty cycle for trainer-worker [MEAN]",
-          "xyChart": {
-            "dataSets": [
-              {
-                "timeSeriesQuery": {
-                  "timeSeriesFilter": {
-                    "filter": "metric.type=\"kubernetes.io/container/accelerator/duty_cycle\" resource.type=\"k8s_container\" resource.label.container_name=\"trainer-worker\"",
-                    "aggregation": {
-                      "alignmentPeriod": "60s",
-                      "perSeriesAligner": "ALIGN_MEAN"
-                    }
-                  }
-                },
-                "plotType": "LINE",
-                "minAlignmentPeriod": "60s"
-              }
-            ],
-            "yAxis": {
-              "scale": "LINEAR",
-              "label": "Duty Cycle (0-100)"
-            },
-            "chartOptions": {
-              "mode": "COLOR"
-            }
-          }
-        }
-      },
-      {
-        "yPos": 4,
-        "xPos": 24,
-        "width": 24,
-        "height": 16,
-        "widget": {
-          "title": "Kubernetes Container - Accelerator duty cycle for vllm [MEAN]",
-          "xyChart": {
-            "dataSets": [
-              {
-                "timeSeriesQuery": {
-                  "timeSeriesFilter": {
-                    "filter": "metric.type=\"kubernetes.io/container/accelerator/duty_cycle\" resource.type=\"k8s_container\" resource.label.container_name=\"vllm\"",
-                    "aggregation": {
-                      "alignmentPeriod": "60s",
-                      "perSeriesAligner": "ALIGN_MEAN"
-                    }
-                  }
-                },
-                "plotType": "LINE",
-                "minAlignmentPeriod": "60s"
-              }
-            ],
-            "yAxis": {
-              "scale": "LINEAR",
-              "label": "Duty Cycle (0-100)"
-            },
-            "chartOptions": {
-              "mode": "COLOR"
-            }
-          }
-        }
-      },
-
-      {
-        "yPos": 20,
-        "xPos": 0,
+        "yPos": 8,
         "width": 12,
-        "height": 12,
+        "height": 8,
         "widget": {
-          "title": "Trainer Mean Duty Cycle",
+          "title": "Fleet mean GPU utilization (%)",
           "scorecard": {
             "timeSeriesQuery": {
-              "timeSeriesFilter": {
-                "filter": "metric.type=\"kubernetes.io/container/accelerator/duty_cycle\" resource.type=\"k8s_container\" resource.label.container_name=\"trainer-worker\"",
-                "aggregation": {
-                  "alignmentPeriod": "300s",
-                  "perSeriesAligner": "ALIGN_MEAN",
-                  "crossSeriesReducer": "REDUCE_MEAN"
-                }
-              }
-            },
-            "sparkChartView": {
-              "sparkChartType": "SPARK_LINE"
+              "prometheusQuery": "avg(DCGM_FI_DEV_GPU_UTIL)"
             }
           }
         }
       },
       {
-        "yPos": 20,
         "xPos": 12,
+        "yPos": 8,
         "width": 12,
-        "height": 12,
+        "height": 8,
         "widget": {
-          "title": "vLLM Mean Duty Cycle",
+          "title": "GPUs busy (>5% util)",
           "scorecard": {
             "timeSeriesQuery": {
-              "timeSeriesFilter": {
-                "filter": "metric.type=\"kubernetes.io/container/accelerator/duty_cycle\" resource.type=\"k8s_container\" resource.label.container_name=\"vllm\"",
-                "aggregation": {
-                  "alignmentPeriod": "300s",
-                  "perSeriesAligner": "ALIGN_MEAN",
-                  "crossSeriesReducer": "REDUCE_MEAN"
+              "prometheusQuery": "count(DCGM_FI_DEV_GPU_UTIL > 5) or vector(0)"
+            }
+          }
+        }
+      },
+      {
+        "xPos": 0,
+        "yPos": 16,
+        "width": 24,
+        "height": 16,
+        "widget": {
+          "title": "GPU utilization by node (%)",
+          "xyChart": {
+            "chartOptions": {
+              "mode": "COLOR"
+            },
+            "dataSets": [
+              {
+                "plotType": "LINE",
+                "targetAxis": "Y1",
+                "timeSeriesQuery": {
+                  "prometheusQuery": "avg by (Hostname) (DCGM_FI_DEV_GPU_UTIL)"
                 }
               }
-            },
-            "sparkChartView": {
-              "sparkChartType": "SPARK_LINE"
-            }
+            ]
           }
         }
       },
       {
-        "yPos": 20,
         "xPos": 24,
-        "width": 12,
-        "height": 12,
+        "yPos": 16,
+        "width": 24,
+        "height": 16,
         "widget": {
-          "title": "Trainer GPU Memory",
+          "title": "GPU memory used by node (MiB)",
           "xyChart": {
-            "dataSets": [
-              {
-                "timeSeriesQuery": {
-                  "timeSeriesFilter": {
-                    "filter": "metric.type=\"kubernetes.io/container/accelerator/memory_used\" resource.type=\"k8s_container\" resource.label.container_name=\"trainer-worker\"",
-                    "aggregation": {
-                      "alignmentPeriod": "60s",
-                      "perSeriesAligner": "ALIGN_MEAN"
-                    }
-                  }
-                },
-                "plotType": "STACKED_AREA",
-                "minAlignmentPeriod": "60s"
-              },
-              {
-                "timeSeriesQuery": {
-                  "timeSeriesFilter": {
-                    "filter": "metric.type=\"kubernetes.io/container/accelerator/memory_total\" resource.type=\"k8s_container\" resource.label.container_name=\"trainer-worker\"",
-                    "aggregation": {
-                      "alignmentPeriod": "60s",
-                      "perSeriesAligner": "ALIGN_MEAN"
-                    }
-                  }
-                },
-                "plotType": "LINE",
-                "minAlignmentPeriod": "60s"
-              }
-            ],
-            "yAxis": {
-              "scale": "LINEAR",
-              "label": "Bytes"
-            },
             "chartOptions": {
               "mode": "COLOR"
-            }
-          }
-        }
-      },
-      {
-        "yPos": 20,
-        "xPos": 36,
-        "width": 12,
-        "height": 12,
-        "widget": {
-          "title": "vLLM GPU Memory",
-          "xyChart": {
+            },
             "dataSets": [
               {
-                "timeSeriesQuery": {
-                  "timeSeriesFilter": {
-                    "filter": "metric.type=\"kubernetes.io/container/accelerator/memory_used\" resource.type=\"k8s_container\" resource.label.container_name=\"vllm\"",
-                    "aggregation": {
-                      "alignmentPeriod": "60s",
-                      "perSeriesAligner": "ALIGN_MEAN"
-                    }
-                  }
-                },
-                "plotType": "STACKED_AREA",
-                "minAlignmentPeriod": "60s"
-              },
-              {
-                "timeSeriesQuery": {
-                  "timeSeriesFilter": {
-                    "filter": "metric.type=\"kubernetes.io/container/accelerator/memory_total\" resource.type=\"k8s_container\" resource.label.container_name=\"vllm\"",
-                    "aggregation": {
-                      "alignmentPeriod": "60s",
-                      "perSeriesAligner": "ALIGN_MEAN"
-                    }
-                  }
-                },
                 "plotType": "LINE",
-                "minAlignmentPeriod": "60s"
+                "targetAxis": "Y1",
+                "timeSeriesQuery": {
+                  "prometheusQuery": "avg by (Hostname) (DCGM_FI_DEV_FB_USED)"
+                }
               }
-            ],
-            "yAxis": {
-              "scale": "LINEAR",
-              "label": "Bytes"
-            },
-            "chartOptions": {
-              "mode": "COLOR"
-            }
+            ]
           }
         }
       }

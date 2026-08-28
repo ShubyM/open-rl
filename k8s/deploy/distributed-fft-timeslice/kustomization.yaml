@@ -14,6 +14,9 @@ resources:
   - 07-accel-timeslicer-daemonset.yaml
   - 09-sampler-pod-template.yaml
   - 10-dcgm-monitoring.yaml
+  # The placement controller: the gateway requests workers as OpenRLWorker
+  # objects and this decides which claim each one lands on.
+  - ../../../scheduler/deploy/base
 
 generatorOptions:
   disableNameSuffixHash: true

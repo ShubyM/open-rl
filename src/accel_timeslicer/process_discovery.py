@@ -5,11 +5,22 @@ from pathlib import Path
 from .workload import DEFAULT_TIME_SLICE_GROUP, WorkloadRef
 
 JOB_ID_ENV = "OPEN_RL_TIME_SLICE_JOB_ID"
+WORKLOAD_ID_ENV = "OPEN_RL_WORKLOAD_ID"
 GROUP_ENV = "OPEN_RL_TIME_SLICE_GROUP"
 
 
 def discover_workload_gpu_pids(workload: WorkloadRef) -> list[int]:
   return sorted(pid for pid in nvidia_smi_compute_pids() if gpu_pid_matches_workload(pid, workload))
+
+
+def workload_process_exists(workload: WorkloadRef) -> bool:
+  """Whether any process on this node carries the workload's identity, on the
+  GPU or off it. Distinguishes a departed resident from an idle one: a worker
+  offloaded to host memory has no GPU pids but very much still exists."""
+  for entry in Path("/proc").iterdir():
+    if entry.name.isdigit() and process_matches_workload(int(entry.name), workload):
+      return True
+  return False
 
 
 def workload_root_pids(workload: WorkloadRef) -> list[int]:
@@ -36,7 +47,8 @@ def workload_root_pid(pid: int, workload: WorkloadRef) -> int | None:
 
 def process_matches_workload(pid: int, workload: WorkloadRef) -> bool:
   env = process_environ(pid)
-  return env.get(JOB_ID_ENV) == workload.job_id and env.get(GROUP_ENV, DEFAULT_TIME_SLICE_GROUP) == workload.group
+  job_id = env.get(WORKLOAD_ID_ENV) or env.get(JOB_ID_ENV)
+  return job_id == workload.job_id and env.get(GROUP_ENV, DEFAULT_TIME_SLICE_GROUP) == workload.group
 
 
 def process_environ(pid: int) -> dict[str, str]:

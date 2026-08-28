@@ -1,0 +1,19 @@
+# Demo overlay: the scheduler built from the working tree, pushed to the
+# open-rl-2 sandbox registry by crane (no ENTRYPOINT baked in, so command is
+# set here).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../scheduler/deploy/base
+images:
+  - name: ghcr.io/gke-labs/open-rl/scheduler
+    newName: gcr.io/open-rl-2-sandbox-102433/open-rl-scheduler
+    newTag: demo1-raw
+patches:
+  - target:
+      kind: Deployment
+      name: open-rl-scheduler
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/command
+        value: ["/manager"]

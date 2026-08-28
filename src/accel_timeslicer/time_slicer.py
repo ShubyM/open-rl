@@ -105,14 +105,23 @@ class SocketTimeSlicerClient:
 
 
 def workload_from_env(pid: int | None = None, job_id: str | None = None, group: str = DEFAULT_TIME_SLICE_GROUP) -> WorkloadRef:
-  env_job_id = os.getenv("OPEN_RL_TIME_SLICE_JOB_ID")
+  # The launcher's stamps win over the caller's defaults: the scheduler sets
+  # the group to the ResourceClaim name and the owner to the fairness unit
+  # this workload is served under, and the process itself has no better
+  # information.
+  group = os.getenv("OPEN_RL_TIME_SLICE_GROUP") or group
+  owner = os.getenv("OPEN_RL_TIME_SLICE_OWNER") or ""
+  # OPEN_RL_WORKLOAD_ID is the Workload name, written by the API server
+  # into the template it authors; the TIME_SLICE_JOB_ID spelling is the older
+  # controller stamp, kept as a fallback.
+  env_job_id = os.getenv("OPEN_RL_WORKLOAD_ID") or os.getenv("OPEN_RL_TIME_SLICE_JOB_ID")
   if env_job_id:
-    return WorkloadRef(job_id=env_job_id, group=group)
+    return WorkloadRef(job_id=env_job_id, group=group, owner=owner)
   if job_id:
-    return WorkloadRef(job_id=job_id, group=group)
+    return WorkloadRef(job_id=job_id, group=group, owner=owner)
   if pid is None:
     raise ValueError("workload requires job_id")
-  return WorkloadRef(job_id=str(pid), group=group)
+  return WorkloadRef(job_id=str(pid), group=group, owner=owner)
 
 
 def time_slicer_client_from_env() -> TimeSlicerClient:

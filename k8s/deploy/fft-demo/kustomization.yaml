@@ -1,0 +1,61 @@
+# gsm8k RL demo on open-rl-fft-test: the full FFT time-slice stack with the
+# scheduler, all images built from this branch and pushed to the sandbox
+# registry. The scheduler image carries no ENTRYPOINT (crane-built), so the
+# command is patched in.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Everything in default: the pre-existing shared PVC, redis, and workers live
+# there, and the gateway creates Workloads in its own namespace, which the
+# scheduler must watch.
+namespace: default
+
+resources:
+  - ../distributed-fft-timeslice
+
+images:
+  # The base already renames the ghcr images to the cdrollouts registry, so
+  # this overlay matches those names.
+  - name: gcr.io/cdrollouts-sunilarora/open-rl-server
+    newName: gcr.io/open-rl-2-sandbox-102433/open-rl-server
+    newTag: demo1
+  - name: gcr.io/cdrollouts-sunilarora/open-rl-gateway
+    newName: gcr.io/open-rl-2-sandbox-102433/open-rl-gateway
+    newTag: demo1
+  - name: ghcr.io/gke-labs/open-rl/scheduler
+    newName: gcr.io/open-rl-2-sandbox-102433/open-rl-scheduler
+    newTag: demo2
+
+patches:
+  - target:
+      kind: Deployment
+      name: open-rl-scheduler
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/command
+        value: ["/manager"]
+  # The base binding hardcodes the openrl-system subject; everything here
+  # runs in default.
+  - target:
+      kind: ClusterRoleBinding
+      name: open-rl-scheduler-nodes
+    patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: default
+  # OPEN_RL_WORKER_IMAGE is a plain env string filled by the base's
+  # replacement before this overlay's image rename runs, so it is pinned
+  # here explicitly.
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-gateway
+      spec:
+        template:
+          spec:
+            containers:
+            - name: gateway
+              env:
+              - name: OPEN_RL_WORKER_IMAGE
+                value: gcr.io/open-rl-2-sandbox-102433/open-rl-server:demo1

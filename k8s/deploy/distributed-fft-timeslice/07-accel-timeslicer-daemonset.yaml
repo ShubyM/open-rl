@@ -1,6 +1,16 @@
 # Node-local OpenRL accelerator time-slicer. One agent runs on each GPU node, owns the
 # acquire/release queue for trainer worker pods placed on that node, and uses
 # the llm-d snapshot-agent API for physical checkpoint/restore.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: openrl-node-daemon
+value: 1000000
+globalDefault: false
+description: >-
+  Node daemons every OpenRL worker on the node depends on. Outranks workers
+  so a daemon can always schedule, even on a node workers have filled.
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -18,16 +28,17 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: group.timeslice.io/trainers
-                operator: Exists
-            - matchExpressions:
-              - key: group.timeslice.io/samplers
-                operator: Exists
+      # Follows the same marker every DRA GPU pool must carry (and the same
+      # selector the llm-d snapshot agent uses), so a new pool gets its
+      # daemon without a bespoke labeling step -- forgetting the old
+      # group.timeslice.io labels once cost four trainers an hour of
+      # crash-looping against a node with no daemon.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      # Outranks workers so the daemon always fits: two 28Gi trainers once
+      # filled a node before its daemon could schedule 512Mi, and the gated
+      # workers then waited on a daemon that could never start.
+      priorityClassName: openrl-node-daemon
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"
@@ -46,4 +57,6 @@ spec:
             memory: "1Gi"
           requests:
             cpu: "250m"
-            memory: "512Mi"
+            # Small enough to fit beside two full-sized workers; the daemon
+            # coordinates handoffs, it does not hold model state.
+            memory: "256Mi"

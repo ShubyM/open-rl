@@ -6,6 +6,7 @@ separate launch queue: the subprocess table / the Kubernetes API already hold
 the launched-worker state, and both launchers are idempotent per model_id.
 """
 
+import copy
 import logging
 import os
 import re
@@ -125,6 +126,32 @@ def _fits_24gb_fft(params: int) -> bool:
   return params * FFT_VRAM_BYTES_PER_PARAM <= TIER_24GB_FFT_BUDGET_BYTES
 
 
+# vLLM's share of a sampler's device: enough for the frozen weights plus a
+# KV-cache reserve, floored so a small model leaves the rest of a shared card
+# to co-tenants and capped short of the whole device. Sized to the model
+# rather than the device, because a flat fraction fails at both ends: it
+# starves a large model's weights or hands a small model most of an 80GB
+# card it will never touch.
+VLLM_WEIGHT_BYTES_PER_PARAM = 2  # frozen bf16 base weights
+VLLM_KV_CACHE_RESERVE_BYTES = 6 * 1024**3
+VLLM_UTILIZATION_FLOOR = 0.30
+TIER_DEVICE_BYTES = {"24gb": 24 * 1024**3, "80gb": 80 * 1024**3}
+
+
+def vllm_gpu_memory_utilization(base_model: str, fine_tuning_type: str = "lora") -> str:
+  """The VLLM_GPU_MEMORY_UTILIZATION a sampler of this model should be given.
+
+  A model missing from the parameter table keeps the old flat 0.70; it also
+  tiers to 80gb, where 0.70 loads anything the table could plausibly gain.
+  """
+  params = known_parameter_count(base_model)
+  if params is None:
+    return "0.70"
+  tier = estimate_memory_tier(base_model, fine_tuning_type)
+  needed = params * VLLM_WEIGHT_BYTES_PER_PARAM + VLLM_KV_CACHE_RESERVE_BYTES
+  return f"{min(max(needed / TIER_DEVICE_BYTES[tier], VLLM_UTILIZATION_FLOOR), 0.90):.2f}"
+
+
 def _fft_memory_tier(base_model: str) -> str:
   """Tier for a full fine-tune, sized from the model's parameter count.
 
@@ -164,6 +191,33 @@ def estimate_memory_tier(base_model: str, fine_tuning_type: str = "lora") -> str
     return "80gb"
 
   return "24gb"
+
+
+# One footprint per tier: the accelerator estimate plus the host-side shape
+# it implies per role (a parked worker backs its accelerator state into host
+# memory). Measured calibration points, not a model:
+#   24gb trainer 28Gi/110Gi, sampler 20Gi/110Gi -- Qwen2.5-0.5B trial runs
+#   80gb trainer 90Gi/200Gi -- Qwen2.5-7B FFT (OOMKilled at 110Gi)
+#   80gb sampler 70Gi/200Gi -- derived, not yet validated
+TIER_FOOTPRINTS = {
+  "24gb": {
+    "accelerator": "10Gi",
+    "trainer": {"requests": {"cpu": "6", "memory": "28Gi"}, "limits": {"memory": "110Gi"}},
+    "sampler": {"requests": {"cpu": "2", "memory": "20Gi"}, "limits": {"memory": "110Gi"}},
+  },
+  "80gb": {
+    "accelerator": "60Gi",
+    "trainer": {"requests": {"cpu": "12", "memory": "90Gi"}, "limits": {"memory": "200Gi"}},
+    "sampler": {"requests": {"cpu": "4", "memory": "70Gi"}, "limits": {"memory": "200Gi"}},
+  },
+}
+
+
+def estimate_worker_footprint(base_model: str, fine_tuning_type: str, role: str) -> dict:
+  """The complete sizing decision for one worker: accelerator memory for
+  placement, and the pod resources that accelerator figure implies."""
+  footprint = TIER_FOOTPRINTS[estimate_memory_tier(base_model, fine_tuning_type)]
+  return {"accelerator_memory": footprint["accelerator"], "resources": copy.deepcopy(footprint[role])}
 
 
 def get_model_target_info(model_id: str) -> tuple[TrainingModelMetadata, str, bool]:
@@ -325,6 +379,10 @@ def create_worker_manager() -> WorkerManager | None:
     # Standing worker deployments (e.g. k8s/deploy/distributed-shared) own the
     # trainer and sampler lifecycles; the gateway must not spawn its own.
     return None
+  if mode == "scheduler":
+    from server.scheduler_worker_manager import SchedulerWorkerManager
+
+    return SchedulerWorkerManager()
   if mode in {"kubernetes", "k8s"}:
     from server.k8s_worker_manager import KubernetesWorkerManager
 

@@ -19,6 +19,24 @@ class CheckpointRestorer(Protocol):
     pass
 
 
+class NoopCheckpointRestorer:
+  """Skips physical checkpoint/restore while keeping the handoff protocol
+  intact: turns still pass one at a time, but nothing moves off the device.
+
+  For dev environments without cuda-checkpoint or llm-d -- kind clusters and
+  CPU-only CI. Suspended workloads keep their CUDA contexts resident, so this
+  trades the one-resident memory guarantee for runnability; the exclusion of
+  *execution* still holds.
+  """
+
+  def checkpoint(self, workload: WorkloadRef) -> bool:
+    logger.info("noop checkpoint workload=%s", workload.key)
+    return True
+
+  def restore(self, workload: WorkloadRef) -> None:
+    logger.info("noop restore workload=%s", workload.key)
+
+
 class CudaCheckpointRestorer:
   def __init__(self, cuda_checkpoint_bin: str | None = None, timeout_ms: int | None = None):
     self.cuda_checkpoint_bin = cuda_checkpoint_bin or os.getenv("CUDA_CHECKPOINT_BIN", "cuda-checkpoint")
