@@ -59,8 +59,10 @@ assert cluster["kubernetes"]["available"], cluster["kubernetes"]
 assert cluster["kubernetes"]["namespace"] == "default", cluster["kubernetes"]
 assert cluster["pools"], "expected the Kind node in a cluster pool"
 assert any(pod["name"].startswith("open-rl-dashboard-") for pod in cluster["pods"]), cluster["pods"]
+assert cluster["scheduler"]["installed"] is False, cluster["scheduler"]
 checks = {check["id"]: check for check in snapshot["health"]["checks"]}
 assert checks["kubernetes"]["status"] == "ok", checks["kubernetes"]
+assert checks["scheduler"]["status"] == "off", checks["scheduler"]
 for stat in snapshot["health"]["stats"]:
   assert {"value_number", "unit", "context", "status"} <= stat.keys(), stat
 assert not snapshot["problems"]["problems"], snapshot["problems"]

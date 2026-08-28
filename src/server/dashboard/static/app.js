@@ -471,7 +471,7 @@ function renderCluster(data) {
   const podsByName = new Map(data.pods.map((p) => [p.name, p]));
 
   // Control column: gateway + configured services.
-  const controlItems = [{ id: "gateway" }, ...data.services];
+  const controlItems = [{ id: "gateway" }, { id: "scheduler" }, ...data.services];
   sync(
     $("control-col"),
     controlItems,
@@ -484,6 +484,20 @@ function renderCluster(data) {
           { k: "sampler", v: g.sampler_backend },
           { k: "fft", v: g.fft_enabled ? "enabled" : "off" },
           { k: "namespace", v: data.kubernetes.namespace || "—" },
+        ]);
+      } else if (item.id === "scheduler") {
+        const scheduler = data.scheduler || {};
+        const summary = scheduler.summary || {};
+        const phases = Object.entries(summary.phase_counts || {}).map(([phase, count]) => `${count} ${phase}`).join(" · ") || "none";
+        const state = scheduler.installed === false ? "not installed" : scheduler.available ? "active" : "unavailable";
+        updateCard(card, "scheduler", state, [
+          { k: "workloads", v: scheduler.available ? String(summary.workloads || 0) : "—" },
+          {
+            k: "phases",
+            v: scheduler.available ? phases : scheduler.error || "optional placement API",
+            bad: scheduler.installed !== false && !scheduler.available,
+          },
+          { k: "ledgers", v: scheduler.available ? `${summary.ledgers || 0} · ${summary.seats || 0} seats` : "—" },
         ]);
       } else {
         const state = item.ok === false ? "unreachable" : item.ok === true ? "connected" : item.configured ? "configured" : "not configured";
@@ -711,10 +725,12 @@ function renderRunDetail(container, run, detail) {
   const claims = Object.entries(detail.gpu_claims || {});
   const claimsText = claims.length ? claims.map(([pool, count]) => `${count} on ${pool}`).join(" · ") : "none visible";
   const metrics = el("div", "run-metrics");
+  const workloadPhases = Object.entries(detail.state?.workload_phase_counts || {}).map(([phase, count]) => `${count} ${phase}`).join(" · ") || "none";
   metrics.append(
     metric("Queue", String(detail.queue_depth || 0), "requests"),
     metric("GPU claims", String(detail.gpu_devices || 0), claimsText),
     metric("Pods", String(detail.pods?.length || 0), Object.entries(detail.state?.pod_phase_counts || {}).map(([phase, count]) => `${count} ${phase}`).join(" · ") || "none visible"),
+    metric("Workloads", String(detail.workloads?.length || 0), workloadPhases),
     metric("Sources", String(detail.sources?.length || 0), (detail.sources || []).join(" · ") || "none")
   );
 
@@ -725,6 +741,29 @@ function renderRunDetail(container, run, detail) {
       const row = el("div", `run-diagnostic ${diagnostic.severity}`);
       row.append(el("span", "run-diagnostic-code", diagnostic.code), el("span", "run-diagnostic-message", diagnostic.message));
       diagnostics.append(row);
+    }
+  }
+
+  const workloadSection = el("div", "run-workloads");
+  if (detail.workloads?.length) {
+    workloadSection.append(el("div", "eyebrow", "Scheduler placement"));
+    for (const workload of detail.workloads) {
+      const card = el("div", "run-workload-card");
+      const head = el("div", "run-workload-head");
+      const statusClass = workload.phase === "Failed" ? "bad" : ["Pending", "Placing"].includes(workload.phase) ? "warn" : "";
+      head.append(el("span", "run-workload-name", workload.name), el("span", `pod-state ${statusClass}`.trim(), workload.phase));
+      const ledger = (detail.claim_ledgers || []).find((item) => item.claim_name === workload.claim_name);
+      const placement = [
+        workload.role,
+        workload.requested_memory ? `${workload.requested_memory} requested` : null,
+        workload.device_count ? `${workload.device_count} device${workload.device_count === 1 ? "" : "s"}` : null,
+        workload.node_name || "node pending",
+        workload.claim_name || "claim pending",
+        ledger ? `${ledger.seat_count} seat${ledger.seat_count === 1 ? "" : "s"}` : null,
+      ].filter(Boolean).join(" · ");
+      card.append(head, el("div", "run-workload-meta", placement));
+      if (workload.reason) card.append(el("div", "run-workload-reason", workload.reason));
+      workloadSection.append(card);
     }
   }
 
@@ -750,7 +789,7 @@ function renderRunDetail(container, run, detail) {
     if (detail.logs && Object.hasOwn(detail.logs, pod.name)) card.append(el("pre", "run-log-preview", detail.logs[pod.name] || "(no log output)"));
     podSection.append(card);
   }
-  container.replaceChildren(head, metrics, diagnostics, podSection);
+  container.replaceChildren(head, metrics, diagnostics, workloadSection, podSection);
 }
 
 async function loadRunDetail(runId) {

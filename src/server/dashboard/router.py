@@ -46,7 +46,7 @@ async def dashboard_runs(request: Request):
   if data.demo_mode_enabled():
     return demo.demo_runs()
   k8s = await asyncio.to_thread(data.k8s_snapshot)
-  return await data.runs_snapshot(get_store(), request.app.state.fft_worker_manager, k8s["pods"])
+  return await data.runs_snapshot(get_store(), request.app.state.fft_worker_manager, k8s["pods"], k8s.get("scheduler"))
 
 
 @router.post("/runs")

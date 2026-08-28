@@ -5,7 +5,7 @@
 import math
 import time
 
-from server.dashboard.data import derive_problems, run_diagnostics
+from server.dashboard.data import derive_problems, run_diagnostics, scheduler_run_diagnostics
 
 DEMO_NOTICE = "Demo data — every machine, pod, and run on this page is fictional."
 
@@ -29,6 +29,94 @@ def demo_duty_series(capacity: int, jobs: dict[str, tuple[int, int]], seed: int)
   return {"capacity": capacity, "current": current, "jobs": list(jobs), "series": series}
 
 
+def demo_scheduler() -> dict:
+  workloads = [
+    {
+      "name": "trainer-demo-run-1",
+      "uid": "demo-workload-1",
+      "created_at": "2026-07-29T06:02:00+00:00",
+      "age_seconds": 540,
+      "deleting": False,
+      "generation": 1,
+      "role": "trainer",
+      "model_id": "demo-run-1",
+      "owner_id": "demo-run-1",
+      "training_kind": "fft",
+      "requested_memory": "72Gi",
+      "max_devices": 1,
+      "phase": "Running",
+      "reason": "Allocated",
+      "claim_name": "openrl-h100-demo-1",
+      "assignment_id": "assignment-demo-1",
+      "pod_name": "open-rl-trainer-demo-run-1",
+      "node_name": "demo-h100-node-1",
+      "device_count": 1,
+      "memory_per_device": "72Gi",
+      "observed_generation": 1,
+      "generation_current": True,
+      "placed": True,
+      "placed_reason": "Allocated",
+      "placed_message": "claim allocated on demo-h100-node-1",
+      "placed_transition_at": "2026-07-29T06:02:18+00:00",
+    },
+    {
+      "name": "trainer-demo-run-2",
+      "uid": "demo-workload-2",
+      "created_at": "2026-07-29T07:41:00+00:00",
+      "age_seconds": 420,
+      "deleting": False,
+      "generation": 1,
+      "role": "trainer",
+      "model_id": "demo-run-2",
+      "owner_id": "demo-run-2",
+      "training_kind": "fft",
+      "requested_memory": "40Gi",
+      "max_devices": 1,
+      "phase": "Pending",
+      "reason": "No tier has a free claim and host memory is full",
+      "claim_name": None,
+      "assignment_id": None,
+      "pod_name": "open-rl-trainer-demo-run-2",
+      "node_name": None,
+      "device_count": 0,
+      "memory_per_device": None,
+      "observed_generation": 1,
+      "generation_current": True,
+      "placed": False,
+      "placed_reason": "NoCapacity",
+      "placed_message": "waiting for a free claim",
+      "placed_transition_at": "2026-07-29T07:41:00+00:00",
+    },
+  ]
+  ledgers = [
+    {
+      "name": "openrl-h100-demo-1",
+      "created_at": "2026-07-29T06:02:00+00:00",
+      "age_seconds": 540,
+      "claim_name": "openrl-h100-demo-1",
+      "seat_count": 1,
+      "owners": ["demo-run-1"],
+      "seats": [
+        {
+          "workload": "trainer-demo-run-1",
+          "workload_uid": "demo-workload-1",
+          "assignment_id": "assignment-demo-1",
+          "owner": "demo-run-1",
+          "host_request": "24Gi",
+        }
+      ],
+    }
+  ]
+  return {
+    "installed": True,
+    "available": True,
+    "error": None,
+    "workloads": workloads,
+    "ledgers": ledgers,
+    "summary": {"workloads": 2, "phase_counts": {"Running": 1, "Pending": 1}, "ledgers": 1, "seats": 1, "shared_ledgers": 0},
+  }
+
+
 def demo_cluster() -> dict:
   return {
     "demo": True,
@@ -42,6 +130,7 @@ def demo_cluster() -> dict:
       "vllm_url": None,
       "sampler_backend": "vllm",
     },
+    "scheduler": demo_scheduler(),
     "services": [
       {"id": "redis", "label": "Redis", "configured": True, "ok": True, "detail": "redis://demo-redis:6379"},
       {"id": "storage", "label": "Shared storage", "configured": True, "ok": True, "detail": "/mnt/shared/open-rl"},
@@ -196,7 +285,13 @@ def demo_runs() -> dict:
         "pods": ["open-rl-trainer-demo-run-1", "open-rl-sampler-demo-run-1"],
         "queue_depth": 5,
         "worker_alive": True,
-        "state": {"phase": "running", "status": "ok", "reason": "2 running pods", "pod_phase_counts": {"Running": 2}},
+        "state": {
+          "phase": "running",
+          "status": "ok",
+          "reason": "2 running pods",
+          "pod_phase_counts": {"Running": 2},
+          "workload_phase_counts": {"Running": 1},
+        },
       },
       {
         "run_id": "demo-run-2",
@@ -214,6 +309,7 @@ def demo_runs() -> dict:
           "status": "error",
           "reason": "CrashLoopBackOff: CUDA out of memory",
           "pod_phase_counts": {"Pending": 1, "Failed": 1},
+          "workload_phase_counts": {"Pending": 1},
         },
       },
       {
@@ -232,6 +328,7 @@ def demo_runs() -> dict:
           "status": "off",
           "reason": "saved artifacts are present; no active worker is visible",
           "pod_phase_counts": {},
+          "workload_phase_counts": {},
         },
       },
     ],
@@ -253,6 +350,7 @@ def demo_health() -> dict:
         "detail": "/mnt/shared/open-rl writable, 412 GiB free",
       },
       {"id": "kubernetes", "group": "Kubernetes", "label": "API server", "status": "ok", "detail": "6 pods visible in namespace open-rl-demo"},
+      {"id": "scheduler", "group": "Scheduler", "label": "Placement API", "status": "ok", "detail": "2 workloads, 1 claim ledger, 1 seat"},
       {
         "id": "visibility.trace",
         "group": "Visibility",
@@ -359,6 +457,26 @@ def demo_health() -> dict:
         "context": {"capacity_devices": 20, "allocation_ratio": 0.65, "overcommitted": False},
         "status": "ok",
       },
+      {
+        "id": "scheduler.workloads",
+        "label": "Scheduler workloads",
+        "value": "2",
+        "value_number": 2,
+        "unit": "workloads",
+        "detail": "1 waiting · 0 failed",
+        "context": {"phase_counts": {"Running": 1, "Pending": 1}},
+        "status": "ok",
+      },
+      {
+        "id": "scheduler.seats",
+        "label": "Claim ledger seats",
+        "value": "1",
+        "value_number": 1,
+        "unit": "seats",
+        "detail": "across 1 ledger · 0 shared",
+        "context": {"ledgers": 1, "shared_ledgers": 0},
+        "status": "ok",
+      },
     ],
     "queues": [
       {"model_id": "demo-run-1", "depth": 5},
@@ -378,6 +496,7 @@ def demo_problems() -> dict:
         "namespace": cluster["kubernetes"]["namespace"],
         "pods": cluster["pods"],
         "nodes": [node for pool in cluster["pools"] for node in pool["nodes"]],
+        "scheduler": cluster["scheduler"],
       },
     ),
   }
@@ -395,16 +514,32 @@ def demo_run_detail(run_id: str, log_tail: int = 0) -> dict | None:
     if duty and duty["series"] and duty["series"][-1][1].get(run_id):
       gpu_claims[pool["id"]] = duty["series"][-1][1][run_id]
   queue_depth = run["queue_depth"]
-  k8s = {"available": True, "namespace": cluster["kubernetes"]["namespace"], "error": None, "pods": cluster["pods"], "nodes": []}
+  scheduler = cluster["scheduler"]
+  workloads = [workload for workload in scheduler["workloads"] if workload["model_id"] == run_id]
+  claims = {workload["claim_name"] for workload in workloads if workload["claim_name"]}
+  ledgers = [ledger for ledger in scheduler["ledgers"] if ledger["claim_name"] in claims]
+  k8s = {
+    "available": True,
+    "namespace": cluster["kubernetes"]["namespace"],
+    "error": None,
+    "pods": cluster["pods"],
+    "nodes": [],
+    "scheduler": scheduler,
+  }
+  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s)
+  diagnostics.extend(scheduler_run_diagnostics(workloads, ledgers, k8s))
   detail = {
     **run,
     "demo": True,
     "notice": DEMO_NOTICE,
     "pods": pods,
+    "workloads": workloads,
+    "claim_ledgers": ledgers,
     "queue_depth": queue_depth,
     "gpu_claims": gpu_claims,
     "gpu_devices": sum(gpu_claims.values()),
-    "diagnostics": run_diagnostics(run_id, run["state"], pods, queue_depth, k8s),
+    "scheduled_devices": sum(workload["device_count"] for workload in workloads),
+    "diagnostics": diagnostics,
   }
   if log_tail:
     detail["logs"] = {pod["name"]: demo_pod_logs(pod["name"])["text"] for pod in pods}

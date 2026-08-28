@@ -335,7 +335,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .run-detail-error { color: var(--error); }
 .run-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 10px; }
 .run-detail-head .eyebrow { margin: 0; }
-.run-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 10px 0 16px; }
+.run-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 8px; margin: 10px 0 16px; }
 .run-metric { min-width: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
 .run-metric-value { font: 600 17px var(--mono); font-variant-numeric: tabular-nums; }
 .run-metric-label { color: var(--muted); font-size: 11px; }
@@ -346,6 +346,13 @@ main { flex: 1; min-height: 0; display: flex; }
 .run-diagnostic-message { color: var(--muted); overflow-wrap: anywhere; }
 .run-diagnostic.warn .run-diagnostic-code { color: var(--warn); }
 .run-diagnostic.error .run-diagnostic-code { color: var(--error); }
+.run-workloads { margin-bottom: 16px; }
+.run-workloads:empty { display: none; }
+.run-workload-card { margin-top: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.run-workload-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.run-workload-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; font: 12px var(--mono); white-space: nowrap; }
+.run-workload-meta { color: var(--faint); font-size: 10px; margin-top: 3px; }
+.run-workload-reason { color: var(--muted); font-size: 11px; margin-top: 4px; overflow-wrap: anywhere; }
 .run-pod-card { margin-top: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); overflow: hidden; }
 .run-pod {
   width: 100%;

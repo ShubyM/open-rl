@@ -22,6 +22,10 @@ experiment analysis; nothing here duplicates metrics.
   breakdown at that point in time; the pool's nodes are listed below. Back, Escape, or the Cluster tab
   returns to the canvas with pan/zoom intact. This is truthful scheduler state, not device utilization;
   DCGM owns that.
+
+  When the `openrl.io/v1alpha1` placement API from the GPU scheduler is installed, the control column
+  also shows Workload phases, ClaimLedger and seat totals. Missing scheduler CRDs are treated as an
+  optional feature being off; installed-but-unreadable CRDs are a health error.
 - **Runs** — launch by base model without leaving the page. Every row has an observed lifecycle verdict
   and an expandable inspection showing queue depth, current GPU claims by pool, pod phase counts,
   structured diagnostics, and recent logs for every pod. Clicking a pod opens its live log panel. A
@@ -29,8 +33,10 @@ experiment analysis; nothing here duplicates metrics.
   process, queued work, or labeled pods).
 - **Health** — current problems first, then a **Load** section of measured stats (active runs, queued
   requests per run, worker-launch backlog, Redis memory and clients, gateway RSS, disk free, pod and
-  GPU totals), then gateway / storage / Kubernetes / visibility checks. Node `MemoryPressure` and
-  `DiskPressure` conditions surface under Problems.
+  GPU totals, scheduler workload phases, and ClaimLedger seats), then gateway / storage / Kubernetes /
+  scheduler / visibility checks. Node `MemoryPressure` and `DiskPressure` conditions surface under
+  Problems. Failed or slow placement, stale observed generations, assignment/seat mismatches, and stale
+  ClaimLedger seats include exact `kubectl` inspection commands.
 
 The page polls one coherent snapshot every 8 seconds and updates in place — canvas position, selection,
 and open log panels survive refreshes. A refresh lists Kubernetes state once, so every view describes the
@@ -76,6 +82,10 @@ left running for inspection; remove it with `make kind-dashboard-clean`.
   credentials are tried first, then the local kubeconfig. Listing nodes requires cluster-scope RBAC and
   is skipped when denied; fetching pod logs from the gateway's service account requires the `pods/log`
   verb.
+- **Scheduler placement** is read directly from optional namespaced `Workload` and `ClaimLedger` CRDs.
+  Run inspection joins them by exact `spec.modelId`, showing requested accelerator memory, placement
+  phase and reason, chosen claim/node/device count, and ledger seat count. The gateway service account
+  only receives read access to those two resources.
 - **Runs** are discovered from Redis queues and model metadata keys, the shared filesystem
   (`$OPEN_RL_TMP_DIR/peft`, `$OPEN_RL_TMP_DIR/checkpoints`), and the gateway's own FFT worker processes.
   Every create-model request now records lifecycle metadata before enqueueing, then transitions it to

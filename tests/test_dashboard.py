@@ -379,6 +379,109 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(ready["lifecycle"]["status"], "ready")
     self.assertIsNotNone(ready["lifecycle"]["ready_at"])
 
+  def test_scheduler_snapshot_drives_run_state_and_consistency_diagnostics(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    class CustomObjects:
+      def list_namespaced_custom_object(self, _group, _version, _namespace, plural, **_kwargs):
+        if plural == "workloads":
+          return {
+            "items": [
+              {
+                "metadata": {"name": "trainer-run-scheduled", "uid": "uid-a", "creationTimestamp": "2020-01-01T00:00:00Z", "generation": 2},
+                "spec": {
+                  "role": "trainer",
+                  "modelId": "run-scheduled",
+                  "ownerId": "owner-a",
+                  "trainingKind": "fft",
+                  "accelerator": {"memory": "40Gi", "maxDeviceCount": 1},
+                },
+                "status": {
+                  "phase": "Failed",
+                  "reason": "Unsatisfiable: no tier can provide 40Gi",
+                  "claimName": "claim-a",
+                  "assignmentID": "assignment-a",
+                  "podName": "trainer-run-scheduled",
+                  "deviceCount": 1,
+                  "memoryPerDevice": "40Gi",
+                  "observedGeneration": 1,
+                },
+              }
+            ]
+          }
+        return {
+          "items": [
+            {
+              "metadata": {"name": "claim-a", "creationTimestamp": "2020-01-01T00:00:00Z"},
+              "spec": {
+                "claimName": "claim-a",
+                "seats": [
+                  {"workload": "trainer-run-scheduled", "workloadUID": "uid-a", "assignmentID": "assignment-a", "owner": "owner-a"},
+                  {"workload": "deleted-workload", "workloadUID": "uid-old", "assignmentID": "assignment-old", "owner": "owner-old"},
+                ],
+              },
+            }
+          ]
+        }
+
+    with mock.patch.object(data, "k8s_custom_objects", return_value=(CustomObjects(), None)):
+      scheduler = data.scheduler_snapshot("open-rl")
+
+    self.assertTrue(scheduler["available"])
+    self.assertEqual(scheduler["summary"]["phase_counts"], {"Failed": 1})
+    self.assertEqual(scheduler["summary"]["seats"], 2)
+    self.assertEqual(scheduler["workloads"][0]["requested_memory"], "40Gi")
+
+    runs = asyncio.run(data.runs_snapshot(InMemoryStore(), None, pods=[], scheduler=scheduler))["runs"]
+    self.assertEqual(runs[0]["run_id"], "run-scheduled")
+    self.assertEqual(runs[0]["state"]["phase"], "failed")
+    self.assertEqual(runs[0]["placement"], {"workloads": 1, "device_count": 1, "phase_counts": {"Failed": 1}})
+
+    k8s = {"available": True, "namespace": "open-rl", "error": None, "pods": [], "nodes": [], "scheduler": scheduler}
+    codes = {problem["code"] for problem in data.derive_problems([], k8s)}
+    self.assertLessEqual({"scheduler.workload_failed", "scheduler.generation_stale", "scheduler.stale_seat"}, codes)
+    self.assertNotIn("scheduler.assignment_mismatch", codes)
+
+    detail = asyncio.run(data.run_detail(InMemoryStore(), None, "run-scheduled", k8s))
+    self.assertEqual(detail["workloads"][0]["claim_name"], "claim-a")
+    self.assertEqual(detail["claim_ledgers"][0]["seat_count"], 2)
+    self.assertLessEqual(
+      {"scheduler.workload_failed", "scheduler.generation_stale", "scheduler.stale_seat"}, {item["code"] for item in detail["diagnostics"]}
+    )
+
+    stats, _ = asyncio.run(data.operational_stats(InMemoryStore(), k8s, None))
+    by_id = {stat["id"]: stat for stat in stats}
+    self.assertEqual(by_id["scheduler.workloads"]["context"]["phase_counts"], {"Failed": 1})
+    self.assertEqual(by_id["scheduler.seats"]["value_number"], 2)
+
+  def test_missing_scheduler_crd_is_optional_not_an_error(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    class MissingCustomObjects:
+      def list_namespaced_custom_object(self, *_args, **_kwargs):
+        error = RuntimeError("not found")
+        error.status = 404
+        raise error
+
+    with mock.patch.object(data, "k8s_custom_objects", return_value=(MissingCustomObjects(), None)):
+      scheduler = data.scheduler_snapshot("default")
+
+    self.assertFalse(scheduler["installed"])
+    self.assertFalse(scheduler["available"])
+    self.assertIsNone(scheduler["error"])
+    checks = asyncio.run(
+      data.health_checks(
+        InMemoryStore(),
+        {"available": True, "namespace": "default", "error": None, "pods": [], "nodes": [], "scheduler": scheduler},
+      )
+    )
+    check = next(check for check in checks if check["id"] == "scheduler")
+    self.assertEqual(check["status"], "off")
+
 
 if __name__ == "__main__":
   unittest.main()

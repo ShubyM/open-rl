@@ -3,6 +3,7 @@
 # "unavailable" result instead of raising so the dashboard can always render something truthful.
 
 import asyncio
+import concurrent.futures
 import functools
 import json
 import os
@@ -19,6 +20,8 @@ from server.worker_launch_processor import FFTWorkerManager
 START_TIME = time.time()
 K8S_REQUEST_TIMEOUT = 4
 NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+SCHEDULER_GROUP = "openrl.io"
+SCHEDULER_VERSION = "v1alpha1"
 
 
 def demo_mode_enabled() -> bool:
@@ -66,6 +69,151 @@ def k8s_core_v1() -> tuple[Any, str | None]:
     except Exception as exc:
       return None, f"no cluster credentials: {exc}"
   return client.CoreV1Api(), None
+
+
+@functools.cache
+def k8s_custom_objects() -> tuple[Any, str | None]:
+  _, err = k8s_core_v1()
+  if err:
+    return None, err
+  from kubernetes import client
+
+  return client.CustomObjectsApi(), None
+
+
+def object_age_seconds(timestamp: str | None) -> int | None:
+  if not timestamp:
+    return None
+  try:
+    created = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    return max(0, int((datetime.now(tz=UTC) - created).total_seconds()))
+  except (TypeError, ValueError):
+    return None
+
+
+def empty_scheduler_snapshot(*, installed: bool | None, error: str | None = None) -> dict:
+  return {
+    "installed": installed,
+    "available": False,
+    "error": error,
+    "workloads": [],
+    "ledgers": [],
+    "summary": {"workloads": 0, "phase_counts": {}, "ledgers": 0, "seats": 0, "shared_ledgers": 0},
+  }
+
+
+def scheduler_snapshot(namespace: str) -> dict:
+  """Read the optional scheduler CRDs as unstructured objects. A missing CRD is a supported
+  configuration, while RBAC or API failures remain visible diagnostic facts."""
+  api, err = k8s_custom_objects()
+  if api is None:
+    return empty_scheduler_snapshot(installed=None, error=err)
+
+  def list_objects(plural: str) -> list[dict]:
+    return api.list_namespaced_custom_object(
+      SCHEDULER_GROUP,
+      SCHEDULER_VERSION,
+      namespace,
+      plural,
+      _request_timeout=K8S_REQUEST_TIMEOUT,
+    ).get("items", [])
+
+  with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    workloads_future = executor.submit(list_objects, "workloads")
+    ledgers_future = executor.submit(list_objects, "claimledgers")
+    try:
+      workload_items = workloads_future.result()
+    except Exception as exc:
+      if getattr(exc, "status", None) == 404:
+        return empty_scheduler_snapshot(installed=False)
+      return empty_scheduler_snapshot(installed=True, error=f"workload list failed: {exc}")
+    try:
+      ledger_items = ledgers_future.result()
+    except Exception as exc:
+      return empty_scheduler_snapshot(installed=True, error=f"claim ledger list failed: {exc}")
+
+  workloads = []
+  for item in workload_items:
+    metadata = item.get("metadata") or {}
+    spec = item.get("spec") or {}
+    accelerator = spec.get("accelerator") or {}
+    status = item.get("status") or {}
+    conditions = status.get("conditions") or []
+    placed = next((condition for condition in conditions if condition.get("type") == "Placed"), None)
+    workloads.append(
+      {
+        "name": metadata.get("name"),
+        "uid": metadata.get("uid"),
+        "created_at": metadata.get("creationTimestamp"),
+        "age_seconds": object_age_seconds(metadata.get("creationTimestamp")),
+        "deleting": bool(metadata.get("deletionTimestamp")),
+        "generation": metadata.get("generation"),
+        "role": spec.get("role"),
+        "model_id": spec.get("modelId"),
+        "owner_id": spec.get("ownerId"),
+        "training_kind": spec.get("trainingKind"),
+        "requested_memory": accelerator.get("memory"),
+        "max_devices": accelerator.get("maxDeviceCount", 1),
+        "phase": status.get("phase") or "Pending",
+        "reason": status.get("reason"),
+        "claim_name": status.get("claimName"),
+        "assignment_id": status.get("assignmentID"),
+        "pod_name": status.get("podName"),
+        "node_name": status.get("nodeName"),
+        "device_count": status.get("deviceCount", 0),
+        "memory_per_device": status.get("memoryPerDevice"),
+        "observed_generation": status.get("observedGeneration"),
+        "generation_current": status.get("observedGeneration") == metadata.get("generation"),
+        "placed": None if placed is None else placed.get("status") == "True",
+        "placed_reason": placed.get("reason") if placed else None,
+        "placed_message": placed.get("message") if placed else None,
+        "placed_transition_at": placed.get("lastTransitionTime") if placed else None,
+      }
+    )
+
+  ledgers = []
+  for item in ledger_items:
+    metadata = item.get("metadata") or {}
+    spec = item.get("spec") or {}
+    seats = spec.get("seats") or []
+    ledgers.append(
+      {
+        "name": metadata.get("name"),
+        "created_at": metadata.get("creationTimestamp"),
+        "age_seconds": object_age_seconds(metadata.get("creationTimestamp")),
+        "claim_name": spec.get("claimName"),
+        "seat_count": len(seats),
+        "owners": sorted({owner for seat in seats if (owner := seat.get("owner") or seat.get("workload"))}),
+        "seats": [
+          {
+            "workload": seat.get("workload"),
+            "workload_uid": seat.get("workloadUID"),
+            "assignment_id": seat.get("assignmentID"),
+            "owner": seat.get("owner"),
+            "host_request": seat.get("hostRequest"),
+          }
+          for seat in seats
+        ],
+      }
+    )
+
+  phase_counts: dict[str, int] = {}
+  for workload in workloads:
+    phase_counts[workload["phase"]] = phase_counts.get(workload["phase"], 0) + 1
+  return {
+    "installed": True,
+    "available": True,
+    "error": None,
+    "workloads": workloads,
+    "ledgers": ledgers,
+    "summary": {
+      "workloads": len(workloads),
+      "phase_counts": phase_counts,
+      "ledgers": len(ledgers),
+      "seats": sum(ledger["seat_count"] for ledger in ledgers),
+      "shared_ledgers": sum(ledger["seat_count"] > 1 for ledger in ledgers),
+    },
+  }
 
 
 def pod_problem(pod: Any) -> str | None:
@@ -147,17 +295,46 @@ def k8s_snapshot() -> dict:
   api, err = k8s_core_v1()
   namespace = k8s_namespace()
   if api is None:
-    return {"available": False, "namespace": namespace, "error": err, "pods": [], "nodes": []}
+    return {
+      "available": False,
+      "namespace": namespace,
+      "error": err,
+      "pods": [],
+      "nodes": [],
+      "scheduler": empty_scheduler_snapshot(installed=None, error=err),
+    }
   try:
     pods = [pod_to_dict(p) for p in api.list_namespaced_pod(namespace, _request_timeout=K8S_REQUEST_TIMEOUT).items]
   except Exception as exc:
-    return {"available": False, "namespace": namespace, "error": f"pod list failed: {exc}", "pods": [], "nodes": []}
-  try:
-    nodes = [node_to_dict(n) for n in api.list_node(_request_timeout=K8S_REQUEST_TIMEOUT).items]
-  except Exception:
-    # Namespaced service accounts often cannot list nodes; pods alone are still useful.
-    nodes = []
-  return {"available": True, "namespace": namespace, "error": None, "pods": pods, "nodes": nodes}
+    error = f"pod list failed: {exc}"
+    return {
+      "available": False,
+      "namespace": namespace,
+      "error": error,
+      "pods": [],
+      "nodes": [],
+      "scheduler": empty_scheduler_snapshot(installed=None, error=error),
+    }
+  with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    nodes_future = executor.submit(api.list_node, _request_timeout=K8S_REQUEST_TIMEOUT)
+    scheduler_future = executor.submit(scheduler_snapshot, namespace)
+    try:
+      nodes = [node_to_dict(n) for n in nodes_future.result().items]
+    except Exception:
+      # Namespaced service accounts often cannot list nodes; pods alone are still useful.
+      nodes = []
+    try:
+      scheduler = scheduler_future.result()
+    except Exception as exc:
+      scheduler = empty_scheduler_snapshot(installed=True, error=f"scheduler snapshot failed: {exc}")
+  return {
+    "available": True,
+    "namespace": namespace,
+    "error": None,
+    "pods": pods,
+    "nodes": nodes,
+    "scheduler": scheduler,
+  }
 
 
 def k8s_pod_logs(pod: str, container: str | None, tail: int) -> dict:
@@ -338,6 +515,7 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
     "demo": False,
     "kubernetes": {"available": k8s["available"], "namespace": k8s["namespace"], "error": k8s["error"]},
     "gateway": gateway_card,
+    "scheduler": k8s.get("scheduler") or empty_scheduler_snapshot(installed=None),
     "services": services,
     "edges": edges,
     "pools": sorted(pools.values(), key=lambda p: (p["id"] == "cpu", p["id"] == "unscheduled", p["id"])),
@@ -349,7 +527,7 @@ async def diagnostic_snapshot(store: RequestStore, worker_manager: FFTWorkerMana
   """Build one coherent dashboard payload from one Kubernetes observation."""
   cluster, runs, checks, operational = await asyncio.gather(
     cluster_snapshot(store, k8s),
-    runs_snapshot(store, worker_manager, k8s["pods"]),
+    runs_snapshot(store, worker_manager, k8s["pods"], k8s.get("scheduler")),
     health_checks(store, k8s),
     operational_stats(store, k8s, worker_manager),
   )
@@ -447,6 +625,10 @@ def model_pods(model_id: str, pods: list[dict]) -> list[dict]:
   return [p for p in pods if (p.get("labels") or {}).get("timeslice.io/job-id") in wanted]
 
 
+def model_workloads(model_id: str, scheduler: dict | None) -> list[dict]:
+  return [workload for workload in (scheduler or {}).get("workloads", []) if workload.get("model_id") == model_id]
+
+
 def summarize_run(
   pods: list[dict],
   queue_depth: int,
@@ -454,6 +636,7 @@ def summarize_run(
   sources: set[str] | list[str],
   model_status: str | None = None,
   model_error: str | None = None,
+  workloads: list[dict] | None = None,
 ) -> dict:
   """Derive a compact lifecycle verdict from observable state without pretending an artifact
   is a currently running process. The verdict is shared by the list and detail endpoints."""
@@ -471,17 +654,41 @@ def summarize_run(
     None,
   )
   waiting = next((pod for pod in pods if pod.get("problem") or pod.get("phase") == "Pending"), None)
+  workloads = workloads or []
+  workload_phases: dict[str, int] = {}
+  for workload in workloads:
+    workload_phases[workload["phase"]] = workload_phases.get(workload["phase"], 0) + 1
+  failed_workload = next((workload for workload in workloads if workload["phase"] == "Failed"), None)
+  waiting_workload = next((workload for workload in workloads if workload["phase"] in {"Pending", "Placing"}), None)
   running = phases.get("Running", 0)
-  if failed or model_status == "failed":
-    reason = (failed.get("problem") or f"pod {failed['name']} failed") if failed else model_error or "model creation failed"
+  if failed or failed_workload or model_status == "failed":
+    if failed:
+      reason = failed.get("problem") or f"pod {failed['name']} failed"
+    elif failed_workload:
+      reason = failed_workload.get("reason") or f"workload {failed_workload['name']} failed"
+    else:
+      reason = model_error or "model creation failed"
     phase, status = "failed", "error"
   elif waiting and running:
     phase, status, reason = "degraded", "warn", waiting.get("problem") or f"pod {waiting['name']} is pending"
   elif waiting:
     phase, status, reason = "waiting", "warn", waiting.get("problem") or f"pod {waiting['name']} is pending"
-  elif worker_alive or running:
+  elif waiting_workload:
+    phase, status, reason = (
+      "waiting",
+      "warn",
+      waiting_workload.get("reason") or f"workload {waiting_workload['name']} is {waiting_workload['phase'].lower()}",
+    )
+  elif worker_alive or running or workload_phases.get("Running"):
     count = running or 1
-    phase, status, reason = "running", "ok", f"{count} running {'pod' if count == 1 else 'pods'}" if running else "local worker process is alive"
+    if running:
+      reason = f"{count} running {'pod' if count == 1 else 'pods'}"
+    elif workload_phases.get("Running"):
+      count = workload_phases["Running"]
+      reason = f"{count} scheduler {'workload is' if count == 1 else 'workloads are'} running"
+    else:
+      reason = "local worker process is alive"
+    phase, status = "running", "ok"
   elif queue_depth:
     phase, status, reason = "queued", "ok", f"{queue_depth} queued {'request' if queue_depth == 1 else 'requests'}"
   elif model_status == "queued":
@@ -496,7 +703,13 @@ def summarize_run(
     phase, status, reason = "saved", "off", "saved artifacts are present; no active worker is visible"
   else:
     phase, status, reason = "inactive", "off", "no active worker, queued work, or pod is visible"
-  return {"phase": phase, "status": status, "reason": reason, "pod_phase_counts": phases}
+  return {
+    "phase": phase,
+    "status": status,
+    "reason": reason,
+    "pod_phase_counts": phases,
+    "workload_phase_counts": workload_phases,
+  }
 
 
 def current_gpu_claims(pods: list[dict], nodes: list[dict]) -> dict[str, int]:
@@ -603,8 +816,35 @@ def run_diagnostics(run_id: str, state: dict, pods: list[dict], queue_depth: int
   return diagnostics
 
 
-async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | None, pods: list[dict]) -> dict:
+def scheduler_run_diagnostics(workloads: list[dict], ledgers: list[dict], k8s: dict) -> list[dict]:
+  if not workloads:
+    return []
+  workload_names = {workload["name"] for workload in workloads}
+  ledger_names = {ledger["name"] for ledger in ledgers}
+  scheduler_only = {**k8s, "pods": [], "nodes": []}
+  return [
+    problem
+    for problem in derive_problems([], scheduler_only)
+    if (problem["resource"]["kind"] == "Workload" and problem["resource"]["name"] in workload_names)
+    or (problem["resource"]["kind"] == "ClaimLedger" and problem["resource"]["name"] in ledger_names)
+  ]
+
+
+async def runs_snapshot(
+  store: RequestStore,
+  worker_manager: FFTWorkerManager | None,
+  pods: list[dict],
+  scheduler: dict | None = None,
+) -> dict:
   found = await redis_runs(store)
+  for workload in (scheduler or {}).get("workloads", []):
+    model_id = workload.get("model_id")
+    if not model_id:
+      continue
+    info = found.setdefault(model_id, {"sources": set()})
+    info["sources"].add("scheduler")
+    if info.get("created_at") is None:
+      info["created_at"] = workload.get("created_at")
   for model_id, info in filesystem_runs().items():
     merged = found.setdefault(model_id, {"sources": set()})
     merged["sources"] |= info.pop("sources")
@@ -620,6 +860,7 @@ async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | 
   runs = []
   for model_id, info in found.items():
     run_pods = model_pods(model_id, pods)
+    run_workloads = model_workloads(model_id, scheduler)
     queue_depth = int(info.get("queue_depth") or 0)
     worker_alive = info.get("worker_alive")
     stoppable = bool(info.get("worker_alive") or "queue" in info["sources"] or run_pods)
@@ -633,6 +874,15 @@ async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | 
         "stoppable": stoppable,
         "sources": sorted(info["sources"]),
         "pods": [p["name"] for p in run_pods],
+        "workloads": [workload["name"] for workload in run_workloads],
+        "placement": {
+          "workloads": len(run_workloads),
+          "device_count": sum(workload.get("device_count") or 0 for workload in run_workloads),
+          "phase_counts": {
+            phase: sum(workload["phase"] == phase for workload in run_workloads)
+            for phase in sorted({workload["phase"] for workload in run_workloads})
+          },
+        },
         "queue_depth": queue_depth,
         "worker_alive": worker_alive,
         "model_status": info.get("status"),
@@ -644,7 +894,7 @@ async def runs_snapshot(store: RequestStore, worker_manager: FFTWorkerManager | 
           "failed_at": info.get("failed_at"),
           "stopped_at": info.get("stopped_at"),
         },
-        "state": summarize_run(run_pods, queue_depth, worker_alive, info["sources"], info.get("status"), info.get("error")),
+        "state": summarize_run(run_pods, queue_depth, worker_alive, info["sources"], info.get("status"), info.get("error"), run_workloads),
       }
     )
   runs.sort(key=lambda r: (r["created_at"] is not None, r["created_at"] or "", r["run_id"]), reverse=True)
@@ -660,22 +910,31 @@ async def run_detail(
 ) -> dict | None:
   """Everything about one run in a single payload: its record, full pod state, queue depth,
   current GPU claims per pool, and (when log_tail > 0) a log tail per pod."""
-  snapshot = await runs_snapshot(store, worker_manager, k8s["pods"])
+  scheduler = k8s.get("scheduler")
+  snapshot = await runs_snapshot(store, worker_manager, k8s["pods"], scheduler)
   run = next((r for r in snapshot["runs"] if r["run_id"] == run_id), None)
   if run is None:
     return None
 
   pods = model_pods(run_id, k8s["pods"])
+  workloads = model_workloads(run_id, scheduler)
+  claim_names = {workload["claim_name"] for workload in workloads if workload.get("claim_name")}
+  ledgers = [ledger for ledger in (scheduler or {}).get("ledgers", []) if ledger.get("claim_name") in claim_names]
   queue_depth = run["queue_depth"]
+  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s)
+  diagnostics.extend(scheduler_run_diagnostics(workloads, ledgers, k8s))
   gpu_claims = current_gpu_claims(pods, k8s["nodes"])
   detail = {
     **run,
     "demo": False,
     "pods": pods,
+    "workloads": workloads,
+    "claim_ledgers": ledgers,
     "queue_depth": queue_depth,
     "gpu_claims": gpu_claims,
     "gpu_devices": sum(gpu_claims.values()),
-    "diagnostics": run_diagnostics(run_id, run["state"], pods, queue_depth, k8s),
+    "scheduled_devices": sum(workload.get("device_count") or 0 for workload in workloads),
+    "diagnostics": diagnostics,
   }
   if log_tail:
 
@@ -902,6 +1161,34 @@ async def operational_stats(store: RequestStore, k8s: dict, worker_manager: FFTW
           status="warn" if ratio > 1 else "ok",
         )
       )
+    scheduler = k8s.get("scheduler") or {}
+    if scheduler.get("available"):
+      summary = scheduler["summary"]
+      failed = summary["phase_counts"].get("Failed", 0)
+      waiting = summary["phase_counts"].get("Pending", 0) + summary["phase_counts"].get("Placing", 0)
+      stats.extend(
+        [
+          stat_entry(
+            "scheduler.workloads",
+            "Scheduler workloads",
+            str(summary["workloads"]),
+            f"{waiting} waiting · {failed} failed",
+            value_number=summary["workloads"],
+            unit="workloads",
+            context={"phase_counts": summary["phase_counts"]},
+            status="warn" if failed else "ok",
+          ),
+          stat_entry(
+            "scheduler.seats",
+            "Claim ledger seats",
+            str(summary["seats"]),
+            f"across {summary['ledgers']} ledgers · {summary['shared_ledgers']} shared",
+            value_number=summary["seats"],
+            unit="seats",
+            context={"ledgers": summary["ledgers"], "shared_ledgers": summary["shared_ledgers"]},
+          ),
+        ]
+      )
   return stats, queues
 
 
@@ -946,6 +1233,23 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
   else:
     status = "off" if "not installed" in (k8s["error"] or "") or "credentials" in (k8s["error"] or "") else "error"
     checks.append(check_entry("kubernetes", "Kubernetes", "API server", status, k8s["error"] or "unavailable"))
+
+  scheduler = k8s.get("scheduler") or empty_scheduler_snapshot(installed=None)
+  if scheduler["installed"] is False:
+    checks.append(check_entry("scheduler", "Scheduler", "Placement API", "off", "Workload CRD is not installed"))
+  elif scheduler["available"]:
+    summary = scheduler["summary"]
+    checks.append(
+      check_entry(
+        "scheduler",
+        "Scheduler",
+        "Placement API",
+        "ok",
+        f"{summary['workloads']} workloads, {summary['ledgers']} claim ledgers, {summary['seats']} seats",
+      )
+    )
+  elif scheduler["installed"] is True:
+    checks.append(check_entry("scheduler", "Scheduler", "Placement API", "error", scheduler["error"] or "scheduler API unavailable"))
 
   if os.getenv("ENABLE_GCP_TRACE", "0") == "1":
     checks.append(check_entry("visibility.trace", "Visibility", "Trace export", "ok", "GCP Cloud Trace exporter configured"))
@@ -1016,6 +1320,104 @@ def derive_problems(checks: list[dict], k8s: dict) -> list[dict]:
           ],
         )
       )
+  scheduler = k8s.get("scheduler") or {}
+  if scheduler.get("available"):
+    namespace = k8s["namespace"]
+    workloads_by_name = {workload["name"]: workload for workload in scheduler["workloads"]}
+    ledgers_by_claim = {ledger["claim_name"]: ledger for ledger in scheduler["ledgers"]}
+    for workload in scheduler["workloads"]:
+      source = f"workload/{workload['name']}"
+      resource = {"kind": "Workload", "name": workload["name"], "namespace": namespace}
+      actions = [
+        {
+          "label": "Inspect workload",
+          "method": "GET",
+          "path": "/api/v1/dashboard/snapshot",
+          "command": f"kubectl get workload {workload['name']} -n {namespace} -o yaml",
+        }
+      ]
+      evidence = {
+        "phase": workload["phase"],
+        "reason": workload["reason"],
+        "age_seconds": workload["age_seconds"],
+        "claim_name": workload["claim_name"],
+        "assignment_id": workload["assignment_id"],
+        "pod_name": workload["pod_name"],
+        "node_name": workload["node_name"],
+      }
+      if workload["phase"] == "Failed":
+        problems.append(
+          diagnostic_entry(
+            "scheduler.workload_failed",
+            "error",
+            source,
+            workload["reason"] or "scheduler marked the workload failed",
+            resource=resource,
+            evidence=evidence,
+            actions=actions,
+          )
+        )
+      elif workload["phase"] in {"Pending", "Placing"} and (workload["age_seconds"] or 0) >= (300 if workload["phase"] == "Pending" else 120):
+        problems.append(
+          diagnostic_entry(
+            f"scheduler.workload_{workload['phase'].lower()}_slow",
+            "warn",
+            source,
+            workload["reason"] or f"workload has remained {workload['phase'].lower()} for {workload['age_seconds']} seconds",
+            resource=resource,
+            evidence=evidence,
+            actions=actions,
+          )
+        )
+      if workload["observed_generation"] is not None and not workload["generation_current"]:
+        problems.append(
+          diagnostic_entry(
+            "scheduler.generation_stale",
+            "warn",
+            source,
+            f"controller observed generation {workload['observed_generation']}, current generation is {workload['generation']}",
+            resource=resource,
+            evidence=evidence,
+            actions=actions,
+          )
+        )
+      if not workload["deleting"] and workload["claim_name"] and workload["assignment_id"] and (workload["age_seconds"] or 0) >= 60:
+        ledger = ledgers_by_claim.get(workload["claim_name"])
+        seat = next((seat for seat in (ledger or {}).get("seats", []) if seat["workload"] == workload["name"]), None)
+        if seat is None or seat["assignment_id"] != workload["assignment_id"]:
+          problems.append(
+            diagnostic_entry(
+              "scheduler.assignment_mismatch",
+              "error",
+              source,
+              "workload status assignment does not match its ClaimLedger seat",
+              resource=resource,
+              evidence={**evidence, "ledger": ledger["name"] if ledger else None, "seat_assignment_id": seat["assignment_id"] if seat else None},
+              actions=actions,
+            )
+          )
+    for ledger in scheduler["ledgers"]:
+      for seat in ledger["seats"]:
+        if seat["workload"] in workloads_by_name or (ledger["age_seconds"] or 0) < 60:
+          continue
+        problems.append(
+          diagnostic_entry(
+            "scheduler.stale_seat",
+            "warn",
+            f"claimledger/{ledger['name']}",
+            f"seat references missing workload {seat['workload']}",
+            resource={"kind": "ClaimLedger", "name": ledger["name"], "namespace": namespace},
+            evidence={"claim_name": ledger["claim_name"], "workload": seat["workload"], "assignment_id": seat["assignment_id"]},
+            actions=[
+              {
+                "label": "Inspect claim ledger",
+                "method": "GET",
+                "path": "/api/v1/dashboard/snapshot",
+                "command": f"kubectl get claimledger {ledger['name']} -n {namespace} -o yaml",
+              }
+            ],
+          )
+        )
   priority = {"error": 0, "warn": 1, "info": 2}
   problems.sort(key=lambda problem: (priority.get(problem["severity"], 3), problem["id"]))
   return problems
