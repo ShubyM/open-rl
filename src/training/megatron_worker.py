@@ -688,7 +688,9 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     # and what load_from_state reads back. save_hf_pretrained gathers the
     # tensor-parallel shards, so it is collective -- every rank calls it.
     ensure_modelopt_importable()
-    self.bridge.save_hf_pretrained(self.model_chunks, staging_path)
+    # Only here, never on the sampler sync -- see the context manager's docstring.
+    with gemma4.multimodal_export_passthrough():
+      self.bridge.save_hf_pretrained(self.model_chunks, staging_path)
     if is_primary() and self.tokenizer is not None:
       self.tokenizer.save_pretrained(staging_path)
 

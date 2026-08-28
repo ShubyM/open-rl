@@ -26,7 +26,9 @@ seam moves -- except install_flex_attention, which degrades to the stock
 attention and only costs a lower context ceiling.
 """
 
+import contextlib
 import os
+import threading
 from typing import Any
 
 import torch
@@ -175,6 +177,38 @@ MULTIMODAL_SOURCE_PREFIXES = (
   "model.audio_tower.",
 )
 
+# Thread-local, not a module global, because the trainer dispatches every worker
+# entry point through asyncio.to_thread -- a save and a sampler sync can be in
+# flight on two pool threads at once, which is exactly the concurrency that
+# expressed the thread-local device bug in run33.
+_passthrough = threading.local()
+
+
+@contextlib.contextmanager
+def multimodal_export_passthrough():
+  """Complete the export with the base checkpoint's vision weights, in this block.
+
+  Off by default, and it must stay off for the sampler sync. sync_weights_to_
+  samplers exports with cpu=False and hands the tensors to vLLM's packed NCCL
+  broadcast, while the passthrough's tensors come off disk and are therefore on
+  the CPU. They land at the end of the stream, so vLLM's packer builds its last
+  chunk out of them, torch.cat returns a CPU buffer, and the NCCL broadcast of
+  that buffer never arrives. run35 died there: /update_weights timed out after
+  30 minutes, rank 0 raised out of sync() while the other three sat in drain(),
+  and the next tensor-parallel allgather hung until the watchdog aborted them.
+
+  Scoping is not just a workaround for that. The samplers hold the full
+  multimodal model already and these eleven tensors never change, so sending
+  them every optimizer step was pointless work in the hot loop. Only the save
+  path needs them, and only because of how the shard writer counts keys.
+  """
+  previous = getattr(_passthrough, "enabled", False)
+  _passthrough.enabled = True
+  try:
+    yield
+  finally:
+    _passthrough.enabled = previous
+
 
 def install_multimodal_export_passthrough() -> bool:
   """Copy the vision/audio weights through the export, so its one shard completes.
@@ -240,6 +274,8 @@ def install_multimodal_export_passthrough() -> bool:
       exported.add(name)
       yield HFWeightTuple(name, weight)
 
+    if not getattr(_passthrough, "enabled", False):
+      return
     source = getattr(getattr(hf_pretrained, "state", None), "source", None)
     if source is None or not hasattr(source, "get_all_keys"):
       return
