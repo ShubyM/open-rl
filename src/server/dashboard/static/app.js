@@ -131,6 +131,13 @@ function bytes(value) {
   return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
 }
 
+function revisionLabel(value) {
+  if (!value || value === "unknown") return "unknown";
+  const dirty = value.endsWith("-dirty");
+  const revision = dirty ? value.slice(0, -6) : value;
+  return `${revision.slice(0, 12)}${dirty ? "-dirty" : ""}`;
+}
+
 // *** Theme ***
 
 function applyTheme(theme) {
@@ -516,6 +523,8 @@ function renderCluster(data) {
       if (item.id === "gateway") {
         const g = data.gateway;
         updateCard(card, "gateway", g.mode, [
+          { k: "build", v: revisionLabel(g.build?.revision) },
+          { k: "uptime", v: duration(g.build?.uptime_seconds) },
           { k: "sampler", v: g.sampler_backend },
           { k: "fft", v: g.fft_enabled ? "enabled" : "off" },
           { k: "namespace", v: data.kubernetes.namespace || "—" },
@@ -1163,6 +1172,8 @@ function updatePanel() {
   if (selected) {
     const current = [selected.state, selected.reason, selected.exit_code != null ? `exit ${selected.exit_code}` : null, selected.message].filter(Boolean).join(" · ");
     evidence.push({ key: `container/${selected.name}`, value: current || "state unavailable" });
+    if (selected.image) evidence.push({ key: "image", value: selected.image });
+    if (selected.image_id) evidence.push({ key: "image ID", value: selected.image_id });
     if (selected.last_termination) {
       const prior = selected.last_termination;
       evidence.push({ key: "previous", value: [prior.reason, prior.exit_code != null ? `exit ${prior.exit_code}` : null, prior.message].filter(Boolean).join(" · ") });
@@ -1234,6 +1245,9 @@ async function refresh() {
     renderRuns(S.runs);
     renderHealth(S.health, S.problems);
     $("demo-banner").hidden = !snapshot.demo;
+    const build = snapshot.cluster?.gateway?.build;
+    setText($("build-at"), `build ${revisionLabel(build?.revision)}`);
+    $("build-at").title = build ? `${build.hostname} · Python ${build.python_version} · started ${build.started_at}` : "build identity unavailable";
     const updated = snapshot.generated_at ? new Date(snapshot.generated_at) : new Date();
     setText($("updated-at"), `updated ${updated.toLocaleTimeString()}`);
   } catch (err) {

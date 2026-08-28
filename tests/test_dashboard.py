@@ -140,6 +140,27 @@ class DashboardEndpointsTest(unittest.TestCase):
     for edge in body["edges"]:
       self.assertEqual(edge["from"], "gateway")
 
+  def test_diagnostics_expose_build_identity_without_endpoint_credentials(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    k8s = {"available": False, "namespace": "default", "error": "off", "pods": [], "nodes": []}
+    with mock.patch.dict(
+      os.environ,
+      {
+        "OPEN_RL_BUILD_VERSION": "0123456789abcdef",
+        "REDIS_URL": "redis://agent:super-secret@redis.internal:6379/0?token=also-secret",
+      },
+    ):
+      cluster = asyncio.run(data.cluster_snapshot(InMemoryStore(), k8s))
+
+    self.assertEqual(cluster["gateway"]["build"]["revision"], "0123456789abcdef")
+    self.assertEqual(cluster["services"][0]["detail"], "redis://redis.internal:6379")
+    serialized = json.dumps(cluster)
+    self.assertNotIn("super-secret", serialized)
+    self.assertNotIn("also-secret", serialized)
+
   def test_runs_lists_filesystem_checkpoints(self) -> None:
     old_tmp_dir = os.environ.get("OPEN_RL_TMP_DIR")
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -475,6 +496,7 @@ class DashboardEndpointsTest(unittest.TestCase):
     container_status = NS(
       name="trainer",
       image="open-rl:test",
+      image_id="docker-pullable://open-rl@sha256:abc123",
       ready=False,
       restart_count=2,
       state=NS(running=None, waiting=NS(reason="CrashLoopBackOff", message="back-off restarting"), terminated=None),
@@ -502,6 +524,7 @@ class DashboardEndpointsTest(unittest.TestCase):
     diagnostic = data.pod_diagnostic(observed, "open-rl")
 
     self.assertEqual(observed["problem"], "CrashLoopBackOff: back-off restarting")
+    self.assertEqual(observed["containers"][0]["image_id"], "docker-pullable://open-rl@sha256:abc123")
     self.assertEqual(observed["containers"][0]["last_termination"]["exit_code"], 137)
     self.assertEqual(diagnostic["code"], "pod.oom_killed")
     self.assertEqual(diagnostic["evidence"]["containers"][0]["last_termination"]["reason"], "OOMKilled")

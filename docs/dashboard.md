@@ -42,7 +42,8 @@ experiment analysis; nothing here duplicates metrics.
 The page polls one coherent snapshot every 8 seconds and updates in place — canvas position, selection,
 and open log panels survive refreshes. A refresh lists Kubernetes state once, so every view describes the
 same observation while avoiding redundant API-server work. Manual refresh and a light/dark toggle are in
-the top bar.
+the top bar. The top bar and gateway card show the exact image build revision; pod inspection includes
+the runtime image digest, so an agent can prove a rebuilt fix is actually deployed rather than trusting a tag.
 
 ## JSON API and ops CLI
 
@@ -67,7 +68,9 @@ not need to parse text such as byte sizes or GPU fractions.
 Problems and per-run diagnostics carry a stable `id` and `code`, the affected `resource`, structured
 `evidence`, and concrete `actions` containing both API paths and copyable CLI or `kubectl` commands.
 Pod evidence includes current and previous container termination state, exit code, condition messages,
-and up to 10 recent Kubernetes events. Use `make ops logs <pod> --container <name> --previous` (or the
+the configured image, runtime image digest, and up to 10 recent Kubernetes events. Configured service
+endpoints are reduced to scheme, host, and port; credentials, paths, queries, and fragments never enter
+diagnostic JSON. Use `make ops logs <pod> --container <name> --previous` (or the
 **previous** toggle in the pod panel) after a restart; diagnoses distinguish OOM kills, crash loops,
 image-pull failures, evictions, volume mounts, and failed scheduling.
 Queue entries are timestamped at first enqueue (the timestamp survives the FFT worker-launch hop), so

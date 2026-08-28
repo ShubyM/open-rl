@@ -5,6 +5,14 @@ CLUSTER_NAME=${KIND_CLUSTER_NAME:-open-rl-dashboard}
 IMAGE=${DASHBOARD_IMAGE:-open-rl-dashboard:dev}
 PORT=${DASHBOARD_PORT:-9013}
 CONTEXT="kind-${CLUSTER_NAME}"
+if [[ -n ${DASHBOARD_BUILD_VERSION:-} ]]; then
+  BUILD_VERSION=$DASHBOARD_BUILD_VERSION
+else
+  BUILD_VERSION=$(git rev-parse --short=12 HEAD 2>/dev/null || echo dev)
+  if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+    BUILD_VERSION="${BUILD_VERSION}-dirty"
+  fi
+fi
 
 for command in kind kubectl docker curl python3; do
   command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 1; }
@@ -14,7 +22,7 @@ if ! kind get clusters | grep -Fxq "$CLUSTER_NAME"; then
   kind create cluster --name "$CLUSTER_NAME" --wait 90s
 fi
 
-docker build -f src/server/Dockerfile.gateway -t "$IMAGE" .
+docker build --build-arg VERSION="$BUILD_VERSION" -f src/server/Dockerfile.gateway -t "$IMAGE" .
 kind load docker-image "$IMAGE" --name "$CLUSTER_NAME"
 kubectl --context "$CONTEXT" apply -k dev/kind/dashboard
 kubectl --context "$CONTEXT" rollout restart deployment/open-rl-dashboard
@@ -59,7 +67,7 @@ if kubectl --context "$CONTEXT" logs deployment/open-rl-dashboard | grep -Fq "Bu
   exit 1
 fi
 
-python3 - "$snapshot_file" <<'PY'
+python3 - "$snapshot_file" "$BUILD_VERSION" <<'PY'
 import json
 import sys
 
@@ -70,6 +78,7 @@ assert snapshot["schema_version"] == 1, snapshot.get("schema_version")
 cluster = snapshot["cluster"]
 assert cluster["kubernetes"]["available"], cluster["kubernetes"]
 assert cluster["kubernetes"]["namespace"] == "default", cluster["kubernetes"]
+assert cluster["gateway"]["build"]["revision"] == sys.argv[2], cluster["gateway"]["build"]
 assert cluster["kubernetes"]["metrics"] == {
   "installed": False,
   "available": False,
@@ -81,6 +90,8 @@ assert cluster["kubernetes"]["metrics"] == {
 }, cluster["kubernetes"]["metrics"]
 assert cluster["pools"], "expected the Kind node in a cluster pool"
 assert any(pod["name"].startswith("open-rl-dashboard-") for pod in cluster["pods"]), cluster["pods"]
+dashboard = next(pod for pod in cluster["pods"] if pod["name"].startswith("open-rl-dashboard-"))
+assert dashboard["containers"][0]["image_id"], dashboard["containers"]
 assert cluster["scheduler"]["installed"] is False, cluster["scheduler"]
 checks = {check["id"]: check for check in snapshot["health"]["checks"]}
 assert checks["kubernetes"]["status"] == "ok", checks["kubernetes"]
@@ -119,4 +130,4 @@ assert isinstance(detail["diagnostics"], list), detail
 assert detail["telemetry"] == run["telemetry"], (run, detail)
 PY
 
-echo "Dashboard UI, persistent launch inspection, runtime telemetry schema, pod logs, and stop permission verified in Kind"
+echo "Dashboard UI, build/image identity, persistent launch inspection, runtime telemetry, pod logs, and stop permission verified in Kind"

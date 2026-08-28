@@ -20,6 +20,7 @@ TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_U
 TRAINING_TEST_EXTRA ?= gpu
 TRAINING_TEST_ARGS ?=
 PIGLATIN_TEST_PYTHONPATH ?= examples/sft/pig-latin
+BUILD_VERSION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 
 # CUDA_VISIBLE_DEVICES can be provided either as an environment variable or as a
 # Make variable, and is inherited by the backend/eval subprocesses.
@@ -125,8 +126,8 @@ GCP_PROJECT ?= cdrollouts-sunilarora
 IMAGE_TAG   ?= latest
 
 build-images:
-	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) -f src/server/Dockerfile .
-	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) -f src/server/Dockerfile.gateway .
+	DOCKER_BUILDKIT=1 docker build --build-arg VERSION="$(BUILD_VERSION)" -t gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) -f src/server/Dockerfile .
+	DOCKER_BUILDKIT=1 docker build --build-arg VERSION="$(BUILD_VERSION)" -t gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) -f src/server/Dockerfile.gateway .
 
 push-images:
 	docker push gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG)

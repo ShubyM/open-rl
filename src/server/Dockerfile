@@ -37,6 +37,12 @@ ENV UV_COMPILE_BYTECODE=1 \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --extra gpu --extra vllm
 
+# Stamp identity after the expensive dependency layer so a new revision does
+# not invalidate package installation.
+ARG VERSION=unknown
+LABEL org.opencontainers.image.revision=$VERSION
+ENV OPEN_RL_BUILD_VERSION=$VERSION
+
 # Copy source code
 COPY . .
 

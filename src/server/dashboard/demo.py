@@ -142,6 +142,13 @@ def demo_cluster() -> dict:
       "redis_configured": True,
       "vllm_url": None,
       "sampler_backend": "vllm",
+      "build": {
+        "revision": "demo-build-9f3c7a1",
+        "started_at": "2026-07-29T07:00:00+00:00",
+        "uptime_seconds": 7200,
+        "python_version": "3.12.11",
+        "hostname": "open-rl-gateway-demo",
+      },
     },
     "scheduler": demo_scheduler(),
     "services": [
@@ -325,6 +332,8 @@ def demo_cluster() -> dict:
     "open-rl-sampler-demo-run-2": (0.2, 2 * 2**30),
   }
   for pod in snapshot["pods"]:
+    for container in pod.get("containers", []):
+      container["image_id"] = "ghcr.io/gke-labs/open-rl/demo@sha256:fictional"
     if pod["name"] in pod_usage:
       cpu, memory = pod_usage[pod["name"]]
       pod["usage"] = {"cpu_cores": cpu, "memory_bytes": memory}

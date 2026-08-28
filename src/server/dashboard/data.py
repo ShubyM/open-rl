@@ -7,8 +7,11 @@ import concurrent.futures
 import functools
 import json
 import os
+import platform
 import shutil
+import socket
 import time
+import urllib.parse
 from datetime import UTC, datetime
 from typing import Any
 
@@ -38,6 +41,31 @@ def iso_timestamp(ts: float | str | None) -> str | None:
   if isinstance(ts, str):
     return ts
   return datetime.fromtimestamp(ts, tz=UTC).isoformat()
+
+
+def safe_endpoint(value: str | None) -> str | None:
+  """Return only scheme, host, and port. Diagnostic payloads must never echo credentials."""
+  if not value:
+    return None
+  try:
+    parsed = urllib.parse.urlsplit(value)
+    if not parsed.scheme or not parsed.hostname:
+      return "[configured]"
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return f"{parsed.scheme}://{host}{port}"
+  except ValueError:
+    return "[configured]"
+
+
+def build_summary() -> dict:
+  return {
+    "revision": os.getenv("OPEN_RL_BUILD_VERSION", "unknown"),
+    "started_at": iso_timestamp(START_TIME),
+    "uptime_seconds": max(0, int(time.time() - START_TIME)),
+    "python_version": platform.python_version(),
+    "hostname": socket.gethostname(),
+  }
 
 
 # *** Kubernetes ***
@@ -401,6 +429,7 @@ def pod_to_dict(pod: Any) -> dict:
           "name": cs.name,
           "kind": kind,
           "image": cs.image,
+          "image_id": getattr(cs, "image_id", None),
           "ready": bool(cs.ready),
           "state": state,
           "reason": reason,
@@ -419,6 +448,7 @@ def pod_to_dict(pod: Any) -> dict:
         "name": c.name,
         "kind": "app",
         "image": c.image,
+        "image_id": None,
         "ready": False,
         "state": "unknown",
         "reason": None,
@@ -679,8 +709,9 @@ def gateway_summary() -> dict:
     "mode": "single-process" if gateway.is_single_process_mode() else "distributed",
     "fft_enabled": gateway.is_fft_enabled(),
     "redis_configured": bool(os.getenv("REDIS_URL")),
-    "vllm_url": gateway.VLLM_URL if gateway.get_sampler_backend() == "vllm" else None,
+    "vllm_url": safe_endpoint(gateway.VLLM_URL) if gateway.get_sampler_backend() == "vllm" else None,
     "sampler_backend": gateway.get_sampler_backend(),
+    "build": build_summary(),
   }
 
 
@@ -705,7 +736,7 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
       "label": "Redis",
       "configured": gateway_card["redis_configured"],
       "ok": redis_ok,
-      "detail": os.getenv("REDIS_URL") or "not set — in-memory store",
+      "detail": safe_endpoint(os.getenv("REDIS_URL")) or "not set — in-memory store",
     },
     {
       "id": "storage",
@@ -1706,16 +1737,20 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
   uptime = int(time.time() - START_TIME)
   mode = "single-process" if gateway.is_single_process_mode() else "distributed"
   fft = "FFT enabled" if gateway.is_fft_enabled() else "LoRA mode"
-  checks.append(check_entry("gateway", "Gateway", "Gateway process", "ok", f"{mode}, {fft}, up {uptime // 3600}h {uptime % 3600 // 60}m"))
+  revision = build_summary()["revision"]
+  revision_label = revision[:12] if revision not in {"", "unknown"} else "unknown build"
+  checks.append(
+    check_entry("gateway", "Gateway", "Gateway process", "ok", f"{mode}, {fft}, build {revision_label}, up {uptime // 3600}h {uptime % 3600 // 60}m")
+  )
 
   if isinstance(store, RedisStore):
     started = time.perf_counter()
     ok = await ping_redis(store)
     latency_ms = (time.perf_counter() - started) * 1000
     if ok:
-      checks.append(check_entry("storage.redis", "Storage", "Redis", "ok", f"PING {latency_ms:.1f} ms — {os.getenv('REDIS_URL')}"))
+      checks.append(check_entry("storage.redis", "Storage", "Redis", "ok", f"PING {latency_ms:.1f} ms — {safe_endpoint(os.getenv('REDIS_URL'))}"))
     else:
-      checks.append(check_entry("storage.redis", "Storage", "Redis", "error", f"PING failed — {os.getenv('REDIS_URL')}"))
+      checks.append(check_entry("storage.redis", "Storage", "Redis", "error", f"PING failed — {safe_endpoint(os.getenv('REDIS_URL'))}"))
   else:
     checks.append(check_entry("storage.redis", "Storage", "Redis", "off", "REDIS_URL not set — using in-memory store"))
 
@@ -1784,9 +1819,9 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
     try:
       async with httpx.AsyncClient(timeout=2.0) as client:
         (await client.get(healthz)).raise_for_status()
-      checks.append(check_entry("visibility.sampler", "Visibility", "vLLM worker", "ok", f"reachable at {gateway.VLLM_URL}"))
+      checks.append(check_entry("visibility.sampler", "Visibility", "vLLM worker", "ok", f"reachable at {safe_endpoint(gateway.VLLM_URL)}"))
     except Exception:
-      checks.append(check_entry("visibility.sampler", "Visibility", "vLLM worker", "error", f"unreachable at {gateway.VLLM_URL}"))
+      checks.append(check_entry("visibility.sampler", "Visibility", "vLLM worker", "error", f"unreachable at {safe_endpoint(gateway.VLLM_URL)}"))
 
   return checks
 
