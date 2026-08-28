@@ -4,12 +4,12 @@ from collections.abc import Sequence
 
 
 def split_stop(stop: str | Sequence[str] | Sequence[int] | None) -> tuple[list[str] | None, list[int] | None]:
-  """Split a Tinker `stop` into vLLM's `stop` and `stop_token_ids`.
+  """Split a sampling request's `stop` into vLLM's `stop` and `stop_token_ids`.
 
-  Tinker types stop as `str | Sequence[str] | Sequence[int]` and which one
-  arrives depends on the renderer; vLLM keeps strings and token ids in separate
-  arguments. Each half is None when empty so callers do not override a vLLM
-  default with [].
+  The sampling API types stop as `str | Sequence[str] | Sequence[int]` and which
+  one arrives depends on the client's renderer. vLLM keeps strings and token ids
+  in separate arguments and rejects a string in `stop_token_ids`. Each half is
+  None when empty so callers do not override a vLLM default with [].
   """
   if stop is None:
     return None, None
