@@ -397,6 +397,8 @@ main { flex: 1; min-height: 0; display: flex; }
   background: var(--surface);
   padding: 10px 12px;
 }
+.stat.warn { border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); }
+.stat.warn .stat-value { color: var(--warn); }
 .stat-value { font-family: var(--mono); font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .stat-label { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .stat-detail { color: var(--faint); font-size: 11px; margin-top: 1px; }

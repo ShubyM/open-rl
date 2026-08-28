@@ -587,8 +587,27 @@ def gateway_rss_bytes() -> int | None:
   return None
 
 
-def stat_entry(stat_id: str, label: str, value: str, detail: str = "") -> dict:
-  return {"id": stat_id, "label": label, "value": value, "detail": detail}
+def stat_entry(
+  stat_id: str,
+  label: str,
+  value: str,
+  detail: str = "",
+  *,
+  value_number: int | float,
+  unit: str,
+  context: dict | None = None,
+  status: str = "ok",
+) -> dict:
+  return {
+    "id": stat_id,
+    "label": label,
+    "value": value,
+    "value_number": value_number,
+    "unit": unit,
+    "detail": detail,
+    "context": context or {},
+    "status": status,
+  }
 
 
 async def operational_stats(store: RequestStore, k8s: dict, worker_manager: FFTWorkerManager | None) -> tuple[list[dict], list[dict]]:
@@ -609,9 +628,23 @@ async def operational_stats(store: RequestStore, k8s: dict, worker_manager: FFTW
       maxmemory = memory.get("maxmemory", 0)
       value = f"{used / maxmemory:.0%} of {format_bytes(maxmemory)}" if maxmemory else format_bytes(used)
       limit = f"limit {format_bytes(maxmemory)}" if maxmemory else "no maxmemory limit"
-      redis_stats.append(stat_entry("redis.memory", "Redis memory", value, f"peak {format_bytes(memory.get('used_memory_peak', 0))} · {limit}"))
+      peak = memory.get("used_memory_peak", 0)
+      utilization = used / maxmemory if maxmemory else None
+      redis_stats.append(
+        stat_entry(
+          "redis.memory",
+          "Redis memory",
+          value,
+          f"peak {format_bytes(peak)} · {limit}",
+          value_number=used,
+          unit="bytes",
+          context={"peak_bytes": peak, "limit_bytes": maxmemory or None, "utilization": utilization},
+          status="warn" if utilization is not None and utilization >= 0.8 else "ok",
+        )
+      )
       clients = await store.redis.info("clients")
-      redis_stats.append(stat_entry("redis.clients", "Redis clients", str(clients.get("connected_clients", 0)), "connected"))
+      connected = clients.get("connected_clients", 0)
+      redis_stats.append(stat_entry("redis.clients", "Redis clients", str(connected), "connected", value_number=connected, unit="clients"))
     except Exception:
       pass
   elif isinstance(store, InMemoryStore):
@@ -622,33 +655,73 @@ async def operational_stats(store: RequestStore, k8s: dict, worker_manager: FFTW
   active = {model_id for model_id, alive in workers.items() if alive} | {q["model_id"] for q in queues if q["model_id"] != "default"}
 
   stats = [
-    stat_entry("runs.active", "Active runs", str(len(active)), "live worker or queued work"),
+    stat_entry("runs.active", "Active runs", str(len(active)), "live worker or queued work", value_number=len(active), unit="runs"),
     stat_entry(
-      "queue.requests", "Queued requests", str(sum(q["depth"] for q in queues)), f"across {len(queues)} queue{'' if len(queues) == 1 else 's'}"
+      "queue.requests",
+      "Queued requests",
+      str(sum(q["depth"] for q in queues)),
+      f"across {len(queues)} queue{'' if len(queues) == 1 else 's'}",
+      value_number=sum(q["depth"] for q in queues),
+      unit="requests",
+      context={"queue_count": len(queues)},
     ),
-    stat_entry("queue.launch", "Launches pending", str(launch_depth), "worker launch queue"),
+    stat_entry("queue.launch", "Launches pending", str(launch_depth), "worker launch queue", value_number=launch_depth, unit="runs"),
     *redis_stats,
   ]
   rss = gateway_rss_bytes()
   if rss is not None:
-    stats.append(stat_entry("gateway.rss", "Gateway memory", format_bytes(rss), "resident set size"))
+    stats.append(stat_entry("gateway.rss", "Gateway memory", format_bytes(rss), "resident set size", value_number=rss, unit="bytes"))
   shared = tmp_dir()
   if os.path.isdir(shared):
     usage = shutil.disk_usage(shared)
-    stats.append(stat_entry("storage.disk", "Disk free", format_bytes(usage.free), f"of {format_bytes(usage.total)} at {shared}"))
+    free_ratio = usage.free / usage.total if usage.total else 0
+    stats.append(
+      stat_entry(
+        "storage.disk",
+        "Disk free",
+        format_bytes(usage.free),
+        f"of {format_bytes(usage.total)} at {shared}",
+        value_number=usage.free,
+        unit="bytes",
+        context={"total_bytes": usage.total, "free_ratio": free_ratio, "path": shared},
+        status="warn" if usage.free < 20 * 2**30 else "ok",
+      )
+    )
   if k8s["available"]:
     phases: dict[str, int] = {}
     for pod in k8s["pods"]:
       phases[pod["phase"]] = phases.get(pod["phase"], 0) + 1
     running = phases.pop("Running", 0)
     others = " · ".join(f"{count} {phase.lower()}" for phase, count in sorted(phases.items())) or "no other phases"
-    stats.append(stat_entry("pods.running", "Pods running", str(running), others))
+    stats.append(
+      stat_entry(
+        "pods.running",
+        "Pods running",
+        str(running),
+        others,
+        value_number=running,
+        unit="pods",
+        context={"phase_counts": {"Running": running, **phases}},
+        status="warn" if phases.get("Failed", 0) else "ok",
+      )
+    )
     total_gpus = sum(node["gpu_capacity"] for node in k8s["nodes"])
     if total_gpus:
       claimed = sum(pod.get("gpus", 0) for pod in k8s["pods"] if pod["node"] and pod["phase"] not in TERMINAL_POD_PHASES)
       ratio = claimed / total_gpus
       detail = "across all pools" if ratio <= 1 else f"{ratio:.1f}× allocation overcommit across all pools"
-      stats.append(stat_entry("gpus.claimed", "GPUs claimed", f"{claimed}/{total_gpus}", detail))
+      stats.append(
+        stat_entry(
+          "gpus.claimed",
+          "GPUs claimed",
+          f"{claimed}/{total_gpus}",
+          detail,
+          value_number=claimed,
+          unit="devices",
+          context={"capacity_devices": total_gpus, "allocation_ratio": ratio, "overcommitted": ratio > 1},
+          status="warn" if ratio > 1 else "ok",
+        )
+      )
   return stats, queues
 
 

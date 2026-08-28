@@ -730,6 +730,7 @@ function renderHealth(health, problems) {
       return tile;
     },
     (tile, s) => {
+      setClass(tile, `stat ${s.status || "ok"}`);
       setText(tile.querySelector(".stat-value"), s.value);
       setText(tile.querySelector(".stat-label"), s.label);
       setText(tile.querySelector(".stat-detail"), s.detail || "");

@@ -20,6 +20,7 @@ router = APIRouter(prefix="/api/v1/dashboard")
 async def dashboard_snapshot(request: Request):
   if data.demo_mode_enabled():
     return {
+      "schema_version": 1,
       "demo": True,
       "notice": demo.DEMO_NOTICE,
       "cluster": demo.demo_cluster(),
@@ -28,7 +29,8 @@ async def dashboard_snapshot(request: Request):
       "problems": demo.demo_problems(),
     }
   k8s = await asyncio.to_thread(data.k8s_snapshot)
-  return await data.diagnostic_snapshot(get_store(), request.app.state.fft_worker_manager, k8s)
+  snapshot = await data.diagnostic_snapshot(get_store(), request.app.state.fft_worker_manager, k8s)
+  return {**snapshot, "schema_version": 1}
 
 
 @router.get("/cluster")

@@ -38,6 +38,11 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertLessEqual(statuses, {"ok", "warn", "error", "off"})
     stat_ids = {stat["id"] for stat in body["stats"]}
     self.assertLessEqual({"runs.active", "queue.requests", "queue.launch"}, stat_ids)
+    for stat in body["stats"]:
+      self.assertIn("value_number", stat)
+      self.assertIn("unit", stat)
+      self.assertIn("context", stat)
+      self.assertIn(stat["status"], {"ok", "warn"})
     self.assertIsInstance(body["queues"], list)
 
   def test_snapshot_reads_kubernetes_once_and_bundles_triage_state(self) -> None:
@@ -48,6 +53,7 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(resp.status_code, 200)
     body = resp.json()
     self.assertFalse(body["demo"])
+    self.assertEqual(body["schema_version"], 1)
     self.assertIsNotNone(body["generated_at"])
     self.assertEqual({"cluster", "runs", "health", "problems"}, set(body) & {"cluster", "runs", "health", "problems"})
     self.assertEqual(body["cluster"]["kubernetes"]["namespace"], "test")
@@ -126,6 +132,13 @@ class DashboardEndpointsTest(unittest.TestCase):
     for path in ("snapshot", "cluster", "runs", "health", "problems", "pods/any-pod/logs", "runs/demo-run-1?logs=5"):
       body = self.client.get(f"/api/v1/dashboard/{path}").json()
       self.assertTrue(body["demo"], path)
+      if path == "snapshot":
+        self.assertEqual(body["schema_version"], 1)
+        for stat in body["health"]["stats"]:
+          self.assertIn("value_number", stat)
+          self.assertIn("unit", stat)
+          self.assertIn("context", stat)
+          self.assertIn(stat["status"], {"ok", "warn"})
       self.assertIn("fictional", body["notice"], path)
     stop = self.client.post("/api/v1/dashboard/runs/demo-run-1/stop").json()
     self.assertTrue(stop["demo"])
@@ -214,6 +227,10 @@ class DashboardEndpointsTest(unittest.TestCase):
     gpu = next(stat for stat in stats if stat["id"] == "gpus.claimed")
     self.assertEqual(gpu["value"], "2/1")
     self.assertIn("2.0× allocation overcommit", gpu["detail"])
+    self.assertEqual(gpu["value_number"], 2)
+    self.assertEqual(gpu["unit"], "devices")
+    self.assertEqual(gpu["context"], {"capacity_devices": 1, "allocation_ratio": 2.0, "overcommitted": True})
+    self.assertEqual(gpu["status"], "warn")
 
   def test_runs_with_unknown_created_at_sort_last(self) -> None:
     import asyncio

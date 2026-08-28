@@ -52,7 +52,9 @@ The UI serves humans; the same primitives are exposed as JSON for agents and scr
 | stop | `POST /api/v1/dashboard/runs/{run_id}/stop` | `make ops stop <run_id>` |
 
 `dev/tools/ops.py` is stdlib-only and always prints JSON; point it at a remote gateway with
-`BASE_URL=http://host:9003`.
+`BASE_URL=http://host:9003`. The diagnostic snapshot is schema-versioned. Every load stat includes
+the human display string plus `value_number`, `unit`, structured `context`, and `status`, so agents do
+not need to parse text such as byte sizes or GPU fractions.
 
 ## Kind smoke test
 
