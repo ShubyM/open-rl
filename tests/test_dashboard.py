@@ -253,6 +253,11 @@ class DashboardEndpointsTest(unittest.TestCase):
       self.assertIn("fictional", body["notice"], path)
     stop = self.client.post("/api/v1/dashboard/runs/demo-run-1/stop").json()
     self.assertTrue(stop["demo"])
+    detail = self.client.get("/api/v1/dashboard/runs/demo-run-1").json()
+    self.assertEqual(detail["telemetry"]["requests_completed"], 42)
+    self.assertEqual(detail["telemetry"]["latest_metrics"]["loss:mean"], 0.7981)
+    problems = self.client.get("/api/v1/dashboard/problems").json()["problems"]
+    self.assertIn("run.request_failed", {problem["code"] for problem in problems})
 
   def test_duty_tracker_records_per_job_allocation(self) -> None:
     tracker = data.DutyTracker(max_samples=3, min_interval_s=5.0)
@@ -453,6 +458,65 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(ready["state"]["phase"], "ready")
     self.assertEqual(ready["lifecycle"]["status"], "ready")
     self.assertIsNotNone(ready["lifecycle"]["ready_at"])
+
+  def test_run_telemetry_tracks_worker_metrics_latency_and_failures(self) -> None:
+    import asyncio
+    import time
+
+    from server.store import InMemoryStore
+
+    store = InMemoryStore()
+    asyncio.run(store.set_model_metadata("run-metrics", {"base_model": "Qwen/Qwen3-0.6B", "status": "ready"}))
+    asyncio.run(
+      store.put_request(
+        {
+          "request_id": "request-ok",
+          "model_id": "run-metrics",
+          "op": "forward_backward",
+          "enqueued_at": time.time() - 2,
+        }
+      )
+    )
+    asyncio.run(store.get_requests())
+    asyncio.run(store.set_future("request-ok", {"type": "forward_backward_completed", "metrics": {"loss:mean": 0.75, "ignored": float("nan")}}))
+    asyncio.run(store.put_request({"request_id": "request-failed", "model_id": "run-metrics", "op": "optim_step", "enqueued_at": time.time() - 1}))
+    asyncio.run(store.get_requests())
+    asyncio.run(store.set_future("request-failed", {"type": "RequestFailedResponse", "error_message": "gradient overflow"}))
+
+    telemetry = asyncio.run(store.list_model_metadata())["run-metrics"]["telemetry"]
+    self.assertEqual(telemetry["requests_completed"], 2)
+    self.assertEqual(telemetry["requests_failed"], 1)
+    self.assertEqual(telemetry["failure_rate"], 0.5)
+    self.assertEqual(telemetry["operation_counts"], {"forward_backward": 1, "optim_step": 1})
+    self.assertEqual(telemetry["latest_metrics"], {"loss:mean": 0.75})
+    self.assertEqual(len(telemetry["metric_series"]["loss:mean"]), 1)
+    self.assertGreaterEqual(telemetry["mean_latency_seconds"], 1.0)
+    self.assertEqual(telemetry["last_error"], "gradient overflow")
+
+    k8s = {"available": True, "namespace": "default", "error": None, "pods": [], "nodes": []}
+    detail = asyncio.run(data.run_detail(store, None, "run-metrics", k8s))
+    diagnostic = next(item for item in detail["diagnostics"] if item["code"] == "run.request_failed")
+    self.assertEqual(diagnostic["evidence"]["requests_failed"], 1)
+    self.assertEqual(diagnostic["actions"][0]["command"], "make ops run run-metrics 100")
+    problem = next(item for item in data.derive_problems([], k8s, runs=[detail]) if item["code"] == "run.request_failed")
+    self.assertEqual(problem["resource"], {"kind": "Run", "name": "run-metrics"})
+
+  def test_run_metric_series_is_bounded(self) -> None:
+    from server.store import record_request_result
+
+    metadata = {}
+    for index in range(25):
+      metadata = record_request_result(
+        metadata,
+        {"operation": "forward_backward", "enqueued_at": float(index)},
+        {"type": "forward_backward_completed", "metrics": {"loss:mean": index / 10}},
+        completed_at=float(index + 1),
+      )
+
+    series = metadata["telemetry"]["metric_series"]["loss:mean"]
+    self.assertEqual(len(series), 20)
+    self.assertEqual(series[0]["value"], 0.5)
+    self.assertEqual(series[-1]["value"], 2.4)
 
   def test_scheduler_snapshot_drives_run_state_and_consistency_diagnostics(self) -> None:
     import asyncio

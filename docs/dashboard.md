@@ -28,7 +28,8 @@ experiment analysis; nothing here duplicates metrics.
   optional feature being off; installed-but-unreadable CRDs are a health error.
 - **Runs** — launch by base model without leaving the page. Every row has an observed lifecycle verdict
   and an expandable inspection showing queue depth, current GPU claims by pool, pod phase counts,
-  structured diagnostics, and recent logs for every pod. Clicking a pod opens its live log panel. A
+  gateway request counts/failures/latency, latest worker-reported loss and gradient metrics with their
+  bounded recent trend, structured diagnostics, and recent logs for every pod. Clicking a pod opens its live log panel. A
   W&B link appears when one is recorded, and Stop appears when there is something to stop (a worker
   process, queued work, or labeled pods).
 - **Health** — current problems first, then a **Load** section of measured stats (active runs, queued
@@ -96,7 +97,10 @@ left running for inspection; remove it with `make kind-dashboard-clean`.
   ready or failed when the future resolves. In-memory mode keeps that record for the gateway lifetime;
   Redis mode preserves it across gateway restarts. This prevents runs from disappearing after their
   create request drains. A W&B URL is shown when adapter `metadata.json` or model metadata records
-  `wandb_url`.
+  `wandb_url`. Request telemetry is joined by request and model ID at the queue/future boundary: the
+  model record keeps exact completion and failure counts, end-to-end latency, operation counts, and the
+  latest numeric worker metrics (with at most 20 points per metric). It remains available after the
+  request queue drains and, with Redis, after a gateway restart.
 - **Stop** does only what is truthfully stoppable: terminates the gateway-launched worker process,
   clears the run's Redis queues, and deletes pods labeled `timeslice.io/job-id` for the model. It
   reports exactly which actions it took.

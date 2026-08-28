@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import os
 import time
 from abc import ABC, abstractmethod
@@ -77,6 +78,65 @@ def model_result_update(result: dict[str, Any]) -> dict[str, Any]:
   return {}
 
 
+def request_observation(req_data: dict[str, Any]) -> dict[str, Any] | None:
+  request_id = req_data.get("request_id")
+  model_id = req_data.get("model_id")
+  if not request_id or not model_id:
+    return None
+  try:
+    enqueued_at = float(req_data.get("enqueued_at", time.time()))
+  except (TypeError, ValueError):
+    enqueued_at = time.time()
+  return {"request_id": str(request_id), "model_id": str(model_id), "operation": str(req_data.get("op") or "unknown"), "enqueued_at": enqueued_at}
+
+
+def record_request_result(
+  metadata: dict[str, Any], observation: dict[str, Any], result: dict[str, Any], completed_at: float | None = None
+) -> dict[str, Any]:
+  """Fold one completed gateway request into a bounded, JSON-safe run telemetry summary."""
+  completed_at = completed_at or time.time()
+  operation = observation["operation"]
+  failed = result.get("type") == "RequestFailedResponse"
+  latency = max(0.0, completed_at - observation["enqueued_at"])
+  telemetry = {**(metadata.get("telemetry") or {})}
+  completed = int(telemetry.get("requests_completed") or 0) + 1
+  failures = int(telemetry.get("requests_failed") or 0) + int(failed)
+  latency_total = float(telemetry.get("latency_total_seconds") or 0.0) + latency
+  operation_counts = {**(telemetry.get("operation_counts") or {})}
+  operation_counts[operation] = int(operation_counts.get(operation) or 0) + 1
+
+  latest_metrics = {**(telemetry.get("latest_metrics") or {})}
+  metric_series = {name: list(points) for name, points in (telemetry.get("metric_series") or {}).items()}
+  for name, value in (result.get("metrics") or {}).items():
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+      continue
+    numeric = float(value)
+    latest_metrics[name] = numeric
+    metric_series[name] = [*metric_series.get(name, []), {"at": completed_at, "value": numeric, "operation": operation}][-20:]
+
+  telemetry.update(
+    {
+      "requests_completed": completed,
+      "requests_failed": failures,
+      "failure_rate": failures / completed,
+      "operation_counts": operation_counts,
+      "last_operation": operation,
+      "last_outcome": "error" if failed else "ok",
+      "last_completed_at": completed_at,
+      "last_latency_seconds": latency,
+      "mean_latency_seconds": latency_total / completed,
+      "max_latency_seconds": max(float(telemetry.get("max_latency_seconds") or 0.0), latency),
+      "latency_total_seconds": latency_total,
+      "latest_metrics": latest_metrics,
+      "metric_series": metric_series,
+    }
+  )
+  if failed:
+    telemetry["last_error"] = str(result.get("error_message") or "request failed")[:500]
+    telemetry["last_error_at"] = completed_at
+  return {**metadata, "telemetry": telemetry}
+
+
 class InMemoryStore(RequestStore):
   def __init__(self):
     # tenant_id -> queue of requests
@@ -88,10 +148,14 @@ class InMemoryStore(RequestStore):
     self.futures_events: dict[str, asyncio.Event] = {}
     self.model_metadata: dict[str, dict[str, Any]] = {}
     self.queue_oldest_at: dict[str, float] = {}
+    self.request_observations: dict[str, dict[str, Any]] = {}
 
   async def put_request(self, req_data: dict[str, Any]) -> None:
     req_data = {**req_data}
     req_data.setdefault("enqueued_at", time.time())
+    if observation := request_observation(req_data):
+      req_data["enqueued_at"] = observation["enqueued_at"]
+      self.request_observations[observation["request_id"]] = observation
     model_id = req_data.get("model_id", "default")
 
     async with self.active_tenants_cv:
@@ -142,7 +206,12 @@ class InMemoryStore(RequestStore):
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
     self.futures_store[req_id] = result
-    if req_id in self.model_metadata:
+    if result.get("status") != "pending" and (observation := self.request_observations.pop(req_id, None)):
+      model_id = observation["model_id"]
+      self.model_metadata[model_id] = record_request_result(self.model_metadata.get(model_id, {}), observation, result)
+      if observation["operation"] in {"create_model", "create_model_from_state"}:
+        self.model_metadata[model_id].update(model_result_update(result))
+    elif req_id in self.model_metadata:
       self.model_metadata[req_id].update(model_result_update(result))
     if req_id in self.futures_events:
       self.futures_events[req_id].set()
@@ -198,22 +267,33 @@ class RedisStore(RequestStore):
   async def put_request(self, req_data: dict[str, Any]) -> None:
     req_data = {**req_data}
     req_data.setdefault("enqueued_at", time.time())
+    observation = request_observation(req_data)
+    if observation:
+      req_data["enqueued_at"] = observation["enqueued_at"]
     model_id = req_data.get("model_id", "default")
     queue_key = f"open_rl:queue:{model_id}"
 
-    # 1. Add request to tenant-specific list
-    await self.redis.rpush(queue_key, json.dumps(req_data))
-
-    # 2. Add tenant to active set and list if not already there
-    # SADD returns 1 if it was newly added, 0 if it already existed
-    is_new = await self.redis.sadd(self.active_set, model_id)
+    pipeline = self.redis.pipeline(transaction=False)
+    if observation:
+      pipeline.set(f"open_rl:request_observation:{observation['request_id']}", json.dumps(observation), ex=86400)
+    pipeline.rpush(queue_key, json.dumps(req_data))
+    pipeline.sadd(self.active_set, model_id)
+    # SADD is last: 1 means this tenant needs a rotation-list entry.
+    is_new = (await pipeline.execute())[-1]
     if is_new == 1:
       await self.redis.rpush(self.active_list, model_id)
 
   async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
     req_data = {**req_data}
     req_data.setdefault("enqueued_at", time.time())
-    await self.redis.rpush(self.worker_launch_queue, json.dumps(req_data))
+    observation = request_observation(req_data)
+    if observation:
+      req_data["enqueued_at"] = observation["enqueued_at"]
+    pipeline = self.redis.pipeline(transaction=False)
+    if observation:
+      pipeline.set(f"open_rl:request_observation:{observation['request_id']}", json.dumps(observation), ex=86400)
+    pipeline.rpush(self.worker_launch_queue, json.dumps(req_data))
+    await pipeline.execute()
 
   async def get_requests(self) -> list[dict[str, Any]]:
     # BRPOPLPUSH blocks until an item is available.
@@ -297,13 +377,27 @@ class RedisStore(RequestStore):
     return batch
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
-    update = model_result_update(result)
-    if update:
+    if result.get("status") == "pending":
+      return
+
+    observation_key = f"open_rl:request_observation:{req_id}"
+    if raw_observation := await self.redis.get(observation_key):
+      try:
+        observation = json.loads(raw_observation)
+        model_id = observation["model_id"]
+        metadata_key = f"open_rl:model_meta:{model_id}"
+        metadata = json.loads(await self.redis.get(metadata_key) or "{}")
+        metadata = record_request_result(metadata, observation, result)
+        if observation["operation"] in {"create_model", "create_model_from_state"}:
+          metadata.update(model_result_update(result))
+        await self.redis.set(metadata_key, json.dumps(metadata))
+        await self.redis.delete(observation_key)
+      except (KeyError, TypeError, json.JSONDecodeError):
+        pass
+    elif update := model_result_update(result):
       key = f"open_rl:model_meta:{req_id}"
       if raw := await self.redis.get(key):
         await self.redis.set(key, json.dumps({**json.loads(raw), **update}))
-    if result.get("status") == "pending":
-      return
 
     key = f"open_rl:future:{req_id}"
     await self.redis.rpush(key, json.dumps(result))
@@ -337,24 +431,35 @@ class RedisStore(RequestStore):
     await self.redis.set(key, json.dumps({**existing, **metadata}))
 
   async def list_model_metadata(self) -> dict[str, dict[str, Any]]:
+    keys = [key async for key in self.redis.scan_iter(match="open_rl:model_meta:*", count=200)]
+    pipeline = self.redis.pipeline(transaction=False)
+    for key in keys:
+      pipeline.get(key)
+    values = await pipeline.execute() if keys else []
     metadata = {}
-    async for key in self.redis.scan_iter(match="open_rl:model_meta:*", count=200):
+    for key, raw in zip(keys, values, strict=True):
       try:
-        metadata[key.removeprefix("open_rl:model_meta:")] = json.loads(await self.redis.get(key) or "{}")
+        metadata[key.removeprefix("open_rl:model_meta:")] = json.loads(raw or "{}")
       except (TypeError, json.JSONDecodeError):
         continue
     return metadata
 
   async def queue_stats(self) -> list[dict[str, Any]]:
     now = time.time()
+    keys = [key async for key in self.redis.scan_iter(match="open_rl:queue:*", count=200)]
+    pipeline = self.redis.pipeline(transaction=False)
+    for key in keys:
+      pipeline.llen(key)
+      pipeline.lindex(key, 0)
+    observations = await pipeline.execute() if keys else []
     stats = []
-    async for key in self.redis.scan_iter(match="open_rl:queue:*", count=200):
-      depth = await self.redis.llen(key)
+    for index, key in enumerate(keys):
+      depth, raw_oldest = observations[index * 2 : index * 2 + 2]
       if not depth:
         continue
       oldest_at = None
       try:
-        oldest_at = float(json.loads(await self.redis.lindex(key, 0) or "{}").get("enqueued_at"))
+        oldest_at = float(json.loads(raw_oldest or "{}").get("enqueued_at"))
       except (TypeError, ValueError, json.JSONDecodeError):
         pass
       stats.append(

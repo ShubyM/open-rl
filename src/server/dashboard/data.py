@@ -542,7 +542,7 @@ async def diagnostic_snapshot(store: RequestStore, worker_manager: FFTWorkerMana
     "cluster": cluster,
     "runs": runs,
     "health": {"demo": False, "checks": checks, "stats": stats, "queues": queues},
-    "problems": {"demo": False, "problems": derive_problems(checks, k8s, stats)},
+    "problems": {"demo": False, "problems": derive_problems(checks, k8s, stats, runs["runs"])},
   }
 
 
@@ -585,7 +585,19 @@ async def redis_runs(store: RequestStore, queues: list[dict] | None = None) -> d
     for model_id, meta in (await store.list_model_metadata()).items():
       info = found.setdefault(model_id, {"sources": set()})
       info["sources"].add("registered")
-      for field in ("base_model", "created_at", "wandb_url", "status", "error", "operation", "state_path", "ready_at", "failed_at", "stopped_at"):
+      for field in (
+        "base_model",
+        "created_at",
+        "wandb_url",
+        "status",
+        "error",
+        "operation",
+        "state_path",
+        "ready_at",
+        "failed_at",
+        "stopped_at",
+        "telemetry",
+      ):
         if meta.get(field) is not None:
           info[field] = iso_timestamp(meta[field]) if field in {"created_at", "ready_at", "failed_at", "stopped_at"} else meta[field]
   except Exception:
@@ -788,6 +800,7 @@ def run_diagnostics(
   queue_depth: int,
   k8s: dict,
   queue_age_seconds: float | None = None,
+  telemetry: dict | None = None,
 ) -> list[dict]:
   diagnostics = []
   if not k8s["available"]:
@@ -821,7 +834,40 @@ def run_diagnostics(
         ],
       )
     )
+  if diagnostic := run_telemetry_diagnostic(run_id, telemetry or {}):
+    diagnostics.append(diagnostic)
   return diagnostics
+
+
+def run_telemetry_diagnostic(run_id: str, telemetry: dict) -> dict | None:
+  completed = int(telemetry.get("requests_completed") or 0)
+  failures = int(telemetry.get("requests_failed") or 0)
+  last_failed = telemetry.get("last_outcome") == "error"
+  elevated_failures = completed >= 5 and failures / completed >= 0.2
+  if not last_failed and not elevated_failures:
+    return None
+  return diagnostic_entry(
+    "run.request_failed" if last_failed else "run.request_errors",
+    "error" if last_failed else "warn",
+    f"run/{run_id}",
+    telemetry.get("last_error") or f"{failures} of {completed} completed requests failed",
+    resource={"kind": "Run", "name": run_id},
+    evidence={
+      "requests_completed": completed,
+      "requests_failed": failures,
+      "failure_rate": failures / completed if completed else 0,
+      "last_operation": telemetry.get("last_operation"),
+      "last_error_at": iso_timestamp(telemetry.get("last_error_at")),
+    },
+    actions=[
+      {
+        "label": "Inspect run and pod logs",
+        "method": "GET",
+        "path": f"/api/v1/dashboard/runs/{run_id}?logs=100",
+        "command": f"make ops run {run_id} 100",
+      }
+    ],
+  )
 
 
 def scheduler_run_diagnostics(workloads: list[dict], ledgers: list[dict], k8s: dict) -> list[dict]:
@@ -895,6 +941,7 @@ async def runs_snapshot(
         "queue_depth": queue_depth,
         "queue_oldest_at": info.get("queue_oldest_at"),
         "queue_oldest_seconds": info.get("queue_oldest_seconds"),
+        "telemetry": info.get("telemetry") or {},
         "worker_alive": worker_alive,
         "model_status": info.get("status"),
         "lifecycle": {
@@ -932,7 +979,7 @@ async def run_detail(
   claim_names = {workload["claim_name"] for workload in workloads if workload.get("claim_name")}
   ledgers = [ledger for ledger in (scheduler or {}).get("ledgers", []) if ledger.get("claim_name") in claim_names]
   queue_depth = run["queue_depth"]
-  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s, run.get("queue_oldest_seconds"))
+  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s, run.get("queue_oldest_seconds"), run.get("telemetry"))
   diagnostics.extend(scheduler_run_diagnostics(workloads, ledgers, k8s))
   gpu_claims = current_gpu_claims(pods, k8s["nodes"])
   detail = {
@@ -1337,7 +1384,7 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
   return checks
 
 
-def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = None) -> list[dict]:
+def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = None, runs: list[dict] | None = None) -> list[dict]:
   problems = []
   for check in checks:
     if check["status"] in {"warn", "error"}:
@@ -1380,6 +1427,9 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
         actions=actions,
       )
     )
+  for run in runs or []:
+    if diagnostic := run_telemetry_diagnostic(run["run_id"], run.get("telemetry") or {}):
+      problems.append(diagnostic)
   for pod in k8s["pods"]:
     if diagnostic := pod_diagnostic(pod, k8s.get("namespace")):
       problems.append(diagnostic)

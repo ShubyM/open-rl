@@ -87,10 +87,12 @@ run_id = sys.argv[3]
 run = next(run for run in snapshot["runs"]["runs"] if run["run_id"] == run_id)
 assert run["state"]["phase"] in {"queued", "starting", "ready", "failed"}, run
 assert isinstance(run["queue_depth"], int), run
+assert isinstance(run["telemetry"], dict), run
 assert detail["run_id"] == run_id, detail
 assert detail["state"]["phase"] == run["state"]["phase"], (run, detail)
 assert isinstance(detail["gpu_devices"], int), detail
 assert isinstance(detail["diagnostics"], list), detail
+assert detail["telemetry"] == run["telemetry"], (run, detail)
 PY
 
-echo "Dashboard UI, persistent launch inspection, metrics schema, pod logs, and stop permission verified in Kind"
+echo "Dashboard UI, persistent launch inspection, runtime telemetry schema, pod logs, and stop permission verified in Kind"

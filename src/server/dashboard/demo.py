@@ -287,6 +287,29 @@ def demo_runs() -> dict:
         "queue_oldest_at": "2026-07-29T08:01:42+00:00",
         "queue_oldest_seconds": 18,
         "worker_alive": True,
+        "telemetry": {
+          "requests_completed": 42,
+          "requests_failed": 0,
+          "failure_rate": 0.0,
+          "operation_counts": {"create_model": 1, "forward_backward": 20, "optim_step": 20, "save_weights_for_sampler": 1},
+          "last_operation": "forward_backward",
+          "last_outcome": "ok",
+          "last_latency_seconds": 3.42,
+          "mean_latency_seconds": 2.18,
+          "max_latency_seconds": 7.91,
+          "latest_metrics": {"loss:mean": 0.7981, "grad_norm:mean": 0.42},
+          "metric_series": {
+            "loss:mean": [
+              {"at": 1785333650.0, "value": 0.9124, "operation": "forward_backward"},
+              {"at": 1785333710.0, "value": 0.8312, "operation": "forward_backward"},
+              {"at": 1785333770.0, "value": 0.7981, "operation": "forward_backward"},
+            ],
+            "grad_norm:mean": [
+              {"at": 1785333680.0, "value": 0.48, "operation": "optim_step"},
+              {"at": 1785333740.0, "value": 0.42, "operation": "optim_step"},
+            ],
+          },
+        },
         "state": {
           "phase": "running",
           "status": "ok",
@@ -308,6 +331,21 @@ def demo_runs() -> dict:
         "queue_oldest_at": "2026-07-29T07:59:15+00:00",
         "queue_oldest_seconds": 75,
         "worker_alive": True,
+        "telemetry": {
+          "requests_completed": 7,
+          "requests_failed": 2,
+          "failure_rate": 2 / 7,
+          "operation_counts": {"create_model": 1, "forward_backward": 4, "optim_step": 2},
+          "last_operation": "forward_backward",
+          "last_outcome": "error",
+          "last_error": "CUDA out of memory while allocating the training batch",
+          "last_error_at": 1785333770.0,
+          "last_latency_seconds": 11.7,
+          "mean_latency_seconds": 5.2,
+          "max_latency_seconds": 11.7,
+          "latest_metrics": {"loss:mean": 1.182},
+          "metric_series": {"loss:mean": [{"at": 1785333710.0, "value": 1.182, "operation": "forward_backward"}]},
+        },
         "state": {
           "phase": "failed",
           "status": "error",
@@ -329,6 +367,7 @@ def demo_runs() -> dict:
         "queue_oldest_at": None,
         "queue_oldest_seconds": None,
         "worker_alive": None,
+        "telemetry": {},
         "state": {
           "phase": "saved",
           "status": "off",
@@ -525,6 +564,7 @@ def demo_problems() -> dict:
         "scheduler": cluster["scheduler"],
       },
       demo_health()["stats"],
+      demo_runs()["runs"],
     ),
   }
 
@@ -553,7 +593,7 @@ def demo_run_detail(run_id: str, log_tail: int = 0) -> dict | None:
     "nodes": [],
     "scheduler": scheduler,
   }
-  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s, run.get("queue_oldest_seconds"))
+  diagnostics = run_diagnostics(run_id, run["state"], pods, queue_depth, k8s, run.get("queue_oldest_seconds"), run.get("telemetry"))
   diagnostics.extend(scheduler_run_diagnostics(workloads, ledgers, k8s))
   detail = {
     **run,

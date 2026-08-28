@@ -101,9 +101,18 @@ async def dashboard_problems(request: Request):
   if data.demo_mode_enabled():
     return demo.demo_problems()
   k8s = await asyncio.to_thread(data.k8s_snapshot)
-  checks = await data.health_checks(get_store(), k8s)
-  stats, _ = await data.operational_stats(get_store(), k8s, request.app.state.fft_worker_manager)
-  return {"demo": False, "problems": data.derive_problems(checks, k8s, stats)}
+  store = get_store()
+  try:
+    queues, launch = await asyncio.gather(store.queue_stats(), store.worker_launch_stats())
+  except Exception:
+    queues, launch = [], {"depth": 0, "oldest_enqueued_at": None, "oldest_age_seconds": None}
+  checks, runs, operational = await asyncio.gather(
+    data.health_checks(store, k8s),
+    data.runs_snapshot(store, request.app.state.fft_worker_manager, k8s["pods"], k8s.get("scheduler"), queues),
+    data.operational_stats(store, k8s, request.app.state.fft_worker_manager, queues, launch),
+  )
+  stats, _ = operational
+  return {"demo": False, "problems": data.derive_problems(checks, k8s, stats, runs["runs"])}
 
 
 @router.get("/pods/{pod}/logs")

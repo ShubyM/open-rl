@@ -104,6 +104,21 @@ function duration(seconds) {
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
+function latency(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  if (seconds < 1) return `${Math.round(seconds * 1000)}ms`;
+  if (seconds < 10) return `${seconds.toFixed(2)}s`;
+  return duration(seconds);
+}
+
+function compactNumber(value) {
+  if (!Number.isFinite(Number(value))) return "—";
+  const number = Number(value);
+  if (number === 0) return "0";
+  if (Math.abs(number) >= 1000 || Math.abs(number) < 0.001) return number.toExponential(2);
+  return Number(number.toPrecision(4)).toString();
+}
+
 // *** Theme ***
 
 function applyTheme(theme) {
@@ -751,6 +766,33 @@ function renderRunDetail(container, run, detail) {
     }
   }
 
+  const telemetrySection = el("div", "run-telemetry");
+  const telemetry = detail.telemetry || {};
+  if (telemetry.requests_completed) {
+    telemetrySection.append(el("div", "eyebrow", "Gateway request telemetry"));
+    const requestMetrics = el("div", "run-metrics");
+    const failures = telemetry.requests_failed || 0;
+    requestMetrics.append(
+      metric("Completed", String(telemetry.requests_completed), Object.entries(telemetry.operation_counts || {}).map(([op, count]) => `${op} ${count}`).join(" · ")),
+      metric("Failures", String(failures), `${((telemetry.failure_rate || 0) * 100).toFixed(1)}% of requests`),
+      metric("Last latency", latency(telemetry.last_latency_seconds), telemetry.last_operation || "request"),
+      metric("Mean latency", latency(telemetry.mean_latency_seconds), `max ${latency(telemetry.max_latency_seconds)}`)
+    );
+    telemetrySection.append(requestMetrics);
+
+    const latest = Object.entries(telemetry.latest_metrics || {}).sort(([a], [b]) => a.localeCompare(b));
+    if (latest.length) {
+      telemetrySection.append(el("div", "eyebrow", "Latest worker metrics"));
+      const workerMetrics = el("div", "run-metrics worker-metrics");
+      for (const [name, value] of latest) {
+        const points = telemetry.metric_series?.[name] || [];
+        const trend = points.length > 1 ? `${compactNumber(points[0].value)} → ${compactNumber(points.at(-1).value)} · ${points.length} samples` : `${points.length || 1} sample`;
+        workerMetrics.append(metric(name, compactNumber(value), trend));
+      }
+      telemetrySection.append(workerMetrics);
+    }
+  }
+
   const workloadSection = el("div", "run-workloads");
   if (detail.workloads?.length) {
     workloadSection.append(el("div", "eyebrow", "Scheduler placement"));
@@ -796,7 +838,7 @@ function renderRunDetail(container, run, detail) {
     if (detail.logs && Object.hasOwn(detail.logs, pod.name)) card.append(el("pre", "run-log-preview", detail.logs[pod.name] || "(no log output)"));
     podSection.append(card);
   }
-  container.replaceChildren(head, metrics, diagnostics, workloadSection, podSection);
+  container.replaceChildren(head, metrics, diagnostics, telemetrySection, workloadSection, podSection);
 }
 
 async function loadRunDetail(runId) {

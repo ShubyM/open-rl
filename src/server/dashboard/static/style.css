@@ -346,6 +346,10 @@ main { flex: 1; min-height: 0; display: flex; }
 .run-diagnostic-message { color: var(--muted); overflow-wrap: anywhere; }
 .run-diagnostic.warn .run-diagnostic-code { color: var(--warn); }
 .run-diagnostic.error .run-diagnostic-code { color: var(--error); }
+.run-telemetry { margin-bottom: 16px; }
+.run-telemetry:empty { display: none; }
+.run-telemetry .run-metrics { margin-top: 8px; }
+.worker-metrics .run-metric-value { font-size: 15px; }
 .run-workloads { margin-bottom: 16px; }
 .run-workloads:empty { display: none; }
 .run-workload-card { margin-top: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
