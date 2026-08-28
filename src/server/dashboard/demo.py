@@ -118,10 +118,23 @@ def demo_scheduler() -> dict:
 
 
 def demo_cluster() -> dict:
-  return {
+  snapshot = {
     "demo": True,
     "notice": DEMO_NOTICE,
-    "kubernetes": {"available": True, "namespace": "open-rl-demo", "error": None},
+    "kubernetes": {
+      "available": True,
+      "namespace": "open-rl-demo",
+      "error": None,
+      "metrics": {
+        "installed": True,
+        "available": True,
+        "error": None,
+        "pods_available": True,
+        "nodes_available": True,
+        "pods_observed": 5,
+        "nodes_observed": 5,
+      },
+    },
     "gateway": {
       "title": "open-rl gateway",
       "mode": "distributed",
@@ -293,6 +306,31 @@ def demo_cluster() -> dict:
       },
     ],
   }
+  node_usage = {
+    "demo-h100-node-1": (19.4, 148 * 2**30),
+    "demo-h100-node-2": (8.7, 96 * 2**30),
+    "demo-l4-node-1": (5.2, 34 * 2**30),
+    "demo-l4-node-2": (0.8, 9 * 2**30),
+    "demo-cpu-node-1": (0.43, 3 * 2**30),
+  }
+  for pool in snapshot["pools"]:
+    for node in pool["nodes"]:
+      cpu, memory = node_usage[node["name"]]
+      node["usage"] = {"cpu_cores": cpu, "memory_bytes": memory}
+  pod_usage = {
+    "open-rl-gateway-7f9c4": (0.35, 450 * 2**20),
+    "demo-redis-0": (0.08, 80 * 2**20),
+    "open-rl-trainer-demo-run-1": (6.4, 58 * 2**30),
+    "open-rl-sampler-demo-run-1": (3.1, 46 * 2**30),
+    "open-rl-sampler-demo-run-2": (0.2, 2 * 2**30),
+  }
+  for pod in snapshot["pods"]:
+    if pod["name"] in pod_usage:
+      cpu, memory = pod_usage[pod["name"]]
+      pod["usage"] = {"cpu_cores": cpu, "memory_bytes": memory}
+    else:
+      pod["usage"] = None
+  return snapshot
 
 
 def demo_runs() -> dict:
@@ -438,6 +476,13 @@ def demo_health() -> dict:
       },
       {"id": "visibility.events", "group": "Visibility", "label": "Pod events", "status": "ok", "detail": "4 recent events visible"},
       {
+        "id": "visibility.metrics",
+        "group": "Visibility",
+        "label": "Resource metrics",
+        "status": "ok",
+        "detail": "usage visible for 5 pods and 5 nodes",
+      },
+      {
         "id": "visibility.sampler",
         "group": "Visibility",
         "label": "vLLM sampler",
@@ -545,6 +590,26 @@ def demo_health() -> dict:
         "detail": "1 failed · 1 pending",
         "context": {"phase_counts": {"Running": 4, "Failed": 1, "Pending": 1}},
         "status": "warn",
+      },
+      {
+        "id": "cluster.cpu",
+        "label": "Cluster CPU",
+        "value": "34.53 cores",
+        "value_number": 34.53,
+        "unit": "cores",
+        "detail": "19% of 184.00 allocatable",
+        "context": {"allocatable_cores": 184.0, "utilization": 0.1877, "measured_nodes": 5},
+        "status": "ok",
+      },
+      {
+        "id": "cluster.memory",
+        "label": "Cluster memory",
+        "value": "290.0 GiB",
+        "value_number": 311385128960,
+        "unit": "bytes",
+        "detail": "22% of 1.3 TiB allocatable",
+        "context": {"allocatable_bytes": 1429365116108, "utilization": 0.2178, "measured_nodes": 5},
+        "status": "ok",
       },
       {
         "id": "gpus.claimed",

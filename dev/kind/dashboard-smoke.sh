@@ -42,6 +42,18 @@ curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/pods/${dashboard_pod}/logs?
   python3 -c 'import json,sys; assert "text" in json.load(sys.stdin)'
 kubectl --context "$CONTEXT" auth can-i delete pods --as system:serviceaccount:default:open-rl-dashboard | grep -Fxq yes
 kubectl --context "$CONTEXT" auth can-i list events --as system:serviceaccount:default:open-rl-dashboard | grep -Fxq yes
+
+# `kubectl auth can-i` requires API discovery, but vanilla Kind deliberately
+# has no Metrics Server. A SubjectAccessReview verifies the RBAC independently.
+assert_metrics_access() {
+  local resource=$1
+  local namespace=${2:-}
+  python3 -c 'import json,sys; print(json.dumps({"apiVersion":"authorization.k8s.io/v1","kind":"SubjectAccessReview","spec":{"user":"system:serviceaccount:default:open-rl-dashboard","resourceAttributes":{"namespace":sys.argv[2],"verb":"list","group":"metrics.k8s.io","resource":sys.argv[1]}}}))' "$resource" "$namespace" |
+    kubectl --context "$CONTEXT" create --raw /apis/authorization.k8s.io/v1/subjectaccessreviews -f - |
+    python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]["allowed"]'
+}
+assert_metrics_access pods default
+assert_metrics_access nodes
 if kubectl --context "$CONTEXT" logs deployment/open-rl-dashboard | grep -Fq "Building open-rl"; then
   echo "gateway performed an unexpected runtime package rebuild" >&2
   exit 1
@@ -58,6 +70,15 @@ assert snapshot["schema_version"] == 1, snapshot.get("schema_version")
 cluster = snapshot["cluster"]
 assert cluster["kubernetes"]["available"], cluster["kubernetes"]
 assert cluster["kubernetes"]["namespace"] == "default", cluster["kubernetes"]
+assert cluster["kubernetes"]["metrics"] == {
+  "installed": False,
+  "available": False,
+  "error": None,
+  "pods_available": False,
+  "nodes_available": False,
+  "pods_observed": 0,
+  "nodes_observed": 0,
+}, cluster["kubernetes"]["metrics"]
 assert cluster["pools"], "expected the Kind node in a cluster pool"
 assert any(pod["name"].startswith("open-rl-dashboard-") for pod in cluster["pods"]), cluster["pods"]
 assert cluster["scheduler"]["installed"] is False, cluster["scheduler"]
@@ -65,6 +86,7 @@ checks = {check["id"]: check for check in snapshot["health"]["checks"]}
 assert checks["kubernetes"]["status"] == "ok", checks["kubernetes"]
 assert checks["scheduler"]["status"] == "off", checks["scheduler"]
 assert checks["visibility.events"]["status"] == "ok", checks["visibility.events"]
+assert checks["visibility.metrics"]["status"] == "off", checks["visibility.metrics"]
 for stat in snapshot["health"]["stats"]:
   assert {"value_number", "unit", "context", "status"} <= stat.keys(), stat
 assert not snapshot["problems"]["problems"], snapshot["problems"]

@@ -55,7 +55,22 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertIsInstance(body["queues"], list)
 
   def test_snapshot_reads_kubernetes_once_and_bundles_triage_state(self) -> None:
-    k8s = {"available": True, "namespace": "test", "error": None, "pods": [], "nodes": []}
+    k8s = {
+      "available": True,
+      "namespace": "test",
+      "error": None,
+      "pods": [],
+      "nodes": [],
+      "metrics": {
+        "installed": True,
+        "available": True,
+        "error": None,
+        "pods_available": True,
+        "nodes_available": True,
+        "pods": {},
+        "nodes": {},
+      },
+    }
     with mock.patch.object(data, "k8s_snapshot", return_value=k8s) as snapshot:
       resp = self.client.get("/api/v1/dashboard/snapshot")
 
@@ -66,6 +81,18 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertIsNotNone(body["generated_at"])
     self.assertEqual({"cluster", "runs", "health", "problems"}, set(body) & {"cluster", "runs", "health", "problems"})
     self.assertEqual(body["cluster"]["kubernetes"]["namespace"], "test")
+    self.assertEqual(
+      body["cluster"]["kubernetes"]["metrics"],
+      {
+        "installed": True,
+        "available": True,
+        "error": None,
+        "pods_available": True,
+        "nodes_available": True,
+        "pods_observed": 0,
+        "nodes_observed": 0,
+      },
+    )
     self.assertIn("checks", body["health"])
     self.assertIn("problems", body["problems"])
     snapshot.assert_called_once_with()
@@ -500,6 +527,88 @@ class DashboardEndpointsTest(unittest.TestCase):
     volume_diagnostic = data.pod_diagnostic(volume, "open-rl")
     self.assertEqual(volume_diagnostic["code"], "pod.volume_mount")
     self.assertEqual(volume_diagnostic["evidence"]["events"][0]["count"], 3)
+
+  def test_metrics_server_quantities_become_numeric_usage(self) -> None:
+    class MetricsApi:
+      def list_namespaced_custom_object(self, *_args, **_kwargs):
+        return {
+          "items": [
+            {
+              "metadata": {"name": "trainer-a"},
+              "timestamp": "2026-08-28T20:00:00Z",
+              "window": "30s",
+              "containers": [
+                {"name": "trainer", "usage": {"cpu": "250m", "memory": "128Mi"}},
+                {"name": "sidecar", "usage": {"cpu": "50000000n", "memory": "64Mi"}},
+              ],
+            }
+          ]
+        }
+
+      def list_cluster_custom_object(self, *_args, **_kwargs):
+        return {"items": [{"metadata": {"name": "node-a"}, "usage": {"cpu": "1500m", "memory": "2Gi"}, "timestamp": "now", "window": "30s"}]}
+
+    with mock.patch.object(data, "k8s_custom_objects", return_value=(MetricsApi(), None)):
+      metrics = data.resource_metrics_snapshot("open-rl")
+
+    self.assertTrue(metrics["available"])
+    self.assertAlmostEqual(metrics["pods"]["trainer-a"]["cpu_cores"], 0.3)
+    self.assertEqual(metrics["pods"]["trainer-a"]["memory_bytes"], 192 * 2**20)
+    self.assertEqual(metrics["nodes"]["node-a"]["cpu_cores"], 1.5)
+    self.assertEqual(metrics["nodes"]["node-a"]["memory_bytes"], 2 * 2**30)
+
+  def test_metrics_server_preserves_partial_usage_and_explains_missing_scope(self) -> None:
+    class Forbidden(Exception):
+      status = 403
+
+    class MetricsApi:
+      def list_namespaced_custom_object(self, *_args, **_kwargs):
+        return {"items": [{"metadata": {"name": "trainer-a"}, "containers": [{"name": "trainer", "usage": {"cpu": "1", "memory": "1Gi"}}]}]}
+
+      def list_cluster_custom_object(self, *_args, **_kwargs):
+        raise Forbidden("nodes.metrics.k8s.io is forbidden")
+
+    with mock.patch.object(data, "k8s_custom_objects", return_value=(MetricsApi(), None)):
+      metrics = data.resource_metrics_snapshot("open-rl")
+
+    self.assertTrue(metrics["installed"])
+    self.assertTrue(metrics["available"])
+    self.assertTrue(metrics["pods_available"])
+    self.assertFalse(metrics["nodes_available"])
+    self.assertEqual(metrics["pods"]["trainer-a"]["memory_bytes"], 2**30)
+    self.assertIn("nodes.metrics.k8s.io is forbidden", metrics["error"])
+
+  def test_operational_stats_warn_on_measured_resource_pressure(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    k8s = {
+      "available": True,
+      "namespace": "open-rl",
+      "error": None,
+      "pods": [],
+      "nodes": [
+        {
+          "name": "node-a",
+          "ready": True,
+          "memory_pressure": False,
+          "disk_pressure": False,
+          "gpu_capacity": 0,
+          "cpu_allocatable_cores": 8.0,
+          "memory_allocatable_bytes": 16 * 2**30,
+          "usage": {"cpu_cores": 7.6, "memory_bytes": 15 * 2**30},
+        }
+      ],
+    }
+    stats, _ = asyncio.run(data.operational_stats(InMemoryStore(), k8s, None))
+    by_id = {stat["id"]: stat for stat in stats}
+
+    self.assertEqual(by_id["cluster.cpu"]["status"], "warn")
+    self.assertAlmostEqual(by_id["cluster.cpu"]["context"]["utilization"], 0.95)
+    self.assertEqual(by_id["cluster.memory"]["status"], "warn")
+    problems = data.derive_problems([], k8s, stats)
+    self.assertLessEqual({"metric.cluster_cpu", "metric.cluster_memory"}, {problem["code"] for problem in problems})
 
   def test_runs_with_unknown_created_at_sort_last(self) -> None:
     import asyncio

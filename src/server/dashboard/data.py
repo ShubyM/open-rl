@@ -102,6 +102,99 @@ def empty_scheduler_snapshot(*, installed: bool | None, error: str | None = None
   }
 
 
+def empty_resource_metrics(*, installed: bool | None, error: str | None = None) -> dict:
+  return {
+    "installed": installed,
+    "available": False,
+    "error": error,
+    "pods_available": False,
+    "nodes_available": False,
+    "pods": {},
+    "nodes": {},
+  }
+
+
+def quantity_number(value: Any) -> float:
+  if value in (None, ""):
+    return 0.0
+  from kubernetes.utils.quantity import parse_quantity
+
+  return float(parse_quantity(str(value)))
+
+
+def usage_values(usage: dict | None) -> dict:
+  usage = usage or {}
+  return {"cpu_cores": quantity_number(usage.get("cpu")), "memory_bytes": int(quantity_number(usage.get("memory")))}
+
+
+def resource_metrics_snapshot(namespace: str) -> dict:
+  api, err = k8s_custom_objects()
+  if api is None:
+    return empty_resource_metrics(installed=None, error=err)
+
+  with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    pods_future = executor.submit(
+      api.list_namespaced_custom_object,
+      "metrics.k8s.io",
+      "v1beta1",
+      namespace,
+      "pods",
+      _request_timeout=K8S_REQUEST_TIMEOUT,
+    )
+    nodes_future = executor.submit(
+      api.list_cluster_custom_object,
+      "metrics.k8s.io",
+      "v1beta1",
+      "nodes",
+      _request_timeout=K8S_REQUEST_TIMEOUT,
+    )
+    pod_error = node_error = None
+    try:
+      pod_items = pods_future.result().get("items", [])
+    except Exception as exc:
+      pod_items, pod_error = [], exc
+    try:
+      node_items = nodes_future.result().get("items", [])
+    except Exception as exc:
+      node_items, node_error = [], exc
+
+  if pod_error is not None and node_error is not None and getattr(pod_error, "status", None) == getattr(node_error, "status", None) == 404:
+    return empty_resource_metrics(installed=False)
+
+  pods = {}
+  for item in pod_items:
+    name = item.get("metadata", {}).get("name")
+    if not name:
+      continue
+    containers = {container["name"]: usage_values(container.get("usage")) for container in item.get("containers", []) if container.get("name")}
+    pods[name] = {
+      "cpu_cores": sum(container["cpu_cores"] for container in containers.values()),
+      "memory_bytes": sum(container["memory_bytes"] for container in containers.values()),
+      "containers": containers,
+      "timestamp": item.get("timestamp"),
+      "window": item.get("window"),
+    }
+  nodes = {}
+  for item in node_items:
+    name = item.get("metadata", {}).get("name")
+    if name:
+      nodes[name] = {**usage_values(item.get("usage")), "timestamp": item.get("timestamp"), "window": item.get("window")}
+  errors = []
+  if pod_error is not None:
+    errors.append(f"pod metrics failed: {pod_error}")
+  if node_error is not None:
+    errors.append(f"node metrics failed: {node_error}")
+  return {
+    "installed": True,
+    "available": pod_error is None or node_error is None,
+    "error": "; ".join(errors) or None,
+    "pods_available": pod_error is None,
+    "nodes_available": node_error is None,
+    "pods": pods,
+    "nodes": nodes,
+  }
+
+
 def scheduler_snapshot(namespace: str) -> dict:
   """Read the optional scheduler CRDs as unstructured objects. A missing CRD is a supported
   configuration, while RBAC or API failures remain visible diagnostic facts."""
@@ -398,6 +491,11 @@ def node_to_dict(node: Any) -> dict:
     "accelerator": labels.get("cloud.google.com/gke-accelerator") or labels.get("nvidia.com/gpu.product"),
     "gpu_capacity": int(capacity.get("nvidia.com/gpu", 0)),
     "gpu_allocatable": int(allocatable.get("nvidia.com/gpu", 0)),
+    "cpu_capacity_cores": quantity_number(capacity.get("cpu")),
+    "cpu_allocatable_cores": quantity_number(allocatable.get("cpu")),
+    "memory_capacity_bytes": int(quantity_number(capacity.get("memory"))),
+    "memory_allocatable_bytes": int(quantity_number(allocatable.get("memory"))),
+    "usage": None,
   }
 
 
@@ -412,6 +510,7 @@ def k8s_snapshot() -> dict:
       "error": err,
       "pods": [],
       "nodes": [],
+      "metrics": empty_resource_metrics(installed=None, error=err),
       "scheduler": empty_scheduler_snapshot(installed=None, error=err),
     }
   try:
@@ -424,9 +523,10 @@ def k8s_snapshot() -> dict:
       "error": error,
       "pods": [],
       "nodes": [],
+      "metrics": empty_resource_metrics(installed=None, error=error),
       "scheduler": empty_scheduler_snapshot(installed=None, error=error),
     }
-  with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
     nodes_future = executor.submit(api.list_node, _request_timeout=K8S_REQUEST_TIMEOUT)
     scheduler_future = executor.submit(scheduler_snapshot, namespace)
     events_future = executor.submit(
@@ -436,6 +536,7 @@ def k8s_snapshot() -> dict:
       limit=200,
       _request_timeout=K8S_REQUEST_TIMEOUT,
     )
+    metrics_future = executor.submit(resource_metrics_snapshot, namespace)
     try:
       nodes = [node_to_dict(n) for n in nodes_future.result().items]
     except Exception:
@@ -450,11 +551,18 @@ def k8s_snapshot() -> dict:
       events = [event_to_dict(event) for event in events_future.result().items]
     except Exception as exc:
       events, events_error = [], f"event list failed: {exc}"
+    try:
+      metrics = metrics_future.result()
+    except Exception as exc:
+      metrics = empty_resource_metrics(installed=True, error=f"resource metrics snapshot failed: {exc}")
   events_by_pod: dict[str, list[dict]] = {}
   for event in events:
     events_by_pod.setdefault(event["pod_name"], []).append(event)
   for pod in pods:
     pod["events"] = sorted(events_by_pod.get(pod["name"], []), key=lambda event: event["last_seen_at"] or "")[-10:]
+    pod["usage"] = metrics["pods"].get(pod["name"])
+  for node in nodes:
+    node["usage"] = metrics["nodes"].get(node["name"])
   return {
     "available": True,
     "namespace": namespace,
@@ -462,6 +570,7 @@ def k8s_snapshot() -> dict:
     "pods": pods,
     "nodes": nodes,
     "events_error": events_error,
+    "metrics": metrics,
     "scheduler": scheduler,
   }
 
@@ -625,7 +734,24 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
     pool_id = node["accelerator"] or ("gpu" if node["gpu_capacity"] else "cpu")
     pool = pools.setdefault(pool_id, {"id": pool_id, "label": pool_id, "nodes": []})
     pool["nodes"].append(
-      {**{k: node[k] for k in ("name", "ready", "instance_type", "gpu_capacity", "gpu_allocatable")}, "pods": pods_by_node.get(node["name"], [])}
+      {
+        **{
+          k: node.get(k)
+          for k in (
+            "name",
+            "ready",
+            "instance_type",
+            "gpu_capacity",
+            "gpu_allocatable",
+            "cpu_capacity_cores",
+            "cpu_allocatable_cores",
+            "memory_capacity_bytes",
+            "memory_allocatable_bytes",
+            "usage",
+          )
+        },
+        "pods": pods_by_node.get(node["name"], []),
+      }
     )
   duty_tracker.record(list(pools.values()), k8s["pods"])
   for pool in pools.values():
@@ -641,9 +767,23 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
       "nodes": [{"name": "—", "ready": None, "instance_type": None, "gpu_capacity": 0, "gpu_allocatable": 0, "pods": unplaced}],
     }
 
+  metrics = k8s.get("metrics") or empty_resource_metrics(installed=None)
   return {
     "demo": False,
-    "kubernetes": {"available": k8s["available"], "namespace": k8s["namespace"], "error": k8s["error"]},
+    "kubernetes": {
+      "available": k8s["available"],
+      "namespace": k8s["namespace"],
+      "error": k8s["error"],
+      "metrics": {
+        "installed": metrics["installed"],
+        "available": metrics["available"],
+        "error": metrics["error"],
+        "pods_available": metrics["pods_available"],
+        "nodes_available": metrics["nodes_available"],
+        "pods_observed": len(metrics["pods"]),
+        "nodes_observed": len(metrics["nodes"]),
+      },
+    },
     "gateway": gateway_card,
     "scheduler": k8s.get("scheduler") or empty_scheduler_snapshot(installed=None),
     "services": services,
@@ -1488,6 +1628,38 @@ async def operational_stats(
           status="warn" if ratio > 1 else "ok",
         )
       )
+    measured_nodes = [node for node in k8s["nodes"] if node.get("usage")]
+    if measured_nodes:
+      cpu_used = sum(node["usage"]["cpu_cores"] for node in measured_nodes)
+      cpu_available = sum(node.get("cpu_allocatable_cores") or 0 for node in measured_nodes)
+      cpu_ratio = cpu_used / cpu_available if cpu_available else None
+      stats.append(
+        stat_entry(
+          "cluster.cpu",
+          "Cluster CPU",
+          f"{cpu_used:.2f} cores",
+          f"{cpu_ratio:.0%} of {cpu_available:.2f} allocatable" if cpu_ratio is not None else "Metrics Server usage",
+          value_number=cpu_used,
+          unit="cores",
+          context={"allocatable_cores": cpu_available or None, "utilization": cpu_ratio, "measured_nodes": len(measured_nodes)},
+          status="warn" if cpu_ratio is not None and cpu_ratio >= 0.9 else "ok",
+        )
+      )
+      memory_used = sum(node["usage"]["memory_bytes"] for node in measured_nodes)
+      memory_available = sum(node.get("memory_allocatable_bytes") or 0 for node in measured_nodes)
+      memory_ratio = memory_used / memory_available if memory_available else None
+      stats.append(
+        stat_entry(
+          "cluster.memory",
+          "Cluster memory",
+          format_bytes(memory_used),
+          f"{memory_ratio:.0%} of {format_bytes(memory_available)} allocatable" if memory_ratio is not None else "Metrics Server usage",
+          value_number=memory_used,
+          unit="bytes",
+          context={"allocatable_bytes": memory_available or None, "utilization": memory_ratio, "measured_nodes": len(measured_nodes)},
+          status="warn" if memory_ratio is not None and memory_ratio >= 0.9 else "ok",
+        )
+      )
     scheduler = k8s.get("scheduler") or {}
     if scheduler.get("available"):
       summary = scheduler["summary"]
@@ -1562,6 +1734,25 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
     else:
       event_count = sum(len(pod.get("events") or []) for pod in k8s["pods"])
       checks.append(check_entry("visibility.events", "Visibility", "Pod events", "ok", f"{event_count} recent events visible"))
+    metrics = k8s.get("metrics") or empty_resource_metrics(installed=None)
+    if metrics["installed"] is False:
+      checks.append(check_entry("visibility.metrics", "Visibility", "Resource metrics", "off", "metrics.k8s.io is not installed"))
+    elif metrics["available"]:
+      status = "warn" if metrics["error"] else "ok"
+      detail = f"usage visible for {len(metrics['pods'])} pods and {len(metrics['nodes'])} nodes"
+      if metrics["error"]:
+        detail += f"; {metrics['error']}"
+      checks.append(
+        check_entry(
+          "visibility.metrics",
+          "Visibility",
+          "Resource metrics",
+          status,
+          detail,
+        )
+      )
+    elif metrics["installed"] is True:
+      checks.append(check_entry("visibility.metrics", "Visibility", "Resource metrics", "warn", metrics["error"] or "metrics.k8s.io unavailable"))
   else:
     status = "off" if "not installed" in (k8s["error"] or "") or "credentials" in (k8s["error"] or "") else "error"
     checks.append(check_entry("kubernetes", "Kubernetes", "API server", status, k8s["error"] or "unavailable"))
@@ -1609,6 +1800,8 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
         actions.append({"label": "Verify pod visibility", "command": f"kubectl auth can-i list pods -n {k8s['namespace']}"})
       elif check["id"] == "visibility.events":
         actions.append({"label": "Verify event visibility", "command": f"kubectl auth can-i list events -n {k8s['namespace']}"})
+      elif check["id"] == "visibility.metrics":
+        actions.append({"label": "Verify Metrics API visibility", "command": f"kubectl auth can-i list pods.metrics.k8s.io -n {k8s['namespace']}"})
       problems.append(
         diagnostic_entry(
           f"check.{check['id']}",
@@ -1620,7 +1813,7 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
           actions=actions,
         )
       )
-  alerting_stats = {"queue.request_age", "queue.launch_age", "redis.memory", "storage.disk"}
+  alerting_stats = {"queue.request_age", "queue.launch_age", "redis.memory", "storage.disk", "cluster.cpu", "cluster.memory"}
   for stat in stats or []:
     if stat["status"] != "warn" or stat["id"] not in alerting_stats:
       continue

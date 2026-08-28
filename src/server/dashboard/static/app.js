@@ -119,6 +119,18 @@ function compactNumber(value) {
   return Number(number.toPrecision(4)).toString();
 }
 
+function bytes(value) {
+  if (!Number.isFinite(Number(value))) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let amount = Number(value);
+  let unit = 0;
+  while (Math.abs(amount) >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
+}
+
 // *** Theme ***
 
 function applyTheme(theme) {
@@ -472,7 +484,8 @@ function renderPool() {
       setText(row.querySelector(".pool-node-gpus"), node.gpu_capacity ? `${node.gpu_allocatable}/${node.gpu_capacity} GPU` : "");
       const meta = row.querySelector(".pool-node-meta");
       const pods = `${node.pods.length} pod${node.pods.length === 1 ? "" : "s"}`;
-      meta.replaceChildren(el("span", "", [node.instance_type, pods].filter(Boolean).join(" · ")));
+      const usage = node.usage ? `${compactNumber(node.usage.cpu_cores)} CPU · ${bytes(node.usage.memory_bytes)}` : null;
+      meta.replaceChildren(el("span", "", [node.instance_type, pods, usage].filter(Boolean).join(" · ")));
       if (node.ready === false) meta.append(" ", el("span", "bad", "not ready"));
     }
   );
@@ -584,6 +597,7 @@ function renderCluster(data) {
           const bits = [];
           if (node.instance_type) bits.push(node.instance_type);
           if (node.gpu_capacity) bits.push(`${node.gpu_allocatable}/${node.gpu_capacity} GPU`);
+          if (node.usage) bits.push(`${compactNumber(node.usage.cpu_cores)} CPU · ${bytes(node.usage.memory_bytes)}`);
           meta.replaceChildren(el("span", "", bits.join(" · ")));
           if (node.ready === false) meta.append(" ", el("span", "bad", "not ready"));
           sync(
@@ -747,6 +761,9 @@ function renderRunDetail(container, run, detail) {
   const claims = Object.entries(detail.gpu_claims || {});
   const claimsText = claims.length ? claims.map(([pool, count]) => `${count} on ${pool}`).join(" · ") : "none visible";
   const metrics = el("div", "run-metrics");
+  const measuredPods = (detail.pods || []).filter((pod) => pod.usage);
+  const cpuUsage = measuredPods.reduce((total, pod) => total + pod.usage.cpu_cores, 0);
+  const memoryUsage = measuredPods.reduce((total, pod) => total + pod.usage.memory_bytes, 0);
   const workloadPhases = Object.entries(detail.state?.workload_phase_counts || {}).map(([phase, count]) => `${count} ${phase}`).join(" · ") || "none";
   metrics.append(
     metric("Queue", String(detail.queue_depth || 0), detail.queue_depth ? `oldest waiting ${duration(detail.queue_oldest_seconds)}` : "requests"),
@@ -755,6 +772,10 @@ function renderRunDetail(container, run, detail) {
     metric("Workloads", String(detail.workloads?.length || 0), workloadPhases),
     metric("Sources", String(detail.sources?.length || 0), (detail.sources || []).join(" · ") || "none")
   );
+  if (measuredPods.length) {
+    metrics.append(metric("CPU usage", `${compactNumber(cpuUsage)} cores`, `${measuredPods.length} measured pod${measuredPods.length === 1 ? "" : "s"}`));
+    metrics.append(metric("Memory usage", bytes(memoryUsage), "Metrics Server working set"));
+  }
 
   const diagnostics = el("div", "run-diagnostics");
   if (detail.diagnostics?.length) {
@@ -1108,6 +1129,8 @@ function updatePanel() {
       { k: "app", v: pod.app || "—" },
       { k: "ready", v: pod.ready },
       { k: "restarts", v: String(pod.restarts) },
+      { k: "cpu", v: pod.usage ? `${compactNumber(pod.usage.cpu_cores)} cores` : "—" },
+      { k: "memory", v: pod.usage ? bytes(pod.usage.memory_bytes) : "—" },
       { k: "created", v: pod.created_at ? `${relTime(pod.created_at)}` : "—" },
     ],
     (r) => r.k,

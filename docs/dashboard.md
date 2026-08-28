@@ -34,7 +34,7 @@ experiment analysis; nothing here duplicates metrics.
   process, queued work, or labeled pods).
 - **Health** — current problems first, then a **Load** section of measured stats (active runs, queued
   requests per run, oldest request and worker-launch wait, Redis memory and clients, gateway RSS, disk free, pod and
-  GPU totals, scheduler workload phases, and ClaimLedger seats), then gateway / storage / Kubernetes /
+  GPU totals, optional Metrics Server CPU/memory usage, scheduler workload phases, and ClaimLedger seats), then gateway / storage / Kubernetes /
   scheduler / visibility checks. Node `MemoryPressure` and `DiskPressure` conditions surface under
   Problems. Failed or slow placement, stale observed generations, assignment/seat mismatches, and stale
   ClaimLedger seats include exact `kubectl` inspection commands.
@@ -92,7 +92,11 @@ left running for inspection; remove it with `make kind-dashboard-clean`.
   is skipped when denied; fetching pod logs from the gateway's service account requires the `pods/log`
   verb. One bounded namespaced Event list is fetched alongside nodes and scheduler state; `events`
   read permission is included in the supplied manifests, and missing permission is an actionable
-  visibility warning rather than a snapshot failure.
+  visibility warning rather than a snapshot failure. When `metrics.k8s.io` is installed, pod and node
+  CPU cores and memory working-set bytes are joined into the same snapshot and shown in run, pod, node,
+  and Health views. A missing Metrics Server is reported as an optional feature being off; the dashboard
+  snapshot also exposes per-scope availability and observed-object counts so automation can distinguish
+  absent, partial, and empty telemetry. The dashboard never substitutes requests or limits for utilization.
 - **Scheduler placement** is read directly from optional namespaced `Workload` and `ClaimLedger` CRDs.
   Run inspection joins them by exact `spec.modelId`, showing requested accelerator memory, placement
   phase and reason, chosen claim/node/device count, and ledger seat count. The gateway service account
