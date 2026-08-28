@@ -606,6 +606,15 @@ def node_to_dict(node: Any) -> dict:
   }
 
 
+def measured_call(func: Any, *args: Any, **kwargs: Any) -> tuple[Any, Exception | None, float]:
+  """Run one blocking observation and return its result, error, and elapsed milliseconds."""
+  started = time.perf_counter()
+  try:
+    return func(*args, **kwargs), None, round((time.perf_counter() - started) * 1000, 3)
+  except Exception as exc:
+    return None, exc, round((time.perf_counter() - started) * 1000, 3)
+
+
 def _collect_k8s_snapshot() -> dict:
   """List pods in our namespace and (when RBAC allows) cluster nodes. Blocking; call in a thread."""
   api, err = k8s_core_v1()
@@ -620,10 +629,10 @@ def _collect_k8s_snapshot() -> dict:
       "metrics": empty_resource_metrics(installed=None, error=err),
       "scheduler": empty_scheduler_snapshot(installed=None, error=err),
     }
-  try:
-    pods = [pod_to_dict(p) for p in api.list_namespaced_pod(namespace, _request_timeout=K8S_REQUEST_TIMEOUT).items]
-  except Exception as exc:
-    error = f"pod list failed: {exc}"
+  pod_list, pod_error, pod_ms = measured_call(api.list_namespaced_pod, namespace, _request_timeout=K8S_REQUEST_TIMEOUT)
+  component_ms = {"pods": pod_ms}
+  if pod_error is not None:
+    error = f"pod list failed: {pod_error}"
     return {
       "available": False,
       "namespace": namespace,
@@ -632,36 +641,45 @@ def _collect_k8s_snapshot() -> dict:
       "nodes": [],
       "metrics": empty_resource_metrics(installed=None, error=error),
       "scheduler": empty_scheduler_snapshot(installed=None, error=error),
+      "_component_ms": component_ms,
     }
+  pods = [pod_to_dict(p) for p in pod_list.items]
   with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-    nodes_future = executor.submit(api.list_node, _request_timeout=K8S_REQUEST_TIMEOUT)
-    scheduler_future = executor.submit(scheduler_snapshot, namespace)
+    nodes_future = executor.submit(measured_call, api.list_node, _request_timeout=K8S_REQUEST_TIMEOUT)
+    scheduler_future = executor.submit(measured_call, scheduler_snapshot, namespace)
     events_future = executor.submit(
+      measured_call,
       api.list_namespaced_event,
       namespace,
       field_selector="involvedObject.kind=Pod",
       limit=200,
       _request_timeout=K8S_REQUEST_TIMEOUT,
     )
-    metrics_future = executor.submit(resource_metrics_snapshot, namespace)
-    try:
-      nodes = [node_to_dict(n) for n in nodes_future.result().items]
-    except Exception:
+    metrics_future = executor.submit(measured_call, resource_metrics_snapshot, namespace)
+
+    node_list, node_error, component_ms["nodes"] = nodes_future.result()
+    if node_error is not None:
       # Namespaced service accounts often cannot list nodes; pods alone are still useful.
       nodes = []
-    try:
-      scheduler = scheduler_future.result()
-    except Exception as exc:
-      scheduler = empty_scheduler_snapshot(installed=True, error=f"scheduler snapshot failed: {exc}")
-    events_error = None
-    try:
-      events = [event_to_dict(event) for event in events_future.result().items]
-    except Exception as exc:
-      events, events_error = [], f"event list failed: {exc}"
-    try:
-      metrics = metrics_future.result()
-    except Exception as exc:
-      metrics = empty_resource_metrics(installed=True, error=f"resource metrics snapshot failed: {exc}")
+      nodes_error = f"node list failed: {node_error}"
+    else:
+      nodes = [node_to_dict(n) for n in node_list.items]
+      nodes_error = None
+
+    scheduler, scheduler_error, component_ms["scheduler"] = scheduler_future.result()
+    if scheduler_error is not None:
+      scheduler = empty_scheduler_snapshot(installed=True, error=f"scheduler snapshot failed: {scheduler_error}")
+
+    event_list, event_error, component_ms["events"] = events_future.result()
+    if event_error is not None:
+      events, events_error = [], f"event list failed: {event_error}"
+    else:
+      events = [event_to_dict(event) for event in event_list.items]
+      events_error = None
+
+    metrics, metrics_error, component_ms["metrics"] = metrics_future.result()
+    if metrics_error is not None:
+      metrics = empty_resource_metrics(installed=True, error=f"resource metrics snapshot failed: {metrics_error}")
   events_by_pod: dict[str, list[dict]] = {}
   for event in events:
     events_by_pod.setdefault(event["pod_name"], []).append(event)
@@ -676,9 +694,11 @@ def _collect_k8s_snapshot() -> dict:
     "error": None,
     "pods": pods,
     "nodes": nodes,
+    "nodes_error": nodes_error,
     "events_error": events_error,
     "metrics": metrics,
     "scheduler": scheduler,
+    "_component_ms": component_ms,
   }
 
 
@@ -715,7 +735,8 @@ class K8sObservationCache:
         }
 
       started = time.perf_counter()
-      snapshot = _collect_k8s_snapshot()
+      snapshot = dict(_collect_k8s_snapshot())
+      component_ms = snapshot.pop("_component_ms", {})
       completed = time.time()
       self._observed_monotonic = time.monotonic()
       self._snapshot = {
@@ -723,6 +744,7 @@ class K8sObservationCache:
         "observation": {
           "observed_at": iso_timestamp(completed),
           "collection_ms": round((time.perf_counter() - started) * 1000, 3),
+          "components_ms": component_ms,
           "source": "live",
           "age_seconds": 0.0,
         },
@@ -937,6 +959,7 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
       "available": k8s["available"],
       "namespace": k8s["namespace"],
       "error": k8s["error"],
+      "nodes_error": k8s.get("nodes_error"),
       "observation": k8s.get("observation"),
       "metrics": {
         "installed": metrics["installed"],
@@ -1789,6 +1812,33 @@ async def operational_stats(
     ),
     *redis_stats,
   ]
+  if observation := k8s.get("observation"):
+    collection_ms = observation["collection_ms"]
+    components_ms = observation.get("components_ms") or {}
+    slowest_component = max(components_ms, key=components_ms.get) if components_ms else None
+    warn_after_ms = float(os.getenv("OPEN_RL_K8S_WARN_MS", "1000"))
+    detail = f"{observation['source']} observation"
+    if slowest_component is not None:
+      detail += f" · slowest {slowest_component} {components_ms[slowest_component]:.1f} ms"
+    stats.append(
+      stat_entry(
+        "kubernetes.collection",
+        "Kubernetes collection",
+        f"{collection_ms:.1f} ms",
+        detail,
+        value_number=collection_ms,
+        unit="milliseconds",
+        context={
+          "source": observation["source"],
+          "age_seconds": observation["age_seconds"],
+          "observed_at": observation["observed_at"],
+          "components_ms": components_ms,
+          "slowest_component": slowest_component,
+          "warn_after_ms": warn_after_ms,
+        },
+        status="warn" if collection_ms >= warn_after_ms else "ok",
+      )
+    )
   rss = gateway_rss_bytes()
   if rss is not None:
     stats.append(stat_entry("gateway.rss", "Gateway memory", format_bytes(rss), "resident set size", value_number=rss, unit="bytes"))
@@ -2000,6 +2050,10 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
     if observation := k8s.get("observation"):
       detail += f" · {observation['source']} observation collected in {observation['collection_ms']:.1f} ms"
     checks.append(check_entry("kubernetes", "Kubernetes", "API server", "ok", detail))
+    if nodes_error := k8s.get("nodes_error"):
+      checks.append(check_entry("visibility.nodes", "Visibility", "Cluster nodes", "warn", nodes_error))
+    else:
+      checks.append(check_entry("visibility.nodes", "Visibility", "Cluster nodes", "ok", f"{len(k8s['nodes'])} nodes visible"))
     if event_error := k8s.get("events_error"):
       checks.append(check_entry("visibility.events", "Visibility", "Pod events", "warn", event_error))
     else:
@@ -2071,6 +2125,8 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
         actions.append({"label": "Verify pod visibility", "command": f"kubectl auth can-i list pods -n {k8s['namespace']}"})
       elif check["id"] == "visibility.events":
         actions.append({"label": "Verify event visibility", "command": f"kubectl auth can-i list events -n {k8s['namespace']}"})
+      elif check["id"] == "visibility.nodes":
+        actions.append({"label": "Verify node visibility", "command": "kubectl auth can-i list nodes"})
       elif check["id"] == "visibility.metrics":
         actions.append({"label": "Verify Metrics API visibility", "command": f"kubectl auth can-i list pods.metrics.k8s.io -n {k8s['namespace']}"})
       problems.append(
@@ -2093,6 +2149,7 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
     "cluster.memory",
     "cluster.cpu_requests",
     "cluster.memory_requests",
+    "kubernetes.collection",
   }
   for stat in stats or []:
     if stat["status"] != "warn" or stat["id"] not in alerting_stats:
@@ -2105,6 +2162,15 @@ def derive_problems(checks: list[dict], k8s: dict, stats: list[dict] | None = No
           "method": "GET",
           "path": f"/api/v1/dashboard/runs/{model_id}",
           "command": f"make ops run {model_id}",
+        }
+      )
+    elif stat["id"] == "kubernetes.collection":
+      actions.append(
+        {
+          "label": "Inspect Kubernetes observation",
+          "method": "GET",
+          "path": "/api/v1/dashboard/cluster",
+          "command": "make ops inspect",
         }
       )
     problems.append(

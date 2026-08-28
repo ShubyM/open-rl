@@ -44,7 +44,9 @@ The page polls one coherent snapshot every 8 seconds and updates in place — ca
 and open log panels survive refreshes. A refresh lists Kubernetes state once, so every view describes the
 same observation while avoiding redundant API-server work. Observations are single-flight cached for one
 second across browser tabs, focused API calls, and agents; every response says whether the observation was
-live or cached, its age, and collection latency. Set `OPEN_RL_K8S_CACHE_SECONDS=0` to disable that cache.
+live or cached, its age, total collection latency, and the pod/node/event/scheduler/metrics timing breakdown.
+Collections slower than one second become a warning; tune that with `OPEN_RL_K8S_WARN_MS`. Set
+`OPEN_RL_K8S_CACHE_SECONDS=0` to disable the cache.
 Manual refresh and a light/dark toggle are in
 the top bar. The top bar and gateway card show the exact image build revision; pod inspection includes
 the runtime image digest, so an agent can prove a rebuilt fix is actually deployed rather than trusting a tag.

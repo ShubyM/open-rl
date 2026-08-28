@@ -128,6 +128,7 @@ def demo_cluster() -> dict:
       "observation": {
         "observed_at": "2026-07-29T09:00:00+00:00",
         "collection_ms": 18.4,
+        "components_ms": {"pods": 8.1, "nodes": 3.2, "events": 4.6, "scheduler": 5.4, "metrics": 2.8},
         "source": "live",
         "age_seconds": 0,
       },

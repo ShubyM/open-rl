@@ -113,7 +113,14 @@ class DashboardEndpointsTest(unittest.TestCase):
       with calls_lock:
         calls += 1
       time.sleep(0.05)
-      return {"available": True, "namespace": "test", "error": None, "pods": [], "nodes": []}
+      return {
+        "available": True,
+        "namespace": "test",
+        "error": None,
+        "pods": [],
+        "nodes": [],
+        "_component_ms": {"pods": 30.0, "nodes": 20.0},
+      }
 
     def observe() -> dict:
       ready.wait()
@@ -131,10 +138,38 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual([item["source"] for item in observations].count("live"), 1)
     self.assertEqual([item["source"] for item in observations].count("cache"), workers - 1)
     self.assertEqual(len({item["observed_at"] for item in observations}), 1)
+    self.assertTrue(all(item["components_ms"] == {"pods": 30.0, "nodes": 20.0} for item in observations))
     self.assertTrue(all(item["collection_ms"] >= 50 for item in observations))
     self.assertTrue(all(item["age_seconds"] >= 0 for item in observations))
     self.assertEqual(forced["source"], "live")
     self.assertEqual(forced["age_seconds"], 0)
+
+  def test_kubernetes_collection_records_component_latency_and_node_visibility_failure(self) -> None:
+    from types import SimpleNamespace as NS
+
+    class CoreApi:
+      def list_namespaced_pod(self, *_args, **_kwargs):
+        return NS(items=[])
+
+      def list_node(self, **_kwargs):
+        raise PermissionError("nodes is forbidden")
+
+      def list_namespaced_event(self, *_args, **_kwargs):
+        return NS(items=[])
+
+    metrics = data.empty_resource_metrics(installed=False)
+    scheduler = data.empty_scheduler_snapshot(installed=False)
+    with (
+      mock.patch.object(data, "k8s_core_v1", return_value=(CoreApi(), None)),
+      mock.patch.object(data, "scheduler_snapshot", return_value=scheduler),
+      mock.patch.object(data, "resource_metrics_snapshot", return_value=metrics),
+    ):
+      observed = data._collect_k8s_snapshot()
+
+    self.assertTrue(observed["available"], "pod visibility keeps the namespaced observation usable")
+    self.assertIn("nodes is forbidden", observed["nodes_error"])
+    self.assertEqual(set(observed["_component_ms"]), {"pods", "nodes", "events", "scheduler", "metrics"})
+    self.assertTrue(all(value >= 0 for value in observed["_component_ms"].values()))
 
   def test_snapshot_reads_each_queue_observation_once(self) -> None:
     import asyncio
@@ -526,6 +561,37 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertEqual(gpu["unit"], "devices")
     self.assertEqual(gpu["context"], {"capacity_devices": 1, "allocation_ratio": 2.0, "overcommitted": True})
     self.assertEqual(gpu["status"], "warn")
+
+  def test_slow_kubernetes_collection_is_a_numeric_actionable_problem(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    k8s = {
+      "available": True,
+      "namespace": "open-rl",
+      "error": None,
+      "pods": [],
+      "nodes": [],
+      "observation": {
+        "observed_at": "2026-08-28T20:00:00+00:00",
+        "collection_ms": 1250.0,
+        "components_ms": {"pods": 40.0, "nodes": 55.0, "events": 1200.0, "scheduler": 60.0, "metrics": 80.0},
+        "source": "cache",
+        "age_seconds": 0.2,
+      },
+    }
+    with mock.patch.dict(os.environ, {"OPEN_RL_K8S_WARN_MS": "1000"}):
+      stats, _ = asyncio.run(data.operational_stats(InMemoryStore(), k8s, None))
+
+    collection = next(stat for stat in stats if stat["id"] == "kubernetes.collection")
+    self.assertEqual(collection["status"], "warn")
+    self.assertEqual(collection["value_number"], 1250.0)
+    self.assertEqual(collection["unit"], "milliseconds")
+    self.assertEqual(collection["context"]["slowest_component"], "events")
+    problem = next(problem for problem in data.derive_problems([], k8s, stats) if problem["code"] == "metric.kubernetes_collection")
+    self.assertEqual(problem["evidence"]["components_ms"]["events"], 1200.0)
+    self.assertEqual(problem["actions"][1]["command"], "make ops inspect")
 
   def test_problems_have_stable_codes_evidence_and_next_actions(self) -> None:
     checks = [{"id": "storage.shared", "group": "Storage", "label": "Shared filesystem", "status": "warn", "detail": "/tmp missing"}]

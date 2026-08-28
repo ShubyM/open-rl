@@ -84,6 +84,9 @@ observation = cluster["kubernetes"]["observation"]
 assert observation["source"] == "live", observation
 assert observation["age_seconds"] == 0, observation
 assert observation["collection_ms"] >= 0, observation
+assert set(observation["components_ms"]) == {"pods", "nodes", "events", "scheduler", "metrics"}, observation
+assert all(value >= 0 for value in observation["components_ms"].values()), observation
+assert cluster["kubernetes"]["nodes_error"] is None, cluster["kubernetes"]
 assert cluster["gateway"]["build"]["revision"] == sys.argv[2], cluster["gateway"]["build"]
 assert cluster["kubernetes"]["metrics"] == {
   "installed": False,
@@ -109,6 +112,8 @@ assert checks["scheduler"]["status"] == "off", checks["scheduler"]
 assert checks["visibility.events"]["status"] == "ok", checks["visibility.events"]
 assert checks["visibility.metrics"]["status"] == "off", checks["visibility.metrics"]
 stats = {stat["id"]: stat for stat in snapshot["health"]["stats"]}
+assert stats["kubernetes.collection"]["value_number"] == observation["collection_ms"], stats["kubernetes.collection"]
+assert stats["kubernetes.collection"]["unit"] == "milliseconds", stats["kubernetes.collection"]
 assert stats["cluster.cpu_requests"]["value_number"] == 0.1, stats["cluster.cpu_requests"]
 assert stats["cluster.memory_requests"]["value_number"] == 128 * 2**20, stats["cluster.memory_requests"]
 assert "cluster.cpu" not in stats, "requests must not be mislabeled as measured usage"
