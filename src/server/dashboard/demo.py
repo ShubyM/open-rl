@@ -125,6 +125,12 @@ def demo_cluster() -> dict:
       "available": True,
       "namespace": "open-rl-demo",
       "error": None,
+      "observation": {
+        "observed_at": "2026-07-29T09:00:00+00:00",
+        "collection_ms": 18.4,
+        "source": "live",
+        "age_seconds": 0,
+      },
       "metrics": {
         "installed": True,
         "available": True,

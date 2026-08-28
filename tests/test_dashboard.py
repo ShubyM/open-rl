@@ -1,7 +1,10 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -96,6 +99,42 @@ class DashboardEndpointsTest(unittest.TestCase):
     self.assertIn("checks", body["health"])
     self.assertIn("problems", body["problems"])
     snapshot.assert_called_once_with()
+
+  def test_kubernetes_observation_cache_coalesces_concurrent_reads_and_forces_refresh(self) -> None:
+    workers = 8
+    calls = 0
+    calls_lock = threading.Lock()
+    ready = threading.Barrier(workers)
+    data.k8s_observation_cache.clear()
+    self.addCleanup(data.k8s_observation_cache.clear)
+
+    def collect() -> dict:
+      nonlocal calls
+      with calls_lock:
+        calls += 1
+      time.sleep(0.05)
+      return {"available": True, "namespace": "test", "error": None, "pods": [], "nodes": []}
+
+    def observe() -> dict:
+      ready.wait()
+      return data.k8s_snapshot()["observation"]
+
+    with (
+      mock.patch.dict(os.environ, {"OPEN_RL_K8S_CACHE_SECONDS": "5"}),
+      mock.patch.object(data, "_collect_k8s_snapshot", side_effect=collect),
+    ):
+      with ThreadPoolExecutor(max_workers=workers) as executor:
+        observations = list(executor.map(lambda _index: observe(), range(workers)))
+      forced = data.k8s_snapshot(force=True)["observation"]
+
+    self.assertEqual(calls, 2, "one concurrent collection plus one explicit refresh")
+    self.assertEqual([item["source"] for item in observations].count("live"), 1)
+    self.assertEqual([item["source"] for item in observations].count("cache"), workers - 1)
+    self.assertEqual(len({item["observed_at"] for item in observations}), 1)
+    self.assertTrue(all(item["collection_ms"] >= 50 for item in observations))
+    self.assertTrue(all(item["age_seconds"] >= 0 for item in observations))
+    self.assertEqual(forced["source"], "live")
+    self.assertEqual(forced["age_seconds"], 0)
 
   def test_snapshot_reads_each_queue_observation_once(self) -> None:
     import asyncio
@@ -298,6 +337,40 @@ class DashboardEndpointsTest(unittest.TestCase):
     metadata = asyncio.run(store.list_model_metadata())["run-stop"]
     self.assertEqual(metadata["status"], "stopped")
     self.assertIn("stopped_at", metadata)
+
+  def test_stop_forces_fresh_pod_discovery_and_invalidates_the_observation(self) -> None:
+    import asyncio
+
+    from server.store import InMemoryStore
+
+    class CoreApi:
+      def __init__(self) -> None:
+        self.deleted = []
+
+      def delete_namespaced_pod(self, name, namespace, **_kwargs) -> None:
+        self.deleted.append((name, namespace))
+
+    store = InMemoryStore()
+    asyncio.run(store.set_model_metadata("run-stop", {"status": "ready", "created_at": 100.0}))
+    api = CoreApi()
+    k8s = {
+      "available": True,
+      "namespace": "open-rl",
+      "error": None,
+      "pods": [{"name": "trainer-run-stop", "labels": {"timeslice.io/job-id": "trainer-run-stop"}}],
+      "nodes": [],
+    }
+    with (
+      mock.patch.object(data, "k8s_core_v1", return_value=(api, None)),
+      mock.patch.object(data, "k8s_snapshot", return_value=k8s) as snapshot,
+      mock.patch.object(data.k8s_observation_cache, "clear") as clear,
+    ):
+      result = asyncio.run(data.stop_run(store, None, "run-stop"))
+
+    self.assertTrue(result["stopped"])
+    self.assertEqual(api.deleted, [("trainer-run-stop", "open-rl")])
+    snapshot.assert_called_once_with(force=True)
+    clear.assert_called_once_with()
 
   def test_demo_mode_flags_every_payload(self) -> None:
     os.environ["OPEN_RL_DASHBOARD_DEMO"] = "1"

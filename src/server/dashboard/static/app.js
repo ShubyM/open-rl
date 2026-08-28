@@ -1283,7 +1283,11 @@ async function refresh() {
     setText($("build-at"), `build ${revisionLabel(build?.revision)}`);
     $("build-at").title = build ? `${build.hostname} · Python ${build.python_version} · started ${build.started_at}` : "build identity unavailable";
     const updated = snapshot.generated_at ? new Date(snapshot.generated_at) : new Date();
-    setText($("updated-at"), `updated ${updated.toLocaleTimeString()}`);
+    const observation = snapshot.cluster?.kubernetes?.observation;
+    const observed = observation
+      ? ` · k8s ${observation.source} · ${compactNumber(observation.age_seconds)}s old · ${compactNumber(observation.collection_ms)} ms collect`
+      : "";
+    setText($("updated-at"), `updated ${updated.toLocaleTimeString()}${observed}`);
   } catch (err) {
     setText($("updated-at"), `refresh failed: ${err.message}`);
   } finally {

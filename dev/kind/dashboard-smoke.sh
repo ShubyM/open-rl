@@ -43,6 +43,8 @@ for _ in $(seq 1 30); do
 done
 
 curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/snapshot" >"$snapshot_file"
+curl -fsS "http://127.0.0.1:${PORT}/api/v1/dashboard/cluster" |
+  python3 -c 'import json,sys; observation=json.load(sys.stdin)["kubernetes"]["observation"]; assert observation["source"] == "cache", observation; assert 0 <= observation["age_seconds"] < 1, observation'
 curl -fsS "http://127.0.0.1:${PORT}/dashboard" | grep -Fq "open-rl operations"
 
 dashboard_pod=$(kubectl --context "$CONTEXT" get pods -l app=open-rl-dashboard -o jsonpath='{.items[0].metadata.name}')
@@ -78,6 +80,10 @@ assert snapshot["schema_version"] == 1, snapshot.get("schema_version")
 cluster = snapshot["cluster"]
 assert cluster["kubernetes"]["available"], cluster["kubernetes"]
 assert cluster["kubernetes"]["namespace"] == "default", cluster["kubernetes"]
+observation = cluster["kubernetes"]["observation"]
+assert observation["source"] == "live", observation
+assert observation["age_seconds"] == 0, observation
+assert observation["collection_ms"] >= 0, observation
 assert cluster["gateway"]["build"]["revision"] == sys.argv[2], cluster["gateway"]["build"]
 assert cluster["kubernetes"]["metrics"] == {
   "installed": False,

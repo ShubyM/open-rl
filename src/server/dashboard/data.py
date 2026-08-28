@@ -10,6 +10,7 @@ import os
 import platform
 import shutil
 import socket
+import threading
 import time
 import urllib.parse
 from datetime import UTC, datetime
@@ -605,7 +606,7 @@ def node_to_dict(node: Any) -> dict:
   }
 
 
-def k8s_snapshot() -> dict:
+def _collect_k8s_snapshot() -> dict:
   """List pods in our namespace and (when RBAC allows) cluster nodes. Blocking; call in a thread."""
   api, err = k8s_core_v1()
   namespace = k8s_namespace()
@@ -679,6 +680,61 @@ def k8s_snapshot() -> dict:
     "metrics": metrics,
     "scheduler": scheduler,
   }
+
+
+class K8sObservationCache:
+  """Short-lived, single-flight cache for API-server observations.
+
+  Every dashboard surface can request Kubernetes state independently. Serializing refreshes
+  behind one lock prevents a burst of agents and browser tabs from issuing the same expensive
+  pod/node/event/custom-resource lists in parallel.
+  """
+
+  def __init__(self) -> None:
+    self._lock = threading.Lock()
+    self._snapshot: dict | None = None
+    self._observed_monotonic = 0.0
+
+  def clear(self) -> None:
+    with self._lock:
+      self._snapshot = None
+      self._observed_monotonic = 0.0
+
+  def get(self, *, force: bool = False) -> dict:
+    try:
+      ttl = max(0.0, float(os.getenv("OPEN_RL_K8S_CACHE_SECONDS", "1")))
+    except ValueError:
+      ttl = 1.0
+    with self._lock:
+      now = time.monotonic()
+      age = now - self._observed_monotonic
+      if not force and self._snapshot is not None and age < ttl:
+        return {
+          **self._snapshot,
+          "observation": {**self._snapshot["observation"], "source": "cache", "age_seconds": round(age, 6)},
+        }
+
+      started = time.perf_counter()
+      snapshot = _collect_k8s_snapshot()
+      completed = time.time()
+      self._observed_monotonic = time.monotonic()
+      self._snapshot = {
+        **snapshot,
+        "observation": {
+          "observed_at": iso_timestamp(completed),
+          "collection_ms": round((time.perf_counter() - started) * 1000, 3),
+          "source": "live",
+          "age_seconds": 0.0,
+        },
+      }
+      return {**self._snapshot, "observation": dict(self._snapshot["observation"])}
+
+
+k8s_observation_cache = K8sObservationCache()
+
+
+def k8s_snapshot(*, force: bool = False) -> dict:
+  return k8s_observation_cache.get(force=force)
 
 
 def k8s_pod_logs(pod: str, container: str | None, tail: int, previous: bool = False) -> dict:
@@ -881,6 +937,7 @@ async def cluster_snapshot(store: RequestStore, k8s: dict) -> dict:
       "available": k8s["available"],
       "namespace": k8s["namespace"],
       "error": k8s["error"],
+      "observation": k8s.get("observation"),
       "metrics": {
         "installed": metrics["installed"],
         "available": metrics["available"],
@@ -1552,13 +1609,17 @@ async def stop_run(store: RequestStore, worker_manager: FFTWorkerManager | None,
   api, _ = k8s_core_v1()
   if api is not None:
     try:
-      k8s = k8s_snapshot()
+      k8s = k8s_snapshot(force=True)
       for pod in model_pods(model_id, k8s["pods"]):
         api.delete_namespaced_pod(pod["name"], k8s["namespace"], _request_timeout=K8S_REQUEST_TIMEOUT)
         actions.append(f"deleted pod {pod['name']}")
         changed = True
     except Exception as exc:
       errors.append(f"pod deletion failed: {exc}")
+    finally:
+      # The forced read happened before deletion; never serve that pre-mutation
+      # observation to the next agent or browser refresh.
+      k8s_observation_cache.clear()
 
   if changed:
     try:
@@ -1935,7 +1996,10 @@ async def health_checks(store: RequestStore, k8s: dict) -> list[dict]:
     checks.append(check_entry("storage.shared", "Storage", "Shared filesystem", "warn", f"{shared} missing or not writable"))
 
   if k8s["available"]:
-    checks.append(check_entry("kubernetes", "Kubernetes", "API server", "ok", f"{len(k8s['pods'])} pods visible in namespace {k8s['namespace']}"))
+    detail = f"{len(k8s['pods'])} pods visible in namespace {k8s['namespace']}"
+    if observation := k8s.get("observation"):
+      detail += f" · {observation['source']} observation collected in {observation['collection_ms']:.1f} ms"
+    checks.append(check_entry("kubernetes", "Kubernetes", "API server", "ok", detail))
     if event_error := k8s.get("events_error"):
       checks.append(check_entry("visibility.events", "Visibility", "Pod events", "warn", event_error))
     else:
