@@ -575,15 +575,22 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     ref = payload.get("path") or payload.get("sampling_session_id")
     if not ref:
       raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
-    rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
-    local_path = os.path.join(paths.tmp_dir(), "sampler_full", rel_path)
-    await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
-    if hasattr(self.store, "redis"):
-      num_subs = await self.store.redis.publish(
-        f"open_rl:weight_update:{model_id}",
-        json.dumps({"weights_path": local_path}),
-      )
-      print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")
+    if self.worker.publishes_sampler_adapter():
+      # A LoRA-trained full-parameter worker (the Megatron backend) publishes
+      # the adapter alone, into the same peft/<model>/<label> layout the LoRA
+      # processor above writes and gateway.sampler_adapter_path resolves.
+      session_label = (payload.get("sampling_session_id") or "").rsplit("/", 1)[-1] or None
+      await asyncio.to_thread(self.worker.write_adapter, model_id, payload.get("alias"), session_label)
+    else:
+      rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
+      local_path = os.path.join(paths.tmp_dir(), "sampler_full", rel_path)
+      await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
+      if hasattr(self.store, "redis"):
+        num_subs = await self.store.redis.publish(
+          f"open_rl:weight_update:{model_id}",
+          json.dumps({"weights_path": local_path}),
+        )
+        print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")
     return {
       "path": payload.get("path"),
       "sampling_session_id": payload.get("sampling_session_id"),

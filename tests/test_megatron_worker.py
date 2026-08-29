@@ -12,6 +12,10 @@ The checkpoint cases are here for a different reason. They do not fail silently
 at all -- they kill the run -- but they only fire at a save boundary, so on a
 long run the failure arrives hours after the commit that caused it and takes the
 training with it. A stub bridge runs the same path in milliseconds.
+
+The round-trip cases are the other half of that: the fixes reached for after
+such a crash mostly work by making the save stop complaining, which converts a
+dead run into a checkpoint nothing can be resumed from.
 """
 
 import importlib
@@ -25,6 +29,7 @@ import unittest
 import unittest.mock
 
 import torch
+from safetensors.torch import load_file, save_file
 
 import training.megatron_worker as megatron_worker
 from training.megatron_worker import MegatronTrainingWorker, chunked_target_logprobs
@@ -662,30 +667,374 @@ class CheckpointSaveTest(unittest.TestCase):
     # nothing and report success.
     self.assertFalse(self.read_metadata(path)["has_optimizer"])
 
-  def test_publishing_sampler_weights_never_reaches_the_save_path(self) -> None:
-    # This is why run32 looked healthy for four steps: with NCCL transfer
-    # configured, the per-step sampler publish goes over the wire and only the
-    # every-fifth-step save_state touches save_hf_pretrained. A backend without
-    # the fast path exercises the broken line at step 0 instead.
-    worker = self.worker()
-    with (
-      unittest.mock.patch.object(worker, "sampler_urls", return_value=["http://127.0.0.1:8000"]),
-      unittest.mock.patch.object(worker, "sync_weights_to_samplers", return_value=666) as sync,
-    ):
-      worker.save_state("model-1", os.path.join(self.root, "sampler"), kind="sampler")
-
-    sync.assert_called_once()
-    self.assertEqual(self.calls, [])
-    self.assertFalse(os.path.exists(os.path.join(self.root, "sampler")))
-
-  def test_without_samplers_a_sampler_save_still_writes_to_disk(self) -> None:
+  def test_a_sampler_save_reaching_save_state_writes_a_whole_checkpoint(self) -> None:
+    # Sampler weights are published as an adapter by the processor, which never
+    # calls this. Anything that does get here wants the merged model.
     path = os.path.join(self.root, "sampler")
-    worker = self.worker()
-    with unittest.mock.patch.object(worker, "sampler_urls", return_value=[]):
-      worker.save_state("model-1", path, kind="sampler")
+    self.worker().save_state("model-1", path, kind="sampler")
 
     self.assertEqual(self.read_metadata(path)["kind"], "sampler")
     self.assertEqual(self.calls, ["save_hf_pretrained(is_quantized=False)"])
+
+
+# google/gemma-4-12B-it's checkpoint index in miniature: a language tower the
+# Megatron export does produce, four multimodal tensors it does not, and -- the
+# detail that turned run34 from a partial save into no save -- one shard file
+# holding all of them.
+LANGUAGE_KEYS = (
+  "model.language_model.embed_tokens.weight",
+  "model.language_model.layers.0.self_attn.q_proj.weight",
+  "model.language_model.layers.1.self_attn.q_proj.weight",
+  "model.language_model.norm.weight",
+)
+MULTIMODAL_KEYS = (
+  "model.embed_audio.embedding_projection.weight",
+  "model.embed_vision.embedding_projection.weight",
+  "model.vision_embedder.patch_dense.weight",
+  "model.vision_embedder.pos_embedding",
+)
+SINGLE_SHARD_INDEX = {key: "model.safetensors" for key in LANGUAGE_KEYS + MULTIMODAL_KEYS}
+# The config save_artifacts copies out of the source snapshot, verbatim, before
+# a single tensor is written. vision_config is the part that matters: it is what
+# tells vLLM and transformers to expect a vision tower in the weights.
+SOURCE_CONFIG = {
+  "architectures": ["Gemma4ForConditionalGeneration"],
+  "model_type": "gemma4_unified",
+  "vision_config": {"hidden_size": 2},
+}
+# A distinct value per key, so a save that writes the right names with the wrong
+# tensors is caught as well as one that writes nothing.
+FULL_EXPORT = {key: torch.full((2, 2), float(n + 1), dtype=torch.bfloat16) for n, key in enumerate(SINGLE_SHARD_INDEX)}
+# What the run34 export actually yielded: the language tower and nothing else.
+LANGUAGE_EXPORT = {key: FULL_EXPORT[key] for key in LANGUAGE_KEYS}
+# Every tensor produced, under names the source index has never heard of -- the
+# shape of a bridge whose key mapping drifted from the checkpoint's.
+RENAMED_EXPORT = {key.replace("model.", "model.decoder."): value for key, value in FULL_EXPORT.items()}
+
+
+class ShardedSaveBridge:
+  """save_hf_pretrained with the shard-completeness rule the real bridge enforces.
+
+  megatron-bridge's SafeTensorsStateSource.save_generator writes a source shard
+  file only once every key the source checkpoint assigned to that shard has come
+  out of the export generator, and drops any yielded name the source does not
+  know. Under strict=True an incomplete shard is skipped and the save raises
+  after the complete ones are written; under strict=False the incomplete shard is
+  written anyway, short whatever is missing, and the save returns normally.
+  Either way save_artifacts has already copied the source config.json into the
+  output directory, before the first tensor is looked at.
+
+  Both branches were checked against megatron-bridge 0.6.1 on CPU with a toy
+  checkpoint of this shape before this stub was written. run34 is the strict=True
+  branch, and the reason it lost everything is that google/gemma-4-12B-it ships
+  as one unsharded model.safetensors with no index file: all 677 keys belong to
+  one shard, so the 11 the text-only bridge never yields took the 666 that were
+  yielded down with them.
+  """
+
+  def __init__(self, index: dict[str, str], export: dict[str, torch.Tensor], strict: bool = True):
+    self.index = index
+    self.export = export
+    self.strict = strict
+
+  def save_hf_pretrained(self, _chunks, path: str) -> None:
+    # The unguarded import the real save path does on its way in.
+    from modelopt.torch.quantization.utils import is_quantized
+
+    assert not is_quantized(None)
+    os.makedirs(path, exist_ok=True)
+    # save_artifacts runs first and unconditionally: config.json describes the
+    # source model whatever the weight write goes on to do.
+    with open(os.path.join(path, "config.json"), "w") as handle:
+      json.dump(SOURCE_CONFIG, handle)
+
+    shards: dict[str, list[str]] = {}
+    for key, filename in self.index.items():
+      shards.setdefault(filename, []).append(key)
+
+    written = 0
+    for filename, keys in shards.items():
+      present = {key: self.export[key] for key in keys if key in self.export}
+      if len(present) < len(keys) and self.strict:
+        continue
+      save_file(present, os.path.join(path, filename))
+      written += len(present)
+
+    if written < len(self.index) and self.strict:
+      raise RuntimeError(
+        f"{len(self.index) - written} tensors from the original checkpoint were not written. "
+        "Re-run with strict=False to save the partial checkpoint instead of failing."
+      )
+
+
+class ResumingWorker(MegatronTrainingWorker):
+  """A worker whose load side reads the HF checkpoint back off disk.
+
+  load_from_state hands the checkpoint directory to load_base_model, which in the
+  real worker is AutoBridge.from_hf_pretrained streaming the safetensors into
+  Megatron's sharded layout. Reading every shard in the directory -- what a
+  loader does when there is no index file, which is this model's layout -- is the
+  part of that the round trip turns on: it decides which weights come back.
+  """
+
+  def load_base_model(self, base_model_name: str) -> None:
+    self.restored = {}
+    for filename in sorted(os.listdir(base_model_name)):
+      if filename.endswith(".safetensors"):
+        self.restored.update(load_file(os.path.join(base_model_name, filename)))
+    self.model_chunks = [object()]
+
+  def prepare_model_for_training(self) -> None:
+    pass
+
+
+class CheckpointRoundTripTest(unittest.TestCase):
+  """save_state -> load_from_state, against a bridge that can write less than it got.
+
+  run34 died in the middle of this round trip at step 1. The crash is the cheap
+  half: it costs one run and says exactly what happened. The expensive half is
+  the fix its error message recommends -- "Re-run with strict=False to save the
+  partial checkpoint instead of failing" -- which turns the stop into a save that
+  reports success over a checkpoint the model cannot be rebuilt from. Nothing
+  downstream would catch that: load_from_state validates metadata.json, and
+  metadata.json is written by us, after the bridge, whatever the bridge did.
+  """
+
+  def setUp(self) -> None:
+    saved = {name: module for name, module in sys.modules.items() if name.split(".")[0] == "modelopt"}
+
+    def restore() -> None:
+      for name in [name for name in sys.modules if name.split(".")[0] == "modelopt"]:
+        del sys.modules[name]
+      sys.modules.update(saved)
+
+    self.addCleanup(restore)
+    for name in saved:
+      del sys.modules[name]
+    finder = BlockModeloptImport()
+    sys.meta_path.insert(0, finder)
+    self.addCleanup(sys.meta_path.remove, finder)
+
+    self.root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, self.root, True)
+    self.enterContext(unittest.mock.patch.object(megatron_worker, "is_primary", return_value=True))
+    self.enterContext(unittest.mock.patch.object(megatron_worker, "barrier", lambda: None))
+
+  def worker(self, export: dict[str, torch.Tensor], strict: bool = True) -> ResumingWorker:
+    worker = ResumingWorker.__new__(ResumingWorker)
+    worker.model_chunks = [object()]
+    worker.bridge = ShardedSaveBridge(SINGLE_SHARD_INDEX, export, strict=strict)
+    worker.tokenizer = None
+    worker.optimizer = None
+    worker.base_model_name = "google/gemma-4-12B-it"
+    worker.restored = {}
+    return worker
+
+  def save_or_refuse(self, worker: ResumingWorker, path: str) -> bool:
+    """Run the save; report whether it committed anything, and hold it to that.
+
+    Deliberately does not pin down which way a fix goes. Refusing to commit a
+    checkpoint the export could not fill and getting the export to fill it are
+    both correct outcomes, and the cases below pass under either. Returning
+    success over a checkpoint the next process cannot use is the one outcome
+    that is not correct, because it is the one that spends GPU-hours instead of
+    ending them.
+    """
+    try:
+      worker.save_state("model-1", path)
+    except RuntimeError:
+      self.assertFalse(os.path.exists(path), "a save that raised must not leave a checkpoint a resume would pick up")
+      return False
+    return True
+
+  def assert_resumable_or_loud(self, worker: ResumingWorker, path: str) -> None:
+    """Whatever the save committed, a resume must get every tensor back intact."""
+    if not self.save_or_refuse(worker, path):
+      return
+
+    worker.load_from_state("model-1", path)
+    self.assertEqual(set(worker.restored), set(SINGLE_SHARD_INDEX))
+    for key, expected in FULL_EXPORT.items():
+      self.assertTrue(torch.equal(worker.restored[key], expected), key)
+
+  def test_a_complete_export_round_trips_every_tensor(self) -> None:
+    self.assert_resumable_or_loud(self.worker(FULL_EXPORT), os.path.join(self.root, "state"))
+
+  def test_run34_an_export_one_shard_short_writes_nothing_and_says_so(self) -> None:
+    # run34 scaled down. The export is only missing the four multimodal tensors,
+    # but the source index keeps all eight keys in one model.safetensors, so no
+    # shard completes and the language tensors that were produced go in the bin
+    # with the rest. The count in the message is the whole model, not the gap.
+    path = os.path.join(self.root, "state")
+    with self.assertRaisesRegex(RuntimeError, "8 tensors from the original checkpoint were not written"):
+      self.worker(LANGUAGE_EXPORT).save_state("model-1", path)
+
+    self.assertFalse(os.path.exists(path))
+
+  def test_a_failed_save_leaves_the_previous_checkpoint_resumable(self) -> None:
+    # The staging dance exists for this: run34 crashed at step 1, and whatever
+    # step 0 wrote had to still be there to resume from.
+    path = os.path.join(self.root, "state")
+    self.worker(FULL_EXPORT).save_state("model-0", path)
+    with self.assertRaises(RuntimeError):
+      self.worker(LANGUAGE_EXPORT).save_state("model-1", path)
+
+    resumed = self.worker(FULL_EXPORT)
+    resumed.load_from_state("model-0", path)
+    self.assertEqual(set(resumed.restored), set(SINGLE_SHARD_INDEX))
+
+  def test_a_partial_save_is_not_committed_as_a_resumable_checkpoint(self) -> None:
+    # strict=False, the fix the bridge's own error message recommends. Measured
+    # against megatron-bridge 0.6.1: it writes the shard minus the tensors the
+    # export never produced, rewrites model.safetensors.index.json so the gap is
+    # not even visible as a missing key, and returns. At run34's scale that is
+    # 666 of 677 tensors with the whole vision tower gone, reported as a save.
+    self.assert_resumable_or_loud(self.worker(LANGUAGE_EXPORT, strict=False), os.path.join(self.root, "state"))
+
+  def test_a_save_that_writes_no_tensors_at_all_is_not_reported_as_success(self) -> None:
+    # Same strict=False, but with the bridge's key mapping drifted off the
+    # checkpoint's instead of the export being short: every yielded name misses
+    # the source map, all of them are skipped with a warning, and an empty
+    # model.safetensors is written. Measured on megatron-bridge 0.6.1 the file is
+    # 16 bytes and holds zero tensors, and save_generator returns.
+    self.assert_resumable_or_loud(self.worker(RENAMED_EXPORT, strict=False), os.path.join(self.root, "state"))
+
+  def test_the_config_committed_beside_the_weights_describes_them(self) -> None:
+    # save_artifacts copies the source config.json into the checkpoint before a
+    # single tensor is looked at, so a text-only export under strict=False lands
+    # a config advertising a vision tower next to weights that have none. Nothing
+    # in this process notices: the mismatch surfaces in whatever loads the
+    # checkpoint next, which is vLLM or a resume, both of which size the model
+    # from this file. Making the save loud is what keeps the pair consistent --
+    # a checkpoint that is never committed cannot disagree with itself.
+    path = os.path.join(self.root, "state")
+    worker = self.worker(LANGUAGE_EXPORT, strict=False)
+    if not self.save_or_refuse(worker, path):
+      return
+    worker.load_from_state("model-1", path)
+
+    with open(os.path.join(path, "config.json")) as handle:
+      config = json.load(handle)
+    self.assertEqual(
+      "vision_config" in config,
+      any(key.startswith("model.vision_embedder.") for key in worker.restored),
+      "config.json describes a model the weights committed beside it do not contain",
+    )
+
+
+class AdapterBridge:
+  """save_hf_adapter as megatron-bridge implements it, plus the base key list.
+
+  Exports hub-layout names by default (model.language_model.layers.N...), which
+  is what the real bridge was measured emitting under GEMMA4_CONVERSION_MODE=text.
+  """
+
+  def __init__(self, base_keys: tuple[str, ...], adapter_names: list[str] | None = None):
+    self.hf_pretrained = types.SimpleNamespace(state=types.SimpleNamespace(source=types.SimpleNamespace(get_all_keys=lambda: list(base_keys))))
+    self.adapter_names = adapter_names
+    self.saved_config: dict | None = None
+
+  def save_hf_adapter(self, _chunks, path: str, peft_config, base_model_name_or_path=None, show_progress=True) -> None:
+    names = self.adapter_names
+    if names is None:
+      names = [
+        f"base_model.model.{key[: -len('.weight')]}.lora_{side}.weight" for key in LANGUAGE_KEYS if key.endswith("q_proj.weight") for side in "AB"
+      ]
+    os.makedirs(path, exist_ok=True)
+    save_file({name: torch.zeros(2, 2) for name in names}, os.path.join(path, "adapter_model.safetensors"))
+    self.saved_config = {"r": peft_config.dim, "base_model_name_or_path": base_model_name_or_path}
+    with open(os.path.join(path, "adapter_config.json"), "w") as handle:
+      json.dump(self.saved_config, handle)
+
+
+class AdapterPublishTest(unittest.TestCase):
+  """Publishing sampler weights as a LoRA adapter instead of merged base weights.
+
+  The case that matters is not a crash. vLLM applies the adapter modules whose
+  names it recognises and silently applies none of the rest, so an adapter in
+  the wrong layout trains for a whole run against the base model and the only
+  symptom is a flat reward curve -- which is why write_adapter checks its own
+  output against the base checkpoint's key list rather than trusting the bridge.
+  """
+
+  def setUp(self) -> None:
+    self.root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, self.root, True)
+    self.enterContext(unittest.mock.patch.dict(os.environ, {"OPEN_RL_SNAPSHOT_DIR": os.path.join(self.root, "peft")}))
+    self.enterContext(unittest.mock.patch.object(megatron_worker, "MEGATRON_LORA_RANK", 32))
+    self.enterContext(unittest.mock.patch.object(megatron_worker, "barrier", lambda: None))
+
+  def worker(self, bridge: AdapterBridge) -> MegatronTrainingWorker:
+    worker = MegatronTrainingWorker.__new__(MegatronTrainingWorker)
+    worker.model_chunks = [object()]
+    worker.bridge = bridge
+    worker.base_model_name = "google/gemma-4-12B-it"
+    worker.lora = types.SimpleNamespace(dim=32, alpha=32, dropout=0.0)
+    return worker
+
+  def test_the_adapter_lands_where_the_sampler_looks_for_it(self) -> None:
+    # gateway.sampler_adapter_path resolves a sampling ref to
+    # peft/<model>/<label>; anywhere else and the sampler gets a 404 for a file
+    # the trainer swears it wrote.
+    final = self.worker(AdapterBridge(LANGUAGE_KEYS)).write_adapter("model-1", session_label="sampler-7")
+
+    self.assertEqual(final, os.path.join(self.root, "peft", "model-1", "sampler-7"))
+    self.assertTrue(os.path.exists(os.path.join(final, "adapter_model.safetensors")))
+    self.assertTrue(os.path.exists(os.path.join(final, "adapter_config.json")))
+    # No staging directory left behind for a loader to trip over.
+    self.assertEqual(sorted(os.listdir(os.path.join(self.root, "peft", "model-1"))), ["metadata.json", "sampler-7"])
+
+  def test_an_adapter_naming_modules_the_base_lacks_is_refused(self) -> None:
+    # peft's text layout, which is what the FSDP path emits before its remap.
+    # vLLM would load this, match nothing, and serve the base model all run.
+    bridge = AdapterBridge(LANGUAGE_KEYS, adapter_names=["base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"])
+    with self.assertRaisesRegex(RuntimeError, "base checkpoint does not have"):
+      self.worker(bridge).write_adapter("model-1", session_label="sampler-7")
+
+  def test_a_refused_adapter_leaves_nothing_for_the_sampler_to_load(self) -> None:
+    bridge = AdapterBridge(LANGUAGE_KEYS, adapter_names=["base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"])
+    with self.assertRaises(RuntimeError):
+      self.worker(bridge).write_adapter("model-1", session_label="sampler-7")
+
+    self.assertFalse(os.path.exists(os.path.join(self.root, "peft", "model-1", "sampler-7")))
+
+  def test_an_empty_adapter_is_refused(self) -> None:
+    with self.assertRaisesRegex(RuntimeError, "wrote no tensors"):
+      self.worker(AdapterBridge(LANGUAGE_KEYS, adapter_names=[])).write_adapter("model-1", session_label="sampler-7")
+
+  def test_full_parameter_training_refuses_to_publish_an_adapter(self) -> None:
+    # Rank 0 means there is no adapter. Publishing an empty one would leave the
+    # samplers on the base model with nothing in any log to say so.
+    with unittest.mock.patch.object(megatron_worker, "MEGATRON_LORA_RANK", 0):
+      worker = self.worker(AdapterBridge(LANGUAGE_KEYS))
+      self.assertFalse(worker.publishes_sampler_adapter())
+      with self.assertRaisesRegex(RuntimeError, "no adapter to publish"):
+        worker.write_adapter("model-1", session_label="sampler-7")
+
+  def test_the_alias_ref_resolves_to_the_snapshot(self) -> None:
+    # tinker://<id>/sampler_weights/final is returned to the caller as a real
+    # ref; without the symlink it names a directory that was never written.
+    worker = self.worker(AdapterBridge(LANGUAGE_KEYS))
+    worker.write_adapter("model-1", alias="final", session_label="sampler-7")
+
+    alias = os.path.join(self.root, "peft", "model-1", "final")
+    self.assertTrue(os.path.islink(alias))
+    self.assertTrue(os.path.exists(os.path.join(alias, "adapter_model.safetensors")))
+
+  def test_a_second_publish_does_not_disturb_the_first(self) -> None:
+    # Rollouts issued against the previous snapshot are still in flight.
+    worker = self.worker(AdapterBridge(LANGUAGE_KEYS))
+    worker.write_adapter("model-1", session_label="sampler-7")
+    worker.write_adapter("model-1", session_label="sampler-8")
+
+    for label in ("sampler-7", "sampler-8"):
+      self.assertTrue(os.path.exists(os.path.join(self.root, "peft", "model-1", label, "adapter_model.safetensors")))
+
+  def test_the_config_carries_the_rank_the_run_trained(self) -> None:
+    bridge = AdapterBridge(LANGUAGE_KEYS)
+    self.worker(bridge).write_adapter("model-1", session_label="sampler-7")
+
+    self.assertEqual(bridge.saved_config, {"r": 32, "base_model_name_or_path": "google/gemma-4-12B-it"})
 
 
 class BackendGuardTest(unittest.TestCase):

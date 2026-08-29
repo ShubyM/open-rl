@@ -156,6 +156,13 @@ class BaseTrainerWorker:
     else:
       self.device = torch.device("cpu")
 
+  def publishes_sampler_adapter(self) -> bool:
+    """Whether save_weights_for_sampler should publish a LoRA adapter the
+    sampler loads with /v1/load_lora_adapter, rather than write a full
+    checkpoint. False here: a full-parameter worker has no adapter to publish.
+    """
+    return False
+
   # Data-parallel geometry, as five overridable hooks.
   #
   # forward_backward assumes every rank is an independent data shard, which is

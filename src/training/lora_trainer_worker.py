@@ -13,7 +13,7 @@ from peft import PeftModelForCausalLM, get_peft_model
 from pydantic import BaseModel
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
-from training import paths
+from training import adapter_snapshot
 from training.distributed import all_reduce_gradients, barrier, broadcast_parameters, is_primary
 from training.trainer_worker import BaseTrainerWorker, Datum
 
@@ -238,7 +238,7 @@ class LoraTrainingWorker(BaseTrainerWorker):
     save_file(remapped, weights_file, metadata={"format": "pt"})
     print(f"Remapped adapter keys to the multimodal hub layout in {weights_file}")
 
-  SNAPSHOT_KEEP = 4
+  SNAPSHOT_KEEP = adapter_snapshot.SNAPSHOT_KEEP
 
   def save_adapter(self, adapter_id: str, alias: str | None = None, session_label: str | None = None) -> None:
     """Write the adapter snapshot on rank 0; other ranks wait at the barrier
@@ -263,74 +263,16 @@ class LoraTrainingWorker(BaseTrainerWorker):
     propagate to the caller (the training future) instead of logging a
     success-shaped response over a broken adapter dir.
     """
-    adapter_root = os.path.join(paths.snapshot_root(), adapter_id)
-    final_dir = os.path.join(adapter_root, session_label or adapter_id)
-    staging_root = os.path.join(adapter_root, f".staging-{os.getpid()}-{time.time_ns()}")
-    os.makedirs(staging_root, exist_ok=True)
 
-    try:
+    def write_files(staging_root: str) -> str:
       self.peft_model.set_adapter(adapter_id)
       self.peft_model.save_pretrained(staging_root, selected_adapters=[adapter_id])
       staged_adapter = os.path.join(staging_root, adapter_id)
       self._remap_adapter_to_hub_layout(staged_adapter)
+      return staged_adapter
 
-      if os.path.exists(final_dir):
-        # Only the legacy label (adapter_id itself) can collide; snapshot
-        # labels are unique per save. Move the old dir aside, never delete
-        # under a reader.
-        os.replace(final_dir, os.path.join(staging_root, "replaced"))
-      os.rename(staged_adapter, final_dir)
-
-      if alias and alias != os.path.basename(final_dir):
-        # Alias-named refs (e.g. tinker://<id>/sampler_weights/final) resolve
-        # to peft/<id>/<alias>, but the adapter itself lives in the snapshot
-        # dir — without this link the returned ref points at a directory that
-        # was never written and every sample against it fails.
-        alias_path = os.path.join(adapter_root, alias)
-        staged_link = os.path.join(staging_root, "alias-link")
-        os.symlink(os.path.basename(final_dir), staged_link)
-        if os.path.isdir(alias_path) and not os.path.islink(alias_path):
-          os.replace(alias_path, os.path.join(staging_root, "replaced-alias"))
-        os.replace(staged_link, alias_path)
-    finally:
-      import shutil
-
-      shutil.rmtree(staging_root, ignore_errors=True)
-
-    metadata = {"model_id": adapter_id, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
-    if alias is not None:
-      metadata["alias"] = alias
-    with open(os.path.join(adapter_root, "metadata.json"), "w") as f:
-      json.dump(metadata, f)
-
-    self._prune_snapshots(adapter_root, keep=self.SNAPSHOT_KEEP, current=final_dir)
+    final_dir = adapter_snapshot.publish(adapter_id, write_files, alias, session_label, keep=self.SNAPSHOT_KEEP)
     print(f"Auto-saved adapter '{adapter_id}' to {final_dir}")
-
-  def _prune_snapshots(self, adapter_root: str, keep: int, current: str) -> None:
-    """Delete all but the newest `keep` snapshot dirs (in-flight rollouts may
-    still sample from a recent previous snapshot). Snapshots an alias symlink
-    (e.g. "final") points at are kept regardless of age."""
-    try:
-      entries = os.listdir(adapter_root)
-      alias_targets = {
-        os.path.realpath(os.path.join(adapter_root, name)) for name in entries if os.path.islink(os.path.join(adapter_root, name))
-      }
-      snapshots = sorted(
-        (
-          os.path.join(adapter_root, name)
-          for name in entries
-          if name.startswith("sampler-") and os.path.isdir(os.path.join(adapter_root, name)) and not os.path.islink(os.path.join(adapter_root, name))
-        ),
-        key=os.path.getmtime,
-        reverse=True,
-      )
-      import shutil
-
-      for stale in snapshots[keep:]:
-        if stale != current and os.path.realpath(stale) not in alias_targets:
-          shutil.rmtree(stale, ignore_errors=True)
-    except OSError:
-      pass
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     """Save adapter weights (and optionally optimizer state) to a specific path."""

@@ -546,6 +546,44 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result["fine_tuning_type"], "full")
     self.assertEqual(result["type"], "model_created")
 
+  async def test_full_processor_publishes_an_adapter_when_the_worker_has_one(self) -> None:
+    # The Megatron backend registers as full-parameter because its checkpoints
+    # are whole HF models, but it trains LoRA and publishes only the adapter.
+    # Sending it down the sampler_full route instead would write a checkpoint
+    # nothing reads while every rollout came from the base model.
+    class _AdapterWorker(_RecordingFullWorker):
+      def __init__(self):
+        super().__init__()
+        self.published = []
+
+      def publishes_sampler_adapter(self):
+        return True
+
+      def write_adapter(self, model_id, alias=None, session_label=None):
+        self.published.append((model_id, alias, session_label))
+
+    worker = _AdapterWorker()
+    store = _FutureStoreStub()
+
+    with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test", "REDIS_URL": "redis://localhost:6379"}):
+      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=_TimeSlicerStub())
+      await processor.process_request(
+        {
+          "request_id": "req-a",
+          "model_id": "model-a",
+          "op": "save_weights_for_sampler",
+          "payload": {
+            "path": "tinker://model-a/sampler_weights/final",
+            "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
+          },
+        },
+        "model-a",
+      )
+
+    self.assertEqual(worker.published, [("model-a", None, "sampler-7")])
+    self.assertEqual(worker.saved_states, [])
+    self.assertEqual(store.results["req-a"]["path"], "tinker://model-a/sampler_weights/final")
+
   async def test_full_processor_saves_sampler_checkpoint_as_full_state(self) -> None:
     worker = _RecordingFullWorker()
     store = _FutureStoreStub()
