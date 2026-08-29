@@ -486,24 +486,25 @@ AFFINITY=${AFFINITY:-0}
 BACKEND_ENV=""
 MEGATRON_WEIGHT_TRANSFER=0
 if [ "$TRAINER_BACKEND" = "megatron" ]; then
-  # How the weights reach the samplers, because it is not the way every other
-  # backend here does it. external_sampler.py pushes a LoRA adapter through
-  # /v1/load_lora_adapter, and the Megatron worker cannot produce one: the
-  # bridge's export merges the adapter into the base weights and yields a whole
-  # HF checkpoint, which stock vLLM has no way to hot-reload. Wiring the two
-  # anyway used to be an `exit 1` here, because the failure is silent -- the
-  # trainer trains, every step writes a 24 GiB checkpoint nothing reads, and
-  # every rollout still comes from the untouched base model.
+  # How the weights reach the samplers. This backend takes the same route as
+  # every other one now -- the trainer writes a LoRA adapter and the sampler
+  # loads it with /v1/load_lora_adapter (megatron_worker.write_adapter). It did
+  # not always: this block used to say the Megatron worker could not produce an
+  # adapter, because the bridge's *export* merges LoRA into the base weights and
+  # yields a whole HF checkpoint that stock vLLM cannot hot-reload. That was
+  # true of export_hf_weights and never true of the bridge, which has
+  # save_hf_adapter. The NCCL transfer built on that belief
+  # (src/training/weight_transfer.py) is still reachable and still needs the two
+  # flags below, so they stay for one run as the fallback.
   #
-  # So the samplers below take their weights over NCCL instead
-  # (src/training/weight_transfer.py), which needs both of the flags added to
-  # the serve command and a trainer that can reach the ports. AFFINITY=1 is
-  # required: a data-parallel server has one engine core per replica and the
-  # RLHF router addresses one, so DP>1 would update a single replica and leave
-  # the others stale -- the same silent-staleness bug in a smaller box.
+  # AFFINITY=1 is no longer a correctness requirement -- an adapter load is an
+  # HTTP call every replica of a DP server handles, unlike the RLHF router,
+  # which addresses one engine core and would have left the others stale. It is
+  # still enforced because four single-GPU samplers is the topology every
+  # context and throughput number for this backend was measured on.
   if [ "$AFFINITY" != "1" ]; then
     echo "ERROR: TRAINER_BACKEND=megatron needs AFFINITY=1 (one server per sampler GPU)." >&2
-    echo "  Weight transfer addresses one engine; a DP server would leave replicas stale." >&2
+    echo "  Not for correctness any more; it is the measured topology and the NCCL fallback needs it." >&2
     exit 1
   fi
   MEGATRON_WEIGHT_TRANSFER=1
@@ -533,7 +534,7 @@ if [ "$TRAINER_BACKEND" = "megatron" ]; then
   BACKEND_ENV="OPEN_RL_TRAINER_BACKEND=megatron OPEN_RL_ENABLE_FFT=true \
 OPEN_RL_MEGATRON_TP=$MEGATRON_TP OPEN_RL_MEGATRON_LORA_RANK=${MEGATRON_LORA_RANK:-16} \
 OPEN_RL_TIME_SLICING=off OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl"
-  echo "[work] TRAINER_BACKEND=megatron -> TP=$MEGATRON_TP, LoRA rank ${MEGATRON_LORA_RANK:-16}, NCCL weight transfer"
+  echo "[work] TRAINER_BACKEND=megatron -> TP=$MEGATRON_TP, LoRA rank ${MEGATRON_LORA_RANK:-16}, adapter published to disk"
 fi
 
 # Weight-transfer flags, only under the Megatron backend. The router that

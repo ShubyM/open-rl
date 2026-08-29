@@ -105,15 +105,16 @@ def gateway_launches_trainers() -> bool:
   return is_fft_enabled() and os.getenv("OPEN_RL_EXTERNAL_TRAINER") != "1"
 
 
-def trainer_pushes_weights() -> bool:
-  """Whether the trainer publishes weights into the samplers itself.
+def trainer_publishes_adapter() -> bool:
+  """Whether a full-parameter backend nonetheless publishes a LoRA adapter.
 
-  The Megatron worker does: it holds a NCCL group with each `vllm serve` and
-  writes the new weights straight into engine memory every optim step
-  (src/training/weight_transfer.py). That is what makes an externally managed
-  server usable under full-weight training at all -- everywhere else, FFT has
-  to fall back to the managed queue workers because a stock server can load an
-  adapter but not a checkpoint.
+  The Megatron worker does. It registers as full-parameter (OPEN_RL_ENABLE_FFT)
+  because its checkpoints are whole HF models, but it trains LoRA, and
+  megatron-bridge's save_hf_adapter writes the adapter on its own without
+  merging it into the base weights. So the sampler side takes the ordinary
+  /v1/load_lora_adapter route rather than the sampler_full checkpoint route it
+  could not reload anyway -- which is what makes an externally managed server
+  usable under this backend at all.
   """
   return os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower() == "megatron"
 
@@ -888,7 +889,7 @@ async def asample(req: dict):
   propagate.inject(carrier)
   await store.set_future(req_id, {"status": "pending"})
 
-  if is_fft_enabled():
+  if is_fft_enabled() and not trainer_publishes_adapter():
     rel_path = model_id[len("tinker://") :] if model_id.startswith("tinker://") else model_id.lstrip("/")
     local_path = os.path.join(TMP_DIR, "sampler_full", rel_path)
     weights_path = local_path
@@ -918,9 +919,9 @@ async def asample(req: dict):
 
   # Externally managed `vllm serve`. FFT normally cannot use one — stock vLLM
   # hot-reloads an adapter but not a checkpoint, so it falls back to the managed
-  # queue workers — unless the trainer pushes the weights in over NCCL, which
-  # leaves nothing for the sampler side to load.
-  if get_sampler_base_url() and (not is_fft_enabled() or trainer_pushes_weights()):
+  # queue workers — unless the trainer publishes an adapter after all, which is
+  # a thing a stock server does know how to load.
+  if get_sampler_base_url() and (not is_fft_enabled() or trainer_publishes_adapter()):
     task = asyncio.create_task(_sample_via_external_server(req_id, sampling_req))
     _external_sampler_tasks.add(task)
     task.add_done_callback(_external_sampler_tasks.discard)

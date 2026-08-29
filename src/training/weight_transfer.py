@@ -1,12 +1,14 @@
 """Push trained weights into a running vLLM engine over NCCL.
 
-Every other sync path in this repo goes through the filesystem: the trainer
-writes a LoRA adapter and the sampler loads it with /v1/load_lora_adapter. The
-Megatron worker cannot use that path. Its export merges the adapter into the
-base weights and produces a whole HF checkpoint, and stock vLLM has no
-checkpoint hot-reload -- see the header of external_sampler.py. Wiring the two
-together anyway would train normally while every rollout came from the
-untouched base model.
+UNREFERENCED, and kept for one run as the fallback for the path that replaced
+it. This existed because the Megatron worker was believed unable to use the
+filesystem route every other backend takes -- the trainer writes a LoRA adapter,
+the sampler loads it with /v1/load_lora_adapter -- on the grounds that its
+export merges the adapter into the base weights and produces a whole HF
+checkpoint that stock vLLM cannot hot-reload. That is true of
+export_hf_weights and false of megatron-bridge, which also has save_hf_adapter.
+megatron_worker.write_adapter uses it, and this module's whole reason to exist
+went with it. Delete once the adapter path has a run behind it.
 
 vLLM 0.25.1 ships the third option. `vllm serve --weight-transfer-config
 '{"backend":"nccl"}'` with VLLM_SERVER_DEV_MODE=1 exposes an RLHF router whose

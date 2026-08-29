@@ -90,7 +90,7 @@ from pydantic import BaseModel
 from transformers import AutoTokenizer
 
 from accel_timeslicer.time_slicer import is_time_slicing_enabled
-from training import paths
+from training import adapter_snapshot, paths
 from training.distributed import barrier, is_primary, local_rank
 from training.models import gemma4
 from training.trainer_worker import BaseTrainerWorker, Datum
@@ -294,6 +294,9 @@ class MegatronTrainingWorker(BaseTrainerWorker):
       )
     self.model_chunks: list[torch.nn.Module] = []
     self.bridge: Any = None
+    # The megatron.bridge LoRA object, kept because save_hf_adapter needs it to
+    # write adapter_config.json. None when training full parameters.
+    self.lora: Any = None
     self.base_model_name: str | None = None
     self.trainable_params: list[torch.nn.Parameter] = []
     self.optimizer: Any = None
@@ -450,12 +453,13 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     memory for tensors that never get one.
 
     This deliberately does not make the worker a LoRA worker as far as the rest
-    of the system is concerned, and it stays in FULL_PARAMETER_WORKERS. The
+    of the system is concerned, and it stays in FULL_PARAMETER_WORKERS.
+    save_checkpoint keeps emitting an ordinary whole HF checkpoint, because the
     bridge's export path merges adapters into the base weights by default
     (export_hf_weights(merge_adapter_weights=True), which save_hf_pretrained
-    calls), so save_checkpoint keeps emitting an ordinary whole HF checkpoint.
-    The sampler reloads it as it already does and never learns an adapter
-    existed. LoRA here is purely a training-memory decision.
+    calls) -- a checkpoint is a thing to resume and to evaluate, and both want
+    the whole model. Publishing weights for the *samplers* is the opposite
+    problem and takes the other path; see write_adapter.
     """
     if MEGATRON_LORA_RANK <= 0:
       return chunks
@@ -465,6 +469,8 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     targets = [target.strip() for target in MEGATRON_LORA_TARGETS.split(",") if target.strip()]
     lora = LoRA(dim=MEGATRON_LORA_RANK, alpha=MEGATRON_LORA_ALPHA, dropout=MEGATRON_LORA_DROPOUT, target_modules=targets)
     chunks = lora(chunks, training=True)
+    # save_hf_adapter reads dim/alpha/dropout off this to write adapter_config.json.
+    self.lora = lora
     trainable = sum(param.numel() for chunk in chunks for param in chunk.parameters() if param.requires_grad)
     total = sum(param.numel() for chunk in chunks for param in chunk.parameters())
     print(
@@ -754,21 +760,109 @@ class MegatronTrainingWorker(BaseTrainerWorker):
   def sampler_urls(self) -> list[str]:
     return [url.strip().rstrip("/") for url in SAMPLER_BASE_URLS.split(",") if url.strip()]
 
+  def publishes_sampler_adapter(self) -> bool:
+    # Only a LoRA run has an adapter; at rank 0 this worker trains full
+    # parameters and the base class's checkpoint route is the only one there is.
+    return MEGATRON_LORA_RANK > 0
+
+  def write_adapter(self, model_id: str, alias: str | None = None, session_label: str | None = None) -> str:
+    """Publish the LoRA adapter for the samplers to load with /v1/load_lora_adapter.
+
+    This is the same route every other backend here uses, and for a long time
+    this worker was documented as unable to take it: the bridge's export merges
+    adapters into the base weights and yields a whole HF checkpoint, which stock
+    vLLM cannot hot-reload. That was never a property of the bridge, only of the
+    export call we happened to make. save_hf_adapter writes an ordinary PEFT
+    directory -- adapter_config.json plus adapter_model.safetensors, a few
+    hundred MB at rank 32 against 24 GiB of merged base weights, none of which
+    training changed.
+
+    Collective: every rank calls it because the export gathers the
+    tensor-parallel shards, and only rank 0 writes.
+    """
+    if MEGATRON_LORA_RANK <= 0:
+      raise RuntimeError(
+        "Sampling weights are published as a LoRA adapter, and OPEN_RL_MEGATRON_LORA_RANK=0 trains "
+        "full parameters, so there is no adapter to publish. Set a rank, or the samplers would "
+        "serve the base model for the whole run while training looked healthy."
+      )
+
+    def write_files(staging_root: str) -> str:
+      # A subdirectory, not staging_root itself: publish() stages the directory
+      # it displaces inside staging_root before renaming what we return.
+      staged = os.path.join(staging_root, "adapter")
+      self.bridge.save_hf_adapter(
+        self.model_chunks,
+        staged,
+        peft_config=self.lora,
+        base_model_name_or_path=self.base_model_name,
+        show_progress=False,
+      )
+      if is_primary():
+        self.assert_adapter_targets_base(staged)
+      return staged
+
+    final_dir = adapter_snapshot.publish(model_id, write_files, alias, session_label)
+    if is_primary():
+      print(f"[Megatron Worker] Published LoRA adapter to {final_dir}.")
+    barrier()
+    return final_dir
+
+  def assert_adapter_targets_base(self, adapter_dir: str) -> None:
+    """Fail unless every adapter module names a real module of the base model.
+
+    This path has one failure mode worse than a crash. vLLM resolves adapter
+    modules by name against the loaded model and applies the ones that match;
+    names that match nothing yield a 200 OK and NO adapter, so the trainer
+    trains, the sampler answers, and every rollout for the whole run comes from
+    the base weights. It is precisely the bug the NCCL transfer was built to
+    avoid, and the FSDP path already hit it once -- peft writes text-layout
+    names (model.layers.N) while vLLM's multimodal mapper wants the hub layout
+    (model.language_model.layers.N), which is what _remap_adapter_to_hub_layout
+    exists for.
+
+    The bridge exports hub-layout names already, so no remap is needed here.
+    Checking anyway, because "already correct" and "silently wrong" look
+    identical from the outside: strip the PEFT wrapper and the lora_A/lora_B
+    suffix off each key and require the module it names to exist in the base
+    checkpoint's own key list.
+    """
+    from safetensors import safe_open
+
+    source = getattr(getattr(self.bridge.hf_pretrained, "state", None), "source", None)
+    if source is None or not hasattr(source, "get_all_keys"):
+      raise RuntimeError(f"Cannot verify adapter targets: bridge has no readable base checkpoint source ({source!r}).")
+    base_keys = set(source.get_all_keys())
+
+    with safe_open(os.path.join(adapter_dir, "adapter_model.safetensors"), framework="pt") as handle:
+      names = list(handle.keys())
+    if not names:
+      raise RuntimeError(f"save_hf_adapter wrote no tensors to {adapter_dir}.")
+
+    unmatched = []
+    for name in names:
+      target = name.removeprefix("base_model.model.")
+      for suffix in (".lora_A.weight", ".lora_B.weight"):
+        if target.endswith(suffix):
+          target = target[: -len(suffix)] + ".weight"
+          break
+      else:
+        continue  # Packed-parameter targets are named differently; not ours to judge.
+      if target not in base_keys:
+        unmatched.append(f"{name} -> {target}")
+    if unmatched:
+      raise RuntimeError(
+        f"{len(unmatched)} of {len(names)} adapter tensors name modules the base checkpoint does not "
+        f"have, so vLLM would load the adapter and apply none of it: {unmatched[:4]}"
+      )
+
   def sync_weights_to_samplers(self) -> int:
-    """Push the current weights straight into every running sampler.
+    """Push the current weights straight into every running sampler over NCCL.
 
-    This is the whole reason the Megatron backend can be used with external
-    samplers at all. The disk route does not work here: a LoRA worker publishes
-    an adapter file and the sampler picks it up with /v1/load_lora_adapter, but
-    the bridge's export merges adapters into the base weights and yields a whole
-    HF checkpoint, and stock vLLM has no checkpoint hot-reload. Writing one
-    anyway would leave every rollout coming from the untouched base model while
-    training looked healthy -- 24 GiB per step to produce stale samples.
-
-    Instead each sampler joins a NCCL group with rank 0 and receives tensors
-    into the live engine's memory. Measured on the 12B model at TP=4: 666
-    tensors in 1.9s per sampler, against roughly a minute to write and reload a
-    checkpoint of the same weights.
+    Unreferenced since write_adapter took over publishing sampler weights, and
+    kept only as the fallback for one run. Each sampler joins a NCCL group with
+    rank 0 and receives tensors into the live engine's memory: measured on the
+    12B model at TP=4, 666 tensors in 1.9s per sampler.
 
     Collective, so every rank has to call it. export_hf_weights gathers the
     tensor-parallel shards, so the ranks that are not sending still walk it in
@@ -801,13 +895,6 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     return sent
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
-    # Weights published for sampling go over the wire, not to disk. Everything
-    # else -- real checkpoints, resumable state -- still writes HF format.
-    if kind == "sampler" and self.sampler_urls():
-      sent = self.sync_weights_to_samplers()
-      print(f"[Megatron Worker] Synced {sent} tensors to {len(self.sampler_urls())} sampler(s).")
-      return {"path": state_path}
-
     metadata = {
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
