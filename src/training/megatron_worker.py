@@ -142,6 +142,27 @@ MEGATRON_CPU_OFFLOAD = is_time_slicing_enabled()
 
 OPTIMIZER_SUBDIR = "megatron_optimizer"
 
+# The optimizer sharding format, which has to be asked for by name because
+# megatron-core's default one cannot be written at all. Leave metadata off and
+# sharded_state_dict picks 'fully_sharded_model_space'
+# (distrib_optimizer.py:1510), whose builder sets flattened_range on every
+# ShardedTensor it makes (:2037) and then validates it (:2038) against a
+# validator that rejects any flattened_range outright
+# (dist_checkpointing/mapping.py:134). The writer and the validator in the same
+# release disagree; the format is marked deprecated and is evidently untested.
+# It raised CheckpointingException on all four ranks in run35, at the first
+# checkpoint, 4h in.
+#
+# 'fully_reshardable' is the maintained replacement. It costs a DP gather --
+# nothing here, where DP is 1 -- and buys back what the flat formats give up:
+# the checkpoint records model-shaped tensors, so it can be reloaded at a
+# different TP. This backend has already changed parallel layout once between
+# runs, so that is not hypothetical.
+#
+# Save and load must name the same format: it is written into the checkpoint as
+# param_state_sharding_type and dispatched on at load.
+OPTIMIZER_SHARDING = {"distrib_optim_sharding_type": "fully_reshardable"}
+
 # Where a Megatron optimizer keeps its fp32 master weights. The distributed
 # optimizer uses the shard_* names, the plain mixed-precision one the last.
 # Each is a list of lists of tensors, and none of them live inside the DDP
@@ -733,7 +754,7 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     if is_primary():
       os.makedirs(optimizer_path, exist_ok=True)
     barrier()
-    state = self.optimizer.sharded_state_dict(self.model_sharded_state_dict(), is_loading=False)
+    state = self.optimizer.sharded_state_dict(self.model_sharded_state_dict(), is_loading=False, metadata=OPTIMIZER_SHARDING)
     dist_checkpointing.save(state, optimizer_path)
 
   def load_optimizer(self, optimizer_path: str, adam_params: dict[str, Any]) -> None:
@@ -741,7 +762,7 @@ class MegatronTrainingWorker(BaseTrainerWorker):
 
     if self.optimizer is None:
       self.build_optimizer(adam_params)
-    state = self.optimizer.sharded_state_dict(self.model_sharded_state_dict(), is_loading=True)
+    state = self.optimizer.sharded_state_dict(self.model_sharded_state_dict(), is_loading=True, metadata=OPTIMIZER_SHARDING)
     self.optimizer.load_state_dict(dist_checkpointing.load(state, optimizer_path))
     print(f"Restored Megatron optimizer state from {optimizer_path}")
 

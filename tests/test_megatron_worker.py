@@ -32,7 +32,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 import training.megatron_worker as megatron_worker
-from training.megatron_worker import MegatronTrainingWorker, chunked_target_logprobs
+from training.megatron_worker import OPTIMIZER_SUBDIR, MegatronTrainingWorker, chunked_target_logprobs
 from training.models import gemma4
 from training.trainer_worker import BaseTrainerWorker, Datum
 
@@ -675,6 +675,82 @@ class CheckpointSaveTest(unittest.TestCase):
 
     self.assertEqual(self.read_metadata(path)["kind"], "sampler")
     self.assertEqual(self.calls, ["save_hf_pretrained(is_quantized=False)"])
+
+
+class CheckpointingException(Exception):
+  """megatron.core.dist_checkpointing.core.CheckpointingException, by value."""
+
+
+class FormatPickingOptimizer:
+  """Stands in for megatron-core's choice of optimizer sharding format.
+
+  One thing about that seam matters and it is not obvious: sharded_state_dict
+  picks a format by name out of metadata, and the name it defaults to cannot be
+  written. 'fully_sharded_model_space' builds every ShardedTensor with a
+  flattened_range and then validates it against a validator that rejects any
+  flattened_range at all -- the writer and the validator ship in the same
+  release. Passing no metadata therefore raises, on every rank, and only at a
+  checkpoint boundary: run35 spent four hours reaching that line.
+  """
+
+  WRITABLE = frozenset({"fully_reshardable", "dp_reshardable", "dp_zero_gather_scatter", "fsdp_dtensor"})
+
+  def __init__(self) -> None:
+    self.requested: list[str] = []
+
+  def sharded_state_dict(self, model_sharded_state_dict, is_loading=False, metadata=None):
+    name = (metadata or {}).get("distrib_optim_sharding_type", "fully_sharded_model_space")
+    self.requested.append(name)
+    if name not in self.WRITABLE:
+      raise CheckpointingException("ShardedTensor.flattened_range is not supported.")
+    return {"param_state_sharding_type": name}
+
+  def load_state_dict(self, state_dict) -> None:
+    self.loaded = state_dict
+
+
+class OptimizerFormatTest(unittest.TestCase):
+  """Which optimizer sharding format the save and the load ask megatron for."""
+
+  def setUp(self) -> None:
+    self.root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, self.root, True)
+    self.enterContext(unittest.mock.patch.object(megatron_worker, "is_primary", return_value=True))
+    self.enterContext(unittest.mock.patch.object(megatron_worker, "barrier", lambda: None))
+
+    self.saved: list[str] = []
+    dist_checkpointing = types.ModuleType("megatron.core.dist_checkpointing")
+    dist_checkpointing.save = lambda state, path: self.saved.append(path)
+    dist_checkpointing.load = lambda state, path: {"restored": path}
+    core = types.ModuleType("megatron.core")
+    core.dist_checkpointing = dist_checkpointing
+    modules = {"megatron": types.ModuleType("megatron"), "megatron.core": core}
+    self.enterContext(unittest.mock.patch.dict(sys.modules, modules))
+
+    self.optimizer = FormatPickingOptimizer()
+    self.worker = MegatronTrainingWorker.__new__(MegatronTrainingWorker)
+    self.worker.optimizer = self.optimizer
+    self.worker.model_chunks = []
+
+  def test_the_save_asks_for_a_format_megatron_can_actually_write(self) -> None:
+    # Drop the metadata argument and this is run35: CheckpointingException on
+    # all four ranks, at the first checkpoint, with the run's work unsaved.
+    path = os.path.join(self.root, OPTIMIZER_SUBDIR)
+    self.worker.save_optimizer(path)
+
+    self.assertEqual(self.optimizer.requested, ["fully_reshardable"])
+    self.assertEqual(self.saved, [path])
+
+  def test_the_load_asks_for_the_same_format_the_save_wrote(self) -> None:
+    # The format is recorded in the checkpoint as param_state_sharding_type and
+    # dispatched on at load, so a load that names a different one reads the
+    # bytes back through the wrong layout.
+    path = os.path.join(self.root, OPTIMIZER_SUBDIR)
+    self.worker.save_optimizer(path)
+    self.worker.load_optimizer(path, {})
+
+    self.assertEqual(self.optimizer.requested, ["fully_reshardable", "fully_reshardable"])
+    self.assertEqual(self.optimizer.loaded, {"restored": path})
 
 
 # google/gemma-4-12B-it's checkpoint index in miniature: a language tower the
