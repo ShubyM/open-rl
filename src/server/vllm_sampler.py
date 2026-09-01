@@ -11,7 +11,7 @@ from typing import Any
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
-from server.vllm_options import split_stop
+from server.vllm_options import split_stop, text_only_engine_kwargs
 
 try:
   from vllm import SamplingParams
@@ -106,6 +106,8 @@ def init_engine():
     }
     if hf_overrides:
       engine_kwargs["hf_overrides"] = hf_overrides
+
+    engine_kwargs.update(text_only_engine_kwargs())
 
     from server.model_metadata import WeightSyncConfig
 

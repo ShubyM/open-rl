@@ -11,7 +11,7 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from server.store import get_store
-from server.vllm_options import split_stop
+from server.vllm_options import split_stop, text_only_engine_kwargs
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 engine: AsyncLLMEngine | None = None
@@ -168,6 +168,8 @@ async def main():
   if arch_override:
     hf_overrides = engine_kwargs.setdefault("hf_overrides", {})
     hf_overrides["architectures"] = [arch_override]
+
+  engine_kwargs.update(text_only_engine_kwargs())
 
   engine_args = AsyncEngineArgs(**engine_kwargs)
   engine = AsyncLLMEngine.from_engine_args(engine_args)
