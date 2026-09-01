@@ -5,12 +5,13 @@ import asyncio
 import os
 import sys
 import traceback
+from collections.abc import Sequence
 from typing import Any
 
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
-from server.vllm_options import text_only_engine_kwargs
+from server.vllm_options import split_stop, text_only_engine_kwargs
 
 try:
   from vllm import SamplingParams
@@ -130,7 +131,7 @@ async def run_generation_backend(
   prompt_token_ids: list[int],
   max_tokens: int,
   temperature: float,
-  stop: list[int] | None,
+  stop: str | Sequence[str] | Sequence[int] | None,
   top_p: float,
   top_k: int,
   num_samples: int,
@@ -147,11 +148,13 @@ async def run_generation_backend(
       return {"sequences": [{"tokens": [0] * max_tokens, "logprobs": [-0.1] * max_tokens, "stop_reason": "length"}]}
 
     prompt_logprobs_val = 1 if include_prompt_logprobs else None
+    stop_strings, stop_token_ids = split_stop(stop)
     sampling_params = SamplingParams(
       n=num_samples,
       temperature=temperature,
       max_tokens=max_tokens,
-      stop_token_ids=stop,
+      stop=stop_strings,
+      stop_token_ids=stop_token_ids,
       top_p=top_p,
       top_k=top_k,
       logprobs=1,  # return logprobs for TITO RL

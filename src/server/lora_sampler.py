@@ -11,7 +11,7 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from server.store import get_store
-from server.vllm_options import text_only_engine_kwargs
+from server.vllm_options import split_stop, text_only_engine_kwargs
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 engine: AsyncLLMEngine | None = None
@@ -66,11 +66,13 @@ async def process_sampling_request(req: dict[str, Any], store: Any) -> None:
       return
 
     prompt_logprobs_val = 1 if include_prompt_logprobs else None
+    stop_strings, stop_token_ids = split_stop(stop)
     sampling_params = SamplingParams(
       n=num_samples,
       temperature=temperature,
       max_tokens=max_tokens,
-      stop_token_ids=stop,
+      stop=stop_strings,
+      stop_token_ids=stop_token_ids,
       top_p=top_p,
       top_k=top_k,
       logprobs=1,
