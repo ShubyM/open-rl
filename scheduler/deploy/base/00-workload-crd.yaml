@@ -85,6 +85,13 @@ spec:
                     description: Memory is total peak accelerator memory. Never re-estimated.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  mode:
+                    default: SingleGPU
+                    description: Mode is the claim shape Memory describes. Only SingleGPU
+                      exists today.
+                    enum:
+                    - SingleGPU
+                    type: string
                 required:
                 - memory
                 type: object

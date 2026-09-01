@@ -314,9 +314,11 @@ spec:
             memory: "100Gi"
 ```
 
-Every shipped runtime drives exactly one device, so the spec carries no
-device count; an `accelerator.maxDeviceCount` field returns when a runtime
-declares it can use a wider claim (section 12). `workerContainerName`
+Every shipped runtime drives exactly one device, which is what the default
+`accelerator.mode: SingleGPU` says: one device with room for `memory`, and
+no device count to guess. A runtime that can drive a wider claim gets a
+new mode carrying its own count field (section 12), an addition rather
+than a change. `workerContainerName`
 names the container in the template that consumes the accelerator; the
 claim reference and the controller's stamps land on that container.
 
@@ -1164,9 +1166,9 @@ each shippable alone:
    sampler workloads, fanned out and routed by the API server. No scheduler
    change.
 2. **Multi-device claims:** a workload requests `count x size` (the tier
-   compiler already carries counts; the spec regains a `maxDeviceCount`
-   field); such claims take one seat and are never time-slice shared. This
-   unlocks the TP-4 sampler and FSDP-4 trainer.
+   compiler already carries counts; a new `accelerator.mode` brings the
+   count fields); such claims take one seat and are never time-slice
+   shared. This unlocks the TP-4 sampler and FSDP-4 trainer.
 3. **One claim, one request per role:** trainer and sampler requests in a
    single claim allocate atomically on one host, so co-location is
    guaranteed by the single allocation. Seats gain a request dimension: different requests run

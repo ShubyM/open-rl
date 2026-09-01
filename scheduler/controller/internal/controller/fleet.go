@@ -249,8 +249,8 @@ func requestFrom(worker *openrlv1alpha1.Workload) placement.Request {
 		// The CR name: the one identity Kubernetes already guarantees unique.
 		// Model id is model configuration, not object identity.
 		WorkerID: worker.Name,
-		// Every current runtime drives one device; the spec regains a
-		// device-count field only when a runtime declares it can use more.
+		// Every current runtime drives one device -- the SingleGPU mode;
+		// a wider claim arrives as a new accelerator mode.
 		MaxDevices:       1,
 		HostRequestBytes: hostRequestBytes(worker),
 	}

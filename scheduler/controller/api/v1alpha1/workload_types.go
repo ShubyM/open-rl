@@ -51,11 +51,25 @@ const (
 	TrainingKindLoRA TrainingKind = "lora"
 )
 
+// AcceleratorMode names the claim shape the workload is asking for.
+// SingleGPU is the only mode today: one device with room for Memory. A
+// runtime that can drive a wider claim gets a new mode with its own
+// fields, an addition rather than a change.
+// +kubebuilder:validation:Enum=SingleGPU
+type AcceleratorMode string
+
+const (
+	AcceleratorModeSingleGPU AcceleratorMode = "SingleGPU"
+)
+
 // AcceleratorSpec is the estimator's accelerator requirement. Every current
-// runtime drives exactly one device; a device-count field returns here only
-// when a runtime declares it can use a wider claim, so placement never
-// guesses a count the process cannot drive.
+// runtime drives exactly one device -- which is what SingleGPU says -- so
+// placement never guesses a count the process cannot drive.
 type AcceleratorSpec struct {
+	// Mode is the claim shape Memory describes. Only SingleGPU exists today.
+	// +kubebuilder:default=SingleGPU
+	Mode AcceleratorMode `json:"mode,omitempty"`
+
 	// Memory is total peak accelerator memory. Never re-estimated.
 	Memory resource.Quantity `json:"memory"`
 }
