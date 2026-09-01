@@ -32,9 +32,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          # Nothing in this job talks to git.
-          persist-credentials: false
 
       # The CUDA server image needs more scratch space than the runner leaves free.
       - name: Free Disk Space
@@ -95,9 +92,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          # Nothing in this job talks to git.
-          persist-credentials: false
 
       # kustomize and gh both ship with the runner image.
       - name: Render release bundle
