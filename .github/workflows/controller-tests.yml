@@ -22,7 +22,7 @@ jobs:
         working-directory: scheduler/controller
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -32,11 +32,16 @@ jobs:
           go-version-file: scheduler/controller/go.mod
           cache-dependency-path: scheduler/controller/go.sum
 
+      # Each step is a make target so the same checks run identically on a
+      # dev machine: `make -C scheduler/controller fmt-check vet test`.
       - name: gofmt
-        run: test -z "$(gofmt -l .)"
+        run: make fmt-check
 
       - name: vet
-        run: go vet ./...
+        run: make vet
+
+      - name: generated CRDs match the types
+        run: make manifests-check
 
       - name: test
-        run: go test ./...
+        run: make test

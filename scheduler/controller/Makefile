@@ -53,6 +53,11 @@ rbac: $(CONTROLLER_GEN)
 fmt:
 	go fmt ./...
 
+# fmt without mutation, for CI: fails listing the files gofmt would rewrite.
+.PHONY: fmt-check
+fmt-check:
+	@files="$$(gofmt -l .)"; if [ -n "$$files" ]; then echo "$$files"; exit 1; fi
+
 .PHONY: vet
 vet:
 	go vet ./...
