@@ -92,7 +92,7 @@ from transformers import AutoTokenizer
 from accel_timeslicer.time_slicer import is_time_slicing_enabled
 from training import adapter_snapshot, paths
 from training.distributed import barrier, is_primary, local_rank
-from training.models import gemma4
+from training.models import gemma4, qwen35
 from training.trainer_worker import BaseTrainerWorker, Datum
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
@@ -425,6 +425,11 @@ class MegatronTrainingWorker(BaseTrainerWorker):
 
     AutoBridge, _ = require_megatron()
     gemma4.register_unified_bridge()
+    # Both registrations are keyed on an architecture string, so the one that
+    # does not match the checkpoint being loaded is inert. Qwen's overwrites a
+    # registration megatron-bridge ships, rather than adding a missing one --
+    # see models/qwen35.py.
+    qwen35.register_text_only_bridge()
     # install_flex_attention has to run before the provider builds any layer:
     # the spec it rebinds is read inside provide_distributed_model below. The
     # split patch only matters at export, but both are idempotent, so keep the

@@ -531,10 +531,30 @@ if [ "$TRAINER_BACKEND" = "megatron" ]; then
   # topology never starts, and rank 0 dies with FileNotFoundError before it
   # reads a single request. It also stops the worker cpu-offloading its weights
   # and optimizer state to host RAM between batches, for GPUs nobody else wants.
+  # Which projections LoRA adapts. The worker's default names the four a dense
+  # transformer has, and on Qwen3.5 that silently covers a quarter of the model:
+  # 24 of its 32 layers are gated-deltanet, whose mixer is in_proj/out_proj and
+  # matches none of those four. Adding them is what the FSDP path already does
+  # (lora_trainer_worker.py) and what run19 trained, so it is parity rather than
+  # a new variable. Megatron fuses the checkpoint's four in_proj_* projections
+  # into one in_proj; save_hf_adapter splits them back out under the names vLLM
+  # packs, verified tensor by tensor against the base checkpoint.
+  MEGATRON_LORA_TARGETS=${MEGATRON_LORA_TARGETS:-linear_qkv,linear_proj,linear_fc1,linear_fc2}
+  # Sequence parallelism, which the worker turns on for any TP>1 by default.
+  # Some architectures cannot have it at all: megatron's gated-deltanet asserts
+  # against it outright (core/ssm/gated_delta_net/gdn.py:91), so a Qwen3.5 at
+  # TP>1 dies in model construction rather than falling back. TP=1 hid this --
+  # the worker ands the flag with TP>1 -- so it first appears the moment tensor
+  # parallelism is used to buy context. Off costs replicated LayerNorm and
+  # residual activations, which is the measured reason TP=2 saves 0.72x of the
+  # activation bill rather than 0.5x.
+  MEGATRON_SEQUENCE_PARALLEL=${MEGATRON_SEQUENCE_PARALLEL:-1}
   BACKEND_ENV="OPEN_RL_TRAINER_BACKEND=megatron OPEN_RL_ENABLE_FFT=true \
 OPEN_RL_MEGATRON_TP=$MEGATRON_TP OPEN_RL_MEGATRON_LORA_RANK=${MEGATRON_LORA_RANK:-16} \
+OPEN_RL_MEGATRON_LORA_TARGETS=$MEGATRON_LORA_TARGETS \
+OPEN_RL_MEGATRON_SEQUENCE_PARALLEL=$MEGATRON_SEQUENCE_PARALLEL \
 OPEN_RL_TIME_SLICING=off OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl"
-  echo "[work] TRAINER_BACKEND=megatron -> TP=$MEGATRON_TP, LoRA rank ${MEGATRON_LORA_RANK:-16}, adapter published to disk"
+  echo "[work] TRAINER_BACKEND=megatron -> TP=$MEGATRON_TP, LoRA rank ${MEGATRON_LORA_RANK:-16}, targets $MEGATRON_LORA_TARGETS, sequence_parallel=$MEGATRON_SEQUENCE_PARALLEL, adapter published to disk"
 fi
 
 # Weight-transfer flags, only under the Megatron backend. The router that
