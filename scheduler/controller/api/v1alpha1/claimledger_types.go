@@ -3,32 +3,32 @@ package v1alpha1
 import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // Seat is one workload's booking on a shared claim.
 type Seat struct {
-	// Workload is the Workload holding this seat. One seat per
-	// workload: booking is idempotent by name.
+	// Workload is the name of the Workload that holds this seat.
+	// A workload holds at most one seat.
 	Workload string `json:"workload"`
 
-	// WorkloadUID pins the seat to one incarnation of that workload. A
-	// deleted-and-recreated workload is a different identity; its stale
-	// seat must not be mistaken for the new one's booking.
-	WorkloadUID string `json:"workloadUID,omitempty"`
+	// WorkloadUID is the Kubernetes UID of that Workload. It tells a
+	// deleted-and-recreated workload apart from the one that booked this
+	// seat, so the new one does not reuse the old seat.
+	WorkloadUID types.UID `json:"workloadUID,omitempty"`
 
-	// AssignmentID names this particular booking. The same value is written
-	// to the workload's status and stamped into its pod, so the runtime can
-	// refuse an obsolete pod whose booking has been superseded.
+	// AssignmentID identifies this booking. The same value is written to
+	// the workload status and its pod; a pod carrying an old value is
+	// refused GPU access.
 	AssignmentID string `json:"assignmentID,omitempty"`
 
-	// Owner is the fairness unit the workload is served under, copied here
-	// so admission can prefer less-contended ledgers without reading every
-	// workload.
-	Owner string `json:"owner,omitempty"`
+	// OwnerID groups workloads that share one GPU turn; the API server sets
+	// it (the job for FFT workers, the shared base model for LoRA workers).
+	// Copied from the workload's spec.ownerId.
+	OwnerID string `json:"ownerId,omitempty"`
 
-	// HostRequest is the workload pod's memory request, copied here so
-	// admission can sum what the node must satisfy without reading every
-	// workload.
+	// HostRequest is the pod's host memory request. Copied here so
+	// placement can add up a node's load without reading every workload.
 	HostRequest resource.Quantity `json:"hostRequest,omitempty"`
 }
 

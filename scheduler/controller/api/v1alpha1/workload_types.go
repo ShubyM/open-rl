@@ -51,20 +51,13 @@ const (
 	TrainingKindLoRA TrainingKind = "lora"
 )
 
-// AcceleratorSpec is the estimator's accelerator requirement: how much
-// memory, across at most how many devices the runtime can drive.
+// AcceleratorSpec is the estimator's accelerator requirement. Every current
+// runtime drives exactly one device; a device-count field returns here only
+// when a runtime declares it can use a wider claim, so placement never
+// guesses a count the process cannot drive.
 type AcceleratorSpec struct {
-	// Memory is total peak accelerator memory, an aggregate across however
-	// many devices it takes. Never re-estimated.
+	// Memory is total peak accelerator memory. Never re-estimated.
 	Memory resource.Quantity `json:"memory"`
-
-	// MaxDeviceCount is the widest claim the runtime can drive. Current
-	// runtimes are single-device; a wider claim is usable only when the
-	// runtime declares it, so placement never guesses a device count the
-	// process cannot use.
-	// +kubebuilder:default=1
-	// +kubebuilder:validation:Minimum=1
-	MaxDeviceCount int32 `json:"maxDeviceCount,omitempty"`
 }
 
 // WorkloadSpec is one worker process's scheduling request. Memory arrives
@@ -183,7 +176,7 @@ type Workload struct {
 	// The spec is immutable: every field either places the worker or renders
 	// its pod, and V1 does not re-place or re-render a live worker. Change by
 	// deleting and recreating.
-	// +kubebuilder:validation:XValidation:rule="self.role == oldSelf.role && self.modelId == oldSelf.modelId && self.ownerId == oldSelf.ownerId && self.accelerator == oldSelf.accelerator",message="placement fields are immutable; delete and recreate the workload"
+	// +kubebuilder:validation:XValidation:rule="self.role == oldSelf.role && self.modelId == oldSelf.modelId && has(self.ownerId) == has(oldSelf.ownerId) && (!has(self.ownerId) || self.ownerId == oldSelf.ownerId) && self.accelerator == oldSelf.accelerator",message="placement fields are immutable; delete and recreate the workload"
 	Spec   WorkloadSpec   `json:"spec"`
 	Status WorkloadStatus `json:"status,omitempty"`
 }

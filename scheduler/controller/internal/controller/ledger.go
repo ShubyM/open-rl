@@ -35,9 +35,9 @@ func ledgerNameFor(claimName string) string {
 func newSeat(worker *openrlv1alpha1.Workload, request placement.Request) openrlv1alpha1.Seat {
 	return openrlv1alpha1.Seat{
 		Workload:     worker.Name,
-		WorkloadUID:  string(worker.UID),
+		WorkloadUID:  worker.UID,
 		AssignmentID: string(uuid.NewUUID()),
-		Owner:        request.OwnerKey(),
+		OwnerID:      request.OwnerKey(),
 		HostRequest:  *resource.NewQuantity(request.HostRequestBytes, resource.BinarySI),
 	}
 }
@@ -89,7 +89,12 @@ func (r *WorkloadReconciler) ensureSeat(ctx context.Context, claimName string, s
 			if existing.WorkloadUID == seat.WorkloadUID {
 				return &claimLedger, existing, nil // already booked; adopt it
 			}
-			*existing = seat // a predecessor's seat under our name: replace it
+			// A predecessor's seat under our name: replace it. Its pod may
+			// still be terminating, and that is tolerated by two guards: the
+			// deterministic pod name is a mutex (the successor pod cannot be
+			// created until the old one is gone), and the fresh assignment ID
+			// fences the old incarnation from ever regaining residency.
+			*existing = seat
 		} else {
 			claimLedger.Spec.Seats = append(claimLedger.Spec.Seats, seat)
 		}
@@ -114,7 +119,7 @@ func (r *WorkloadReconciler) ensureSeat(ctx context.Context, claimName string, s
 // pass: an allocated claim pins its device with or without pods, so a
 // seatless one must not idle a GPU waiting for the sweep. The sweep remains
 // the backstop for a controller that dies between the two deletions.
-func (r *WorkloadReconciler) releaseSeatAndReclaim(ctx context.Context, claimName, workloadName, workloadUID string) error {
+func (r *WorkloadReconciler) releaseSeatAndReclaim(ctx context.Context, claimName, workloadName string, workloadUID types.UID) error {
 	ledgerName := ledgerNameFor(claimName)
 	for attempt := 0; attempt < bookAttempts; attempt++ {
 		var claimLedger openrlv1alpha1.ClaimLedger

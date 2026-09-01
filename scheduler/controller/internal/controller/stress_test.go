@@ -236,9 +236,6 @@ func runStorm(t *testing.T, rng *rand.Rand, strategy placement.Strategy) {
 			nextID++
 			w := worker(name, "model-"+name, openrlv1alpha1.RoleTrainer, memories[rng.Intn(len(memories))])
 			if rng.Intn(3) == 0 {
-				w.Spec.Accelerator.MaxDeviceCount = 2
-			}
-			if rng.Intn(3) == 0 {
 				w.Spec.OwnerID = fmt.Sprintf("owner-%d", rng.Intn(3))
 			}
 			if err := r.Create(ctx, w); err != nil {
@@ -368,7 +365,7 @@ func checkLedger(t *testing.T, r *WorkloadReconciler, round int) {
 				t.Errorf("round %d: ledger %s seats %q, but no such workload exists", round, ledger.Name, seat.Workload)
 				continue
 			}
-			if string(w.UID) != seat.WorkloadUID && seat.WorkloadUID != "" {
+			if w.UID != seat.WorkloadUID && seat.WorkloadUID != "" {
 				t.Errorf("round %d: ledger %s seats %q under UID %s, live workload is %s",
 					round, ledger.Name, seat.Workload, seat.WorkloadUID, w.UID)
 			}

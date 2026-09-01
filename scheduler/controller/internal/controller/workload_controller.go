@@ -191,7 +191,7 @@ func (r *WorkloadReconciler) repairPlacementAssignment(ctx context.Context, scop
 			// The ledger can outlive its claim, and a booking held there would
 			// count against the node's host memory forever.
 			logger.Info("assigned claim no longer exists; releasing the seat and re-placing", "claim", scope.claimName, "worker", worker.Name)
-			if err := r.releaseSeatAndReclaim(ctx, scope.claimName, worker.Name, string(worker.UID)); err != nil {
+			if err := r.releaseSeatAndReclaim(ctx, scope.claimName, worker.Name, worker.UID); err != nil {
 				return placementPhaseResult{}, err
 			}
 			scope.claimName = ""
@@ -205,7 +205,7 @@ func (r *WorkloadReconciler) repairPlacementAssignment(ctx context.Context, scop
 			continue
 		}
 		logger.Info("releasing a stray seat", "claim", stray.Name, "worker", worker.Name)
-		if err := r.releaseSeatAndReclaim(ctx, stray.Name, worker.Name, string(worker.UID)); err != nil {
+		if err := r.releaseSeatAndReclaim(ctx, stray.Name, worker.Name, worker.UID); err != nil {
 			return placementPhaseResult{}, err
 		}
 	}
@@ -382,7 +382,7 @@ func (r *WorkloadReconciler) abandonWedgedClaim(ctx context.Context, worker *ope
 	}
 	// releaseSeatAndReclaim deletes the claim only when this was its last
 	// seat: a shared claim still backs its co-tenants, who lose nothing but us.
-	if err := r.releaseSeatAndReclaim(ctx, claimName, worker.Name, string(worker.UID)); err != nil {
+	if err := r.releaseSeatAndReclaim(ctx, claimName, worker.Name, worker.UID); err != nil {
 		return false, err
 	}
 	return true, r.patchStatus(ctx, worker, func(status *openrlv1alpha1.WorkloadStatus) {
@@ -423,7 +423,7 @@ func (r *WorkloadReconciler) fallBackToSharing(ctx context.Context, worker *open
 	// seat was booked, prefer it and give the speculative seat back.
 	var fresh resourcev1.ResourceClaim
 	if err := r.fleetReader().Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: claimName}, &fresh); err == nil && fresh.Status.Allocation != nil {
-		if err := r.releaseSeatAndReclaim(ctx, target.Name, worker.Name, string(worker.UID)); err != nil {
+		if err := r.releaseSeatAndReclaim(ctx, target.Name, worker.Name, worker.UID); err != nil {
 			return "", err
 		}
 		return claimName, nil
@@ -440,7 +440,7 @@ func (r *WorkloadReconciler) fallBackToSharing(ctx context.Context, worker *open
 	}
 	// Reclaiming the abandoned dedicated claim inline also retracts the
 	// autoscale signal the moment we stop wanting the node.
-	if err := r.releaseSeatAndReclaim(ctx, claimName, worker.Name, string(worker.UID)); err != nil {
+	if err := r.releaseSeatAndReclaim(ctx, claimName, worker.Name, worker.UID); err != nil {
 		return "", err
 	}
 	return target.Name, nil
@@ -473,7 +473,7 @@ func (r *WorkloadReconciler) teardown(ctx context.Context, worker *openrlv1alpha
 	// The pod is verifiably gone: give the seat back before the CR goes.
 	// Keyed by UID, so a successor incarnation's fresh seat survives this.
 	if worker.Status.ClaimName != "" {
-		if err := r.releaseSeatAndReclaim(ctx, worker.Status.ClaimName, worker.Name, string(worker.UID)); err != nil {
+		if err := r.releaseSeatAndReclaim(ctx, worker.Status.ClaimName, worker.Name, worker.UID); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -530,7 +530,7 @@ func (r *WorkloadReconciler) cutDedicatedClaim(ctx context.Context, worker *open
 	claim := &placement.Claim{Name: claimNameFor(worker)}
 	claim.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes)
 
-	_, seat, err := r.ensureSeat(ctx, claim.Name, newSeat(worker, request), true)
+	claimLedger, seat, err := r.ensureSeat(ctx, claim.Name, newSeat(worker, request), true)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -539,7 +539,18 @@ func (r *WorkloadReconciler) cutDedicatedClaim(ctx context.Context, worker *open
 	verb := "CreatedClaim: " + summary
 	log.FromContext(ctx).Info("cutting a claim", "claim", claim.Name, "worker", worker.Name, "tiers", summary)
 
-	if err := r.Create(ctx, r.buildClaim(claim.Name, tiers)); err != nil {
+	body := r.buildClaim(claim.Name, tiers)
+	// The ledger owns the claim. Retirement still deletes the ledger first --
+	// its absence stays the tombstone joiners honor -- and if the controller
+	// crashes before the follow-up claim delete, garbage collection finishes
+	// the job instead of leaving an allocated device orphaned.
+	body.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: openrlv1alpha1.GroupVersion.String(),
+		Kind:       "ClaimLedger",
+		Name:       claimLedger.Name,
+		UID:        claimLedger.UID,
+	}}
+	if err := r.Create(ctx, body); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return nil, nil, "", fmt.Errorf("create claim %s: %w", claim.Name, err)
 		}

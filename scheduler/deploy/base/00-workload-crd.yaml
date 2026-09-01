@@ -78,23 +78,11 @@ spec:
                 description: Accelerator is the estimator's requirement this workload
                   is placed by.
                 properties:
-                  maxDeviceCount:
-                    default: 1
-                    description: |-
-                      MaxDeviceCount is the widest claim the runtime can drive. Current
-                      runtimes are single-device; a wider claim is usable only when the
-                      runtime declares it, so placement never guesses a device count the
-                      process cannot use.
-                    format: int32
-                    minimum: 1
-                    type: integer
                   memory:
                     anyOf:
                     - type: integer
                     - type: string
-                    description: |-
-                      Memory is total peak accelerator memory, an aggregate across however
-                      many devices it takes. Never re-estimated.
+                    description: Memory is total peak accelerator memory. Never re-estimated.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
                 required:
@@ -435,7 +423,7 @@ spec:
                                             MatchLabelKeys is a set of pod label keys to select which pods will
                                             be taken into consideration. The keys are used to lookup values from the
                                             incoming pod labels, those key-value labels are merged with `labelSelector` as `key in (value)`
-                                            to select the ledger of existing pods which pods will be taken into consideration
+                                            to select the group of existing pods which pods will be taken into consideration
                                             for the incoming pod's pod (anti) affinity. Keys that don't exist in the incoming
                                             pod labels will be ignored. The default value is empty.
                                             The same key is forbidden to exist in both matchLabelKeys and labelSelector.
@@ -449,7 +437,7 @@ spec:
                                             MismatchLabelKeys is a set of pod label keys to select which pods will
                                             be taken into consideration. The keys are used to lookup values from the
                                             incoming pod labels, those key-value labels are merged with `labelSelector` as `key notin (value)`
-                                            to select the ledger of existing pods which pods will be taken into consideration
+                                            to select the group of existing pods which pods will be taken into consideration
                                             for the incoming pod's pod (anti) affinity. Keys that don't exist in the incoming
                                             pod labels will be ignored. The default value is empty.
                                             The same key is forbidden to exist in both mismatchLabelKeys and labelSelector.
@@ -616,7 +604,7 @@ spec:
                                         MatchLabelKeys is a set of pod label keys to select which pods will
                                         be taken into consideration. The keys are used to lookup values from the
                                         incoming pod labels, those key-value labels are merged with `labelSelector` as `key in (value)`
-                                        to select the ledger of existing pods which pods will be taken into consideration
+                                        to select the group of existing pods which pods will be taken into consideration
                                         for the incoming pod's pod (anti) affinity. Keys that don't exist in the incoming
                                         pod labels will be ignored. The default value is empty.
                                         The same key is forbidden to exist in both matchLabelKeys and labelSelector.
@@ -630,7 +618,7 @@ spec:
                                         MismatchLabelKeys is a set of pod label keys to select which pods will
                                         be taken into consideration. The keys are used to lookup values from the
                                         incoming pod labels, those key-value labels are merged with `labelSelector` as `key notin (value)`
-                                        to select the ledger of existing pods which pods will be taken into consideration
+                                        to select the group of existing pods which pods will be taken into consideration
                                         for the incoming pod's pod (anti) affinity. Keys that don't exist in the incoming
                                         pod labels will be ignored. The default value is empty.
                                         The same key is forbidden to exist in both mismatchLabelKeys and labelSelector.
@@ -795,7 +783,7 @@ spec:
                                             MatchLabelKeys is a set of pod label keys to select which pods will
                                             be taken into consideration. The keys are used to lookup values from the
                                             incoming pod labels, those key-value labels are merged with `labelSelector` as `key in (value)`
-                                            to select the ledger of existing pods which pods will be taken into consideration
+                                            to select the group of existing pods which pods will be taken into consideration
                                             for the incoming pod's pod (anti) affinity. Keys that don't exist in the incoming
                                             pod labels will be ignored. The default value is empty.
                                             The same key is forbidden to exist in both matchLabelKeys and labelSelector.
@@ -809,7 +797,7 @@ spec:
                                             MismatchLabelKeys is a set of pod label keys to select which pods will
                                             be taken into consideration. The keys are used to lookup values from the
                                             incoming pod labels, those key-value labels are merged with `labelSelector` as `key notin (value)`
-                                            to select the ledger of existing pods which pods will be taken into consideration
+                                            to select the group of existing pods which pods will be taken into consideration
                                             for the incoming pod's pod (anti) affinity. Keys that don't exist in the incoming
                                             pod labels will be ignored. The default value is empty.
                                             The same key is forbidden to exist in both mismatchLabelKeys and labelSelector.
@@ -976,7 +964,7 @@ spec:
                                         MatchLabelKeys is a set of pod label keys to select which pods will
                                         be taken into consideration. The keys are used to lookup values from the
                                         incoming pod labels, those key-value labels are merged with `labelSelector` as `key in (value)`
-                                        to select the ledger of existing pods which pods will be taken into consideration
+                                        to select the group of existing pods which pods will be taken into consideration
                                         for the incoming pod's pod (anti) affinity. Keys that don't exist in the incoming
                                         pod labels will be ignored. The default value is empty.
                                         The same key is forbidden to exist in both matchLabelKeys and labelSelector.
@@ -990,7 +978,7 @@ spec:
                                         MismatchLabelKeys is a set of pod label keys to select which pods will
                                         be taken into consideration. The keys are used to lookup values from the
                                         incoming pod labels, those key-value labels are merged with `labelSelector` as `key notin (value)`
-                                        to select the ledger of existing pods which pods will be taken into consideration
+                                        to select the group of existing pods which pods will be taken into consideration
                                         for the incoming pod's pod (anti) affinity. Keys that don't exist in the incoming
                                         pod labels will be ignored. The default value is empty.
                                         The same key is forbidden to exist in both mismatchLabelKeys and labelSelector.
@@ -6022,7 +6010,7 @@ spec:
                                 When the DRAWorkloadResourceClaims feature gate is enabled and the pod
                                 belongs to a PodGroup that defines a PodGroupResourceClaim with the same
                                 Name and ResourceClaimTemplateName, this PodResourceClaim resolves to the
-                                ResourceClaim generated for the PodGroup. All pods in the ledger that
+                                ResourceClaim generated for the PodGroup. All pods in the group that
                                 define an equivalent PodResourceClaim matching the
                                 PodGroupResourceClaim's Name and ResourceClaimTemplateName share the same
                                 generated ResourceClaim. ResourceClaims generated for a PodGroup are
@@ -6120,7 +6108,7 @@ spec:
                         type: string
                       runtimeClassName:
                         description: |-
-                          RuntimeClassName refers to a RuntimeClass object in the node.k8s.io ledger, which should be used
+                          RuntimeClassName refers to a RuntimeClass object in the node.k8s.io group, which should be used
                           to run this pod.  If no RuntimeClass resource matches the named class, the pod will not be run.
                           If unset or empty, the "legacy" RuntimeClass will be used, which is an implicit class with an
                           empty definition that uses the default runtime handler.
@@ -6158,21 +6146,21 @@ spec:
                         description: |-
                           SchedulingGroup provides a reference to the immediate scheduling runtime
                           grouping object that this Pod belongs to.
-                          This field is used by the scheduler to identify the ledger and apply the
-                          correct ledger scheduling policies. The association with a ledger also
+                          This field is used by the scheduler to identify the group and apply the
+                          correct group scheduling policies. The association with a group also
                           impacts other lifecycle aspects of a Pod that are relevant in a wider context
                           of scheduling like preemption, resource attachment, etc. If not specified,
                           the Pod is treated as a single unit in all of these aspects.
-                          The ledger object referenced by this field may not exist at the time the
+                          The group object referenced by this field may not exist at the time the
                           Pod is created.
-                          This field is immutable, but a ledger object with the same name may be
+                          This field is immutable, but a group object with the same name may be
                           recreated with different policies. Doing this during pod scheduling
                           may result in the placement not conforming to the expected policies.
                         properties:
                           podGroupName:
                             description: |-
                               PodGroupName specifies the name of the standalone PodGroup object
-                              that represents the runtime instance of this ledger.
+                              that represents the runtime instance of this group.
                               Must be a DNS subdomain.
                             type: string
                         type: object
@@ -6206,7 +6194,7 @@ spec:
                             type: object
                           fsGroup:
                             description: |-
-                              A special supplemental ledger that applies to all containers in a pod.
+                              A special supplemental group that applies to all containers in a pod.
                               Some volume types allow the Kubelet to change the ownership of that volume
                               to be owned by the pod:
 
@@ -6335,12 +6323,12 @@ spec:
                             type: object
                           supplementalGroups:
                             description: |-
-                              A list of ledgers applied to the first process run in each container, in
+                              A list of groups applied to the first process run in each container, in
                               addition to the container's primary GID and fsGroup (if specified).  If
                               the SupplementalGroupsPolicy feature is enabled, the
                               supplementalGroupsPolicy field determines whether these are in addition
-                              to or instead of any ledger memberships defined in the container image.
-                              If unspecified, no additional ledgers are added, though ledger memberships
+                              to or instead of any group memberships defined in the container image.
+                              If unspecified, no additional groups are added, though group memberships
                               defined in the container image may still be used, depending on the
                               supplementalGroupsPolicy field.
                               Note that this field cannot be set when spec.os.name is windows.
@@ -6351,7 +6339,7 @@ spec:
                             x-kubernetes-list-type: atomic
                           supplementalGroupsPolicy:
                             description: |-
-                              Defines how supplemental ledgers of the first container processes are calculated.
+                              Defines how supplemental groups of the first container processes are calculated.
                               Valid values are "Merge" and "Strict". If not specified, "Merge" is used.
                               (Alpha) Using the field requires the SupplementalGroupsPolicy feature gate to be enabled
                               and the container runtime must implement support for this feature.
@@ -6497,7 +6485,7 @@ spec:
                         x-kubernetes-list-type: atomic
                       topologySpreadConstraints:
                         description: |-
-                          TopologySpreadConstraints describes how a ledger of pods ought to spread across topology
+                          TopologySpreadConstraints describes how a group of pods ought to spread across topology
                           domains. Scheduler will schedule pods in a way which abides by the constraints.
                           All topologySpreadConstraints are ANDed.
                         items:
@@ -6558,7 +6546,7 @@ spec:
                                 MatchLabelKeys is a set of pod label keys to select the pods over which
                                 spreading will be calculated. The keys are used to lookup values from the
                                 incoming pod labels, those key-value labels are ANDed with labelSelector
-                                to select the ledger of existing pods over which spreading will be calculated
+                                to select the group of existing pods over which spreading will be calculated
                                 for the incoming pod. The same key is forbidden to exist in both MatchLabelKeys and LabelSelector.
                                 MatchLabelKeys cannot be set when LabelSelector isn't set.
                                 Keys that don't exist in the incoming pod labels will
@@ -7201,7 +7189,7 @@ spec:
                                           properties:
                                             apiGroup:
                                               description: |-
-                                                APIGroup is the ledger for the resource being referenced.
+                                                APIGroup is the group for the resource being referenced.
                                                 If APIGroup is not specified, the specified Kind must be in the core API group.
                                                 For any other third-party types, APIGroup is required.
                                               type: string
@@ -7246,7 +7234,7 @@ spec:
                                           properties:
                                             apiGroup:
                                               description: |-
-                                                APIGroup is the ledger for the resource being referenced.
+                                                APIGroup is the group for the resource being referenced.
                                                 If APIGroup is not specified, the specified Kind must be in the core API group.
                                                 For any other third-party types, APIGroup is required.
                                               type: string
@@ -8274,10 +8262,10 @@ spec:
                                 quobyte represents a Quobyte mount on the host that shares a pod's lifetime.
                                 Deprecated: Quobyte is deprecated and the in-tree quobyte type is no longer supported.
                               properties:
-                                ledger:
+                                group:
                                   description: |-
-                                    ledger to map volume access to
-                                    Default is no ledger
+                                    group to map volume access to
+                                    Default is no group
                                   type: string
                                 readOnly:
                                   description: |-
@@ -8635,7 +8623,8 @@ spec:
             x-kubernetes-validations:
             - message: placement fields are immutable; delete and recreate the workload
               rule: self.role == oldSelf.role && self.modelId == oldSelf.modelId &&
-                self.ownerId == oldSelf.ownerId && self.accelerator == oldSelf.accelerator
+                has(self.ownerId) == has(oldSelf.ownerId) && (!has(self.ownerId) ||
+                self.ownerId == oldSelf.ownerId) && self.accelerator == oldSelf.accelerator
           status:
             description: WorkloadStatus is what the controller decided and what came
               of it.

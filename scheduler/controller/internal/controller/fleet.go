@@ -85,7 +85,7 @@ func (r *WorkloadReconciler) readFleet(ctx context.Context) (*placement.Fleet, e
 			continue
 		}
 		for _, seat := range ledger.Spec.Seats {
-			claim.Book(seat.Workload, seat.Owner, seat.HostRequest.Value())
+			claim.Book(seat.Workload, seat.OwnerID, seat.HostRequest.Value())
 		}
 	}
 	return fleet, nil
@@ -248,8 +248,10 @@ func requestFrom(worker *openrlv1alpha1.Workload) placement.Request {
 		Owner: spec.OwnerID,
 		// The CR name: the one identity Kubernetes already guarantees unique.
 		// Model id is model configuration, not object identity.
-		WorkerID:         worker.Name,
-		MaxDevices:       int(spec.Accelerator.MaxDeviceCount),
+		WorkerID: worker.Name,
+		// Every current runtime drives one device; the spec regains a
+		// device-count field only when a runtime declares it can use more.
+		MaxDevices:       1,
 		HostRequestBytes: hostRequestBytes(worker),
 	}
 }

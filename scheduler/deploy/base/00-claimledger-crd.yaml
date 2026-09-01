@@ -75,36 +75,35 @@ spec:
                   properties:
                     assignmentID:
                       description: |-
-                        AssignmentID names this particular booking. The same value is written
-                        to the workload's status and stamped into its pod, so the runtime can
-                        refuse an obsolete pod whose booking has been superseded.
+                        AssignmentID identifies this booking. The same value is written to
+                        the workload status and its pod; a pod carrying an old value is
+                        refused GPU access.
                       type: string
                     hostRequest:
                       anyOf:
                       - type: integer
                       - type: string
                       description: |-
-                        HostRequest is the workload pod's memory request, copied here so
-                        admission can sum what the node must satisfy without reading every
-                        workload.
+                        HostRequest is the pod's host memory request. Copied here so
+                        placement can add up a node's load without reading every workload.
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
-                    owner:
+                    ownerId:
                       description: |-
-                        Owner is the fairness unit the workload is served under, copied here
-                        so admission can prefer less-contended ledgers without reading every
-                        workload.
+                        OwnerID groups workloads that share one GPU turn; the API server sets
+                        it (the job for FFT workers, the shared base model for LoRA workers).
+                        Copied from the workload's spec.ownerId.
                       type: string
                     workload:
                       description: |-
-                        Workload is the Workload holding this seat. One seat per
-                        workload: booking is idempotent by name.
+                        Workload is the name of the Workload that holds this seat.
+                        A workload holds at most one seat.
                       type: string
                     workloadUID:
                       description: |-
-                        WorkloadUID pins the seat to one incarnation of that workload. A
-                        deleted-and-recreated workload is a different identity; its stale
-                        seat must not be mistaken for the new one's booking.
+                        WorkloadUID is the Kubernetes UID of that Workload. It tells a
+                        deleted-and-recreated workload apart from the one that booked this
+                        seat, so the new one does not reuse the old seat.
                       type: string
                   required:
                   - workload

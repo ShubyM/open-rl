@@ -106,15 +106,16 @@ is written by whoever observes the fact: the controller writes
 | Worker Pod      | Runtime process consuming the claim              | Placement controller (GC parent: its Workload) |
 
 Owner here means the entity that decides the object's content and lifecycle,
-not a Kubernetes `ownerReference`. Only one garbage-collection reference
-exists: the worker Pod carries a controller reference to its Workload.
-ClaimLedgers are shared between workloads, so no single workload can own them
-for garbage collection. The claim could carry an ownerReference to its ledger,
-but we do not use one yet. Deletion order matters: ledger first, then claim,
-each step conditional. GC would add a second deleter that does not follow
-that order. The controller manages both deletions itself (section 8);
-adopting the ownerReference so GC finishes the claim's half after the ledger
-goes is recorded under Future work.
+not a Kubernetes `ownerReference`. Two garbage-collection references exist:
+the worker Pod carries a controller reference to its Workload, and each
+claim carries an ownerReference to its ClaimLedger. ClaimLedgers are shared
+between workloads, so no single workload can own them for garbage
+collection. Deletion order matters — ledger first, then claim, each step
+conditional — and the controller still performs both deletions itself
+(section 8); the claim's ownerReference is a backstop, not a second
+deleter: if the controller crashes between the two deletes, garbage
+collection finishes the claim's half instead of orphaning an allocated
+device.
 
 The API server and placement controller communicate only through Kubernetes
 objects. The API server does not query accelerator inventory, choose claims, or
@@ -289,7 +290,6 @@ spec:
 
   accelerator:
     memory: 60Gi
-    maxDeviceCount: 1
 
   workerContainerName: worker
 
@@ -314,8 +314,9 @@ spec:
             memory: "100Gi"
 ```
 
-`accelerator.maxDeviceCount` is the widest claim the runtime can drive --
-one today, since no shipped runtime is multi-device. `workerContainerName`
+Every shipped runtime drives exactly one device, so the spec carries no
+device count; an `accelerator.maxDeviceCount` field returns when a runtime
+declares it can use a wider claim (section 12). `workerContainerName`
 names the container in the template that consumes the accelerator; the
 claim reference and the controller's stamps land on that container.
 
@@ -1163,9 +1164,9 @@ each shippable alone:
    sampler workloads, fanned out and routed by the API server. No scheduler
    change.
 2. **Multi-device claims:** a workload requests `count x size` (the tier
-   compiler and `maxDeviceCount` already carry counts); such claims take one
-   seat and are never time-slice shared. This unlocks the TP-4 sampler and
-   FSDP-4 trainer.
+   compiler already carries counts; the spec regains a `maxDeviceCount`
+   field); such claims take one seat and are never time-slice shared. This
+   unlocks the TP-4 sampler and FSDP-4 trainer.
 3. **One claim, one request per role:** trainer and sampler requests in a
    single claim allocate atomically on one host, so co-location is
    guaranteed by the single allocation. Seats gain a request dimension: different requests run
@@ -1205,10 +1206,7 @@ Future work includes:
 * GPU-memory caching of inactive workers;
 * runtime-gate verification: the time-slicer checking seat, assignment, and
   Pod stamps against the API server before granting residency (today's
-  workers are trusted to obey the gate cooperatively);
-* an ownerReference from each claim to its ledger, handing the second half
-  of retirement to Kubernetes' garbage collector and closing the
-  crash-orphan gap of section 8.
+  workers are trusted to obey the gate cooperatively).
 
 ## Controller conventions
 

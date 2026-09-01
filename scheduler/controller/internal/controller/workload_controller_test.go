@@ -408,35 +408,22 @@ func TestReconcileRejectsPlacementShapedTemplates(t *testing.T) {
 	}
 }
 
-// The device count is derived from memory, bounded by the shape the runtime
-// declared: 120Gi on 96Gi devices needs two of them, and the worker gets
-// them only because its spec says the runtime can drive two.
-func TestReconcileDerivesTheDeviceCountFromMemory(t *testing.T) {
+// Every shipped runtime drives one device, so memory that fits no single
+// device is unplaceable: placement never guesses a device count the process
+// cannot use. (Multi-device claims return with a runtime that declares them;
+// design doc section 12.)
+func TestOversizedMemoryStaysPendingOnSingleDeviceRuntimes(t *testing.T) {
 	big := worker("w-big", "model-big", openrlv1alpha1.RoleTrainer, "120Gi")
-	big.Spec.Accelerator.MaxDeviceCount = 2
 	r := newReconciler(t, append(enabledNode(), big)...)
 
 	runReconcile(t, r, "w-big")
 
-	var claim resourcev1.ResourceClaim
-	if err := r.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: claimOf(t, r, "w-big")}, &claim); err != nil {
-		t.Fatal(err)
+	status := getWorker(t, r, "w-big").Status
+	if status.Phase != openrlv1alpha1.PhasePending {
+		t.Errorf("phase = %s, want Pending for a 120Gi worker on single-device runtimes", status.Phase)
 	}
-	tiers := claim.Spec.Devices.Requests[0].FirstAvailable
-	if len(tiers) != 1 || tiers[0].Count != 2 {
-		t.Fatalf("firstAvailable = %+v, want one two-device tier: 120Gi does not fit one 96Gi device", tiers)
-	}
-	if cel := tiers[0].Selectors[0].CEL.Expression; !strings.Contains(cel, `quantity("60Gi")) >= 0`) {
-		t.Errorf("tier CEL = %q, want a 60Gi per-device floor", cel)
-	}
-
-	// The same worker without the declaration stays pending: placement never
-	// guesses a device count the process cannot use.
-	undeclared := worker("w-undeclared", "model-big", openrlv1alpha1.RoleTrainer, "120Gi")
-	r2 := newReconciler(t, append(enabledNode(), undeclared)...)
-	runReconcile(t, r2, "w-undeclared")
-	if status := getWorker(t, r2, "w-undeclared").Status; status.Phase != openrlv1alpha1.PhasePending {
-		t.Errorf("phase = %s, want Pending for an undeclared 120Gi single-device worker", status.Phase)
+	if status.ClaimName != "" {
+		t.Errorf("claim = %q, want none: no single device fits 120Gi", status.ClaimName)
 	}
 }
 
