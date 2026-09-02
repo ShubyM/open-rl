@@ -26,23 +26,28 @@ type Tier struct {
 	CeilingBytes int64
 }
 
-// Catalog is the fleet's device shapes as seen by one role: what exists,
-// never what is free. Sizes merge across nodes; the per-node device count
-// bound keeps a tier from asking one node for more devices than any single
-// node of that size offers.
+// Catalog is the fleet's device shapes as seen by one role. It says what
+// exists, never what is free. Sizes are bucketed by whole GiB so that
+// 79.65Gi and 80Gi devices form one tier, sized by the smaller so the fit
+// holds on both. MaxPerNode keeps a tier from asking one node for more
+// devices than any node of that size has.
 func Catalog(fleet *Fleet, role string) []Size {
-	bySize := map[int64]int{}
+	bySize := map[int64]Size{}
 	for _, node := range fleet.Nodes {
 		if !node.Accepts(role) || node.DeviceMemoryBytes <= 0 || node.DeviceCount < 1 {
 			continue
 		}
-		if node.DeviceCount > bySize[node.DeviceMemoryBytes] {
-			bySize[node.DeviceMemoryBytes] = node.DeviceCount
+		bucket := CeilGiB(node.DeviceMemoryBytes)
+		size := bySize[bucket]
+		if size.DeviceMemoryBytes == 0 || node.DeviceMemoryBytes < size.DeviceMemoryBytes {
+			size.DeviceMemoryBytes = node.DeviceMemoryBytes
 		}
+		size.MaxPerNode = max(size.MaxPerNode, node.DeviceCount)
+		bySize[bucket] = size
 	}
 	catalog := make([]Size, 0, len(bySize))
-	for memory, count := range bySize {
-		catalog = append(catalog, Size{DeviceMemoryBytes: memory, MaxPerNode: count})
+	for _, size := range bySize {
+		catalog = append(catalog, size)
 	}
 	return catalog
 }
@@ -117,7 +122,7 @@ func PreferTightFit(fleet *Fleet, req Request) []NodePreference {
 	for i, tier := range tiers[:len(tiers)-1] {
 		var names []string
 		for name, node := range fleet.Nodes {
-			if node.Accepts(req.Role) && node.DeviceMemoryBytes == tier.CeilingBytes {
+			if node.Accepts(req.Role) && CeilGiB(node.DeviceMemoryBytes) == CeilGiB(tier.CeilingBytes) {
 				names = append(names, name)
 			}
 		}

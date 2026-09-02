@@ -111,15 +111,17 @@ func (r *WorkloadReconciler) ensureSeat(ctx context.Context, claimName string, s
 	return nil, nil, errBookingContended
 }
 
-// releaseSeatAndReclaim removes one workload incarnation's seat via one CAS
-// loop. A missing ClaimLedger or missing seat is success: the seat is gone.
-// Releasing the last seat retires the ClaimLedger itself -- deleted against the
-// resourceVersion that showed it empty, so a joiner booking concurrently
-// bumps the version and keeps the ClaimLedger -- and deletes the claim in the same
-// pass: an allocated claim pins its device with or without pods, so a
-// seatless one must not idle a GPU waiting for the sweep. The sweep remains
-// the backstop for a controller that dies between the two deletions.
-func (r *WorkloadReconciler) releaseSeatAndReclaim(ctx context.Context, claimName, workloadName string, workloadUID types.UID) error {
+// releaseSeatAndReclaim removes the seat under a workload name via one CAS
+// loop. It matches by name, not UID. A seat under our name is either ours
+// or was left by an earlier workload with the same name, and nothing else
+// would ever release that one. A missing ledger or seat counts as released.
+//
+// Releasing the last seat deletes the ledger, conditioned on the version
+// that showed it empty so a concurrent join wins, and then deletes the
+// claim, since an allocated claim pins its GPU with or without pods. If the
+// controller dies between the two deletes, the claim's owner reference lets
+// GC finish.
+func (r *WorkloadReconciler) releaseSeatAndReclaim(ctx context.Context, claimName, workloadName string) error {
 	ledgerName := ledgerNameFor(claimName)
 	for attempt := 0; attempt < bookAttempts; attempt++ {
 		var claimLedger openrlv1alpha1.ClaimLedger
@@ -132,7 +134,7 @@ func (r *WorkloadReconciler) releaseSeatAndReclaim(ctx context.Context, claimNam
 
 		kept := claimLedger.Spec.Seats[:0]
 		for _, seat := range claimLedger.Spec.Seats {
-			if seat.Workload == workloadName && seat.WorkloadUID == workloadUID {
+			if seat.Workload == workloadName {
 				continue
 			}
 			kept = append(kept, seat)
@@ -170,6 +172,24 @@ func (r *WorkloadReconciler) deleteClaim(ctx context.Context, claimName string) 
 		return fmt.Errorf("reclaim claim %s: %w", claimName, err)
 	}
 	return nil
+}
+
+// seatedClaims lists every claim whose ledger seats this workload name. It
+// reads ledgers rather than the fleet, so seats whose claim is already gone
+// are included. It reads from the cache, which can miss a seat but never
+// invent one, and the release re-reads consistently.
+func (r *WorkloadReconciler) seatedClaims(ctx context.Context, workloadName string) ([]string, error) {
+	var ledgers openrlv1alpha1.ClaimLedgerList
+	if err := r.List(ctx, &ledgers, client.InNamespace(r.Namespace), client.MatchingLabels{LabelManaged: "true"}); err != nil {
+		return nil, fmt.Errorf("list claim ledgers: %w", err)
+	}
+	var claims []string
+	for i := range ledgers.Items {
+		if findSeat(&ledgers.Items[i], workloadName) != nil {
+			claims = append(claims, ledgers.Items[i].Spec.ClaimName)
+		}
+	}
+	return claims, nil
 }
 
 // findSeat returns the seat held under a workload name, or nil.

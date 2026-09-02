@@ -66,6 +66,12 @@ vet:
 test:
 	go test ./... -race -count=1
 
+# The placement storm (internal/controller/stress_test.go). Minutes under
+# -race, so it is behind a build tag and not part of `test`.
+.PHONY: stress
+stress:
+	go test ./internal/controller/ -tags stress -run TestPlacementStorm -count=1 -timeout 30m
+
 .PHONY: build
 build:
 	go build -o bin/manager ./cmd/manager

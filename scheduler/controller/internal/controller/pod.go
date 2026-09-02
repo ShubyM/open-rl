@@ -78,15 +78,17 @@ func claimNameFor(worker *openrlv1alpha1.Workload) string {
 	return "claim-" + name + "-" + uid
 }
 
-// buildClaim renders the tiers as ordered firstAvailable alternatives with
-// CEL memory bounds: floor = the worker's share, ceiling = the priced device
-// size, so DRA cannot substitute a bigger device the order never reached.
-// No node selector -- that is kube-scheduler's call.
+// buildClaim renders the tiers as ordered firstAvailable alternatives, each
+// bounded by a CEL memory floor and ceiling. The floor is written in exact
+// bytes because devices report fractional sizes (an 80GB A100 is ~79.65Gi)
+// and a floor rounded up to whole GiB could exceed the device. The ceiling
+// rounds up, which admits nothing new. There is no node selector; that is
+// kube-scheduler's call.
 func (r *WorkloadReconciler) buildClaim(claimName string, tiers []placement.Tier) *resourcev1.ResourceClaim {
 	subrequests := make([]resourcev1.DeviceSubRequest, len(tiers))
 	for i, tier := range tiers {
-		bounds := fmt.Sprintf(`device.capacity["%s"].memory.compareTo(quantity("%dGi")) >= 0 && device.capacity["%s"].memory.compareTo(quantity("%dGi")) <= 0`,
-			r.DeviceDriver, placement.CeilGiB(tier.FloorBytes), r.DeviceDriver, placement.CeilGiB(tier.CeilingBytes))
+		bounds := fmt.Sprintf(`device.capacity["%s"].memory.compareTo(quantity("%d")) >= 0 && device.capacity["%s"].memory.compareTo(quantity("%dGi")) <= 0`,
+			r.DeviceDriver, tier.FloorBytes, r.DeviceDriver, placement.CeilGiB(tier.CeilingBytes))
 		subrequests[i] = resourcev1.DeviceSubRequest{
 			Name:            tier.Name,
 			DeviceClassName: r.DeviceClass,

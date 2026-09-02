@@ -53,6 +53,7 @@ scheduler/controller/             the Go module
 │   │                             the fallback move, the abandon
 │   └── stress_test.go            the placement storm: random fleets, churn,
 │   │                             concurrent reconciles, invariants per round
+│   │                             (build tag stress; `make stress`)
 │
 └── cmd/manager/main.go           flags/env -> Manager -> run. Boilerplate.
 

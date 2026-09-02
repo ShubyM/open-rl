@@ -20,7 +20,7 @@ spec:
     - jsonPath: .spec.role
       name: Role
       type: string
-    - jsonPath: .spec.ownerId
+    - jsonPath: .spec.ownerID
       name: Owner
       type: string
     - jsonPath: .status.deviceCount
@@ -95,14 +95,14 @@ spec:
                 required:
                 - memory
                 type: object
-              modelId:
+              modelID:
                 description: |-
                   ModelID names the model this worker serves: configuration for the
                   worker process and the humans reading kubectl get, never identity.
                   The worker's identity is metadata.name.
                 minLength: 1
                 type: string
-              ownerId:
+              ownerID:
                 description: |-
                   OwnerID is the unit of fairness: the runtime serves owners round-robin,
                   so an owner never gets extra turns for having more processes, requests,
@@ -8623,15 +8623,15 @@ spec:
                 type: string
             required:
             - accelerator
-            - modelId
+            - modelID
             - role
             - template
             type: object
             x-kubernetes-validations:
             - message: placement fields are immutable; delete and recreate the workload
-              rule: self.role == oldSelf.role && self.modelId == oldSelf.modelId &&
-                has(self.ownerId) == has(oldSelf.ownerId) && (!has(self.ownerId) ||
-                self.ownerId == oldSelf.ownerId) && self.accelerator == oldSelf.accelerator
+              rule: self.role == oldSelf.role && self.modelID == oldSelf.modelID &&
+                has(self.ownerID) == has(oldSelf.ownerID) && (!has(self.ownerID) ||
+                self.ownerID == oldSelf.ownerID) && self.accelerator == oldSelf.accelerator
           status:
             description: WorkloadStatus is what the controller decided and what came
               of it.

@@ -87,14 +87,14 @@ type WorkloadSpec struct {
 	// worker process and the humans reading kubectl get, never identity.
 	// The worker's identity is metadata.name.
 	// +kubebuilder:validation:MinLength=1
-	ModelID string `json:"modelId"`
+	ModelID string `json:"modelID"`
 
 	// OwnerID is the unit of fairness: the runtime serves owners round-robin,
 	// so an owner never gets extra turns for having more processes, requests,
 	// or adapters. Opaque to the controller, never read by placement -- one
 	// worker is resident at a time whatever the owners. A worker naming no
 	// owner is an owner of one.
-	OwnerID string `json:"ownerId,omitempty"`
+	OwnerID string `json:"ownerID,omitempty"`
 
 	// TrainingKind records whether this runtime is full fine-tuning or LoRA.
 	// Informational: reuse was already decided in the workload's name.
@@ -170,7 +170,7 @@ type WorkloadStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=owl
 // +kubebuilder:printcolumn:name="Role",type=string,JSONPath=`.spec.role`
-// +kubebuilder:printcolumn:name="Owner",type=string,JSONPath=`.spec.ownerId`
+// +kubebuilder:printcolumn:name="Owner",type=string,JSONPath=`.spec.ownerID`
 // +kubebuilder:printcolumn:name="GPUs",type=integer,JSONPath=`.status.deviceCount`
 // +kubebuilder:printcolumn:name="MemEach",type=string,JSONPath=`.status.memoryPerDevice`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
@@ -190,7 +190,7 @@ type Workload struct {
 	// The spec is immutable: every field either places the worker or renders
 	// its pod, and V1 does not re-place or re-render a live worker. Change by
 	// deleting and recreating.
-	// +kubebuilder:validation:XValidation:rule="self.role == oldSelf.role && self.modelId == oldSelf.modelId && has(self.ownerId) == has(oldSelf.ownerId) && (!has(self.ownerId) || self.ownerId == oldSelf.ownerId) && self.accelerator == oldSelf.accelerator",message="placement fields are immutable; delete and recreate the workload"
+	// +kubebuilder:validation:XValidation:rule="self.role == oldSelf.role && self.modelID == oldSelf.modelID && has(self.ownerID) == has(oldSelf.ownerID) && (!has(self.ownerID) || self.ownerID == oldSelf.ownerID) && self.accelerator == oldSelf.accelerator",message="placement fields are immutable; delete and recreate the workload"
 	Spec   WorkloadSpec   `json:"spec"`
 	Status WorkloadStatus `json:"status,omitempty"`
 }

@@ -218,7 +218,7 @@ including:
 Placement is not part of the runtime key: identity must survive the workload
 moving between dedicated and shared ledgers, so nothing the placement
 controller decides may feed back into the name. A shared LoRA runtime's
-`ownerId` is its runtime key (the base-model identity). Jobs attaching and
+`ownerID` is its runtime key (the base-model identity). Jobs attaching and
 detaching do not change the seat's fairness identity.
 
 The API server chooses a runtime instance and creates deterministic workload
@@ -285,8 +285,8 @@ metadata:
 spec:
   role: trainer
   trainingKind: fft
-  modelId: job-123
-  ownerId: job-123
+  modelID: job-123
+  ownerID: job-123
 
   accelerator:
     memory: 60Gi
@@ -484,7 +484,7 @@ spec:
   - workload:
       name: fft-job-123-trainer
       uid: 4f164c5e-7e3f-4dc3-a6ec-6997db852f52
-    ownerId: job-123
+    ownerID: job-123
     assignmentId: 6f04fe8d-7971-480d-aee5-5ee228c4da3f
     hostRequest: 100Gi
 ```
@@ -606,10 +606,10 @@ correctness mechanism.
 ## 6. Placement and autoscaling
 
 Placement is one arc, and the strategy flag only decides which end of it a
-worker enters from. Under the default `spread`, every workload first asks
-for its own GPU and only the cluster's refusal moves it onto shared
-capacity; under `binpack` (below), the first move is a seat and the
-dedicated claim is the fallback. This section walks the arc: the dedicated
+worker enters from. Under the default `binpack` (below), the first move is
+a seat on an existing ledger and the dedicated claim is the fallback; under
+`spread`, every workload first asks for its own GPU and only the cluster's
+refusal moves it onto shared capacity. This section walks the arc: the dedicated
 attempt, the device-size ordering inside it, the fallback on the
 unschedulable verdict, who may join a shared ledger, and how a placement
 that goes wrong is unwound.
@@ -710,7 +710,7 @@ spec:
         - cel:
             expression: >-
               device.capacity["gpu.nvidia.com"].memory
-                .compareTo(quantity("20Gi")) >= 0 &&
+                .compareTo(quantity("21474836480")) >= 0 &&
               device.capacity["gpu.nvidia.com"].memory
                 .compareTo(quantity("24Gi")) <= 0
       - name: t1x48
@@ -718,6 +718,12 @@ spec:
       - name: t1x80
         # ... floor 20Gi, ceiling 80Gi
 ```
+
+The floor is written in exact bytes and the ceiling in whole GiB. Drivers
+publish fractional sizes (an 80 GB A100 reports about 79.65 GiB), so a
+floor rounded up to whole GiB would ask such a device for more than it has
+whenever the share lands in that last fraction; a ceiling rounded up admits
+nothing new, since catalog shapes are bucketed by whole GiB.
 
 The allocation result names the winning subrequest (`request: gpu/t1x24`),
 which is how the controller learns what it actually got and records the tier
@@ -765,9 +771,9 @@ timer but the `binpack` strategy below: it cuts a claim only when nothing
 can seat the worker, so every pending claim is an honest scale-up request
 and stands until answered.
 
-A second placement policy sits behind a flag, not a timer:
-`--placement-strategy` (`OPEN_RL_PLACEMENT_STRATEGY`) selects `spread` --
-the default, everything described above -- or `binpack`.
+The policy sits behind a flag, not a timer: `--placement-strategy`
+(`OPEN_RL_PLACEMENT_STRATEGY`) selects `binpack`, the default, or `spread`,
+the dedicated-first arc described above.
 
 * **Claim-affinity first (`binpack`):** book a seat on an eligible ledger
   before cutting a claim at all; only a workload no ledger can seat cuts a
@@ -1175,7 +1181,7 @@ each shippable alone:
    simultaneously on disjoint devices; the same request time-slices.
 
 Client metadata (`create_model(..., meta)`) carries only intrinsic topology:
-DP width and TP degree per role. Co-location comes from `ownerId`. A recipe
+DP width and TP degree per role. Co-location comes from `ownerID`. A recipe
 that declares its full shape up front gets the stage-3 claim. An interactive
 session that discovers sampling later relies on owner-affinity at sampler
 arrival time.
@@ -1243,11 +1249,12 @@ host requests, or runtime time-slicing membership.
 **Serial full-fleet placement.** Rejected because placement throughput would
 depend on repeated fleet scans and a single active writer.
 
-**Share before asking for a dedicated GPU (bin-pack first) as the default.**
-Rejected as a default, offered as a policy: on a fixed fleet it strands
-throughput by leaving GPUs idle while workers time-slice, and without
-migration it is a one-way door. Available behind
-`--placement-strategy=binpack`; spread-first remains the default (section 6).
+**Ask for a dedicated GPU before sharing (spread first) as the default.**
+Offered as a policy, not the default: on a fixed fleet it keeps GPUs busy,
+but on an autoscaled pool every arrival cuts a claim it retracts moments
+later, so the autoscaler sees demand that vanishes before it can act.
+Bin-pack first makes every pending claim an honest scale-up request.
+Available behind `--placement-strategy=spread` (section 6).
 
 **Wait on a timer for scale-out.** An earlier revision held pending workers
 for a grace period so a cluster autoscaler could provision a node. Rejected:

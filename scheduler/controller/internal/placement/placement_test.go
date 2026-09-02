@@ -203,17 +203,12 @@ func TestTiersPreferTheTightestFit(t *testing.T) {
 	}
 }
 
-// Host admission sums the assigned pods' memory requests -- what the node
-// must actually satisfy, resident or parked -- and fairness counts distinct
-// owners, not workers.
-func TestHostBytesSumTheAssignedPods(t *testing.T) {
+// Fairness counts distinct owners, not workers.
+func TestOwnersCountFairnessUnits(t *testing.T) {
 	claim := &Claim{Name: "c", DeviceCount: 1, Node: "n"}
 	claim.Book("trainer-a", "job-a", gib(40))
 	claim.Book("sampler-a", "job-a", gib(20))
 
-	if got, want := claim.HostBytesWith(gib(30)), gib(90); got != want {
-		t.Errorf("HostBytesWith = %d, want %d", got, want)
-	}
 	if got := claim.Owners(); got != 1 {
 		t.Errorf("Owners = %d, want 1: a trainer and sampler of one job are one fairness unit", got)
 	}
@@ -305,5 +300,45 @@ func TestPreferTightFitIsSilentWithoutAChoice(t *testing.T) {
 	uniform.Nodes["b"] = l4Node("b", "trainer")
 	if prefs := PreferTightFit(uniform, Request{Role: "trainer", WorkerID: "w", Memory: gib(10)}); prefs != nil {
 		t.Fatalf("prefs = %+v, want none on a single-shape fleet", prefs)
+	}
+}
+
+// A device the driver reports at 79.65Gi and one it reports at 80Gi are the
+// same shape: one catalog entry, sized by the smaller so the fit holds on
+// either, and both nodes earn the same tight-fit rung. Bucketed by whole
+// GiB, so the tier list is the same however the map iterates.
+func TestCatalogBucketsSubGiBSizes(t *testing.T) {
+	fleet := NewFleet()
+	fleet.Nodes["exact"] = bigNode("exact", 1, 80, "trainer")
+	fleet.Nodes["short"] = bigNode("short", 1, 80, "trainer")
+	fleet.Nodes["short"].DeviceMemoryBytes = gib(80) - 360*1024*1024 // ~79.65Gi
+	fleet.Nodes["big"] = bigNode("big", 1, 96, "trainer")
+
+	catalog := Catalog(fleet, "trainer")
+	if len(catalog) != 2 {
+		t.Fatalf("Catalog = %+v, want two shapes: one 80Gi bucket and 96Gi", catalog)
+	}
+	for _, size := range catalog {
+		if CeilGiB(size.DeviceMemoryBytes) == 80 && size.DeviceMemoryBytes != fleet.Nodes["short"].DeviceMemoryBytes {
+			t.Errorf("80Gi bucket sized %d, want the smaller device %d", size.DeviceMemoryBytes, fleet.Nodes["short"].DeviceMemoryBytes)
+		}
+	}
+
+	// 10Gi: the 80Gi tier leads, and its rung names both 80Gi-class nodes.
+	prefs := PreferTightFit(fleet, trainer("w", 10))
+	if len(prefs) != 1 || strings.Join(prefs[0].Nodes, ",") != "exact,short" {
+		t.Fatalf("PreferTightFit = %+v, want one rung naming exact and short", prefs)
+	}
+}
+
+// Binpack is the default: an unset strategy shares first and cuts a claim
+// only when no ledger can seat the worker.
+func TestDefaultStrategyIsBinPack(t *testing.T) {
+	got, err := ParseStrategy("")
+	if err != nil || got != StrategyBinPack {
+		t.Fatalf("ParseStrategy(\"\") = %q, %v; want binpack", got, err)
+	}
+	if _, err := ParseStrategy("sideways"); err == nil {
+		t.Error("an unknown strategy was accepted")
 	}
 }

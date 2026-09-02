@@ -236,8 +236,9 @@ Use the make targets; they are the same commands CI runs:
 ```bash
 make -C scheduler/controller fmt-check vet manifests-check test
 ```
-The suite needs no GPUs and no cluster. `test` runs with `-race`; expect the
-placement stress test to take a few minutes.
+The suite needs no GPUs and no cluster and runs in seconds with `-race`. The
+placement storm is behind a build tag because it takes minutes; run it with
+`make -C scheduler/controller stress` before touching the ledger or placement.
 
 ### Generated Files (`Rule`)
 `scheduler/deploy/base/00-workload-crd.yaml`, `00-claimledger-crd.yaml`, and

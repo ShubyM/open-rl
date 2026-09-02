@@ -24,8 +24,8 @@ type Seat struct {
 
 	// OwnerID groups workloads that share one GPU turn; the API server sets
 	// it (the job for FFT workers, the shared base model for LoRA workers).
-	// Copied from the workload's spec.ownerId.
-	OwnerID string `json:"ownerId,omitempty"`
+	// Copied from the workload's spec.ownerID.
+	OwnerID string `json:"ownerID,omitempty"`
 
 	// HostRequest is the pod's host memory request. Copied here so
 	// placement can add up a node's load without reading every workload.

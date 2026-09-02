@@ -11,8 +11,8 @@ metadata:
   name: fft-job-a-trainer
 spec:
   role: trainer                # which node pools may host it
-  modelId: job-a               # its identity everywhere
-  ownerId: Qwen/Qwen3-0.6B     # optional: the unit of fairness it belongs to
+  modelID: job-a               # its identity everywhere
+  ownerID: Qwen/Qwen3-0.6B     # optional: the unit of fairness it belongs to
   accelerator:
     memory: 28Gi               # peak accelerator memory, from the estimator
   template:                    # the complete worker pod, inline
@@ -63,6 +63,7 @@ played through the same decisions the controller makes.
 
 ```
 go test ./...
+make stress    # the placement storm; slow, not part of go test ./...
 ```
 
 For the pipeline — real API server, real kube-scheduler, real DRA — there is

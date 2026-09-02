@@ -131,14 +131,19 @@ func (r *WorkloadReconciler) poolsFrom(ctx context.Context, slices []resourcev1.
 				"node", node.Name, "driver", r.DeviceDriver)
 			continue
 		}
-		// A node naming no role labels allows both roles.
+		// No role labels means both roles. A label set to "false" denies
+		// that role and does not fall back to both. This mirrors the pod
+		// affinity, so placement never offers a node the pod cannot land on.
 		pool.Roles = map[string]bool{}
+		labeled := false
 		for role, label := range nodeRoleLabel {
-			if node.Labels[label] == "true" {
+			value, present := node.Labels[label]
+			labeled = labeled || present
+			if value == "true" {
 				pool.Roles[string(role)] = true
 			}
 		}
-		if len(pool.Roles) == 0 {
+		if !labeled {
 			for role := range nodeRoleLabel {
 				pool.Roles[string(role)] = true
 			}

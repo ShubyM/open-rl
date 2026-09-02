@@ -1,3 +1,8 @@
+//go:build stress
+
+// Behind a build tag because it is slow: minutes under -race, so it is not
+// part of `make test`. Run it with `make stress`.
+
 package controller
 
 import (
@@ -105,7 +110,16 @@ func randomFleet(rng *rand.Rand) []pool {
 	return pools
 }
 
-var celGi = regexp.MustCompile(`quantity\("(\d+)Gi"\)`)
+var celQuantity = regexp.MustCompile(`quantity\("(\d+)(Gi)?"\)`)
+
+// celBytes reads one CEL bound: exact bytes, or whole GiB.
+func celBytes(match []string) int64 {
+	n, _ := strconv.ParseInt(match[1], 10, 64)
+	if match[2] == "Gi" {
+		return n * placement.GiB
+	}
+	return n
+}
 
 // playDRA allocates pending claims the way the real allocator would: walk
 // each claim's tiers in order and satisfy the first whose bounds admit a
@@ -134,11 +148,10 @@ func playDRA(t *testing.T, r *WorkloadReconciler, rng *rand.Rand, pools []pool) 
 		}
 	tiers:
 		for _, tier := range claim.Spec.Devices.Requests[0].FirstAvailable {
-			bounds := celGi.FindAllStringSubmatch(tier.Selectors[0].CEL.Expression, 2)
-			floor, _ := strconv.ParseInt(bounds[0][1], 10, 64)
-			ceiling, _ := strconv.ParseInt(bounds[1][1], 10, 64)
+			bounds := celQuantity.FindAllStringSubmatch(tier.Selectors[0].CEL.Expression, 2)
+			floor, ceiling := celBytes(bounds[0]), celBytes(bounds[1])
 			for _, p := range pools {
-				if p.sizeGiB < floor || p.sizeGiB > ceiling {
+				if size := p.sizeGiB * placement.GiB; size < floor || size > ceiling {
 					continue
 				}
 				if p.devices-used[p.name] < int(tier.Count) {

@@ -7,6 +7,9 @@ kind: Kustomization
 # real manifests instead of shell fixups.
 resources:
   - ../../base
+  # A smoke cluster has no control plane, so the overlay supplies the
+  # service account the base expects to exist.
+  - serviceaccount.yaml
 
 images:
   - name: ghcr.io/gke-labs/open-rl/scheduler

@@ -1,7 +1,7 @@
 // Package v1alpha1 contains the Workload API, the placement request the
 // gateway writes for every worker process it wants running.
 //
-// See docs/designs/012-dynamic-placement.md.
+// See scheduler/docs/design.md.
 // +kubebuilder:object:generate=true
 // +groupName=openrl.io
 package v1alpha1

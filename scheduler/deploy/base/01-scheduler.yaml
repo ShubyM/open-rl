@@ -7,13 +7,9 @@
 # watches an empty namespace and does nothing. Seat booking is
 # CAS-arbitrated, so reconciles run concurrently; the leader lease keeps a
 # rolling update from running two processes at once.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  # The shared OpenRL control-plane account (same identity the gateway and
-  # workers use in k8s/deploy); the roles below add what the scheduler needs.
-  name: open-rl-sa
----
+# The scheduler runs as the shared OpenRL control-plane account, open-rl-sa,
+# which the control-plane manifests in k8s/deploy create. This file does not
+# declare it; the roles below only add what the scheduler needs.
 # Cluster-scoped only for reading nodes: the scheduler must see the capacity
 # labels (openrl.io/enabled, /trainer, /sampler) to know which nodes accept
 # which role, and the node's allocatable memory, which is what bounds how many

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -51,7 +52,7 @@ type WorkloadReconciler struct {
 	// forever, indistinguishable from one that is merely queued.
 	PlacementTimeout time.Duration
 	// PlacementStrategy orders the two placement moves; the zero value reads
-	// as spread.
+	// as binpack.
 	PlacementStrategy placement.Strategy
 	// MaxConcurrentReconciles is how many workers place at once.
 	MaxConcurrentReconciles int
@@ -188,28 +189,49 @@ func (r *WorkloadReconciler) repairPlacementAssignment(ctx context.Context, scop
 	}
 	if scope.claimName != "" {
 		if _, live := scope.fleet.Claims[scope.claimName]; !live {
+			// The fleet is read from the cache and can lag a claim created
+			// last pass. Confirm first, or a false "gone" deletes a live claim.
+			if r.claimExists(ctx, scope.claimName) {
+				return placementPhaseResult{done: true, result: ctrl.Result{RequeueAfter: r.RetryInterval}}, nil
+			}
 			// The ledger can outlive its claim, and a booking held there would
 			// count against the node's host memory forever.
 			logger.Info("assigned claim no longer exists; releasing the seat and re-placing", "claim", scope.claimName, "worker", worker.Name)
-			if err := r.releaseSeatAndReclaim(ctx, scope.claimName, worker.Name, worker.UID); err != nil {
+			if err := r.releaseSeatAndReclaim(ctx, scope.claimName, worker.Name); err != nil {
 				return placementPhaseResult{}, err
 			}
 			scope.claimName = ""
 		}
 	}
-	// One seat per worker, on its own claim only. A status write lost after
-	// a seat move strands a booking on a ledger this worker no longer tracks,
-	// and no other path revisits it: teardown releases only the status claim.
-	for _, stray := range scope.fleet.Claims {
-		if stray.Name == scope.claimName || !stray.Booked(worker.Name) {
+	// One seat per worker. Any other seat under this name is stale, left by
+	// a lost status write after a move or by an earlier workload with the
+	// same name.
+	seated, err := r.seatedClaims(ctx, worker.Name)
+	if err != nil {
+		return placementPhaseResult{}, err
+	}
+	for _, stray := range seated {
+		if stray == scope.claimName {
 			continue
 		}
-		logger.Info("releasing a stray seat", "claim", stray.Name, "worker", worker.Name)
-		if err := r.releaseSeatAndReclaim(ctx, stray.Name, worker.Name, worker.UID); err != nil {
+		// Unassigned but seated on our own claim means the status write
+		// after the cut was lost. The re-cut below adopts it, so leave it.
+		if scope.claimName == "" && stray == claimNameFor(worker) {
+			continue
+		}
+		logger.Info("releasing a stray seat", "claim", stray, "worker", worker.Name)
+		if err := r.releaseSeatAndReclaim(ctx, stray, worker.Name); err != nil {
 			return placementPhaseResult{}, err
 		}
 	}
 	return placementPhaseResult{}, nil
+}
+
+// claimExists reads one claim past the cache. Terminating counts as gone.
+func (r *WorkloadReconciler) claimExists(ctx context.Context, claimName string) bool {
+	var claim resourcev1.ResourceClaim
+	err := r.fleetReader().Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: claimName}, &claim)
+	return err == nil && claim.DeletionTimestamp == nil
 }
 
 func (r *WorkloadReconciler) applyPlacementFallbacks(ctx context.Context, scope *placementScope) (placementPhaseResult, error) {
@@ -229,6 +251,15 @@ func (r *WorkloadReconciler) ensurePlacementClaim(ctx context.Context, scope *pl
 	worker := scope.worker
 	if scope.claimName == "" {
 		claim, seat, verb, err := r.assign(ctx, worker, scope.request, scope.fleet)
+		if errors.Is(err, errClaimTerminating) {
+			// This is a wait, not a capacity verdict, so the placement
+			// timeout does not apply.
+			reason := "WaitingForPredecessorClaim: " + err.Error()
+			return placementPhaseResult{done: true, result: ctrl.Result{RequeueAfter: r.RetryInterval}}, r.patchStatus(ctx, worker, func(status *openrlv1alpha1.WorkloadStatus) {
+				status.Phase, status.Reason = openrlv1alpha1.PhasePending, reason
+				setCondition(status, metav1.ConditionFalse, "WaitingForPredecessorClaim", reason)
+			})
+		}
 		if err != nil {
 			return placementPhaseResult{}, err
 		}
@@ -382,7 +413,7 @@ func (r *WorkloadReconciler) abandonWedgedClaim(ctx context.Context, worker *ope
 	}
 	// releaseSeatAndReclaim deletes the claim only when this was its last
 	// seat: a shared claim still backs its co-tenants, who lose nothing but us.
-	if err := r.releaseSeatAndReclaim(ctx, claimName, worker.Name, worker.UID); err != nil {
+	if err := r.releaseSeatAndReclaim(ctx, claimName, worker.Name); err != nil {
 		return false, err
 	}
 	return true, r.patchStatus(ctx, worker, func(status *openrlv1alpha1.WorkloadStatus) {
@@ -423,7 +454,7 @@ func (r *WorkloadReconciler) fallBackToSharing(ctx context.Context, worker *open
 	// seat was booked, prefer it and give the speculative seat back.
 	var fresh resourcev1.ResourceClaim
 	if err := r.fleetReader().Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: claimName}, &fresh); err == nil && fresh.Status.Allocation != nil {
-		if err := r.releaseSeatAndReclaim(ctx, target.Name, worker.Name, worker.UID); err != nil {
+		if err := r.releaseSeatAndReclaim(ctx, target.Name, worker.Name); err != nil {
 			return "", err
 		}
 		return claimName, nil
@@ -440,7 +471,7 @@ func (r *WorkloadReconciler) fallBackToSharing(ctx context.Context, worker *open
 	}
 	// Reclaiming the abandoned dedicated claim inline also retracts the
 	// autoscale signal the moment we stop wanting the node.
-	if err := r.releaseSeatAndReclaim(ctx, claimName, worker.Name, worker.UID); err != nil {
+	if err := r.releaseSeatAndReclaim(ctx, claimName, worker.Name); err != nil {
 		return "", err
 	}
 	return target.Name, nil
@@ -450,9 +481,8 @@ func (r *WorkloadReconciler) fallBackToSharing(ctx context.Context, worker *open
 // it, the memory booking -- survives until its pod is verifiably gone.
 const workerFinalizer = "openrl.io/placement"
 
-// teardown drives a deleting worker: delete its pod, wait for the process to
-// actually exit, then let the CR go. Releasing the last seat reclaims the
-// claim inline; the sweep only backstops a crash between the two.
+// teardown drives a deleting worker: delete its pod, wait until it is gone,
+// release its seats, then remove the finalizer.
 func (r *WorkloadReconciler) teardown(ctx context.Context, worker *openrlv1alpha1.Workload) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(worker, workerFinalizer) {
 		return ctrl.Result{}, nil
@@ -470,10 +500,17 @@ func (r *WorkloadReconciler) teardown(ctx context.Context, worker *openrlv1alpha
 		// Still terminating: the seat stays booked until it is gone.
 		return ctrl.Result{RequeueAfter: r.RetryInterval}, nil
 	}
-	// The pod is verifiably gone: give the seat back before the CR goes.
-	// Keyed by UID, so a successor incarnation's fresh seat survives this.
+	// The pod is gone. Release every seat under this name, not just the one
+	// in status, because a seat the status never recorded has no other way out.
+	seated, err := r.seatedClaims(ctx, worker.Name)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	if worker.Status.ClaimName != "" {
-		if err := r.releaseSeatAndReclaim(ctx, worker.Status.ClaimName, worker.Name, worker.UID); err != nil {
+		seated = append(seated, worker.Status.ClaimName)
+	}
+	for _, claimName := range seated {
+		if err := r.releaseSeatAndReclaim(ctx, claimName, worker.Name); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -503,9 +540,9 @@ func (r *WorkloadReconciler) joinExistingClaim(ctx context.Context, worker *open
 // assign orders joining and claim creation according to the configured strategy.
 func (r *WorkloadReconciler) assign(ctx context.Context, worker *openrlv1alpha1.Workload, request placement.Request, fleet *placement.Fleet) (*placement.Claim, *openrlv1alpha1.Seat, string, error) {
 	switch r.PlacementStrategy {
-	case "", placement.StrategySpread:
+	case placement.StrategySpread:
 		return r.cutDedicatedClaim(ctx, worker, request, fleet)
-	case placement.StrategyBinPack:
+	case "", placement.StrategyBinPack:
 		target, seat, err := r.joinExistingClaim(ctx, worker, request, fleet, "")
 		if err != nil {
 			return nil, nil, "", err
@@ -520,6 +557,10 @@ func (r *WorkloadReconciler) assign(ctx context.Context, worker *openrlv1alpha1.
 	}
 }
 
+// errClaimTerminating means the worker's previous dedicated claim is still
+// being deleted. It is a wait, not a capacity verdict.
+var errClaimTerminating = errors.New("the worker's previous claim is still being deleted")
+
 // cutDedicatedClaim books the first seat, then creates an ordered set of DRA alternatives.
 func (r *WorkloadReconciler) cutDedicatedClaim(ctx context.Context, worker *openrlv1alpha1.Workload, request placement.Request, fleet *placement.Fleet) (*placement.Claim, *openrlv1alpha1.Seat, string, error) {
 	tiers := placement.Tiers(request, placement.Catalog(fleet, request.Role))
@@ -527,19 +568,39 @@ func (r *WorkloadReconciler) cutDedicatedClaim(ctx context.Context, worker *open
 		return nil, nil, "", nil
 	}
 
-	claim := &placement.Claim{Name: claimNameFor(worker)}
-	claim.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes)
+	name := claimNameFor(worker)
+	// The name is UID-derived, so an existing claim is this worker's own,
+	// either created earlier or abandoned and still terminating. Check before
+	// booking a seat, so a wait does not leave a ledger with no claim.
+	var existing resourcev1.ResourceClaim
+	err := r.fleetReader().Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: name}, &existing)
+	switch {
+	case err == nil && existing.DeletionTimestamp != nil:
+		return nil, nil, "", errClaimTerminating
+	case err != nil && !apierrors.IsNotFound(err):
+		return nil, nil, "", fmt.Errorf("read claim %s: %w", name, err)
+	}
+	found := err == nil
 
-	claimLedger, seat, err := r.ensureSeat(ctx, claim.Name, newSeat(worker, request), true)
+	claim := &placement.Claim{Name: name}
+	claim.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes)
+	claimLedger, seat, err := r.ensureSeat(ctx, name, newSeat(worker, request), true)
 	if err != nil {
 		return nil, nil, "", err
 	}
 
 	summary := tierSummary(tiers)
 	verb := "CreatedClaim: " + summary
-	log.FromContext(ctx).Info("cutting a claim", "claim", claim.Name, "worker", worker.Name, "tiers", summary)
+	if found {
+		// Adopt the cluster's copy -- it may already be allocated.
+		adopted := claimFrom(&existing)
+		adopted.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes)
+		fleet.Claims[adopted.Name] = adopted
+		return adopted, seat, verb, nil
+	}
+	log.FromContext(ctx).Info("cutting a claim", "claim", name, "worker", worker.Name, "tiers", summary)
 
-	body := r.buildClaim(claim.Name, tiers)
+	body := r.buildClaim(name, tiers)
 	// The ledger owns the claim. Retirement still deletes the ledger first --
 	// its absence stays the tombstone joiners honor -- and if the controller
 	// crashes before the follow-up claim delete, garbage collection finishes
@@ -550,28 +611,12 @@ func (r *WorkloadReconciler) cutDedicatedClaim(ctx context.Context, worker *open
 		Name:       claimLedger.Name,
 		UID:        claimLedger.UID,
 	}}
+	// The consistent read above said absent and one worker never reconciles
+	// concurrently, so AlreadyExists here is a real error.
 	if err := r.Create(ctx, body); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return nil, nil, "", fmt.Errorf("create claim %s: %w", claim.Name, err)
-		}
-		// Claim names are UID-derived, so an existing claim is this same
-		// incarnation's earlier create. Adopt the cluster's copy -- it may
-		// already be allocated.
-		var existing resourcev1.ResourceClaim
-		if err := r.fleetReader().Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: claim.Name}, &existing); err != nil {
-			return nil, nil, "", fmt.Errorf("read existing claim %s: %w", claim.Name, err)
-		}
-		if existing.DeletionTimestamp != nil {
-			// Our abandoned predecessor, still held by DRA's finalizer.
-			// Wait it out rather than adopting a dying claim.
-			return nil, nil, "", nil
-		}
-		adopted := claimFrom(&existing)
-		adopted.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes)
-		fleet.Claims[adopted.Name] = adopted
-		return adopted, seat, verb, nil
+		return nil, nil, "", fmt.Errorf("create claim %s: %w", name, err)
 	}
-	fleet.Claims[claim.Name] = claim
+	fleet.Claims[name] = claim
 	return claim, seat, verb, nil
 }
 

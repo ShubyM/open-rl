@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,9 @@ func newReconciler(t *testing.T, objects ...client.Object) *WorkloadReconciler {
 		DeviceDriver:     testDriver,
 		RetryInterval:    time.Second,
 		PlacementTimeout: time.Hour,
+		// The scripted tests reason about one dedicated claim per worker, so
+		// they pin spread. Binpack tests set it explicitly; the storm runs both.
+		PlacementStrategy: placement.StrategySpread,
 	}
 }
 
@@ -339,8 +343,8 @@ func TestReconcilePlacesUnplacedWorker(t *testing.T) {
 		t.Fatalf("firstAvailable = %+v, want one single-device tier", tiers)
 	}
 	cel := tiers[0].Selectors[0].CEL.Expression
-	if !strings.Contains(cel, `quantity("24Gi")) >= 0`) || !strings.Contains(cel, `quantity("96Gi")) <= 0`) {
-		t.Errorf("claim CEL = %q, want a 24Gi floor and a 96Gi ceiling", cel)
+	if !strings.Contains(cel, fmt.Sprintf(`quantity("%d")) >= 0`, 24*placement.GiB)) || !strings.Contains(cel, `quantity("96Gi")) <= 0`) {
+		t.Errorf("claim CEL = %q, want a 24Gi floor in exact bytes and a 96Gi ceiling", cel)
 	}
 
 	// The pod is created on the pass after the claim, so reconcile again.
@@ -926,5 +930,54 @@ func TestReconcileReportsAnUnplaceableWorkerAsPending(t *testing.T) {
 	}
 	if getPod(t, r, "orw-w-a") != nil {
 		t.Error("a pod was created for a worker that was never placed")
+	}
+}
+
+// The CEL floor is exact bytes: a share rounded up to whole GiB would ask a
+// 79.65Gi device for 80Gi whenever the request lands in its last fraction,
+// and the claim would never allocate. The ceiling still rounds up.
+func TestClaimFloorIsExactBytes(t *testing.T) {
+	r := newReconciler(t, enabledNode()...)
+	device := 80*placement.GiB - 360*1024*1024 // ~79.65Gi
+	floor := 79*placement.GiB + 512*1024*1024  // 79.5Gi: fits the device, rounds up past it
+	claim := r.buildClaim("claim-x", []placement.Tier{{Name: "t1x80", Count: 1, FloorBytes: floor, CeilingBytes: device}})
+
+	expr := claim.Spec.Devices.Requests[0].FirstAvailable[0].Selectors[0].CEL.Expression
+	if want := fmt.Sprintf(`quantity("%d")) >= 0`, floor); !strings.Contains(expr, want) {
+		t.Errorf("floor: %s\nwant it to contain %s", expr, want)
+	}
+	if want := `quantity("80Gi")) <= 0`; !strings.Contains(expr, want) {
+		t.Errorf("ceiling: %s\nwant it to contain %s", expr, want)
+	}
+}
+
+// A role label set to "false" names the role and denies it, exactly as the
+// pod affinity reads it; only a node naming neither role takes both.
+func TestRoleLabelFalseDeniesTheRole(t *testing.T) {
+	r := newReconciler(t)
+	roles := func(labels map[string]string) (trainer, sampler bool) {
+		t.Helper()
+		objects := enabledNode()
+		node := objects[0].(*corev1.Node)
+		slice := objects[1].(*resourcev1.ResourceSlice)
+		node.Labels = map[string]string{NodeLabelEnabled: "true"}
+		for k, v := range labels {
+			node.Labels[k] = v
+		}
+		pool := r.poolsFrom(context.Background(), []resourcev1.ResourceSlice{*slice}, []corev1.Node{*node})[testNode]
+		if pool == nil {
+			t.Fatal("the enabled node was dropped from the fleet")
+		}
+		return pool.Accepts("trainer"), pool.Accepts("sampler")
+	}
+
+	if tr, sa := roles(nil); !tr || !sa {
+		t.Errorf("no role labels: trainer=%v sampler=%v, want both", tr, sa)
+	}
+	if tr, sa := roles(map[string]string{NodeLabelTrainer: "false", NodeLabelSampler: "true"}); tr || !sa {
+		t.Errorf("trainer=false sampler=true: trainer=%v sampler=%v, want sampler only", tr, sa)
+	}
+	if tr, sa := roles(map[string]string{NodeLabelTrainer: "false"}); tr || sa {
+		t.Errorf("trainer=false alone: trainer=%v sampler=%v, want neither -- the affinity admits neither", tr, sa)
 	}
 }

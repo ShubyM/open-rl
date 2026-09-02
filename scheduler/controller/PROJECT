@@ -6,14 +6,14 @@
 # markers on the types) and this file is what makes the CLI and its plugins
 # recognise it, so `kubebuilder create api` and `kubebuilder edit` work here.
 #
-# One deviation from a stock scaffold: there is no config/ kustomize tree. This
-# repo deploys every component from k8s/deploy, and a second deploy path would
-# be a second thing to keep correct. `make manifests` generates the CRD straight
-# into k8s/deploy/dra-placement instead.
+# One deviation from a stock scaffold: there is no config/ kustomize tree. The
+# scheduler deploys from scheduler/deploy, and a second deploy path would be a
+# second thing to keep correct. `make manifests` generates the CRDs straight
+# into scheduler/deploy/base instead.
 domain: openrl.io
 layout:
 - go.kubebuilder.io/v4
-projectName: open-rl-placement-controller
+projectName: open-rl-scheduler
 repo: github.com/gke-labs/open-rl/scheduler/controller
 resources:
 - api:
@@ -21,7 +21,14 @@ resources:
     namespaced: true
   controller: true
   domain: openrl.io
-  kind: OpenRLWorker
+  kind: Workload
+  path: github.com/gke-labs/open-rl/scheduler/controller/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: openrl.io
+  kind: ClaimLedger
   path: github.com/gke-labs/open-rl/scheduler/controller/api/v1alpha1
   version: v1alpha1
 version: "3"

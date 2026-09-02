@@ -7,7 +7,7 @@ kind: Kustomization
 # acts on Workload objects, and nothing creates those until the gateway is
 # pointed at it.
 #
-#   kubectl apply -k k8s/deploy/scheduler
+#   kubectl apply -k scheduler/deploy/base
 #   kubectl label node <node> openrl.io/enabled=true openrl.io/trainer=true
 #   kubectl get workloads -n openrl-system -w
 namespace: openrl-system

@@ -17,10 +17,10 @@ import (
 // GiB is the unit every memory figure here is reported in.
 const GiB int64 = 1 << 30
 
-// Strategy orders the two placement moves. Spread cuts a dedicated claim
-// first and shares when the cluster says no; BinPack seats a worker on an
-// existing ledger first and cuts a claim only when none can hold it. The
-// zero value reads as spread.
+// Strategy orders the two placement moves. BinPack seats a worker on an
+// existing ledger first and cuts a claim only when none can hold it; Spread
+// cuts a dedicated claim first and shares when the cluster says no. The
+// zero value reads as binpack.
 type Strategy string
 
 const (
@@ -29,19 +29,19 @@ const (
 )
 
 // ParseStrategy validates an operator-supplied strategy name; empty means
-// spread.
+// binpack.
 func ParseStrategy(name string) (Strategy, error) {
 	switch Strategy(name) {
-	case "", StrategySpread:
-		return StrategySpread, nil
-	case StrategyBinPack:
+	case "", StrategyBinPack:
 		return StrategyBinPack, nil
+	case StrategySpread:
+		return StrategySpread, nil
 	}
 	return "", fmt.Errorf("unknown placement strategy %q: want %q or %q", name, StrategySpread, StrategyBinPack)
 }
 
-// CeilGiB rounds a byte count up to whole GiB. The one rounding rule for
-// every figure the scheduler reports or writes into a CEL selector.
+// CeilGiB rounds a byte count up to whole GiB. Used for reported figures,
+// tier names and CEL ceilings; CEL floors stay in exact bytes.
 func CeilGiB(bytes int64) int64 {
 	return (bytes + GiB - 1) / GiB
 }
@@ -127,18 +127,6 @@ func (c *Claim) Owners() int {
 		owners[b.owner] = true
 	}
 	return len(owners)
-}
-
-// HostBytesWith is the host memory the claim's node must satisfy if one more
-// pod requesting hostBytes joins: the sum of every assigned pod's request.
-// The pods all sit on the claim's node whether resident or parked, so their
-// requests -- which carry the parking headroom -- must fit together.
-func (c *Claim) HostBytesWith(hostBytes int64) int64 {
-	total := hostBytes
-	for _, b := range c.booked {
-		total += b.hostBytes
-	}
-	return total
 }
 
 // Fleet is everything placement decides against.

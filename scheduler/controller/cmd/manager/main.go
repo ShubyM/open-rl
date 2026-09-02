@@ -2,7 +2,7 @@
 //
 // It watches Workload resources and reconciles each into a DRA
 // ResourceClaim and a worker pod, letting Kubernetes pick the devices and the
-// node. See docs/designs/012-dynamic-placement.md.
+// node. See scheduler/docs/design.md.
 package main
 
 import (
@@ -60,8 +60,8 @@ func main() {
 	flag.DurationVar(&retryInterval, "retry-interval", envDuration("OPEN_RL_RECONCILE_INTERVAL", 10*time.Second), "How often an unplaced worker is retried.")
 	flag.DurationVar(&placementTimeout, "placement-timeout", envDuration("OPEN_RL_PLACEMENT_TIMEOUT", 15*time.Minute),
 		"How long a worker may go unplaced before the request is declared unsatisfiable. 0 waits forever.")
-	flag.StringVar(&strategy, "placement-strategy", env("OPEN_RL_PLACEMENT_STRATEGY", string(placement.StrategySpread)),
-		"spread cuts a dedicated claim per worker, sharing only as a fallback; binpack seats workers on existing claims before cutting new ones.")
+	flag.StringVar(&strategy, "placement-strategy", env("OPEN_RL_PLACEMENT_STRATEGY", string(placement.StrategyBinPack)),
+		"binpack seats workers on existing claims before cutting new ones; spread cuts a dedicated claim per worker, sharing only as a fallback.")
 	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", envInt("OPEN_RL_MAX_CONCURRENT_RECONCILES", 4),
 		"How many workers place at once. Seat booking is CAS-arbitrated, so concurrency risks only transient over-cut claims, which the sharing fallback drains.")
 

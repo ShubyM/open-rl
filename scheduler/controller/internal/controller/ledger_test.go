@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -313,5 +314,109 @@ func TestJoinNeverResurrectsARetiringGroup(t *testing.T) {
 	expectGone(t, r, &openrlv1alpha1.ClaimLedger{}, ledgerNameFor("claim-orphan"))
 	if got := claimOf(t, r, "w-a"); got == "claim-orphan" {
 		t.Fatal("worker seated on a retiring claim")
+	}
+}
+
+// An earlier workload with the same name, deleted before its own repair
+// pass, can leave a seat under our name with its UID. The stray release is
+// by name, so our next reconcile removes it and it stops counting against
+// the node.
+func TestPredecessorsStraySeatIsReleased(t *testing.T) {
+	r := newReconciler(t, append(enabledNode(), trainerWorker("w-a", "model-a"), trainerWorker("w-b", "model-b"))...)
+	settle(t, r, "w-a")
+	settle(t, r, "w-b")
+
+	ledger := getLedger(t, r, ledgerNameFor(claimOf(t, r, "w-b")))
+	ledger.Spec.Seats = append(ledger.Spec.Seats, openrlv1alpha1.Seat{Workload: "w-a", WorkloadUID: "old-workload", AssignmentID: "stale"})
+	if err := r.Update(context.Background(), ledger); err != nil {
+		t.Fatal(err)
+	}
+
+	runReconcile(t, r, "w-a")
+	ledger = getLedger(t, r, ledgerNameFor(claimOf(t, r, "w-b")))
+	if findSeat(ledger, "w-a") != nil {
+		t.Errorf("the old workload's seat survived our reconcile: %+v", ledger.Spec.Seats)
+	}
+	if findSeat(ledger, "w-b") == nil {
+		t.Error("the release took the rightful tenant's seat with it")
+	}
+	if findSeat(getLedger(t, r, ledgerNameFor(claimOf(t, r, "w-a"))), "w-a") == nil {
+		t.Error("w-a lost its own seat")
+	}
+}
+
+// Teardown releases every seat under the name, not just the one the status
+// records: a booking a lost status write never recorded would otherwise
+// outlive its workload, with nothing left to release it.
+func TestTeardownReleasesSeatsTheStatusForgot(t *testing.T) {
+	r := newReconciler(t, append(enabledNode(), trainerWorker("w-a", "model-a"), trainerWorker("w-b", "model-b"))...)
+	settle(t, r, "w-a")
+	settle(t, r, "w-b")
+
+	// Strand a seat on w-b's ledger behind w-a's status, then delete w-a
+	// with no pod left to wait for.
+	wa := getWorker(t, r, "w-a")
+	if _, _, err := r.ensureSeat(context.Background(), claimOf(t, r, "w-b"), newSeat(wa, requestFrom(wa)), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), getPod(t, r, "orw-w-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), wa); err != nil {
+		t.Fatal(err)
+	}
+	runReconcile(t, r, "w-a")
+
+	expectGone(t, r, &openrlv1alpha1.Workload{}, "w-a")
+	ledger := getLedger(t, r, ledgerNameFor(claimOf(t, r, "w-b")))
+	if findSeat(ledger, "w-a") != nil {
+		t.Errorf("the stranded seat outlived its workload: %+v", ledger.Spec.Seats)
+	}
+	if findSeat(ledger, "w-b") == nil {
+		t.Error("the release took the rightful tenant's seat with it")
+	}
+}
+
+// A worker re-cutting its dedicated claim while DRA's finalizer still holds
+// the one it abandoned waits, and the wait is named for what it is: not a
+// capacity verdict, so the placement clock does not run, and no ledger is
+// seated on a claim that does not exist.
+func TestWaitsForATerminatingPredecessorClaim(t *testing.T) {
+	w := trainerWorker("w-a", "model-a")
+	w.UID = "11111111-aaaa-bbbb-cccc-dddddddddddd"
+	w.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+	dying := &resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: claimNameFor(w), Namespace: testNamespace,
+		Labels:     map[string]string{LabelManaged: "true"},
+		Finalizers: []string{"resource.kubernetes.io/delete-protection"},
+	}}
+	r := newReconciler(t, append(enabledNode(), w, dying)...)
+	r.PlacementTimeout = time.Minute
+	if err := r.Delete(context.Background(), dying); err != nil {
+		t.Fatal(err)
+	}
+
+	result := runReconcile(t, r, "w-a")
+	if result.RequeueAfter != r.RetryInterval {
+		t.Errorf("requeueAfter = %v, want %v", result.RequeueAfter, r.RetryInterval)
+	}
+	after := getWorker(t, r, "w-a")
+	if after.Status.Phase != openrlv1alpha1.PhasePending || !strings.Contains(after.Status.Reason, "WaitingForPredecessorClaim") {
+		t.Fatalf("status = %s %q, want Pending WaitingForPredecessorClaim despite the expired clock", after.Status.Phase, after.Status.Reason)
+	}
+	expectGone(t, r, &openrlv1alpha1.ClaimLedger{}, ledgerNameFor(claimNameFor(w)))
+
+	// The finalizer lets go: the next passes cut the claim afresh.
+	var claim resourcev1.ResourceClaim
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: claimNameFor(w)}, &claim); err != nil {
+		t.Fatal(err)
+	}
+	claim.Finalizers = nil
+	if err := r.Update(context.Background(), &claim); err != nil {
+		t.Fatal(err)
+	}
+	settle(t, r, "w-a")
+	if got := claimOf(t, r, "w-a"); got != claimNameFor(w) {
+		t.Fatalf("placed on %q, want the fresh %q", got, claimNameFor(w))
 	}
 }
