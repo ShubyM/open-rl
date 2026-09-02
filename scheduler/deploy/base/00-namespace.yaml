@@ -1,0 +1,8 @@
+# Every namespaced OpenRL object -- workloads, claim groups, claims, worker
+# pods, and the scheduler itself -- lives here. Workers reaching services in
+# other namespaces (Redis, shared storage) need fully-qualified names and a
+# PVC bound in this namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openrl-system

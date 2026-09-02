@@ -18,6 +18,9 @@ jobs:
           - image_name: client
             context: .
             dockerfile: examples/autoresearch/Dockerfile
+          - image_name: scheduler
+            context: scheduler/controller
+            dockerfile: scheduler/controller/Dockerfile
     permissions:
       contents: read
     steps:

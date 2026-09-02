@@ -1,0 +1,123 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: claimledgers.openrl.io
+spec:
+  group: openrl.io
+  names:
+    kind: ClaimLedger
+    listKind: ClaimLedgerList
+    plural: claimledgers
+    shortNames:
+    - ocl
+    singular: claimledger
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.claimName
+      name: Claim
+      type: string
+    - jsonPath: .spec.seats[*].workload
+      name: Seats
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClaimLedger records who sits on one shared ResourceClaim. It exists
+          so that seat booking is arbitrated by etcd instead of by controller
+          serialization: reconciles run concurrently, and a stale booking costs a
+          conflict retry rather than a double-booked device.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ClaimLedgerSpec is the seating chart for one managed ResourceClaim.
+              Membership lives here and nowhere else; updates race through
+              resourceVersion, so two controllers booking the last seat cannot both
+              win -- one write lands, the other conflicts, re-reads, and re-checks.
+            properties:
+              claimName:
+                description: |-
+                  ClaimName is the ResourceClaim this ledger seats. The ledger shares the
+                  claim's name; this field makes the pairing survive a rename audit.
+                type: string
+              seats:
+                description: |-
+                  Seats is who holds the claim's membership. At most one seated
+                  workload is resident on the devices at a time; the rest are
+                  suspended. The list is the authority: worker statuses are
+                  observational copies.
+                items:
+                  description: Seat is one workload's booking on a shared claim.
+                  properties:
+                    assignmentID:
+                      description: |-
+                        AssignmentID identifies this booking. The same value is written to
+                        the workload status and its pod; a pod carrying an old value is
+                        refused GPU access.
+                      type: string
+                    hostRequest:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: |-
+                        HostRequest is the pod's host memory request. Copied here so
+                        placement can add up a node's load without reading every workload.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    ownerID:
+                      description: |-
+                        OwnerID groups workloads that share one GPU turn; the API server sets
+                        it (the job for FFT workers, the shared base model for LoRA workers).
+                        Copied from the workload's spec.ownerID.
+                      type: string
+                    workload:
+                      description: |-
+                        Workload is the name of the Workload that holds this seat.
+                        A workload holds at most one seat.
+                      type: string
+                    workloadUID:
+                      description: |-
+                        WorkloadUID is the Kubernetes UID of that Workload. It tells a
+                        deleted-and-recreated workload apart from the one that booked this
+                        seat, so the new one does not reuse the old seat.
+                      type: string
+                  required:
+                  - workload
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - workload
+                x-kubernetes-list-type: map
+            required:
+            - claimName
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}

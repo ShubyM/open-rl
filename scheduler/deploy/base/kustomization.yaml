@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The scheduler on its own: two CRDs, a namespace, and one deployment.
+#
+# Applying this changes nothing about a running cluster. The scheduler only
+# acts on Workload objects, and nothing creates those until the gateway is
+# pointed at it.
+#
+#   kubectl apply -k scheduler/deploy/base
+#   kubectl label node <node> openrl.io/enabled=true openrl.io/trainer=true
+#   kubectl get workloads -n openrl-system -w
+namespace: openrl-system
+
+resources:
+  - 00-namespace.yaml
+  - 00-workload-crd.yaml
+  - 00-claimledger-crd.yaml
+  - 01-scheduler.yaml

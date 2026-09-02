@@ -217,3 +217,48 @@ When an end-to-end benchmark campaign completes, always archive the results into
    kubectl exec deployment/open-rl-gateway -- cat /mnt/shared/open-rl/runs/fft-gsm8k-rl/open-rl-tmp/fft_gsm8k_rl/metrics.jsonl > runs/<run_dir>/metrics.jsonl
    ```
 2. Write a comprehensive markdown benchmark report (`benchmark_report.md`) inside `runs/<run_dir>/` documenting executive findings, full step-by-step progression tables, timing breakdown, and hardware/concurrency performance.
+
+---
+
+## 7. The Scheduler (`scheduler/`)
+
+The OpenRL scheduler is a standalone Go controller that places worker pods by
+cutting DRA `ResourceClaim`s and booking seats on `ClaimLedger`s. It has its own
+module and never imports the Python tree.
+
+- `scheduler/controller/` — the controller, its API types, and unit tests.
+- `scheduler/deploy/base/` — CRDs and manifests; everything deploys into `openrl-system`.
+- `scheduler/docs/` — `design.md` (the contract and mechanism) and `layout.md` (file map).
+- `scheduler/hack/` — `kind-smoke.sh` (end-to-end on kind) and `stress.sh` (churn against a live cluster).
+
+### Building and Testing (`Rule`)
+Use the make targets; they are the same commands CI runs:
+```bash
+make -C scheduler/controller fmt-check vet manifests-check test
+```
+The suite needs no GPUs and no cluster and runs in seconds with `-race`. The
+placement storm is behind a build tag because it takes minutes; run it with
+`make -C scheduler/controller stress` before touching the ledger or placement.
+
+### Generated Files (`Rule`)
+`scheduler/deploy/base/00-workload-crd.yaml`, `00-claimledger-crd.yaml`, and
+`api/v1alpha1/zz_generated.deepcopy.go` are generated. Never edit them by hand.
+After changing anything under `api/` (including doc comments — they become the
+CRD descriptions shown by `kubectl explain`):
+```bash
+make -C scheduler/controller generate manifests
+```
+CI fails via `manifests-check` when the checked-in CRDs drift from the types.
+
+### RBAC (`Tip`)
+The RBAC in `01-scheduler.yaml` is hand-written and deliberately split:
+cluster-scoped read-only for nodes and ResourceSlices, namespaced for
+everything else. `make -C scheduler/controller rbac` generates a comparison
+copy under `bin/`; reconcile differences by hand, never by overwriting.
+
+### Kind Smoke Test
+```bash
+cd scheduler && ./hack/kind-smoke.sh   # kind + fake GPUs (dra-example-driver)
+```
+Fake GPUs are the default so the whole pipeline runs without hardware; the
+script header documents the env overrides for real DRA hardware.

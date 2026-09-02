@@ -1,0 +1,45 @@
+name: controller tests
+
+on:
+  pull_request:
+    paths:
+      - "scheduler/controller/**"
+      - ".github/workflows/controller-tests.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "scheduler/controller/**"
+      - ".github/workflows/controller-tests.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: scheduler/controller
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: scheduler/controller/go.mod
+          cache-dependency-path: scheduler/controller/go.sum
+
+      # Each step is a make target so the same checks run identically on a
+      # dev machine: `make -C scheduler/controller fmt-check vet test`.
+      - name: gofmt
+        run: make fmt-check
+
+      - name: vet
+        run: make vet
+
+      - name: generated CRDs match the types
+        run: make manifests-check
+
+      - name: test
+        run: make test
