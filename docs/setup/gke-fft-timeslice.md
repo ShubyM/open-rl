@@ -1,13 +1,13 @@
-# GKE FFT DRA Worker Manager Setup Guide
+# GKE FFT Time-Slice Setup Guide
 
-This guide describes the core cluster shape introduced by this PR. It separates
+This guide describes the cluster shape for FFT on shared GPUs. It separates
 three ideas that build on each other:
 
-1. **DRA pinning:** one manually created `ResourceClaim` allocates one physical
-   GPU per role, and every worker pod that references that claim is scheduled
-   onto the node that can access that same device.
-2. **Kubernetes worker manager:** the gateway creates one trainer worker pod per
-   `model_id`, instead of relying on a static trainer Deployment.
+1. **Workload placement:** the gateway creates one `Workload` per worker
+   process, and the OpenRL scheduler turns each into a DRA `ResourceClaim` and
+   a pod, sharing a claim between workers when the cluster is full.
+2. **DRA pinning:** every pod that references a claim is scheduled onto the
+   node that holds that claim's device.
 3. **OpenRL GPU coordination:** a node-local accelerator time-slicer DaemonSet serializes
    acquire/release so only one workload in a role group enters a CUDA batch at
    a time on that node, and layers on top of llm-d's physical snapshot agent for
@@ -15,15 +15,20 @@ three ideas that build on each other:
 
 ## Architecture at a glance
 
-There are three separate responsibilities in this PR.
+There are three separate responsibilities.
 
-First, DRA is used only for GPU allocation and placement. The deployment creates
-two static `ResourceClaims` named `open-rl-trainer-gpu-1` and `open-rl-sampler-gpu-1`. Trainer worker pods reference `open-rl-trainer-gpu-1`, while Sampler worker pods reference `open-rl-sampler-gpu-1`. Kubernetes allocates one matching NVIDIA GPU to each claim and schedules those pods onto separate physical nodes where those devices are available.
+First, the gateway is the launcher, and it launches by asking. When it receives
+`create_model` in FFT mode it creates a `Workload` for that job's trainer; when
+it receives `create_sampling_client` it creates one for the sampler. Each
+Workload carries the complete pod template and the estimator's accelerator
+figure. It enqueues the request on the model-specific Redis queue. It is
+idempotent: a Workload that already exists is reused.
 
-Second, the Kubernetes worker manager is the deployment launcher. It runs inside
-the gateway process today. When the gateway receives `create_model` in FFT mode, it creates a trainer pod for that `model_id`. When it receives `create_sampling_client`, it creates a dedicated vLLM sampler pod for that `model_id` from the sampler worker pod template. It enqueues the request
-on the model-specific Redis queue. It is idempotent: if the trainer worker pod
-for a model is already running, it reuses it.
+Second, the OpenRL scheduler (`scheduler/`) places. For each Workload it cuts
+or selects a DRA `ResourceClaim`, renders the pod from the Workload's template
+with the claim and node affinity stamped on, and Kubernetes allocates one
+matching NVIDIA GPU to the claim and schedules the pod onto that node. DRA is
+used only for allocation and placement.
 
 Third, the OpenRL accelerator time-slicer is the runtime GPU coordinator. It runs as a
 node-local DaemonSet (`open-rl-accel-timeslicer`) on GPU nodes with `hostNetwork` enabled. Trainer and
@@ -41,16 +46,15 @@ The request flow is:
 
 1. A client calls `create_model`.
 2. The gateway creates a unique `model_id`.
-3. The Kubernetes worker manager ensures a trainer worker pod exists for that
-   model.
-4. The trainer worker pod references `open-rl-trainer-gpu-1`, so Kubernetes
-   places it on the DRA GPU node.
+3. The gateway ensures a trainer `Workload` exists for that job.
+4. The scheduler cuts or selects a `ResourceClaim` and creates the worker pod
+   against it, so Kubernetes places it on the node holding that device.
 5. The gateway enqueues the create request on the model's Redis queue.
 6. The trainer worker drains that queue and uses the node-local time slicer
    before entering CUDA sections.
 
-The whole shape has two layers. The top layer creates pods, places them, and
-moves requests through Redis. The bottom layer runs on the GPU node and
+The whole shape has two layers. The top layer creates Workloads, places them,
+and moves requests through Redis. The bottom layer runs on the GPU node and
 coordinates which colocated trainer worker may enter CUDA.
 
 ```mermaid
@@ -60,7 +64,7 @@ flowchart TD
         gateway["OpenRL gateway\nworker manager lives here"]
         kube["Kubernetes API"]
         redis["Redis\nper-model queue + future"]
-        claim["DRA ResourceClaim\nopen-rl-trainer-gpu-1"]
+        scheduler["OpenRL scheduler\none Workload -> claim + pod"]
     end
 
     subgraph node["Layer 2: node-local GPU coordination"]
@@ -72,13 +76,14 @@ flowchart TD
     end
 
     client -->|"create_model / retrieve_future"| gateway
-    gateway -->|"create or reuse pod"| kube
+    gateway -->|"create or reuse Workload"| kube
+    kube -->|"Workload"| scheduler
+    scheduler -->|"ResourceClaim + pod"| kube
     gateway -->|"enqueue request / read future"| redis
     kube -->|"schedule pods that reference claim"| workerA
     kube -->|"schedule pods that reference claim"| workerB
-    claim -.->|"pins placement to one device"| workerA
-    claim -.->|"pins placement to one device"| workerB
-    claim -.->|"allocates physical device"| gpu
+    scheduler -.->|"claim pins each pod to one device"| workerA
+    scheduler -.->|"claim pins each pod to one device"| workerB
 
     workerA <-->|"pop request / write result"| redis
     workerB <-->|"pop request / write result"| redis
@@ -92,57 +97,32 @@ flowchart TD
 
 The orchestration is currently cooperative: worker code calls acquire/release,
 and the OpenRL time slicer serializes those calls with a FIFO lock. The
-Kubernetes worker manager only launches pods; it is not the runtime time-slice
-scheduler.
+scheduler only places pods; it is not the runtime time-slice scheduler.
 
-## 1. DRA pins the GPU allocation
+## 1. The gateway creates one Workload per worker process
 
-`k8s/deploy/distributed-fft-timeslice/06-gpu-resourceclaim.yaml` and `08-sampler-resourceclaim.yaml` create dedicated namespace-scoped `ResourceClaims` for Trainers and Samplers:
-
-```yaml
-apiVersion: resource.k8s.io/v1
-kind: ResourceClaim
-metadata:
-  name: open-rl-trainer-gpu-1 # (and open-rl-sampler-gpu-1)
-spec:
-  devices:
-    requests:
-    - name: gpu
-      exactly:
-        deviceClassName: gpu.nvidia.com
-```
-
-Trainer worker pods reference `open-rl-trainer-gpu-1`, while Sampler worker pods reference `open-rl-sampler-gpu-1`:
-
-```yaml
-resourceClaims:
-- name: trainer-gpu # (or sampler-gpu)
-  resourceClaimName: open-rl-trainer-gpu-1 # (or open-rl-sampler-gpu-1)
-```
-
-Because these are shared `ResourceClaims`, Kubernetes allocates a single matching device to each claim and schedules referencing pods onto the dedicated nodes where those claims reside (`group.timeslice.io/trainers` vs `samplers`).
-
-DRA is the allocation and placement layer. It does not serialize CUDA execution
-by itself. This PR is intentionally an oversubscription model: multiple trainer
-worker pods can reference the same GPU claim, and OpenRL decides which trainer
-worker may touch CUDA at a given time.
-
-## 2. The gateway creates one trainer worker pod per model
-
-The per-model Redis queues and future protocol are unchanged. The new behavior
-is only how dedicated trainer workers are launched:
+The per-model Redis queues and future protocol are unchanged. What differs is
+how workers are launched: with `OPEN_RL_WORKER_MANAGER=scheduler`, the
+gateway's `server/scheduler_worker_manager.py` creates one `Workload` object
+per runtime process and stops. FFT jobs own their processes
+(`fft-<job>-trainer`, `fft-<job>-sampler`); LoRA jobs on one base model share
+them (`lora-<base>-0-<role>`), so a second compatible request hits
+`AlreadyExists` and reuses the running worker.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant G as Gateway
     participant K as Kubernetes API
+    participant S as Scheduler
     participant R as Redis
-    participant W as trainer worker pod
+    participant W as worker pod
 
     C->>G: POST /create_model
     G->>G: model_id = uuid4
-    G->>K: create Pod open-rl-trainer-<model_id>
+    G->>K: create Workload fft-<job>-trainer
+    K->>S: Workload
+    S->>K: ResourceClaim + Pod orw-fft-<job>-trainer
     G->>R: RPUSH open_rl:queue:<model_id>
     G-->>C: request_id = model_id
     W->>R: BLPOP open_rl:queue:<model_id>
@@ -150,19 +130,26 @@ sequenceDiagram
     W->>R: resolve open_rl:future:<request_id>
 ```
 
-`server/k8s_worker_manager.py` renders the trainer worker pod from the ConfigMap
-template in `05-worker-pod-template.yaml`. It stamps:
+The Workload carries the complete pod template -- image, entrypoint, identity
+env, resources, volumes -- plus the estimator's accelerator figure
+(`spec.accelerator.memory`) and the fairness unit (`spec.ownerID`). Everything
+placement-shaped is deliberately absent: the scheduler cuts or selects the DRA
+`ResourceClaim`, stamps the claim reference, node affinity, and time-slice
+group onto the pod, and rejects a template that tries to set them itself.
+See `scheduler/docs/design.md` for the placement rules.
 
-- the pod name, derived from the model id
-- trainer worker labels, including `app=open-rl-trainer-worker`
-- time-slicing labels (`accel-timeslicer=true`, `timeslice.io/group`,
-  `timeslice.io/job-id`) used by physical pod discovery
-- `OPEN_RL_TIME_SLICE_JOB_ID`, aligned with the `timeslice.io/job-id` label
-- `OPEN_RL_TIME_SLICE_GROUP`, aligned with the `timeslice.io/group` label
-- `--model-id <model_id>`, so the worker drains only its own queue
+## 2. DRA pins the GPU allocation
 
-The gateway still has a local subprocess launcher for VM development. Select the
-cluster launcher with `OPEN_RL_WORKER_MANAGER=kubernetes`.
+Each `ResourceClaim` the scheduler cuts lists the device shapes that can hold
+the worker, and Kubernetes allocates one matching device and schedules the
+pod onto that node. Several Workloads may be seated on one claim; the scheduler
+keeps that seating on a `ClaimLedger`, and exactly one seated worker is
+resident on the device at a time.
+
+DRA is the allocation and placement layer. It does not serialize CUDA execution
+by itself. This is intentionally an oversubscription model: multiple worker
+pods can share one GPU claim, and OpenRL decides which one may touch CUDA at a
+given time.
 
 ## 3. A node-local time slicer coordinates GPU windows
 
@@ -206,16 +193,15 @@ the relevant pod and process set.
   owns physical snapshot/restore.
 - A working NVIDIA GPU driver on the DRA node. The llm-d snapshot path uses
   CUDA checkpointing under the hood, so use driver **r570 or newer**.
-- The **NVIDIA DRA GPU driver** (Helm chart `nvidia-dra-driver-gpu` >= 25.8.0)
-  so all trainer worker pods can share one GPU through a single `ResourceClaim`.
+- The **NVIDIA DRA GPU driver** (Helm chart `nvidia-dra-driver-gpu` >= 25.8.0),
+  which publishes the ResourceSlices the scheduler places against.
 - Helm v3 for the DRA-driver chart.
 
 ## Setup 1: Create the DRA GPU node pool
 
-Trainer worker pods share the GPU through the `open-rl-trainer-gpu-1`
-`ResourceClaim` (`06-gpu-resourceclaim.yaml`) instead of device-plugin time
-sharing, so the node pool disables the default device plugin and automatic
-driver install (per the
+Worker pods get their GPUs through the DRA `ResourceClaims` the scheduler cuts
+instead of device-plugin time sharing, so the node pool disables the default
+device plugin and automatic driver install (per the
 [GKE DRA setup guide](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/set-up-dra);
 follow it if these flags have drifted):
 
@@ -225,7 +211,7 @@ gcloud container node-pools create gpu-dra \
   --cluster "${CLUSTER}" --zone "${ZONE}" \
   --machine-type g2-standard-24 \
   --accelerator "type=nvidia-l4,count=1,gpu-driver-version=disabled" \
-  --node-labels="group.timeslice.io/trainers=true,group.timeslice.io/samplers=true,gke-no-default-nvidia-gpu-device-plugin=true,nvidia.com/gpu.present=true" \
+  --node-labels="openrl.io/enabled=true,openrl.io/trainer=true,openrl.io/sampler=true,gke-no-default-nvidia-gpu-device-plugin=true,nvidia.com/gpu.present=true" \
   --num-nodes 2
 
 # Multi-GPU pool (for Qwen 4B+ sharded FSDP training):
@@ -233,7 +219,7 @@ gcloud container node-pools create gpu-dra-2x \
   --cluster "${CLUSTER}" --zone "${ZONE}" \
   --machine-type g2-standard-24 \
   --accelerator "type=nvidia-l4,count=2,gpu-driver-version=disabled" \
-  --node-labels="group.timeslice.io/trainers=true,gke-no-default-nvidia-gpu-device-plugin=true,nvidia.com/gpu.present=true" \
+  --node-labels="openrl.io/enabled=true,openrl.io/trainer=true,gke-no-default-nvidia-gpu-device-plugin=true,nvidia.com/gpu.present=true" \
   --num-nodes 1
 ```
 
@@ -256,24 +242,16 @@ helm install nvidia-dra-driver-gpu nvidia/nvidia-dra-driver-gpu \
 
 Notes:
 
-- `group.timeslice.io/trainers=true` and `group.timeslice.io/samplers=true`
-  are the node labels used by these manifests to select the role-specific GPU
-  nodes. The runtime time-slicing groups are `trainers` and `samplers`.
-- The trainer GPU claim does not bound how many trainer jobs reference the GPU.
-  The node-local OpenRL time slicer decides which trainer worker may run a CUDA
-  batch at a time.
+- `openrl.io/enabled=true` opts a node in to the scheduler; `openrl.io/trainer`
+  and `openrl.io/sampler` say which roles it accepts. A node naming neither role
+  accepts both. The runtime time-slicing group of a pod is its claim name.
+- A claim does not bound how many workloads are seated on it. The node-local
+  OpenRL time slicer decides which one may run a CUDA batch at a time.
 - Upstream caveat: DRA for GPUs is a supported GKE path on 1.35+, but GPU
   allocation is still marked experimental in the upstream
   [k8s-dra-driver-gpu](https://github.com/NVIDIA/k8s-dra-driver-gpu) repo. If
-  it misbehaves or the cluster is pre-1.35, the fallback is device-plugin
-  **time sharing**: create the pool with
-  `--accelerator "type=nvidia-l4,count=1,gpu-sharing-strategy=time-sharing,max-shared-clients-per-gpu=2" --gpu-driver-version=latest`
-  and only the `group.timeslice.io/trainers=true` label, skip the DRA driver
-  install, and in `05-worker-pod-template.yaml` replace the
-  `resources.claims`/`resourceClaims` stanzas with `nvidia.com/gpu: "1"`
-  requests/limits. On non-GKE clusters the equivalent is the NVIDIA device
-  plugin's [time-slicing config](https://github.com/NVIDIA/k8s-device-plugin#shared-access-to-gpus-with-cuda-time-slicing)
-  (`replicas: 2`) plus the node label.
+  it misbehaves or the cluster is pre-1.35, this deployment has no fallback:
+  the scheduler places through DRA claims and nothing else.
 
 ## Setup 2: Build, push, and deploy OpenRL
 
@@ -285,20 +263,20 @@ make deploy-fft-timeslice
 `k8s/deploy/distributed-fft-timeslice/` deploys Redis, the shared PVC, the
 shared GPU `ResourceClaim`, the llm-d Snapshot Agent DaemonSet, the node-local
 OpenRL time-slicer DaemonSet, and the gateway with `OPEN_RL_ENABLE_FFT=true`
-and `OPEN_RL_WORKER_MANAGER=kubernetes`.
+and `OPEN_RL_WORKER_MANAGER=scheduler`.
 The deployment assumes one base model per rollout: set `BASE_MODEL` in
 `kustomization.yaml`, and the gateway uses that value for `get_info` and
 `create_model` requests that do not explicitly pass a base model.
 
-There are no static worker deployments. Every `create_model` call makes the gateway create a trainer pod named `open-rl-trainer-<model-id>`, and every `create_sampling_client` call makes the gateway create a dedicated vLLM sampler pod named `open-rl-sampler-<model-id>`. Both are labeled:
+There are no static worker deployments. Every `create_model` call makes the gateway create a trainer `Workload` (`fft-<job>-trainer`), and every `create_sampling_client` call makes it create a sampler one (`fft-<job>-sampler`); the scheduler creates the pod for each as `orw-<workload name>`. Both pods are labeled:
 
 ```yaml
-accel-timeslicer: "true"        # OpenRL time-slicer marker
-timeslice.io/group: trainers    # or samplers
-timeslice.io/job-id: trainer-<model-id> # or sampler-<model-id>
+accel-timeslicer: "true"            # OpenRL time-slicer marker
+timeslice.io/group: <claim name>    # the ResourceClaim the pod shares
+timeslice.io/job-id: <workload name>
 ```
 
-The gateway's `open-rl-sa` service account has a Role allowing pod CRUD in the workload namespace (`03-rbac.yaml`). When weight updates occur during FFT training, Trainers write checkpoints to NFS `/mnt/shared`, and Samplers dynamically reload those checkpoint safetensors in-place in ~1.1 seconds while yielding GPU VRAM via cooperative sleep.
+The gateway's `open-rl-sa` service account has a Role allowing Workload CRUD in the workload namespace (`03-rbac.yaml`); the scheduler runs as the same account with the roles its own manifests add. When weight updates occur during FFT training, Trainers write checkpoints to NFS `/mnt/shared`, and Samplers dynamically reload those checkpoint safetensors in-place in ~1.1 seconds while yielding GPU VRAM via cooperative sleep.
 
 ### Structured Model Serialization in Redis
 To ensure reliable metadata persistence across gateway restarts and worker spawns, model configuration is serialized in Redis using the `TrainingModelMetadata` dataclass:
@@ -325,14 +303,15 @@ make test e2e fft-gsm8k BASE_URL=http://127.0.0.1:8000
 
 ## Troubleshooting
 
-- **Trainer worker pod Pending**: the `open-rl-trainer-gpu-1` `ResourceClaim`
-  could not be allocated; the DRA driver isn't running, or no GPU node carries the
-  `group.timeslice.io/trainers` label. `kubectl describe resourceclaim
-  open-rl-trainer-gpu-1` and `kubectl get pods -n nvidia-dra-driver-gpu` show why.
-- **Additional trainer worker pod Pending**: all trainer workers reference the same
-  `ResourceClaim`, so they should be schedulable onto the node that owns that
-  claim. If only later pods are pending, check pod events for PVC attach limits,
-  node selectors, taints, image pull errors, or an unallocated claim.
+- **Workload stays Pending**: `kubectl get workloads -n openrl-system` shows
+  the reason in the `status.reason` column. `NoCapacity` means no enabled node
+  (`openrl.io/enabled=true` plus the role label) has a device big enough;
+  `WaitingForCapacity` means the hardware exists but is busy. `kubectl describe
+  resourceclaim <claim>` and `kubectl get pods -n nvidia-dra-driver-gpu` show
+  whether the DRA driver is allocating at all.
+- **Worker pod Pending under a placed Workload**: check pod events for PVC
+  attach limits, taints, image pull errors, or host memory; the scheduler moves
+  a worker onto a shared claim when kube-scheduler refuses its dedicated one.
 - **No snapshot agent on a GPU node**: `kubectl get pods -n timeslice-system -l
   app.kubernetes.io/name=snapshot-agent -o wide` should show a `Running` pod
   listening on TCP `9001` for every GPU node. The DaemonSet selects
@@ -343,8 +322,8 @@ make test e2e fft-gsm8k BASE_URL=http://127.0.0.1:8000
   llm-d snapshot-agent logs. The worker should connect to
   `OPEN_RL_ACCEL_TIMESLICER_HOST:OPEN_RL_ACCEL_TIMESLICER_PORT`, the OpenRL
   DaemonSet should reach llm-d at `127.0.0.1:9001`, and the worker pod should
-  carry a role-prefixed `timeslice.io/job-id` such as
-  `trainer-<model-id>` or `sampler-<model-id>`.
+  carry a `timeslice.io/job-id` equal to its Workload name and a
+  `timeslice.io/group` equal to its ResourceClaim.
 - **`create_model` future fails with a pod-create error**: check gateway logs and
   RBAC; the error message is propagated into the `RequestFailedResponse`.
 - **First request after `create_model` is slow**: pod scheduling, image pull, and

@@ -18,7 +18,7 @@ holds — a one-line source change re-shipped the whole 36 GB server image, abou
 ## Requirements
 
 - A Linux VM with NVIDIA GPUs and the kernel driver installed (`nvidia-smi` works).
-- **Kubernetes 1.34+.** `k8s_worker_manager.py` talks to `resource.k8s.io/v1`,
+- **Kubernetes 1.34+.** The scheduler talks to `resource.k8s.io/v1`,
   which reached GA in 1.34. On a 1.33 node image the API server serves `v1beta1`
   and every claim call 404s. `kind-cluster.yaml` pins `kindest/node:v1.35.5`.
 - Enough VRAM for the model. `Qwen/Qwen2.5-0.5B` (the overlay default) fits a
@@ -56,7 +56,7 @@ ssh <host> 'cd ~/open-rl && make kind-deploy'
 ```bash
 make push-vm REMOTE_HOST=<host>                  # from the workstation
 make kind-gateway                                # on the VM: ~1 min; covers
-                                                 # gateway.py, k8s_worker_manager.py,
+                                                 # gateway.py, scheduler_worker_manager.py,
                                                  # store.py — then rolls out
 ```
 
@@ -132,23 +132,21 @@ register, so the cluster looks fine and every claim silently stays Pending.
 ComputeDomains are disabled — they target Multi-Node NVLink, which L4s do not
 have. Pass `KEEP_COMPUTE_DOMAINS=1` on NVLink hardware.
 
-## The 80gb tier
+## Sizing
 
-`_discover_cluster_gpu_products()` buckets devices by `capacity.memory`: over
-40000Mi is `80gb`, everything else `24gb`. L4s only ever yield a `24gb` tier, so
-nothing here reaches the 80gb branch. That branch is covered by the unit tests
-in `tests/test_k8s_worker_manager.py`, which feed the discovery path a slice
-list containing an H100 — no cluster required. A claim for the 80gb tier
-differs from a 24gb one only by the product name interpolated into its CEL
-selector and the `open-rl.io/memory-tier` label, both of which the 24gb path
-exercises against a real API server on every run here.
+The gateway sizes each Workload from the model's parameter count
+(`footprint` in `src/server/estimator.py`): bytes per parameter on the
+device and in host memory, plus a fixed reserve per role. There are no GPU
+tiers; the scheduler picks whichever device the figure fits. An L4 holds
+everything up to about a 2B full fine-tune or an 8B LoRA sampler, so larger
+models never place here. The formula is pinned by `tests/test_worker_manager.py`.
 
 ## Known gaps versus GKE
 
 | | GKE | kind |
 |---|---|---|
 | Shared storage | RWX Filestore (`enterprise-rwx`) | RWO local-path, single node |
-| GPU tiers | L4 + H100 | L4 only (`24gb`) |
+| GPUs | L4 + H100 | L4 only |
 | `compute-domain.nvidia.com` | present | not installed |
 | DCGM / Managed Prometheus | deployed | omitted |
 | Nodes | multi-node, real scheduling spread | one node |
