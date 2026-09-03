@@ -234,7 +234,10 @@ def megatron_model(path: str, dtype: torch.dtype = torch.float32, lora=None, rec
   provider.finalize()
   chunks = provider.provide_distributed_model(wrap_with_ddp=False)
   if lora is not None:
+    from training.megatron_worker import match_peft_adapter_init
+
     chunks = lora(chunks, training=True)
+    match_peft_adapter_init(chunks)
   return bridge, chunks
 
 
