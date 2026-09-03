@@ -20,6 +20,8 @@ class _FakeQwenRenderer:
 def _load_prompts_with_stubbed_dependencies(renderer: _FakeQwenRenderer):
   gemma = types.ModuleType("gemma4_renderer")
   gemma.register_gemma4_tool_renderer = lambda: None
+  qwen35 = types.ModuleType("qwen35_renderer")
+  qwen35.verbatim_history_renderer = lambda renderer: renderer
   reward = types.ModuleType("reward")
   reward.ARTIFACT_EXTENSIONS = ("txt",)
   tasks = types.ModuleType("tasks")
@@ -40,6 +42,7 @@ def _load_prompts_with_stubbed_dependencies(renderer: _FakeQwenRenderer):
 
   stubs = {
     "gemma4_renderer": gemma,
+    "qwen35_renderer": qwen35,
     "reward": reward,
     "tasks": tasks,
     "tinker_cookbook": cookbook,
