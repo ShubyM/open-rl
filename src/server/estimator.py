@@ -83,20 +83,3 @@ def footprint(base_model: str, fine_tuning_type: str, role: str) -> Footprint:
   device = params * DEVICE_BYTES_PER_PARAM[(kind, role)] + DEVICE_RESERVE_BYTES[role]
   host = params * HOST_BYTES_PER_PARAM[(kind, role)] + HOST_OVERHEAD_BYTES[role]
   return Footprint(device, host, int(host * HOST_LIMIT_FACTOR))
-
-
-# -- tiers: used only by the Kubernetes launcher; removed with it -----------------
-FFT_VRAM_BYTES_PER_PARAM = 12
-TIER_24GB_FFT_BUDGET_BYTES = 20 * GIB
-LORA_VRAM_BYTES_PER_PARAM = 2
-TIER_24GB_LORA_BUDGET_BYTES = 13 * GIB
-
-
-def estimate_memory_tier(base_model: str, fine_tuning_type: str = "lora") -> str:
-  params = parameter_count(base_model)
-  if params is None:
-    logger.warning("No known parameter count for %r; using the 80gb tier.", base_model)
-    return "80gb"
-  if fine_tuning_type == "full":
-    return "24gb" if params * FFT_VRAM_BYTES_PER_PARAM <= TIER_24GB_FFT_BUDGET_BYTES else "80gb"
-  return "24gb" if params * LORA_VRAM_BYTES_PER_PARAM <= TIER_24GB_LORA_BUDGET_BYTES else "80gb"
