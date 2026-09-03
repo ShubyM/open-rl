@@ -18,9 +18,8 @@ kind: Kustomization
 # match nothing and deploy the wrong images. Patching the two containers by name
 # does not care what the base retagged them to.
 #
-# The pod templates' nodeSelectors are left alone: dev/kind/kind-cluster.yaml
-# labels the single node as both a trainer and a sampler host, so the GKE
-# manifests apply unmodified.
+# dev/kind/kind-cluster.yaml labels the single node as both a trainer and a
+# sampler host, so the GKE manifests apply unmodified.
 resources:
   - ../distributed-fft-timeslice
 
@@ -88,7 +87,6 @@ patches:
       kind: DaemonSet
       metadata:
         name: snapshot-agent
-        namespace: timeslice-system
       spec:
         template:
           spec:
@@ -141,11 +139,9 @@ patches:
                 image: localhost:5001/open-rl-gateway:kind-dev
                 imagePullPolicy: Always
                 env:
-                  # The worker and sampler pod templates live inside ConfigMaps
-                  # as YAML strings, out of reach of any image transformer. The
-                  # gateway overrides that image at render time from this var
-                  # (k8s_worker_manager.py:506), so this is what actually decides
-                  # the image every launched worker runs.
+                  # The worker image is a plain string in the Workload template
+                  # the gateway renders, out of reach of any image transformer,
+                  # so this var is what decides the image every worker runs.
                   - name: OPEN_RL_WORKER_IMAGE
                     value: localhost:5001/open-rl-server:kind-dev
                   # Same reason as the containers patched above, but the worker

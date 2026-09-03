@@ -1,19 +1,26 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# FFT DRA deployment: the gateway launches one worker pod per FFT model and all
-# GPU workloads reference the same DRA ResourceClaim, pinning them to one
-# physical GPU allocation. There is no static trainer worker in this variant.
+# FFT deployment: the gateway creates one Workload per worker process and the
+# scheduler turns each into a DRA ResourceClaim and a pod. There is no static
+# trainer worker in this variant.
+# One namespace for the whole stack. The gateway creates Workloads in its own
+# namespace and the scheduler watches its own, and the scheduler runs as the
+# open-rl-sa this stack creates, so all three must agree. The scheduler base
+# pins openrl-system on its own; this makes the rest of the stack match it.
+namespace: openrl-system
+
 resources:
   - 00-llmd-snapshot-agent.yaml
   - 01-shared-pvc.yaml
   - 02-redis.yaml
   - 03-rbac.yaml
   - 04-gateway.yaml
-  - 05-worker-pod-template.yaml
   - 07-accel-timeslicer-daemonset.yaml
-  - 09-sampler-pod-template.yaml
   - 10-dcgm-monitoring.yaml
+  # The placement controller: the gateway requests workers as Workload
+  # objects and this decides which claim each one lands on.
+  - ../../../scheduler/deploy/base
 
 generatorOptions:
   disableNameSuffixHash: true
