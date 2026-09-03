@@ -78,7 +78,20 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
     granted_b = await asyncio.wait_for(blocked, timeout=1.0)
     self.assertTrue(granted_b["ok"])
     self.assertEqual(restorer.simple_labels(), [("checkpoint", "101")])
-    self.assertEqual(agent.active_workload, "shared-accelerator:202")
+    self.assertEqual(agent.running, {"shared-accelerator": "shared-accelerator:202"})
+
+  async def test_groups_do_not_wait_on_each_other(self) -> None:
+    restorer = RecordingRestorer()
+    agent = SingleNodeTimeSlicer(restorer)
+    claim_a = WorkloadRef(job_id="trainer-a", group="claim-a")
+    claim_b = WorkloadRef(job_id="trainer-b", group="claim-b")
+    await agent.register(claim_a)
+    await agent.register(claim_b)
+
+    self.assertTrue((await agent.acquire(claim_a))["ok"])
+    granted = await asyncio.wait_for(agent.acquire(claim_b), timeout=1.0)
+    self.assertTrue(granted["ok"])
+    self.assertEqual(agent.running, {"claim-a": "claim-a:trainer-a", "claim-b": "claim-b:trainer-b"})
 
   async def test_first_acquire_is_cold_and_later_acquire_restores_after_checkpoint(self) -> None:
     restorer = RecordingRestorer()
@@ -105,7 +118,7 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
     release = await agent.release(WorkloadRef(job_id="101"))
 
     self.assertTrue(release["ok"])
-    self.assertIsNone(agent.active_workload)
+    self.assertFalse(agent.running)
     self.assertTrue(agent.workloads["shared-accelerator:101"].checkpointed)
     self.assertFalse(agent.workloads["shared-accelerator:101"].failed)
     self.assertEqual(restorer.simple_labels(), [("checkpoint", "101")])
@@ -184,7 +197,7 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
 
     result = await asyncio.wait_for(acquire_b, timeout=1.0)
     self.assertFalse(result["ok"])
-    self.assertIsNone(agent.active_workload)
+    self.assertFalse(agent.running)
 
   async def test_duplicate_commands_return_explicit_errors(self) -> None:
     agent = SingleNodeTimeSlicer(RecordingRestorer())
@@ -223,6 +236,16 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual(grant_order, [303, 202, 404])
 
+  async def test_reregister_clears_a_previous_failure(self) -> None:
+    agent = SingleNodeTimeSlicer(RecordingRestorer())
+    await agent.register(WorkloadRef(job_id="101"), connection_id=7)
+    await agent.connection_closed(7)
+    self.assertFalse((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
+
+    # The restarted process announces itself again and is servable.
+    await agent.register(WorkloadRef(job_id="101"), connection_id=8)
+    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
+
   async def test_register_can_use_stable_snapshot_id_for_backend_calls(self) -> None:
     restorer = RecordingRestorer()
     agent = SingleNodeTimeSlicer(restorer)
@@ -254,6 +277,8 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
           self.assertFalse(blocked.done())
 
         self.assertEqual(await asyncio.wait_for(blocked, timeout=1.0), "202")
+        # 101 was suspended on the handoff; 202 stays resident after its
+        # release because nobody follows it.
         self.assertEqual(restorer.simple_labels(), [("checkpoint", "101"), ("checkpoint", "202")])
       finally:
         await client_a.close()
@@ -273,7 +298,7 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
         await client.close()
         await asyncio.sleep(0.05)
 
-        self.assertIsNone(agent.active_workload)
+        self.assertFalse(agent.running)
         self.assertTrue(agent.workloads["shared-accelerator:101"].failed)
       finally:
         server.close()
