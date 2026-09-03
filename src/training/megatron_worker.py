@@ -111,7 +111,10 @@ MEGATRON_APEX_FUSIONS = os.getenv("OPEN_RL_MEGATRON_APEX_FUSIONS", "0") == "1"
 # base weights and trains adapters instead. See apply_lora for why this does not
 # change how checkpoints are published.
 MEGATRON_LORA_RANK = int(os.getenv("OPEN_RL_MEGATRON_LORA_RANK", "0"))
-MEGATRON_LORA_ALPHA = int(os.getenv("OPEN_RL_MEGATRON_LORA_ALPHA", "32"))
+# 16 is what the FSDP LoRA worker runs: LoraConfig.lora_alpha defaults to 16
+# and the tinker request carries no alpha, so run19's adapters were 16/32. The
+# bridge's own default of 32 doubled the effective step per unit lr here.
+MEGATRON_LORA_ALPHA = int(os.getenv("OPEN_RL_MEGATRON_LORA_ALPHA", "16"))
 # Default 0, matching LoraConfig: dropout during logprob computation makes
 # trainer logprobs stochastic while the sampler's are deterministic, biasing
 # every importance-sampling ratio.
@@ -225,6 +228,34 @@ def ensure_modelopt_importable() -> None:
   # Answering False is the correct answer, not a placeholder: without modelopt
   # installed nothing could have quantized this model in the first place.
   sys.modules["modelopt.torch.quantization.utils"].is_quantized = lambda _model: False
+
+
+def match_peft_adapter_init(chunks: list[torch.nn.Module]) -> int:
+  """Re-draw every adapter's A the way PEFT does, from the full fan-in.
+
+  PEFT initialises lora_A with kaiming_uniform(a=sqrt(5)), which is
+  U(-1/sqrt(in), 1/sqrt(in)) over the layer's full input width. megatron-bridge
+  draws xavier_normal on the local TP shard instead, so A starts sqrt(6) larger,
+  and sqrt(6 * TP) larger for the row-parallel targets. B starts at zero on both
+  sides, so the first steps move W by scale * |A| * lr: together with the alpha
+  default this made lr=2e-4 here worth about 1e-3 on the FSDP worker (run42 vs
+  run19, 5x the gradient norm, and every Megatron divergence on record). Drawn
+  inside the tensor-parallel RNG region so shards differ across ranks, exactly
+  as the bridge's own initialisation does. Returns the number of adapters.
+  """
+  from megatron.bridge.peft.utils import ParallelLinearAdapter
+  from megatron.core.tensor_parallel import get_cuda_rng_tracker
+
+  count = 0
+  for chunk in chunks:
+    for module in chunk.modules():
+      if not isinstance(module, ParallelLinearAdapter):
+        continue
+      bound = 1.0 / math.sqrt(module.linear_in.input_size)
+      with torch.no_grad(), get_cuda_rng_tracker().fork():
+        module.linear_in.weight.uniform_(-bound, bound)
+      count += 1
+  return count
 
 
 def chunked_target_logprobs(
@@ -495,6 +526,7 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     targets = [target.strip() for target in MEGATRON_LORA_TARGETS.split(",") if target.strip()]
     lora = LoRA(dim=MEGATRON_LORA_RANK, alpha=MEGATRON_LORA_ALPHA, dropout=MEGATRON_LORA_DROPOUT, target_modules=targets)
     chunks = lora(chunks, training=True)
+    match_peft_adapter_init(chunks)
     # save_hf_adapter reads dim/alpha/dropout off this to write adapter_config.json.
     self.lora = lora
     trainable = sum(param.numel() for chunk in chunks for param in chunk.parameters() if param.requires_grad)

@@ -26,6 +26,7 @@ PassthroughTest, which needs nothing. On the box:
 
 from __future__ import annotations
 
+import math
 import os
 
 os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
@@ -267,6 +268,73 @@ class AdapterExportTest(unittest.TestCase):
       first = tensors[siblings[0] + ".lora_A.weight"]
       for module in siblings[1:]:
         self.assertTrue(torch.equal(tensors[module + ".lora_A.weight"], first), module)
+
+
+def assert_peft_initialisation(test: unittest.TestCase, adapter_dir: str) -> None:
+  """Every exported lora_A is drawn as PEFT draws it, and B is zero.
+
+  PEFT's kaiming_uniform(a=sqrt(5)) on a [r, in] matrix is U(-1/sqrt(in),
+  1/sqrt(in)), std 1/sqrt(3 in). The fixture's smallest adapter has 8 x 64
+  entries, for which the sample std scatters by about 3%; 20% is far outside
+  that and well inside the sqrt(6) and sqrt(12) factors being ruled out.
+  """
+  import json
+
+  tensors = fixture.saved_tensors(adapter_dir)
+  with open(os.path.join(adapter_dir, "adapter_config.json")) as f:
+    config = json.load(f)
+  test.assertEqual(config["lora_alpha"], fixture.LORA_ALPHA)
+  test.assertEqual(config["r"], fixture.LORA_DIM)
+  checked = 0
+  for name, t in sorted(tensors.items()):
+    if name.endswith("lora_B.weight"):
+      test.assertEqual(float(t.abs().max()), 0.0, name)
+      continue
+    test.assertTrue(name.endswith("lora_A.weight"), name)
+    fan_in = t.shape[1]
+    expected = 1.0 / math.sqrt(3 * fan_in)
+    ratio = float(t.float().std()) / expected
+    test.assertLess(abs(ratio - 1.0), 0.2, f"{name}: std is {ratio:.2f}x PEFT's for fan_in {fan_in}")
+    test.assertLessEqual(float(t.abs().max()), 1.0 / math.sqrt(fan_in) * 1.001, f"{name}: outside the uniform bound")
+    checked += 1
+  test.assertGreater(checked, 0)
+
+
+@unittest.skipUnless(HAVE_STACK, "needs a GPU with megatron-bridge and fla-core")
+class AdapterInitialisationTest(unittest.TestCase):
+  """Invariant 8: a fresh Megatron adapter is a fresh PEFT adapter.
+
+  Same rank, same lr, different backend was not the same experiment. The
+  bridge draws A xavier-normal on the local TP shard where PEFT draws
+  kaiming-uniform on the full fan-in, and its alpha default is 32 where the
+  FSDP worker's is 16. B starts at zero on both, so the first steps move W by
+  scale * |A| * lr: a factor 2 * sqrt(6) ~ 4.9 on the effective learning rate,
+  which is the 5x gradient-norm gap between run42 and run19 and the reason
+  every Megatron lr on record diverged where the FSDP one held.
+  """
+
+  @classmethod
+  def setUpClass(cls) -> None:
+    cls.path = fixture.write_tiny_checkpoint(FIXTURE_DIR)
+    cls.lora = fixture.lora_config()
+    cls.bridge, cls.chunks = fixture.megatron_model(cls.path, lora=cls.lora)
+    cls.adapter_dir = tempfile.mkdtemp(prefix="qwen35-fresh-adapter-")
+    cls.bridge.save_hf_adapter(cls.chunks, cls.adapter_dir, peft_config=cls.lora, base_model_name_or_path=cls.path, show_progress=False)
+
+  def test_a_fresh_adapter_starts_where_pefts_would(self) -> None:
+    assert_peft_initialisation(self, self.adapter_dir)
+
+  def test_the_formula_is_pefts_initialiser(self) -> None:
+    # Pins the analytic target used above to torch's own kaiming_uniform.
+    w = torch.empty(64, 1024)
+    torch.nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+    self.assertLess(abs(float(w.std()) / (1.0 / math.sqrt(3 * 1024)) - 1.0), 0.05)
+
+  def test_the_alpha_default_is_the_fsdp_workers(self) -> None:
+    from training import megatron_worker
+    from training.lora_trainer_worker import LoraConfig
+
+    self.assertEqual(megatron_worker.MEGATRON_LORA_ALPHA, LoraConfig.model_fields["lora_alpha"].default)
 
 
 @unittest.skipUnless(HAVE_STACK, "needs a GPU with megatron-bridge and fla-core")
@@ -561,6 +629,15 @@ def adapter_worker(rank: int, world_size: int, port: int, dirs: dict[str, str], 
 
     # fp32 for the forward and the adapter's values; export is write_adapter's call.
     bridge, chunks = fixture.megatron_model(FIXTURE_DIR, lora=lora)
+    # The fresh adapter first, before fill_adapters overwrites the initialisation.
+    bridge.save_hf_adapter(chunks, dirs["init"], peft_config=lora, base_model_name_or_path=FIXTURE_DIR, show_progress=False)
+    from megatron.bridge.peft.utils import ParallelLinearAdapter
+
+    first = next(m for m in chunks[0].modules() if isinstance(m, ParallelLinearAdapter))
+    local = first.linear_in.weight.detach().float().contiguous()
+    gathered = [torch.empty_like(local) for _ in range(world_size)]
+    dist.all_gather(gathered, local)
+    out["ranks_drew_alike"] = bool(torch.equal(gathered[0], gathered[1]))
     fill_adapters(chunks[0])
     with torch.no_grad():
       out["logits"] = fixture.megatron_logits(chunks[0].eval(), input_ids).float().cpu()
@@ -613,7 +690,7 @@ class AdapterTensorParallelTest(unittest.TestCase):
   @classmethod
   def setUpClass(cls) -> None:
     cls.path = fixture.write_tiny_checkpoint(FIXTURE_DIR)
-    cls.dirs = {k: tempfile.mkdtemp(prefix=f"qwen35-tp-adapter-{k}-") for k in ("values", "grads")}
+    cls.dirs = {k: tempfile.mkdtemp(prefix=f"qwen35-tp-adapter-{k}-") for k in ("init", "values", "grads")}
     ctx = mp.get_context("spawn")
     with ctx.Manager() as manager:
       results = manager.dict()
@@ -631,6 +708,15 @@ class AdapterTensorParallelTest(unittest.TestCase):
     for r in range(self.WORLD_SIZE):
       self.assertNotIn("error", self.results[r], self.results[r].get("error"))
       self.assertEqual(self.results[r]["no_gradient"], [])
+
+  def test_a_fresh_adapter_starts_where_pefts_would_on_two_ranks(self) -> None:
+    # The row-parallel targets are the ones the bridge draws from the local
+    # shard's fan-in; at TP=2 that is sqrt(2) too wide without the re-draw.
+    assert_peft_initialisation(self, self.dirs["init"])
+
+  def test_the_two_ranks_draw_different_adapter_shards(self) -> None:
+    # Identical draws would collapse a rank-r adapter to rank r/TP.
+    self.assertFalse(self.results[0]["ranks_drew_alike"])
 
   def test_the_exported_adapter_reproduces_the_two_rank_model(self) -> None:
     logits, _ = peft_gradients(fixture.reference_model(self.path), self.dirs["values"], self.input_ids)
