@@ -5,6 +5,7 @@ from pathlib import Path
 from .workload import DEFAULT_TIME_SLICE_GROUP, WorkloadRef
 
 JOB_ID_ENV = "OPEN_RL_TIME_SLICE_JOB_ID"
+WORKLOAD_ID_ENV = "OPEN_RL_WORKLOAD_ID"
 GROUP_ENV = "OPEN_RL_TIME_SLICE_GROUP"
 
 
@@ -36,7 +37,8 @@ def workload_root_pid(pid: int, workload: WorkloadRef) -> int | None:
 
 def process_matches_workload(pid: int, workload: WorkloadRef) -> bool:
   env = process_environ(pid)
-  return env.get(JOB_ID_ENV) == workload.job_id and env.get(GROUP_ENV, DEFAULT_TIME_SLICE_GROUP) == workload.group
+  job_id = env.get(WORKLOAD_ID_ENV) or env.get(JOB_ID_ENV)
+  return job_id == workload.job_id and env.get(GROUP_ENV, DEFAULT_TIME_SLICE_GROUP) == workload.group
 
 
 def process_environ(pid: int) -> dict[str, str]:

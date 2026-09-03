@@ -303,7 +303,7 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
       server.close()
       await server.wait_closed()
 
-  async def test_env_client_registers_time_slice_job_id(self) -> None:
+  async def test_env_client_registers_time_slice_job_id_and_group(self) -> None:
     restorer = RecordingRestorer()
     agent = SingleNodeTimeSlicer(restorer)
     server = await start_tcp_time_slicer(agent, "127.0.0.1", 0)
@@ -312,7 +312,8 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
       "OPEN_RL_ACCEL_TIMESLICER_HOST": "127.0.0.1",
       "OPEN_RL_ACCEL_TIMESLICER_PORT": str(port),
       "OPEN_RL_TIME_SLICE_JOB_ID": "job-a",
-      "OPEN_RL_TIME_SLICE_GROUP": "ignored-group",
+      # The launcher's stamp wins: under the scheduler this is the claim name.
+      "OPEN_RL_TIME_SLICE_GROUP": "claim-a",
     }
     with patch.dict("os.environ", env, clear=True):
       client = time_slicer_client_from_env()
@@ -321,19 +322,33 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
       await client.register(workload)
       async with client.acquire(workload):
         pass
+      # A successor in the same group forces the handoff, which must name the
+      # env-derived job id and group to the backend.
+      successor = WorkloadRef(job_id="job-b", group="claim-a")
+      await client.register(successor)
+      async with client.acquire(successor):
+        pass
 
-      self.assertEqual(restorer.labels(), [("checkpoint", "job-a", "shared-accelerator")])
+      self.assertEqual(restorer.labels(), [("checkpoint", "job-a", "claim-a"), ("checkpoint", "job-b", "claim-a")])
     finally:
       await client.close()
       server.close()
       await server.wait_closed()
 
-  async def test_workload_from_env_uses_fixed_group_and_model_id_when_job_id_env_is_absent(self) -> None:
-    with patch.dict("os.environ", {"OPEN_RL_TIME_SLICE_GROUP": "ignored-group"}, clear=True):
+  async def test_workload_from_env_prefers_the_launchers_group(self) -> None:
+    env = {"OPEN_RL_TIME_SLICE_GROUP": "claim-a"}
+    with patch.dict("os.environ", env, clear=True):
       workload = workload_from_env(101, job_id="model-a")
 
     self.assertEqual(workload.job_id, "model-a")
-    self.assertEqual(workload.group, "shared-accelerator")
+    self.assertEqual(workload.group, "claim-a")
+
+  async def test_workload_from_env_falls_back_to_the_callers_group(self) -> None:
+    with patch.dict("os.environ", {}, clear=True):
+      workload = workload_from_env(101, job_id="model-a", group="trainers")
+
+    self.assertEqual(workload.job_id, "model-a")
+    self.assertEqual(workload.group, "trainers")
 
 
 class CudaCheckpointRestorerTest(unittest.TestCase):

@@ -105,7 +105,11 @@ class SocketTimeSlicerClient:
 
 
 def workload_from_env(pid: int | None = None, job_id: str | None = None, group: str = DEFAULT_TIME_SLICE_GROUP) -> WorkloadRef:
-  env_job_id = os.getenv("OPEN_RL_TIME_SLICE_JOB_ID")
+  # The launcher's stamps win over the caller's defaults. The scheduler sets
+  # the group to the ResourceClaim name and OPEN_RL_WORKLOAD_ID to the
+  # Workload name; TIME_SLICE_JOB_ID is the older spelling, kept as a fallback.
+  group = os.getenv("OPEN_RL_TIME_SLICE_GROUP") or group
+  env_job_id = os.getenv("OPEN_RL_WORKLOAD_ID") or os.getenv("OPEN_RL_TIME_SLICE_JOB_ID")
   if env_job_id:
     return WorkloadRef(job_id=env_job_id, group=group)
   if job_id:

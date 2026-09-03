@@ -68,10 +68,7 @@ def workload_from_payload(payload: dict[str, Any]) -> WorkloadRef:
   job_id = payload.get("job_id") or payload.get("snapshot_id")
   if job_id is None:
     raise ValueError("workload requires job_id")
-  return WorkloadRef(
-    job_id=job_id,
-    group=payload.get("group") or DEFAULT_TIME_SLICE_GROUP,
-  )
+  return WorkloadRef(job_id=job_id, group=payload.get("group") or DEFAULT_TIME_SLICE_GROUP)
 
 
 def parse_args() -> argparse.Namespace:

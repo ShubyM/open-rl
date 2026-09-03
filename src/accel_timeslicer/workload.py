@@ -11,6 +11,10 @@ def workload_job_id(role: str, model_id: str) -> str:
 
 @dataclass(frozen=True)
 class WorkloadRef:
+  """One process's identity to the time slicer, in the snapshot agent's words.
+  job_id is the timeslice.io/job-id pod label (under the scheduler, the
+  Workload name) and group is the devices it shares (the ResourceClaim)."""
+
   job_id: str
   group: str = DEFAULT_TIME_SLICE_GROUP
 
