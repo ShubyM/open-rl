@@ -405,7 +405,7 @@ class KubernetesWorkerManager:
   ) -> str:
     """Resolve target DRA ResourceClaim using pure dynamic managed claim provisioning (No static fallbacks)."""
     if not memory_tier:
-      from server.worker_manager import estimate_memory_tier
+      from server.estimator import estimate_memory_tier
 
       base_model_name = (meta.base_model if meta and getattr(meta, "base_model", None) else None) or target_id
       memory_tier = estimate_memory_tier(base_model_name, fine_tuning_type=workload_type)
@@ -503,7 +503,7 @@ class KubernetesWorkerManager:
       node_sel.pop("cloud.google.com/gke-accelerator", None)
     self._inject_resource_claim(pod, role, claim_name)
     base_model_name = (meta.base_model if meta and meta.base_model else None) or os.getenv("BASE_MODEL") or target_id
-    from server.worker_manager import estimate_memory_tier
+    from server.estimator import estimate_memory_tier
 
     memory_tier = estimate_memory_tier(base_model_name, fine_tuning_type="lora")
     self._inject_container_resources(pod, memory_tier)
@@ -578,7 +578,7 @@ class KubernetesWorkerManager:
       node_sel.pop("cloud.google.com/gke-accelerator", None)
     self._inject_resource_claim(pod, role, claim_name)
     base_model_name = (meta.base_model if meta and meta.base_model else None) or os.getenv("BASE_MODEL") or target_id
-    from server.worker_manager import estimate_memory_tier
+    from server.estimator import estimate_memory_tier
 
     memory_tier = estimate_memory_tier(base_model_name, fine_tuning_type="full")
     self._inject_container_resources(pod, memory_tier)
