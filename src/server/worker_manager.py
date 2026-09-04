@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -168,9 +169,29 @@ class LocalWorkerManager:
         self.terminate(key)
 
   def terminate(self, key: tuple[str, str]) -> None:
-    proc = self.processes.pop(key)
-    if proc.poll() is None:
-      proc.terminate()
+    stop_process_group(self.processes.pop(key))
+
+
+def stop_process_group(proc: subprocess.Popen, timeout: float = 15.0) -> None:
+  """Signal the worker's whole session, not just the launcher.
+
+  Workers start under uv run, and a vLLM sampler forks an EngineCore under
+  that. Terminating the launcher alone leaves the engine core holding the GPU
+  until someone notices. start_new_session put each worker in its own session,
+  so its process group is exactly the set of processes to signal.
+  """
+  for sig in (signal.SIGTERM, signal.SIGKILL):
+    if proc.poll() is not None:
+      return
+    try:
+      os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+      return
+    try:
+      proc.wait(timeout=timeout)
+      return
+    except subprocess.TimeoutExpired:
+      continue
 
 
 def python_command(extras: list[str], module: str, args: list[str]) -> list[str]:

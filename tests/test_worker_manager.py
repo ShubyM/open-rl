@@ -1,4 +1,5 @@
 import json
+import signal
 import unittest
 from unittest.mock import patch
 
@@ -204,6 +205,24 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(kwargs["env"]["OPEN_RL_MODEL_ID"], "Model_A.1")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "sampler-Model_A.1")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "samplers")
+
+  async def test_release_signals_the_workers_whole_process_group(self) -> None:
+    with (
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_ENABLE_FFT": "true"}, clear=True),
+      patch("server.worker_manager.subprocess.Popen") as popen,
+      patch("server.worker_manager.os.killpg") as killpg,
+    ):
+      launched = popen.return_value
+      launched.pid = 4242
+      launched.poll.return_value = None
+      manager = LocalWorkerManager()
+      manager.ensure("Model_A.1", "sampler")
+      manager.release("Model_A.1")
+
+    # vLLM's engine core is a grandchild in the launcher's session; terminating the launcher alone leaks it.
+    killpg.assert_called_once_with(4242, signal.SIGTERM)
+    launched.terminate.assert_not_called()
+    launched.wait.assert_called_once()
 
   async def test_launch_fetches_metadata_from_store(self) -> None:
     import json
