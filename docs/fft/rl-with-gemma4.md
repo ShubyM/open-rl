@@ -1,5 +1,9 @@
 # Reinforcement Learning with Gemma 4 Models in Open-RL
 
+> The Harvey LAB recipe ships a maintained Gemma 4 renderer with a pinned chat
+> template (`examples/harvey_labs/gemma4_renderer.py`); prefer it over building the
+> approaches below from scratch.
+
 When running Reinforcement Learning recipes (such as `rl_loop.py` or GSM8K / Math RL) with **Gemma 4** models, you may encounter formatting incompatibility issues if relying on default built-in chat renderers (e.g., `qwen3_instruct`), which emit tags unsupported by Gemma 4 (`<|im_start|>`, `<|im_end|>`).
 
 Because the installed `tinker_cookbook` SDK package cannot be edited directly on disk, this guide outlines the recommended architectural approaches for supporting Gemma 4 without modifying SDK source code.
