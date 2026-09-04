@@ -22,7 +22,7 @@
 
 ## 5. HuggingFace Hub Token (`HF_TOKEN`) Injection via Kubernetes Secret / ConfigMap
 - **Current Behavior:** Dynamically spawned `Trainer` and `Sampler` worker containers run without authentication (`user_id=public`), causing strict HuggingFace Hub CDN throttling (`403 Forbidden` / lengthy retry loops on `xet_client` during first-time model caching) and failing on gated models (`e.g., Gemma 2, Gemma 4, Llama 3`).
-- **Improvement:** Update `k8s_worker_manager.py` (`render_pod()`) and static Kubernetes manifests to inject an optional `open-rl-hf-secret` (`or ConfigMap via envFrom / set_env`) into all worker containers, ensuring authenticated, high-bandwidth model downloads without rate-limiting across multi-pod cluster setups.
+- **Improvement:** Update `scheduler_worker_manager.py` (`render_template()`) and static Kubernetes manifests to inject an optional `open-rl-hf-secret` (`or ConfigMap via envFrom / set_env`) into all worker containers, ensuring authenticated, high-bandwidth model downloads without rate-limiting across multi-pod cluster setups.
 
 ## 6. Pin `uv` Image to Specific SHA Digest in Dockerfiles
 - **Current Behavior:** `src/server/Dockerfile` and `src/server/Dockerfile.gateway` copy the `uv` binary from `ghcr.io/astral-sh/uv:latest`. Because the `:latest` tag is mutable and updated frequently upstream, any new `uv` release invalidates the Docker BuildKit cache at that layer, forcing a complete rebuild from scratch (e.g. re-downloading Python, dependency trees, and recompiling custom vLLM C++ extensions).
