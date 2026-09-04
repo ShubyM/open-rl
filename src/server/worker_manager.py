@@ -1,11 +1,8 @@
-"""Worker managers for dedicated per-model trainer workers.
+"""Worker managers. The gateway asks one to make sure a model's trainer or
+sampler exists before it enqueues work. Local mode spawns subprocesses; the
+scheduler mode (scheduler_worker_manager.py) creates Workloads."""
 
-The gateway ensures a model's worker exists before enqueueing its create request:
-locally by spawning a subprocess, on Kubernetes by creating a pod. There is no
-separate launch queue: the subprocess table / the Kubernetes API already hold
-the launched-worker state, and both launchers are idempotent per model_id.
-"""
-
+import json
 import logging
 import os
 import shutil
@@ -16,202 +13,180 @@ from pathlib import Path
 from typing import Protocol
 
 from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
+from server.estimator import footprint
+from server.model_metadata import TrainingModelMetadata
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 logger = logging.getLogger(__name__)
 
 
-def _py_cmd(extras: list[str], module: str, model_id: str, active_tenant_set_id: str | None = None) -> list[str]:
-  if shutil.which("uv"):
-    extra_args = []
-    for e in extras:
-      extra_args.extend(["--extra", e])
-    cmd = ["uv", "run", *extra_args, "python", "-u", "-m", module, "--model-id", model_id]
-  else:
-    cmd = [sys.executable, "-u", "-m", module, "--model-id", model_id]
-  if active_tenant_set_id:
-    cmd.extend(["--active-tenant-set-id", active_tenant_set_id])
-  return cmd
+# -- what is being run ------------------------------------------------------------
 
 
-from server.model_metadata import TrainingModelMetadata
-
-
-def _fetch_metadata_from_store(model_id: str) -> TrainingModelMetadata | None:
-  """Retrieve TrainingModelMetadata dataclass from canonical open_rl:model_meta:<model_id>."""
-  import json
-
+def metadata_for(model_id: str) -> TrainingModelMetadata | None:
+  """The metadata create_model stored for this model, or None."""
   from server.store import get_store
 
   try:
-    val = get_store().get_value_sync(f"open_rl:model_meta:{model_id}")
-    if val:
-      meta_dict = json.loads(val) if isinstance(val, str) else val
-      if isinstance(meta_dict, dict):
-        return TrainingModelMetadata.from_dict(meta_dict)
+    raw = get_store().get_value_sync(f"open_rl:model_meta:{model_id}")
+    data = json.loads(raw) if isinstance(raw, str) else raw
+    return TrainingModelMetadata.from_dict(data) if isinstance(data, dict) else None
   except Exception:
-    pass
-  return None
+    return None
 
 
-def get_model_target_info(model_id: str) -> tuple[TrainingModelMetadata, str, bool]:
-  """Retrieve model metadata, target_id, and is_lora flag cleanly from the canonical store."""
-  meta = _fetch_metadata_from_store(model_id)
+def runtime_of(model_id: str) -> tuple[TrainingModelMetadata, str, bool]:
+  """Which runtime serves this model, as (metadata, runtime id, is_lora).
+
+  An FFT job owns its runtime, so the id is the model_id. LoRA jobs on one
+  base model share a runtime, so the id is the base model. A model with no
+  metadata (a sampling session opened on a bare base-model name) is FFT when
+  this deployment enables FFT and LoRA otherwise, because an FFT sampler in
+  a LoRA deployment would serve base weights and ignore every adapter.
+  """
+  meta = metadata_for(model_id)
   if meta is None:
-    # Without metadata we cannot know the fine-tuning type (e.g. a sampling
-    # session opened directly on a base-model name). Only assume FFT when this
-    # deployment has FFT enabled: a LoRA deployment must never spawn FFT
-    # workers — the FFT vllm_sampler drains the same per-base-model sampling
-    # queue but ignores LoRA adapters, silently sampling base weights.
-    fallback_type = "full" if os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true" else "lora"
-    meta = TrainingModelMetadata(base_model=model_id, created_at=0.0, fine_tuning_type=fallback_type)
+    kind = "full" if os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true" else "lora"
+    meta = TrainingModelMetadata(base_model=model_id, created_at=0.0, fine_tuning_type=kind)
   is_lora = meta.fine_tuning_type == "lora"
-  target_id = meta.base_model if is_lora else model_id
-  return meta, target_id, is_lora
+  return meta, (meta.base_model if is_lora else model_id), is_lora
+
+
+def base_model_of(meta: TrainingModelMetadata, runtime: str) -> str:
+  return meta.base_model or os.getenv("BASE_MODEL") or runtime
+
+
+# -- the process ------------------------------------------------------------------
+
+
+def worker_env(meta: TrainingModelMetadata, base_model: str, runtime: str, is_lora: bool, role: str) -> dict[str, str]:
+  """The env every worker gets, whichever manager launches it. Time-slice
+  identity is the manager's to add."""
+  env = {
+    "BASE_MODEL": base_model,
+    "OPEN_RL_BASE_MODEL": base_model,
+    "OPEN_RL_ENABLE_FFT": "false" if is_lora else "true",
+    "OPEN_RL_FINE_TUNING_TYPE": "lora" if is_lora else "full",
+    # The device budget this worker was sized for; a sampler derives its
+    # vLLM fraction from it against the device it actually gets.
+    "OPEN_RL_ACCELERATOR_MEMORY": str(footprint(base_model, meta.fine_tuning_type, role).accelerator_bytes),
+  }
+  weight_sync = getattr(meta, "weight_sync_config", None)
+  if weight_sync is not None:
+    env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = weight_sync.strategy
+    if weight_sync.strategy == "delta":
+      env["OPEN_RL_WEIGHT_SYNC_DELTA_FORMAT"] = weight_sync.delta_format
+      env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = weight_sync.delta_apply_method
+  if role == "trainer":
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+  else:
+    env["OPEN_RL_MODEL_ID"] = runtime
+    env["VLLM_SERVER_DEV_MODE"] = "1"
+    env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+    if not is_lora and ("gemma-4" in base_model.lower() or "gemma4" in base_model.lower()):
+      env["VLLM_ARCHITECTURE_OVERRIDE"] = "Gemma4ForCausalLM"
+  return env
+
+
+def worker_module(role: str, is_lora: bool) -> str:
+  if role == "trainer":
+    return "server.training_requests_processor"
+  return "server.lora_sampler" if is_lora else "server.vllm_sampler"
+
+
+def worker_args(runtime: str, role: str, is_lora: bool) -> list[str]:
+  args = ["--model-id", runtime]
+  if role == "trainer" and is_lora:
+    args += ["--active-tenant-set-id", f"{runtime}-1"]
+  return args
+
+
+# -- managers ----------------------------------------------------------------------
 
 
 class WorkerManager(Protocol):
-  def launch(self, model_id: str) -> None:
-    """Ensure the model's worker exists; idempotent per model_id."""
+  def ensure(self, model_id: str, role: str) -> None:
+    """Make sure the runtime serving this model's trainer or sampler exists. Idempotent."""
     ...
 
-  def launch_trainer(self, model_id: str) -> None:
-    """Ensure the trainer worker exists."""
+  def release(self, model_id: str) -> None:
+    """Tear down the runtimes an FFT job owns. A shared LoRA runtime is left alone."""
     ...
 
-  def launch_sampler(self, model_id: str) -> None:
-    """Ensure the sampler worker exists."""
+  def close(self) -> None:
+    """The gateway is exiting."""
     ...
-
-  def shutdown(self, model_id: str) -> None:
-    """Tear down the model's worker, if any. The idempotent launch can revive it later."""
-    ...
-
-  def shutdown_all(self) -> None: ...
 
 
 class LocalWorkerManager:
-  """Runs local trainer and sampler subprocesses per model."""
+  """Runs each runtime as a subprocess of the gateway, for development."""
 
   def __init__(self, project_dir: Path = PROJECT_DIR):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("OPEN_RL_ENABLE_FFT=true requires REDIS_URL so launched workers can share queues and futures")
-
     self.project_dir = project_dir
-    self.train_processes: dict[str, subprocess.Popen] = {}
-    self.sampler_processes: dict[str, subprocess.Popen] = {}
+    self.processes: dict[tuple[str, str], subprocess.Popen] = {}
     self.lock = threading.Lock()
 
-  def launch(self, model_id: str) -> None:
-    self.launch_trainer(model_id)
-
-  def launch_trainer(self, model_id: str) -> None:
-    meta, target_id, is_lora = get_model_target_info(model_id)
+  def ensure(self, model_id: str, role: str) -> None:
+    if role == "sampler" and os.getenv("SAMPLING_BACKEND", "vllm").lower() != "vllm":
+      return
+    meta, runtime, is_lora = runtime_of(model_id)
     with self.lock:
-      proc = self.train_processes.get(target_id)
+      proc = self.processes.get((role, runtime))
       if proc is not None and proc.poll() is None:
         return
-
-      env = {
-        **os.environ,
-        "OPEN_RL_ENABLE_FFT": "false" if is_lora else "true",
-        "OPEN_RL_FINE_TUNING_TYPE": "lora" if is_lora else "full",
-        "OPEN_RL_TIME_SLICE_JOB_ID": workload_job_id("trainer", target_id),
-        "OPEN_RL_TIME_SLICE_GROUP": TRAINER_TIME_SLICE_GROUP,
-      }
-      if meta.base_model:
-        env["BASE_MODEL"] = meta.base_model
-
-      env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = meta.weight_sync_config.strategy
-      if meta.weight_sync_config.strategy == "delta":
-        env["OPEN_RL_WEIGHT_SYNC_DELTA_FORMAT"] = meta.weight_sync_config.delta_format
-        env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = meta.weight_sync_config.delta_apply_method
-
-      trainer_gpu = os.getenv("TRAINER_CUDA_VISIBLE_DEVICES")
-      if trainer_gpu:
-        env["CUDA_VISIBLE_DEVICES"] = trainer_gpu
-
-      active_set_id = f"{target_id}-1" if is_lora else None
-      tmp_dir = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp"))
-      tmp_dir.mkdir(parents=True, exist_ok=True)
-      clean_name = target_id.replace("/", "_")
-      with open(tmp_dir / f"trainer_{clean_name}.log", "a") as train_log:
-        self.train_processes[target_id] = subprocess.Popen(
-          _py_cmd(["gpu"], "server.training_requests_processor", target_id, active_tenant_set_id=active_set_id),
-          cwd=self.project_dir,
-          env=env,
-          stdout=train_log,
-          stderr=subprocess.STDOUT,
-          start_new_session=True,
+      base_model = base_model_of(meta, runtime)
+      env = {**os.environ, **worker_env(meta, base_model, runtime, is_lora, role)}
+      env["OPEN_RL_TIME_SLICE_JOB_ID"] = workload_job_id(role, runtime)
+      env["OPEN_RL_TIME_SLICE_GROUP"] = TRAINER_TIME_SLICE_GROUP if role == "trainer" else SAMPLER_TIME_SLICE_GROUP
+      gpus = os.getenv("TRAINER_CUDA_VISIBLE_DEVICES" if role == "trainer" else "SAMPLER_CUDA_VISIBLE_DEVICES")
+      if gpus:
+        env["CUDA_VISIBLE_DEVICES"] = gpus
+      extras = ["gpu"] if role == "trainer" else ["gpu", "vllm"]
+      command = python_command(extras, worker_module(role, is_lora), worker_args(runtime, role, is_lora))
+      log_dir = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp"))
+      log_dir.mkdir(parents=True, exist_ok=True)
+      with open(log_dir / f"{role}_{runtime.replace('/', '_')}.log", "a") as log:
+        self.processes[(role, runtime)] = subprocess.Popen(
+          command, cwd=self.project_dir, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
 
-  def launch_sampler(self, model_id: str) -> None:
-    meta, target_id, is_lora = get_model_target_info(model_id)
-    with self.lock:
-      proc = self.sampler_processes.get(target_id)
-      if proc is not None and proc.poll() is None:
-        return
-
-      env = {
-        **os.environ,
-        "OPEN_RL_ENABLE_FFT": "false" if is_lora else "true",
-        "OPEN_RL_FINE_TUNING_TYPE": "lora" if is_lora else "full",
-      }
-      if meta.base_model:
-        env["BASE_MODEL"] = meta.base_model
-
-      sampling_backend = os.getenv("SAMPLING_BACKEND", "vllm").lower()
-      if sampling_backend == "vllm":
-        sampler_env = env.copy()
-        sampler_env["OPEN_RL_MODEL_ID"] = target_id
-        sampler_env["OPEN_RL_TIME_SLICE_JOB_ID"] = workload_job_id("sampler", target_id)
-        sampler_env["OPEN_RL_TIME_SLICE_GROUP"] = SAMPLER_TIME_SLICE_GROUP
-
-        sampler_env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = meta.weight_sync_config.strategy
-        if meta.weight_sync_config.strategy == "delta":
-          sampler_env["OPEN_RL_WEIGHT_SYNC_DELTA_FORMAT"] = meta.weight_sync_config.delta_format
-          sampler_env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = meta.weight_sync_config.delta_apply_method
-        sampler_gpu = os.getenv("SAMPLER_CUDA_VISIBLE_DEVICES")
-        if sampler_gpu:
-          sampler_env["CUDA_VISIBLE_DEVICES"] = sampler_gpu
-
-        sampler_module = "server.lora_sampler" if is_lora else "server.vllm_sampler"
-        tmp_dir = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp"))
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        clean_name = target_id.replace("/", "_")
-        with open(tmp_dir / f"sampler_{clean_name}.log", "a") as sampler_log:
-          self.sampler_processes[target_id] = subprocess.Popen(
-            _py_cmd(["gpu", "vllm"], sampler_module, target_id),
-            cwd=self.project_dir,
-            env=sampler_env,
-            stdout=sampler_log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-          )
-
-  def shutdown(self, model_id: str) -> None:
+  def release(self, model_id: str) -> None:
     try:
-      _, target_id, _ = get_model_target_info(model_id)
+      _, runtime, _ = runtime_of(model_id)
     except Exception:
-      target_id = model_id
-    for key in {model_id, target_id}:
-      proc = self.train_processes.pop(key, None)
-      if proc is not None and proc.poll() is None:
-        proc.terminate()
-      proc_s = self.sampler_processes.pop(key, None)
-      if proc_s is not None and proc_s.poll() is None:
-        proc_s.terminate()
+      runtime = model_id
+    with self.lock:
+      for key in [key for key in self.processes if key[1] in {runtime, model_id}]:
+        self.terminate(key)
 
-  def shutdown_all(self) -> None:
-    for model_id in set(list(self.train_processes) + list(self.sampler_processes)):
-      self.shutdown(model_id)
+  def close(self) -> None:
+    with self.lock:
+      for key in list(self.processes):
+        self.terminate(key)
+
+  def terminate(self, key: tuple[str, str]) -> None:
+    proc = self.processes.pop(key)
+    if proc.poll() is None:
+      proc.terminate()
+
+
+def python_command(extras: list[str], module: str, args: list[str]) -> list[str]:
+  if shutil.which("uv"):
+    extra_args = [arg for extra in extras for arg in ("--extra", extra)]
+    return ["uv", "run", *extra_args, "python", "-u", "-m", module, *args]
+  return [sys.executable, "-u", "-m", module, *args]
 
 
 def create_worker_manager() -> WorkerManager | None:
   mode = os.getenv("OPEN_RL_WORKER_MANAGER", "local").lower()
   if mode in {"none", "disabled"}:
-    # Standing worker deployments (e.g. k8s/deploy/distributed-shared) own the
-    # trainer and sampler lifecycles; the gateway must not spawn its own.
+    # Standing worker deployments own the trainer and sampler lifecycles.
     return None
+  if mode == "scheduler":
+    from server.scheduler_worker_manager import SchedulerWorkerManager
+
+    return SchedulerWorkerManager()
   return LocalWorkerManager()

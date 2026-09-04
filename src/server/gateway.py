@@ -223,7 +223,7 @@ async def launch_worker_and_enqueue(request: dict) -> str:
   request_id = request["request_id"]
   await store.set_future(request_id, {"status": "pending"})
   try:
-    await asyncio.to_thread(worker_manager.launch_trainer, request["model_id"])
+    await asyncio.to_thread(worker_manager.ensure, request["model_id"], "trainer")
   except Exception as exc:
     traceback.print_exc()
     await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
@@ -234,7 +234,7 @@ async def launch_worker_and_enqueue(request: dict) -> str:
 async def ensure_sampler_launched(model_id: str) -> None:
   if worker_manager is not None and get_sampler_backend() == "vllm":
     try:
-      await asyncio.to_thread(worker_manager.launch_sampler, model_id)
+      await asyncio.to_thread(worker_manager.ensure, model_id, "sampler")
     except Exception:
       traceback.print_exc()
 
@@ -323,7 +323,7 @@ async def lifespan(_: FastAPI):
     if task is not None:
       task.cancel()
     if worker_manager is not None:
-      worker_manager.shutdown_all()
+      worker_manager.close()
       worker_manager = None
 
 
@@ -409,6 +409,8 @@ async def delete_model(req: dict):
     print(f"[GATEWAY] Requesting shutdown of workers for model {model_id}...")
     await store.put_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
+    if worker_manager is not None:
+      await asyncio.to_thread(worker_manager.release, model_id)
   now = time.time()
   await store.update_job_metadata(model_id, {"status": "completed", "completed_at": now, "updated_at": now})
   return {"status": "ok"}

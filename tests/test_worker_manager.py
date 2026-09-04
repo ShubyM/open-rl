@@ -45,23 +45,16 @@ class WorkerManagerStub:
     self.launched_sampler_model_ids = []
     self.shutdown_model_ids = []
 
-  def launch(self, model_id: str) -> None:
+  def ensure(self, model_id: str, role: str) -> None:
     self.launched_model_ids.append(model_id)
+    (self.launched_trainer_model_ids if role == "trainer" else self.launched_sampler_model_ids).append(model_id)
     if self.error is not None:
       raise self.error
 
-  def launch_trainer(self, model_id: str) -> None:
-    self.launched_trainer_model_ids.append(model_id)
-    self.launch(model_id)
-
-  def launch_sampler(self, model_id: str) -> None:
-    self.launched_sampler_model_ids.append(model_id)
-    self.launch(model_id)
-
-  def shutdown(self, model_id: str) -> None:
+  def release(self, model_id: str) -> None:
     self.shutdown_model_ids.append(model_id)
 
-  def shutdown_all(self) -> None:
+  def close(self) -> None:
     pass
 
 
@@ -189,7 +182,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
-      manager.launch("Model_A.1")
+      manager.ensure("Model_A.1", "trainer")
 
     _, kwargs = popen.call_args
     self.assertTrue(kwargs["start_new_session"])
@@ -203,7 +196,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
-      manager.launch_sampler("Model_A.1")
+      manager.ensure("Model_A.1", "sampler")
 
     _, kwargs = popen.call_args
     self.assertTrue(kwargs["start_new_session"])
@@ -232,12 +225,12 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
-      manager.launch_trainer("Model_A.1")
+      manager.ensure("Model_A.1", "trainer")
       _, kwargs = popen.call_args
       self.assertEqual(kwargs["env"].get("BASE_MODEL"), "base-model-a")
       self.assertEqual(kwargs["env"].get("OPEN_RL_WEIGHT_SYNC_STRATEGY"), "delta")
 
-      manager.launch_sampler("Model_A.1")
+      manager.ensure("Model_A.1", "sampler")
       _, kwargs_s = popen.call_args
       self.assertEqual(kwargs_s["env"].get("BASE_MODEL"), "base-model-a")
       self.assertEqual(kwargs_s["env"].get("OPEN_RL_WEIGHT_SYNC_STRATEGY"), "delta")
@@ -366,7 +359,7 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
       self.manager = LocalWorkerManager(project_dir=Path("/tmp"))
     self.store = StoreStub()
 
-  @patch("server.worker_manager._fetch_metadata_from_store")
+  @patch("server.worker_manager.metadata_for")
   @patch("subprocess.Popen")
   def test_launch_sampler_lora_uses_base_model_and_reuses_process(self, mock_popen, mock_fetch) -> None:
     from server.model_metadata import TrainingModelMetadata
@@ -382,8 +375,8 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
     )
 
     # Launch for first LoRA model ID
-    self.manager.launch_sampler("model-lora-1")
-    self.assertIn("Qwen/Qwen2.5-0.5B", self.manager.sampler_processes)
+    self.manager.ensure("model-lora-1", "sampler")
+    self.assertIn(("sampler", "Qwen/Qwen2.5-0.5B"), self.manager.processes)
     self.assertEqual(mock_popen.call_count, 1)
 
     cmd_args = mock_popen.call_args[0][0]
@@ -391,11 +384,11 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
     self.assertIn("Qwen/Qwen2.5-0.5B", cmd_args)
 
     # Launch for second LoRA model ID sharing the same base model
-    self.manager.launch_sampler("model-lora-2")
+    self.manager.ensure("model-lora-2", "sampler")
     # Should reuse existing process and NOT call popen again!
     self.assertEqual(mock_popen.call_count, 1)
 
-  @patch("server.worker_manager._fetch_metadata_from_store")
+  @patch("server.worker_manager.metadata_for")
   @patch("subprocess.Popen")
   def test_launch_sampler_fft_uses_model_id(self, mock_popen, mock_fetch) -> None:
     from server.model_metadata import TrainingModelMetadata
@@ -410,8 +403,8 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
       fine_tuning_type="full",
     )
 
-    self.manager.launch_sampler("model-fft-1")
-    self.assertIn("model-fft-1", self.manager.sampler_processes)
+    self.manager.ensure("model-fft-1", "sampler")
+    self.assertIn(("sampler", "model-fft-1"), self.manager.processes)
     self.assertEqual(mock_popen.call_count, 1)
 
     cmd_args = mock_popen.call_args[0][0]
