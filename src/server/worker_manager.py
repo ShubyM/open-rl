@@ -214,8 +214,4 @@ def create_worker_manager() -> WorkerManager | None:
     # Standing worker deployments (e.g. k8s/deploy/distributed-shared) own the
     # trainer and sampler lifecycles; the gateway must not spawn its own.
     return None
-  if mode in {"kubernetes", "k8s"}:
-    from server.k8s_worker_manager import KubernetesWorkerManager
-
-    return KubernetesWorkerManager()
   return LocalWorkerManager()
