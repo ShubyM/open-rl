@@ -31,6 +31,48 @@ class TimeSlicer(Protocol):
   async def unregister(self, workload: WorkloadRef) -> dict[str, Any]: ...
 
 
+class NoOpLease:
+  """Lease returned by NoOpTimeSlicer.acquire: awaitable like the daemon-side
+  TimeSlicer contract and usable as an async context manager like the client one."""
+
+  def __await__(self):
+    async def grant() -> dict[str, Any]:
+      return {"ok": True}
+
+    return grant().__await__()
+
+  async def __aenter__(self) -> None:
+    return None
+
+  async def __aexit__(self, exc_type, exc, tb) -> bool:
+    return False
+
+
+class NoOpTimeSlicer:
+  """Time slicer that coordinates nothing.
+
+  Used when OPEN_RL_TIME_SLICING=off: trainer and sampler own their accelerators
+  outright (or run on drivers where cuda-checkpoint does not work), so acquire,
+  release, register, and unregister all succeed immediately. Satisfies both the
+  TimeSlicer and TimeSlicerClient protocols.
+  """
+
+  async def register(self, workload: WorkloadRef) -> dict[str, Any]:
+    return {"ok": True}
+
+  async def unregister(self, workload: WorkloadRef) -> dict[str, Any]:
+    return {"ok": True}
+
+  async def release(self, workload: WorkloadRef) -> dict[str, Any]:
+    return {"ok": True}
+
+  def acquire(self, workload: WorkloadRef) -> NoOpLease:
+    return NoOpLease()
+
+  async def close(self) -> None:
+    return None
+
+
 class SocketTimeSlicerClient:
   def __init__(
     self,
@@ -115,7 +157,21 @@ def workload_from_env(pid: int | None = None, job_id: str | None = None, group: 
   return WorkloadRef(job_id=str(pid), group=group)
 
 
+def is_time_slicing_enabled() -> bool:
+  """The checkpoint/time-slice lifecycle switch, default on.
+
+  OPEN_RL_TIME_SLICING=off disables GPU time sharing entirely: no cuda-checkpoint
+  snapshot/restore, no acquire/release coordination. Use it when the trainer and
+  sampler have dedicated GPUs, or on driver stacks where cuda-checkpoint fails
+  (WSL, RunPod r550).
+  """
+  return os.getenv("OPEN_RL_TIME_SLICING", "on").lower() != "off"
+
+
 def time_slicer_client_from_env() -> TimeSlicerClient:
+  if not is_time_slicing_enabled():
+    return NoOpTimeSlicer()
+
   host = os.getenv("OPEN_RL_ACCEL_TIMESLICER_HOST")
   if host:
     port = int(os.getenv("OPEN_RL_ACCEL_TIMESLICER_PORT", str(DEFAULT_TCP_PORT)))
