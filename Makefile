@@ -18,7 +18,7 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_gateway_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_k8s_worker_manager tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends
+UNIT_TESTS ?= tests.test_gateway_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_k8s_worker_manager tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends tests.test_compute_target_logprobs tests.test_external_sampler tests.test_sampler_hot_reload tests.test_lora_distributed
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -68,9 +68,19 @@ server:
 	  uv run --extra $(if $(filter vllm,$(SAMPLING_BACKEND)),gpu,cpu) \
 	  python -m uvicorn server.gateway:app --host $(HOST) --port $(PORT)
 
+# Sampler workers are launched automatically by the gateway (one per model).
+# This target is for launching one by hand when debugging.
 vllm:
 	BASE_MODEL="$(BASE_MODEL)" \
-	  uv run --extra vllm python -m server.vllm_sampler
+	  uv run --extra gpu --extra vllm python -m server.vllm_sampler --model-id "$(MODEL_ID)"
+
+# Stock OpenAI-compatible vLLM server for the SAMPLER_BASE_URL gateway mode
+# (LoRA only). Point the gateway at it with SAMPLER_BASE_URL=http://host:8001.
+VLLM_SERVE_PORT ?= 8001
+vllm-serve:
+	VLLM_ALLOW_RUNTIME_LORA_UPDATING=true \
+	  uv run --extra gpu --extra vllm vllm serve "$(BASE_MODEL)" \
+	  --port $(VLLM_SERVE_PORT) --enable-lora --max-lora-rank 64 $(VLLM_SERVE_ARGS)
 
 # ---------------------------------------------------------------------------
 # CLI
