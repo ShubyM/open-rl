@@ -15,7 +15,7 @@ from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
-from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
+from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.store import RequestStore, get_store
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
@@ -306,7 +306,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     self.store = store
     self.worker = worker
     self.model_id = model_id
-    self.workload = workload_from_env(os.getpid(), job_id=workload_job_id("trainer", model_id), group=TRAINER_TIME_SLICE_GROUP)
+    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM)
     self.time_slicer = time_slicer
     self.snapshot_registered = False
 

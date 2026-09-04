@@ -18,7 +18,8 @@ class LlmDClient(Protocol):
 
 
 class LlmDCheckpointRestorer(CheckpointRestorer):
-  """CheckpointRestorer backed by llm-d's snapshot-agent Python client."""
+  """CheckpointRestorer backed by llm-d's snapshot-agent Python client.
+  llm-d calls the workload name job_id and the claim group."""
 
   def __init__(
     self,
@@ -32,16 +33,16 @@ class LlmDCheckpointRestorer(CheckpointRestorer):
 
   def checkpoint(self, workload: WorkloadRef) -> bool:
     result = self.client.snapshot_and_wait(
-      workload.job_id, group=workload.group, poll_interval_sec=self.poll_interval_sec, backend_config=self.backend_config
+      workload.name, group=workload.claim, poll_interval_sec=self.poll_interval_sec, backend_config=self.backend_config
     )
-    ensure_complete("snapshot", workload.job_id, result)
+    ensure_complete("snapshot", workload.name, result)
     return True
 
   def restore(self, workload: WorkloadRef) -> None:
     result = self.client.restore_and_wait(
-      workload.job_id, group=workload.group, poll_interval_sec=self.poll_interval_sec, backend_config=self.backend_config
+      workload.name, group=workload.claim, poll_interval_sec=self.poll_interval_sec, backend_config=self.backend_config
     )
-    ensure_complete("restore", workload.job_id, result)
+    ensure_complete("restore", workload.name, result)
 
 
 def ensure_complete(op: str, job_id: str, result: LlmDOperationResult) -> None:
