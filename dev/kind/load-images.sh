@@ -17,7 +17,7 @@
 # kubelet pulls only that. Same iteration is now seconds.
 #
 # Usage:
-#   ./dev/kind/load-images.sh                # gateway + server
+#   ./dev/kind/load-images.sh                # gateway + server + scheduler
 #   ./dev/kind/load-images.sh gateway        # just the fast one
 #   IMAGE_TAG=wip ./dev/kind/load-images.sh
 set -euo pipefail
@@ -26,13 +26,13 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 IMAGE_TAG="${IMAGE_TAG:-kind-dev}"
 # The registry is published on the host loopback and mirrored into the node by
 # create-cluster.sh, so this one reference resolves from both sides. Kept
-# distinct from the gcr.io names so a local dev build can never be confused with
+# distinct from the upstream GHCR names so a local dev build cannot be confused with
 # something that was actually pushed.
 REGISTRY="${REGISTRY:-localhost:5001}"
 
 TARGETS=("$@")
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-  TARGETS=(gateway server)
+  TARGETS=(gateway server scheduler)
 fi
 
 log() { echo "[load-images] $*"; }
@@ -45,19 +45,21 @@ if ! curl -fsS "http://${REGISTRY}/v2/" >/dev/null 2>&1; then
 fi
 
 for target in "${TARGETS[@]}"; do
+  context="$REPO_ROOT"
   case "$target" in
     gateway) dockerfile="src/server/Dockerfile.gateway" ;;
     server) dockerfile="src/server/Dockerfile" ;;
     client) dockerfile="src/server/Dockerfile.client" ;;
+    scheduler) dockerfile="scheduler/controller/Dockerfile"; context="$REPO_ROOT/scheduler/controller" ;;
     *)
-      echo "Unknown target '$target'. Expected gateway, server, or client." >&2
+      echo "Unknown target '$target'. Expected gateway, server, client, or scheduler." >&2
       exit 2
       ;;
   esac
 
   image="${REGISTRY}/open-rl-${target}:${IMAGE_TAG}"
   log "Building $image..."
-  DOCKER_BUILDKIT=1 docker build -t "$image" -f "$REPO_ROOT/$dockerfile" "$REPO_ROOT"
+  DOCKER_BUILDKIT=1 docker build -t "$image" -f "$REPO_ROOT/$dockerfile" "$context"
 
   log "Pushing $image..."
   docker push "$image"

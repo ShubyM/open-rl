@@ -223,7 +223,7 @@ async def launch_worker_and_enqueue(request: dict) -> str:
   request_id = request["request_id"]
   await store.set_future(request_id, {"status": "pending"})
   try:
-    await asyncio.to_thread(worker_manager.launch_trainer, request["model_id"])
+    await asyncio.to_thread(worker_manager.ensure, request["model_id"], "trainer")
   except Exception as exc:
     traceback.print_exc()
     await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
@@ -234,7 +234,7 @@ async def launch_worker_and_enqueue(request: dict) -> str:
 async def ensure_sampler_launched(model_id: str) -> None:
   if worker_manager is not None and get_sampler_backend() == "vllm":
     try:
-      await asyncio.to_thread(worker_manager.launch_sampler, model_id)
+      await asyncio.to_thread(worker_manager.ensure, model_id, "sampler")
     except Exception:
       traceback.print_exc()
 
@@ -294,45 +294,12 @@ def translate_future_result(result: dict) -> dict:
   return result
 
 
-async def run_claim_reconciler(manager: WorkerManager, interval: float) -> None:
-  """Periodically reclaim dynamic DRA claims left behind by finished workers.
-
-  Nothing else deletes them: the scheduler provisions a claim whenever no
-  eligible one is free, so without this loop every completed job strands a GPU
-  claim until an operator removes it by hand.
-  """
-  while True:
-    await asyncio.sleep(interval)
-    try:
-      deleted = await asyncio.to_thread(manager.reconcile_managed_claims)
-      if deleted:
-        print(f"[GATEWAY] Reclaimed {len(deleted)} unused DRA claim(s): {', '.join(deleted)}")
-    except asyncio.CancelledError:
-      raise
-    except Exception:
-      traceback.print_exc()
-
-
-def start_claim_reconciler(manager: WorkerManager | None) -> asyncio.Task | None:
-  """Start the reconcile loop when the worker manager provisions claims (Kubernetes mode only)."""
-  if manager is None or not hasattr(manager, "reconcile_managed_claims"):
-    return None
-  interval = float(os.getenv("OPEN_RL_CLAIM_RECONCILE_INTERVAL_SECONDS", "300"))
-  if interval <= 0:
-    print("[GATEWAY] DRA claim reconciliation disabled (OPEN_RL_CLAIM_RECONCILE_INTERVAL_SECONDS <= 0)")
-    return None
-  print(f"[GATEWAY] DRA claim reconciliation every {interval:.0f}s")
-  return asyncio.create_task(run_claim_reconciler(manager, interval))
-
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
   global worker_manager
   task = None
-  reconcile_task = None
   if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER"):
     worker_manager = create_worker_manager()
-    reconcile_task = start_claim_reconciler(worker_manager)
   if is_single_process_mode():
     base_model = os.getenv("BASE_MODEL")
     print("\n" + "=" * 50)
@@ -355,10 +322,8 @@ async def lifespan(_: FastAPI):
   finally:
     if task is not None:
       task.cancel()
-    if reconcile_task is not None:
-      reconcile_task.cancel()
     if worker_manager is not None:
-      worker_manager.shutdown_all()
+      worker_manager.close()
       worker_manager = None
 
 
@@ -444,6 +409,8 @@ async def delete_model(req: dict):
     print(f"[GATEWAY] Requesting shutdown of workers for model {model_id}...")
     await store.put_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
+    if worker_manager is not None:
+      await asyncio.to_thread(worker_manager.release, model_id)
   now = time.time()
   await store.update_job_metadata(model_id, {"status": "completed", "completed_at": now, "updated_at": now})
   return {"status": "ok"}

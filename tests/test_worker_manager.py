@@ -1,9 +1,8 @@
 import json
-import sys
 import unittest
 from unittest.mock import patch
 
-from server import estimator, gateway
+from server import gateway
 from server.worker_manager import LocalWorkerManager
 
 
@@ -46,23 +45,16 @@ class WorkerManagerStub:
     self.launched_sampler_model_ids = []
     self.shutdown_model_ids = []
 
-  def launch(self, model_id: str) -> None:
+  def ensure(self, model_id: str, role: str) -> None:
     self.launched_model_ids.append(model_id)
+    (self.launched_trainer_model_ids if role == "trainer" else self.launched_sampler_model_ids).append(model_id)
     if self.error is not None:
       raise self.error
 
-  def launch_trainer(self, model_id: str) -> None:
-    self.launched_trainer_model_ids.append(model_id)
-    self.launch(model_id)
-
-  def launch_sampler(self, model_id: str) -> None:
-    self.launched_sampler_model_ids.append(model_id)
-    self.launch(model_id)
-
-  def shutdown(self, model_id: str) -> None:
+  def release(self, model_id: str) -> None:
     self.shutdown_model_ids.append(model_id)
 
-  def shutdown_all(self) -> None:
+  def close(self) -> None:
     pass
 
 
@@ -190,7 +182,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
-      manager.launch("Model_A.1")
+      manager.ensure("Model_A.1", "trainer")
 
     _, kwargs = popen.call_args
     self.assertTrue(kwargs["start_new_session"])
@@ -204,7 +196,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
-      manager.launch_sampler("Model_A.1")
+      manager.ensure("Model_A.1", "sampler")
 
     _, kwargs = popen.call_args
     self.assertTrue(kwargs["start_new_session"])
@@ -233,12 +225,12 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
-      manager.launch_trainer("Model_A.1")
+      manager.ensure("Model_A.1", "trainer")
       _, kwargs = popen.call_args
       self.assertEqual(kwargs["env"].get("BASE_MODEL"), "base-model-a")
       self.assertEqual(kwargs["env"].get("OPEN_RL_WEIGHT_SYNC_STRATEGY"), "delta")
 
-      manager.launch_sampler("Model_A.1")
+      manager.ensure("Model_A.1", "sampler")
       _, kwargs_s = popen.call_args
       self.assertEqual(kwargs_s["env"].get("BASE_MODEL"), "base-model-a")
       self.assertEqual(kwargs_s["env"].get("OPEN_RL_WEIGHT_SYNC_STRATEGY"), "delta")
@@ -367,7 +359,7 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
       self.manager = LocalWorkerManager(project_dir=Path("/tmp"))
     self.store = StoreStub()
 
-  @patch("server.worker_manager._fetch_metadata_from_store")
+  @patch("server.worker_manager.metadata_for")
   @patch("subprocess.Popen")
   def test_launch_sampler_lora_uses_base_model_and_reuses_process(self, mock_popen, mock_fetch) -> None:
     from server.model_metadata import TrainingModelMetadata
@@ -383,8 +375,8 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
     )
 
     # Launch for first LoRA model ID
-    self.manager.launch_sampler("model-lora-1")
-    self.assertIn("Qwen/Qwen2.5-0.5B", self.manager.sampler_processes)
+    self.manager.ensure("model-lora-1", "sampler")
+    self.assertIn(("sampler", "Qwen/Qwen2.5-0.5B"), self.manager.processes)
     self.assertEqual(mock_popen.call_count, 1)
 
     cmd_args = mock_popen.call_args[0][0]
@@ -392,11 +384,11 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
     self.assertIn("Qwen/Qwen2.5-0.5B", cmd_args)
 
     # Launch for second LoRA model ID sharing the same base model
-    self.manager.launch_sampler("model-lora-2")
+    self.manager.ensure("model-lora-2", "sampler")
     # Should reuse existing process and NOT call popen again!
     self.assertEqual(mock_popen.call_count, 1)
 
-  @patch("server.worker_manager._fetch_metadata_from_store")
+  @patch("server.worker_manager.metadata_for")
   @patch("subprocess.Popen")
   def test_launch_sampler_fft_uses_model_id(self, mock_popen, mock_fetch) -> None:
     from server.model_metadata import TrainingModelMetadata
@@ -411,76 +403,13 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
       fine_tuning_type="full",
     )
 
-    self.manager.launch_sampler("model-fft-1")
-    self.assertIn("model-fft-1", self.manager.sampler_processes)
+    self.manager.ensure("model-fft-1", "sampler")
+    self.assertIn(("sampler", "model-fft-1"), self.manager.processes)
     self.assertEqual(mock_popen.call_count, 1)
 
     cmd_args = mock_popen.call_args[0][0]
     self.assertIn("server.vllm_sampler", cmd_args)
     self.assertIn("model-fft-1", cmd_args)
-
-
-class EstimateMemoryTierTest(unittest.TestCase):
-  """Tier selection for full fine-tuning is driven by the known-model table."""
-
-  def test_small_models_fit_the_24gb_tier(self) -> None:
-    for model in ("Qwen/Qwen3-0.6B", "Qwen/Qwen2.5-0.5B", "Qwen/Qwen2.5-1.5B", "google/gemma-3-1b-pt"):
-      self.assertEqual(estimator.estimate_memory_tier(model, "full"), "24gb", model)
-
-  def test_large_models_need_the_80gb_tier(self) -> None:
-    for model in ("Qwen/Qwen3-4B", "Qwen/Qwen3-8B", "Qwen/Qwen3.5-27B", "google/gemma-4-e4b"):
-      self.assertEqual(estimator.estimate_memory_tier(model, "full"), "80gb", model)
-
-  def test_effective_size_names_are_sized_by_their_raw_weights(self) -> None:
-    # `gemma-4-e2b` states its *effective* size; the raw weights an FFT has to
-    # hold are ~5B. Reading "2b" off the name is what puts it on a 24 GB card.
-    self.assertEqual(estimator.estimate_memory_tier("google/gemma-4-e2b", "full"), "80gb")
-
-  def test_unknown_models_stay_on_the_conservative_tier(self) -> None:
-    with self.assertLogs("server.estimator", level="WARNING"):
-      self.assertEqual(estimator.estimate_memory_tier("acme/mystery-model", "full"), "80gb")
-
-  def test_variant_and_release_tags_resolve_to_the_base_entry(self) -> None:
-    cases = {
-      "Qwen/Qwen2.5-0.5B-Instruct": "24gb",
-      "Qwen/Qwen3-4B-Instruct-2507": "80gb",
-      "google/gemma-4-E2B-it": "80gb",
-      "google/gemma-3-1b-it": "24gb",
-      "qwen3-0.6b": "24gb",  # bare id, no org prefix
-    }
-    for model, tier in cases.items():
-      self.assertEqual(estimator.estimate_memory_tier(model, "full"), tier, model)
-
-  def test_sizing_needs_no_network_or_hub_client(self) -> None:
-    # The launch path must not depend on the Hub being reachable, so a missing
-    # huggingface_hub must not change any verdict.
-    with patch.dict(sys.modules, {"huggingface_hub": None}):
-      self.assertEqual(estimator.estimate_memory_tier("Qwen/Qwen3-0.6B", "full"), "24gb")
-      self.assertEqual(estimator.estimate_memory_tier("Qwen/Qwen3-8B", "full"), "80gb")
-
-  def test_table_entries_agree_with_the_documented_budget(self) -> None:
-    # The 24gb tier admits ~1.7B params at 12 bytes each; guard the boundary so
-    # a future budget change has to be made deliberately.
-    threshold = estimator.TIER_24GB_FFT_BUDGET_BYTES / estimator.FFT_VRAM_BYTES_PER_PARAM
-    self.assertLess(estimator.MODEL_TO_PARAM_COUNT["qwen3-1.7b"], threshold)
-    self.assertGreater(estimator.MODEL_TO_PARAM_COUNT["qwen3-4b"], threshold)
-
-  def test_lora_is_sized_by_the_frozen_base_weights(self) -> None:
-    # A LoRA worker holds the base model in bf16; the adapter is negligible. The
-    # binding constraint is the sampler fitting those weights inside the slice
-    # of the device vLLM is given.
-    self.assertEqual(estimator.estimate_memory_tier("Qwen/Qwen3-4B", "lora"), "24gb")
-    self.assertEqual(estimator.estimate_memory_tier("Qwen/Qwen3-8B", "lora"), "80gb")
-
-  def test_lora_needs_less_gpu_than_full_fine_tuning(self) -> None:
-    # Same model, different mode: 4B carries 8GB of weights for LoRA but ~48GB
-    # of weights, gradients and optimizer state for a full fine-tune.
-    self.assertEqual(estimator.estimate_memory_tier("Qwen/Qwen3-4B", "lora"), "24gb")
-    self.assertEqual(estimator.estimate_memory_tier("Qwen/Qwen3-4B", "full"), "80gb")
-
-  def test_unknown_models_stay_conservative_for_lora_too(self) -> None:
-    with self.assertLogs("server.estimator", level="WARNING"):
-      self.assertEqual(estimator.estimate_memory_tier("meta-llama/Llama-3-70B", "lora"), "80gb")
 
 
 if __name__ == "__main__":

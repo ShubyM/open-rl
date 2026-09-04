@@ -18,7 +18,7 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_gateway_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_estimator tests.test_k8s_worker_manager tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends
+UNIT_TESTS ?= tests.test_gateway_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -34,7 +34,7 @@ E2E_ARGS ?=
 E2E_NAMESPACE ?=
 # The client image cluster-e2e runs. Overridden by kind-e2e to the
 # cluster-local registry; the pull policy is left to the manifest by default.
-E2E_IMAGE ?= gcr.io/$(GCP_PROJECT)/open-rl-client:$(IMAGE_TAG)
+E2E_IMAGE ?= $(IMAGE_REPO)/client:latest
 E2E_IMAGE_PULL_POLICY ?=
 
 # CUDA_VISIBLE_DEVICES can be provided either as an environment variable or as a
@@ -127,15 +127,20 @@ fmt:
 # ---------------------------------------------------------------------------
 # Deployment (GKE)
 # ---------------------------------------------------------------------------
-GCP_PROJECT ?= cdrollouts-sunilarora
+# Set GCP_PROJECT explicitly only when building into your own GCP registry.
+GCP_PROJECT ?=
 IMAGE_TAG   ?= $(shell git rev-parse --short HEAD 2>/dev/null || cat VERSION 2>/dev/null || echo latest)
 
-build-images:
+.PHONY: require-gcp-project
+require-gcp-project:
+	@test -n "$(GCP_PROJECT)" || { echo "Set GCP_PROJECT=<your-project> for private image builds/deploys"; exit 2; }
+
+build-images: require-gcp-project
 	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) -f src/server/Dockerfile .
 	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) -f src/server/Dockerfile.gateway .
 	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-client:$(IMAGE_TAG) -f src/server/Dockerfile.client .
 
-push-images:
+push-images: require-gcp-project
 	docker push gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG)
 	docker push gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG)
 	docker push gcr.io/$(GCP_PROJECT)/open-rl-client:$(IMAGE_TAG)
@@ -164,23 +169,23 @@ CLOUD_IMAGE_TAG := $(CLOUD_IMAGE_TAG)
 
 CLOUD_BUILD = gcloud builds submit --project=$(GCP_PROJECT) --config=cloudbuild.yaml
 
-cloud-build-gateway:
+cloud-build-gateway: require-gcp-project
 	$(CLOUD_BUILD) --substitutions=_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-gateway,_DOCKERFILE=src/server/Dockerfile.gateway,_TAG=$(CLOUD_IMAGE_TAG) .
 
-cloud-build-server:
+cloud-build-server: require-gcp-project
 	$(CLOUD_BUILD) --substitutions=_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server,_DOCKERFILE=src/server/Dockerfile,_TAG=$(CLOUD_IMAGE_TAG) .
 
-cloud-build-client:
+cloud-build-client: require-gcp-project
 	$(CLOUD_BUILD) --substitutions=_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-client,_DOCKERFILE=src/server/Dockerfile.client,_TAG=$(CLOUD_IMAGE_TAG) .
 
 # Point the running workloads at the freshly built tag. Split from the build
 # steps so a tag built earlier can be re-deployed with
 # `make cloud-deploy-gateway CLOUD_IMAGE_TAG=<tag>`.
-cloud-deploy-gateway:
+cloud-deploy-gateway: require-gcp-project
 	kubectl set image deployment/open-rl-gateway gateway=gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(CLOUD_IMAGE_TAG)
 	@echo "gateway -> gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(CLOUD_IMAGE_TAG)"
 
-cloud-deploy-server:
+cloud-deploy-server: require-gcp-project
 	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=gcr.io/$(GCP_PROJECT)/open-rl-server:$(CLOUD_IMAGE_TAG) 2>/dev/null || true
 	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(CLOUD_IMAGE_TAG)
 	@echo "workers -> gcr.io/$(GCP_PROJECT)/open-rl-server:$(CLOUD_IMAGE_TAG)"
@@ -205,7 +210,7 @@ kind-create:
 # Rebuild and republish only the slim gateway image -- the fast inner loop.
 kind-gateway:
 	./dev/kind/load-images.sh gateway
-	kubectl rollout restart deployment/open-rl-gateway
+	kubectl -n openrl-system rollout restart deployment/open-rl-gateway
 
 kind-deploy:
 	./dev/kind/load-images.sh
@@ -298,7 +303,7 @@ dashboard-apply:
 # Images published by .github/workflows/build-and-push.yml. The names must match
 # the manifests exactly or the pin silently does nothing.
 IMAGE_REPO     ?= ghcr.io/gke-labs/open-rl
-RELEASE_IMAGES ?= server gateway client
+RELEASE_IMAGES ?= server gateway client scheduler
 # Gitignored; the release job uploads everything in here.
 DIST_DIR       ?= dist
 

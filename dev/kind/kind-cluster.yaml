@@ -4,7 +4,7 @@
 # there are no workers, so every GPU on the host is schedulable and there is one
 # less container to inject devices into.
 #
-# The node image must be v1.34 or newer. k8s_worker_manager.py talks to
+# The node image must be v1.34 or newer. The scheduler talks to
 # resource.k8s.io/v1, which only reached GA in 1.34 -- on a 1.33 node image the
 # API server serves v1beta1 and every claim call 404s. v1.35 is pinned to track
 # the GKE cluster (1.35.x) this is meant to stand in for.
@@ -34,10 +34,8 @@ nodes:
     kubeadmConfigPatches:
       # node-labels covers two separate needs:
       #
-      # group.timeslice.io/{trainers,samplers} -- the accel-timeslicer DaemonSet
-      #   requires at least one of them to exist, so setting both here lets the
-      #   GKE manifests apply unpatched. Worker Pods no longer select on them:
-      #   their ResourceClaim decides placement.
+      # openrl.io/enabled plus openrl.io/{trainer,sampler} -- opts the node in
+      #   to the scheduler for both roles, so the GKE manifests apply unpatched.
       #
       # nvidia.com/gpu.present -- the DRA driver's kubelet-plugin DaemonSet has a
       #   required nodeAffinity matching one of several Node Feature Discovery
@@ -48,4 +46,4 @@ nodes:
         kind: InitConfiguration
         nodeRegistration:
           kubeletExtraArgs:
-            node-labels: "group.timeslice.io/trainers=true,group.timeslice.io/samplers=true,nvidia.com/gpu.present=true"
+            node-labels: "openrl.io/enabled=true,openrl.io/trainer=true,openrl.io/sampler=true,nvidia.com/gpu.present=true"

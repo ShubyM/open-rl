@@ -25,11 +25,10 @@
 #      rendered from.
 #   3. Bump the timeslice client pin in pyproject.toml to the same upstream
 #      tag, so the client and the agent stay paired.
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: timeslice-system
----
+# The upstream render also creates a timeslice-system Namespace. It is
+# dropped here: the stack's kustomization moves every object, this agent
+# included, into one namespace, and a second Namespace object under that
+# transformer is an ID conflict with the scheduler's.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

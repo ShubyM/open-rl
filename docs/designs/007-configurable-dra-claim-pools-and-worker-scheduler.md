@@ -182,7 +182,7 @@ spec:
   # claimRef: "open-rl-trainer-gpu-1"
 
   # Container overrides (image, args, env)
-  image: "gcr.io/cdrollouts-sunilarora/open-rl-server:0.3.74"
+  image: "ghcr.io/gke-labs/open-rl/server:latest"
 
 status:
   phase: "Scheduled" # Pending | Scheduled | Running | Failed | Terminated
