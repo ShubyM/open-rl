@@ -58,18 +58,14 @@ spec:
           value: "vllm"
         - name: OPEN_RL_ENABLE_FFT
           value: "true"
+        # One Workload object per worker; the scheduler picks the claim and
+        # renders the pod.
         - name: OPEN_RL_WORKER_MANAGER
-          value: "kubernetes"
+          value: "scheduler"
         - name: OPEN_RL_WORKER_NAMESPACE
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        - name: OPEN_RL_TRAINER_POD_TEMPLATE
-          value: "/etc/open-rl/trainer/trainer-worker-pod.yaml"
-        - name: OPEN_RL_SAMPLER_POD_TEMPLATE
-          value: "/etc/open-rl/sampler/sampler-worker-pod.yaml"
-        - name: OPEN_RL_WORKER_POD_TEMPLATE
-          value: "/etc/open-rl/trainer/trainer-worker-pod.yaml"
         - name: OPEN_RL_WORKER_IMAGE
           value: "ghcr.io/gke-labs/open-rl/server:latest"
         resources:
@@ -89,19 +85,7 @@ spec:
         volumeMounts:
         - name: shared-storage
           mountPath: /mnt/shared
-        - name: trainer-tmpl
-          mountPath: /etc/open-rl/trainer
-          readOnly: true
-        - name: sampler-tmpl
-          mountPath: /etc/open-rl/sampler
-          readOnly: true
       volumes:
       - name: shared-storage
         persistentVolumeClaim:
           claimName: open-rl-shared-pvc
-      - name: trainer-tmpl
-        configMap:
-          name: open-rl-trainer-worker-pod-template
-      - name: sampler-tmpl
-        configMap:
-          name: open-rl-sampler-worker-pod-template

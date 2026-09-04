@@ -12,15 +12,12 @@ kind: Kustomization
 #     than COS's /home/kubernetes/bin/nvidia bundle
 #   - images point at locally built tags in the cluster-local registry
 #
-# Images are set with explicit patches rather than an `images:` transformer.
-# The base kustomization runs its own transformer first, retagging everything to
-# gcr.io, so an `images:` entry here matching ghcr.io/gke-labs/... would silently
-# match nothing and deploy the wrong images. Patching the two containers by name
-# does not care what the base retagged them to.
+# Container patches select local development images and their pull policies.
+# The base uses upstream GHCR images; the gateway worker-image env is patched
+# separately because it is not a container image field.
 #
-# The pod templates' nodeSelectors are left alone: dev/kind/kind-cluster.yaml
-# labels the single node as both a trainer and a sampler host, so the GKE
-# manifests apply unmodified.
+# dev/kind/kind-cluster.yaml labels the single node as both a trainer and a
+# sampler host, so the GKE manifests apply unmodified.
 resources:
   - ../distributed-fft-timeslice
 
@@ -88,7 +85,6 @@ patches:
       kind: DaemonSet
       metadata:
         name: snapshot-agent
-        namespace: timeslice-system
       spec:
         template:
           spec:
@@ -141,15 +137,27 @@ patches:
                 image: localhost:5001/open-rl-gateway:kind-dev
                 imagePullPolicy: Always
                 env:
-                  # The worker and sampler pod templates live inside ConfigMaps
-                  # as YAML strings, out of reach of any image transformer. The
-                  # gateway overrides that image at render time from this var
-                  # (k8s_worker_manager.py:506), so this is what actually decides
-                  # the image every launched worker runs.
+                  # The worker image is a plain string in the Workload template
+                  # the gateway renders, out of reach of any image transformer,
+                  # so this var is what decides the image every worker runs.
                   - name: OPEN_RL_WORKER_IMAGE
                     value: localhost:5001/open-rl-server:kind-dev
-                  # Same reason as the containers patched above, but the worker
-                  # templates are ConfigMap strings a patch cannot reach, so the
-                  # gateway stamps this at render time.
+                  # The gateway also stamps the pull policy into each Workload.
                   - name: OPEN_RL_WORKER_IMAGE_PULL_POLICY
                     value: Always
+
+  - target:
+      kind: Deployment
+      name: open-rl-scheduler
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-scheduler
+      spec:
+        template:
+          spec:
+            containers:
+              - name: manager
+                image: localhost:5001/open-rl-scheduler:kind-dev
+                imagePullPolicy: Always

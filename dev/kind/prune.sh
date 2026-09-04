@@ -44,7 +44,7 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$REGISTRY_NAME" 2>/dev/null || 
   # way to restore it, so leave the registry untouched instead.
   restorable=()
   missing=()
-  for target in server gateway client; do
+  for target in server gateway client scheduler; do
     image="${REGISTRY}/open-rl-${target}:${IMAGE_TAG}"
     if docker image inspect "$image" >/dev/null 2>&1; then
       restorable+=("$image")
@@ -55,7 +55,7 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$REGISTRY_NAME" 2>/dev/null || 
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     log "Not rebuilding the registry: ${missing[*]} not present locally to re-push."
-    log "Build them first (./dev/kind/load-images.sh) or accept the stale blobs."
+    log "Build them first (./dev/kind/load-images.sh server gateway client scheduler) or accept the stale blobs."
   else
     before="$(registry_size)"
     log "Rebuilding the registry (was $before)..."
