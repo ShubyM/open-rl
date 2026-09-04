@@ -11,7 +11,7 @@ from typing import Any
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
-from server.vllm_options import split_stop, text_only_engine_kwargs
+from server.vllm_options import gpu_memory_utilization, split_stop, text_only_engine_kwargs
 
 try:
   from vllm import SamplingParams
@@ -100,7 +100,7 @@ def init_engine():
       "enable_lora": False,
       "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", "8192")),
       "max_num_seqs": int(os.getenv("VLLM_MAX_NUM_SEQS", "64")),
-      "gpu_memory_utilization": float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")),
+      "gpu_memory_utilization": gpu_memory_utilization(),
       "enable_prefix_caching": False,
       "enforce_eager": os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
     }
