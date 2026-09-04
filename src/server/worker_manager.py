@@ -36,6 +36,18 @@ def _py_cmd(extras: list[str], module: str, model_id: str, active_tenant_set_id:
   return cmd
 
 
+def trainer_cmd(model_id: str, active_tenant_set_id: str | None = None) -> list[str]:
+  """Trainer launch command; OPEN_RL_FSDP_WORLD_SIZE>1 runs it under torchrun for data-parallel LoRA."""
+  world_size = int(os.getenv("OPEN_RL_FSDP_WORLD_SIZE", "1"))
+  if world_size <= 1:
+    return _py_cmd(["gpu"], "server.training_requests_processor", model_id, active_tenant_set_id=active_tenant_set_id)
+  runner = ["uv", "run", "--extra", "gpu", "torchrun"] if shutil.which("uv") else [sys.executable, "-u", "-m", "torch.distributed.run"]
+  cmd = runner + ["--standalone", f"--nproc-per-node={world_size}", "-m", "server.training_requests_processor", "--model-id", model_id]
+  if active_tenant_set_id:
+    cmd.extend(["--active-tenant-set-id", active_tenant_set_id])
+  return cmd
+
+
 from server.model_metadata import TrainingModelMetadata
 
 
@@ -285,7 +297,7 @@ class LocalWorkerManager:
       clean_name = target_id.replace("/", "_")
       with open(tmp_dir / f"trainer_{clean_name}.log", "a") as train_log:
         self.train_processes[target_id] = subprocess.Popen(
-          _py_cmd(["gpu"], "server.training_requests_processor", target_id, active_tenant_set_id=active_set_id),
+          trainer_cmd(target_id, active_tenant_set_id=active_set_id),
           cwd=self.project_dir,
           env=env,
           stdout=train_log,

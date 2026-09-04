@@ -198,6 +198,20 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "trainer-Model_A.1")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "trainers")
 
+  async def test_local_launch_uses_torchrun_for_fsdp(self) -> None:
+    with (
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_FSDP_WORLD_SIZE": "2"}, clear=True),
+      patch("server.worker_manager.subprocess.Popen") as popen,
+      patch("server.worker_manager.shutil.which", return_value="/usr/bin/uv"),
+    ):
+      LocalWorkerManager().launch("model-a")
+
+    command = popen.call_args.args[0]
+    self.assertIn("torchrun", command)
+    self.assertIn("--nproc-per-node=2", command)
+    self.assertIn("--model-id", command)
+    self.assertEqual(command[command.index("--model-id") + 1], "model-a")
+
   async def test_local_sampler_launch_stamps_workload_tags_and_process_group(self) -> None:
     with (
       patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}, clear=True),

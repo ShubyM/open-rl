@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -12,6 +13,8 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 
 class RequestStore(ABC):
+  redis: Any | None = None
+
   @abstractmethod
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     """Push a request into the tenant queue and assign to an active set."""
@@ -245,9 +248,38 @@ class InMemoryStore(RequestStore):
       self.kv_store.pop(k, None)
 
 
+async def encode(data: Any) -> str:
+  """json.dumps off the event loop.
+
+  Training payloads at long context are tens of MB; serializing them on the
+  loop stalls it past the client's ~5s socket timeout, which surfaces as
+  spurious RedisTimeoutErrors on every concurrent command."""
+  return await asyncio.to_thread(json.dumps, data)
+
+
+async def decode(raw: str) -> Any:
+  return await asyncio.to_thread(json.loads, raw)
+
+
 class RedisStore(RequestStore):
   def __init__(self, redis_url: str):
-    self.redis = redis.from_url(redis_url, decode_responses=True, health_check_interval=2, max_connections=10000)
+    # Long health-check interval and timeout retry: a briefly stalled loop or
+    # server must not turn one late reply into a failed request. The pool is
+    # deliberately SMALL: nothing holds a connection across a wait (get_future
+    # polls non-blockingly), commands borrow a socket for ~1ms, and the pool
+    # retains every connection it ever opens — so a large cap IS a connection
+    # leak under a forward_backward wave. Excess commands queue up to 120s.
+    self.redis = redis.Redis(
+      connection_pool=redis.BlockingConnectionPool.from_url(
+        redis_url,
+        decode_responses=True,
+        health_check_interval=30,
+        socket_keepalive=True,
+        retry_on_timeout=True,
+        max_connections=48,
+        timeout=120,
+      )
+    )
     import redis as sync_redis_mod
 
     self.sync_redis = sync_redis_mod.Redis.from_url(redis_url, decode_responses=True)
@@ -264,7 +296,7 @@ class RedisStore(RequestStore):
     active_list = f"open_rl:active_tenants:{active_set_id}" if active_set_id else self.active_list
 
     # 1. Add request to tenant-specific list
-    await self.redis.rpush(queue_key, json.dumps(req_data))
+    await self.redis.rpush(queue_key, await encode(req_data))
 
     # 2. Add tenant to active set and list if not already there
     # SADD returns 1 if it was newly added, 0 if it already existed
@@ -273,7 +305,7 @@ class RedisStore(RequestStore):
       await self.redis.rpush(active_list, model_id)
 
   async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
-    await self.redis.rpush(self.worker_launch_queue, json.dumps(req_data))
+    await self.redis.rpush(self.worker_launch_queue, await encode(req_data))
 
   async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]:
     active_set = f"open_rl:active_tenants_set:{active_set_id}" if active_set_id else self.active_set
@@ -307,7 +339,7 @@ class RedisStore(RequestStore):
         item = await self.redis.lpop(queue_key)
         if not item:
           break
-        batch.append(json.loads(item))
+        batch.append(await decode(item))
 
       if batch:
         # Round-robin: move the tenant we just served from the head to the tail.
@@ -325,13 +357,13 @@ class RedisStore(RequestStore):
     if not result:
       return []
 
-    batch = [json.loads(result[1])]
+    batch = [await decode(result[1])]
 
     while True:
       item = await self.redis.lpop(self.worker_launch_queue)
       if not item:
         break
-      batch.append(json.loads(item))
+      batch.append(await decode(item))
 
     return batch
 
@@ -345,13 +377,13 @@ class RedisStore(RequestStore):
     if not result:
       return []
 
-    batch = [json.loads(result[1])]
+    batch = [await decode(result[1])]
 
     while True:
       item = await self.redis.lpop(queue_key)
       if not item:
         break
-      batch.append(json.loads(item))
+      batch.append(await decode(item))
 
     q_len = await self.redis.llen(queue_key)
     if q_len == 0:
@@ -363,7 +395,7 @@ class RedisStore(RequestStore):
   async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
     queue_key = f"open_rl:sampler_queue:{model_id}"
-    await self.redis.rpush(queue_key, json.dumps(req_data))
+    await self.redis.rpush(queue_key, await encode(req_data))
 
   async def get_sampling_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     queue_key = f"open_rl:sampler_queue:{model_id}"
@@ -375,13 +407,13 @@ class RedisStore(RequestStore):
     if not result:
       return []
 
-    batch = [json.loads(result[1])]
+    batch = [await decode(result[1])]
 
     while True:
       item = await self.redis.lpop(queue_key)
       if not item:
         break
-      batch.append(json.loads(item))
+      batch.append(await decode(item))
 
     return batch
 
@@ -390,28 +422,28 @@ class RedisStore(RequestStore):
       return
 
     key = f"open_rl:future:{req_id}"
-    await self.redis.rpush(key, json.dumps(result))
+    await self.redis.rpush(key, await encode(result))
     await self.redis.expire(key, 300)
 
   async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     key = f"open_rl:future:{req_id}"
+
+    # Deliberately NOT a blocking read: BLPOP pins one pool connection per
+    # pending request for its entire wait, so a forward_backward wave (hundreds
+    # of chunked requests from one optimizer step) exhausts any fixed pool.
+    # A cheap read every 250ms holds a connection for ~1ms per check, keeping
+    # connection usage O(concurrent commands) instead of O(pending requests).
     deadline = time.monotonic() + timeout
     while True:
-      remaining = deadline - time.monotonic()
-      if remaining <= 0:
-        return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
-      try:
-        raw_result = await self.redis.lpop(key)
-      except Exception:
-        raw_result = None
-
-      if raw_result:
-        payload = json.loads(raw_result)
-        await self.redis.rpush(key, raw_result)
+      raw = await self.redis.lindex(key, 0)
+      if raw is not None:
         await self.redis.expire(key, 300)
-        return payload
-
-      await asyncio.sleep(0.1)
+        return await decode(raw)
+      if time.monotonic() >= deadline:
+        return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
+      # Jittered so waiters born in the same wave don't poll in lockstep and
+      # demand hundreds of connections in the same event-loop tick.
+      await asyncio.sleep(0.2 + 0.2 * random.random())
 
   async def set_value(self, key: str, value: str) -> None:
     await self.redis.set(key, value)

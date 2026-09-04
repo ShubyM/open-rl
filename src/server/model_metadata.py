@@ -78,6 +78,9 @@ class TrainingModelMetadata:
   total_steps_completed: int = 0
   max_steps: int | None = None
   tenant_id: str = "default"
+  # Opaque client metadata (tinker-cookbook stores renderer_name here and
+  # verifies it on resume).
+  user_metadata: dict[str, Any] | None = None
 
   @classmethod
   def from_dict(cls, data: dict[str, Any]) -> "TrainingModelMetadata":
@@ -112,6 +115,7 @@ class TrainingModelMetadata:
       total_steps_completed=data.get("total_steps_completed", 0),
       max_steps=data.get("max_steps"),
       tenant_id=data.get("tenant_id", "default"),
+      user_metadata=data.get("user_metadata"),
     )
 
   @classmethod
