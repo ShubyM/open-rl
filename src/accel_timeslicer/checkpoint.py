@@ -30,11 +30,11 @@ class CudaCheckpointRestorer:
   def checkpoint(self, workload: WorkloadRef) -> bool:
     pids = self.discover_pids(workload)
     if not pids:
-      self.checkpointed_pids.pop(workload.key, None)
-      logger.info("checkpoint skipped for workload=%s: no GPU PIDs found", workload.key)
+      self.checkpointed_pids.pop(workload.name, None)
+      logger.info("checkpoint skipped for workload=%s: no GPU PIDs found", workload.name)
       return False
     start = time.perf_counter()
-    logger.info("checkpoint workload=%s pids=%s", workload.key, pids)
+    logger.info("checkpoint workload=%s pids=%s", workload.name, pids)
     for pid in pids:
       lock_args = ["--action", "lock", "--pid", str(pid)]
       if self.timeout_ms is not None:
@@ -43,22 +43,22 @@ class CudaCheckpointRestorer:
       self.run_cuda_checkpoint(lock_args)
     for pid in pids:
       self.run_cuda_checkpoint(["--action", "checkpoint", "--pid", str(pid)])
-    self.checkpointed_pids[workload.key] = pids
-    logger.info("checkpoint workload=%s took %.0f ms", workload.key, (time.perf_counter() - start) * 1000)
+    self.checkpointed_pids[workload.name] = pids
+    logger.info("checkpoint workload=%s took %.0f ms", workload.name, (time.perf_counter() - start) * 1000)
     return True
 
   def restore(self, workload: WorkloadRef) -> None:
-    pids = self.checkpointed_pids.get(workload.key)
+    pids = self.checkpointed_pids.get(workload.name)
     if not pids:
-      raise RuntimeError(f"no checkpointed PIDs found for workload {workload.key}")
+      raise RuntimeError(f"no checkpointed PIDs found for workload {workload.name}")
     start = time.perf_counter()
-    logger.info("restore workload=%s pids=%s", workload.key, pids)
+    logger.info("restore workload=%s pids=%s", workload.name, pids)
     for pid in pids:
       self.run_cuda_checkpoint(["--action", "restore", "--pid", str(pid)])
     for pid in pids:
       self.run_cuda_checkpoint(["--action", "unlock", "--pid", str(pid)])
-    self.checkpointed_pids.pop(workload.key, None)
-    logger.info("restore workload=%s took %.0f ms", workload.key, (time.perf_counter() - start) * 1000)
+    self.checkpointed_pids.pop(workload.name, None)
+    logger.info("restore workload=%s took %.0f ms", workload.name, (time.perf_counter() - start) * 1000)
 
   def run_cuda_checkpoint(self, args: list[str]) -> None:
     full_argv = [self.cuda_checkpoint_bin, *args]

@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Protocol
 
-from .workload import DEFAULT_TIME_SLICE_GROUP, WorkloadRef
+from .workload import DEFAULT_CLAIM, WorkloadRef
 
 DEFAULT_SOCKET_PATH = "/tmp/open-rl/accel-timeslicer.sock"
 DEFAULT_TCP_PORT = 9753
@@ -104,15 +104,18 @@ class SocketTimeSlicerClient:
       raise
 
 
-def workload_from_env(pid: int | None = None, job_id: str | None = None, group: str = DEFAULT_TIME_SLICE_GROUP) -> WorkloadRef:
-  env_job_id = os.getenv("OPEN_RL_TIME_SLICE_JOB_ID")
-  if env_job_id:
-    return WorkloadRef(job_id=env_job_id, group=group)
-  if job_id:
-    return WorkloadRef(job_id=job_id, group=group)
+def workload_from_env(pid: int | None = None, name: str | None = None, claim: str = DEFAULT_CLAIM) -> WorkloadRef:
+  # The launcher's stamps win over the caller's defaults. OPEN_RL_TIME_SLICE_GROUP
+  # and OPEN_RL_TIME_SLICE_JOB_ID are the older spellings the scheduler still stamps.
+  claim = os.getenv("OPEN_RL_CLAIM") or os.getenv("OPEN_RL_TIME_SLICE_GROUP") or claim
+  env_name = os.getenv("OPEN_RL_WORKLOAD_ID") or os.getenv("OPEN_RL_TIME_SLICE_JOB_ID")
+  if env_name:
+    return WorkloadRef(env_name, claim)
+  if name:
+    return WorkloadRef(name, claim)
   if pid is None:
-    raise ValueError("workload requires job_id")
-  return WorkloadRef(job_id=str(pid), group=group)
+    raise ValueError("workload requires a name")
+  return WorkloadRef(str(pid), claim)
 
 
 def time_slicer_client_from_env() -> TimeSlicerClient:

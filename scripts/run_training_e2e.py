@@ -482,8 +482,8 @@ def check_snapshot_interleaving(config: RunConfig) -> None:
     return
   text = log_path.read_text(encoding="utf-8", errors="replace")
 
-  checkpointed = set(re.findall(r"checkpointed workload (\S+) group \S+", text))
-  restored = set(re.findall(r"restored workload (\S+) group \S+", text))
+  checkpointed = set(re.findall(r"checkpointed workload (\S+) claim \S+", text))
+  restored = set(re.findall(r"restored workload (\S+) claim \S+", text))
 
   cp_t = {workload for workload in checkpointed if ":trainer-" in workload or workload.startswith("trainer-")}
   rs_t = {workload for workload in restored if ":trainer-" in workload or workload.startswith("trainer-")}

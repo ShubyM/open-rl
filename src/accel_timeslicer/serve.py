@@ -10,7 +10,7 @@ from typing import Any
 from .checkpoint import CudaCheckpointRestorer
 from .llmd import LlmDCheckpointRestorer
 from .single_node import SingleNodeTimeSlicer
-from .workload import DEFAULT_TIME_SLICE_GROUP, WorkloadRef
+from .workload import DEFAULT_CLAIM, WorkloadRef
 
 try:
   from timeslice.snapshot_agent import SnapshotAgentClient as LlmDClient
@@ -65,13 +65,11 @@ async def dispatch(time_slicer: SingleNodeTimeSlicer, line: bytes, connection_id
 
 
 def workload_from_payload(payload: dict[str, Any]) -> WorkloadRef:
-  job_id = payload.get("job_id") or payload.get("snapshot_id")
-  if job_id is None:
-    raise ValueError("workload requires job_id")
-  return WorkloadRef(
-    job_id=job_id,
-    group=payload.get("group") or DEFAULT_TIME_SLICE_GROUP,
-  )
+  # job_id and group are the older spellings, still sent by older workers.
+  name = payload.get("name") or payload.get("job_id") or payload.get("snapshot_id")
+  if name is None:
+    raise ValueError("workload requires a name")
+  return WorkloadRef(name, payload.get("claim") or payload.get("group") or DEFAULT_CLAIM)
 
 
 def parse_args() -> argparse.Namespace:

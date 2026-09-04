@@ -2,10 +2,10 @@ import os
 import subprocess
 from pathlib import Path
 
-from .workload import DEFAULT_TIME_SLICE_GROUP, WorkloadRef
+from .workload import WorkloadRef
 
-JOB_ID_ENV = "OPEN_RL_TIME_SLICE_JOB_ID"
-GROUP_ENV = "OPEN_RL_TIME_SLICE_GROUP"
+WORKLOAD_ID_ENV = "OPEN_RL_WORKLOAD_ID"
+JOB_ID_ENV = "OPEN_RL_TIME_SLICE_JOB_ID"  # older spelling
 
 
 def discover_workload_gpu_pids(workload: WorkloadRef) -> list[int]:
@@ -36,7 +36,7 @@ def workload_root_pid(pid: int, workload: WorkloadRef) -> int | None:
 
 def process_matches_workload(pid: int, workload: WorkloadRef) -> bool:
   env = process_environ(pid)
-  return env.get(JOB_ID_ENV) == workload.job_id and env.get(GROUP_ENV, DEFAULT_TIME_SLICE_GROUP) == workload.group
+  return (env.get(WORKLOAD_ID_ENV) or env.get(JOB_ID_ENV)) == workload.name
 
 
 def process_environ(pid: int) -> dict[str, str]:

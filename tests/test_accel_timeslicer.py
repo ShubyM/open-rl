@@ -26,10 +26,10 @@ class RecordingRestorer:
     self.calls.append(("restore", target))
 
   def labels(self) -> list[tuple[str, str, str]]:
-    return [(op, target.job_id, target.group) for op, target in self.calls]
+    return [(op, target.name, target.claim) for op, target in self.calls]
 
   def simple_labels(self) -> list[tuple[str, str]]:
-    return [(op, target.job_id) for op, target in self.calls]
+    return [(op, target.name) for op, target in self.calls]
 
 
 class BlockingRestorer(RecordingRestorer):
@@ -65,60 +65,73 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
   async def test_agent_grants_only_one_active_process_at_a_time(self) -> None:
     restorer = RecordingRestorer()
     agent = SingleNodeTimeSlicer(restorer)
-    await agent.register(WorkloadRef(job_id="101"))
-    await agent.register(WorkloadRef(job_id="202"))
+    await agent.register(WorkloadRef(name="101"))
+    await agent.register(WorkloadRef(name="202"))
 
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
-    blocked = asyncio.create_task(agent.acquire(WorkloadRef(job_id="202")))
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
+    blocked = asyncio.create_task(agent.acquire(WorkloadRef(name="202")))
     await asyncio.sleep(0.05)
     self.assertFalse(blocked.done())
 
-    release = await agent.release(WorkloadRef(job_id="101"))
+    release = await agent.release(WorkloadRef(name="101"))
     self.assertTrue(release["ok"])
     granted_b = await asyncio.wait_for(blocked, timeout=1.0)
     self.assertTrue(granted_b["ok"])
     self.assertEqual(restorer.simple_labels(), [("checkpoint", "101")])
-    self.assertEqual(agent.active_workload, "shared-accelerator:202")
+    self.assertEqual(agent.running, {"shared-accelerator": "202"})
+
+  async def test_groups_do_not_wait_on_each_other(self) -> None:
+    restorer = RecordingRestorer()
+    agent = SingleNodeTimeSlicer(restorer)
+    claim_a = WorkloadRef(name="trainer-a", claim="claim-a")
+    claim_b = WorkloadRef(name="trainer-b", claim="claim-b")
+    await agent.register(claim_a)
+    await agent.register(claim_b)
+
+    self.assertTrue((await agent.acquire(claim_a))["ok"])
+    granted = await asyncio.wait_for(agent.acquire(claim_b), timeout=1.0)
+    self.assertTrue(granted["ok"])
+    self.assertEqual(agent.running, {"claim-a": "trainer-a", "claim-b": "trainer-b"})
 
   async def test_first_acquire_is_cold_and_later_acquire_restores_after_checkpoint(self) -> None:
     restorer = RecordingRestorer()
     agent = SingleNodeTimeSlicer(restorer)
-    await agent.register(WorkloadRef(job_id="101"))
-    await agent.register(WorkloadRef(job_id="202"))
+    await agent.register(WorkloadRef(name="101"))
+    await agent.register(WorkloadRef(name="202"))
 
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
-    self.assertTrue((await agent.release(WorkloadRef(job_id="101")))["ok"])
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
+    self.assertTrue((await agent.release(WorkloadRef(name="101")))["ok"])
     self.assertEqual(restorer.simple_labels(), [("checkpoint", "101")])
 
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="202")))["ok"])
-    self.assertTrue((await agent.release(WorkloadRef(job_id="202")))["ok"])
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
+    self.assertTrue((await agent.acquire(WorkloadRef(name="202")))["ok"])
+    self.assertTrue((await agent.release(WorkloadRef(name="202")))["ok"])
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
 
     self.assertEqual(restorer.simple_labels(), [("checkpoint", "101"), ("checkpoint", "202"), ("restore", "101")])
 
   async def test_release_with_no_waiters_checkpoints_process(self) -> None:
     restorer = RecordingRestorer()
     agent = SingleNodeTimeSlicer(restorer)
-    await agent.register(WorkloadRef(job_id="101"))
+    await agent.register(WorkloadRef(name="101"))
 
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
-    release = await agent.release(WorkloadRef(job_id="101"))
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
+    release = await agent.release(WorkloadRef(name="101"))
 
     self.assertTrue(release["ok"])
-    self.assertIsNone(agent.active_workload)
-    self.assertTrue(agent.workloads["shared-accelerator:101"].checkpointed)
-    self.assertFalse(agent.workloads["shared-accelerator:101"].failed)
+    self.assertFalse(agent.running)
+    self.assertTrue(agent.workloads["101"].checkpointed)
+    self.assertFalse(agent.workloads["101"].failed)
     self.assertEqual(restorer.simple_labels(), [("checkpoint", "101")])
 
   async def test_release_without_snapshot_does_not_restore_later(self) -> None:
     restorer = NoSnapshotRestorer()
     agent = SingleNodeTimeSlicer(restorer)
-    workload = WorkloadRef(job_id="101")
+    workload = WorkloadRef(name="101")
 
     await agent.register(workload)
     self.assertTrue((await agent.acquire(workload))["ok"])
     self.assertTrue((await agent.release(workload))["ok"])
-    self.assertFalse(agent.workloads[workload.key].checkpointed)
+    self.assertFalse(agent.workloads[workload.name].checkpointed)
 
     self.assertTrue((await agent.acquire(workload))["ok"])
 
@@ -128,16 +141,16 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
     restorer = BlockingRestorer()
     restorer.block_checkpoint = True
     agent = SingleNodeTimeSlicer(restorer)
-    await agent.register(WorkloadRef(job_id="101"))
-    await agent.register(WorkloadRef(job_id="202"))
+    await agent.register(WorkloadRef(name="101"))
+    await agent.register(WorkloadRef(name="202"))
 
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
-    release_a = asyncio.create_task(agent.release(WorkloadRef(job_id="101")))
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
+    release_a = asyncio.create_task(agent.release(WorkloadRef(name="101")))
 
     checkpoint_started = await asyncio.to_thread(restorer.checkpoint_started.wait, 1.0)
     self.assertTrue(checkpoint_started)
 
-    acquire_b = asyncio.create_task(agent.acquire(WorkloadRef(job_id="202")))
+    acquire_b = asyncio.create_task(agent.acquire(WorkloadRef(name="202")))
     await asyncio.sleep(0.05)
     self.assertFalse(release_a.done())
     self.assertFalse(acquire_b.done())
@@ -151,13 +164,13 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
   async def test_checkpointed_process_is_not_granted_until_restore_finishes(self) -> None:
     restorer = BlockingRestorer()
     agent = SingleNodeTimeSlicer(restorer)
-    await agent.register(WorkloadRef(job_id="101"))
+    await agent.register(WorkloadRef(name="101"))
 
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
-    self.assertTrue((await agent.release(WorkloadRef(job_id="101")))["ok"])
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
+    self.assertTrue((await agent.release(WorkloadRef(name="101")))["ok"])
 
     restorer.block_restore = True
-    acquire_a = asyncio.create_task(agent.acquire(WorkloadRef(job_id="101")))
+    acquire_a = asyncio.create_task(agent.acquire(WorkloadRef(name="101")))
 
     restore_started = await asyncio.to_thread(restorer.restore_started.wait, 1.0)
     self.assertTrue(restore_started)
@@ -166,49 +179,49 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
     restorer.finish_restore.set()
 
     self.assertTrue((await asyncio.wait_for(acquire_a, timeout=1.0))["ok"])
-    self.assertFalse(agent.workloads["shared-accelerator:101"].checkpointed)
+    self.assertFalse(agent.workloads["101"].checkpointed)
     self.assertEqual(restorer.simple_labels(), [("checkpoint", "101"), ("restore", "101")])
 
   async def test_unregister_waiting_process_prevents_later_grant(self) -> None:
     agent = SingleNodeTimeSlicer(RecordingRestorer())
-    await agent.register(WorkloadRef(job_id="101"))
-    await agent.register(WorkloadRef(job_id="202"))
+    await agent.register(WorkloadRef(name="101"))
+    await agent.register(WorkloadRef(name="202"))
 
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
-    acquire_b = asyncio.create_task(agent.acquire(WorkloadRef(job_id="202")))
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
+    acquire_b = asyncio.create_task(agent.acquire(WorkloadRef(name="202")))
     await asyncio.sleep(0.05)
     self.assertFalse(acquire_b.done())
 
-    self.assertTrue((await agent.unregister(WorkloadRef(job_id="202")))["ok"])
-    self.assertTrue((await agent.release(WorkloadRef(job_id="101")))["ok"])
+    self.assertTrue((await agent.unregister(WorkloadRef(name="202")))["ok"])
+    self.assertTrue((await agent.release(WorkloadRef(name="101")))["ok"])
 
     result = await asyncio.wait_for(acquire_b, timeout=1.0)
     self.assertFalse(result["ok"])
-    self.assertIsNone(agent.active_workload)
+    self.assertFalse(agent.running)
 
   async def test_duplicate_commands_return_explicit_errors(self) -> None:
     agent = SingleNodeTimeSlicer(RecordingRestorer())
-    await agent.register(WorkloadRef(job_id="101"))
+    await agent.register(WorkloadRef(name="101"))
 
-    self.assertTrue((await agent.register(WorkloadRef(job_id="101")))["ok"])
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
-    self.assertFalse((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
-    self.assertTrue((await agent.release(WorkloadRef(job_id="101")))["ok"])
-    self.assertFalse((await agent.release(WorkloadRef(job_id="101")))["ok"])
-    self.assertTrue((await agent.unregister(WorkloadRef(job_id="101")))["ok"])
-    self.assertFalse((await agent.unregister(WorkloadRef(job_id="101")))["ok"])
+    self.assertTrue((await agent.register(WorkloadRef(name="101")))["ok"])
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
+    self.assertFalse((await agent.acquire(WorkloadRef(name="101")))["ok"])
+    self.assertTrue((await agent.release(WorkloadRef(name="101")))["ok"])
+    self.assertFalse((await agent.release(WorkloadRef(name="101")))["ok"])
+    self.assertTrue((await agent.unregister(WorkloadRef(name="101")))["ok"])
+    self.assertFalse((await agent.unregister(WorkloadRef(name="101")))["ok"])
 
   async def test_waiters_are_granted_in_fifo_order(self) -> None:
     agent = SingleNodeTimeSlicer(RecordingRestorer())
     for pid in [101, 202, 303, 404]:
-      await agent.register(WorkloadRef(job_id=str(pid)))
+      await agent.register(WorkloadRef(name=str(pid)))
 
-    self.assertTrue((await agent.acquire(WorkloadRef(job_id="101")))["ok"])
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
 
     grant_order: list[int] = []
 
     async def acquire_then_release(pid: int) -> None:
-      workload = WorkloadRef(job_id=str(pid))
+      workload = WorkloadRef(name=str(pid))
       await agent.acquire(workload)
       grant_order.append(pid)
       await agent.release(workload)
@@ -218,15 +231,25 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
       waiters.append(asyncio.create_task(acquire_then_release(pid)))
       await asyncio.sleep(0.01)
 
-    self.assertTrue((await agent.release(WorkloadRef(job_id="101")))["ok"])
+    self.assertTrue((await agent.release(WorkloadRef(name="101")))["ok"])
     await asyncio.wait_for(asyncio.gather(*waiters), timeout=1.0)
 
     self.assertEqual(grant_order, [303, 202, 404])
 
+  async def test_reregister_clears_a_previous_failure(self) -> None:
+    agent = SingleNodeTimeSlicer(RecordingRestorer())
+    await agent.register(WorkloadRef(name="101"), connection_id=7)
+    await agent.connection_closed(7)
+    self.assertFalse((await agent.acquire(WorkloadRef(name="101")))["ok"])
+
+    # The restarted process announces itself again and is servable.
+    await agent.register(WorkloadRef(name="101"), connection_id=8)
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
+
   async def test_register_can_use_stable_snapshot_id_for_backend_calls(self) -> None:
     restorer = RecordingRestorer()
     agent = SingleNodeTimeSlicer(restorer)
-    workload = WorkloadRef(job_id="job-a")
+    workload = WorkloadRef(name="job-a")
     await agent.register(workload)
 
     self.assertTrue((await agent.acquire(workload))["ok"])
@@ -245,15 +268,17 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
       client_a = SocketTimeSlicerClient(socket_path)
       client_b = SocketTimeSlicerClient(socket_path)
       try:
-        await client_a.register(WorkloadRef(job_id="101"))
-        await client_b.register(WorkloadRef(job_id="202"))
+        await client_a.register(WorkloadRef(name="101"))
+        await client_b.register(WorkloadRef(name="202"))
 
-        async with client_a.acquire(WorkloadRef(job_id="101")):
-          blocked = asyncio.create_task(acquire_once(client_b, WorkloadRef(job_id="202")))
+        async with client_a.acquire(WorkloadRef(name="101")):
+          blocked = asyncio.create_task(acquire_once(client_b, WorkloadRef(name="202")))
           await asyncio.sleep(0.05)
           self.assertFalse(blocked.done())
 
         self.assertEqual(await asyncio.wait_for(blocked, timeout=1.0), "202")
+        # 101 was suspended on the handoff; 202 stays resident after its
+        # release because nobody follows it.
         self.assertEqual(restorer.simple_labels(), [("checkpoint", "101"), ("checkpoint", "202")])
       finally:
         await client_a.close()
@@ -268,13 +293,13 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
       server = await start_time_slicer(agent, socket_path)
       client = SocketTimeSlicerClient(socket_path)
       try:
-        await client.register(WorkloadRef(job_id="101"))
+        await client.register(WorkloadRef(name="101"))
         await client.request({"command": "ACQUIRE", "job_id": "101"})
         await client.close()
         await asyncio.sleep(0.05)
 
-        self.assertIsNone(agent.active_workload)
-        self.assertTrue(agent.workloads["shared-accelerator:101"].failed)
+        self.assertFalse(agent.running)
+        self.assertTrue(agent.workloads["101"].failed)
       finally:
         server.close()
         await server.wait_closed()
@@ -287,11 +312,11 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
     client_a = SocketTimeSlicerClient(host="127.0.0.1", port=port)
     client_b = SocketTimeSlicerClient(host="127.0.0.1", port=port)
     try:
-      await client_a.register(WorkloadRef(job_id="101"))
-      await client_b.register(WorkloadRef(job_id="202"))
+      await client_a.register(WorkloadRef(name="101"))
+      await client_b.register(WorkloadRef(name="202"))
 
-      async with client_a.acquire(WorkloadRef(job_id="101")):
-        blocked = asyncio.create_task(acquire_once(client_b, WorkloadRef(job_id="202")))
+      async with client_a.acquire(WorkloadRef(name="101")):
+        blocked = asyncio.create_task(acquire_once(client_b, WorkloadRef(name="202")))
         await asyncio.sleep(0.05)
         self.assertFalse(blocked.done())
 
@@ -303,7 +328,7 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
       server.close()
       await server.wait_closed()
 
-  async def test_env_client_registers_time_slice_job_id(self) -> None:
+  async def test_env_client_registers_time_slice_job_id_and_group(self) -> None:
     restorer = RecordingRestorer()
     agent = SingleNodeTimeSlicer(restorer)
     server = await start_tcp_time_slicer(agent, "127.0.0.1", 0)
@@ -312,7 +337,8 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
       "OPEN_RL_ACCEL_TIMESLICER_HOST": "127.0.0.1",
       "OPEN_RL_ACCEL_TIMESLICER_PORT": str(port),
       "OPEN_RL_TIME_SLICE_JOB_ID": "job-a",
-      "OPEN_RL_TIME_SLICE_GROUP": "ignored-group",
+      # The launcher's stamp wins: under the scheduler this is the claim name.
+      "OPEN_RL_TIME_SLICE_GROUP": "claim-a",
     }
     with patch.dict("os.environ", env, clear=True):
       client = time_slicer_client_from_env()
@@ -321,25 +347,39 @@ class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
       await client.register(workload)
       async with client.acquire(workload):
         pass
+      # A successor in the same group forces the handoff, which must name the
+      # env-derived job id and group to the backend.
+      successor = WorkloadRef(name="job-b", claim="claim-a")
+      await client.register(successor)
+      async with client.acquire(successor):
+        pass
 
-      self.assertEqual(restorer.labels(), [("checkpoint", "job-a", "shared-accelerator")])
+      self.assertEqual(restorer.labels(), [("checkpoint", "job-a", "claim-a"), ("checkpoint", "job-b", "claim-a")])
     finally:
       await client.close()
       server.close()
       await server.wait_closed()
 
-  async def test_workload_from_env_uses_fixed_group_and_model_id_when_job_id_env_is_absent(self) -> None:
-    with patch.dict("os.environ", {"OPEN_RL_TIME_SLICE_GROUP": "ignored-group"}, clear=True):
-      workload = workload_from_env(101, job_id="model-a")
+  async def test_workload_from_env_prefers_the_launchers_group(self) -> None:
+    env = {"OPEN_RL_TIME_SLICE_GROUP": "claim-a"}
+    with patch.dict("os.environ", env, clear=True):
+      workload = workload_from_env(101, name="model-a")
 
-    self.assertEqual(workload.job_id, "model-a")
-    self.assertEqual(workload.group, "shared-accelerator")
+    self.assertEqual(workload.name, "model-a")
+    self.assertEqual(workload.claim, "claim-a")
+
+  async def test_workload_from_env_falls_back_to_the_callers_group(self) -> None:
+    with patch.dict("os.environ", {}, clear=True):
+      workload = workload_from_env(101, name="model-a", claim="trainers")
+
+    self.assertEqual(workload.name, "model-a")
+    self.assertEqual(workload.claim, "trainers")
 
 
 class CudaCheckpointRestorerTest(unittest.TestCase):
   def test_checkpoint_discovers_pids_from_workload_identity(self) -> None:
     restorer = CudaCheckpointRestorer("cuda-checkpoint")
-    workload = WorkloadRef(job_id="trainer-model-a")
+    workload = WorkloadRef(name="trainer-model-a")
 
     with (
       patch.object(restorer, "discover_pids", return_value=[101, 202]),
@@ -359,7 +399,7 @@ class CudaCheckpointRestorerTest(unittest.TestCase):
 
   def test_restore_uses_checkpointed_pids_without_rediscovery(self) -> None:
     restorer = CudaCheckpointRestorer("cuda-checkpoint")
-    workload = WorkloadRef(job_id="trainer-model-a")
+    workload = WorkloadRef(name="trainer-model-a")
 
     with (
       patch.object(restorer, "discover_pids", return_value=[101, 202]) as discover_pids,
@@ -387,7 +427,7 @@ class CudaCheckpointRestorerTest(unittest.TestCase):
 
   def test_checkpoint_with_no_gpu_pids_skips_snapshot(self) -> None:
     restorer = CudaCheckpointRestorer("cuda-checkpoint")
-    workload = WorkloadRef(job_id="trainer-model-a")
+    workload = WorkloadRef(name="trainer-model-a")
 
     with (
       patch.object(restorer, "discover_pids", return_value=[]),
@@ -400,7 +440,7 @@ class CudaCheckpointRestorerTest(unittest.TestCase):
 
   def test_restore_without_prior_checkpoint_fails(self) -> None:
     restorer = CudaCheckpointRestorer("cuda-checkpoint")
-    workload = WorkloadRef(job_id="trainer-model-a")
+    workload = WorkloadRef(name="trainer-model-a")
 
     with self.assertRaisesRegex(RuntimeError, "no checkpointed PIDs"):
       restorer.restore(workload)
@@ -408,7 +448,7 @@ class CudaCheckpointRestorerTest(unittest.TestCase):
   def test_process_discovery_checks_gpu_pids_and_process_group_leaders(self) -> None:
     from accel_timeslicer.process_discovery import discover_workload_gpu_pids, workload_root_pids
 
-    workload = WorkloadRef(job_id="trainer-model-a")
+    workload = WorkloadRef(name="trainer-model-a")
 
     def environ(pid: int) -> dict[str, str]:
       if pid == 11:
@@ -471,7 +511,7 @@ class LlmDCheckpointRestorerTest(unittest.TestCase):
     cuda_config = object()
     restorer = LlmDCheckpointRestorer(client, cuda_config, 0.25)
 
-    target = WorkloadRef(job_id="job-a")
+    target = WorkloadRef(name="job-a")
     restorer.checkpoint(target)
     restorer.restore(target)
 
@@ -483,24 +523,24 @@ class LlmDCheckpointRestorerTest(unittest.TestCase):
       ],
     )
 
-  def test_workload_requires_job_id(self) -> None:
+  def test_workload_requires_a_name(self) -> None:
     class Client:
       def snapshot_and_wait(self, *_args, **_kwargs):
-        raise AssertionError("must not call llm-d without job id")
+        raise AssertionError("must not call llm-d without a name")
 
       def restore_and_wait(self, *_args, **_kwargs):
-        raise AssertionError("must not call llm-d without job id")
+        raise AssertionError("must not call llm-d without a name")
 
       def close(self):
         pass
 
-    with self.assertRaisesRegex(ValueError, "job_id"):
-      WorkloadRef(job_id="")
+    with self.assertRaisesRegex(ValueError, "name"):
+      WorkloadRef(name="")
 
 
 async def acquire_once(client: SocketTimeSlicerClient, workload: WorkloadRef) -> str:
   async with client.acquire(workload):
-    return workload.job_id
+    return workload.name
 
 
 if __name__ == "__main__":

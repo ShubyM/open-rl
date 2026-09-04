@@ -66,7 +66,7 @@ def is_fft_enabled() -> bool:
 time_slicer: Any = None
 if is_fft_enabled():
   from accel_timeslicer.time_slicer import time_slicer_client_from_env, workload_from_env
-  from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, workload_job_id
+  from accel_timeslicer.workload import SAMPLER_CLAIM, local_workload_name
 
   time_slicer = time_slicer_client_from_env()
 
@@ -302,12 +302,12 @@ async def run_sampling_worker(model_id: str) -> None:
   snapshot_registered = False
   workload = None
   if time_slicer is not None:
-    workload = workload_from_env(os.getpid(), job_id=workload_job_id("sampler", model_id), group=SAMPLER_TIME_SLICE_GROUP)
+    workload = workload_from_env(os.getpid(), name=local_workload_name("sampler", model_id), claim=SAMPLER_CLAIM)
 
   if time_slicer is not None:
     assert workload is not None
     try:
-      print(f"[vLLM Worker] Registering workload {workload.key} for initialization lock...")
+      print(f"[vLLM Worker] Registering workload {workload.name} for initialization lock...")
       await time_slicer.register(workload)
       snapshot_registered = True
       async with time_slicer.acquire(workload):
