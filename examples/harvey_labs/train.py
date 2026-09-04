@@ -5,25 +5,178 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import re
 import subprocess
 from pathlib import Path
 
 import chz
 import tinker
-from env import LabDatasetBuilder
-from tasks import BOOTSTRAP_TASKS, EVAL_TASKS, random_task_split
 from tinker.lib.public_interfaces import training_client as tinker_training_client
 from tinker_cookbook import checkpoint_utils
 
+from .env import LabDatasetBuilder
+from .tasks import BOOTSTRAP_TASKS, EVAL_TASKS, family_task_split, random_task_split, three_way_task_split
+
 # 5MB chunks put one long-context datum per request, collapsing DP sharding
-# to rank 0; ~30MB keeps real shards without stalling the HTTP/JSON path.
+# to rank 0. ~30MB carries several datums so ranks get real shards, while
+# staying small enough for the HTTP/JSON path (a single giant request
+# stalled the gateway loop and reset connections).
 tinker_training_client.MAX_CHUNK_BYTES_COUNT = 30_000_000
 
+from tinker_cookbook.rl import message_env as rl_message_env
 from tinker_cookbook.rl import train as rl_train
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator
 from tinker_cookbook.stores.storage import LocalStorage
 from tinker_cookbook.stores.training_store import TrainingRunStore
 from tinker_utils import force_rich_log_colors, resolve_base_url
+
+# Give optim_step a gradient clip. The cookbook builds its AdamParams as
+# AdamParams(learning_rate=..., beta1=.9, beta2=.95, eps=1e-8) at two call sites
+# and never passes grad_clip_norm, which defaults to 0.0; lora_trainer_worker
+# reads that as `adam_params.get("grad_clip_norm") or math.inf`, so nothing is
+# ever clipped. The knob is implemented on both ends -- it is simply not
+# reachable from a recipe, and rl_train.Config has no field for it either, so a
+# patch here is the only place to set it without forking a pinned dependency.
+#
+# The threshold sits just above the healthy range rather than at the usual O(1).
+# Clipping is only useful against spikes anyway -- Adam is scale-invariant to a
+# *constant* gradient rescale (m and sqrt(v) scale together), so a clip low
+# enough to bind on every step would buy nothing and only discard the
+# relative-magnitude signal Adam runs on. run26 hit 7.6e5 and 1.3e6 on the two
+# steps where it came apart, which is what this is meant to catch.
+#
+# run27 measured the healthy distribution and 1e5 looked too low: it bound on 11
+# of 21 steps, i.e. most of the ordinary body (5e4-2e5) rather than the tail,
+# while the run's real outliers were ~9.8e5. run28 raised it to 3e5 to clear the
+# body -- and that was the wrong read. Binding often was doing useful work.
+# Over 40 steps at 3e5, entropy went 0.21 -> 0.55 (run27 held 0.15-0.31 for its
+# whole length), KL(sample||train) went 7.7e-4 -> 6.8e-3, and train reward drifted
+# down 0.217 -> 0.200. The looser clip bought drift, not signal, so this is back
+# at run27's value.
+GRAD_CLIP_NORM = 1e5
+
+_BaseAdamParams = tinker.AdamParams
+
+
+class _AdamParamsWithClip(_BaseAdamParams):
+  def __init__(self, **kwargs):
+    kwargs.setdefault("grad_clip_norm", GRAD_CLIP_NORM)
+    super().__init__(**kwargs)
+
+
+tinker.AdamParams = _AdamParamsWithClip
+
+# Report the terminal-condition flags as rates instead of the constant 1.0.
+# message_env emits context_overflow / parse_error / max_tokens_reached only on
+# the transition that trips them, and only ever as 1.0. dict_mean averages a key
+# over just the dicts that carry it ("missing keys are not treated as zero"), so
+# each one reads exactly 1.000 whenever >=1 episode trips it and is absent
+# otherwise -- it encodes presence, never frequency. That hid the failure mode
+# in run26: max_tokens_reached went 6% -> 54% of episodes across seven steps
+# while logging 1.000 throughout, and context_overflow logged the same 1.000
+# while falling 33% -> 0%.
+#
+# Defaulting them to 0.0 makes the mean a real rate. Note the denominator is
+# transitions, not episodes: these flags all end the episode, so each episode
+# trips at most one once, and the per-episode rate is the logged value times
+# total_turns / total_episodes (both already in the metrics).
+_TERMINAL_FLAG_METRICS = ("context_overflow", "parse_error", "max_tokens_reached")
+_base_env_step = rl_message_env.EnvFromMessageEnv.step
+
+# Keep the generation behind a parse_error, because nothing else does.
+# message_env's MALFORMED branch returns metrics={"parse_error": 1.0} and an
+# empty next_observation, dropping the text; StepResult.logs is left empty on
+# exactly those steps, so the failure survives nowhere -- not the rollout
+# summaries, not the logtree, not the HTML. run27 could establish that parse
+# errors land on generations ~13x longer than clean turns (median ac_len 3.4k vs
+# 270, in every one of 21 steps) and that they cost ~16% of episodes, but not
+# *why* they fail: a hallucinated tool name, a channel order outside the response
+# schema, and a truncated JSON body are indistinguishable after the fact.
+#
+# Gemma4ToolRenderer flags MALFORMED on exactly one condition -- "<|tool_call>"
+# present in the decoded text and no call surviving _valid_tool_calls -- so the
+# decoded text is the entire diagnosis. Log the tail preferentially: the call
+# sits at the end, after whatever prose ran long.
+PARSE_ERROR_SAMPLE_CHARS = 2000
+_TOOL_CALL_NAME = re.compile(r"<\|tool_call>call:(\w+)")
+
+
+def _parse_error_logs(env, action: list[int]) -> dict[str, str | int]:
+  try:
+    text = env.renderer.tokenizer.decode(action, skip_special_tokens=False)
+  except Exception as exc:  # a decode failure is itself the diagnosis
+    return {"parse_error_decode_failed": repr(exc)}
+  if len(text) <= PARSE_ERROR_SAMPLE_CHARS:
+    sample = text
+  else:
+    head = PARSE_ERROR_SAMPLE_CHARS // 4
+    tail = PARSE_ERROR_SAMPLE_CHARS - head
+    sample = f"{text[:head]}\n...[{len(text) - PARSE_ERROR_SAMPLE_CHARS} chars elided]...\n{text[-tail:]}"
+  return {
+    "parse_error_text": sample,
+    "parse_error_chars": len(text),
+    "parse_error_call_tokens": text.count("<|tool_call>"),
+    # Names the renderer would have had to recognise. Any name here that is not
+    # a live tool means the model invented one and the fallback dropped it.
+    "parse_error_call_names": ",".join(sorted(set(_TOOL_CALL_NAME.findall(text)))),
+  }
+
+
+# Same hole as parse_error, and worse. A generation that trips max_tokens ends
+# the episode from message_env's cap branch, and StepResult.logs comes back
+# empty on exactly those steps -- run38's 32,768-token blowups recorded
+# `logs: {}`, nothing in the logtree, nothing in the HTML. That is the one
+# failure mode the run was actually dying of: the median generation held at
+# ~200 tokens from step 0 to step 14 while the share of all generated tokens
+# sitting inside capped generations went 2.9% -> 84.5%. The distribution is
+# bimodal, so the aggregate ac_tokens_per_turn understates it badly and the text
+# that would say *why* was the text being dropped.
+MAX_TOKENS_SAMPLE_CHARS = 2000
+# Tokens off the end to measure repetition over. Long enough to span a loop,
+# short enough that a legitimately long answer still looks varied.
+REPETITION_WINDOW_TOKENS = 512
+
+
+def max_tokens_logs(env, action: list[int]) -> dict[str, str | int | float]:
+  try:
+    text = env.renderer.tokenizer.decode(action, skip_special_tokens=False)
+  except Exception as exc:
+    return {"max_tokens_decode_failed": repr(exc)}
+  # Keep both ends: these start coherent and degenerate, so the head says what
+  # the model was trying to do and the tail says what it collapsed into.
+  head = MAX_TOKENS_SAMPLE_CHARS // 2
+  if len(text) <= MAX_TOKENS_SAMPLE_CHARS:
+    sample = text
+  else:
+    tail = MAX_TOKENS_SAMPLE_CHARS - head
+    sample = f"{text[:head]}\n...[{len(text) - MAX_TOKENS_SAMPLE_CHARS} chars elided]...\n{text[-tail:]}"
+  # One number that separates the two ways to hit the cap. A repetition loop
+  # cycles a handful of tokens and lands near 0; a long but varied answer that
+  # simply ran out of budget stays high.
+  window = action[-REPETITION_WINDOW_TOKENS:]
+  distinct = len(set(window)) / len(window) if window else 0.0
+  return {
+    "max_tokens_text": sample,
+    "max_tokens_chars": len(text),
+    "max_tokens_tokens": len(action),
+    "max_tokens_distinct_frac": round(distinct, 4),
+  }
+
+
+async def _step_with_flag_rates(self, action, *, extra=None):
+  result = await _base_env_step(self, action, extra=extra)
+  metrics = dict(result.metrics or {})
+  if metrics.get("parse_error"):
+    result.logs = {**(result.logs or {}), **_parse_error_logs(self, action)}
+  if metrics.get("max_tokens_reached"):
+    result.logs = {**(result.logs or {}), **max_tokens_logs(self, action)}
+  for key in _TERMINAL_FLAG_METRICS:
+    metrics.setdefault(key, 0.0)
+  result.metrics = metrics
+  return result
+
+
+rl_message_env.EnvFromMessageEnv.step = _step_with_flag_rates
 
 MODEL_NAME = "google/gemma-4-E4B-it"
 COMMAND_TIMEOUT = 60
@@ -83,16 +236,24 @@ class RunConfig:
   learning_rate: float = 3e-6
   lora_rank: int = 32
   lab_root: Path = Path(__file__).resolve().parent / "harvey-labs"
-  # Single-task override; otherwise task_set picks the pools ("random" =
-  # seeded split, "bootstrap" = curated lists).
+  # Single-task override; otherwise task_set picks the pools: "random" is a
+  # seeded disjoint split of the whole runnable pool, "bootstrap" is the
+  # curated 100-train/20-eval lists earlier runs used (comparable numbers).
   task: str | None = None
   task_set: str = "random"
+  # Only used by task_set=disjoint: tasks reserved for SFT trace collection,
+  # family-disjoint from the RL train pool (must match collect_traces.py).
+  sft_tasks: int = 100
   train_tasks: int = 300
   eval_tasks: int = 50
   task_split_seed: int = 0
   eval_every: int = 20
   batch_size: int = 1
   rollouts_per_example: int = 4
+  # Rollouts per held-out eval task, averaged. At 1 the benchmark cannot see a
+  # 10pp change (see env.py); at 4 the floor is ~4.9pp. Eval cost scales with
+  # it, so widen eval_every to pay for it rather than evaluating as often.
+  eval_rollouts_per_task: int = 4
   max_steps: int = 40
   max_turns: int = 40
   max_tokens: int = 3072
@@ -104,18 +265,49 @@ class RunConfig:
   max_reward_criteria: int | None = None
   # Full-state checkpoint cadence (weights + optimizer, resumable). 0 = off.
   save_every: int = 5
-  # Overlap training with sampling: forward_backward per finished trajectory
-  # group. Gradient math unchanged at num_substeps=1.
+  # Overlap training with sampling: forward_backward runs on each trajectory
+  # group as its rollouts finish instead of waiting for the whole batch.
+  # Gradient math is unchanged at num_substeps=1 (one optim_step per batch).
   stream_minibatches: bool = False
   num_substeps: int = 1
-  # Warm-start from a sampler snapshot (fresh optimizer, batch counter
-  # restarts at 0).
+  # Anchor the policy to the base model by penalizing per-token KL against it.
+  # run38 measured what actually goes wrong, and it is not verbosity. The median
+  # generation was 225 tokens at step 0 and 193 at step 14 -- flat the whole run,
+  # as was p90. What grows is a bimodal tail that never terminates and burns to
+  # max_tokens: 1 such generation out of 1074 at step 0, 29 out of 466 at step
+  # 14, by which point 84.5% of every token generated was inside a capped one.
+  # Capped episodes end at the -0.1 floor ungraded, so once most of a GRPO group
+  # lands there the group's rewards are identical, every advantage is zero, and
+  # the gradient vanishes -- the lock that froze run37 for five hours.
+  # A KL term is the right lever precisely because it is per-token: the penalty
+  # is coef * (avg_kl - per_token_kl), which still varies across tokens when
+  # every episode in the group scores the same. It restores a gradient pointing
+  # back at base exactly where the reward signal has gone flat. 0.0 = off,
+  # which is the cookbook default and every run through run38.
+  # The reference is a plain sampling client on base weights: the gateway maps a
+  # base_model session to lora_path=None, so the samplers serve the base model,
+  # and compute_logprobs is just sample(max_tokens=1, prompt_logprobs=True) over
+  # the endpoint they already implement. No server change is needed.
+  kl_penalty_coef: float = 0.0
+  # Spread each token's penalty over the tokens that follow it. 0 = undiscounted.
+  kl_discount_factor: float = 0.0
+  # Warm-start: initialize adapter weights from an existing snapshot
+  # (tinker://<model_id>/sampler_weights/<label>) with a fresh optimizer.
+  # The batch counter restarts at 0 — this begins a NEW run from those
+  # weights, it does not resume the old run's step position.
   load_checkpoint_path: str | None = None
   log_path: str = "artifacts/harvey-labs"
   log_full_rollouts: bool = False
-  # In-loop evals measure the model before each optim step; this one runs
-  # after training, on the final checkpoint.
+  # The in-loop evals measure the model BEFORE an optimizer step (batch 0 is
+  # the untrained baseline); this one runs after training, on the final
+  # checkpoint. The cookbook always evals once more at the top of the last
+  # iteration, even with eval_every=0.
   final_eval: bool = True
+  # Batch 0's eval is the untrained baseline. It is a full test-set pass before
+  # a single optimizer step, and it re-measures a number we already have
+  # whenever the benchmark has not moved. Turn it back on when the task set,
+  # split seed, or base model changes and the baseline is genuinely unknown.
+  eval_at_step_0: bool = False
 
 
 def resolve_renderer_name(config: RunConfig) -> str:
@@ -130,8 +322,12 @@ def resolve_renderer_name(config: RunConfig) -> str:
 
 
 def preflight_grading(config: RunConfig) -> None:
-  """Fail before step 0 on grading-environment rot (missing LAB venv, stale
-  judge) instead of silently losing gradings mid-run."""
+  """Fail before step 0 on the grading-environment rot that poisoned runs 3/4.
+
+  Run 4 lost 38% of its gradings to a missing LAB venv (reward.py silently
+  fell back to the recipe interpreter, which cannot import anthropic) and 58%
+  to a stale judge without the schema fix. Both are detectable up front.
+  """
   lab_python = config.lab_root / ".venv" / "bin" / "python"
   if not lab_python.exists():
     raise RuntimeError(
@@ -159,9 +355,17 @@ def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
   elif config.task_set == "bootstrap":
     train_names, eval_names = list(BOOTSTRAP_TASKS), list(EVAL_TASKS)
   elif config.task_set == "random":
-    train_names, eval_names = random_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
+    train_names, eval_names = random_task_split(
+      config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed
+    )
+  elif config.task_set == "family":
+    train_names, eval_names = family_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
+  elif config.task_set == "disjoint":
+    _, train_names, eval_names = three_way_task_split(
+      config.lab_root, config.sft_tasks, config.train_tasks, config.eval_tasks, config.task_split_seed
+    )
   else:
-    raise ValueError(f"Unknown task_set {config.task_set!r} (use 'random' or 'bootstrap').")
+    raise ValueError(f"Unknown task_set {config.task_set!r} (use 'random', 'family', 'disjoint', or 'bootstrap').")
   return LabDatasetBuilder(
     lab_root=config.lab_root,
     task_names=train_names,
@@ -170,6 +374,7 @@ def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
     eval_limit=len(eval_names) or None,
     batch_size=config.batch_size,
     group_size=config.rollouts_per_example,
+    eval_group_size=config.eval_rollouts_per_task,
     model_name=config.model_name,
     renderer_name=resolve_renderer_name(config),
     max_turns=config.max_turns,
@@ -205,9 +410,27 @@ async def run_final_eval(train_config: rl_train.Config) -> None:
     rl_train.logger.info(f"Final eval after {batch} steps: pooled criteria {passed * episodes:.0f}/{total * episodes:.0f} ({passed / total:.1%})")
 
 
+def skip_batch_0_eval(run_evals):
+  """Wrap run_evaluations_parallel so the batch-0 baseline pass is a no-op."""
+
+  async def wrapped(evaluators, sampling_client, config, i_batch, store=None):
+    if i_batch == 0:
+      return {}
+    return await run_evals(evaluators, sampling_client, config, i_batch, store=store)
+
+  return wrapped
+
+
 async def run(config: RunConfig) -> None:
   preflight_grading(config)
   rl_train.print_group = print_group_responses if config.log_full_rollouts else print_group_summary
+  # All three cookbook training loops gate their in-loop evals on
+  # `i_batch % eval_every == 0`, so batch 0 always evals and there is no config
+  # knob for it. All three also route through run_evaluations_parallel, so
+  # wrapping that one name covers every path without forking the cookbook.
+  # run_final_eval calls run_single_evaluation directly and is unaffected.
+  if not config.eval_at_step_0:
+    rl_train.run_evaluations_parallel = skip_batch_0_eval(rl_train.run_evaluations_parallel)
   train_config = rl_train.Config(
     learning_rate=config.learning_rate,
     lora_rank=config.lora_rank,
@@ -224,6 +447,15 @@ async def run(config: RunConfig) -> None:
     num_groups_to_log=NUM_GROUPS_TO_LOG,
     load_checkpoint_path=config.load_checkpoint_path,
     num_substeps=config.num_substeps,
+    kl_penalty_coef=config.kl_penalty_coef,
+    kl_discount_factor=config.kl_discount_factor,
+    # Required whenever the coefficient is on: the cookbook raises rather than
+    # defaulting to the training model's base, despite what its docstring says.
+    kl_reference_config=(
+      rl_train.KLReferenceConfig(base_model=config.model_name)
+      if config.kl_penalty_coef > 0
+      else None
+    ),
     stream_minibatch_config=(
       rl_train.StreamMinibatchConfig(
         groups_per_batch=config.batch_size,

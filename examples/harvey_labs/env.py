@@ -13,12 +13,13 @@ from pathlib import Path
 from typing import Any
 
 import chz
-from prompts import copy_skill_scripts, default_skills, initial_messages, lab_renderer, lab_system_prompt
-from reward import LabRubricReward
-from tasks import LabTask, load_lab_tasks, task_slug
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetBuilder, StepResult
 from tinker_cookbook.tool_use import build_agent_tool_env
-from tools import LabTool
+
+from .prompts import copy_skill_scripts, default_skills, initial_messages, lab_renderer, lab_system_prompt
+from .reward import LabRubricReward
+from .tasks import LabTask, load_lab_tasks, task_slug
+from .tools import LabTool
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,7 @@ class LabDatasetBuilder(RLDatasetBuilder):
   eval_limit: int | None
   batch_size: int
   group_size: int
+  eval_group_size: int
   model_name: str
   renderer_name: str | None
   max_turns: int
@@ -216,10 +218,19 @@ class LabDatasetBuilder(RLDatasetBuilder):
     train = LabDataset([self._env_group(task, lab_root, self.group_size) for task in train_tasks], self.batch_size)
     if not self.eval_limit or not self.eval_task_names:
       return train, None
-    # Held-out progress evals: single rollouts on the dedicated eval tasks,
-    # graded with the same rubric settings as training.
+    # Held-out progress evals on the dedicated eval tasks, graded with the same
+    # rubric settings as training. eval_group_size rollouts per task, averaged:
+    # one rollout per task made the benchmark unreadable. Two evals of the same
+    # untrained model on these same 50 tasks (run39 and run40, step 0) scored
+    # 0.3267 and 0.3923, and per-task they correlated only 0.41 -- a task scored
+    # twice varied as much as two different tasks. The paired difference had
+    # sd 0.245, so the smallest detectable change was 9.7pp while run39's entire
+    # eval range was 5.4pp. Averaging k rollouts per task divides that variance
+    # by k, taking the floor to 9.7/sqrt(k) pp for k times the eval cost.
     eval_tasks = load_lab_tasks(lab_root, self.eval_task_names, limit=self.eval_limit)
-    eval_dataset = LabDataset([self._env_group(task, lab_root, 1) for task in eval_tasks], self.batch_size)
+    eval_dataset = LabDataset(
+      [self._env_group(task, lab_root, self.eval_group_size) for task in eval_tasks], self.batch_size
+    )
     return train, eval_dataset
 
   def _env_group(self, task: LabTask, lab_root: Path, group_size: int) -> LabEnvGroupBuilder:

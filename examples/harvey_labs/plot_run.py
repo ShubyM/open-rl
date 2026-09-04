@@ -27,7 +27,7 @@ def load_metrics(path: Path) -> list[dict]:
 
 def rollout_rewards(log_dir: Path) -> list[tuple[int, float]]:
   points = []
-  for summary in sorted(log_dir.glob("iterations/iteration_*/train_rollout_summaries.jsonl")):
+  for summary in sorted(log_dir.glob("**/iteration_*/train_rollout_summaries.jsonl")):
     step = int(summary.parent.name.split("_")[-1])
     for line in summary.read_text().splitlines():
       if line.strip():
@@ -35,14 +35,26 @@ def rollout_rewards(log_dir: Path) -> list[tuple[int, float]]:
   return points
 
 
+ENV_NAMES = ("all", "harvey-labs")
+
+
+def env_get(row: dict, prefix: str, suffix: str):
+  """Metrics are keyed by env name, which has been both "all" and "harvey-labs"."""
+  for name in ENV_NAMES:
+    value = row.get(f"{prefix}env/{name}/{suffix}")
+    if value is not None:
+      return value
+  return None
+
+
 def eval_pass_rate(row: dict) -> float | None:
-  episodes = row.get("test/env/harvey-labs/total_episodes")
-  passed = row.get("test/env/harvey-labs/lab/criteria_passed")
-  total = row.get("test/env/harvey-labs/lab/criteria_total")
-  graded_marker = row.get("test/env/harvey-labs/lab/graded")
+  episodes = env_get(row, "test/", "total_episodes")
+  passed = env_get(row, "test/", "lab/criteria_passed")
+  total = env_get(row, "test/", "lab/criteria_total")
+  graded_marker = env_get(row, "test/", "lab/graded")
   if episodes and total and graded_marker is not None:
     return (passed * episodes) / (total * episodes)
-  return row.get("test/env/harvey-labs/lab/criteria_pass_fraction")
+  return env_get(row, "test/", "lab/criteria_pass_fraction")
 
 
 def ema(values: list[float], alpha: float = 0.4) -> list[float]:
@@ -56,6 +68,7 @@ def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument("log_dir", type=Path)
   parser.add_argument("--out", type=Path, default=None)
+  parser.add_argument("--title", default=None, help="plot title; defaults to the log directory name")
   args = parser.parse_args()
 
   import matplotlib
@@ -65,7 +78,7 @@ def main() -> None:
 
   rows = load_metrics(args.log_dir / "metrics.jsonl")
   raw = rollout_rewards(args.log_dir)
-  train_rows = [(r["step"], r["env/harvey-labs/reward/total"]) for r in rows if "env/harvey-labs/reward/total" in r and "step" in r]
+  train_rows = [(r["step"], env_get(r, "", "reward/total")) for r in rows if env_get(r, "", "reward/total") is not None and "step" in r]
   evals = [(r["step"], eval_pass_rate(r)) for r in rows if eval_pass_rate(r) is not None and "step" in r]
 
   fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
@@ -89,7 +102,7 @@ def main() -> None:
   ax.set_ylim(-0.15, 1.05)
   ax.set_xlabel("step", color=INK)
   ax.set_ylabel("reward / pass rate", color=INK)
-  ax.set_title(args.log_dir.name, color=INK, fontsize=11, loc="left")
+  ax.set_title(args.title or args.log_dir.name, color=INK, fontsize=11, loc="left")
   ax.grid(axis="y", color=MUTED, alpha=0.25, linewidth=0.5)
   for spine in ("top", "right"):
     ax.spines[spine].set_visible(False)

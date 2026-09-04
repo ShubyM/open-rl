@@ -146,6 +146,7 @@ if [ -n "${VERTEX_JUDGE_ENDPOINT:-}" ]; then
 else
   [ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ] && ok "Gemini judge key present" || echo "    [WARN] export GEMINI_API_KEY before training — grading needs it (or use the GLM judge: set VERTEX_JUDGE_ENDPOINT + JUDGE_MODEL=glm-5.2)"
 fi
+[ -n "${ANTHROPIC_API_KEY:-}" ] && ok "Anthropic key present" || echo "    [WARN] export ANTHROPIC_API_KEY — deliverable-name matching degrades without it"
 
 echo
 if [ ${#FAILED[@]} -eq 0 ]; then

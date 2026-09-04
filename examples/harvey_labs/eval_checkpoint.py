@@ -4,7 +4,7 @@ Points the gateway's sampler at an existing adapter dir (e.g.
 /tmp/open-rl/peft/<model-id>/sampler-12 or any copied checkpoint folder) and
 runs the held-out eval task set against it:
 
-  uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
+  uv --project examples run python -m harvey_labs.eval_checkpoint \
     checkpoint=/tmp/open-rl/peft/<model-id>/final \
     model_name=Qwen/Qwen3.5-27B base_url=http://127.0.0.1:9003
 
@@ -24,7 +24,8 @@ import chz
 import tinker
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator
 from tinker_utils import resolve_base_url
-from train import RunConfig, build_dataset_builder, preflight_grading
+
+from .train import RunConfig, build_dataset_builder, preflight_grading
 
 TMP_DIR = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"))
 
@@ -42,7 +43,10 @@ def sampler_ref(config: EvalConfig) -> str:
   if not path.is_dir():
     raise RuntimeError(f"Checkpoint dir does not exist: {path}")
   if not (path / "adapter_config.json").exists():
-    raise RuntimeError(f"{path} does not look like an adapter checkpoint (no adapter_config.json). FFT full checkpoints are not supported here.")
+    raise RuntimeError(
+      f"{path} does not look like an adapter checkpoint (no adapter_config.json). "
+      "FFT full checkpoints are not supported here."
+    )
 
   peft_root = (TMP_DIR / "peft").resolve()
   if path.parent.parent == peft_root:
@@ -50,7 +54,10 @@ def sampler_ref(config: EvalConfig) -> str:
     return f"tinker://{model_id}/sampler_weights/{label}"
 
   if not config.model_id:
-    raise RuntimeError(f"{path} is outside {peft_root}; pass model_id=<live model id> so the checkpoint can be linked into that model's adapter dir.")
+    raise RuntimeError(
+      f"{path} is outside {peft_root}; pass model_id=<live model id> so the "
+      "checkpoint can be linked into that model's adapter dir."
+    )
   link = peft_root / config.model_id / config.label
   link.parent.mkdir(parents=True, exist_ok=True)
   if link.resolve() != path:
@@ -63,12 +70,17 @@ def sampler_ref(config: EvalConfig) -> str:
 
 async def run(config: EvalConfig) -> None:
   preflight_grading(config)
-  ref = sampler_ref(config)
+  # An empty checkpoint= evaluates the untrained base model. That number is the
+  # reference every trained checkpoint is scored against, so it has to be
+  # measurable with the same tasks, judge, and rollout count as the runs that
+  # are compared to it -- otherwise the comparison carries the difference
+  # between two eval protocols rather than the effect of training.
+  ref = sampler_ref(config) if config.checkpoint else None
   _, test_dataset = await build_dataset_builder(config)()
   if test_dataset is None:
     raise RuntimeError("No eval tasks configured (eval_tasks=0, or a single-task run via task=?).")
 
-  print(f"Evaluating {ref} on {len(test_dataset)} eval batches...")
+  print(f"Evaluating {ref or f'{config.model_name} (base, no adapter)'} on {len(test_dataset)} eval batches...")
   service_client = tinker.ServiceClient(base_url=resolve_base_url(config.base_url))
   sampling_client = service_client.create_sampling_client(base_model=config.model_name, model_path=ref)
   evaluator = RLTestSetEvaluator(test_dataset, max_tokens=config.max_tokens)
@@ -79,7 +91,10 @@ async def run(config: EvalConfig) -> None:
   total = metrics.get("test/env/harvey-labs/lab/criteria_total")
   episodes = metrics.get("test/env/harvey-labs/total_episodes")
   if passed is not None and total and episodes:
-    print(f"Pooled criteria: {passed * episodes:.0f}/{total * episodes:.0f} ({passed / total:.1%}) over {episodes:.0f} episodes")
+    print(
+      f"Pooled criteria: {passed * episodes:.0f}/{total * episodes:.0f} "
+      f"({passed / total:.1%}) over {episodes:.0f} episodes"
+    )
 
 
 def main() -> None:
