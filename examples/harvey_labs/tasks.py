@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -222,11 +223,84 @@ def discover_lab_tasks(lab_root: Path) -> tuple[list[str], int]:
   return names, skipped
 
 
+# The held-out eval slice is taken after the first EVAL_SLICE_OFFSET names of the
+# seeded shuffle. Freezing the offset (rather than keying it on the train count)
+# keeps the benchmark byte-identical when the train pool grows or is redrawn.
+# Runs 19-47 took this slice at seed 0, so keep both pinned across compared runs.
+EVAL_SLICE_OFFSET = 300
+
+
 def random_task_split(lab_root: Path, num_train: int, num_eval: int, seed: int) -> tuple[list[str], list[str]]:
-  """Seeded disjoint train/eval task split over the whole runnable pool."""
+  """Seeded train/eval split whose eval set depends only on the seed.
+
+  Eval is shuffle(seed)[EVAL_SLICE_OFFSET : EVAL_SLICE_OFFSET + num_eval], so it
+  never moves with num_train. Train draws the family-disjoint remainder, so a
+  scenario sibling of an eval task never leaks into training.
+  """
   names, skipped = discover_lab_tasks(lab_root)
-  if num_train + num_eval > len(names):
-    raise ValueError(f"Requested {num_train} train + {num_eval} eval tasks but only {len(names)} runnable tasks exist under {lab_root / 'tasks'}")
-  random.Random(seed).shuffle(names)
-  print(f"[tasks] split seed={seed}: {num_train} train / {num_eval} eval from {len(names)} runnable tasks ({skipped} skipped as broken)")
-  return names[:num_train], names[num_train : num_train + num_eval]
+  shuffled = list(names)
+  random.Random(seed).shuffle(shuffled)
+  if EVAL_SLICE_OFFSET + num_eval > len(shuffled):
+    raise ValueError(
+      f"Requested eval slice [{EVAL_SLICE_OFFSET}:{EVAL_SLICE_OFFSET + num_eval}] but only "
+      f"{len(shuffled)} runnable tasks exist under {lab_root / 'tasks'}"
+    )
+  eval_names = shuffled[EVAL_SLICE_OFFSET : EVAL_SLICE_OFFSET + num_eval]
+  eval_families = {task_family(name) for name in eval_names}
+  train_pool = [name for name in shuffled if task_family(name) not in eval_families]
+  if num_train > len(train_pool):
+    raise ValueError(f"Requested {num_train} train tasks but only {len(train_pool)} sit outside eval's {len(eval_families)} scenario families")
+  train_names = train_pool[:num_train]
+  print(
+    f"[tasks] split seed={seed}: {len(train_names)} train / {num_eval} eval from {len(names)} "
+    f"runnable tasks, eval slice [{EVAL_SLICE_OFFSET}:{EVAL_SLICE_OFFSET + num_eval}] "
+    f"({skipped} skipped as broken)"
+  )
+  return train_names, eval_names
+
+
+def task_family(name: str) -> str:
+  return re.sub(r"/scenario-\d+$", "", name)
+
+
+def family_task_split(lab_root: Path, num_train: int, num_eval: int, seed: int) -> tuple[list[str], list[str]]:
+  """Family-disjoint split, eval stratified across practice areas.
+
+  Scenario siblings of an eval task never appear in train, and eval draws
+  round-robin across practice areas (one task per chosen family)."""
+  names, skipped = discover_lab_tasks(lab_root)
+  rng = random.Random(seed)
+  by_family: dict[str, list[str]] = {}
+  for name in names:
+    by_family.setdefault(task_family(name), []).append(name)
+  by_area: dict[str, list[str]] = {}
+  for family in by_family:
+    by_area.setdefault(family.split("/")[0], []).append(family)
+  areas = sorted(by_area)
+  for area in areas:
+    rng.shuffle(by_area[area])
+
+  eval_names: list[str] = []
+  eval_families: set[str] = set()
+  while len(eval_names) < num_eval:
+    progressed = False
+    for area in areas:
+      if len(eval_names) >= num_eval:
+        break
+      if by_area[area]:
+        family = by_area[area].pop()
+        eval_families.add(family)
+        eval_names.append(rng.choice(by_family[family]))
+        progressed = True
+    if not progressed:
+      raise ValueError(f"Ran out of families after {len(eval_names)} of {num_eval} requested eval tasks")
+
+  train_pool = [name for name in names if task_family(name) not in eval_families]
+  if num_train > len(train_pool):
+    raise ValueError(f"Requested {num_train} train tasks but only {len(train_pool)} outside eval families")
+  rng.shuffle(train_pool)
+  print(
+    f"[tasks] family split seed={seed}: {num_train} train / {len(eval_names)} eval, "
+    f"{len(eval_families)} eval families across {len(areas)} areas ({skipped} skipped)"
+  )
+  return train_pool[:num_train], eval_names

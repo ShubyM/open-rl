@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 import zipfile
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,8 +19,10 @@ from tinker_cookbook.renderers.base import Message, message_to_jsonable
 
 ARTIFACT_EXTENSIONS = ("docx", "xlsx", "pptx", "pdf", "md", "txt")
 
-# Bound cross-episode grading so end-of-batch bursts don't rate-limit the
-# judge into failures.
+# All episodes of a batch finish (and grade) near-simultaneously; without a
+# cap, 30-50 concurrent gradings each fire judge calls at once and the burst
+# rate-limits the judge into slow retries or hard failures. Serialized within
+# an episode (judge_parallel=1), bounded across episodes here.
 GRADING_CONCURRENCY = threading.Semaphore(int(os.getenv("OPEN_RL_GRADING_CONCURRENCY", "6")))
 _EXPECTED_EXTENSION_RE = re.compile(rf"\.({'|'.join(ARTIFACT_EXTENSIONS)})\b", re.IGNORECASE)
 
@@ -36,6 +38,7 @@ class LabRubricReward:
   max_criteria: int | None
   criteria_count: int
   tool_metrics: Callable[[], dict[str, Any]]
+  collect_outputs: Callable[[Path], Awaitable[None]]
   config: dict[str, Any] = field(default_factory=dict)
   timeout_seconds: int = 3600
   # Reward is pure rubric score by default; process metrics are still computed
@@ -47,6 +50,7 @@ class LabRubricReward:
     return self.lab_root / "results" / self.run_id
 
   async def __call__(self, history: list[Message]) -> tuple[float, dict[str, float]]:
+    await self.collect_outputs(self.run_dir / "output")
     return await asyncio.to_thread(self.score, history)
 
   def failure_metrics(self) -> dict[str, float]:
@@ -86,7 +90,9 @@ class LabRubricReward:
     if self.max_criteria is not None:
       cmd += ["--max-criteria", str(self.max_criteria)]
 
-    # Stream judge output to grading.log so progress is visible live.
+    # Judge output streams to grading.log as it happens (tail -f to watch the
+    # [rubric n/N] progress live); captured output would sit invisible until
+    # the subprocess exits.
     grading_log = self.run_dir / "grading.log"
     with GRADING_CONCURRENCY:
       return self.run_grading(cmd, grading_log, process_reward, process_metrics)
@@ -105,7 +111,8 @@ class LabRubricReward:
           timeout=self.timeout_seconds,
         )
     except subprocess.TimeoutExpired:
-      # Contain timeouts like any other grading failure.
+      # An uncaught timeout would escape reward containment entirely and fail
+      # the whole rollout group; grade it like any other grading failure.
       (self.run_dir / "reward_error.log").write_text(
         f"TIMEOUT after {self.timeout_seconds}s\n\n" + grading_log.read_text(encoding="utf-8", errors="replace"),
         encoding="utf-8",
@@ -143,7 +150,8 @@ class LabRubricReward:
 
   def process_reward(self) -> tuple[float, dict[str, float]]:
     """Give bounded credit for grounded progress without rewarding tool loops."""
-    # Reuse LAB's read tracking so reward and metrics share one definition.
+    # LAB's executor already tracks unique successful document reads; reuse it
+    # so the reward and metrics.json share one coverage definition.
     metrics = self.tool_metrics()
     total_documents = int(metrics.get("total_documents") or 0)
     coverage = int(metrics.get("documents_read") or 0) / total_documents if total_documents else 0.0

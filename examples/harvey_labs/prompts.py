@@ -7,12 +7,14 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from gemma4_renderer import register_gemma4_tool_renderer
-from reward import ARTIFACT_EXTENSIONS
-from tasks import LabTask
 from tinker_cookbook import model_info, tokenizer_utils
 from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.renderers.base import Message, Renderer
+
+from .gemma4_renderer import register_gemma4_tool_renderer
+from .qwen35_renderer import verbatim_history_renderer
+from .reward import ARTIFACT_EXTENSIONS
+from .tasks import LabTask
 
 OUTPUT_FILE_RE = re.compile(rf"`([^`]+\.(?:{'|'.join(ARTIFACT_EXTENSIONS)}))`", re.IGNORECASE)
 
@@ -88,6 +90,11 @@ def lab_renderer(model_name: str, renderer_name: str | None) -> Renderer:
     # which breaks sampler prefix affinity and makes trajectory_to_data emit a
     # separate cumulative datum for nearly every turn.
     renderer.strip_thinking_from_history = False
+  if resolved_name == "qwen3_5":
+    # Keeping thinking is necessary but not sufficient. The re-render of a
+    # tool-calling turn still differs from the sampled tokens; see
+    # qwen35_renderer for the failure and the fix.
+    renderer = verbatim_history_renderer(renderer)
   if not renderer.has_extension_property:
     raise ValueError(f"Harvey LAB multi-turn RL requires a prefix-extending renderer; {resolved_name!r} does not preserve history")
   return renderer

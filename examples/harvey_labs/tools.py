@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
 
 from tinker_cookbook.tool_use.tools import simple_tool_result
 from tinker_cookbook.tool_use.types import ToolInput, ToolResult
+
+from .sandbox import LabSandbox
 
 
 def bounded_tool_result(
@@ -47,7 +48,7 @@ def bounded_tool_result(
 @dataclass(frozen=True)
 class LabTool:
   spec: dict[str, Any]
-  executor: Any
+  sandbox: LabSandbox
   tokenizer: Any
   max_result_tokens: int
 
@@ -71,17 +72,12 @@ class LabTool:
     }
 
   async def run(self, input: ToolInput) -> ToolResult:
-    # The executor shells into podman synchronously (up to command_timeout);
-    # off the event loop so one env's slow tool call can't stall the group.
-    result = await asyncio.to_thread(self._execute_bounded, input)
-    return simple_tool_result(result, call_id=input.call_id or "", name=self.name)
-
-  def _execute_bounded(self, input: ToolInput) -> str:
-    result = self.executor.execute(self.name, input.arguments)
-    return bounded_tool_result(
+    result = await self.sandbox.execute_tool(self.name, input.arguments)
+    result = bounded_tool_result(
       result,
       tool_name=self.name,
       arguments=input.arguments,
       tokenizer=self.tokenizer,
       max_tokens=self.max_result_tokens,
     )
+    return simple_tool_result(result, call_id=input.call_id or "", name=self.name)

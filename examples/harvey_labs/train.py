@@ -3,27 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import subprocess
 from pathlib import Path
 
 import chz
 import tinker
-from env import LabDatasetBuilder
-from tasks import BOOTSTRAP_TASKS, EVAL_TASKS, random_task_split
-from tinker.lib.public_interfaces import training_client as tinker_training_client
+from common.tinker_utils import force_rich_log_colors, resolve_base_url
 from tinker_cookbook import checkpoint_utils
-
-# 5MB chunks put one long-context datum per request, collapsing DP sharding
-# to rank 0; ~30MB keeps real shards without stalling the HTTP/JSON path.
-tinker_training_client.MAX_CHUNK_BYTES_COUNT = 30_000_000
-
 from tinker_cookbook.rl import train as rl_train
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator
 from tinker_cookbook.stores.storage import LocalStorage
 from tinker_cookbook.stores.training_store import TrainingRunStore
-from tinker_utils import force_rich_log_colors, resolve_base_url
+
+from .cookbook_compat import recipe_runtime
+from .env import LabDatasetBuilder
+from .results import write_report
+from .sandbox import SandboxFactory, podman_sandbox_factory
+from .tasks import BOOTSTRAP_TASKS, EVAL_TASKS, family_task_split, random_task_split
 
 MODEL_NAME = "google/gemma-4-E4B-it"
 COMMAND_TIMEOUT = 60
@@ -32,45 +29,6 @@ COMMAND_TIMEOUT = 60
 def default_judge_parallel(judge_model: str) -> int:
   # Self-hosted GLM absorbs concurrent grading; Gemini rate limits force 1.
   return 16 if "glm" in judge_model else 1
-
-
-NUM_GROUPS_TO_LOG = 1
-
-
-def print_group_summary(traj_group, tokenizer) -> None:
-  rewards = traj_group.get_total_rewards()
-  buf = io.StringIO()
-  buf.write("====== Trajectory Group ======\n")
-  for idx, traj in enumerate(traj_group.trajectories_G):
-    metrics = traj_group.metrics_G[idx] or {}
-    ac_tokens = sum(len(t.ac.tokens) for t in traj.transitions)
-    last_ac = len(traj.transitions[-1].ac.tokens) if traj.transitions else 0
-    extras = "".join(
-      f" {key.rsplit('/', 1)[-1]}={metrics[key]:.3g}"
-      for key in ("lab/criteria_pass_fraction", "lab/document_coverage", "lab/reward_error")
-      if isinstance(metrics.get(key), (int, float))
-    )
-    buf.write(f"  rollout {idx}: reward={rewards[idx]:.3f} turns={len(traj.transitions)} ac_tokens={ac_tokens} last_ac={last_ac}{extras}\n")
-  buf.write("====== End Trajectory Group ======")
-  rl_train.logger.info(buf.getvalue())
-
-
-def print_group_responses(traj_group, tokenizer) -> None:
-  rewards = traj_group.get_total_rewards()
-  buf = io.StringIO()
-  buf.write("\n====== Trajectory Group (model responses only) ======\n")
-  for idx, traj in enumerate(traj_group.trajectories_G):
-    buf.write(f"****** trajectory idx={idx}, reward={rewards[idx]:.3g} ******\n")
-    for key, value in (traj_group.metrics_G[idx] or {}).items():
-      buf.write(f"  {key}: {value}\n")
-    for turn, transition in enumerate(traj.transitions):
-      buf.write(f"---- turn {turn} | ob_len={transition.ob.length} ac_len={len(transition.ac.tokens)} reward={transition.reward:.3f} ----\n")
-      buf.write(tokenizer.decode(transition.ac.tokens).rstrip() + "\n")
-  buf.write("====== End Trajectory Group ======")
-  rl_train.logger.info(buf.getvalue())
-
-
-_print_group_responses = print_group_responses
 
 
 @chz.chz
@@ -83,8 +41,9 @@ class RunConfig:
   learning_rate: float = 3e-6
   lora_rank: int = 32
   lab_root: Path = Path(__file__).resolve().parent / "harvey-labs"
-  # Single-task override; otherwise task_set picks the pools ("random" =
-  # seeded split, "bootstrap" = curated lists).
+  # Single-task override; otherwise task_set picks the pools: "random" is a
+  # seeded disjoint split of the whole runnable pool, "bootstrap" is the
+  # curated 100-train/20-eval lists earlier runs used (comparable numbers).
   task: str | None = None
   task_set: str = "random"
   train_tasks: int = 300
@@ -93,6 +52,10 @@ class RunConfig:
   eval_every: int = 20
   batch_size: int = 1
   rollouts_per_example: int = 4
+  # Rollouts per held-out eval task, averaged. At 1 the benchmark cannot see a
+  # 10pp change (see env.py); at 4 the floor is ~4.9pp. Eval cost scales with
+  # it, so widen eval_every to pay for it rather than evaluating as often.
+  eval_rollouts_per_task: int = 4
   max_steps: int = 40
   max_turns: int = 40
   max_tokens: int = 3072
@@ -104,18 +67,33 @@ class RunConfig:
   max_reward_criteria: int | None = None
   # Full-state checkpoint cadence (weights + optimizer, resumable). 0 = off.
   save_every: int = 5
-  # Overlap training with sampling: forward_backward per finished trajectory
-  # group. Gradient math unchanged at num_substeps=1.
+  # Overlap training with sampling: forward_backward runs on each trajectory
+  # group as its rollouts finish instead of waiting for the whole batch.
+  # Gradient math is unchanged at num_substeps=1 (one optim_step per batch).
   stream_minibatches: bool = False
   num_substeps: int = 1
-  # Warm-start from a sampler snapshot (fresh optimizer, batch counter
-  # restarts at 0).
+  # Optional per-token KL to the base model. This can retain a learning signal
+  # when long, capped episodes all receive the same reward. 0 disables it.
+  kl_penalty_coef: float = 0.0
+  # Spread each token's penalty over the tokens that follow it. 0 = undiscounted.
+  kl_discount_factor: float = 0.0
+  # Warm-start: initialize adapter weights from an existing snapshot
+  # (tinker://<model_id>/sampler_weights/<label>) with a fresh optimizer.
+  # The batch counter restarts at 0 — this begins a NEW run from those
+  # weights, it does not resume the old run's step position.
   load_checkpoint_path: str | None = None
   log_path: str = "artifacts/harvey-labs"
   log_full_rollouts: bool = False
-  # In-loop evals measure the model before each optim step; this one runs
-  # after training, on the final checkpoint.
+  # The in-loop evals measure the model BEFORE an optimizer step (batch 0 is
+  # the untrained baseline); this one runs after training, on the final
+  # checkpoint. The cookbook always evals once more at the top of the last
+  # iteration, even with eval_every=0.
   final_eval: bool = True
+  # Batch 0's eval is the untrained baseline. It is a full test-set pass before
+  # a single optimizer step, and it re-measures a number we already have
+  # whenever the benchmark has not moved. Turn it back on when the task set,
+  # split seed, or base model changes and the baseline is genuinely unknown.
+  eval_at_step_0: bool = False
 
 
 def resolve_renderer_name(config: RunConfig) -> str:
@@ -130,8 +108,12 @@ def resolve_renderer_name(config: RunConfig) -> str:
 
 
 def preflight_grading(config: RunConfig) -> None:
-  """Fail before step 0 on grading-environment rot (missing LAB venv, stale
-  judge) instead of silently losing gradings mid-run."""
+  """Fail before step 0 on the grading-environment rot that poisoned runs 3/4.
+
+  Run 4 lost 38% of its gradings to a missing LAB venv (reward.py silently
+  fell back to the recipe interpreter, which cannot import anthropic) and 58%
+  to a stale judge without the schema fix. Both are detectable up front.
+  """
   lab_python = config.lab_root / ".venv" / "bin" / "python"
   if not lab_python.exists():
     raise RuntimeError(
@@ -153,23 +135,27 @@ def preflight_grading(config: RunConfig) -> None:
     )
 
 
-def build_dataset_builder(config: RunConfig) -> LabDatasetBuilder:
+def build_dataset_builder(config: RunConfig, sandbox_factory: SandboxFactory = podman_sandbox_factory) -> LabDatasetBuilder:
   if config.task:
     train_names, eval_names = [config.task], []
   elif config.task_set == "bootstrap":
     train_names, eval_names = list(BOOTSTRAP_TASKS), list(EVAL_TASKS)
   elif config.task_set == "random":
     train_names, eval_names = random_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
+  elif config.task_set == "family":
+    train_names, eval_names = family_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
   else:
-    raise ValueError(f"Unknown task_set {config.task_set!r} (use 'random' or 'bootstrap').")
+    raise ValueError(f"Unknown task_set {config.task_set!r} (use 'random', 'family', or 'bootstrap').")
   return LabDatasetBuilder(
     lab_root=config.lab_root,
+    sandbox_factory=sandbox_factory,
     task_names=train_names,
     eval_task_names=eval_names,
     train_limit=None,
     eval_limit=len(eval_names) or None,
     batch_size=config.batch_size,
     group_size=config.rollouts_per_example,
+    eval_group_size=config.eval_rollouts_per_task,
     model_name=config.model_name,
     renderer_name=resolve_renderer_name(config),
     max_turns=config.max_turns,
@@ -197,7 +183,7 @@ async def run_final_eval(train_config: rl_train.Config) -> None:
   store = TrainingRunStore(LocalStorage(Path(train_config.log_path)))
   metrics = await rl_train.run_single_evaluation(evaluator, train_config, batch, sampling_client, "test", store=store)
   with open(Path(train_config.log_path) / "metrics.jsonl", "a", encoding="utf-8") as f:
-    f.write(json.dumps({"progress/batch": batch, **metrics}) + "\n")
+    f.write(json.dumps({**metrics, "step": batch, "progress/batch": batch, "eval_phase": "final"}) + "\n")
   passed = metrics.get("test/env/harvey-labs/lab/criteria_passed")
   total = metrics.get("test/env/harvey-labs/lab/criteria_total")
   episodes = metrics.get("test/env/harvey-labs/total_episodes")
@@ -205,13 +191,13 @@ async def run_final_eval(train_config: rl_train.Config) -> None:
     rl_train.logger.info(f"Final eval after {batch} steps: pooled criteria {passed * episodes:.0f}/{total * episodes:.0f} ({passed / total:.1%})")
 
 
-async def run(config: RunConfig) -> None:
+async def run(config: RunConfig, *, sandbox_factory: SandboxFactory = podman_sandbox_factory) -> None:
   preflight_grading(config)
-  rl_train.print_group = print_group_responses if config.log_full_rollouts else print_group_summary
+  print(f"Read this run: uv --project examples run --no-sync python -m harvey_labs.results {config.log_path} --json", flush=True)
   train_config = rl_train.Config(
     learning_rate=config.learning_rate,
     lora_rank=config.lora_rank,
-    dataset_builder=build_dataset_builder(config),
+    dataset_builder=build_dataset_builder(config, sandbox_factory),
     model_name=config.model_name,
     recipe_name="harvey_labs",
     renderer_name=resolve_renderer_name(config),
@@ -221,9 +207,14 @@ async def run(config: RunConfig) -> None:
     eval_every=config.eval_every,
     save_every=config.save_every,
     max_steps=config.max_steps,
-    num_groups_to_log=NUM_GROUPS_TO_LOG,
+    num_groups_to_log=1,
     load_checkpoint_path=config.load_checkpoint_path,
     num_substeps=config.num_substeps,
+    kl_penalty_coef=config.kl_penalty_coef,
+    kl_discount_factor=config.kl_discount_factor,
+    # Required whenever the coefficient is on: the cookbook raises rather than
+    # defaulting to the training model's base, despite what its docstring says.
+    kl_reference_config=(rl_train.KLReferenceConfig(base_model=config.model_name) if config.kl_penalty_coef > 0 else None),
     stream_minibatch_config=(
       rl_train.StreamMinibatchConfig(
         groups_per_batch=config.batch_size,
@@ -233,9 +224,19 @@ async def run(config: RunConfig) -> None:
       else None
     ),
   )
-  await rl_train.main(train_config)
-  if config.final_eval:
-    await run_final_eval(train_config)
+  with recipe_runtime(config):
+    try:
+      await rl_train.main(train_config)
+      if config.final_eval:
+        await run_final_eval(train_config)
+    finally:
+      # Keep partial runs inspectable, and never hide a training failure behind
+      # an error while creating its report.
+      if (Path(config.log_path) / "metrics.jsonl").exists():
+        try:
+          write_report(Path(config.log_path))
+        except Exception:
+          rl_train.logger.exception("Could not generate the run report; read metrics with harvey_labs.results")
 
 
 def main() -> None:

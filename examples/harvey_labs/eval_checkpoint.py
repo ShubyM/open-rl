@@ -4,7 +4,7 @@ Points the gateway's sampler at an existing adapter dir (e.g.
 /tmp/open-rl/peft/<model-id>/sampler-12 or any copied checkpoint folder) and
 runs the held-out eval task set against it:
 
-  uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
+  uv --project examples run python -m harvey_labs.eval_checkpoint \
     checkpoint=/tmp/open-rl/peft/<model-id>/final \
     model_name=Qwen/Qwen3.5-27B base_url=http://127.0.0.1:9003
 
@@ -22,9 +22,11 @@ from pathlib import Path
 
 import chz
 import tinker
+from common.tinker_utils import resolve_base_url
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator
-from tinker_utils import resolve_base_url
-from train import RunConfig, build_dataset_builder, preflight_grading
+
+from .sandbox import SandboxFactory, podman_sandbox_factory
+from .train import RunConfig, build_dataset_builder, preflight_grading
 
 TMP_DIR = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"))
 
@@ -61,14 +63,19 @@ def sampler_ref(config: EvalConfig) -> str:
   return f"tinker://{config.model_id}/sampler_weights/{config.label}"
 
 
-async def run(config: EvalConfig) -> None:
+async def run(config: EvalConfig, *, sandbox_factory: SandboxFactory = podman_sandbox_factory) -> None:
   preflight_grading(config)
-  ref = sampler_ref(config)
-  _, test_dataset = await build_dataset_builder(config)()
+  # An empty checkpoint= evaluates the untrained base model. That number is the
+  # reference every trained checkpoint is scored against, so it has to be
+  # measurable with the same tasks, judge, and rollout count as the runs that
+  # are compared to it -- otherwise the comparison carries the difference
+  # between two eval protocols rather than the effect of training.
+  ref = sampler_ref(config) if config.checkpoint else None
+  _, test_dataset = await build_dataset_builder(config, sandbox_factory)()
   if test_dataset is None:
     raise RuntimeError("No eval tasks configured (eval_tasks=0, or a single-task run via task=?).")
 
-  print(f"Evaluating {ref} on {len(test_dataset)} eval batches...")
+  print(f"Evaluating {ref or f'{config.model_name} (base, no adapter)'} on {len(test_dataset)} eval batches...")
   service_client = tinker.ServiceClient(base_url=resolve_base_url(config.base_url))
   sampling_client = service_client.create_sampling_client(base_model=config.model_name, model_path=ref)
   evaluator = RLTestSetEvaluator(test_dataset, max_tokens=config.max_tokens)

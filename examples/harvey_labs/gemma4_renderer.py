@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from functools import cache
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import tinker
 import tinker_cookbook.renderers as renderers
@@ -24,11 +24,27 @@ from tinker_cookbook.renderers.base import (
 )
 
 # chat_template.jinja is pinned from Gemma 4 discussion #36 at HF revision
-# 4e34fcbc4c9a95b92d6a8a97c2faed16dd783f91.
-GEMMA4_CHAT_TEMPLATE_SHA256 = "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5"
+# 4e34fcbc4c9a95b92d6a8a97c2faed16dd783f91, with one local edit: the thinking
+# block is gated on `is not none` rather than truthiness, so an empty thought
+# channel round-trips as '<|channel>thought\n<channel|>'.
+#
+# Upstream needs this because after a tool response the template pre-opens
+# <|channel>thought in the generation prompt; a model that closes it immediately
+# produced a blank thought the re-render then dropped, breaking the prefix chain
+# that trajectory merging depends on. The encoding matches upstream's own -- HF
+# revision 707f0a3b emits exactly '<|channel>thought\n<channel|>' for the empty
+# case on its `not enable_thinking` branch. That revision is otherwise identical
+# to this one for tool-calling paths, so the pin stays on #36.
+GEMMA4_CHAT_TEMPLATE_SHA256 = "ca51a48d0fe20cfe36f480d6cb0a691a60cf1bb4a34475183868e7d24eb8cd38"
 
+# The body must not run past the next call's opener. With a plain `.*?` an
+# unterminated call swallows the following one whole -- it keeps scanning for a
+# `}` and finds the *next* call's, then finds that call's `<tool_call|>` right
+# where it wants a closer, so both are consumed as one malformed call. A `write`
+# that lost its brace to a truncated document therefore took a valid `bash` with
+# it. No real body can contain the opener, so refusing to cross it is free.
 _TOOL_CALL = re.compile(
-  r"<\|tool_call>(?P<body>call:(?P<name>\w+)\{.*?\})"
+  r"<\|tool_call>(?P<body>call:(?P<name>\w+)\{(?:(?!<\|tool_call>).)*?\})"
   r"(?:<tool_call\|>|<eos>|(?=<\|tool_response>)|$)",
   re.DOTALL,
 )
@@ -43,6 +59,99 @@ def _valid_tool_calls(parsed: Any) -> list[dict[str, Any]]:
     for call in calls
     if isinstance(call, Mapping) and isinstance(call.get("function"), Mapping) and isinstance(call["function"].get("name"), str)
   ]
+
+
+_NATIVE_QUOTE = '<|"|>'
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+_JSON_SCALAR = re.compile(r"(?:-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|true|false|null)$")
+_MIXED_CLOSER = re.compile(r'"\s*,\s*[A-Za-z_]\w*\s*:')
+
+
+def _read_native_string(text: str, i: int) -> tuple[str, int]:
+  """Read a <|"|>-delimited string at i, tolerating a missing or mixed closer."""
+  i += len(_NATIVE_QUOTE)
+  end = text.find(_NATIVE_QUOTE, i)
+  if end != -1:
+    return text[i:end], end + len(_NATIVE_QUOTE)
+  # Opened with the native token and closed with a plain quote, or not closed at
+  # all. Only trust a plain quote that a further key follows -- a quote before
+  # the final brace is usually the argument's own, as in
+  # {command:<|"|>find . -name "*.docx"}.
+  mixed = _MIXED_CLOSER.search(text, i)
+  if mixed:
+    return text[i : mixed.start()], mixed.start() + 1
+  end = len(text.rstrip())
+  if end > i and text[end - 1] == "}":
+    end -= 1
+  value = text[i:end].rstrip()
+  if value.endswith('"') and value.count('"') % 2:
+    # An unpaired trailing quote is the closer; a balanced pair is the value's.
+    value = value[:-1]
+  return value, end
+
+
+def _read_bare_value(text: str, i: int) -> tuple[Any, int]:
+  """Read an unquoted value up to the top-level ',' or the closing '}'."""
+  depth, start = 0, i
+  while i < len(text):
+    ch = text[i]
+    if ch in "{[":
+      depth += 1
+    elif ch in "]}":
+      if depth == 0:
+        break
+      depth -= 1
+    elif ch == "," and depth == 0:
+      break
+    i += 1
+  raw = text[start:i].strip()
+  if _JSON_SCALAR.fullmatch(raw) or (raw[:1] in '"[{' and raw[-1:] in '"]}'):
+    try:
+      return json.loads(raw), i
+    except ValueError:
+      pass
+  return raw, i
+
+
+def normalize_tool_call_args(body: str) -> str:
+  """Rebuild one `{...}` argument object leniently as strict JSON.
+
+  Gemma 4 emits string arguments delimited by the <|"|> special token and leaves
+  object keys bare -- {command:<|"|>find . -name "*.docx"}. That is the encoding
+  the tokenizer produces, but its own parse_response rejects it, so run28 threw
+  away 83% of its parse errors on calls that named a real tool and had a proper
+  closing delimiter. Returns the input unchanged when it does not look like this
+  encoding; callers must try the raw body first regardless.
+  """
+  text = body.strip()
+  if not text.startswith("{"):
+    return body
+  i, out = 1, {}
+  while i < len(text):
+    while i < len(text) and text[i] in " \n\t,":
+      i += 1
+    if i >= len(text) or text[i] == "}":
+      break
+    if text.startswith(_NATIVE_QUOTE, i):
+      key, i = _read_native_string(text, i)
+    else:
+      match = _IDENT.match(text, i)
+      if not match:
+        return body
+      key, i = match.group(0), match.end()
+    while i < len(text) and text[i] in " \n\t":
+      i += 1
+    if i >= len(text) or text[i] != ":":
+      return body
+    i += 1
+    while i < len(text) and text[i] in " \n\t":
+      i += 1
+    if text.startswith(_NATIVE_QUOTE, i):
+      value, i = _read_native_string(text, i)
+    else:
+      value, i = _read_bare_value(text, i)
+    out[str(key)] = value
+  return json.dumps(out, separators=(",", ":")) if out else body
 
 
 @cache
@@ -164,14 +273,33 @@ class Gemma4ToolRenderer(renderers.Renderer):
       # call. That channel order is outside the response schema even when the
       # call block itself is complete and valid. Parse complete call blocks in
       # isolation so useful actions are not discarded with their prose.
-      tool_call_input = "".join(
-        f"<|tool_call>{match.group('body')}<tool_call|>" for match in _TOOL_CALL.finditer(parse_input) if match.group("name") in self.tool_names
-      )
-      try:
-        tool_call_parse = self.tokenizer.parse_response(tool_call_input)
-      except Exception:
-        tool_call_parse = {}
-      tool_calls = _valid_tool_calls(tool_call_parse)
+      #
+      # One call at a time, and keep whichever ones survive. Handing the whole
+      # turn to the parser as a single concatenated block let one unrecoverable
+      # call discard every valid call beside it: measured on run29 eval-0,
+      # `good` alone parsed to 1 call and `bad` alone to 0, but `good`+`bad`
+      # parsed to 0 in either order. Two of that eval's seven parse errors were
+      # turns whose calls were individually well-formed.
+      recovered: list[dict[str, Any]] = []
+      for match in _TOOL_CALL.finditer(parse_input):
+        name = match.group("name")
+        if name not in self.tool_names:
+          continue
+        raw = match.group("body")[len("call:") + len(name) :]
+        # Raw first, so a call that already parses is never touched; the lenient
+        # rewrite only ever runs on text the tokenizer has already rejected.
+        candidates = [raw]
+        if (normalized := normalize_tool_call_args(raw)) != raw:
+          candidates.append(normalized)
+        for args in candidates:
+          try:
+            one = _valid_tool_calls(self.tokenizer.parse_response(f"<|tool_call>call:{name}{args}<tool_call|>"))
+          except Exception:
+            one = []
+          if one:
+            recovered.extend(one)
+            break
+      tool_calls = recovered
 
     parsed_tool_calls = []
     for tool_call in tool_calls:
@@ -187,7 +315,13 @@ class Gemma4ToolRenderer(renderers.Renderer):
       )
 
     parts: list[TextPart | ThinkingPart] = []
-    if thinking := parsed.get("thinking"):
+    # An empty thought is not the same as no thought. After a tool response the
+    # template pre-opens <|channel>thought, so a model that closes it right away
+    # still emitted a (blank) thought channel, and the re-render has to reproduce
+    # it or the observation stops being a prefix of the next one. Only None --
+    # the channel never opened -- means there is nothing to carry.
+    thinking = parsed.get("thinking")
+    if thinking is not None:
       parts.append(ThinkingPart(type="thinking", thinking=thinking))
     if content := parsed.get("content"):
       parts.append(TextPart(type="text", text=content))
@@ -226,7 +360,42 @@ class Gemma4ToolRenderer(renderers.Renderer):
     return [Message(role="system", content=rendered[len(prefix) : -len(suffix)])]
 
   def to_openai_message(self, message: Message) -> dict[str, Any]:
+    # Thinking must travel as reasoning_content, not as inline <think> tags.
+    # The base implementation flattens content parts and wraps ThinkingPart in
+    # <think>...</think>; Gemma 4 has no such tag. Its template reads thinking
+    # from reasoning/reasoning_content and emits <|channel>thought ... <channel|>.
+    # Left inline the tags land verbatim in the model channel, and because the
+    # template renders tool_calls before content they land *after* the tool call
+    # the thought was meant to precede.
+    #
+    # This also broke trajectory prefix merging. build_generation_prompt
+    # re-renders the whole history every turn, so a thought block that migrates
+    # across <|tool_response>| between turns stops observation k+1 from being a
+    # token prefix of observation k, and data_processing flushes the accumulator
+    # and starts a new training sequence -- run24 emitted 429 sequences for 48
+    # trajectories over 469 env steps, ~8.9x the tokens it needed. Emitting
+    # reasoning_content restores the canonical block, which also matches the
+    # <|channel>thought opener the template appends to the generation prompt
+    # after a tool response, so the chain holds across turns.
+    content = message["content"]
+    thinking: str | None = None
+    if not isinstance(content, str) and any(p["type"] == "thinking" for p in content):
+      # Pass the parser's text through verbatim, including the newline it keeps
+      # from the closing delimiter. The template appends '\n' only when the text
+      # does not already end in one, so raw round-trips exactly and an external
+      # caller writing plain prose still gets the canonical form.
+      thinking = "".join(p["thinking"] for p in content if p["type"] == "thinking")
+      # Drop the parts unconditionally, even when what is left is empty or pure
+      # whitespace. Leaving them for the base implementation to flatten puts a
+      # literal <think> tag back into the model channel, which is the failure
+      # this override exists to prevent.
+      message = cast(Message, {**message, "content": [p for p in content if p["type"] != "thinking"]})
+
     result = super().to_openai_message(message)
+    if thinking is not None:
+      # Pass "" through as well: the template distinguishes none (no channel)
+      # from empty (channel opened and closed immediately).
+      result["reasoning_content"] = thinking
     if result["role"] == "model":
       result["role"] = "assistant"
     for tool_call in result.get("tool_calls", []):
