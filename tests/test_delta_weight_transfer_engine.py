@@ -3,24 +3,34 @@
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from src.server.delta_weight_transfer_engine import (
+from server.delta_weight_transfer_engine import (
   DeltaSnapshotInitInfo,
   DeltaSnapshotUpdateInfo,
   DeltaSnapshotWeightTransferEngine,
 )
 
 
+def fake_vllm_config(model: str = "") -> SimpleNamespace:
+  """The two attributes the real vLLM base engine reads in its constructor."""
+  return SimpleNamespace(
+    parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
+    model_config=SimpleNamespace(model=model),
+  )
+
+
+def make_engine(model: torch.nn.Module | None = None) -> DeltaSnapshotWeightTransferEngine:
+  return DeltaSnapshotWeightTransferEngine(config=None, vllm_config=fake_vllm_config(), device=torch.device("cpu"), model=model)
+
+
 class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
   def test_delta_snapshot_weight_transfer_engine_contract(self):
     """Test that DeltaSnapshotWeightTransferEngine satisfies the vLLM contract."""
-    engine = DeltaSnapshotWeightTransferEngine(
-      config=None,
-      parallel_config=None,  # type: ignore
-    )
+    engine = make_engine()
 
     init_info = engine.parse_init_info({"model_name_or_path": "Qwen/Qwen3-8B"})
     self.assertIsInstance(init_info, DeltaSnapshotInitInfo)
@@ -43,10 +53,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       file_path = os.path.join(tmpdir, "delta.safetensors")
       save_file(dummy_weights, file_path)
 
-      engine = DeltaSnapshotWeightTransferEngine(
-        config=None,
-        parallel_config=None,  # type: ignore
-      )
+      engine = make_engine()
       update_info = DeltaSnapshotUpdateInfo(target_weights_path=file_path)
 
       loaded_tensors: list[tuple[str, torch.Tensor]] = []
@@ -73,10 +80,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       file_v1 = os.path.join(tmpdir, "delta1.safetensors")
       save_file(weights_v1, file_v1)
 
-      engine = DeltaSnapshotWeightTransferEngine(
-        config=None,
-        parallel_config=None,  # type: ignore
-      )
+      engine = make_engine()
 
       # First update: 2 new/changed tensors
       calls_v1: list[list[tuple[str, torch.Tensor]]] = []
@@ -112,10 +116,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       file_v1 = os.path.join(tmpdir, "delta1.safetensors")
       save_file(weights_v1, file_v1)
 
-      engine = DeltaSnapshotWeightTransferEngine(
-        config=None,
-        parallel_config=None,  # type: ignore
-      )
+      engine = make_engine()
       engine.receive_weights(
         DeltaSnapshotUpdateInfo(target_weights_path=file_v1),
         lambda w: None,
@@ -159,10 +160,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       }
       save_file(sparse_dict, os.path.join(tmpdir, "delta.safetensors"))
 
-      engine = DeltaSnapshotWeightTransferEngine(
-        config=None,
-        parallel_config=None,  # type: ignore
-      )
+      engine = make_engine()
 
       # Mock active vLLM model holding initial weights (all zeros)
       class DummyModel:
@@ -240,10 +238,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
           "vllm.model_executor.model_loader.weight_utils": mock_utils,
         },
       ):
-        engine = DeltaSnapshotWeightTransferEngine(
-          config=None,
-          parallel_config=None,  # type: ignore
-        )
+        engine = make_engine()
 
         loaded_calls: list[tuple[str, torch.Tensor]] = []
         engine.receive_weights(
@@ -308,10 +303,7 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
           },
         ),
       ):
-        engine = DeltaSnapshotWeightTransferEngine(
-          config=None,
-          parallel_config=None,  # type: ignore
-        )
+        engine = make_engine()
 
         loaded_calls: list[tuple[str, torch.Tensor]] = []
         engine.receive_weights(

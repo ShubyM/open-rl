@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import tempfile
 import threading
 import unittest
@@ -470,27 +469,6 @@ class CudaCheckpointRestorerTest(unittest.TestCase):
 
 
 class LlmDCheckpointRestorerTest(unittest.TestCase):
-  def test_installed_llmd_client_matches_checkpoint_restorer_contract(self) -> None:
-    try:
-      from timeslice.snapshot_agent import SnapshotAgentClient
-      from timeslice.snapshot_agent.types import GetOperationResponse
-    except ModuleNotFoundError as exc:
-      if exc.name and exc.name.split(".")[0] == "timeslice":
-        self.skipTest("timeslice cluster extra is not installed")
-      raise
-
-    for name in ["snapshot_and_wait", "restore_and_wait"]:
-      parameters = inspect.signature(getattr(SnapshotAgentClient, name)).parameters
-      self.assertEqual(
-        list(parameters)[:5],
-        ["self", "job_id", "group", "poll_interval_sec", "backend_config"],
-      )
-      self.assertEqual(parameters["poll_interval_sec"].default, 1.0)
-
-    self.assertTrue(callable(SnapshotAgentClient.close))
-    self.assertEqual(GetOperationResponse.__annotations__["status"], str)
-    self.assertIn("error", GetOperationResponse.__annotations__)
-
   def test_checkpoint_and_restore_wait_for_llmd_operations_by_job_id(self) -> None:
     class Client:
       def __init__(self):

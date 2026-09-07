@@ -18,13 +18,11 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_gateway_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
 TRAINING_TEST_EXTRA ?= gpu
 TRAINING_TEST_ARGS ?=
-PIGLATIN_TEST_PYTHONPATH ?= examples/sft/pig-latin
 EVAL_MODEL_PATH ?=
 EVAL_EXAMPLES ?= 100
 EVAL_DATA_PATH ?=
@@ -47,13 +45,12 @@ help:
 	@echo "make server                              # $(BASE_MODEL), SAMPLING_BACKEND=$(SAMPLING_BACKEND), port $(PORT)"
 	@echo "make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm"
 	@echo "VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make vllm BASE_MODEL=google/gemma-4-e2b"
-	@echo "make test                               # fast unit tests"
+	@echo "uv run pytest                            # unit tests (GPU tests skip themselves without a device)"
 	@echo "make test e2e tiny-lora|tiny-fft|tiny-rl|lora-textsql|fft-gsm8k|fft-gsm8k-x2|fft-textsql-rl|fft-textsql-rl-x2  # tiny-* = fast overfit smoke tests"
 	@echo "make test e2e tiny-lora BASE_URL=http://host:9003"
 	@echo "CUDA_VISIBLE_DEVICES=0 make test e2e tiny-fft"
 	@echo "make test e2e tiny-fft TRAINING_TEST_ARGS='steps=20'"
 	@echo "make test e2e fft-gsm8k TRAINING_TEST_ARGS='steps=10 eval_examples=8 extra=\"batch=2\"'"
-	@echo "make test piglatin                      # pig-latin example end-to-end tests"
 	@echo "make cluster-eval EVAL_MODEL_PATH=/mnt/shared/open-rl/checkpoints/...  # one-off vLLM eval job on the cluster"
 	@echo "make lint | fmt"
 	@echo "make render OVERLAY=k8s/deploy/distributed-shared VERSION=v0.0.1  # pinned manifests to stdout"
@@ -95,12 +92,11 @@ cli:
 # ---------------------------------------------------------------------------
 # Dev
 # ---------------------------------------------------------------------------
+# Unit tests are `uv run pytest`; this target only drives the e2e runner.
 test:
 	@mode="$(TEST_MODE)"; \
 	scenario="$(TEST_SCENARIO)"; \
-	if [ -z "$$mode" ] || [ "$$mode" = "unit" ]; then \
-	  uv run --frozen --exact --extra cpu --extra cluster python -m unittest $(UNIT_TESTS); \
-	elif [ "$$mode" = "e2e" ]; then \
+	if [ "$$mode" = "e2e" ]; then \
 	  if [ -z "$$scenario" ]; then \
 	    echo "Missing e2e scenario. Expected tiny-lora, tiny-fft, tiny-rl, lora-textsql, lora-gsm8k-rl, fft-gsm8k, fft-gsm8k-x2, fft-textsql-rl, or fft-textsql-rl-x2."; \
 	    exit 2; \
@@ -109,20 +105,18 @@ test:
 	  if [ -n "$(TRAINING_TEST_BASE_URL)" ]; then set -- "$$@" "base_url=$(TRAINING_TEST_BASE_URL)"; fi; \
 	  kubectl delete pods -l accel-timeslicer=true --force --grace-period=0 2>/dev/null || true; \
 	  uv run --extra "$(TRAINING_TEST_EXTRA)" python scripts/run_training_e2e.py "$$@" $(TRAINING_TEST_ARGS); \
-	elif [ "$$mode" = "piglatin" ]; then \
-	  PYTHONPATH="$(PIGLATIN_TEST_PYTHONPATH)" uv --project examples run python -m unittest tests.test_piglatin_qwen tests.test_piglatin_gemma; \
 	else \
-	  echo "Unknown test mode '$$mode'. Expected unit, e2e, or piglatin."; \
+	  echo "Unit tests: uv run pytest. This target only runs e2e: make test e2e <scenario>."; \
 	  exit 2; \
 	fi
 
 lint:
-	uv run --extra dev ruff check .
-	uv run --extra dev ruff format --check .
+	uv run ruff check .
+	uv run ruff format --check .
 
 fmt:
-	uv run --extra dev ruff check --fix .
-	uv run --extra dev ruff format .
+	uv run ruff check --fix .
+	uv run ruff format .
 
 # ---------------------------------------------------------------------------
 # Deployment (GKE)
