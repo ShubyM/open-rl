@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from server import gateway
+from server.session_registry import SessionRegistry
 from server.worker_manager import LocalWorkerManager
 
 
@@ -18,8 +19,11 @@ class StoreStub:
   async def set_future(self, req_id: str, result: dict) -> None:
     self.futures[req_id] = result
 
-  async def set_value(self, key: str, value: str) -> None:
+  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
+
+  async def add_to_set(self, key: str, member: str) -> None:
+    pass
 
   async def get_value(self, key: str) -> str | None:
     return self.kv_store.get(key)
@@ -70,6 +74,11 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     gateway.store = self.store
     gateway.worker_manager = self.worker_manager
     self.addCleanup(self._restore)
+    self.enterContext(patch.object(gateway, "session_registry", SessionRegistry(self.store)))
+    self.enterContext(patch("server.store.get_store", return_value=self.store))
+
+  async def asyncSetUp(self) -> None:
+    self.session_id = (await gateway.create_session({}))["session_id"]
 
   def _restore(self) -> None:
     gateway.store = self.old_store
@@ -79,7 +88,7 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     import json
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
-      result = await gateway.create_model({"base_model": "base-model"})
+      result = await gateway.create_model({"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
@@ -95,7 +104,7 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.worker_manager.error = RuntimeError("boom")
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}), patch("server.gateway.traceback.print_exc"):
-      result = await gateway.create_model({"base_model": "base-model"})
+      result = await gateway.create_model({"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
@@ -108,6 +117,7 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
       result = await gateway.create_model_from_state(
         {
+          "session_id": self.session_id,
           "state_path": "/tmp/checkpoint",
           "base_model": "restored-base",
           "full_config": {"weight_sync_strategy": "delta"},
@@ -143,13 +153,14 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
           "fine_tuning_type": "full",
         }
       )
+      await gateway.bind_session(self.session_id, "model-x")
       await gateway.ensure_sampler_launched("model-x")
 
     self.assertEqual(self.worker_manager.launched_sampler_model_ids, ["model-x"])
 
   async def test_create_model_launches_trainer_when_worker_manager_present(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "false"}):
-      result = await gateway.create_model({"base_model": "base-model"})
+      result = await gateway.create_model({"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])

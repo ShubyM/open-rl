@@ -19,11 +19,28 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config
+from server.session_registry import SessionRegistry
 from server.store import get_store
-from server.worker_manager import WorkerManager, create_worker_manager
+from server.worker_manager import WorkerManager, create_worker_manager, owner_of
 
 store = get_store()
 worker_manager: WorkerManager | None = None
+
+session_registry = SessionRegistry(store)
+SESSION_REAP_INTERVAL_SEC = 30
+
+
+async def bind_session(session_id: str | None, model_id: str) -> None:
+  if worker_manager is not None and session_id:
+    owner = await asyncio.to_thread(owner_of, model_id)
+    await session_registry.attach(session_id, owner)
+
+
+async def teardown_owner(owner: str) -> None:
+  print(f"[GATEWAY] No live session uses {owner}; tearing its workers down")
+  for model in await asyncio.to_thread(worker_manager.release_owner, owner):
+    await store.delete_values(f"open_rl:sampler_ready:{model}")
+
 
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
@@ -294,6 +311,17 @@ def translate_future_result(result: dict) -> dict:
   return result
 
 
+async def reap_dead_sessions():
+  while True:
+    await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
+    try:
+      for owner in await session_registry.abandoned():
+        await teardown_owner(owner)
+        await session_registry.forget(owner)
+    except Exception:
+      traceback.print_exc()  # whatever failed is still abandoned next sweep
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
   global worker_manager
@@ -317,9 +345,12 @@ async def lifespan(_: FastAPI):
       if base_model:
         await asyncio.to_thread(worker.load_base_model, base_model)
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
+  reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
   try:
     yield
   finally:
+    if reap_task is not None:
+      reap_task.cancel()
     if task is not None:
       task.cancel()
     if worker_manager is not None:
@@ -359,11 +390,15 @@ async def client_config(_: dict):
 
 @app.post("/api/v1/create_session")
 async def create_session(_: dict):
-  return {"session_id": "sess-real-123", "type": "create_session"}
+  session_id = f"sess-{uuid.uuid4().hex[:12]}"
+  await session_registry.heartbeat(session_id)
+  return {"session_id": session_id, "type": "create_session"}
 
 
 @app.post("/api/v1/session_heartbeat")
-async def session_heartbeat(_: dict):
+async def session_heartbeat(req: dict):
+  if session_id := req.get("session_id"):
+    await session_registry.heartbeat(session_id)
   return {"type": "session_heartbeat"}
 
 
@@ -382,6 +417,7 @@ async def create_model(
   except ValueError as exc:
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
+  await bind_session(req.get("session_id"), model_id)
   command = make_training_request(
     "create_model",
     model_id,
@@ -432,6 +468,7 @@ async def create_model_from_state(
   except ValueError as exc:
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
+  await bind_session(req.get("session_id"), model_id)
   command = make_training_request(
     "create_model_from_state",
     model_id,
@@ -642,6 +679,8 @@ async def create_sampling_session(req: dict):
   model_meta = await store.get_model_metadata(target_model_id) if target_model_id else None
   fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
   ready_check_id = (model_meta.get("base_model") or target_model_id) if (fine_tuning_type == "lora" and model_meta) else target_model_id
+
+  await bind_session(req.get("session_id"), target_model_id)
 
   if get_sampler_backend() == "vllm" and ready_check_id:
     # Launch by model ID so the worker manager retains the training kind.
