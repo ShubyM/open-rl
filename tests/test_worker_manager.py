@@ -69,20 +69,13 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
     self.worker_manager = WorkerManagerStub()
-    self.old_store = gateway.store
-    self.old_manager = gateway.worker_manager
-    gateway.store = self.store
-    gateway.worker_manager = self.worker_manager
-    self.addCleanup(self._restore)
+    self.enterContext(patch.object(gateway, "store", self.store))
+    self.enterContext(patch.object(gateway, "worker_manager", self.worker_manager))
     self.enterContext(patch.object(gateway, "session_registry", SessionRegistry(self.store)))
     self.enterContext(patch("server.store.get_store", return_value=self.store))
 
   async def asyncSetUp(self) -> None:
     self.session_id = (await gateway.create_session({}))["session_id"]
-
-  def _restore(self) -> None:
-    gateway.store = self.old_store
-    gateway.worker_manager = self.old_manager
 
   async def test_create_model_launches_worker_then_enqueues(self) -> None:
     import json
@@ -250,12 +243,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
 class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
-    self.old_store = gateway.store
-    gateway.store = self.store
-    self.addCleanup(self._restore)
-
-  def _restore(self) -> None:
-    gateway.store = self.old_store
+    self.enterContext(patch.object(gateway, "store", self.store))
 
   async def test_extract_and_persist_metadata_from_headers(self) -> None:
     import json
