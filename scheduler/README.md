@@ -71,9 +71,20 @@ a kind smoke test that needs no hardware (the DRA example driver publishes
 fake GPUs):
 
 ```
-make smoke                                # kind + fake GPUs
-USE_EXISTING_CLUSTER=1 DEVICE_CLASS=gpu.nvidia.com ./hack/kind-smoke.sh   # real GPUs
+make -C scheduler/controller smoke        # kind + fake GPUs
+USE_EXISTING_CLUSTER=1 DEVICE_CLASS=gpu.nvidia.com scheduler/hack/kind-smoke.sh   # real GPUs
 ```
+
+The smoke test pins Kubernetes and the fake driver, selects `spread` explicitly,
+and uses a private kubeconfig so it does not change your current context.
+`KEEP=1` preserves the cluster and prints commands to inspect it. Existing-cluster
+runs require an empty `openrl-system` namespace. Failures print controller events
+and logs; failed cluster creation also exports kind diagnostics.
+
+Kubernetes 1.35 requires cgroup v2 by default. On older hosts, use
+`KIND_NODE_IMAGE=kindest/node:v1.34.0 make -C scheduler/controller smoke`.
+To test a different checkout without switching branches, set
+`SCHEDULER_DIR=/absolute/path/to/checkout/scheduler`.
 
 The controller only ever reads ResourceSlices and node labels, so fake and
 real devices exercise the identical path; only the two env values differ.

@@ -84,7 +84,7 @@ run:
 # example driver. No hardware needed. See hack/kind-smoke.sh for the knobs.
 .PHONY: smoke
 smoke:
-	./hack/kind-smoke.sh
+	../hack/kind-smoke.sh
 
 .PHONY: docker-build
 docker-build:
