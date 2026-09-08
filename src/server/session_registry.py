@@ -13,6 +13,10 @@ Everything lives in the store, so a gateway restart keeps it:
                           on its own.
   open_rl:owner:<owner>   the sessions using this owner's workers.
   open_rl:owners          every owner that has workers.
+
+Nothing here is atomic. The gateway holds a lock per owner around attach and
+around the in_use check and the teardown that follows it, so a session cannot
+attach to an owner between the check and the delete.
 """
 
 from server.store import RequestStore
@@ -35,18 +39,17 @@ class SessionRegistry:
     await self.store.add_to_set("open_rl:owners", owner)
     await self.store.add_to_set(f"open_rl:owner:{owner}", session_id)
 
-  async def abandoned(self) -> list[str]:
-    """The owners none of whose sessions are live anymore."""
-    result = []
-    for owner in sorted(await self.store.set_members("open_rl:owners")):
-      for session_id in await self.store.set_members(f"open_rl:owner:{owner}"):
-        if not await self.live(session_id):
-          await self.store.remove_from_set(f"open_rl:owner:{owner}", session_id)
-      if not await self.store.set_members(f"open_rl:owner:{owner}"):
-        result.append(owner)
-    return result
+  async def owners(self) -> list[str]:
+    return sorted(await self.store.set_members("open_rl:owners"))
+
+  async def in_use(self, owner: str) -> bool:
+    """Whether any of the owner's sessions is still live. Drops the dead ones."""
+    for session_id in await self.store.set_members(f"open_rl:owner:{owner}"):
+      if not await self.live(session_id):
+        await self.store.remove_from_set(f"open_rl:owner:{owner}", session_id)
+    return bool(await self.store.set_members(f"open_rl:owner:{owner}"))
 
   async def forget(self, owner: str) -> None:
-    """The owner's workers are gone. A session that attached since abandoned() keeps it."""
-    if not await self.store.set_members(f"open_rl:owner:{owner}"):
-      await self.store.remove_from_set("open_rl:owners", owner)
+    """The owner's workers are gone."""
+    await self.store.delete_values(f"open_rl:owner:{owner}")
+    await self.store.remove_from_set("open_rl:owners", owner)

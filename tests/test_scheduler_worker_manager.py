@@ -171,6 +171,15 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(self.api.deleted, ["lora-qwen-qwen2-5-0-5b-0-sampler", "lora-qwen-qwen2-5-0-5b-0-trainer"])
     self.assertEqual(list(self.api.existing), ["lora-qwen-qwen3-0-6b-0-trainer"])
 
+  def test_release_owner_finds_workloads_by_their_spec_not_their_labels(self) -> None:
+    # A workload from before this gateway carries only the managed-by label.
+    self.api.existing["fft-old-trainer"] = {
+      "metadata": {"name": "fft-old-trainer", "labels": {"app.kubernetes.io/managed-by": "open-rl-gateway"}},
+      "spec": {"ownerID": "old", "modelID": "old"},
+    }
+    self.assertEqual(self.manager.release_owner("old"), {"old"})
+    self.assertEqual(self.api.deleted, ["fft-old-trainer"])
+
   def test_ensure_waits_for_a_terminating_workload_before_recreating_it(self) -> None:
     s = self.store_with("adapter", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.store.get_store", return_value=s):

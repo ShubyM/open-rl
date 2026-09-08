@@ -126,7 +126,7 @@ def workload_body(worker: Worker) -> dict[str, Any]:
   return {
     "apiVersion": f"{GROUP}/{VERSION}",
     "kind": "Workload",
-    "metadata": {"name": worker.name, "labels": {"app.kubernetes.io/managed-by": "open-rl-gateway", "openrl.io/owner": worker.owner}},
+    "metadata": {"name": worker.name, "labels": {"app.kubernetes.io/managed-by": "open-rl-gateway"}},
     "spec": {
       "role": worker.role,
       "trainingKind": "lora" if worker.is_lora else "fft",
@@ -190,11 +190,12 @@ class SchedulerWorkerManager:
 
   def release_owner(self, owner: str) -> set[str]:
     """Delete the owner's workloads. The scheduler's finalizer frees the seats."""
-    selector = f"openrl.io/owner={owner}"
+    selector = "app.kubernetes.io/managed-by=open-rl-gateway"
     found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
-    for item in found["items"]:
+    ours = [item for item in found["items"] if item["spec"]["ownerID"] == owner]
+    for item in ours:
       self.delete_workload(item["metadata"]["name"])
-    return {item["spec"]["modelID"] for item in found["items"]}
+    return {item["spec"]["modelID"] for item in ours}
 
   def close(self) -> None:
     pass  # Workloads outlive the gateway; the scheduler owns them from here

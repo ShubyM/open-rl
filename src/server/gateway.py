@@ -7,6 +7,7 @@ import os
 import time
 import traceback
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -28,18 +29,27 @@ worker_manager: WorkerManager | None = None
 
 session_registry = SessionRegistry(store)
 SESSION_REAP_INTERVAL_SEC = 30
+# Attaching a session to an owner and reaping that owner take turns, so a
+# session cannot attach between the reaper deciding an owner is unused and
+# deleting its workers. In-process, which is why there is one gateway replica.
+owner_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 async def bind_session(session_id: str | None, model_id: str) -> None:
   if worker_manager is not None and session_id:
     owner = await asyncio.to_thread(owner_of, model_id)
-    await session_registry.attach(session_id, owner)
+    async with owner_locks[owner]:
+      await session_registry.attach(session_id, owner)
 
 
-async def teardown_owner(owner: str) -> None:
-  print(f"[GATEWAY] No live session uses {owner}; tearing its workers down")
-  for model in await asyncio.to_thread(worker_manager.release_owner, owner):
-    await store.delete_values(f"open_rl:sampler_ready:{model}")
+async def reap_owner(owner: str) -> None:
+  async with owner_locks[owner]:
+    if await session_registry.in_use(owner):
+      return
+    print(f"[GATEWAY] No live session uses {owner}; tearing its workers down")
+    for model in await asyncio.to_thread(worker_manager.release_owner, owner):
+      await store.delete_values(f"open_rl:sampler_ready:{model}")
+    await session_registry.forget(owner)
 
 
 provider = TracerProvider()
@@ -314,12 +324,11 @@ def translate_future_result(result: dict) -> dict:
 async def reap_dead_sessions():
   while True:
     await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
-    try:
-      for owner in await session_registry.abandoned():
-        await teardown_owner(owner)
-        await session_registry.forget(owner)
-    except Exception:
-      traceback.print_exc()  # whatever failed is still abandoned next sweep
+    for owner in await session_registry.owners():
+      try:
+        await reap_owner(owner)
+      except Exception:
+        traceback.print_exc()  # still unused next sweep, so it is retried then
 
 
 @asynccontextmanager
