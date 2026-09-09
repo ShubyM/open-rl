@@ -38,6 +38,7 @@ class Config:
   min_loss_drop: float = 0.02
   seed: int = 0
   behavior_if_log_dir_exists: str = "delete"
+  sample_after_train: bool = False
 
 
 def reset_log_dir(path: Path, behavior: str) -> None:
@@ -133,6 +134,20 @@ def main(config: Config) -> None:
 
   if loss_drop < config.min_loss_drop:
     raise RuntimeError(f"Expected loss_drop >= {config.min_loss_drop:.1%}, got {loss_drop:.1%}")
+
+  if config.sample_after_train:
+    sampler = trainer.save_weights_and_get_sampling_client(name="tiny-sft-sampler")
+    result = sampler.sample(
+      prompt=types.ModelInput.from_ints(tokenizer.encode(config.prompt, add_special_tokens=False)),
+      num_samples=1,
+      sampling_params=types.SamplingParams(max_tokens=8, temperature=0.0),
+    ).result()
+    if len(result.sequences) != 1 or not result.sequences[0].tokens:
+      raise RuntimeError("The sampler did not generate tokens from the saved adapter")
+    tokens = result.sequences[0].tokens
+    text = tokenizer.decode(tokens, skip_special_tokens=True)
+    write_metric(log_dir, {"phase": "sample", "tokens": tokens, "text": text})
+    print(f"[tiny-sft] sampled_saved_adapter={text!r}")
 
 
 if __name__ == "__main__":
