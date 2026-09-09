@@ -8610,7 +8610,7 @@ spec:
               trainingKind:
                 description: |-
                   TrainingKind records whether this runtime is full fine-tuning or LoRA.
-                  Informational: reuse was already decided in the workload's name.
+                  Only FFT can share claims; LoRA and an unspecified kind stay exclusive.
                 enum:
                 - fft
                 - lora
@@ -8631,7 +8631,9 @@ spec:
             - message: placement fields are immutable; delete and recreate the workload
               rule: self.role == oldSelf.role && self.modelID == oldSelf.modelID &&
                 has(self.ownerID) == has(oldSelf.ownerID) && (!has(self.ownerID) ||
-                self.ownerID == oldSelf.ownerID) && self.accelerator == oldSelf.accelerator
+                self.ownerID == oldSelf.ownerID) && has(self.trainingKind) == has(oldSelf.trainingKind)
+                && (!has(self.trainingKind) || self.trainingKind == oldSelf.trainingKind)
+                && self.accelerator == oldSelf.accelerator
           status:
             description: WorkloadStatus is what the controller decided and what came
               of it.

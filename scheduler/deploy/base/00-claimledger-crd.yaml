@@ -94,6 +94,14 @@ spec:
                         it (the job for FFT workers, the shared base model for LoRA workers).
                         Copied from the workload's spec.ownerID.
                       type: string
+                    trainingKind:
+                      description: |-
+                        TrainingKind is copied from the workload. Only FFT seats may share;
+                        a missing kind prevents new joins until the workload refreshes its seat.
+                      enum:
+                      - fft
+                      - lora
+                      type: string
                     workload:
                       description: |-
                         Workload is the name of the Workload that holds this seat.

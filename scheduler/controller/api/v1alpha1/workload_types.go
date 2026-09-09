@@ -41,8 +41,8 @@ const (
 	ConditionPlaced = "Placed"
 )
 
-// TrainingKind is how the workload trains. Identity and reuse are decided
-// by the API server before placement; the controller does not branch on it.
+// TrainingKind is how the workload trains. FFT workers can time-slice a
+// GPU; LoRA workers remain resident and receive exclusive claims.
 // +kubebuilder:validation:Enum=fft;lora
 type TrainingKind string
 
@@ -97,7 +97,7 @@ type WorkloadSpec struct {
 	OwnerID string `json:"ownerID,omitempty"`
 
 	// TrainingKind records whether this runtime is full fine-tuning or LoRA.
-	// Informational: reuse was already decided in the workload's name.
+	// Only FFT can share claims; LoRA and an unspecified kind stay exclusive.
 	TrainingKind TrainingKind `json:"trainingKind,omitempty"`
 
 	// Accelerator is the estimator's requirement this workload is placed by.
@@ -190,7 +190,7 @@ type Workload struct {
 	// The spec is immutable: every field either places the worker or renders
 	// its pod, and V1 does not re-place or re-render a live worker. Change by
 	// deleting and recreating.
-	// +kubebuilder:validation:XValidation:rule="self.role == oldSelf.role && self.modelID == oldSelf.modelID && has(self.ownerID) == has(oldSelf.ownerID) && (!has(self.ownerID) || self.ownerID == oldSelf.ownerID) && self.accelerator == oldSelf.accelerator",message="placement fields are immutable; delete and recreate the workload"
+	// +kubebuilder:validation:XValidation:rule="self.role == oldSelf.role && self.modelID == oldSelf.modelID && has(self.ownerID) == has(oldSelf.ownerID) && (!has(self.ownerID) || self.ownerID == oldSelf.ownerID) && has(self.trainingKind) == has(oldSelf.trainingKind) && (!has(self.trainingKind) || self.trainingKind == oldSelf.trainingKind) && self.accelerator == oldSelf.accelerator",message="placement fields are immutable; delete and recreate the workload"
 	Spec   WorkloadSpec   `json:"spec"`
 	Status WorkloadStatus `json:"status,omitempty"`
 }

@@ -61,7 +61,7 @@ func main() {
 	flag.DurationVar(&placementTimeout, "placement-timeout", envDuration("OPEN_RL_PLACEMENT_TIMEOUT", 15*time.Minute),
 		"How long a worker may go unplaced before the request is declared unsatisfiable. 0 waits forever.")
 	flag.StringVar(&strategy, "placement-strategy", env("OPEN_RL_PLACEMENT_STRATEGY", string(placement.StrategyBinPack)),
-		"binpack seats workers on existing claims before cutting new ones; spread cuts a dedicated claim per worker, sharing only as a fallback.")
+		"binpack shares eligible FFT claims first; spread requests a GPU first, then falls back to FFT sharing. LoRA never shares.")
 	flag.IntVar(&maxConcurrent, "max-concurrent-reconciles", envInt("OPEN_RL_MAX_CONCURRENT_RECONCILES", 4),
 		"How many workers place at once. Seat booking is CAS-arbitrated, so concurrency risks only transient over-cut claims, which the sharing fallback drains.")
 

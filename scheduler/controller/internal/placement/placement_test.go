@@ -48,14 +48,14 @@ func trainer(id string, memoryGiB int64) Request {
 	// that declared it can shard; the single-device default is pinned where
 	// it matters. The host request mirrors the memory figure: the template
 	// asks the node for at least the footprint it may park.
-	return Request{Role: "trainer", WorkerID: id, Memory: gib(memoryGiB), MaxDevices: 8, HostRequestBytes: gib(memoryGiB)}
+	return Request{Shareable: true, Role: "trainer", WorkerID: id, Memory: gib(memoryGiB), MaxDevices: 8, HostRequestBytes: gib(memoryGiB)}
 }
 
 // booked is a claim with workers already assigned to it, charged worker by
 // worker the way readFleet rebuilds one from its ledger's seats.
 func booked(c *Claim, workers ...string) *Claim {
 	for _, worker := range workers {
-		c.Book(worker, worker, 0)
+		c.Book(worker, worker, 0, true)
 	}
 	return c
 }
@@ -137,8 +137,8 @@ func TestSelectClaimRejectsWhenHostMemoryIsFull(t *testing.T) {
 	fleet := NewFleet()
 	fleet.Nodes["n"] = l4Node("n", "trainer") // 94Gi allocatable
 	full := &Claim{Name: "full", DeviceCount: 1, Node: "n"}
-	full.Book("job-a", "job-a", gib(45))
-	full.Book("job-b", "job-b", gib(45))
+	full.Book("job-a", "job-a", gib(45), true)
+	full.Book("job-b", "job-b", gib(45), true)
 	fleet.Claims["full"] = full
 
 	if got := SelectClaim(trainer("job-c", 6), fleet); got != nil {
@@ -206,8 +206,8 @@ func TestTiersPreferTheTightestFit(t *testing.T) {
 // Fairness counts distinct owners, not workers.
 func TestOwnersCountFairnessUnits(t *testing.T) {
 	claim := &Claim{Name: "c", DeviceCount: 1, Node: "n"}
-	claim.Book("trainer-a", "job-a", gib(40))
-	claim.Book("sampler-a", "job-a", gib(20))
+	claim.Book("trainer-a", "job-a", gib(40), true)
+	claim.Book("sampler-a", "job-a", gib(20), true)
 
 	if got := claim.Owners(); got != 1 {
 		t.Errorf("Owners = %d, want 1: a trainer and sampler of one job are one fairness unit", got)

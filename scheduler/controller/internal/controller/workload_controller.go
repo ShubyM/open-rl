@@ -279,12 +279,8 @@ func (r *WorkloadReconciler) ensurePlacementClaim(ctx context.Context, scope *pl
 			status.Reason = verb
 		})
 	}
-	if worker.Status.AssignmentID != "" && worker.Status.ClaimName == scope.claimName {
-		return placementPhaseResult{}, nil
-	}
-
-	// A retained or pod-adopted claim has no fresh booking: re-book
-	// idempotently so the seat list stays authoritative.
+	// Adopt the recorded seat, refreshing legacy seats' training kind without
+	// replacing their assignment. This also heals a retained or pod-adopted claim.
 	_, seat, err := r.ensureSeat(ctx, scope.claimName, newSeat(worker, scope.request), true)
 	if err == errBookingContended {
 		reason := "SeatLost: the ledger is contended; the booking will be retried"
@@ -292,6 +288,9 @@ func (r *WorkloadReconciler) ensurePlacementClaim(ctx context.Context, scope *pl
 	}
 	if err != nil {
 		return placementPhaseResult{}, err
+	}
+	if worker.Status.AssignmentID == seat.AssignmentID && worker.Status.ClaimName == scope.claimName {
+		return placementPhaseResult{}, nil
 	}
 	return placementPhaseResult{}, r.patchStatus(ctx, worker, func(status *openrlv1alpha1.WorkloadStatus) {
 		status.ClaimName = scope.claimName
@@ -533,7 +532,7 @@ func (r *WorkloadReconciler) joinExistingClaim(ctx context.Context, worker *open
 	if err != nil {
 		return nil, nil, err
 	}
-	target.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes)
+	target.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes, request.Shareable)
 	return target, seat, nil
 }
 
@@ -583,7 +582,7 @@ func (r *WorkloadReconciler) cutDedicatedClaim(ctx context.Context, worker *open
 	found := err == nil
 
 	claim := &placement.Claim{Name: name}
-	claim.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes)
+	claim.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes, request.Shareable)
 	claimLedger, seat, err := r.ensureSeat(ctx, name, newSeat(worker, request), true)
 	if err != nil {
 		return nil, nil, "", err
@@ -594,7 +593,7 @@ func (r *WorkloadReconciler) cutDedicatedClaim(ctx context.Context, worker *open
 	if found {
 		// Adopt the cluster's copy -- it may already be allocated.
 		adopted := claimFrom(&existing)
-		adopted.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes)
+		adopted.Book(request.WorkerID, request.OwnerKey(), request.HostRequestBytes, request.Shareable)
 		fleet.Claims[adopted.Name] = adopted
 		return adopted, seat, verb, nil
 	}

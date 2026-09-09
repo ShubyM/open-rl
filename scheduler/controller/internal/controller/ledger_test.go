@@ -122,6 +122,70 @@ func TestRebookingAdoptsTheRecordedSeat(t *testing.T) {
 	}
 }
 
+func TestSharingRechecksTheLedgerAfterSelection(t *testing.T) {
+	resident, incoming := trainerWorker("resident", "model-a"), trainerWorker("incoming", "model-b")
+	r := newReconciler(t, append(enabledNode(), resident, incoming)...)
+	settle(t, r, resident.Name)
+	claim := claimOf(t, r, resident.Name)
+	allocateClaim(t, r, claim)
+	fleet, err := r.readFleet(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := requestFrom(incoming)
+	if placement.SelectClaim(request, fleet) == nil {
+		t.Fatal("snapshot should offer the FFT claim")
+	}
+	// The current ledger now holds a LoRA process, while the informer snapshot
+	// still offers an FFT-only claim. The consistent booking must refuse it.
+	ledger := getLedger(t, r, ledgerNameFor(claim))
+	ledger.Spec.Seats[0].TrainingKind = openrlv1alpha1.TrainingKindLoRA
+	if err := r.Update(context.Background(), ledger); err != nil {
+		t.Fatal(err)
+	}
+	joined, _, err := r.joinExistingClaim(context.Background(), incoming, request, fleet, "")
+	if err != nil || joined != nil {
+		t.Fatalf("stale selection joined=%v, error=%v", joined, err)
+	}
+	if got := len(getLedger(t, r, ledger.Name).Spec.Seats); got != 1 {
+		t.Fatalf("refused join changed occupancy to %d seats", got)
+	}
+}
+
+func TestLegacySeatRefreshPreservesAssignment(t *testing.T) {
+	r := newReconciler(t, append(enabledNode(), trainerWorker("resident", "model-a"))...)
+	settle(t, r, "resident")
+	w := getWorker(t, r, "resident")
+	allocateClaim(t, r, w.Status.ClaimName)
+	podVersion := getPod(t, r, "orw-resident").ResourceVersion
+	ledger := getLedger(t, r, ledgerNameFor(w.Status.ClaimName))
+	ledger.Spec.Seats[0].TrainingKind = ""
+	if err := r.Update(context.Background(), ledger); err != nil {
+		t.Fatal(err)
+	}
+	incoming := trainerWorker("incoming", "model-b")
+	assertJoinable := func(want bool) {
+		t.Helper()
+		fleet, err := r.readFleet(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := placement.SelectClaim(requestFrom(incoming), fleet) != nil; got != want {
+			t.Fatalf("legacy claim joinable=%v, want %v", got, want)
+		}
+	}
+	assertJoinable(false)
+	runReconcile(t, r, w.Name)
+	assertJoinable(true)
+	seat := getLedger(t, r, ledger.Name).Spec.Seats[0]
+	if seat.AssignmentID != w.Status.AssignmentID || getWorker(t, r, w.Name).Status.AssignmentID != w.Status.AssignmentID {
+		t.Fatal("refresh replaced the assignment")
+	}
+	if getPod(t, r, "orw-resident").ResourceVersion != podVersion {
+		t.Fatal("refresh changed the running pod")
+	}
+}
+
 // Deleting a worker frees its seat only once the pod is verifiably gone, and
 // the same reconcile then retires the empty ledger and its claim.
 func TestTeardownReclaimsTheClaimAndGroupInline(t *testing.T) {

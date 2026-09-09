@@ -20,9 +20,9 @@ import (
 // bookAttempts bounds the CAS retry loop; past it the reconcile requeues.
 const bookAttempts = 5
 
-// errBookingContended: the booking lost every CAS retry to concurrent
-// writers. Callers treat it as "no placement this pass", not a failure.
-var errBookingContended = fmt.Errorf("seat booking lost every CAS retry on the chosen ledger")
+// errBookingContended means the ledger no longer accepts this seat or the
+// booking exhausted its CAS retries. Callers retry placement on a later pass.
+var errBookingContended = fmt.Errorf("chosen ledger could not accept the seat")
 
 // ledgerNameFor derives the ClaimLedger name from the claim name; it is never
 // stored anywhere.
@@ -38,6 +38,7 @@ func newSeat(worker *openrlv1alpha1.Workload, request placement.Request) openrlv
 		WorkloadUID:  worker.UID,
 		AssignmentID: string(uuid.NewUUID()),
 		OwnerID:      request.OwnerKey(),
+		TrainingKind: worker.Spec.TrainingKind,
 		HostRequest:  *resource.NewQuantity(request.HostRequestBytes, resource.BinarySI),
 	}
 }
@@ -85,18 +86,27 @@ func (r *WorkloadReconciler) ensureSeat(ctx context.Context, claimName string, s
 			return nil, nil, fmt.Errorf("read ledger %s: %w", ledgerName, err)
 		}
 
-		if existing := findSeat(&claimLedger, seat.Workload); existing != nil {
-			if existing.WorkloadUID == seat.WorkloadUID {
-				return &claimLedger, existing, nil // already booked; adopt it
+		existing := findSeat(&claimLedger, seat.Workload)
+		if existing != nil && existing.WorkloadUID == seat.WorkloadUID {
+			if existing.TrainingKind != "" || seat.TrainingKind == "" {
+				return &claimLedger, existing, nil
 			}
-			// A predecessor's seat under our name: replace it. Its pod may
-			// still be terminating, and that is tolerated by two guards: the
-			// deterministic pod name is a mutex (the successor pod cannot be
-			// created until the old one is gone), and the fresh assignment ID
-			// fences the old incarnation from ever regaining residency.
-			*existing = seat
+			// Upgrade an old seat without changing its assignment or running pod.
+			existing.TrainingKind = seat.TrainingKind
 		} else {
-			claimLedger.Spec.Seats = append(claimLedger.Spec.Seats, seat)
+			// Recheck compatibility on the consistent ledger inside the CAS loop.
+			// A stale fleet must not let an FFT worker join a resident LoRA worker,
+			// or let a recreated LoRA worker replace an FFT seat in a shared claim.
+			for _, other := range claimLedger.Spec.Seats {
+				if other.Workload != seat.Workload && (seat.TrainingKind != openrlv1alpha1.TrainingKindFFT || other.TrainingKind != openrlv1alpha1.TrainingKindFFT) {
+					return nil, nil, errBookingContended
+				}
+			}
+			if existing != nil {
+				*existing = seat
+			} else {
+				claimLedger.Spec.Seats = append(claimLedger.Spec.Seats, seat)
+			}
 		}
 
 		err = r.Update(ctx, &claimLedger)

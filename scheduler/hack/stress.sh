@@ -78,6 +78,7 @@ kind: Workload
 metadata: {name: stress-$i, namespace: $NS}
 spec:
   role: trainer
+  trainingKind: fft
   modelID: stress-$i
   ownerID: stress-$((i % 3))
   accelerator: {memory: $MEMORY}
