@@ -44,8 +44,11 @@ def parameter_count(base_model: str) -> int | None:
 
 
 # On the device: fft trainer 8 B/param (bf16 weights + grads + fp32 master),
-# frozen base 2 B/param; plus activations (trainer) or KV cache (sampler).
-DEVICE_BYTES_PER_PARAM = {("full", "trainer"): 8, ("lora", "trainer"): 2, ("full", "sampler"): 2, ("lora", "sampler"): 2}
+# frozen base 2 B/param; plus activations (trainer). A sampler holds bf16
+# weights plus a KV cache that has to grow with the model: with a flat reserve
+# an 8B sampler on an L4 had 0.23 GiB of KV left after vLLM's own overhead and
+# crash-looped, so it gets 1 B/param of KV on top of the fixed reserve.
+DEVICE_BYTES_PER_PARAM = {("full", "trainer"): 8, ("lora", "trainer"): 2, ("full", "sampler"): 3, ("lora", "sampler"): 3}
 DEVICE_RESERVE_BYTES = {"trainer": 4 * GIB, "sampler": 6 * GIB}
 # Parked in host memory: fft trainer 12 B/param + a weight copy in flight;
 # plus process overhead. Measured: 0.5B trainer 28Gi, sampler 20Gi; 7B FFT

@@ -21,6 +21,13 @@ class FootprintTest(unittest.TestCase):
     self.assertLess(footprint("Qwen/Qwen3-4B", "lora", "trainer").accelerator_bytes, 22 * GIB)
     self.assertGreater(footprint("Qwen/Qwen3-4B", "full", "trainer").accelerator_bytes, 22 * GIB)
 
+  def test_sampler_kv_cache_grows_with_the_model(self) -> None:
+    # An 8B LoRA sampler sized at 22Gi landed on an L4 with 0.23 GiB of KV
+    # cache left and crash-looped; it belongs on the 80GB tier. 4B still fits.
+    self.assertGreater(footprint("Qwen/Qwen3-8B", "lora", "sampler").accelerator_bytes, 22 * GIB)
+    self.assertGreater(footprint("Qwen/Qwen2.5-7B", "lora", "sampler").accelerator_bytes, 22 * GIB)
+    self.assertLess(footprint("Qwen/Qwen3-4B", "lora", "sampler").accelerator_bytes, 22 * GIB)
+
   def test_host_memory_matches_the_measured_points(self) -> None:
     # Qwen2.5-0.5B trial runs measured 28Gi (trainer) and 20Gi (sampler).
     trainer = footprint("Qwen/Qwen2.5-0.5B", "full", "trainer")
