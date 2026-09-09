@@ -18,6 +18,7 @@ verbatim:
 - `ghcr.io/gke-labs/open-rl/server:<tag>`
 - `ghcr.io/gke-labs/open-rl/gateway:<tag>`
 - `ghcr.io/gke-labs/open-rl/client:<tag>`
+- `ghcr.io/gke-labs/open-rl/scheduler:<tag>`
 
 Assets, attached to the GitHub Release:
 
@@ -25,9 +26,11 @@ Assets, attached to the GitHub Release:
 | --- | --- |
 | `openrl-distributed-shared.yaml` | `k8s/deploy/distributed-shared` |
 | `openrl-distributed-lustre.yaml` | `k8s/deploy/distributed-lustre` |
-| `checksums.sha256` | the two YAML files above |
+| `openrl-lora.yaml` | `k8s/deploy/lora` |
+| `openrl-fft.yaml` | `k8s/deploy/fft` |
+| `checksums.sha256` | the four YAML files above |
 
-Both bundles have their images pinned to the release tag.
+Every bundle has its images pinned to the release tag.
 
 ## Cut a release
 

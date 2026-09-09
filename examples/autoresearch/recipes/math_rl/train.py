@@ -120,6 +120,7 @@ async def run_training(args: RunConfig) -> None:
   renderer_name = config.renderer or model_info.get_recommended_renderer_name(config.model)
   builder = LimitedDatasetBuilder(dataset_builder(config, renderer_name), max_batches=None, max_eval_batches=MAX_EVAL_BATCHES)
   train_config = rl_train.Config(
+    recipe_name="math_rl",
     learning_rate=config.lr,
     dataset_builder=builder,
     model_name=config.model,

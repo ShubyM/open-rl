@@ -45,7 +45,7 @@ spec:
               key: ENABLE_GCP_TRACE
         - name: REDIS_URL
           value: "redis://redis-service:6379?max_connections=500"
-        # This cluster path assumes one base model per deployment.
+        # Default model advertised by the gateway.
         - name: BASE_MODEL
           valueFrom:
             configMapKeyRef:
@@ -57,7 +57,7 @@ spec:
         - name: SAMPLING_BACKEND
           value: "vllm"
         - name: OPEN_RL_ENABLE_FFT
-          value: "true"
+          value: "false"
         # One Workload object per worker; the scheduler picks the claim and
         # renders the pod.
         - name: OPEN_RL_WORKER_MANAGER
@@ -67,7 +67,10 @@ spec:
             fieldRef:
               fieldPath: metadata.namespace
         - name: OPEN_RL_WORKER_IMAGE
-          value: "ghcr.io/gke-labs/open-rl/server:latest"
+          valueFrom:
+            configMapKeyRef:
+              name: open-rl-images
+              key: worker
         resources:
           limits:
             memory: "2Gi"

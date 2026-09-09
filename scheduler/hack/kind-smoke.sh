@@ -76,7 +76,7 @@ elif [ -n "$LOAD_INTO" ]; then
 fi
 
 say "deploying the scheduler (smoke overlay)"
-kubectl apply -k "$scheduler/deploy/overlays/smoke"
+kubectl apply --server-side -k "$scheduler/deploy/overlays/smoke"
 if [ "$DEVICE_CLASS" != gpu.example.com ]; then
   # The overlay defaults to the fake driver; real-hardware runs override it.
   kubectl -n "$NS" set env deployment/open-rl-scheduler \

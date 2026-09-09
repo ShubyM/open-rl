@@ -67,6 +67,7 @@ def main(config: Config) -> None:
   asyncio.run(
     train(
       TrainConfig(
+        recipe_name="gsm8k_sft",
         log_path=config.log_path,
         model_name=config.base_model,
         dataset_builder=GSM8KDataset(

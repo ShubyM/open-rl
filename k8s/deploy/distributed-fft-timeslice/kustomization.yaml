@@ -11,22 +11,17 @@ kind: Kustomization
 namespace: openrl-system
 
 resources:
-  - 00-llmd-snapshot-agent.yaml
+  - ../base
+  - ../fft-runtime
   - 01-shared-pvc.yaml
-  - 02-redis.yaml
-  - 03-rbac.yaml
-  - 04-gateway.yaml
-  - 07-accel-timeslicer-daemonset.yaml
   - 10-dcgm-monitoring.yaml
-  # The placement controller: the gateway requests workers as Workload
-  # objects and this decides which claim each one lands on.
-  - ../../../scheduler/deploy/base
 
 generatorOptions:
   disableNameSuffixHash: true
 
 configMapGenerator:
   - name: open-rl-config
+    behavior: merge
     literals:
       - BASE_MODEL="Qwen/Qwen2.5-0.5B"
       - ENABLE_GCP_TRACE="1"
@@ -40,14 +35,31 @@ images:
   - name: ghcr.io/gke-labs/open-rl/gateway
     newTag: latest
 
-replacements:
-  - source:
-      kind: DaemonSet
-      name: open-rl-accel-timeslicer
-      fieldPath: spec.template.spec.containers.[name=accel-timeslicer].image
-    targets:
-      - select:
-          kind: Deployment
-          name: open-rl-gateway
-        fieldPaths:
-          - spec.template.spec.containers.[name=gateway].env.[name=OPEN_RL_WORKER_IMAGE].value
+# FFT remains an optional deployment with cooperative GPU sharing.
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-gateway
+      spec:
+        template:
+          spec:
+            containers:
+              - name: gateway
+                env:
+                  - name: OPEN_RL_ENABLE_FFT
+                    value: "true"
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-scheduler
+      spec:
+        template:
+          spec:
+            containers:
+              - name: manager
+                env:
+                  - name: OPEN_RL_PLACEMENT_STRATEGY
+                    value: binpack

@@ -1,0 +1,14 @@
+# Requires the GKE Filestore CSI driver and the standard-rwx StorageClass.
+# The volume is the size requested here. Two 8B FFT jobs filled 100Gi in
+# under half an hour, since every FFT sampler keeps a full-weight snapshot
+# of its model on this volume next to the Hugging Face cache.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-rl-shared-pvc
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: standard-rwx
+  resources:
+    requests:
+      storage: 1Ti

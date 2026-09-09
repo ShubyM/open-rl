@@ -7,13 +7,18 @@ kind: Kustomization
 # acts on Workload objects, and nothing creates those until the gateway is
 # pointed at it.
 #
-#   kubectl apply -k scheduler/deploy/base
+#   kubectl apply --server-side -k scheduler/deploy/base
 #   kubectl label node <node> openrl.io/enabled=true openrl.io/trainer=true
 #   kubectl get workloads -n openrl-system -w
+#
+# Server-side because the Workload CRD embeds a pod template schema and
+# renders to about 600 KB. Client-side apply records the whole object in
+# an annotation capped at 256 KB, so a plain apply rejects the CRD.
 namespace: openrl-system
 
 resources:
   - 00-namespace.yaml
+  - 00-serviceaccount.yaml
   - 00-workload-crd.yaml
   - 00-claimledger-crd.yaml
   - 01-scheduler.yaml

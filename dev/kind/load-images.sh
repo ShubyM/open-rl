@@ -68,7 +68,7 @@ done
 cat <<EOF
 
 Pushed. Deploy with:
-  kubectl apply -k k8s/deploy/kind-dra/
+  kubectl apply --server-side -k k8s/deploy/kind-dra/
 
 The manifests pin imagePullPolicy: Always against this registry. The tag does not
 change between iterations, so IfNotPresent would leave the kubelet sitting on the

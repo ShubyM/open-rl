@@ -224,6 +224,30 @@ def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantage
   return trainer_worker_module.Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs)
 
 
+class TestLoraTargetModules(unittest.TestCase):
+  def test_targets_survive_peft_wrapping(self) -> None:
+    # The first adapter wraps the targeted Linears (PEFT moves each under
+    # base_layer). A second job with a different config must still resolve
+    # them, or the shared LoRA runtime refuses every job after the first.
+    LoraConfig = lora_trainer_worker_module.LoraConfig
+    block = torch.nn.Module()
+    block.q_proj = torch.nn.Linear(4, 4)
+    block.gate_proj = torch.nn.Linear(4, 4)
+    model = torch.nn.Module()
+    model.layer = block
+    worker = LoraTrainingWorker()
+    worker.base_model = model
+
+    attn_only = LoraConfig(train_attn=True, train_mlp=False, train_unembed=False)
+    self.assertEqual(worker.target_lora_modules(attn_only), ["layer.q_proj"])
+
+    wrapped = torch.nn.Module()
+    wrapped.base_layer = block.q_proj
+    block.q_proj = wrapped
+    attn_and_mlp = LoraConfig(train_attn=True, train_mlp=True, train_unembed=False)
+    self.assertEqual(worker.target_lora_modules(attn_and_mlp), ["layer.q_proj", "layer.gate_proj"])
+
+
 class TestTrainerOptimizerCorrectness(unittest.TestCase):
   def test_lora_create_model_loads_base_then_creates_adapter(self) -> None:
     worker = LoraTrainingWorker()

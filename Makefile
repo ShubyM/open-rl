@@ -220,7 +220,7 @@ kind-gateway:
 
 kind-deploy:
 	./dev/kind/load-images.sh
-	kubectl apply -k k8s/deploy/kind-dra/
+	kubectl apply --server-side -k k8s/deploy/kind-dra/
 
 kind-client:
 	./dev/kind/load-images.sh client
@@ -256,7 +256,7 @@ deploy:
 # to one physical GPU allocation via a shared DRA ResourceClaim.
 # See docs/setup/gke-fft-timeslice.md.
 deploy-fft-timeslice:
-	kubectl apply -k k8s/deploy/distributed-fft-timeslice/
+	kubectl apply --server-side -k k8s/deploy/distributed-fft-timeslice/
 
 rollout:
 	kubectl rollout restart deployment redis-store open-rl-gateway open-rl-trainer-worker vllm-worker
@@ -337,6 +337,8 @@ release-bundle:
 	@rm -rf $(DIST_DIR) && mkdir -p $(DIST_DIR)
 	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/distributed-shared VERSION=$(VERSION) > $(DIST_DIR)/openrl-distributed-shared.yaml
 	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/distributed-lustre VERSION=$(VERSION) > $(DIST_DIR)/openrl-distributed-lustre.yaml
+	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/lora VERSION=$(VERSION) > $(DIST_DIR)/openrl-lora.yaml
+	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/fft VERSION=$(VERSION) > $(DIST_DIR)/openrl-fft.yaml
 	@cd $(DIST_DIR) && { command -v sha256sum >/dev/null && sha256sum *.yaml || shasum -a 256 *.yaml; } > checksums.sha256
 
 # ---------------------------------------------------------------------------

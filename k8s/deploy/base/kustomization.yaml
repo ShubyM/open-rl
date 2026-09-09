@@ -1,0 +1,46 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Portable control plane. Each installation supplies open-rl-shared-pvc.
+# LoRA workers remain resident, so each process needs a dedicated GPU claim.
+namespace: openrl-system
+resources:
+  - ../../../scheduler/deploy/base
+  - rbac.yaml
+  - redis.yaml
+  - gateway.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+  - name: open-rl-config
+    literals:
+      - BASE_MODEL=Qwen/Qwen2.5-0.5B
+      - ENABLE_GCP_TRACE=0
+  - name: open-rl-images
+    literals:
+      - worker=ghcr.io/gke-labs/open-rl/server:latest
+
+# Dynamic worker images receive the same image transformations as containers.
+configurations:
+  - images.yaml
+
+patches:
+  - target:
+      kind: Deployment
+      name: open-rl-scheduler
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-scheduler
+      spec:
+        template:
+          spec:
+            containers:
+              - name: manager
+                env:
+                  # LoRA workers queue for a GPU; a deadline would fail
+                  # a queued request instead of waiting for one to free.
+                  - name: OPEN_RL_PLACEMENT_TIMEOUT
+                    value: "0"
