@@ -27,14 +27,15 @@ import tinker
 import tinker_cookbook.renderers as renderers
 from tinker_cookbook.renderers.base import Message, ParseTermination, RenderContext, RenderedMessage
 from tinker_cookbook.renderers.qwen3_5 import Qwen3_5Renderer
+from tinker_cookbook.renderers.qwen3_8 import Qwen3_8Renderer
 
 # Set on the parsed assistant Message. message_to_jsonable copies only the
 # fields it knows, so transcripts never carry the token list.
 SAMPLED_TOKENS_KEY = "sampled_tokens"
 
 
-class VerbatimHistoryQwen35Renderer(Qwen3_5Renderer):
-  """Qwen3_5Renderer whose history is what the model actually emitted."""
+class VerbatimHistoryMixin:
+  """Replay sampled assistant tokens verbatim when a turn is rendered back into history."""
 
   def parse_response(self, response: list[int]) -> tuple[Message, ParseTermination]:
     message, termination = super().parse_response(response)
@@ -55,7 +56,30 @@ class VerbatimHistoryQwen35Renderer(Qwen3_5Renderer):
     return RenderedMessage(header=header, output=[tinker.EncodedTextChunk(tokens=output)])
 
 
+class VerbatimHistoryQwen35Renderer(VerbatimHistoryMixin, Qwen3_5Renderer):
+  """Qwen3_5Renderer whose history is what the model actually emitted."""
+
+
+class VerbatimHistoryQwen38Renderer(VerbatimHistoryMixin, Qwen3_8Renderer):
+  """Qwen3_8Renderer (reasoning-effort preamble, thinking kept) with verbatim history.
+
+  Qwen3.8 shares Qwen3.5's tokens and tool format, so the re-render mismatch
+  is the same; the cookbook renderer only adds the system-prompt preamble."""
+
+  @property
+  def has_extension_property(self) -> bool:
+    # The cookbook class reports False because its canonical re-render of a
+    # non-reasoning turn is not a token-level prefix of what was sampled.
+    # Replaying the sampled tokens makes history that prefix by construction.
+    return True
+
+
 VERBATIM_RENDERER_NAME = "qwen3_5_verbatim"
+QWEN38_REASONING_EFFORTS = ("xhigh", "medium", "low")
+# Cookbook renderer names that the verbatim variants stand in for. Qwen3.8's
+# reasoning effort is part of the renderer name upstream, so it is here too.
+VERBATIM_FOR = {"qwen3_5": VERBATIM_RENDERER_NAME}
+VERBATIM_FOR.update({f"qwen3_8_{effort}_reasoning": f"qwen3_8_{effort}_verbatim" for effort in QWEN38_REASONING_EFFORTS})
 
 
 def register_verbatim_qwen35_renderer(name: str = VERBATIM_RENDERER_NAME) -> None:
@@ -67,6 +91,13 @@ def register_verbatim_qwen35_renderer(name: str = VERBATIM_RENDERER_NAME) -> Non
       tokenizer, image_processor=image_processor, strip_thinking_from_history=False
     ),
   )
+  for effort in QWEN38_REASONING_EFFORTS:
+    renderers.register_renderer(
+      f"qwen3_8_{effort}_verbatim",
+      lambda tokenizer, image_processor=None, effort=effort: VerbatimHistoryQwen38Renderer(
+        tokenizer, image_processor=image_processor, reasoning_effort=effort
+      ),
+    )
 
 
 if __name__ == "__main__":
@@ -76,9 +107,17 @@ if __name__ == "__main__":
 
   class RendererTest(unittest.TestCase):
     def test_sampled_tokens_survive_history(self):
-      tokenizer = get_tokenizer("Qwen/Qwen3.5-9B")
-      renderer = VerbatimHistoryQwen35Renderer(tokenizer, strip_thinking_from_history=False)
-      stock = Qwen3_5Renderer(tokenizer, strip_thinking_from_history=False)
+      for model, verbatim, stock_cls in (
+        ("Qwen/Qwen3.5-9B", VerbatimHistoryQwen35Renderer, Qwen3_5Renderer),
+        ("Qwen/Qwen3.8-27B", VerbatimHistoryQwen38Renderer, Qwen3_8Renderer),
+      ):
+        with self.subTest(model=model):
+          self.check_family(get_tokenizer(model), verbatim, stock_cls)
+
+    def check_family(self, tokenizer, verbatim, stock_cls):
+      renderer = verbatim(tokenizer, strip_thinking_from_history=False)
+      stock = stock_cls(tokenizer, strip_thinking_from_history=False)
+      self.assertTrue(renderer.has_extension_property)
       messages = [{"role": "user", "content": "List the files."}]
       self.assertEqual(renderer.build_generation_prompt(messages).to_ints(), stock.build_generation_prompt(messages).to_ints())
 

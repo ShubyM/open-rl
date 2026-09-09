@@ -28,7 +28,7 @@ class RunConfig:
   max_trajectory_tokens: int = 128 * 1024
   max_tool_result_tokens: int = 8 * 1024
   command_timeout: int = 60
-  judge_model: str = "gemini-3.5-flash"
+  judge_model: str = "gpt-glm-5.2"  # OpenAI-compatible GLM endpoint via OPENAI_BASE_URL / OPENAI_API_KEY.
   judge_parallel: int = 0  # Auto: 16 for GLM, 1 otherwise.
 
   learning_rate: float = 3e-6
@@ -42,6 +42,7 @@ class RunConfig:
   kl_discount_factor: float = 0.0
   # Warm-start weights with a fresh optimizer and batch counter; not a resume.
   load_checkpoint_path: str | None = None
+  log_groups: int = 0  # Trajectory groups printed to the console per step; 0 keeps the console to steps and metrics.
 
   @property
   def resolved_renderer(self) -> str:

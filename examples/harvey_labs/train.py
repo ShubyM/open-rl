@@ -36,7 +36,7 @@ def build_train_config(config: RunConfig, sandbox_factory: SandboxFactory = podm
     eval_every=config.eval_every,
     save_every=config.save_every,
     max_steps=config.max_steps,
-    num_groups_to_log=1,
+    num_groups_to_log=config.log_groups,
     load_checkpoint_path=config.load_checkpoint_path,
     num_substeps=config.num_substeps,
     kl_penalty_coef=config.kl_penalty_coef,
@@ -79,6 +79,10 @@ async def run_final_eval(config: rl_train.Config) -> None:
 
 
 async def run(config: RunConfig, *, sandbox_factory: SandboxFactory = podman_sandbox_factory) -> None:
+  if config.log_groups == 0:
+    # The cookbook prints up to two trajectory groups per step regardless of
+    # num_groups_to_log; a group is a whole multi-turn transcript.
+    rl_train.print_group = lambda traj_group, tokenizer: None
   preflight_grading(config.lab_root)
   project = os.path.relpath(Path(__file__).resolve().parents[1])
   project_arg = "" if project == "." else f" --project {shlex.quote(project)}"
