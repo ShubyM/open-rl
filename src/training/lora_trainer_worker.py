@@ -91,9 +91,13 @@ class LoraTrainingWorker(BaseTrainerWorker):
     if not target_suffixes:
       raise ValueError("No trainable LoRA targets remain (train_unembed is ignored on tied-embeddings models; enable train_attn or train_mlp)")
 
+    # Once an adapter exists, PEFT has wrapped the targeted layers and the
+    # Linear sits under base_layer; a later config must still find it.
     target_names = set(target_suffixes)
     target_modules = [
-      name for name, module in self.base_model.named_modules() if name.rsplit(".", 1)[-1] in target_names and isinstance(module, torch.nn.Linear)
+      name
+      for name, module in self.base_model.named_modules()
+      if name.rsplit(".", 1)[-1] in target_names and isinstance(getattr(module, "base_layer", module), torch.nn.Linear)
     ]
     if not target_modules:
       raise ValueError(f"No supported LoRA target modules found for suffixes: {target_suffixes}")
