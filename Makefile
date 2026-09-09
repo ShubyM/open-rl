@@ -337,6 +337,8 @@ release-bundle:
 	@rm -rf $(DIST_DIR) && mkdir -p $(DIST_DIR)
 	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/distributed-shared VERSION=$(VERSION) > $(DIST_DIR)/openrl-distributed-shared.yaml
 	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/distributed-lustre VERSION=$(VERSION) > $(DIST_DIR)/openrl-distributed-lustre.yaml
+	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/lora VERSION=$(VERSION) > $(DIST_DIR)/openrl-lora.yaml
+	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/fft VERSION=$(VERSION) > $(DIST_DIR)/openrl-fft.yaml
 	@cd $(DIST_DIR) && { command -v sha256sum >/dev/null && sha256sum *.yaml || shasum -a 256 *.yaml; } > checksums.sha256
 
 # ---------------------------------------------------------------------------
