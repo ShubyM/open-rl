@@ -109,6 +109,8 @@ kind: Workload
 metadata: {name: smoke-$i, namespace: $NS}
 spec:
   role: trainer
+  trainingKind: fft
+  exclusive: false
   modelID: smoke-$i
   ownerID: smoke
   accelerator: {memory: $MEMORY}

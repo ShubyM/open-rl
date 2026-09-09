@@ -27,6 +27,10 @@ type Seat struct {
 	// Copied from the workload's spec.ownerID.
 	OwnerID string `json:"ownerID,omitempty"`
 
+	// Exclusive is copied from the workload. A claim holding an exclusive
+	// seat admits no other, and an exclusive worker joins no claim.
+	Exclusive bool `json:"exclusive,omitempty"`
+
 	// HostRequest is the pod's host memory request. Copied here so
 	// placement can add up a node's load without reading every workload.
 	HostRequest resource.Quantity `json:"hostRequest,omitempty"`

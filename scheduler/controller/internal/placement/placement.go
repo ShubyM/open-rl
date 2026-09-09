@@ -19,8 +19,8 @@ const GiB int64 = 1 << 30
 
 // Strategy orders the two placement moves. BinPack seats a worker on an
 // existing ledger first and cuts a claim only when none can hold it; Spread
-// cuts a dedicated claim first and shares when the cluster says no. The
-// zero value reads as binpack.
+// cuts a dedicated claim first and shares when the cluster says no.
+// The zero value reads as binpack.
 type Strategy string
 
 const (
@@ -35,7 +35,7 @@ func ParseStrategy(name string) (Strategy, error) {
 	case "", StrategyBinPack:
 		return StrategyBinPack, nil
 	case StrategySpread:
-		return StrategySpread, nil
+		return Strategy(name), nil
 	}
 	return "", fmt.Errorf("unknown placement strategy %q: want %q or %q", name, StrategySpread, StrategyBinPack)
 }
@@ -79,11 +79,11 @@ func (n *Node) Describe() string {
 type booking struct {
 	owner     string
 	hostBytes int64
+	shareable bool
 }
 
 // Claim is a ResourceClaim, plus what is already sitting on it. Claims are
-// not partitioned by role or workload type: anything the node accepts may
-// join and take turns.
+// shareable only when every seated worker can suspend between GPU turns.
 type Claim struct {
 	Name string
 	// DeviceCount is how many devices DRA allocated, 0 until it has.
@@ -102,11 +102,25 @@ func (c *Claim) Allocated() bool { return c.Node != "" }
 func (c *Claim) Workers() int { return len(c.booked) }
 
 // Book accepts a placement: one more assigned worker and its footprint.
-func (c *Claim) Book(workerID, owner string, hostBytes int64) {
+func (c *Claim) Book(workerID, owner string, hostBytes int64, shareable bool) {
 	if c.booked == nil {
 		c.booked = map[string]booking{}
 	}
-	c.booked[workerID] = booking{owner: owner, hostBytes: hostBytes}
+	c.booked[workerID] = booking{owner: owner, hostBytes: hostBytes, shareable: shareable}
+}
+
+// Shareable requires every existing worker to participate in time slicing.
+// An empty snapshot is not shareable.
+func (c *Claim) Shareable() bool {
+	if len(c.booked) == 0 {
+		return false
+	}
+	for _, b := range c.booked {
+		if !b.shareable {
+			return false
+		}
+	}
+	return true
 }
 
 // Release gives back a worker's seat and the memory that came with it.
@@ -158,6 +172,8 @@ func (f *Fleet) NodeHostBytes(node *Node) int64 {
 
 // Request is one worker's needs, parsed out of its spec once.
 type Request struct {
+	// Shareable means the worker can suspend between GPU turns.
+	Shareable bool
 	// Role selects node pools and nothing else; it does not partition claims.
 	Role string
 	// Memory is the total accelerator memory the worker needs, across however
@@ -242,6 +258,9 @@ func candidateNodes(req Request, fleet *Fleet) map[string]int {
 // then fewest workers, then name. Advisory -- the ledger's CAS booking is what
 // makes it stick.
 func SelectClaim(req Request, fleet *Fleet) *Claim {
+	if !req.Shareable {
+		return nil
+	}
 	// One pass over the fleet up front: summing bookings per candidate would
 	// rescan every claim for every claim, and SelectClaim runs on every
 	// reconcile of an unplaced worker under BinPack.
@@ -258,7 +277,7 @@ func SelectClaim(req Request, fleet *Fleet) *Claim {
 	var best *Claim
 	for _, claim := range fleet.Claims {
 		node := fleet.Nodes[claim.Node]
-		if !claim.Allocated() || node == nil || !node.Accepts(req.Role) {
+		if !claim.Shareable() || !claim.Allocated() || node == nil || !node.Accepts(req.Role) {
 			continue
 		}
 		if claim.DeviceCount != 1 || req.DevicesOn(node) != 1 {

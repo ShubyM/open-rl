@@ -113,10 +113,11 @@ func worker(name, modelID string, role openrlv1alpha1.WorkerRole, memory string)
 			CreationTimestamp: metav1.Now(),
 		},
 		Spec: openrlv1alpha1.WorkloadSpec{
-			Role:        role,
-			ModelID:     modelID,
-			Accelerator: openrlv1alpha1.AcceleratorSpec{Memory: resource.MustParse(memory)},
-			Template:    testPodTemplate(),
+			Role:         role,
+			TrainingKind: openrlv1alpha1.TrainingKindFFT,
+			ModelID:      modelID,
+			Accelerator:  openrlv1alpha1.AcceleratorSpec{Memory: resource.MustParse(memory)},
+			Template:     testPodTemplate(),
 		},
 	}
 }
@@ -576,9 +577,85 @@ func TestReconcileSpreadsThenSharesUnderContention(t *testing.T) {
 	}
 }
 
-// Under the binpack strategy the order flips: a worker seats on an eligible
-// allocated claim before cutting one at all, even while a device sits free.
-// Only a worker the node's host memory refuses gets a claim of its own.
+// Always-resident LoRA processes cannot fall back to a shared GPU, even when
+// the trainer and sampler belong to the same base-model runtime.
+func TestLoRAKeepsTrainerAndSamplerSeparateUnderContention(t *testing.T) {
+	trainer := trainerWorker("trainer", "base-model")
+	sampler := worker("sampler", "base-model", openrlv1alpha1.RoleSampler, "24Gi")
+	trainer.Spec.OwnerID, sampler.Spec.OwnerID = "base-model", "base-model"
+	trainer.Spec.TrainingKind, sampler.Spec.TrainingKind = openrlv1alpha1.TrainingKindLoRA, openrlv1alpha1.TrainingKindLoRA
+	trainer.Spec.Exclusive, sampler.Spec.Exclusive = true, true
+	r := newReconciler(t, append(enabledNode(), trainer, sampler)...)
+	r.PlacementStrategy = placement.StrategyBinPack
+
+	settle(t, r, "trainer")
+	trainerClaim := claimOf(t, r, "trainer")
+	allocateClaim(t, r, trainerClaim)
+	settle(t, r, "sampler")
+	samplerClaim := claimOf(t, r, "sampler")
+	if samplerClaim == trainerClaim {
+		t.Fatal("LoRA sampler shared the trainer's claim")
+	}
+
+	// A real kube-scheduler refusal must leave the sampler waiting for its
+	// own allocation. Repeated reconciles must not join the available ledger.
+	markUnschedulable(t, r, "sampler", time.Now())
+	for range 3 {
+		runReconcile(t, r, "sampler")
+	}
+	if got := claimOf(t, r, "sampler"); got != samplerClaim {
+		t.Fatalf("waiting sampler moved to claim %q, want %q", got, samplerClaim)
+	}
+	if got := getWorker(t, r, "sampler").Status.Phase; got != openrlv1alpha1.PhasePending {
+		t.Fatalf("unallocated sampler phase %q, want Pending", got)
+	}
+
+	// Once capacity arrives, the original claim is used. A controller restart
+	// must preserve both independent assignments.
+	allocateClaim(t, r, samplerClaim)
+	runReconcile(t, r, "sampler")
+	restarted := newReconciler(t)
+	restarted.Client = r.Client
+	restarted.PlacementStrategy = placement.StrategyBinPack
+	settle(t, restarted, "trainer", "sampler")
+	if claimOf(t, restarted, "trainer") != trainerClaim || claimOf(t, restarted, "sampler") != samplerClaim {
+		t.Fatal("LoRA assignments changed after restart")
+	}
+}
+
+// Both initial packing and the capacity fallback require every seat to be
+// non-exclusive, whichever side arrives first.
+func TestSharingRequiresBothSidesNonExclusive(t *testing.T) {
+	for _, strategy := range []placement.Strategy{placement.StrategyBinPack, placement.StrategySpread} {
+		for _, residentExclusive := range []bool{false, true} {
+			for _, incomingExclusive := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/exclusive=%v-then-%v", strategy, residentExclusive, incomingExclusive), func(t *testing.T) {
+					resident, incoming := trainerWorker("resident", "model-a"), trainerWorker("incoming", "model-b")
+					resident.Spec.Exclusive, incoming.Spec.Exclusive = residentExclusive, incomingExclusive
+					r := newReconciler(t, append(enabledNode(), resident, incoming)...)
+					r.PlacementStrategy = strategy
+					settle(t, r, resident.Name)
+					claim := claimOf(t, r, resident.Name)
+					allocateClaim(t, r, claim)
+					settle(t, r, incoming.Name)
+					canShare := !residentExclusive && !incomingExclusive
+					if got := claimOf(t, r, incoming.Name) == claim; got != (canShare && strategy == placement.StrategyBinPack) {
+						t.Fatalf("initial placement shared=%v", got)
+					}
+					if claimOf(t, r, incoming.Name) != claim {
+						fallBackToSharing(t, r, incoming.Name)
+					}
+					if got := claimOf(t, r, incoming.Name) == claim; got != canShare {
+						t.Fatalf("after capacity refusal shared=%v, want %v", got, canShare)
+					}
+				})
+			}
+		}
+	}
+}
+
+// Eligible FFT workers pack even while a device sits free. Host memory still
+// limits sharing, so a worker that cannot fit gets its own claim.
 func TestReconcileBinPacksOntoExistingClaims(t *testing.T) {
 	// 128Gi each on a 340Gi node: two park together, a third does not.
 	r := newReconciler(t, append(enabledNode(),

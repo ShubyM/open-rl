@@ -67,14 +67,14 @@ func (c *cluster) arrive(req Request) string {
 				continue
 			}
 			claim := &Claim{Name: "claim-" + req.WorkerID, DeviceCount: tier.Count, Node: node.Name}
-			claim.Book(req.WorkerID, req.OwnerKey(), req.HostRequestBytes)
+			claim.Book(req.WorkerID, req.OwnerKey(), req.HostRequestBytes, req.Shareable)
 			c.fleet.Claims[claim.Name] = claim
 			c.placed[req.WorkerID] = claim
 			return claim.Name
 		}
 	}
 	if join := SelectClaim(req, c.fleet); join != nil {
-		join.Book(req.WorkerID, req.OwnerKey(), req.HostRequestBytes)
+		join.Book(req.WorkerID, req.OwnerKey(), req.HostRequestBytes, req.Shareable)
 		c.placed[req.WorkerID] = join
 		return join.Name
 	}
@@ -169,7 +169,7 @@ func TestWorkersShareAClaimWhetherOrNotTheirSumFits(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := newCluster(t, gpu80("gpu", "trainer", "sampler"))
 			first := c.arrive(trainer("trainer", pair[0]))
-			second := c.arrive(Request{Role: "sampler", WorkerID: "sampler", Memory: gib(pair[1])})
+			second := c.arrive(Request{Shareable: true, Role: "sampler", WorkerID: "sampler", Memory: gib(pair[1])})
 			if first == "" || first != second {
 				t.Fatalf("placed on %q and %q, want one shared claim", first, second)
 			}
@@ -199,7 +199,7 @@ func TestAFullNodeMakesTheNextWorkerWaitForHostMemory(t *testing.T) {
 func TestRoleLabelsHideFreeHardware(t *testing.T) {
 	c := newCluster(t, gpu80("trainer-only", "trainer"))
 
-	sampler := Request{Role: "sampler", WorkerID: "sampler", Memory: gib(10)}
+	sampler := Request{Shareable: true, Role: "sampler", WorkerID: "sampler", Memory: gib(10)}
 	if got := c.arrive(sampler); got != "" {
 		t.Fatalf("sampler landed on %q, but the operator allowed no sampler nodes", got)
 	}

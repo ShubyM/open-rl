@@ -95,6 +95,14 @@ spec:
                 required:
                 - memory
                 type: object
+              exclusive:
+                default: true
+                description: |-
+                  Exclusive keeps this worker alone on its GPU. Two workers share a
+                  claim only when neither is exclusive. The gateway sets it from the
+                  training kind, true for LoRA workers because they cannot suspend
+                  between turns. Omitted means exclusive.
+                type: boolean
               modelID:
                 description: |-
                   ModelID names the model this worker serves: configuration for the
@@ -8610,7 +8618,7 @@ spec:
               trainingKind:
                 description: |-
                   TrainingKind records whether this runtime is full fine-tuning or LoRA.
-                  Informational: reuse was already decided in the workload's name.
+                  Placement does not read it.
                 enum:
                 - fft
                 - lora
@@ -8631,7 +8639,9 @@ spec:
             - message: placement fields are immutable; delete and recreate the workload
               rule: self.role == oldSelf.role && self.modelID == oldSelf.modelID &&
                 has(self.ownerID) == has(oldSelf.ownerID) && (!has(self.ownerID) ||
-                self.ownerID == oldSelf.ownerID) && self.accelerator == oldSelf.accelerator
+                self.ownerID == oldSelf.ownerID) && has(self.trainingKind) == has(oldSelf.trainingKind)
+                && (!has(self.trainingKind) || self.trainingKind == oldSelf.trainingKind)
+                && self.exclusive == oldSelf.exclusive && self.accelerator == oldSelf.accelerator
           status:
             description: WorkloadStatus is what the controller decided and what came
               of it.

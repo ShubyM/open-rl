@@ -42,6 +42,13 @@ flowchart TD
     G --> H["node-local time-slicing"]
 ```
 
+Sharing is allowed only between workers whose `spec.exclusive` is false.
+The gateway sets it from the training kind: false for FFT workers, which
+suspend between turns, true for LoRA workers, which stay resident. An
+omitted field is exclusive. Each ledger seat records the flag; selection
+checks every occupant and booking repeats that check inside the ledger CAS
+loop.
+
 A new worker can be placed by exactly two moves: cut a dedicated claim of
 its own, or book a seat on an existing allocated `ClaimLedger` and share. A
 flag specifies the strategy. Under `spread`, the worker asks
@@ -285,6 +292,7 @@ metadata:
 spec:
   role: trainer
   trainingKind: fft
+  exclusive: false
   modelID: job-123
   ownerID: job-123
 
@@ -619,9 +627,8 @@ that goes wrong is unwound.
 *Dedicated* means the claim is requested for one workload alone. Its
 ClaimLedger starts with a single seat. If the claim allocates, the worker has
 the whole GPU and no time-slicing occurs. Dedicated is a state, not a kind
-of claim: every claim starts dedicated, and the ledger becomes shared if a
-workload that could not get its own GPU books a seat on it. Nothing
-guarantees the GPU stays exclusive. The workload only starts alone on it.
+of claim: every claim starts dedicated. An FFT ledger may become shared when
+another FFT worker books a seat on it. LoRA claims remain exclusive.
 
 A workload without an assignment first receives a dedicated placement attempt:
 
@@ -777,8 +784,7 @@ the dedicated-first arc described above.
 
 * **Claim-affinity first (`binpack`):** book a seat on an eligible ledger
   before cutting a claim at all; only a workload no ledger can seat cuts a
-  dedicated claim. Simpler to reason about and consistent between FFT and
-  LoRA, at the cost of leaving GPUs idle on a fixed fleet. Eligibility and
+  dedicated claim. FFT can share; LoRA always cuts its own claim. Eligibility and
   preference are the shared-ledger rules below, unchanged; a booking that
   loses the last seat to a race falls through to a dedicated claim.
 
@@ -1152,7 +1158,8 @@ mechanism.
 | Two compatible LoRA jobs                | One trainer workload and one sampler workload; the second request receives `AlreadyExists`. |
 | Two FFT jobs                            | Separate trainer and sampler workloads for each job.                                        |
 | Two free GPUs                           | Dedicated claims allocate independently.                                                    |
-| One GPU and two workers                 | One dedicated claim allocates; the other worker joins that ledger on the unschedulable verdict. |
+| One GPU and two FFT workers (`spread`)   | One dedicated claim allocates; the other worker joins that ledger on the unschedulable verdict. |
+| One GPU and two LoRA workers             | One claim allocates; the other worker waits for a free GPU. |
 | Co-located trainer and sampler (one node, one GPU) | The trainer allocates the GPU; the sampler's own claim goes unschedulable and it seats on the trainer's ledger; the two take turns, one fairness owner. |
 | Two concurrent joins                    | One ClaimLedger update succeeds; the other conflicts and retries.                            |
 | Same workload booked into two ledgers    | Only one workload-assignment update succeeds; the losing provisional seat is removed.       |

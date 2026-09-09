@@ -23,7 +23,25 @@ MODEL_TO_PARAM_COUNT: dict[str, int] = {
   "gemma-4-e2b": 5_440_000_000,
   "gemma-4-e4b": 8_000_000_000,
 }
-UNKNOWN_MODEL_PARAMS = 8_000_000_000  # unknown models are sized large, not small
+# bf16 KV cache per token: 2 * full-attention layers * kv heads * head dim * 2
+# bytes, from each model's config.json. Sliding-window and linear-attention
+# layers hold a fixed per-sequence state instead and are left out. Checked
+# against vLLM's "GPU KV cache size" for qwen3-0.6b and qwen3-8b.
+MODEL_TO_KV_BYTES_PER_TOKEN: dict[str, int] = {
+  "qwen2.5-0.5b": 12_288,  # 24 layers, 2 kv heads, head dim 64
+  "qwen3-0.6b": 114_688,  # 28 layers, 8 kv heads, head dim 128
+  "qwen2.5-1.5b": 28_672,  # 28 layers, 2 kv heads, head dim 128
+  "qwen3-1.7b": 114_688,  # 28 layers, 8 kv heads, head dim 128
+  "qwen3-4b": 147_456,  # 36 layers, 8 kv heads, head dim 128
+  "qwen2.5-7b": 57_344,  # 28 layers, 4 kv heads, head dim 128
+  "qwen3-8b": 147_456,  # 36 layers, 8 kv heads, head dim 128
+  "qwen3.5-9b": 32_768,  # 8 of 32 layers are full attention, 4 kv heads, head dim 256
+  "qwen3.5-27b": 65_536,  # 16 of 64 layers are full attention, 4 kv heads, head dim 256
+  "gemma-3-1b": 4_096,  # 4 of 26 layers are global, 1 kv head, head dim 256
+  "gemma-4-e2b": 7_168,  # 7 of 35 layers are full attention, 1 kv head, head dim 256
+  "gemma-4-e4b": 14_336,  # 7 of 42 layers are full attention, 2 kv heads, head dim 256
+}
+UNKNOWN_MODEL = "qwen3-8b"  # unknown models are sized large, not small
 VARIANT_SUFFIXES = ("-instruct", "-it", "-pt", "-base", "-chat")
 
 
@@ -43,10 +61,22 @@ def parameter_count(base_model: str) -> int | None:
   return MODEL_TO_PARAM_COUNT.get(normalize_model_id(base_model))
 
 
-# On the device: fft trainer 8 B/param (bf16 weights + grads + fp32 master),
-# frozen base 2 B/param; plus activations (trainer) or KV cache (sampler).
-DEVICE_BYTES_PER_PARAM = {("full", "trainer"): 8, ("lora", "trainer"): 2, ("full", "sampler"): 2, ("lora", "sampler"): 2}
-DEVICE_RESERVE_BYTES = {"trainer": 4 * GIB, "sampler": 6 * GIB}
+# Trainer on the device: fft 8 B/param (bf16 weights + grads + fp32 master),
+# frozen base 2 B/param; plus activations.
+TRAINER_DEVICE_BYTES_PER_PARAM = {"full": 8, "lora": 2}
+TRAINER_DEVICE_RESERVE_BYTES = 4 * GIB
+# Sampler on the device: bf16 weights, vLLM's activation peak and CUDA graphs,
+# LoRA slot buffers (max_loras 8, rank 64) for a LoRA sampler, and a KV cache
+# sized for SAMPLER_KV_TOKENS. The budget is exactly what vLLM is handed, so
+# whatever the overheads do not use becomes KV cache. Overheads measured on
+# the live samplers: activation peak 0.5 GiB at 0.6B and 1.4 GiB at 8B; LoRA
+# slots 1.05 GiB at 0.6B and 2.9 GiB at 8B.
+SAMPLER_WEIGHT_BYTES_PER_PARAM = 2
+SAMPLER_OVERHEAD_BYTES = GIB // 2
+SAMPLER_OVERHEAD_BYTES_PER_PARAM = 0.125
+SAMPLER_LORA_SLOT_BYTES = GIB
+SAMPLER_LORA_SLOT_BYTES_PER_PARAM = 0.25
+SAMPLER_KV_TOKENS = 8 * 8192  # eight max-length requests in flight
 # Parked in host memory: fft trainer 12 B/param + a weight copy in flight;
 # plus process overhead. Measured: 0.5B trainer 28Gi, sampler 20Gi; 7B FFT
 # trainer OOM-killed at 110Gi.
@@ -74,12 +104,24 @@ class Footprint:
     return {"requests": {"memory": gib(self.host_request_bytes)}, "limits": {"memory": gib(self.host_limit_bytes)}}
 
 
+def sampler_device_bytes(params: int, kv_bytes_per_token: int, kind: str) -> int:
+  device = params * SAMPLER_WEIGHT_BYTES_PER_PARAM
+  device += SAMPLER_OVERHEAD_BYTES + int(params * SAMPLER_OVERHEAD_BYTES_PER_PARAM)
+  if kind == "lora":
+    device += SAMPLER_LORA_SLOT_BYTES + int(params * SAMPLER_LORA_SLOT_BYTES_PER_PARAM)
+  return device + kv_bytes_per_token * SAMPLER_KV_TOKENS
+
+
 def footprint(base_model: str, fine_tuning_type: str, role: str) -> Footprint:
-  params = parameter_count(base_model)
-  if params is None:
-    logger.warning("No known parameter count for %r; sizing it as %.0fB.", base_model, UNKNOWN_MODEL_PARAMS / 1e9)
-    params = UNKNOWN_MODEL_PARAMS
+  model = normalize_model_id(base_model)
+  if model not in MODEL_TO_PARAM_COUNT:
+    logger.warning("No known parameter count for %r; sizing it as %s.", base_model, UNKNOWN_MODEL)
+    model = UNKNOWN_MODEL
+  params = MODEL_TO_PARAM_COUNT[model]
   kind = "lora" if fine_tuning_type == "lora" else "full"
-  device = params * DEVICE_BYTES_PER_PARAM[(kind, role)] + DEVICE_RESERVE_BYTES[role]
+  if role == "trainer":
+    device = params * TRAINER_DEVICE_BYTES_PER_PARAM[kind] + TRAINER_DEVICE_RESERVE_BYTES
+  else:
+    device = sampler_device_bytes(params, MODEL_TO_KV_BYTES_PER_TOKEN[model], kind)
   host = params * HOST_BYTES_PER_PARAM[(kind, role)] + HOST_OVERHEAD_BYTES[role]
   return Footprint(device, host, int(host * HOST_LIMIT_FACTOR))

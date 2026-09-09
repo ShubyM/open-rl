@@ -122,6 +122,36 @@ func TestRebookingAdoptsTheRecordedSeat(t *testing.T) {
 	}
 }
 
+func TestSharingRechecksTheLedgerAfterSelection(t *testing.T) {
+	resident, incoming := trainerWorker("resident", "model-a"), trainerWorker("incoming", "model-b")
+	r := newReconciler(t, append(enabledNode(), resident, incoming)...)
+	settle(t, r, resident.Name)
+	claim := claimOf(t, r, resident.Name)
+	allocateClaim(t, r, claim)
+	fleet, err := r.readFleet(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := requestFrom(incoming)
+	if placement.SelectClaim(request, fleet) == nil {
+		t.Fatal("snapshot should offer the FFT claim")
+	}
+	// The current ledger now holds an exclusive worker, while the informer
+	// snapshot still offers a shareable claim. The consistent booking must refuse it.
+	ledger := getLedger(t, r, ledgerNameFor(claim))
+	ledger.Spec.Seats[0].Exclusive = true
+	if err := r.Update(context.Background(), ledger); err != nil {
+		t.Fatal(err)
+	}
+	joined, _, err := r.joinExistingClaim(context.Background(), incoming, request, fleet, "")
+	if err != nil || joined != nil {
+		t.Fatalf("stale selection joined=%v, error=%v", joined, err)
+	}
+	if got := len(getLedger(t, r, ledger.Name).Spec.Seats); got != 1 {
+		t.Fatalf("refused join changed occupancy to %d seats", got)
+	}
+}
+
 // Deleting a worker frees its seat only once the pod is verifiably gone, and
 // the same reconcile then retires the empty ledger and its claim.
 func TestTeardownReclaimsTheClaimAndGroupInline(t *testing.T) {

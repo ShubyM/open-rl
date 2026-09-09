@@ -58,6 +58,7 @@ class Worker:
   runtime: str
   base_model: str
   is_lora: bool
+  exclusive: bool
   meta: Any
   footprint: Footprint
 
@@ -73,7 +74,9 @@ class Worker:
 def describe_worker(model_id: str, role: str) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
-  return Worker(role, runtime, base_model, is_lora, meta, footprint(base_model, meta.fine_tuning_type, role))
+  # LoRA workers stay resident on the GPU, so they never share one. FFT
+  # workers suspend between turns and may.
+  return Worker(role, runtime, base_model, is_lora, is_lora, meta, footprint(base_model, meta.fine_tuning_type, role))
 
 
 def pod_env(worker: Worker) -> list[dict[str, Any]]:
@@ -137,6 +140,7 @@ def workload_body(worker: Worker) -> dict[str, Any]:
     "spec": {
       "role": worker.role,
       "trainingKind": "lora" if worker.is_lora else "fft",
+      "exclusive": worker.exclusive,
       "modelID": worker.runtime,
       "ownerID": worker.owner,
       "accelerator": {"mode": "SingleGPU", "memory": worker.footprint.accelerator},

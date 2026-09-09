@@ -79,6 +79,11 @@ spec:
                         the workload status and its pod; a pod carrying an old value is
                         refused GPU access.
                       type: string
+                    exclusive:
+                      description: |-
+                        Exclusive is copied from the workload. A claim holding an exclusive
+                        seat admits no other, and an exclusive worker joins no claim.
+                      type: boolean
                     hostRequest:
                       anyOf:
                       - type: integer
