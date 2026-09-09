@@ -136,17 +136,17 @@ require-gcp-project:
 	@test -n "$(GCP_PROJECT)" || { echo "Set GCP_PROJECT=<your-project> for private image builds/deploys"; exit 2; }
 
 build-images: require-gcp-project
-	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) -f src/server/Dockerfile .
-	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) -f src/server/Dockerfile.gateway .
-	DOCKER_BUILDKIT=1 docker build -t gcr.io/$(GCP_PROJECT)/open-rl-client:$(IMAGE_TAG) -f src/server/Dockerfile.client .
+	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG) -f src/server/Dockerfile .
+	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-gateway:$(IMAGE_TAG) -f src/server/Dockerfile.gateway .
+	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-client:$(IMAGE_TAG) -f src/server/Dockerfile.client .
 
 push-images: require-gcp-project
-	docker push gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG)
-	docker push gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG)
-	docker push gcr.io/$(GCP_PROJECT)/open-rl-client:$(IMAGE_TAG)
-	kubectl set image deployment/open-rl-gateway gateway=gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(IMAGE_TAG) 2>/dev/null || true
-	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
-	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
+	docker push $(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG)
+	docker push $(CLOUD_REGISTRY)/open-rl-gateway:$(IMAGE_TAG)
+	docker push $(CLOUD_REGISTRY)/open-rl-client:$(IMAGE_TAG)
+	kubectl set image deployment/open-rl-gateway gateway=$(CLOUD_REGISTRY)/open-rl-gateway:$(IMAGE_TAG) 2>/dev/null || true
+	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=$(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
+	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=$(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
 
 # --- Cloud Build ------------------------------------------------------------
 # Builds in GCP instead of locally: `gcloud builds submit` uploads only the
@@ -167,28 +167,34 @@ CLOUD_IMAGE_TAG ?= $(shell test -z "$$(git status --porcelain 2>/dev/null)" && e
 # time -- on every reference within a single make invocation.
 CLOUD_IMAGE_TAG := $(CLOUD_IMAGE_TAG)
 
+# Registry the cloud images are pushed to and deployed from. gcr.io is the
+# historical default; a regional Artifact Registry repo (for example
+# us-central1-docker.pkg.dev/$(GCP_PROJECT)/open-rl) is what GKE image
+# streaming requires.
+CLOUD_REGISTRY ?= gcr.io/$(GCP_PROJECT)
+
 CLOUD_BUILD = gcloud builds submit --project=$(GCP_PROJECT) --config=cloudbuild.yaml
 
 cloud-build-gateway: require-gcp-project
-	$(CLOUD_BUILD) --substitutions=_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-gateway,_DOCKERFILE=src/server/Dockerfile.gateway,_TAG=$(CLOUD_IMAGE_TAG) .
+	$(CLOUD_BUILD) --substitutions=_IMAGE=$(CLOUD_REGISTRY)/open-rl-gateway,_DOCKERFILE=src/server/Dockerfile.gateway,_TAG=$(CLOUD_IMAGE_TAG) .
 
 cloud-build-server: require-gcp-project
-	$(CLOUD_BUILD) --substitutions=_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server,_DOCKERFILE=src/server/Dockerfile,_TAG=$(CLOUD_IMAGE_TAG) .
+	$(CLOUD_BUILD) --substitutions=_IMAGE=$(CLOUD_REGISTRY)/open-rl-server,_DOCKERFILE=src/server/Dockerfile,_TAG=$(CLOUD_IMAGE_TAG) .
 
 cloud-build-client: require-gcp-project
-	$(CLOUD_BUILD) --substitutions=_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-client,_DOCKERFILE=src/server/Dockerfile.client,_TAG=$(CLOUD_IMAGE_TAG) .
+	$(CLOUD_BUILD) --substitutions=_IMAGE=$(CLOUD_REGISTRY)/open-rl-client,_DOCKERFILE=src/server/Dockerfile.client,_TAG=$(CLOUD_IMAGE_TAG) .
 
 # Point the running workloads at the freshly built tag. Split from the build
 # steps so a tag built earlier can be re-deployed with
 # `make cloud-deploy-gateway CLOUD_IMAGE_TAG=<tag>`.
 cloud-deploy-gateway: require-gcp-project
-	kubectl set image deployment/open-rl-gateway gateway=gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(CLOUD_IMAGE_TAG)
-	@echo "gateway -> gcr.io/$(GCP_PROJECT)/open-rl-gateway:$(CLOUD_IMAGE_TAG)"
+	kubectl set image deployment/open-rl-gateway gateway=$(CLOUD_REGISTRY)/open-rl-gateway:$(CLOUD_IMAGE_TAG)
+	@echo "gateway -> $(CLOUD_REGISTRY)/open-rl-gateway:$(CLOUD_IMAGE_TAG)"
 
 cloud-deploy-server: require-gcp-project
-	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=gcr.io/$(GCP_PROJECT)/open-rl-server:$(CLOUD_IMAGE_TAG) 2>/dev/null || true
-	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=gcr.io/$(GCP_PROJECT)/open-rl-server:$(CLOUD_IMAGE_TAG)
-	@echo "workers -> gcr.io/$(GCP_PROJECT)/open-rl-server:$(CLOUD_IMAGE_TAG)"
+	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=$(CLOUD_REGISTRY)/open-rl-server:$(CLOUD_IMAGE_TAG) 2>/dev/null || true
+	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=$(CLOUD_REGISTRY)/open-rl-server:$(CLOUD_IMAGE_TAG)
+	@echo "workers -> $(CLOUD_REGISTRY)/open-rl-server:$(CLOUD_IMAGE_TAG)"
 
 cloud-rollout-gateway: cloud-build-gateway cloud-deploy-gateway
 cloud-rollout-server: cloud-build-server cloud-deploy-server
