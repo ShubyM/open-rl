@@ -61,6 +61,8 @@ experiments for parameter sweeps and reward-signal improvement against a shared 
 
 ## Quick Start
 
+Deploy the [LoRA scheduler release on kind or GKE](docs/setup/lora-dra.md) using the existing render command against an NVIDIA DRA cluster. Trainer and sampler workers use separate GPUs.
+
  - Follow the [Pig Latin notebook](examples/sft/pig-latin/piglatin_sft_notebook.ipynb) or [Text-to-SQL notebook](examples/sft/text-to-sql/texttosql_sft_notebook.ipynb) to see supervised fine-tuning in action.
  - Follow the [Text-to-SQL RL recipe](examples/text-to-sql/README.md) to see reinforcement learning in action.
 

@@ -11,6 +11,7 @@ metadata:
   name: fft-job-a-trainer
 spec:
   role: trainer                # which node pools may host it
+  trainingKind: fft            # FFT may time-slice; LoRA gets exclusive GPUs
   modelID: job-a               # its identity everywhere
   ownerID: Qwen/Qwen3-0.6B     # optional: the unit of fairness it belongs to
   accelerator:
@@ -25,26 +26,22 @@ spec:
 Everything else — device, tier, claim, node — is derived and reported back in
 `status`.
 
-## The model, in one sentence
+## Placement policy
 
-**Every workload first asks DRA for its own GPU via an ordered list of tiers;
-only when the cluster says no — the pod marked Unschedulable — does it
-book a seat on an existing claim's ClaimLedger and share by turns.**
+The default `binpack` strategy shares existing claims between FFT workers,
+which participate in time slicing. LoRA workers get exclusive claims and wait
+for a free GPU. An FFT worker cannot join a LoRA claim either. Multiple LoRA
+adapters can still reuse the same worker; that happens before placement.
 
-- There is no free-capacity survey. The controller cuts a ResourceClaim whose
-  `firstAvailable` alternatives are the device shapes that fit, tightest
-  first, and kube-scheduler's allocation cycle is the mutex.
-- No timers: kube-scheduler's Unschedulable verdict is the one fallback
-  trigger. A pending claim with nowhere to fall back to stays standing as the
-  retry vehicle — and as the autoscale signal, on fleets that have one.
-- A ClaimLedger is the seat ledger for one allocated claim. Seats are booked by
-  compare-and-swap, keyed by workload UID plus a per-booking assignment ID, so
-  concurrent reconciles cannot double-book and a recreated workload cannot
-  inherit a seat it didn't book.
-- Sharing means time-slicing: several workers seated, exactly one resident in
-  accelerator memory at a time, turns rotating between owners.
-- `role` selects nodes, never claims: a trainer and a sampler share one GPU
-  by turns.
+`spread` tries a new claim first and falls back to sharing only between FFT
+workers. Both policies use the workload's existing `trainingKind`; there is no
+separate LoRA placement flag. An omitted kind also gets an exclusive claim.
+The LoRA release sets no placement timeout.
+
+DRA allocates the device from the claim's ordered alternatives. A ClaimLedger
+records each worker's seat using compare-and-swap, so concurrent reconciles
+cannot double-book. Node role labels select eligible pools; hardware capacity
+comes from ResourceSlices.
 
 ## Layout
 
@@ -80,8 +77,11 @@ real devices exercise the identical path; only the two env values differ.
 
 ## Deploy
 
+For the complete LoRA stack, use the [LoRA deployment overlays](../docs/setup/lora-dra.md).
+The standalone scheduler base includes its service account, CRDs, and RBAC:
+
 ```
-kubectl apply -k scheduler/deploy/base
+kubectl apply --server-side -k scheduler/deploy/base
 kubectl label node <node> openrl.io/enabled=true openrl.io/trainer=true
 ```
 
