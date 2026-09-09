@@ -2,15 +2,18 @@
 """Plot a LAB run from its log directory: raw per-rollout rewards, the
 smoothed per-step mean, and held-out criterion pass rate at eval steps.
 
-  python plot_run.py artifacts/harvey-labs/<run> [--out run.png]
+  uv run harvey-plot log_dir=<run-dir> out=run.png
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import random
 from pathlib import Path
+
+import chz
+
+from .results import read_results
 
 RAW_COLOR = "#86b6ef"
 SMOOTH_COLOR = "#2a78d6"
@@ -19,30 +22,11 @@ INK = "#3d3d3a"
 MUTED = "#7f7e78"
 
 
-def load_metrics(path: Path) -> list[dict]:
-  if not path.is_file():
-    return []
-  return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
-
-def rollout_rewards(log_dir: Path) -> list[tuple[int, float]]:
-  points = []
-  for summary in sorted(log_dir.glob("iterations/iteration_*/train_rollout_summaries.jsonl")):
-    step = int(summary.parent.name.split("_")[-1])
-    for line in summary.read_text().splitlines():
-      if line.strip():
-        points.append((step, json.loads(line)["total_reward"]))
-  return points
-
-
-def eval_pass_rate(row: dict) -> float | None:
-  episodes = row.get("test/env/harvey-labs/total_episodes")
-  passed = row.get("test/env/harvey-labs/lab/criteria_passed")
-  total = row.get("test/env/harvey-labs/lab/criteria_total")
-  graded_marker = row.get("test/env/harvey-labs/lab/graded")
-  if episodes and total and graded_marker is not None:
-    return (passed * episodes) / (total * episodes)
-  return row.get("test/env/harvey-labs/lab/criteria_pass_fraction")
+@chz.chz
+class PlotConfig:
+  log_dir: Path
+  out: Path | None = None
+  title: str | None = chz.field(default=None, doc="Plot title; defaults to the log directory name")
 
 
 def ema(values: list[float], alpha: float = 0.4) -> list[float]:
@@ -52,21 +36,15 @@ def ema(values: list[float], alpha: float = 0.4) -> list[float]:
   return smoothed
 
 
-def main() -> None:
-  parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("log_dir", type=Path)
-  parser.add_argument("--out", type=Path, default=None)
-  args = parser.parse_args()
-
+def plot_results(log_dir: Path, results: dict, out: Path | None = None, title: str | None = None) -> Path:
   import matplotlib
 
   matplotlib.use("Agg")
   import matplotlib.pyplot as plt
+  from matplotlib.ticker import MaxNLocator
 
-  rows = load_metrics(args.log_dir / "metrics.jsonl")
-  raw = rollout_rewards(args.log_dir)
-  train_rows = [(r["step"], r["env/harvey-labs/reward/total"]) for r in rows if "env/harvey-labs/reward/total" in r and "step" in r]
-  evals = [(r["step"], eval_pass_rate(r)) for r in rows if eval_pass_rate(r) is not None and "step" in r]
+  raw = [(row["step"], row["reward"]) for row in results["rollout_rewards"]]
+  train_rows = [(row["step"], row["reward"]) for row in results["train"]]
 
   fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
   rng = random.Random(0)
@@ -75,21 +53,37 @@ def main() -> None:
     ax.scatter(xs, [reward for _, reward in raw], s=14, color=RAW_COLOR, alpha=0.6, linewidths=0, label="rollout reward", zorder=2)
   if train_rows:
     steps = [step for step, _ in train_rows]
-    smoothed = ema([reward for _, reward in train_rows])
-    ax.plot(steps, smoothed, color=SMOOTH_COLOR, linewidth=2, label="mean reward (EMA)", zorder=3)
-    ax.annotate(f"{smoothed[-1]:.2f}", (steps[-1], smoothed[-1]), textcoords="offset points", xytext=(6, -3), color=SMOOTH_COLOR, fontsize=9)
-  if evals:
-    ex = [step for step, _ in evals]
-    ey = [rate for _, rate in evals]
-    ax.plot(ex, ey, color=EVAL_COLOR, linewidth=2, linestyle=(0, (2, 3)), zorder=3)
-    ax.scatter(ex, ey, s=64, color=EVAL_COLOR, marker="D", label="held-out criterion pass rate", zorder=4)
-    for x, y in evals:
-      ax.annotate(f"{y:.0%}", (x, y), textcoords="offset points", xytext=(0, 9), ha="center", color=EVAL_COLOR, fontsize=9)
+    rewards = [reward for _, reward in train_rows]
+    ax.plot(steps, rewards, color=SMOOTH_COLOR, linewidth=0.8, alpha=0.5, marker=".", label="batch mean reward", zorder=2)
+    ax.plot(steps, ema(rewards), color=SMOOTH_COLOR, linewidth=2, label="batch mean reward (EMA, alpha=0.4)", zorder=3)
+  for aggregation, label, color, marker in (
+    ("pooled_criteria", "eval: pooled criterion pass rate", EVAL_COLOR, "D"),
+    ("mean_episode_fraction", "eval: mean episode pass fraction (legacy)", MUTED, "s"),
+  ):
+    evals = [row for row in results["evaluations"] if row["aggregation"] == aggregation]
+    if not evals:
+      continue
+    ex = [row["step"] for row in evals]
+    ey = [row["pass_rate"] for row in evals]
+    ax.plot(ex, ey, color=color, linewidth=2, linestyle=(0, (2, 3)), marker=marker, label=label, zorder=4)
+    for row in evals:
+      phase = "final\n" if row["phase"] == "final" else "baseline\n" if row["step"] == 0 else ""
+      ax.annotate(
+        f"{phase}{row['pass_rate']:.0%}",
+        (row["step"], row["pass_rate"]),
+        textcoords="offset points",
+        xytext=(0, 9),
+        ha="center",
+        color=color,
+        fontsize=9,
+      )
 
-  ax.set_ylim(-0.15, 1.05)
-  ax.set_xlabel("step", color=INK)
+  values = [reward for _, reward in raw + train_rows] + [row["pass_rate"] for row in results["evaluations"]]
+  ax.set_ylim(min(-0.15, min(values, default=0) - 0.1), max(1.05, max(values, default=1) + 0.1))
+  ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+  ax.set_xlabel("completed training batches", color=INK)
   ax.set_ylabel("reward / pass rate", color=INK)
-  ax.set_title(args.log_dir.name, color=INK, fontsize=11, loc="left")
+  ax.set_title(title or log_dir.name, color=INK, fontsize=11, loc="left")
   ax.grid(axis="y", color=MUTED, alpha=0.25, linewidth=0.5)
   for spine in ("top", "right"):
     ax.spines[spine].set_visible(False)
@@ -98,10 +92,23 @@ def main() -> None:
   ax.tick_params(colors=MUTED, labelsize=9)
   ax.legend(loc="upper left", frameon=False, fontsize=9, labelcolor=INK)
 
-  out = args.out or args.log_dir / "run_plot.png"
+  out = out or log_dir / "run_plot.png"
   fig.tight_layout()
   fig.savefig(out)
-  print(out)
+  plt.close(fig)
+  return out
+
+
+def write_report(log_dir: Path, results: dict) -> dict:
+  """Save results.json and run_plot.png next to the run's metrics."""
+  (log_dir / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+  plot_results(log_dir, results)
+  return results
+
+
+def main() -> None:
+  args = chz.entrypoint(PlotConfig, allow_hyphens=True)
+  print(plot_results(args.log_dir, read_results(args.log_dir), args.out, args.title))
 
 
 if __name__ == "__main__":
