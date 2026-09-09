@@ -4,6 +4,7 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
+from server import gateway
 from server.estimator import footprint
 from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager
 from server.store import InMemoryStore
@@ -155,6 +156,30 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     ):
       create_worker_manager()
       manager_cls.assert_called_once()
+
+
+class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
+  async def test_lora_and_fft_sessions_launch_their_own_sampler_types(self) -> None:
+    store = InMemoryStore()
+    for model_id, kind in (("lora-a", "lora"), ("lora-b", "lora"), ("fft-a", "full")):
+      await store.set_value(f"open_rl:model_meta:{model_id}", json.dumps({"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": kind}))
+    api = _FakeCustomObjectsApi()
+    with (
+      patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}),
+      patch("server.store.get_store", return_value=store),
+      patch.object(gateway, "store", store),
+      patch.object(gateway, "get_store", return_value=store),
+      patch.object(gateway, "worker_manager", SchedulerWorkerManager(custom_api=api)),
+    ):
+      for model_id in ("lora-a", "fft-a", "lora-b"):
+        await gateway.create_sampling_session({"model_path": f"tinker://{model_id}/sampler_weights/checkpoint"})
+
+    self.assertEqual(len(api.created), 2, "LoRA sessions should reuse one sampler while FFT gets its own")
+    lora, fft = api.created
+    self.assertEqual(lora["spec"]["trainingKind"], "lora")
+    self.assertEqual(lora["spec"]["template"]["spec"]["containers"][0]["command"][-1], "server.lora_sampler")
+    self.assertEqual(fft["spec"]["trainingKind"], "fft")
+    self.assertEqual(fft["metadata"]["name"], "fft-fft-a-sampler")
 
 
 if __name__ == "__main__":

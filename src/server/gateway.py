@@ -644,7 +644,9 @@ async def create_sampling_session(req: dict):
   ready_check_id = (model_meta.get("base_model") or target_model_id) if (fine_tuning_type == "lora" and model_meta) else target_model_id
 
   if get_sampler_backend() == "vllm" and ready_check_id:
-    await ensure_sampler_launched(ready_check_id)
+    # Launch by model ID so the worker manager retains the training kind.
+    # LoRA readiness is still reported under the shared base-model runtime.
+    await ensure_sampler_launched(target_model_id)
     s = get_store()
     if hasattr(s, "redis"):
       print(f"[GATEWAY] Waiting for dynamic vLLM sampler worker to be ready for model {ready_check_id}...")
