@@ -85,7 +85,7 @@ func (r *WorkloadReconciler) readFleet(ctx context.Context) (*placement.Fleet, e
 			continue
 		}
 		for _, seat := range ledger.Spec.Seats {
-			claim.Book(seat.Workload, seat.OwnerID, seat.HostRequest.Value(), seat.TrainingKind == openrlv1alpha1.TrainingKindFFT)
+			claim.Book(seat.Workload, seat.OwnerID, seat.HostRequest.Value(), !seat.Exclusive)
 		}
 	}
 	return fleet, nil
@@ -245,7 +245,7 @@ func isHostnameKey(key string) bool {
 func requestFrom(worker *openrlv1alpha1.Workload) placement.Request {
 	spec := worker.Spec
 	return placement.Request{
-		Shareable: spec.TrainingKind == openrlv1alpha1.TrainingKindFFT,
+		Shareable: !spec.Exclusive,
 		Role:      string(spec.Role),
 		Memory:    spec.Accelerator.Memory.Value(),
 		// Raw: the spec calls the owner ID opaque, and sanitizing here would

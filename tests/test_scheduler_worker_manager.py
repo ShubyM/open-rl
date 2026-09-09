@@ -68,6 +68,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(trainer["spec"]["ownerID"], "qwen-qwen2-5-0-5b")
     self.assertEqual(trainer["spec"]["ownerID"], sampler["spec"]["ownerID"])
     self.assertEqual(trainer["spec"]["trainingKind"], "lora")
+    self.assertTrue(trainer["spec"]["exclusive"])
     self.assertEqual(trainer["spec"]["accelerator"], {"mode": "SingleGPU", "memory": footprint("Qwen/Qwen2.5-0.5B", "lora", "trainer").accelerator})
     t_container = trainer["spec"]["template"]["spec"]["containers"][0]
     s_container = sampler["spec"]["template"]["spec"]["containers"][0]
@@ -87,6 +88,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(worker["metadata"]["name"], "fft-model-a-1-trainer")
     self.assertEqual(worker["spec"]["ownerID"], "model-a-1")
     self.assertEqual(worker["spec"]["trainingKind"], "fft")
+    self.assertFalse(worker["spec"]["exclusive"])
     self.assertEqual(worker["spec"]["accelerator"]["memory"], footprint("Qwen/Qwen3-8B", "full", "trainer").accelerator)
     container = worker["spec"]["template"]["spec"]["containers"][0]
     env = {e["name"]: e.get("value") for e in container["env"]}

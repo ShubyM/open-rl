@@ -42,12 +42,12 @@ flowchart TD
     G --> H["node-local time-slicing"]
 ```
 
-Sharing is allowed only between workers whose `trainingKind` is `fft`, because
-those workers participate in suspension. LoRA and unspecified kinds receive
-exclusive claims under either strategy. Each ledger seat records its training
-kind; selection checks every occupant and booking repeats that check inside
-the ledger CAS loop. Old seats without a kind block new joins until their own
-workloads reconcile and refresh them. Existing assignments are preserved.
+Sharing is allowed only between workers whose `spec.exclusive` is false.
+The gateway sets it from the training kind: false for FFT workers, which
+suspend between turns, true for LoRA workers, which stay resident. An
+omitted field is exclusive. Each ledger seat records the flag; selection
+checks every occupant and booking repeats that check inside the ledger CAS
+loop.
 
 A new worker can be placed by exactly two moves: cut a dedicated claim of
 its own, or book a seat on an existing allocated `ClaimLedger` and share. A
@@ -292,6 +292,7 @@ metadata:
 spec:
   role: trainer
   trainingKind: fft
+  exclusive: false
   modelID: job-123
   ownerID: job-123
 

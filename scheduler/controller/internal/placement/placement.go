@@ -110,7 +110,7 @@ func (c *Claim) Book(workerID, owner string, hostBytes int64, shareable bool) {
 }
 
 // Shareable requires every existing worker to participate in time slicing.
-// An empty snapshot or a worker with unknown capability is not shareable.
+// An empty snapshot is not shareable.
 func (c *Claim) Shareable() bool {
 	if len(c.booked) == 0 {
 		return false

@@ -27,9 +27,9 @@ type Seat struct {
 	// Copied from the workload's spec.ownerID.
 	OwnerID string `json:"ownerID,omitempty"`
 
-	// TrainingKind is copied from the workload. Only FFT seats may share;
-	// a missing kind prevents new joins until the workload refreshes its seat.
-	TrainingKind TrainingKind `json:"trainingKind,omitempty"`
+	// Exclusive is copied from the workload. A claim holding an exclusive
+	// seat admits no other, and an exclusive worker joins no claim.
+	Exclusive bool `json:"exclusive,omitempty"`
 
 	// HostRequest is the pod's host memory request. Copied here so
 	// placement can add up a node's load without reading every workload.

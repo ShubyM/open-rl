@@ -38,7 +38,7 @@ func newSeat(worker *openrlv1alpha1.Workload, request placement.Request) openrlv
 		WorkloadUID:  worker.UID,
 		AssignmentID: string(uuid.NewUUID()),
 		OwnerID:      request.OwnerKey(),
-		TrainingKind: worker.Spec.TrainingKind,
+		Exclusive:    worker.Spec.Exclusive,
 		HostRequest:  *resource.NewQuantity(request.HostRequestBytes, resource.BinarySI),
 	}
 }
@@ -88,25 +88,20 @@ func (r *WorkloadReconciler) ensureSeat(ctx context.Context, claimName string, s
 
 		existing := findSeat(&claimLedger, seat.Workload)
 		if existing != nil && existing.WorkloadUID == seat.WorkloadUID {
-			if existing.TrainingKind != "" || seat.TrainingKind == "" {
-				return &claimLedger, existing, nil
+			return &claimLedger, existing, nil
+		}
+		// Recheck compatibility on the consistent ledger inside the CAS loop.
+		// A stale fleet must not let a worker join a resident exclusive worker,
+		// or let a recreated exclusive worker replace a seat in a shared claim.
+		for _, other := range claimLedger.Spec.Seats {
+			if other.Workload != seat.Workload && (seat.Exclusive || other.Exclusive) {
+				return nil, nil, errBookingContended
 			}
-			// Upgrade an old seat without changing its assignment or running pod.
-			existing.TrainingKind = seat.TrainingKind
+		}
+		if existing != nil {
+			*existing = seat
 		} else {
-			// Recheck compatibility on the consistent ledger inside the CAS loop.
-			// A stale fleet must not let an FFT worker join a resident LoRA worker,
-			// or let a recreated LoRA worker replace an FFT seat in a shared claim.
-			for _, other := range claimLedger.Spec.Seats {
-				if other.Workload != seat.Workload && (seat.TrainingKind != openrlv1alpha1.TrainingKindFFT || other.TrainingKind != openrlv1alpha1.TrainingKindFFT) {
-					return nil, nil, errBookingContended
-				}
-			}
-			if existing != nil {
-				*existing = seat
-			} else {
-				claimLedger.Spec.Seats = append(claimLedger.Spec.Seats, seat)
-			}
+			claimLedger.Spec.Seats = append(claimLedger.Spec.Seats, seat)
 		}
 
 		err = r.Update(ctx, &claimLedger)

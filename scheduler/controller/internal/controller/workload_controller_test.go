@@ -584,6 +584,7 @@ func TestLoRAKeepsTrainerAndSamplerSeparateUnderContention(t *testing.T) {
 	sampler := worker("sampler", "base-model", openrlv1alpha1.RoleSampler, "24Gi")
 	trainer.Spec.OwnerID, sampler.Spec.OwnerID = "base-model", "base-model"
 	trainer.Spec.TrainingKind, sampler.Spec.TrainingKind = openrlv1alpha1.TrainingKindLoRA, openrlv1alpha1.TrainingKindLoRA
+	trainer.Spec.Exclusive, sampler.Spec.Exclusive = true, true
 	r := newReconciler(t, append(enabledNode(), trainer, sampler)...)
 	r.PlacementStrategy = placement.StrategyBinPack
 
@@ -622,22 +623,22 @@ func TestLoRAKeepsTrainerAndSamplerSeparateUnderContention(t *testing.T) {
 	}
 }
 
-// Both initial packing and the capacity fallback require FFT on every seat,
-// regardless of which kind arrives first. Missing kinds stay exclusive.
-func TestSharingRequiresFFTOnBothSides(t *testing.T) {
+// Both initial packing and the capacity fallback require every seat to be
+// non-exclusive, whichever side arrives first.
+func TestSharingRequiresBothSidesNonExclusive(t *testing.T) {
 	for _, strategy := range []placement.Strategy{placement.StrategyBinPack, placement.StrategySpread} {
-		for _, residentKind := range []openrlv1alpha1.TrainingKind{openrlv1alpha1.TrainingKindFFT, openrlv1alpha1.TrainingKindLoRA, ""} {
-			for _, incomingKind := range []openrlv1alpha1.TrainingKind{openrlv1alpha1.TrainingKindFFT, openrlv1alpha1.TrainingKindLoRA, ""} {
-				t.Run(fmt.Sprintf("%s/%s-then-%s", strategy, residentKind, incomingKind), func(t *testing.T) {
+		for _, residentExclusive := range []bool{false, true} {
+			for _, incomingExclusive := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/exclusive=%v-then-%v", strategy, residentExclusive, incomingExclusive), func(t *testing.T) {
 					resident, incoming := trainerWorker("resident", "model-a"), trainerWorker("incoming", "model-b")
-					resident.Spec.TrainingKind, incoming.Spec.TrainingKind = residentKind, incomingKind
+					resident.Spec.Exclusive, incoming.Spec.Exclusive = residentExclusive, incomingExclusive
 					r := newReconciler(t, append(enabledNode(), resident, incoming)...)
 					r.PlacementStrategy = strategy
 					settle(t, r, resident.Name)
 					claim := claimOf(t, r, resident.Name)
 					allocateClaim(t, r, claim)
 					settle(t, r, incoming.Name)
-					canShare := residentKind == openrlv1alpha1.TrainingKindFFT && incomingKind == openrlv1alpha1.TrainingKindFFT
+					canShare := !residentExclusive && !incomingExclusive
 					if got := claimOf(t, r, incoming.Name) == claim; got != (canShare && strategy == placement.StrategyBinPack) {
 						t.Fatalf("initial placement shared=%v", got)
 					}

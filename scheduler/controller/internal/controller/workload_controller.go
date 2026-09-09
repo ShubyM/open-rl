@@ -279,8 +279,7 @@ func (r *WorkloadReconciler) ensurePlacementClaim(ctx context.Context, scope *pl
 			status.Reason = verb
 		})
 	}
-	// Adopt the recorded seat, refreshing legacy seats' training kind without
-	// replacing their assignment. This also heals a retained or pod-adopted claim.
+	// Adopt the recorded seat. This also heals a retained or pod-adopted claim.
 	_, seat, err := r.ensureSeat(ctx, scope.claimName, newSeat(worker, scope.request), true)
 	if err == errBookingContended {
 		reason := "SeatLost: the ledger is contended; the booking will be retried"

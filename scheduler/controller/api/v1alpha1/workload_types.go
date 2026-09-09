@@ -41,8 +41,8 @@ const (
 	ConditionPlaced = "Placed"
 )
 
-// TrainingKind is how the workload trains. FFT workers can time-slice a
-// GPU; LoRA workers remain resident and receive exclusive claims.
+// TrainingKind is how the workload trains. Informational; placement reads
+// Exclusive.
 // +kubebuilder:validation:Enum=fft;lora
 type TrainingKind string
 
@@ -97,8 +97,16 @@ type WorkloadSpec struct {
 	OwnerID string `json:"ownerID,omitempty"`
 
 	// TrainingKind records whether this runtime is full fine-tuning or LoRA.
-	// Only FFT can share claims; LoRA and an unspecified kind stay exclusive.
+	// Placement does not read it.
 	TrainingKind TrainingKind `json:"trainingKind,omitempty"`
+
+	// Exclusive keeps this worker alone on its GPU. Two workers share a
+	// claim only when neither is exclusive. The gateway sets it from the
+	// training kind, true for LoRA workers because they cannot suspend
+	// between turns. Omitted means exclusive.
+	// +kubebuilder:default=true
+	// +optional
+	Exclusive bool `json:"exclusive"`
 
 	// Accelerator is the estimator's requirement this workload is placed by.
 	Accelerator AcceleratorSpec `json:"accelerator"`
@@ -190,7 +198,7 @@ type Workload struct {
 	// The spec is immutable: every field either places the worker or renders
 	// its pod, and V1 does not re-place or re-render a live worker. Change by
 	// deleting and recreating.
-	// +kubebuilder:validation:XValidation:rule="self.role == oldSelf.role && self.modelID == oldSelf.modelID && has(self.ownerID) == has(oldSelf.ownerID) && (!has(self.ownerID) || self.ownerID == oldSelf.ownerID) && has(self.trainingKind) == has(oldSelf.trainingKind) && (!has(self.trainingKind) || self.trainingKind == oldSelf.trainingKind) && self.accelerator == oldSelf.accelerator",message="placement fields are immutable; delete and recreate the workload"
+	// +kubebuilder:validation:XValidation:rule="self.role == oldSelf.role && self.modelID == oldSelf.modelID && has(self.ownerID) == has(oldSelf.ownerID) && (!has(self.ownerID) || self.ownerID == oldSelf.ownerID) && has(self.trainingKind) == has(oldSelf.trainingKind) && (!has(self.trainingKind) || self.trainingKind == oldSelf.trainingKind) && self.exclusive == oldSelf.exclusive && self.accelerator == oldSelf.accelerator",message="placement fields are immutable; delete and recreate the workload"
 	Spec   WorkloadSpec   `json:"spec"`
 	Status WorkloadStatus `json:"status,omitempty"`
 }
