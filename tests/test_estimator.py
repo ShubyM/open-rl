@@ -2,7 +2,11 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from server.estimator import GIB, footprint, parameter_count
+from server.estimator import GIB, MODEL_TO_KV_BYTES_PER_TOKEN, SAMPLER_KV_TOKENS, footprint, normalize_model_id, parameter_count
+
+
+def kv_cache_bytes(model: str) -> int:
+  return MODEL_TO_KV_BYTES_PER_TOKEN[normalize_model_id(model)] * SAMPLER_KV_TOKENS
 
 
 class FootprintTest(unittest.TestCase):
@@ -21,12 +25,23 @@ class FootprintTest(unittest.TestCase):
     self.assertLess(footprint("Qwen/Qwen3-4B", "lora", "trainer").accelerator_bytes, 22 * GIB)
     self.assertGreater(footprint("Qwen/Qwen3-4B", "full", "trainer").accelerator_bytes, 22 * GIB)
 
+  def test_sampler_matches_the_live_samplers(self) -> None:
+    # vLLM on the sweep: handed 7.11 GiB, a Qwen3-0.6B LoRA sampler loaded
+    # 2.17 GiB and had 4.39 GiB of KV cache; handed 21.25 GiB, a Qwen3-8B
+    # LoRA sampler loaded 18.17 GiB and had 1.49 GiB. The model must land
+    # within 0.3 GiB of the KV cache each actually got.
+    for model, budget, kv in (("Qwen/Qwen3-0.6B", 7.11, 4.39), ("Qwen/Qwen3-8B", 21.25, 1.49)):
+      fp = footprint(model, "lora", "sampler")
+      predicted_kv = kv_cache_bytes(model) - (fp.accelerator_bytes - budget * GIB)
+      self.assertAlmostEqual(predicted_kv / GIB, kv, delta=0.3, msg=model)
+
   def test_sampler_kv_cache_grows_with_the_model(self) -> None:
     # An 8B LoRA sampler sized at 22Gi landed on an L4 with 0.23 GiB of KV
-    # cache left and crash-looped; it belongs on the 80GB tier. 4B still fits.
+    # cache left and crash-looped; it belongs on the 80GB tier. 4B still fits,
+    # and a 27B sampler still fits one 80GB device.
     self.assertGreater(footprint("Qwen/Qwen3-8B", "lora", "sampler").accelerator_bytes, 22 * GIB)
-    self.assertGreater(footprint("Qwen/Qwen2.5-7B", "lora", "sampler").accelerator_bytes, 22 * GIB)
     self.assertLess(footprint("Qwen/Qwen3-4B", "lora", "sampler").accelerator_bytes, 22 * GIB)
+    self.assertLess(footprint("Qwen/Qwen3.5-27B", "lora", "sampler").accelerator_bytes, 79 * GIB)
 
   def test_host_memory_matches_the_measured_points(self) -> None:
     # Qwen2.5-0.5B trial runs measured 28Gi (trainer) and 20Gi (sampler).
@@ -55,8 +70,7 @@ class FootprintTest(unittest.TestCase):
   def test_unknown_models_are_sized_large(self) -> None:
     with self.assertLogs("server.estimator", level="WARNING"):
       unknown = footprint("meta-llama/Llama-3-70B", "lora", "sampler")
-    # gemma-4-e4b holds exactly UNKNOWN_MODEL_PARAMS raw weights.
-    self.assertEqual(unknown, footprint("google/gemma-4-e4b", "lora", "sampler"))
+    self.assertEqual(unknown, footprint("Qwen/Qwen3-8B", "lora", "sampler"))
 
   def test_restored_models_are_sized_as_full_fine_tunes(self) -> None:
     self.assertEqual(footprint("Qwen/Qwen3-4B", "restored", "trainer"), footprint("Qwen/Qwen3-4B", "full", "trainer"))
