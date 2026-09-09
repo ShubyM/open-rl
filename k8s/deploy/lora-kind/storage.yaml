@@ -1,0 +1,11 @@
+# All pods share one kind node; this volume is not suitable for multiple nodes.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-rl-shared-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 100Gi

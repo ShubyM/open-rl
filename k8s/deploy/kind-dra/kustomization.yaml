@@ -141,6 +141,7 @@ patches:
                   # the gateway renders, out of reach of any image transformer,
                   # so this var is what decides the image every worker runs.
                   - name: OPEN_RL_WORKER_IMAGE
+                    valueFrom: null
                     value: localhost:5001/open-rl-server:kind-dev
                   # The gateway also stamps the pull policy into each Workload.
                   - name: OPEN_RL_WORKER_IMAGE_PULL_POLICY

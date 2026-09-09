@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: openrl-system
+resources:
+  - ../lora
+  - ../fft-runtime
+
+# Enabling FFT also keeps LoRA available. Placement separates resident LoRA
+# workers from the FFT workers that cooperate with the time-slicer.
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: open-rl-gateway
+      spec:
+        template:
+          spec:
+            containers:
+              - name: gateway
+                env:
+                  - name: OPEN_RL_ENABLE_FFT
+                    value: "true"

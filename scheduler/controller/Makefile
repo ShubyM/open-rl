@@ -96,7 +96,7 @@ docker-push:
 
 .PHONY: deploy
 deploy:
-	kubectl apply -k ../deploy/base
+	kubectl apply --server-side -k ../deploy/base
 
 .PHONY: clean
 clean:

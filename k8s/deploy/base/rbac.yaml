@@ -1,10 +1,5 @@
 # The gateway requests one Workload per worker process; the scheduler owns the
 # pods and claims from there, so this account needs only the Workload verbs.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: open-rl-sa
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
