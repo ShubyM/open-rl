@@ -1,125 +1,126 @@
 # Harvey LAB RL
 
-Live-rollout RL on Harvey's Legal Agent Benchmark: the model works real LAB
-tasks in a podman sandbox (documents, shell, file tools), a judge grades the
-rubric, and the pass fraction is the reward. Training reuses tinker-cookbook's
-GRPO loop and multi-turn tool environment.
-
-## Results
-
-Run 9 (Qwen3.5-9B LoRA, 20 steps, batch 8×6 rollouts, GLM judge): held-out
-criterion pass rate 48.7% → **67.6%** (peak, step 15), 65.1% at the final
-checkpoint — 3,151 pooled rubric criteria over the 50-task eval split.
-
-![run 9 training curve](assets/run9.png)
-
-## Layout
-
-- `train.py` — run config and entrypoint (grading preflight, final eval).
-- `tasks.py` — task discovery and the seeded train/eval split.
-- `eval_checkpoint.py` — evaluate any saved adapter checkpoint.
-- `prompts.py` — system prompt, skills, output-path contract.
-- `env.py` — sandbox env construction and dataset builders.
-- `reward.py` — rubric reward wrapper around LAB's judge.
-- `tools.py` — LAB `ToolExecutor` adapter.
-- `gemma4_renderer.py` — Gemma 4 tool-call renderer (Qwen uses stock `qwen3_5`).
-- `plot_run.py` — plot a run's rewards and pass rate.
-- `score_lab_run.py` — grading shim executed inside the LAB venv.
+Train on Harvey's Legal Agent Benchmark using tinker-cookbook's GRPO loop.
+The model completes tasks in a sandbox; LAB's judge scores the deliverables
+against the full rubric. The default model is `Qwen/Qwen3.5-9B`.
 
 ## Setup
 
-On a bare Ubuntu GPU VM:
+Start an Open-RL gateway, then install the client and LAB environment:
 
 ```bash
-git clone https://github.com/ShubyM/open-rl && cd open-rl
-./scripts/setup_vm.sh
+cd examples
+uv sync
+harvey_labs/setup_lab.sh
 ```
 
-Installs build deps, uv, the Python env, and the LAB harness (sandbox image,
-pandoc, podman), then prints a health checklist. Idempotent. The pieces,
-individually:
+Setup clones LAB and prepares Podman, pandoc, and the sandbox image. Configure
+credentials for the judge and `ANTHROPIC_API_KEY` for LAB's deliverable
+matcher, in the environment or LAB's `.env`. The default judge is GLM through
+an OpenAI-compatible endpoint: export `OPENAI_BASE_URL` and `OPENAI_API_KEY`.
+For Gemini instead, set `judge_model=gemini-3.5-flash` and `GEMINI_API_KEY`.
 
-1. `uv sync --frozen --exact --extra gpu --extra vllm --extra fastpath`
-   (`fastpath` builds `causal-conv1d`; without it Qwen training runs 2–5x
-   slower on the eager fallback).
-2. `examples/harvey_labs/setup_lab.sh` — clones the LAB fork
-   (`ShubyM/harvey-labs`, which carries harness fixes from upstream PRs
-   #85–#90; rewards from unfixed upstream are not comparable) and runs its
-   setup.
-3. Judge key: `export GEMINI_API_KEY=...` (or point `judge_model` at a
-   self-hosted judge). `train.py` preflights the grading environment and
-   refuses to start if it's broken.
-4. Gateway — an open-rl server for the policy model:
+Commands below run from `examples/`. From the repository root, add
+`--project examples` to `uv run`. Arguments use `chz`'s `key=value` syntax;
+use `--help` or [config.py](config.py) for all options.
 
-   ```bash
-   VLLM_ALLOW_RUNTIME_LORA_UPDATING=true uv run --extra gpu --extra vllm \
-     vllm serve <model> --port 8000 --enable-lora --max-lora-rank 64 \
-     --max-model-len 65536 --language-model-only --disable-log-requests
-
-   SAMPLER_BASE_URL=http://127.0.0.1:8000 BASE_MODEL=<model> \
-     uv run --extra gpu --extra vllm python -m uvicorn server.gateway:app --port 9003
-   ```
-
-   Keep the sampler's `--max-model-len` equal to `max_trajectory_tokens` — a
-   mismatch turns over-length rollouts into silent parse failures.
-
-## Run
-
-One command on an 8-GPU box (sampler + gateway + trainer + typed train
-command in a tmux session):
+## Train and evaluate
 
 ```bash
-MODEL=9b ./scripts/launch_work.sh
-```
-
-Or by hand:
-
-```bash
-TINKER_API_KEY=tml-dummy-key \
-uv --project examples run python examples/harvey_labs/train.py \
-  model_name=Qwen/Qwen3.5-9B \
+TINKER_API_KEY=tml-dummy-key uv run harvey-train \
   base_url=http://127.0.0.1:9003 \
-  learning_rate=2e-4 lora_rank=32 \
-  batch_size=8 rollouts_per_example=6 max_steps=20 eval_every=5 \
-  max_tokens=16384 max_trajectory_tokens=131072 max_tool_result_tokens=16384 \
   log_path=artifacts/harvey-labs/my-run
 ```
 
-Tasks are a seeded random split of the runnable LAB pool
-(`train_tasks=300 eval_tasks=50 task_split_seed=0`, disjoint). The split is
-the benchmark — keep the seed fixed across runs you compare.
-`task=<name>` trains a single task for smoke tests. `stream_minibatches=true`
-overlaps training with sampling (identical gradients at `num_substeps=1`).
+- `model_name` selects the model. The sampler's context window must support `max_trajectory_tokens`.
+- `task=<name>` selects one training task. Otherwise, the seeded split defaults to 300 train / 50 eval tasks and excludes eval scenario families from training.
+- Cookbook evaluates at step 0 when evaluation is enabled. `final_eval=True` is the default; `eval_rollouts_per_task=4` controls repeats per eval task.
+- `stream_minibatches=True` overlaps sampling and training. Gradient clipping, SDK request sizing, and console logging use upstream defaults.
 
-Evaluate any saved checkpoint with `eval_checkpoint.py checkpoint=...`,
-passing the same split/window knobs as the training run.
+Evaluate a saved sampler checkpoint using its `sampler_path` from `checkpoints.jsonl`:
 
-## Watching a run
+```bash
+uv run harvey-eval \
+  base_url=http://127.0.0.1:9003 \
+  checkpoint=tinker://MODEL/sampler_weights/LABEL \
+  log_path=artifacts/harvey-labs/eval
+```
 
-- `plot_run.py <run-dir>` — rewards and held-out pass rate.
-- `metrics.jsonl` — every metric per step; episodes report
-  `lab/criteria_passed` / `lab/criteria_total` (failures count 0/N), so
-  `mean(criteria_passed) x total_episodes` gives exact pooled counts.
-- `iterations/iteration_*/` — full transcripts and rollout summaries.
-- `<lab_root>/results/<run-id>/scores.json` — per-episode rubric verdicts.
-- Watch `by_group/frac_all_bad` (structural failures),
-  `optim/kl_sample_train_v1` (~1e-4–1e-3 on-policy), `lab/reward_error`.
+Omit `checkpoint` to evaluate the base model. Keep the task pool, seed, judge,
+and rollout count fixed when comparing runs.
 
-## Troubleshooting
+## Results
 
-- **Rollouts are `<pad>` streams** (logprobs exactly `-0.1`): sampler is in
-  mock mode — vllm failed to import in that process.
-- **Empty completions / `leaves no room in max_model_len`**: sampler context
-  smaller than `max_trajectory_tokens`.
-- **Rubric scores all zero**: judge key missing or stale LAB venv
-  (`uv sync` inside the LAB checkout).
-- **Episodes end after one turn with no tool call**: renderer/template
-  mismatch for the model family.
-- **CUDA OOM in training**: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`,
-  `OPEN_RL_TRAIN_TOKEN_BUDGET`, `OPEN_RL_ACTIVATION_CPU_OFFLOAD=1` (all on
-  the gateway). Knob reference: [docs/configuration.md](../../docs/configuration.md).
-- **Podman**: rootless podman needs `XDG_RUNTIME_DIR` in detached shells;
-  sweep leaked containers with `podman rm -f $(podman ps -aq)`; small root
-  disks need `graphroot` moved before pulling the sandbox image.
+Start here when analyzing a run, including from an agent:
 
-Run the repository unit tests with `make test unit`.
+```bash
+uv run harvey-results log_dir=artifacts/harvey-labs/my-run
+uv run harvey-results log_dir=artifacts/harvey-labs/my-run json=True plot=True
+```
+
+Training saves `results.json` and `run_plot.png` on exit, including partial
+runs with metrics. `plot=True` refreshes both snapshots; omit it for a
+read-only query. Add `metrics=True` with `json=True` for raw diagnostics.
+For a custom plot, use `uv run harvey-plot log_dir=... title="My run" out=run.png`.
+Extend [results.read_results](results.py) for new analyses instead of writing
+another parser.
+
+The plot shows rollout rewards, batch means, an EMA, and evaluation scores.
+Steps count **completed training batches**: batch 0 finishes at step 1;
+its pre-update eval is step 0. Cookbook's streaming logs retain zero-based
+indices, so the last of eight minibatches is shown as `7/8`.
+
+| Artifact | Source |
+| --- | --- |
+| `<lab_root>/results/<run-id>/scores.json`, `report.html` | LAB's evaluation CLI: rubric verdicts and report. Judge progress goes to `grading.log`. |
+| Same directory: `metrics.json`, `config.json`, `tinker_history.jsonl` | Recipe records LAB tool counters, episode settings, and transcript. |
+| `<log_path>/metrics.jsonl`, `iteration_*/*_rollout_summaries.jsonl` | Cookbook aggregates and rollout records, including recipe `lab/*` metrics and final eval. |
+| `<log_path>/results.json`, `run_plot.png` | Derived summary and plot. |
+
+Eval reports prefer **pooled criterion pass rate**: total passed / total
+criteria. Cookbook stores mean criterion counts; their ratio gives this rate.
+For episodes scoring 1/2 and 2/8, pooled success is **30%**, while the mean
+of episode percentages is **37.5%**. Legacy episode averages stay separate
+in the report and plot.
+
+Training reward averages episode rewards and may include termination penalties.
+Missing outputs and grading failures score zero. Terminal `lab/*` flags average
+over recorded episodes; `parse_error`, `context_overflow`, and
+`max_tokens_reached` average over transitions. Check cookbook's error diagnostics
+for failures without a rollout record.
+
+## Custom sandboxes
+
+Inject a factory through the Python training or evaluation API:
+
+```python
+from harvey_labs.train import RunConfig, run
+from my_backend import sandbox_factory
+
+await run(RunConfig(base_url="http://127.0.0.1:9003"), sandbox_factory=sandbox_factory)
+```
+
+The factory is shared across train and eval. It receives a `SandboxRequest`
+and returns a `LabSandbox` extending cookbook's `SandboxInterface`; see
+[sandbox.py](sandbox.py) for the contract. Provide an isolated workspace,
+LAB-compatible tools, and binary-safe output collection into the local grading
+directory. Remote backends own leases/heartbeats; the judge runs locally.
+Clean up failed startup in the factory; after return, the environment group
+owns cleanup. Podman is the bundled default.
+
+## Development
+
+Use `chz` for recipe configuration, data objects, and CLI entrypoints.
+
+```bash
+uv run python -m harvey_labs.renderers.qwen35_renderer
+uv run python -m harvey_labs.renderers.gemma4_renderer
+```
+
+Each renderer has an inline `unittest` for sampled-token preservation across
+turns using the real tokenizer, without model weights or a GPU. Gemma uses
+Google’s unmodified template and response schema at a pinned HF revision,
+with Transformers parsing tool calls; malformed arguments fail parsing. The
+first Gemma run downloads these assets into the HF cache. Keep tests focused here;
+avoid a broad recipe suite or generated fake harness packages. For gateway configuration,
+see [docs/configuration.md](../../docs/configuration.md).
