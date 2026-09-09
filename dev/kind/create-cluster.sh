@@ -99,5 +99,5 @@ cat <<EOF
 
 Cluster ready. Next:
   ./dev/kind/load-images.sh          # build + push the open-rl images
-  kubectl apply -k k8s/deploy/kind-dra/
+  kubectl apply --server-side -k k8s/deploy/kind-dra/
 EOF

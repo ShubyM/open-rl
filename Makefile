@@ -220,7 +220,7 @@ kind-gateway:
 
 kind-deploy:
 	./dev/kind/load-images.sh
-	kubectl apply -k k8s/deploy/kind-dra/
+	kubectl apply --server-side -k k8s/deploy/kind-dra/
 
 kind-client:
 	./dev/kind/load-images.sh client
@@ -256,7 +256,7 @@ deploy:
 # to one physical GPU allocation via a shared DRA ResourceClaim.
 # See docs/setup/gke-fft-timeslice.md.
 deploy-fft-timeslice:
-	kubectl apply -k k8s/deploy/distributed-fft-timeslice/
+	kubectl apply --server-side -k k8s/deploy/distributed-fft-timeslice/
 
 rollout:
 	kubectl rollout restart deployment redis-store open-rl-gateway open-rl-trainer-worker vllm-worker
