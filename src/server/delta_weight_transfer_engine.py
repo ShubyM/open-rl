@@ -244,6 +244,29 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     """Static trainer-side hook for push engines (no-op for pull engines)."""
     pass
 
+  def _vllm_names(self, names: list[str]) -> list[str]:
+    """Maps checkpoint parameter names to the names self.model uses.
+
+    The trainer writes deltas under HuggingFace names. Most vLLM models keep
+    those names, but some rename a prefix on load (Gemma4ForCausalLM maps
+    "model.language_model." to "model."). vLLM publishes that rename as the
+    model's hf_to_vllm_mapper; applying it here keeps both the in-place GPU
+    path and the CPU snapshot keyed by the same names.
+    """
+    mapper = getattr(self.model, "hf_to_vllm_mapper", None)
+    if mapper is None:
+      return names
+    try:
+      mapped = mapper.apply_list(names)
+    except Exception:  # noqa: BLE001 - a mapper bug must not take down the sync
+      return names
+    if len(mapped) != len(names):
+      return names
+    renamed = sum(1 for old, new in zip(names, mapped, strict=True) if old != new)
+    if renamed:
+      logger.info(f"[DeltaSnapshotEngine] Mapped {renamed}/{len(names)} delta parameter names through {type(self.model).__name__}.hf_to_vllm_mapper")
+    return mapped
+
   def _resolve_gpu_param_and_offset(self, hf_name: str) -> tuple[torch.Tensor, int]:
     """Resolves a HuggingFace parameter name to (gpu_param, 1d_element_offset) on self.model."""
     if self.model is None:
@@ -563,6 +586,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
     is_sparse_delta = meta.get("format") == "sparse_delta"
     if is_sparse_delta:
       meta_names, split_indices, split_values, changed_elements = self._parse_sparse_delta_file(target_path, meta)
+      meta_names = self._vllm_names(meta_names)
 
       if changed_elements == 0:
         self.current_weights_path = target_path

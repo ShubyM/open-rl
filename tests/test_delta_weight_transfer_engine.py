@@ -388,6 +388,103 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
       self.assertEqual(qkv_flat[q_numel + 10].item(), 42.0)
       self.assertEqual(qkv_flat[q_numel + 20].item(), 99.0)
 
+  def test_sparse_delta_names_follow_hf_to_vllm_mapper_in_place(self):
+    """In-place patching resolves HF names through the model's hf_to_vllm_mapper (Gemma4ForCausalLM)."""
+    import json
+
+    from safetensors.torch import save_file
+
+    class PrefixMapper:
+      def apply_list(self, names):
+        return [n.replace("model.language_model.", "model.", 1) for n in names]
+
+    embed_param = torch.nn.Parameter(torch.zeros(8, 4), requires_grad=False)
+    qkv_param = torch.nn.Parameter(torch.zeros(1152, 896), requires_grad=False)
+
+    class GemmaLikeModel(torch.nn.Module):
+      hf_to_vllm_mapper = PrefixMapper()
+
+      def get_parameter(self, name):
+        if name == "model.embed_tokens.weight":
+          return embed_param
+        if name == "model.layers.0.self_attn.qkv_proj.weight":
+          return qkv_param
+        raise AttributeError(name)
+
+    mock_config = MagicMock()
+    mock_config.hidden_size = 896
+    mock_config.num_attention_heads = 14
+    mock_config.num_key_value_heads = 2
+    mock_config.head_dim = 64
+    mock_config.intermediate_size = 4864
+    mock_hf_config = MagicMock()
+    mock_hf_config.get_text_config.return_value = mock_config
+    vllm_config = MagicMock()
+    vllm_config.model_config.hf_config = mock_hf_config
+    vllm_config.model_config.model = "google/gemma-4-e2b"
+
+    engine = DeltaSnapshotWeightTransferEngine(config=None, vllm_config=vllm_config, device=torch.device("cpu"), model=GemmaLikeModel())
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      save_file(
+        {
+          "delta.indices_flat": torch.tensor([3, 10], dtype=torch.int32),
+          "delta.values_flat": torch.tensor([7.0, 42.0], dtype=torch.float32),
+          "delta.layer_lengths": torch.tensor([1, 1], dtype=torch.int64),
+        },
+        os.path.join(tmpdir, "delta.safetensors"),
+      )
+      names = ["model.language_model.embed_tokens.weight", "model.language_model.layers.0.self_attn.k_proj.weight"]
+      with open(os.path.join(tmpdir, "metadata.json"), "w") as f:
+        json.dump({"format": "sparse_delta", "layer_names": names}, f)
+      with patch.dict(os.environ, {"OPEN_RL_IN_PLACE_DELTA": "1"}):
+        engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=tmpdir))
+
+    self.assertEqual(embed_param.data.view(-1)[3].item(), 7.0)
+    q_numel = 14 * 64 * 896
+    self.assertEqual(qkv_param.data.view(-1)[q_numel + 10].item(), 42.0)
+
+  def test_sparse_delta_names_follow_hf_to_vllm_mapper_full_replace(self):
+    """CPU-snapshot patching (full_replace) keys the delta by the model's names, not the checkpoint's."""
+    import json
+
+    from safetensors.torch import save_file
+
+    class PrefixMapper:
+      def apply_list(self, names):
+        return [n.replace("model.language_model.", "model.", 1) for n in names]
+
+    class GemmaLikeModel:
+      hf_to_vllm_mapper = PrefixMapper()
+
+      def named_parameters(self):
+        return [("model.embed_tokens.weight", torch.nn.Parameter(torch.zeros(4, 4)))]
+
+      def named_buffers(self):
+        return []
+
+    model = GemmaLikeModel()
+    engine = DeltaSnapshotWeightTransferEngine(config=None, parallel_config=None, model=model)  # type: ignore
+    loaded: list[tuple[str, torch.Tensor]] = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      save_file(
+        {
+          "delta.indices_flat": torch.tensor([5], dtype=torch.int32),
+          "delta.values_flat": torch.tensor([99.0], dtype=torch.float32),
+          "delta.layer_lengths": torch.tensor([1], dtype=torch.int64),
+        },
+        os.path.join(tmpdir, "delta.safetensors"),
+      )
+      with open(os.path.join(tmpdir, "metadata.json"), "w") as f:
+        json.dump({"format": "sparse_delta", "layer_names": ["model.language_model.embed_tokens.weight"]}, f)
+      with patch.dict(os.environ, {"OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD": "full_replace"}, clear=False):
+        os.environ.pop("OPEN_RL_IN_PLACE_DELTA", None)
+        engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=tmpdir), loaded.extend)
+
+    self.assertEqual([name for name, _ in loaded], ["model.embed_tokens.weight"])
+    self.assertEqual(loaded[0][1].view(-1)[5].item(), 99.0)
+
 
 if __name__ == "__main__":
   unittest.main()
