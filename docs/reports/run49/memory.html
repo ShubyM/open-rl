@@ -31,6 +31,18 @@
   <li>Live run (run49, CP4): a 200,309-token trajectory backward peaked at 92.7 GiB, in line with the ladder.</li>
 </ul>
 
+<h2>What context parallelism is</h2>
+<p>CP splits one sequence across GPUs along the token axis; each rank holds 1/CP of the positions of the same sequence. DP gives ranks different sequences, so a single 262k trajectory still lands whole on one GPU. TP slices weights and matmul internals but every rank still sees the full sequence, and the GDN layers (48 of 64) are not in the plan at all. Under CP every per-token activation, stash and recompute alike, scales with seq/CP, which is why the CP4 slope is a quarter of TP4's.</p>
+<table>
+  <tr><th>layer</th><th>what CP needs</th><th>how it is done here</th></tr>
+  <tr><td>softmax attention (16 layers)</td><td>each query must see all earlier keys/values</td><td>torch <code>context_parallel</code> ring attention; K/V all-gathered across the CP group, online-softmax accumulation. Load-balanced layout: rank r owns chunks r and 2CP-1-r so causal work is even.</td></tr>
+  <tr><td>gated-deltanet (48 layers)</td><td>the recurrent state after rank r's tokens is rank r+1's initial state; the conv needs the previous rank's last tokens</td><td>FLA CP kernel: reorder to contiguous chunks, exchange conv boundaries, pass the state along the ring. Sequential across ranks, part of why CP4 runs ~10% MFU vs TP4's 14%.</td></tr>
+  <tr><td>MLP, norms, embeddings, LoRA</td><td>nothing, per-token</td><td>local</td></tr>
+  <tr><td>loss</td><td>the full sequence's logprobs</td><td>each rank projects its own positions, all-gathers, undoes the load-balanced permutation; every rank computes the same loss</td></tr>
+  <tr><td>gradients</td><td>partial gradients of one loss must sum</td><td>FSDP2 averages over dp_shard x cp, so the gather's backward scales each rank's slice by CP. The ring-attention dispatch stays active through the backward because attention and the checkpoint recompute run again there.</td></tr>
+</table>
+<p class="muted">Megatron's CP failed on the second row: ring attention was right, but its GDN chunks started from a zero state instead of the previous rank's, so only the first chunk matched.</p>
+
 <h2>Ladders, 27B</h2>
 <table>
   <tr><th>backend / layout</th><th>checkpointing</th><th class="n">resident</th><th class="n">64k</th><th class="n">128k</th><th class="n">160k</th><th class="n">180k</th><th class="n">200k</th><th class="n">240k</th><th class="n">262144</th><th class="n">GiB / 1k tok</th></tr>
