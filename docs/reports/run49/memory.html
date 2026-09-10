@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Qwen3.8-27B trainer memory on 8x H200</title>
+<style>
+  body { font: 15px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color: #2b2b28; max-width: 900px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  h2 { font-size: 17px; margin-top: 32px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  table { border-collapse: collapse; margin: 12px 0; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #e6e6e2; vertical-align: top; }
+  th { background: #f4f4f0; font-weight: 600; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  code { font: 13px Menlo, Consolas, monospace; background: #f4f4f0; padding: 1px 4px; border-radius: 3px; }
+  .muted { color: #6f6e68; }
+  .oom { color: #a33; font-weight: 600; }
+  ul { padding-left: 20px; }
+  li { margin: 3px 0; }
+</style>
+</head>
+<body>
+
+<h1>Qwen3.8-27B trainer memory on 8x H200</h1>
+<p class="muted">Measured 2026-09-10 on h200-vm with <code>scripts/automodel_probe.py</code> (Automodel worker) and the earlier Megatron probes. LoRA rank 32, one sequence per pass, peak GiB per GPU out of 139.8 usable. Sampler GPUs are separate, so the trainer has 4 GPUs unless noted.</p>
+
+<h2>Bottom line</h2>
+<ul>
+  <li><b>Full 262,144-token context fits only with context parallelism.</b> CP4 on the Automodel worker: 114.5 GiB allocated, 123.0 reserved, 136 s per forward+backward.</li>
+  <li><b>TP4/DP1 cannot get there on either backend.</b> Megatron caps near 185k; Automodel caps near 130-140k.</li>
+  <li>The dominant term at long context is the activation stash of the residual stream. TP does not shard it; CP does.</li>
+  <li>Live run (run49, CP4): a 200,309-token trajectory backward peaked at 92.7 GiB, in line with the ladder.</li>
+</ul>
+
+<h2>Ladders, 27B</h2>
+<table>
+  <tr><th>backend / layout</th><th>checkpointing</th><th class="n">resident</th><th class="n">64k</th><th class="n">128k</th><th class="n">160k</th><th class="n">180k</th><th class="n">200k</th><th class="n">240k</th><th class="n">262144</th><th class="n">GiB / 1k tok</th></tr>
+  <tr><td>Automodel TP4/DP1</td><td>Automodel per-submodule</td><td class="n">21.4</td><td class="n oom">OOM</td><td></td><td></td><td></td><td></td><td></td><td></td><td class="n">2.47 <span class="muted">(16k 68.6, 32k 108.1)</span></td></tr>
+  <tr><td>Automodel TP4/DP1</td><td>groups of 4 layers</td><td class="n">21.4</td><td class="n">81.5</td><td class="n oom">OOM</td><td></td><td></td><td></td><td></td><td></td><td class="n">0.94</td></tr>
+  <tr><td>Automodel TP4/DP1</td><td>groups of 2 layers</td><td class="n">21.4</td><td class="n">71.4</td><td class="n">119.4</td><td class="n oom">OOM</td><td></td><td></td><td></td><td></td><td class="n">0.75</td></tr>
+  <tr><td>Automodel CP4/DP1</td><td>Automodel per-submodule</td><td class="n">12.8</td><td class="n">61.8</td><td></td><td class="n oom">OOM</td><td></td><td></td><td></td><td></td><td class="n">0.62 <span class="muted">(32k 42.0)</span></td></tr>
+  <tr><td><b>Automodel CP4/DP1</b></td><td><b>groups of 4 layers</b></td><td class="n">12.8</td><td></td><td class="n">66.4</td><td></td><td></td><td class="n">92.2</td><td></td><td class="n"><b>114.5</b> <span class="muted">/ 123.0 res</span></td><td class="n">0.36</td></tr>
+  <tr><td>Megatron TP4/DP1</td><td>recompute 4 layers</td><td class="n">12.9</td><td></td><td></td><td></td><td class="n">116.6 <span class="muted">/ 132.1 res</span></td><td class="n oom">OOM</td><td></td><td></td><td class="n">0.58</td></tr>
+  <tr><td>Megatron TP2/DP2</td><td>recompute 4 layers</td><td class="n">25.5</td><td></td><td class="n">127.1 <span class="muted">(120k)</span></td><td class="n oom">OOM (140k)</td><td></td><td></td><td></td><td></td><td class="n">0.85</td></tr>
+  <tr><td>Megatron TP8/DP1 <span class="muted">(no sampler GPUs left)</span></td><td>recompute 4 layers</td><td class="n">6.4</td><td></td><td></td><td></td><td></td><td class="n">100.7</td><td class="n">119.6</td><td class="n oom">OOM</td><td class="n">0.47</td></tr>
+</table>
+<p class="muted">Resident = weights + adapter + optimizer state after load. Slopes are from the two adjacent rungs that fit. Megatron rows are from the run48 probes on the same box.</p>
+
+<h2>Where the memory goes</h2>
+<table>
+  <tr><th>term</th><th>size</th><th>what shards it</th></tr>
+  <tr><td>residual stash for activation checkpointing</td><td>one [seq, 5120] bf16 tensor per checkpointed unit: 0.61 GiB/1k tok for 64 units, 0.15 for 16 groups of 4</td><td>CP (sequence) only. TP replicates it on every rank; sequence parallel would shard it but GDN forbids SP on Megatron and Automodel has no SP plan for GDN.</td></tr>
+  <tr><td>recompute working set of one unit</td><td>attention/MLP internals plus the GDN mixer's projections, conv and chunk states; ~0.1 GiB/1k tok per layer on Megatron, ~0.2 on Automodel's HF GDN path</td><td>TP shards attention and MLP internals only. GDN layers (48 of 64) are not tensor-parallel and stay fully replicated. CP shards all of it.</td></tr>
+  <tr><td>weights</td><td>54 GB bf16 total</td><td>TP shards attention/MLP; FSDP2 shards everything over dp_shard x cp, which is why CP4 resident is 12.8 vs TP4's 21.4</td></tr>
+  <tr><td>logprob head</td><td>[1024, 248k] fp32 logits per chunk, ~1 GiB, plus the gathered 2.5 GB lm_head weight</td><td>chunked; never a full [seq, vocab] tensor</td></tr>
+</table>
+
+<h2>Why the Automodel numbers moved</h2>
+<ul>
+  <li><b>Per-submodule checkpointing.</b> For its native Qwen3.5 model Automodel wraps <code>self_attn</code>, <code>linear_attn</code> and <code>mlp</code> separately and leaves the norms outside, so each layer stashes about four sequence tensors instead of one. That is the 2.47 GiB/1k tok row: 4x Megatron's per-layer stash, ceiling 47k. The worker turns that off and checkpoints groups of whole layers (<code>OPEN_RL_AUTOMODEL_RECOMPUTE_NUM_LAYERS</code>, default 4).</li>
+  <li><b>Group size trades stash for transient.</b> Recompute cost is one extra forward regardless of group size. On TP4 the group's replicated GDN transient dominates, so k=2 beats k=4 (0.75 vs 0.94). On CP4 both terms are divided by 4, so k=4 is comfortable.</li>
+  <li><b>Automodel's GDN forward is heavier than Megatron's.</b> Same layout and group size, TP4: 0.94 vs 0.58 GiB/1k tok. GVA head repeat of q/k, separate conv output, fp32 gate math.</li>
+</ul>
+
+<h2>Levers that did not work</h2>
+<ul>
+  <li>Megatron CP: the GDN recurrent state is not carried across ranks in megatron-core 0.19.0; gradients are wrong past the first sequence chunk. Not a memory lever.</li>
+  <li>Megatron activation offload: mutually exclusive with recompute, so it materializes the full forward set before copying; OOMs at 160k, worse than recompute.</li>
+  <li>Megatron sequence parallel: asserted off by gdn.py.</li>
+  <li>Automodel TP with any group size: bounded by the replicated GDN transient, ~140k at best.</li>
+</ul>
+
+<h2>Practical limits</h2>
+<table>
+  <tr><th>layout</th><th class="n">safe context</th><th>notes</th></tr>
+  <tr><td>Automodel CP4/DP1</td><td class="n">262,144</td><td>run49; ~17 GiB headroom on reserved; one datum per pass, no packing</td></tr>
+  <tr><td>Megatron TP4/DP1, k=4</td><td class="n">~180k</td><td>8 GiB margin at 180k, run48c hit the wall at 164k with k=1</td></tr>
+  <tr><td>Automodel TP4/DP1, k=2</td><td class="n">~130k</td><td>not worth using; Megatron TP4 is better at TP</td></tr>
+  <tr><td>Megatron TP8/DP1</td><td class="n">~240k</td><td>takes all 8 GPUs, no co-located samplers</td></tr>
+</table>
+
+<h2>Regression check</h2>
+<p>On the box: <code>GPUS=0,1,2,3 TP=1 CP=4 PROBE_MODE=ladder PROBE_MODEL=Qwen/Qwen3.8-27B PROBE_LENGTHS=128000,200000,262144 ~/automodel/run_probe.sh</code>. Correctness: <code>PROBE_MODE=ref</code> on one GPU, then <code>PROBE_MODE=layout</code> per layout; expect logprobs within bf16 noise on every chunk and adapter-gradient cosine above 0.998.</p>
+
+</body>
+</html>
