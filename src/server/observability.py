@@ -11,7 +11,7 @@ from itertools import islice
 from opentelemetry import context, propagate, trace
 from opentelemetry.trace import StatusCode
 
-SAMPLE_LIMIT = 120
+SAMPLE_LIMIT = 2000
 
 
 def key(run_id: str) -> str:
@@ -105,7 +105,7 @@ async def read(store, run_id: str) -> dict:
     return {
       "available": bool(samples),
       "samples": samples,
-      "coverage": "Last 120 finished operations; best effort, not exhaustive",
+      "coverage": "Last 2000 finished operations; best effort, not exhaustive",
     }
   except Exception:
     return {"available": False, "samples": [], "error": "Operation telemetry unavailable"}

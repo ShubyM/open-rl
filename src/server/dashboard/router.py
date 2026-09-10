@@ -53,7 +53,7 @@ async def inspection_index():
     "capabilities": {"read_only": True, "pod_exec": False, "filesystem": False, "secrets": False, "inflight_operation_traces": False},
     "limits": {
       "allocation_history_minutes": 30,
-      "operation_samples_per_run": 120,
+      "operation_samples_per_run": 2000,
       "local_log_records_total": 20000,
       "local_log_retention_days": 7,
       "historical_queries_require_observed_pod_identity": True,

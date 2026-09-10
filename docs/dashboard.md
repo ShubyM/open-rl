@@ -4,7 +4,7 @@ The gateway serves `/dashboard`. The UI and agents read the same namespaced data
 
 - `GET /api/v1/dashboard/snapshot`: all recorded runs (including completed runs), pods, scheduler Workloads, nodes, resource usage, events, rollout state, DRA mappings and observation coverage.
 - `GET /api/v1/dashboard/runs/{run_id}`: logical run, current pods, runtime membership and workload state.
-- `GET /api/v1/dashboard/runs/{run_id}/metrics`: last 120 finished operations with outcome, queue and execution durations, numeric runtime metrics, logical run/runtime identity, and available trace/pod/node identifiers.
+- `GET /api/v1/dashboard/runs/{run_id}/metrics`: last 2000 finished operations with outcome, queue and execution durations, numeric runtime metrics, logical run/runtime identity, and available trace/pod/node identifiers.
 - `GET /api/v1/dashboard/runs/{run_id}/logs`: retained container output. Supports `q`, `pod`, `container`, `node`, `severity`, `attempt`, `since`, `until`, `limit` and `cursor`. Pagination is newest-first and excludes records collected after its first page. Keep filters unchanged when following `next_cursor`.
 - `GET /api/v1/dashboard/pods/{pod}/logs`: bounded current or previous container output for any pod in the gateway namespace, including infrastructure pods. Supports `container`, `previous`, and `tail`.
 - `GET /api/v1/dashboard/allocations/{workload_uid}/metrics`: optional DCGM history for the allocation's physical GPUs.
@@ -27,7 +27,7 @@ Missing metrics, missing UUID mappings, and query failures stay unavailable. Dev
 
 Trainer, vLLM sampler, and LoRA sampler requests use one `observe_operation` wrapper in `server/observability.py`. It records succeeded/failed/cancelled outcomes, duration, queue delay when known, bounded numeric metrics, and logical run versus shared runtime identity. Propagated OpenTelemetry context supplies trace identifiers when present; Kubernetes workers supply pod UID and node through the Downward API. Queue delay uses gateway/worker wall clocks and is omitted if their timestamps are inconsistent. Payloads, generated tokens and exception messages are not copied into operation samples. Instrumentation is enabled by default.
 
-Recording has a 100ms budget and cannot fail a training request. Redis appends and trims atomically, preserving concurrent writers; in-memory storage has the same bounded contract. The last 120 finished operations per run remain best effort, and hard process termination can prevent recording. Samples use the `open_rl:operations:` key prefix; older dashboard sample keys are not migrated. Rebuild worker images as well as the gateway for this reporting. Sampling-specific throughput and current in-flight operation tracking are not provided.
+Recording has a 100ms budget and cannot fail a training request. Redis appends and trims atomically, preserving concurrent writers; in-memory storage has the same bounded contract. The last 2000 finished operations per run remain best effort, and hard process termination can prevent recording. Samples use the `open_rl:operations:` key prefix; older dashboard sample keys are not migrated. Rebuild worker images as well as the gateway for this reporting. Sampling-specific throughput and current in-flight operation tracking are not provided.
 
 ## Logs and access
 

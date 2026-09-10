@@ -259,6 +259,17 @@ body {
   outline: 1px solid var(--ink);
   outline-offset: 1px;
 }
+#orl-design-lab .capacity-allocation.shared {
+  background: color-mix(in srgb, var(--line) 55%, var(--ground));
+  padding: 0;
+}
+#orl-design-lab .hold {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: color-mix(in srgb, var(--allocation-color) 62%, var(--ground));
+  pointer-events: none;
+}
 #orl-design-lab .allocation-legend {
   display: flex;
   flex-wrap: wrap;

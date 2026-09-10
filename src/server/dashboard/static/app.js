@@ -142,6 +142,49 @@ function detail(placement) {
     <div><div id="gpu-chart"></div><p id="gpu-status" class="muted" role="status"></p>${run?.shared_runtime ? '<p class="muted">Shared LoRA runtime</p>' : ""}</div>
     <div><p class="muted">GPU memory</p><p id="gpu-memory">—</p><p class="muted">Run MFU</p><p id="gpu-mfu">—</p></div></section>`;
 }
+// Time-sliced GPUs run one job at a time. The workers' own operation records
+// say who held the device when, so shared lanes paint those intervals instead
+// of one flat allocation block.
+function holdUrl(runId, start, end) {
+  return `/api/v1/dashboard/runs/${encode(runId)}/metrics?${new URLSearchParams({
+    since: new Date(start * 1000).toISOString(),
+    until: new Date(end * 1000).toISOString(),
+  })}`;
+}
+function wantHolds(placements, start, end) {
+  const runIds = new Set(placements.flatMap((p) => p.run_ids || []));
+  runIds.forEach((runId) => {
+    const url = holdUrl(runId, start, end);
+    const entry = metricCache.get(url);
+    if (entry?.pending || (entry?.data && Date.now() - entry.fetchedAt < metricFreshFor)) return;
+    metricData(url)
+      .then(() => {
+        if (route()[0] === "nodes") render({ preserveAllocation: true });
+      })
+      .catch(() => {});
+  });
+}
+function holdIntervals(placement, start, end) {
+  const intervals = [];
+  (placement.run_ids || []).forEach((runId) => {
+    const samples = metricCache.get(holdUrl(runId, start, end))?.data?.samples || [];
+    samples.forEach((sample) => {
+      if (sample.role !== placement.role) return;
+      if (sample.node && sample.node !== placement.node) return;
+      const from = Math.max(start, placement.start, sample.started_at ?? sample.at - (sample.elapsed_seconds || 0));
+      const to = Math.min(end, placement.end, sample.at);
+      if (to > from) intervals.push([from, to]);
+    });
+  });
+  intervals.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  intervals.forEach(([from, to]) => {
+    const last = merged.at(-1);
+    if (last && from - last[1] < 3) last[1] = Math.max(last[1], to);
+    else merged.push([from, to]);
+  });
+  return merged;
+}
 function nodes() {
   const observed = nodeNow();
   const { start, end: now } = resolveTimeRange(nodeSelection, observed);
@@ -254,6 +297,7 @@ function nodes() {
           const accelerator = node.accelerator
             ? node.accelerator
                 .replace(/^nvidia[- ]/i, "")
+                .replace(/-\d+gb$/i, "")
                 .replace(/-/g, " ")
                 .toUpperCase()
             : node.gpu_capacity
@@ -267,34 +311,53 @@ function nodes() {
               p.devices.some((d) => !devices.find((n) => n.id === d)),
           );
           const nodeSegments = segments.filter((p) => p.node === node.name);
-          const bars = nodeSegments
-            .flatMap((p) => {
-              const indexes = p.devices
-                .map((id) => devices.findIndex((d) => d.id === id))
-                .filter((i) => i >= 0)
-                .sort((a, b) => a - b);
-              const groups = [];
-              indexes.forEach((i) => {
-                const last = groups.at(-1);
-                if (last && last.at(-1) === i - 1) last.push(i);
-                else groups.push([i]);
-              });
-              return groups.map((group) => {
-                // Shared seats put several allocations on one GPU at once. The
-                // bar carries every sharer's color; the legend below names them.
-                const sharers = nodeSegments
-                  .filter((q) => q.start < p.end && q.end > p.start && group.some((i) => q.devices.includes(devices[i].id)))
-                  .sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
-                const hues = [...new Set(sharers.map((q) => family(q.runtime_id)))];
-                const fill =
-                  hues.length > 1
-                    ? `background:repeating-linear-gradient(45deg, ${hues.map((hue, i) => `color-mix(in srgb, var(--${hue}) 62%, var(--ground)) ${i * 8}px ${(i + 1) * 8}px`).join(", ")});`
-                    : "";
-                const title = `${p.label}${p.role ? " · " + p.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}${sharers.length > 1 ? ` · shared with ${sharers.filter((q) => q.id !== p.id).map((q) => `${q.label} ${q.role || ""}`.trim()).join(", ")}` : ""}`;
-                return `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" title="${escape(title)}" aria-label="${escape(title)} on ${escape(node.name)}" style="left:${Math.max(0, ((p.start - start) / duration) * 100)}%;width:${Math.max(0, ((Math.min(now, p.end) - Math.max(start, p.start)) / duration) * 100)}%;top:${group[0] * height + 2}px;height:${group.length * height - 4}px;${fill}"></button>`;
-              });
+          const pct = (at) => `${Math.max(0, ((Math.min(now, Math.max(start, at)) - start) / duration) * 100)}%`;
+          const span = (from, to) => `left:${pct(from)};width:${Math.max(0, ((Math.min(now, to) - Math.max(start, from)) / duration) * 100)}%`;
+          const sharersOf = (i) =>
+            nodeSegments
+              .filter((q) => q.devices.length === 1 && q.devices[0] === devices[i].id)
+              .sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
+          const sharedDevices = new Set(devices.map((_, i) => i).filter((i) => new Set(sharersOf(i).map((q) => q.id)).size > 1));
+          const sharedPlacements = [...sharedDevices].flatMap((i) => sharersOf(i));
+          if (sharedPlacements.length) wantHolds(sharedPlacements, start, now);
+          const sharedBars = [...sharedDevices]
+            .map((i) => {
+              const sharers = sharersOf(i);
+              const from = Math.min(...sharers.map((q) => q.start));
+              const to = Math.max(...sharers.map((q) => q.end));
+              const chosen = sharers.find((q) => q.id === expanded) || sharers[0];
+              // Hold blocks sit inside the shared bar, so they are placed
+              // against the bar's own span rather than the whole track.
+              const barFrom = Math.max(start, from);
+              const barTo = Math.min(now, to);
+              const within = (a, b) => `left:${((Math.max(a, barFrom) - barFrom) / (barTo - barFrom)) * 100}%;width:${((Math.min(b, barTo) - Math.max(a, barFrom)) / (barTo - barFrom)) * 100}%`;
+              const holds = sharers
+                .flatMap((q) => holdIntervals(q, start, now).map(([a, b]) => `<span class="hold ${family(q.runtime_id)}" style="${within(a, b)}" title="${escape(q.label)}${q.role ? " · " + escape(q.role) : ""}"></span>`))
+                .join("");
+              const title = `Shared GPU: ${[...new Map(sharers.map((q) => [q.id, q])).values()].map((q) => `${q.label}${q.role ? " " + q.role : ""}`).join(", ")}`;
+              return `<button type="button" class="capacity-allocation shared ${sharers.some((q) => q.id === expanded) ? "selected" : ""}" data-placement="${escape(chosen.id)}" aria-expanded="${sharers.some((q) => q.id === expanded)}" title="${escape(title)}" aria-label="${escape(title)} on ${escape(node.name)}" style="${span(from, to)};top:${i * height + 2}px;height:${height - 4}px">${holds}</button>`;
             })
             .join("");
+          const bars =
+            sharedBars +
+            nodeSegments
+              .flatMap((p) => {
+                const indexes = p.devices
+                  .map((id) => devices.findIndex((d) => d.id === id))
+                  .filter((i) => i >= 0 && !(p.devices.length === 1 && sharedDevices.has(i)))
+                  .sort((a, b) => a - b);
+                const groups = [];
+                indexes.forEach((i) => {
+                  const last = groups.at(-1);
+                  if (last && last.at(-1) === i - 1) last.push(i);
+                  else groups.push([i]);
+                });
+                return groups.map((group) => {
+                  const title = `${p.label}${p.role ? " · " + p.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}`;
+                  return `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" title="${escape(title)}" aria-label="${escape(title)} on ${escape(node.name)}" style="${span(p.start, p.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px"></button>`;
+                });
+              })
+              .join("");
           return `<div class="node-placement-group"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)} · ${nodeSelection.end === null ? "Current node status" : "At selected range end"}" aria-label="${escape(accelerator)}, ${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span><span class="claim-label">${escape(claimLabel)}</span></div><div>
         ${devices.length ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(d.name)}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${gaps}${bars}</div></div>` : ""}
         ${unmapped.map((p) => `<button type="button" class="capacity-allocation unknown-mapping ${family(p.runtime_id)}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}"><span class="allocation-name">${escape(p.label)}</span><span class="allocation-count">${p.device_count} GPUs</span></button>`).join("")}
