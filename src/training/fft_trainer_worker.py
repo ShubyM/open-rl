@@ -179,7 +179,12 @@ class FFTTrainingWorker(BaseTrainerWorker):
         "GPU time-slicer lock is not held during save operations."
       )
 
-    if self.weight_sync_cfg.strategy == "delta" and not include_optimizer:
+    # Under the delta strategy save_state writes the sparse delta the sampler
+    # consumes, whatever the caller asked for. That file is not something
+    # load_from_state can open and it carries no optimizer, so an FFT job on
+    # the delta strategy cannot be resumed from save_state yet. The LoRA
+    # path has no such gap. Full checkpoints need the full strategy.
+    if self.weight_sync_cfg.strategy == "delta":
       return self.save_state_delta(model_id=model_id, state_path=state_path, kind=kind)
 
     os.makedirs(state_path, exist_ok=True)

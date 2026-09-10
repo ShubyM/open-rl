@@ -127,9 +127,29 @@ def resolve_sampler_weights_path(model_id: str) -> str:
 
 
 def checkpoint_state_path(model_id: str, name: str) -> str:
+  """Where a named checkpoint lives. Names are scoped under the model that
+  saved them, so two jobs calling save_state("final") never collide. A tinker
+  path names its own model, which is how a resumed job reaches the
+  checkpoint of the one that died."""
+  if name.startswith("tinker://"):
+    owner, sep, rest = name[len("tinker://") :].partition("/weights/")
+    if owner and sep:
+      return os.path.join(TMP_DIR, "checkpoints", owner, "weights", rest)
   if os.path.isabs(name):
     return name
   return os.path.join(TMP_DIR, "checkpoints", model_id, "weights", name)
+
+
+def tinker_state_path(state_path: str) -> str:
+  """The tinker path for a checkpoint directory under TMP_DIR/checkpoints,
+  which is the form the client hands back to weights_info and load_state.
+  Anything else is returned unchanged."""
+  root = os.path.join(TMP_DIR, "checkpoints") + os.sep
+  if state_path.startswith(root):
+    model_id, sep, rest = state_path[len(root) :].partition("/weights/")
+    if model_id and sep:
+      return f"tinker://{model_id}/weights/{rest}"
+  return state_path
 
 
 def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
@@ -316,6 +336,8 @@ def translate_future_result(result: dict) -> dict:
   if result_type in public_type_by_internal_type:
     response = dict(result)
     response["type"] = public_type_by_internal_type[result_type]
+    if result_type == "state_saved" and isinstance(response.get("path"), str):
+      response["path"] = tinker_state_path(response["path"])
     return response
 
   return result
@@ -471,7 +493,10 @@ async def create_model_from_state(
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "state_path is required"})
   # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
-  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
+  if state_path.startswith("tinker://"):
+    resolved_path = checkpoint_state_path("", state_path)
+  else:
+    resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   try:
     model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="restored")
   except ValueError as exc:
@@ -632,7 +657,9 @@ async def save_weights(req: dict):
       model_id,
       {
         "state_path": state_path,
-        "include_optimizer": bool(req.get("include_optimizer", False)),
+        # save_state is the whole training state in tinker's API. The client
+        # chooses on load whether the optimizer comes back.
+        "include_optimizer": True,
         "kind": "weights",
       },
       request_id=req_id,
@@ -663,6 +690,28 @@ async def load_weights(req: dict):
     )
   )
   return {"request_id": req_id}
+
+
+@app.post("/api/v1/weights_info")
+async def weights_info(req: dict):
+  """RestClient.get_weights_info_by_tinker_path(). What a checkpoint was
+  trained from, so create_training_client_from_state can open a matching
+  client and load_state into it. Answered from the checkpoint directory, so
+  it survives a gateway or Redis restart."""
+  path = req.get("tinker_path") or ""
+  state_dir = checkpoint_state_path("", path) if path.startswith("tinker://") else None
+  metadata_path = os.path.join(state_dir, "metadata.json") if state_dir else None
+  if not metadata_path or not os.path.exists(metadata_path):
+    return JSONResponse(status_code=404, content={"error": f"No checkpoint at {path}"})
+  with open(metadata_path) as f:
+    saved = json.load(f)
+  adapter_config_path = os.path.join(state_dir, saved.get("model_id", ""), "adapter_config.json")
+  is_lora = os.path.exists(adapter_config_path)
+  rank = None
+  if is_lora:
+    with open(adapter_config_path) as f:
+      rank = json.load(f).get("r")
+  return {"base_model": saved["base_model"], "is_lora": is_lora, "lora_rank": rank, "type": "weights_info"}
 
 
 # *** SamplingClient endpoints ***
