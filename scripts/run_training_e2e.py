@@ -8,20 +8,27 @@ Scenarios ("tiny-" = minimal overfit/smoke tests; the rest are real workloads):
   fft-gsm8k             examples/sft/gsm8k/gsm8k_sft.py + vLLM eval (min_accuracy gate)
   fft-gsm8k-x2          two concurrent fft-gsm8k jobs sharing one GPU through the
                         accel timeslicer (asserts both workers checkpoint/restore)
-
-There is no FFT RL scenario: the FFT backend does not support sampling during
-training yet (no vLLM sampling mid-training).
+  tiny-rl-x2-families / tiny-fft-rl-x2-families
+                        two concurrent tiny-rl jobs on base_model and
+                        second_base_model, one per model family (asserts each
+                        job earns a reward, i.e. got its own tokenizer)
+  fft-textsql-rl-x2     two concurrent Text-to-SQL FFT RL jobs; extra_a= and
+                        extra_b= override each job separately on top of extra=,
+                        so one run can compare two configs or two base models
 
 Examples:
   uv run --extra gpu python scripts/run_training_e2e.py scenario=tiny-lora
   uv run --extra gpu python scripts/run_training_e2e.py scenario=tiny-rl steps=4
   uv run --extra gpu python scripts/run_training_e2e.py scenario=lora-textsql
   uv run --extra gpu python scripts/run_training_e2e.py scenario=fft-gsm8k extra='batch=2 rank=32'
+  uv run --extra gpu python scripts/run_training_e2e.py scenario=fft-textsql-rl-x2 steps=40 \
+      base_model=google/gemma-4-e2b extra_a='rl.learning_rate=1e-6' extra_b='rl.learning_rate=5e-6'
 
 The example scripts validate their own results and exit nonzero on failure.
 `base_url=...` targets an existing backend instead of starting one. `steps=N`
 sets the example's step count and `extra='k=v ...'` forwards additional chz
-overrides to it. The examples uv environment is kept separate from the root
+overrides to it; two-job scenarios also take `extra_a=` / `extra_b=`, applied on
+top of `extra=` to job-a / job-b only. The examples uv environment is kept separate from the root
 server/eval uv environment; override that path with
 OPEN_RL_EXAMPLES_UV_PROJECT_ENVIRONMENT if needed.
 """
@@ -60,6 +67,8 @@ class RunConfig:
     "tiny-rl",
     "tiny-fft-rl",
     "tiny-fft-rl-x2",
+    "tiny-rl-x2-families",
+    "tiny-fft-rl-x2-families",
     "lora-textsql",
     "lora-gsm8k-rl",
     "lora-gsm8k-rl-x2",
@@ -81,6 +90,9 @@ class RunConfig:
   sampler_gpu: str = "1"
   base_url: str = ""
   base_model: str = "Qwen/Qwen2.5-0.5B"
+  # The other model family for the *-x2-families scenarios; must differ from
+  # base_model in vocabulary, not just in size.
+  second_base_model: str = "google/gemma-4-e2b"
   jitter_sec: int = 180
   steps: int | None = None
   group_size: int = 8
@@ -93,6 +105,10 @@ class RunConfig:
   min_accuracy: float = 0.05
   weight_sync_strategy: str = ""
   extra: str = ""
+  # Per-job overrides for the *-x2 scenarios, layered over `extra`. Setting
+  # model.base_model in one of them also switches that job's tokenizer.
+  extra_a: str = ""
+  extra_b: str = ""
   host: str = "127.0.0.1"
   port: int | None = None
   uv_extra: str = "gpu"
@@ -317,6 +333,19 @@ def clean_cli_extra(extra: str) -> list[str]:
   return [token for token in shlex.split(extra) if not (token.startswith("weight_sync_strategy=") or token.startswith("jitter_sec="))]
 
 
+def _set_fft_delta_apply(env: dict[str, str]) -> None:
+  """FFT scenarios default to in-place delta patching, but an apply method
+  already in the environment (run_cluster_e2e.py's
+  --weight-sync-delta-apply-method) wins. OPEN_RL_IN_PLACE_DELTA forces the
+  in-place path in the sampler regardless of the method, so it is only set
+  when in-place is what was asked for."""
+  method = env.setdefault("OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD", "patch_in_place")
+  if method == "patch_in_place":
+    env["OPEN_RL_IN_PLACE_DELTA"] = "1"
+  else:
+    env.pop("OPEN_RL_IN_PLACE_DELTA", None)
+
+
 def examples_env(config: RunConfig) -> dict[str, str]:
   env = os.environ.copy()
   env["OPEN_RL_TMP_DIR"] = str(open_rl_tmp_dir(config))
@@ -329,8 +358,7 @@ def examples_env(config: RunConfig) -> dict[str, str]:
     env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = config.weight_sync_strategy
   if config.scenario.startswith("fft") or "fft" in config.scenario:
     env["OPEN_RL_FINE_TUNING_TYPE"] = "full"
-    env["OPEN_RL_IN_PLACE_DELTA"] = "1"
-    env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = "patch_in_place"
+    _set_fft_delta_apply(env)
   existing_path = env.get("PYTHONPATH", "")
   env["PYTHONPATH"] = f"examples:{existing_path}" if existing_path else "examples"
   return env
@@ -377,8 +405,30 @@ def run_command(command: list[str], env: dict[str, str] | None = None, watch: li
   return output
 
 
-def run_example(config: RunConfig, script: list[str], defaults: dict[str, str], watch: list[ManagedProcess] | None = None, prefix: str = "") -> str:
-  overrides = dict(item.split("=", 1) for item in shlex.split(config.extra))
+def parse_overrides(*specs: str) -> dict[str, str]:
+  """Merge `k=v ...` strings left to right; later specs win."""
+  overrides: dict[str, str] = {}
+  for spec in specs:
+    overrides.update(item.split("=", 1) for item in shlex.split(spec))
+  return overrides
+
+
+def job_overrides(config: RunConfig, job: str) -> dict[str, str]:
+  """`extra` plus the per-job `extra_a` / `extra_b` for job-a / job-b."""
+  per_job = {"job-a": config.extra_a, "job-b": config.extra_b}.get(job, "")
+  return parse_overrides(config.extra, per_job)
+
+
+def run_example(
+  config: RunConfig,
+  script: list[str],
+  defaults: dict[str, str],
+  watch: list[ManagedProcess] | None = None,
+  prefix: str = "",
+  overrides: dict[str, str] | None = None,
+) -> str:
+  if overrides is None:
+    overrides = parse_overrides(config.extra)
   args = [f"{key}={value}" for key, value in {**defaults, **overrides}.items()]
   return run_command(["uv", "--project", "examples", "run", "python", *script, *args], env=examples_env(config), watch=watch, prefix=prefix)
 
@@ -667,8 +717,7 @@ def run_gsm8k_rl_x4_mixed(config: RunConfig, base_url: str, watch: list[ManagedP
         env.pop("OPEN_RL_IN_PLACE_DELTA", None)
       else:
         env["OPEN_RL_FINE_TUNING_TYPE"] = "full"
-        env["OPEN_RL_IN_PLACE_DELTA"] = "1"
-        env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = "patch_in_place"
+        _set_fft_delta_apply(env)
 
       results[job] = run_command(
         ["uv", "--project", "examples", "run", "python", "-m", module_name, *args],
@@ -974,6 +1023,55 @@ def run_tiny_fft_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProc
   check_snapshot_interleaving(config)
 
 
+def run_tiny_rl_x2_families(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
+  """Two concurrent tiny RL jobs on base models from different families
+  (base_model and second_base_model), LoRA or FFT by scenario name.
+
+  One gateway, two vocabularies: anything that resolves a job's tokenizer,
+  parameter names or worker from a gateway-wide default instead of the job's
+  own metadata hands one job the other model's tokens. That does not crash
+  tiny_rl, the samples just turn into token soup and the reward stays at 0,
+  so each job must also earn a reward at least once."""
+  models = {"job-a": config.base_model, "job-b": config.second_base_model}
+  if len(set(models.values())) != 2:
+    raise RuntimeError(f"{config.scenario} needs two different base models, got {models}")
+  log_dirs = {job: Path(config.log_dir) / f"{config.scenario.replace('-', '_')}_{job}" for job in models}
+  results: dict[str, str | BaseException] = {}
+
+  def train(job: str) -> None:
+    try:
+      defaults = {"base_model": models[job], "base_url": base_url, "log_dir": str(log_dirs[job])}
+      if "fft" in config.scenario:
+        defaults["learning_rate"] = "1e-5"
+      if config.steps is not None:
+        defaults["steps"] = str(config.steps)
+      results[job] = run_example(config, ["examples/tiny/tiny_rl.py"], defaults, watch=watch, prefix=f"[{job}] ")
+    except BaseException as exc:
+      results[job] = exc
+
+  threads = [threading.Thread(target=train, args=(job,)) for job in models]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+
+  for job, result in sorted(results.items()):
+    if isinstance(result, BaseException):
+      raise RuntimeError(f"{config.scenario} {job} ({models[job]}) failed") from result
+
+  for job, model in models.items():
+    rows = [row for row in read_jsonl(log_dirs[job] / "metrics.jsonl") if row.get("phase") == "train"]
+    if not rows:
+      raise RuntimeError(f"{job} ({model}) logged no training steps in {log_dirs[job]}")
+    best = max(require_finite_metric(row, "mean_reward") for row in rows)
+    if best <= 0:
+      raise RuntimeError(
+        f"{job} ({model}) never earned a reward in {len(rows)} steps; its samples are most likely "
+        "token soup from the other model's tokenizer (check the gateway's per-model metadata)"
+      )
+    print(f"[training-e2e] {job} {model}: best mean_reward={best:.2f} over {len(rows)} steps")
+
+
 def read_jsonl(path: Path) -> list[dict]:
   if not path.exists() or path.stat().st_size == 0:
     raise RuntimeError(f"Expected {path} to exist and be non-empty")
@@ -1026,7 +1124,11 @@ def run_textsql(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -
 
 def run_textsql_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
   """Two concurrent Text-to-SQL FFT RL jobs against the same backend: each create_model spawns
-  its own trainer and dedicated sampler worker, and the accel timeslicer time-slices them."""
+  its own trainer and dedicated sampler worker, and the accel timeslicer time-slices them.
+
+  `extra_a` / `extra_b` override job-a / job-b separately (on top of `extra`), so
+  one run can compare two learning rates, or two base models when a job's
+  overrides set model.base_model; that job's tokenizer follows its base model."""
   results: dict[str, str | BaseException] = {}
 
   def train(job: str) -> None:
@@ -1034,12 +1136,15 @@ def run_textsql_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProce
       log_dir = Path(config.log_dir) / f"{config.scenario.replace('-', '_')}_{job}"
       if log_dir.exists():
         shutil.rmtree(log_dir)
+      overrides = job_overrides(config, job)
+      base_model = overrides.get("model.base_model", config.base_model)
+      print(f"[training-e2e] {job}: base_model={base_model} overrides={overrides}")
       defaults = {
         "phase": "rl_only",
         "base_url": base_url,
         "log_dir": str(log_dir),
-        "model.base_model": config.base_model,
-        "model.tokenizer_name": config.base_model,
+        "model.base_model": base_model,
+        "model.tokenizer_name": base_model,
         "model.rank": "16",
         "dataset.train_limit": "64",
         "dataset.rl_train_limit": "64",
@@ -1058,6 +1163,7 @@ def run_textsql_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProce
         defaults,
         watch=watch,
         prefix=f"[{job}] ",
+        overrides=overrides,
       )
     except BaseException as exc:
       results[job] = exc
@@ -1117,6 +1223,8 @@ def main() -> None:
       run_textsql_rl_x2(config, base_url, processes)
     elif config.scenario == "tiny-fft-rl-x2":
       run_tiny_fft_rl_x2(config, base_url, processes)
+    elif config.scenario in {"tiny-rl-x2-families", "tiny-fft-rl-x2-families"}:
+      run_tiny_rl_x2_families(config, base_url, processes)
     else:
       run_tiny(config, base_url, processes)
   finally:

@@ -43,6 +43,11 @@ def parse_datum(raw: dict[str, Any]) -> Datum:
   return Datum(model_input=tokens, loss_fn_inputs=loss_fn_inputs)
 
 
+def describe_requests(batch: list[dict[str, Any]]) -> str:
+  """`op:request_id` per request, matching the gateway's enqueue log line."""
+  return ", ".join(f"{r.get('op')}:{r.get('request_id')}" for r in batch)
+
+
 class TrainingRequestsProcessor(Protocol):
   store: RequestStore
 
@@ -188,7 +193,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
       batch_span.set_attribute("batch_size", len(batch))
       batch_span.set_attribute("model_id", model_id)
 
-      print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {model_id}")
+      print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {model_id}: {describe_requests(batch)}")
       for request in batch:
         target_model_id = request.get("adapter_id") or request.get("model_id") or model_id
         await self.process_request(request, target_model_id)
@@ -365,7 +370,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       batch_span.set_attribute("model_id", self.model_id)
 
       if training_reqs:
-        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}")
+        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}: {describe_requests(training_reqs)}")
         results = []
         save_ops = {"save_state", "save_weights", "save_weights_for_sampler"}
         gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]

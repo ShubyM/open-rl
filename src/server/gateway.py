@@ -208,6 +208,9 @@ async def enqueue(request: dict) -> str:
 
   active_set_id = await _resolve_active_set_id(request.get("model_id"))
   await store.put_request({**request, "trace_context": carrier}, active_set_id=active_set_id)
+  # One line per training request so a request that never reaches a worker can
+  # be traced end to end (the workers log the same id when they pop it).
+  print(f"[GATEWAY] enqueued op={request.get('op')} request_id={request_id} model_id={request.get('model_id')} active_set={active_set_id}")
   return request_id
 
 
@@ -447,15 +450,23 @@ async def create_model_from_state(
 
 @app.post("/api/v1/get_info")
 async def get_info(req: dict):
-  """ServiceClient — model metadata for the training client."""
-  model_name = get_default_model_name()
+  """ServiceClient — model metadata for the training client.
+
+  TrainingClient.get_tokenizer() loads whatever tokenizer this names, so it
+  has to be the model's own base model; BASE_MODEL is only the fallback for
+  an id we have no metadata for. Answering with the gateway default sent a
+  Gemma job Qwen's tokenizer and every sample came back as token soup.
+  """
+  model_id = req.get("model_id")
+  meta = await store.get_model_metadata(base_model_id_from_sampling_ref(model_id) or model_id) if model_id else None
+  model_name = (meta or {}).get("base_model") or get_default_model_name()
   if not model_name:
     return JSONResponse(status_code=404, content={"error": "No base model is configured"})
   # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
   # even when this process is running a full fine-tuning worker.
   result = {
     "model_data": {"arch": "unknown", "model_name": model_name, "tokenizer_id": model_name},
-    "model_id": req.get("model_id", "model-live-123"),
+    "model_id": model_id or "model-live-123",
     "is_lora": True,
     "lora_rank": 16,
     "model_name": model_name,

@@ -36,19 +36,17 @@ def split_stop(stop: str | Sequence[str] | Sequence[int] | None) -> tuple[list[s
   return (strings or None), (token_ids or None)
 
 
-def gpu_memory_utilization(device_bytes: int | None = None) -> float:
-  """vLLM's share of the device. An explicit VLLM_GPU_MEMORY_UTILIZATION wins;
-  otherwise the budget the launcher sized this worker for
-  (OPEN_RL_ACCELERATOR_MEMORY, in bytes) over the device actually present,
-  capped at 0.90; with neither, 0.90."""
+def gpu_memory_utilization() -> float:
+  """vLLM's share of the device: an explicit VLLM_GPU_MEMORY_UTILIZATION, else 0.90.
+
+  OPEN_RL_ACCELERATOR_MEMORY is deliberately not consulted. It is the placement
+  claim the scheduler sized this worker for, not a runtime cap: workers that
+  share an accelerator are time-sliced, so whichever one holds the device may
+  use all of it. Sizing vLLM from the claim starved the sampler of KV cache on
+  large devices and made Gemma-4's first engine init fail when the cold
+  torch.compile transient did not fit in the claim.
+  """
   explicit = os.getenv("VLLM_GPU_MEMORY_UTILIZATION")
   if explicit:
     return float(explicit)
-  budget = os.getenv("OPEN_RL_ACCELERATOR_MEMORY")
-  if not budget:
-    return 0.90
-  if device_bytes is None:
-    import torch
-
-    device_bytes = torch.cuda.mem_get_info()[1]
-  return min(int(budget) / device_bytes, 0.90)
+  return 0.90

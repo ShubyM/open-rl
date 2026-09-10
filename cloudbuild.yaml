@@ -29,20 +29,22 @@ options:
 timeout: 3600s
 
 steps:
+  # buildx with the docker-container driver so the layer cache can live in a
+  # dedicated registry ref. The inline cache (BUILDKIT_INLINE_CACHE) embedded
+  # in :latest is lossy: a build that was itself fully cached publishes a
+  # manifest the next build cannot use, and the CUDA image rebuilds from
+  # scratch. mode=max records every layer, including intermediate ones, so an
+  # unchanged Dockerfile always hits.
   - name: gcr.io/cloud-builders/docker
-    env: ['DOCKER_BUILDKIT=1']
+    args: [buildx, create, --use, --driver, docker-container]
+  - name: gcr.io/cloud-builders/docker
     args:
+      - buildx
       - build
       - --file=${_DOCKERFILE}
       - --tag=${_IMAGE}:${_TAG}
       - --tag=${_IMAGE}:latest
-      # Warm-start from the previous build. BUILDKIT_INLINE_CACHE embeds the
-      # cache manifest in the pushed image so :latest is usable as --cache-from
-      # without a separate cache repository.
-      - --cache-from=${_IMAGE}:latest
-      - --build-arg=BUILDKIT_INLINE_CACHE=1
+      - --cache-from=type=registry,ref=${_IMAGE}:buildcache
+      - --cache-to=type=registry,ref=${_IMAGE}:buildcache,mode=max
+      - --push
       - .
-
-images:
-  - '${_IMAGE}:${_TAG}'
-  - '${_IMAGE}:latest'

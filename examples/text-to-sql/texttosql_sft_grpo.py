@@ -56,6 +56,18 @@ LossValue = float | int
 
 
 # *** Training phases (SFT + PPO+KL RL) ***
+async def bounded(awaitable: Any, what: str) -> Any:
+  """Awaits a backend round trip, failing the run instead of waiting on a lost request.
+
+  The tinker client retries a stuck request for two hours by default; a
+  training step here takes seconds to a few minutes, so a much shorter bound
+  turns a request the backend dropped into a clear error naming the step."""
+  try:
+    return await asyncio.wait_for(awaitable, timeout=config.progress_timeout_sec)
+  except TimeoutError as exc:
+    raise RuntimeError(f"No result for {what} within {config.progress_timeout_sec}s; the request was probably lost in the backend") from exc
+
+
 async def run_sft_phase(
   trainer: tinker.TrainingClient,
   train_examples: list[dict[str, Any]],
@@ -80,8 +92,8 @@ async def run_sft_phase(
     fwdbwd_future = await trainer.forward_backward_async(datums, "cross_entropy")
     optim_future = await trainer.optim_step_async(types.AdamParams(learning_rate=config.sft.learning_rate, grad_clip_norm=config.grad_clip_norm))
 
-    fwdbwd = await fwdbwd_future
-    await optim_future
+    fwdbwd = await bounded(fwdbwd_future, f"forward_backward sft step {local_step}")
+    await bounded(optim_future, f"optim_step sft step {local_step}")
 
     loss = float(fwdbwd.metrics.get("loss:sum", 0.0)) / max(1, active_tokens)
     losses.append(loss)
@@ -119,14 +131,16 @@ async def run_rl_phase(
   sampling_params = types.SamplingParams(max_tokens=config.rl.max_tokens, temperature=config.rl.temperature)
   for local_step in range(1, config.rl.steps + 1):
     # --- Rollout: save weights, sample N completions per prompt, score them ---
-    sampler = await trainer.save_weights_and_get_sampling_client_async(name=f"texttosql_rl_rollout_s{local_step}")
+    sampler = await bounded(
+      trainer.save_weights_and_get_sampling_client_async(name=f"texttosql_rl_rollout_s{local_step}"), f"save_weights step {local_step}"
+    )
     examples = next(batches)
 
     futures = []
     for ex in examples:
       prompt = types.ModelInput.from_ints(tokens=ex["prompt_tokens"])
       futures.append(sampler.sample_async(prompt=prompt, num_samples=config.rl.samples_per_prompt, sampling_params=sampling_params))
-    responses = await asyncio.gather(*futures)
+    responses = await bounded(asyncio.gather(*futures), f"sampling step {local_step}")
 
     datums: list[types.Datum] = []
     rollouts: list[dict[str, Any]] = []
@@ -165,8 +179,8 @@ async def run_rl_phase(
       datums, config.rl.loss_fn, loss_fn_config={"clip_range": config.rl.clip_range, "kl_coeff": config.rl.kl_coeff}
     )
     optim_future = await trainer.optim_step_async(types.AdamParams(learning_rate=config.rl.learning_rate, grad_clip_norm=config.grad_clip_norm))
-    fwdbwd = await fwdbwd_future
-    await optim_future
+    fwdbwd = await bounded(fwdbwd_future, f"forward_backward step {local_step}")
+    await bounded(optim_future, f"optim_step step {local_step}")
 
     # --- Log: best rollout sample, per-step metrics, periodic eval ---
     best = max(rollouts, key=lambda r: (r["reward"], r["execution_match"], r["compile"]))
@@ -488,6 +502,9 @@ class Config:
   base_url: str = os.getenv("TINKER_BASE_URL", BASE_URL)
   seed: int = 30
   grad_clip_norm: float = 0.3
+  # Fail the run if a backend round trip takes longer than this; a step takes
+  # seconds to a few minutes, so 15 minutes means a request is lost or stuck.
+  progress_timeout_sec: int = 15 * 60
   log_dir: str = str(LOG_DIR)
   sft_adapter_name: str | None = None
   dataset: DatasetConfig = chz.field(default_factory=DatasetConfig)

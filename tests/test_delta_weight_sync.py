@@ -61,7 +61,8 @@ class DeltaWeightSyncTest(unittest.TestCase):
     self.assertIn("delta.indices_flat", sparse_delta)
     self.assertIn("delta.values_flat", sparse_delta)
     self.assertEqual(sparse_delta["delta.indices_flat"].numel(), 2)
-    self.assertEqual(sparse_delta["delta.indices_flat"].dtype, torch.int32)
+    # int64: Gemma 4's per-layer embedding table exceeds 2**31 elements.
+    self.assertEqual(sparse_delta["delta.indices_flat"].dtype, torch.int64)
 
     # 3. Verify Lossless Selective Overwrite reproduces exact target W1
     simulated_sampler_weight = orig_w0.clone()

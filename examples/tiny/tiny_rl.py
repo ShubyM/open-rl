@@ -99,7 +99,11 @@ def main(config: Config) -> None:
 
   try:
     tokenizer = trainer.get_tokenizer()
-    prompt_tokens = tokenizer.encode(config.prompt, add_special_tokens=False)
+    # The gateway names this tokenizer; a wrong one turns every sample below into token soup.
+    print(f"[tiny-rl] base_model={config.base_model} tokenizer={getattr(tokenizer, 'name_or_path', type(tokenizer).__name__)}")
+    # Keep the tokenizer's special tokens: Gemma degenerates into repeated
+    # fragments without its BOS token, and Qwen tokenizers add nothing here.
+    prompt_tokens = tokenizer.encode(config.prompt, add_special_tokens=True)
     prompt = types.ModelInput.from_ints(tokens=prompt_tokens)
     sampling_params = types.SamplingParams(max_tokens=config.max_tokens, temperature=config.temperature)
 
@@ -114,6 +118,7 @@ def main(config: Config) -> None:
         if not tokens or len(tokens) != len(logprobs):
           raise RuntimeError(f"Sampler must return aligned tokens and logprobs, got {len(tokens)} tokens and {len(logprobs)} logprobs")
         rewards.append(1.0 if config.target in tokenizer.decode(tokens) else 0.0)
+      print(f"[tiny-rl] step={step:02d} sample[0]={tokenizer.decode(list(sequences[0].tokens))[:160]!r}")
 
       # Group-centered advantages; when every reward ties, fall back to a uniform
       # positive advantage so the update still exercises a nonzero gradient.
