@@ -17,6 +17,14 @@ body {
   --blue: var(--accent);
   --purple: light-dark(#7a60bb, #ad98dc);
   --green: light-dark(#357e70, #76b3a2);
+  --hue-0: light-dark(#416bc3, #83a9ff);
+  --hue-1: light-dark(#357e70, #76b3a2);
+  --hue-2: light-dark(#7a60bb, #ad98dc);
+  --hue-3: light-dark(#b0682a, #e0a46a);
+  --hue-4: light-dark(#a8496b, #dd8fae);
+  --hue-5: light-dark(#2f8a9a, #7cc3d0);
+  --hue-6: light-dark(#8a8a2c, #c9c96d);
+  --hue-7: light-dark(#6b6f7a, #a4a9b5);
   --status-success: light-dark(#27725c, #83baa5);
   --status-warning: light-dark(#895e1e, #ccb079);
   --status-error: light-dark(#ab4249, #da949a);
@@ -233,20 +241,60 @@ body {
   border: 0;
   border-radius: 2px;
   text-align: left;
-  background: color-mix(in srgb, var(--allocation-color) 19%, var(--ground));
+  background: color-mix(in srgb, var(--allocation-color) 62%, var(--ground));
 }
-#orl-design-lab .capacity-allocation.sql {
-  --allocation-color: var(--purple);
-}
-#orl-design-lab .capacity-allocation.eval {
-  --allocation-color: var(--green);
-}
+#orl-design-lab .hue-0 { --allocation-color: var(--hue-0); }
+#orl-design-lab .hue-1 { --allocation-color: var(--hue-1); }
+#orl-design-lab .hue-2 { --allocation-color: var(--hue-2); }
+#orl-design-lab .hue-3 { --allocation-color: var(--hue-3); }
+#orl-design-lab .hue-4 { --allocation-color: var(--hue-4); }
+#orl-design-lab .hue-5 { --allocation-color: var(--hue-5); }
+#orl-design-lab .hue-6 { --allocation-color: var(--hue-6); }
+#orl-design-lab .hue-7 { --allocation-color: var(--hue-7); }
 #orl-design-lab .capacity-allocation:hover {
-  background: color-mix(in srgb, var(--allocation-color) 27%, var(--ground));
+  background: color-mix(in srgb, var(--allocation-color) 80%, var(--ground));
 }
 #orl-design-lab .capacity-allocation.selected {
-  background: color-mix(in srgb, var(--allocation-color) 31%, var(--ground));
-  outline: 1px solid var(--allocation-color);
+  background: var(--allocation-color);
+  outline: 1px solid var(--ink);
+  outline-offset: 1px;
+}
+#orl-design-lab .allocation-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 8px;
+}
+#orl-design-lab .legend-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 8px 3px 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+#orl-design-lab .legend-entry:hover {
+  background: var(--hover);
+}
+#orl-design-lab .legend-entry[aria-pressed="true"] {
+  border-color: var(--control-border);
+  background: var(--selected);
+}
+#orl-design-lab .legend-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--allocation-color);
+  flex: none;
+}
+#orl-design-lab .legend-meta {
+  color: var(--dim);
+  font-size: 11px;
 }
 #orl-design-lab .allocation-name {
   overflow: hidden;

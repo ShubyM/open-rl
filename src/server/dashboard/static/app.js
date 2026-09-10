@@ -33,10 +33,16 @@ let state,
   logRequest = 0,
   logTimer,
   logCursor = null;
-const family = (id) =>
-  ["math", "sql", "eval"][
-    Array.from(id || "").reduce((s, c) => s + c.charCodeAt(0), 0) % 3
-  ];
+const PALETTE_SIZE = 8;
+// One hue per runtime, so a job keeps its color on every node and in the
+// legend. Current placements take the first hues in a stable order; anything
+// only seen in history falls back to a hash.
+const family = (id) => {
+  const ids = [...new Set((state?.placements || []).map((p) => p.runtime_id))].sort();
+  const index = ids.indexOf(id);
+  const hash = Array.from(id || "").reduce((s, c) => s + c.charCodeAt(0), 0);
+  return `hue-${(index >= 0 ? index : hash) % PALETTE_SIZE}`;
+};
 const route = () => location.hash.slice(1).split("/").map(decodeURIComponent);
 async function get(url, signal) {
   const response = await fetch(url, { cache: "no-store", signal });
@@ -124,7 +130,14 @@ function detail(placement) {
   ]
     .filter(Boolean)
     .join(" · ");
-  return `<section class="allocation-expansion" id="placement-detail"><div class="allocation-detail-head"><h2>${run ? `<a href="#run/${encode(run.run_id)}/overview">${escape(title)} ↗</a>` : escape(title)}</h2></div>
+  const neighbours = state.placements.filter((p) => p.node === placement.node);
+  const legend = (neighbours.some((p) => p.id === placement.id) ? neighbours : [placement, ...neighbours])
+    .map(
+      (p) =>
+        `<button type="button" class="legend-entry ${family(p.runtime_id)}" data-placement="${escape(p.id)}" aria-pressed="${p.id === placement.id}"><span class="legend-swatch"></span><span class="legend-name">${escape(p.label)}</span><span class="legend-meta">${escape({ trainer: "trainer", sampler: "sampler" }[p.role] || "process")} · ${p.device_count} GPU${p.device_count === 1 ? "" : "s"}</span></button>`,
+    )
+    .join("");
+  return `<section class="allocation-expansion" id="placement-detail"><div class="allocation-detail-head"><h2>${run ? `<a href="#run/${encode(run.run_id)}/overview">${escape(title)} ↗</a>` : escape(title)}</h2><div class="allocation-legend" aria-label="Allocations on this node">${legend}</div></div>
     <div class="allocation-device-picker" aria-label="GPU selection">${button("All GPUs", `data-device="all" aria-pressed="${device === "all"}"`)}${placement.devices.map((id) => button(devices.find((d) => d.id === id)?.name || id.split("/").at(-1), `data-device="${escape(id)}" aria-pressed="${device === id}"`)).join("")}</div>
     <div><div id="gpu-chart"></div><p id="gpu-status" class="muted" role="status"></p>${run?.shared_runtime ? '<p class="muted">Shared LoRA runtime</p>' : ""}</div>
     <div><p class="muted">GPU memory</p><p id="gpu-memory">—</p><p class="muted">Run MFU</p><p id="gpu-mfu">—</p></div></section>`;
@@ -254,10 +267,10 @@ function nodes() {
               p.devices.some((d) => !devices.find((n) => n.id === d)),
           );
           const nodeSegments = segments.filter((p) => p.node === node.name);
-          // Shared seats put several allocations on one GPU at once. Each gets
-          // its own sub-lane so bars never paint over each other's text.
+          // Shared seats put several allocations on one GPU at once. They split
+          // the GPU row into stripes; the legend below names them.
           const slotOf = new Map();
-          const slotCounts = devices.map((device) => {
+          const slotCount = devices.map((device) => {
             const ends = [];
             nodeSegments
               .filter((p) => p.devices.includes(device.id))
@@ -270,7 +283,6 @@ function nodes() {
               });
             return Math.max(1, ends.length);
           });
-          const laneTops = slotCounts.reduce((tops, count, i) => [...tops, tops[i] + count * height], [0]);
           const bars = nodeSegments
             .flatMap((p) => {
               const indexes = p.devices
@@ -283,14 +295,20 @@ function nodes() {
                 if (last && last.at(-1) === i - 1) last.push(i);
                 else groups.push([i]);
               });
-              return groups.map(
-                (group) =>
-                  `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" aria-label="${escape(p.label)}, ${group.length} GPUs on ${escape(node.name)}" style="left:${Math.max(0, ((p.start - start) / duration) * 100)}%;width:${Math.max(0, ((Math.min(now, p.end) - Math.max(start, p.start)) / duration) * 100)}%;top:${laneTops[group[0]] + (slotOf.get(`${p.key}:${devices[group[0]].id}`) || 0) * height + 2}px;height:${group.length === 1 ? height - 4 : laneTops[group.at(-1) + 1] - laneTops[group[0]] - 4}px"><span class="allocation-name">${escape(p.label)}${p.role ? " · " + escape(p.role) : ""}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`,
-              );
+              return groups.map((group) => {
+                const first = group[0];
+                const stripes = group.length === 1 ? slotCount[first] : 1;
+                const stripe = height / stripes;
+                const slot = group.length === 1 ? slotOf.get(`${p.key}:${devices[first].id}`) || 0 : 0;
+                const top = first * height + slot * stripe + (stripes > 1 ? 1 : 2);
+                const size = group.length === 1 ? stripe - (stripes > 1 ? 2 : 4) : group.length * height - 4;
+                const title = `${p.label}${p.role ? " · " + p.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}`;
+                return `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" title="${escape(title)}" aria-label="${escape(title)} on ${escape(node.name)}" style="left:${Math.max(0, ((p.start - start) / duration) * 100)}%;width:${Math.max(0, ((Math.min(now, p.end) - Math.max(start, p.start)) / duration) * 100)}%;top:${top}px;height:${size}px"></button>`;
+              });
             })
             .join("");
           return `<div class="node-placement-group"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)} · ${nodeSelection.end === null ? "Current node status" : "At selected range end"}" aria-label="${escape(accelerator)}, ${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span><span class="claim-label">${escape(claimLabel)}</span></div><div>
-        ${devices.length ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-template-rows:${slotCounts.map((count) => `${count * height}px`).join(" ")}">${devices.map((d) => `<span title="${escape(d.id)}">${escape(d.name)}</span>`).join("")}</div><div class="capacity-track" style="height:${laneTops.at(-1)}px;--gpu-lane-height:${height}px">${gaps}${bars}</div></div>` : ""}
+        ${devices.length ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(d.name)}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${gaps}${bars}</div></div>` : ""}
         ${unmapped.map((p) => `<button type="button" class="capacity-allocation unknown-mapping ${family(p.runtime_id)}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}"><span class="allocation-name">${escape(p.label)}</span><span class="allocation-count">${p.device_count} GPUs</span></button>`).join("")}
         ${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : ""}
         ${!bars && !placements.length && !node.gpu_capacity ? empty("No GPUs") : ""}</div><span class="node-duty" title="GPU allocation time over the selected range; unavailable when observations or device mappings are incomplete">${duty(node)}</span></div>${current ? detail(current) : ""}</div>`;
