@@ -23,6 +23,7 @@ from typing import Any, cast
 import chz
 import tinker
 from tinker import types
+from tinker.lib.retry_handler import RetryConfig
 from tinker_cookbook.utils import ml_log
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from utils.helpers import (
@@ -488,6 +489,9 @@ class Config:
   base_url: str = os.getenv("TINKER_BASE_URL", BASE_URL)
   seed: int = 30
   grad_clip_norm: float = 0.3
+  # Fail the run if no request makes progress for this long; a step takes
+  # seconds to a few minutes, so 15 minutes means something is lost or stuck.
+  progress_timeout_sec: int = 15 * 60
   log_dir: str = str(LOG_DIR)
   sft_adapter_name: str | None = None
   dataset: DatasetConfig = chz.field(default_factory=DatasetConfig)
@@ -539,6 +543,9 @@ if __name__ == "__main__":
     api_key=os.getenv("TINKER_API_KEY", "tml-dummy-key"),
     base_url=config.base_url,
     default_headers=default_headers,
+    # A request the backend loses would otherwise keep the run waiting for the
+    # SDK's two-hour default before it fails.
+    retry_config=RetryConfig(progress_timeout=config.progress_timeout_sec),
   )
   tokenizer = AutoTokenizer.from_pretrained(config.model.tokenizer_name)
 

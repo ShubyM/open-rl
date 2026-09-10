@@ -208,6 +208,9 @@ async def enqueue(request: dict) -> str:
 
   active_set_id = await _resolve_active_set_id(request.get("model_id"))
   await store.put_request({**request, "trace_context": carrier}, active_set_id=active_set_id)
+  # One line per training request so a request that never reaches a worker can
+  # be traced end to end (the workers log the same id when they pop it).
+  print(f"[GATEWAY] enqueued op={request.get('op')} request_id={request_id} model_id={request.get('model_id')} active_set={active_set_id}")
   return request_id
 
 
