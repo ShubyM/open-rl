@@ -50,3 +50,44 @@ export function elapsedTime(run, observedAt) {
     ? `${minutes}m`
     : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
+
+// morph patches a container toward new markup instead of replacing it, so a
+// 10-second refresh keeps scroll position, focus, open panels, and the charts
+// the chart module owns. Elements that carry the metric-chart class are
+// JS-rendered and are left alone apart from their data attributes.
+export function morph(container, html) {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  morphChildren(container, template.content);
+}
+function morphChildren(from, to) {
+  const current = Array.from(from.childNodes);
+  const next = Array.from(to.childNodes);
+  for (let i = 0; i < Math.max(current.length, next.length); i++) {
+    if (!next[i]) current[i].remove();
+    else if (!current[i]) from.appendChild(next[i]);
+    else morphNode(current[i], next[i], from);
+  }
+}
+function morphNode(node, next, parent) {
+  if (node.nodeType !== next.nodeType || (node.nodeType === 1 && node.tagName !== next.tagName)) {
+    parent.replaceChild(next, node);
+    return;
+  }
+  if (node.nodeType !== 1) {
+    if (node.data !== next.data) node.data = next.data;
+    return;
+  }
+  const chart = node.classList.contains("metric-chart") && !next.classList.contains("metric-chart");
+  syncAttributes(node, next, chart);
+  if (!chart) morphChildren(node, next);
+}
+function syncAttributes(node, next, keepChartAttributes) {
+  const owned = (name) => keepChartAttributes && (name === "class" || name === "data-chart-tone");
+  for (const { name } of Array.from(node.attributes)) {
+    if (!next.hasAttribute(name) && !owned(name)) node.removeAttribute(name);
+  }
+  for (const { name, value } of Array.from(next.attributes)) {
+    if (!owned(name) && node.getAttribute(name) !== value) node.setAttribute(name, value);
+  }
+}

@@ -4,7 +4,7 @@ import {
   bindTimeRange,
 } from "./time-range.js";
 import { runIncidents } from "./timeline.js";
-import { escape, encode, empty, button, runStatus } from "./ui.js";
+import { escape, encode, empty, button, runStatus, morph } from "./ui.js";
 import { runs, scheduler, health, experiments } from "./views.js";
 import { renderMetricChart, disposeMetricCharts } from "./charts.js";
 
@@ -159,7 +159,7 @@ function wantHolds(placements, start, end) {
     if (entry?.pending || (entry?.data && Date.now() - entry.fetchedAt < metricFreshFor)) return;
     metricData(url)
       .then(() => {
-        if (route()[0] === "nodes") render({ preserveAllocation: true });
+        if (route()[0] === "nodes") render();
       })
       .catch(() => {});
   });
@@ -269,7 +269,7 @@ function nodes() {
         });
     }),
   );
-  content.innerHTML = `<div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>${timeRangeControl(nodeSelection, observed)}</div>${missing.length ? `<p class="history-coverage muted">Hatched areas have no allocation observations.</p>` : ""}${!state.cluster.available ? empty(state.cluster.error || "Kubernetes unavailable") : ""}
+  morph(content, `<div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>${timeRangeControl(nodeSelection, observed)}</div>${missing.length ? `<p class="history-coverage muted">Hatched areas have no allocation observations.</p>` : ""}${!state.cluster.available ? empty(state.cluster.error || "Kubernetes unavailable") : ""}
     <div class="node-time-header"><span>Node</span><div class="node-axis">${[0, 1, 2, 3].map((tick) => `<span>${nodeTime(start + (duration * tick) / 3)}</span>`).join("")}</div><span class="node-duty" title="GPU allocation time divided by capacity over the selected range">Duty</span></div>
     ${
       state.cluster.nodes
@@ -369,7 +369,7 @@ function nodes() {
         ${!bars && !placements.length && !node.gpu_capacity ? empty("No GPUs") : ""}</div><span class="node-duty" title="GPU allocation time over the selected range; unavailable when observations or device mappings are incomplete">${duty(node)}</span></div>${current ? detail(current) : ""}</div>`;
         })
         .join("") || empty("No nodes available")
-    }`;
+    }`);
 }
 function paintGpu(view) {
   if (gpuView !== view || !view.element.isConnected || !view.data) return;
@@ -640,7 +640,7 @@ async function loadLogs(id, more = false) {
 }
 let experimentData = null;
 function experimentsPage() {
-  content.innerHTML = experiments(experimentData);
+  morph(content, experiments(experimentData));
   paintExperiments();
   const url = "/api/v1/dashboard/experiments";
   const entry = metricCache.get(url);
@@ -649,12 +649,12 @@ function experimentsPage() {
     .then((data) => {
       experimentData = data;
       if (route()[0] === "experiments") {
-        content.innerHTML = experiments(experimentData);
+        morph(content, experiments(experimentData));
         paintExperiments();
       }
     })
     .catch((error) => {
-      if (route()[0] === "experiments" && !experimentData) content.innerHTML = experiments({ error: error.message, runs: [] });
+      if (route()[0] === "experiments" && !experimentData) morph(content, experiments({ error: error.message, runs: [] }));
     });
 }
 function paintExperiments() {
@@ -675,55 +675,43 @@ function paintExperiments() {
     });
   });
 }
-function render({ preserveAllocation = false } = {}) {
+let renderedPage = null;
+function render() {
   if (!state) return;
   ++logRequest;
   const [page, id, tab] = route();
-  const retained =
-    preserveAllocation && page === "nodes" && gpuView?.id === expanded
-      ? content.querySelector(".allocation-expansion")
-      : null;
-  retained?.remove();
-  disposeMetricCharts(content);
-  if (!retained) gpuView = null;
-  runMetricView = null;
   const currentPage =
     !page || ["run", "runs"].includes(page)
       ? "overview"
       : page === "diagnostics"
         ? "health"
         : page;
+  // A page change starts clean. Within a page the markup is patched in place,
+  // so polling never resets scroll, focus, or an open allocation panel.
+  if (currentPage !== renderedPage || page === "run") {
+    disposeMetricCharts(content);
+    gpuView = null;
+    runMetricView = null;
+    if (currentPage !== renderedPage) content.innerHTML = "";
+    renderedPage = currentPage;
+  }
   root.querySelectorAll(".appbar nav a").forEach((link) => {
     if (link.hash === `#${currentPage}`)
       link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   });
   if (!page || page === "overview" || page === "runs")
-    content.innerHTML = runs(state);
-  else if (page === "scheduler") content.innerHTML = scheduler(state);
+    morph(content, runs(state));
+  else if (page === "scheduler") morph(content, scheduler(state));
   else if (page === "run") runPage(id, tab);
   else if (page === "diagnostics") {
     location.replace("#health");
     return;
-  } else if (page === "health") content.innerHTML = health(state);
+  } else if (page === "health") morph(content, health(state));
   else if (page === "experiments") experimentsPage();
   else {
     nodes();
-    const replacement = document.getElementById("placement-detail");
-    if (retained && replacement) {
-      retained.querySelector(".allocation-detail-head").innerHTML =
-        replacement.querySelector(".allocation-detail-head").innerHTML;
-      const nextDevices = replacement.querySelector(
-        ".allocation-device-picker",
-      ).innerHTML;
-      const picker = retained.querySelector(".allocation-device-picker");
-      if (picker.innerHTML !== nextDevices) picker.innerHTML = nextDevices;
-      replacement.replaceWith(retained);
-    } else if (retained) {
-      disposeMetricCharts(retained);
-      gpuView = null;
-    }
-    if (expanded) loadGpu(expanded, Boolean(retained && replacement));
+    if (expanded) loadGpu(expanded, true);
   }
 }
 root.addEventListener("click", (event) => {
@@ -823,7 +811,7 @@ async function refresh() {
         closedTimePicker ||
         focusedDevice)
     ) {
-      render({ preserveAllocation: true });
+      render();
       if (closedTimePicker)
         root.querySelector(`[data-node-time="${focusedTimeAction}"]`)?.focus();
       else if (focusedDevice)

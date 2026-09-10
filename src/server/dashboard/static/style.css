@@ -232,8 +232,9 @@ body {
 }
 #orl-design-lab .capacity-allocation {
   --allocation-color: var(--blue);
-  overflow: hidden;
   position: absolute;
+  /* A just-placed allocation is a sliver; keep it clickable. */
+  min-width: 8px;
   display: flex;
   flex-direction: row;
   align-items: center;
@@ -265,6 +266,13 @@ body {
 #orl-design-lab .capacity-allocation.shared {
   background: color-mix(in srgb, var(--line) 55%, var(--ground));
   padding: 0;
+  overflow: hidden;
+}
+#orl-design-lab .capacity-allocation::after {
+  /* Hit area beyond the painted bar, so thin bars take a click. */
+  content: "";
+  position: absolute;
+  inset: -4px -6px;
 }
 #orl-design-lab .hold {
   position: absolute;
