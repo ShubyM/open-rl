@@ -67,10 +67,11 @@ TRAINER_DEVICE_BYTES_PER_PARAM = {"full": 8, "lora": 2}
 TRAINER_DEVICE_RESERVE_BYTES = 4 * GIB
 # Sampler on the device: bf16 weights, vLLM's activation peak and CUDA graphs,
 # LoRA slot buffers (max_loras 8, rank 64) for a LoRA sampler, and a KV cache
-# sized for SAMPLER_KV_TOKENS. The budget is exactly what vLLM is handed, so
-# whatever the overheads do not use becomes KV cache. Overheads measured on
-# the live samplers: activation peak 0.5 GiB at 0.6B and 1.4 GiB at 8B; LoRA
-# slots 1.05 GiB at 0.6B and 2.9 GiB at 8B.
+# sized for SAMPLER_KV_TOKENS. This is a placement claim: it decides which
+# device the sampler may land on, not how much of it vLLM uses (see
+# vllm_options.gpu_memory_utilization). Overheads measured on the live
+# samplers: activation peak 0.5 GiB at 0.6B and 1.4 GiB at 8B; LoRA slots
+# 1.05 GiB at 0.6B and 2.9 GiB at 8B.
 SAMPLER_WEIGHT_BYTES_PER_PARAM = 2
 SAMPLER_OVERHEAD_BYTES = GIB // 2
 SAMPLER_OVERHEAD_BYTES_PER_PARAM = 0.125
