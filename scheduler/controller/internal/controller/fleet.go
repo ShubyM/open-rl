@@ -59,6 +59,20 @@ func (r *WorkloadReconciler) readFleet(ctx context.Context) (*placement.Fleet, e
 	fleet := placement.NewFleet()
 	fleet.Nodes = r.poolsFrom(ctx, slices.Items, nodes.Items)
 
+	// kube-scheduler admits a pod against allocatable minus every pod already
+	// on the node, not just the ones this controller placed. Reserving the
+	// rest here keeps the host-memory fit honest, so a shared seat is never
+	// booked on a node whose remaining memory kube-scheduler will refuse.
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods); err != nil {
+		return nil, fmt.Errorf("list pods: %w", err)
+	}
+	for node, reserved := range foreignHostBytes(pods.Items, r.Namespace) {
+		if pool, ok := fleet.Nodes[node]; ok {
+			pool.HostReservedBytes = reserved
+		}
+	}
+
 	var claims resourcev1.ResourceClaimList
 	if err := r.List(ctx, &claims, client.InNamespace(r.Namespace), client.MatchingLabels{LabelManaged: "true"}); err != nil {
 		return nil, fmt.Errorf("list resourceclaims: %w", err)
@@ -156,6 +170,42 @@ func (r *WorkloadReconciler) poolsFrom(ctx context.Context, slices []resourcev1.
 		pools[node.Name] = pool
 	}
 	return pools
+}
+
+// foreignHostBytes sums, per node, the memory requests of pods this
+// controller did not place: anything outside the worker namespace, and
+// anything in it not bound to one of our claims. Worker pods are already on
+// the ledger as seats. Finished pods hold nothing. The request follows
+// kube-scheduler's arithmetic: the larger of the containers' sum and any
+// single init container, plus the pod overhead.
+func foreignHostBytes(pods []corev1.Pod, namespace string) map[string]int64 {
+	reserved := map[string]int64{}
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Spec.NodeName == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if pod.Namespace == namespace && pod.Labels[LabelClaim] != "" {
+			continue
+		}
+		reserved[pod.Spec.NodeName] += podHostRequestBytes(pod)
+	}
+	return reserved
+}
+
+func podHostRequestBytes(pod *corev1.Pod) int64 {
+	var containers, init int64
+	for i := range pod.Spec.Containers {
+		containers += pod.Spec.Containers[i].Resources.Requests.Memory().Value()
+	}
+	for i := range pod.Spec.InitContainers {
+		init = max(init, pod.Spec.InitContainers[i].Resources.Requests.Memory().Value())
+	}
+	total := max(containers, init)
+	if pod.Spec.Overhead != nil {
+		total += pod.Spec.Overhead.Memory().Value()
+	}
+	return total
 }
 
 // latestCompletePools filters slices to the latest complete generation of

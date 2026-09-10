@@ -799,6 +799,72 @@ func TestReconcileDoesNotShareBeyondHostMemory(t *testing.T) {
 	}
 }
 
+// Pods this controller did not place still draw on the node's allocatable
+// memory. A shared seat that ignores them is one kube-scheduler refuses, so
+// the fit reserves their requests up front.
+func TestReconcileReservesForeignPodMemoryBeforeSharing(t *testing.T) {
+	// 100Gi each on a 340Gi node would share, until a 200Gi system pod is
+	// there first.
+	foreign := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "dcgm-exporter", Namespace: "kube-system"},
+		Spec: corev1.PodSpec{
+			NodeName: testNode,
+			Containers: []corev1.Container{{
+				Name:      "exporter",
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("200Gi")}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	r := newReconciler(t, append(enabledNode(), foreign,
+		hungryWorker("w-a", "model-a", "100Gi"), hungryWorker("w-b", "model-b", "100Gi"))...)
+
+	settle(t, r, "w-a")
+	allocateClaim(t, r, claimOf(t, r, "w-a"))
+	settle(t, r, "w-b")
+	dedicated := claimOf(t, r, "w-b")
+
+	fallBackToSharing(t, r, "w-b")
+	if got := claimOf(t, r, "w-b"); got != dedicated {
+		t.Errorf("w-b moved to %q, but 200Gi of foreign pods leave no room beside w-a's 100Gi on a 340Gi node", got)
+	}
+}
+
+// The controller's own pods are already on the ledger as seats. Counting
+// them again as foreign would halve every node.
+func TestReconcileDoesNotCountItsOwnPodsTwice(t *testing.T) {
+	// 100Gi foreign + w-a 100Gi + w-b 100Gi = 300Gi fits 340Gi; double
+	// counting w-a's pod would make it 400Gi.
+	foreign := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "timeslicer", Namespace: "kube-system"},
+		Spec: corev1.PodSpec{
+			NodeName: testNode,
+			Containers: []corev1.Container{{
+				Name:      "agent",
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("100Gi")}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	r := newReconciler(t, append(enabledNode(), foreign,
+		hungryWorker("w-a", "model-a", "100Gi"), hungryWorker("w-b", "model-b", "100Gi"))...)
+
+	settle(t, r, "w-a")
+	allocateClaim(t, r, claimOf(t, r, "w-a"))
+	pod := getPod(t, r, "orw-w-a")
+	pod.Spec.NodeName = testNode
+	if err := r.Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	settle(t, r, "w-b")
+	dedicated := claimOf(t, r, "w-b")
+
+	fallBackToSharing(t, r, "w-b")
+	if got := claimOf(t, r, "w-b"); got == dedicated {
+		t.Errorf("w-b stayed on %q; 300Gi of requests fit a 340Gi node once the managed pod is not counted twice", got)
+	}
+}
+
 // Deleting a worker frees its memory booking only when its pod is verifiably
 // gone: the finalizer holds the CR -- and with it the seat's host request --
 // through the pod's termination grace, so the node's host-memory ceiling
