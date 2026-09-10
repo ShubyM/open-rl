@@ -361,6 +361,7 @@ case "$MODEL" in
     exit 1
     ;;
 esac
+MODEL_NAME=${MODEL_NAME_OVERRIDE:-$MODEL_NAME}
 TOOL_TOKENS=${TOOL_TOKENS:-16384}
 BATCH_SIZE=${BATCH_SIZE:-5}
 ROLLOUTS=${ROLLOUTS:-2}
@@ -557,6 +558,41 @@ OPEN_RL_TIME_SLICING=off OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl"
   echo "[work] TRAINER_BACKEND=megatron -> TP=$MEGATRON_TP, LoRA rank ${MEGATRON_LORA_RANK:-16}, targets $MEGATRON_LORA_TARGETS, sequence_parallel=$MEGATRON_SEQUENCE_PARALLEL, adapter published to disk"
 fi
 
+# automodel: NVIDIA NeMo Automodel trainer, src/training/automodel_worker.py.
+# HF-native FSDP2 with optional tensor and context parallelism; the CP path is
+# the one that shards the residual stream, which neither TP nor Megatron can
+# do for gated-deltanet. Same measured four-sampler topology as Megatron, so
+# AFFINITY=1 is required for the same reason. Weights reach the samplers as a
+# LoRA adapter over HTTP; no NCCL transfer, so the samplers need no dev flags.
+if [ "$TRAINER_BACKEND" = "automodel" ]; then
+  if [ "$AFFINITY" != "1" ]; then
+    echo "ERROR: TRAINER_BACKEND=automodel needs AFFINITY=1 (one server per sampler GPU)." >&2
+    exit 1
+  fi
+  # Its own interpreter, like Megatron's: nemo-automodel pins transformers and
+  # pulls megatron-fsdp, torchao and friends that must not enter the project venv.
+  AUTOMODEL_PYTHON=${AUTOMODEL_PYTHON:-$HOME/automodel/.venv/bin/python}
+  if [ ! -x "$AUTOMODEL_PYTHON" ]; then
+    echo "ERROR: no automodel interpreter at $AUTOMODEL_PYTHON." >&2
+    echo "  Build it with ./scripts/setup_automodel_env.sh, or set AUTOMODEL_PYTHON." >&2
+    exit 1
+  fi
+  AUTOMODEL_TP=${AUTOMODEL_TP:-1}
+  AUTOMODEL_CP=${AUTOMODEL_CP:-1}
+  if [ $((TRAIN_GPUS % (AUTOMODEL_TP * AUTOMODEL_CP))) -ne 0 ]; then
+    echo "ERROR: TRAIN_GPUS=$TRAIN_GPUS is not divisible by AUTOMODEL_TP=$AUTOMODEL_TP * AUTOMODEL_CP=$AUTOMODEL_CP." >&2
+    exit 1
+  fi
+  BACKEND_ENV="OPEN_RL_TRAINER_BACKEND=automodel OPEN_RL_ENABLE_FFT=true \
+OPEN_RL_AUTOMODEL_TP=$AUTOMODEL_TP OPEN_RL_AUTOMODEL_CP=$AUTOMODEL_CP \
+OPEN_RL_AUTOMODEL_LORA_RANK=${AUTOMODEL_LORA_RANK:-16} \
+OPEN_RL_TIME_SLICING=off OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl"
+  # Same single-vNIC NCCL fix as the Megatron trainer: the A3 profile pins the
+  # gIB plugin and NCCL aborts on the first collective instead of falling back.
+  NCCL_NET_ENV="env -u NCCL_ENV_PLUGIN -u NCCL_CONF_FILE NCCL_NET=Socket"
+  echo "[work] TRAINER_BACKEND=automodel -> TP=$AUTOMODEL_TP CP=$AUTOMODEL_CP DP=$((TRAIN_GPUS / (AUTOMODEL_TP * AUTOMODEL_CP))), LoRA rank ${AUTOMODEL_LORA_RANK:-16}, adapter published to disk"
+fi
+
 # Weight-transfer flags, only under the Megatron backend. The router that
 # serves /init_weight_transfer_engine and /update_weights is registered only
 # when both are set: --weight-transfer-config builds the engine,
@@ -564,7 +600,7 @@ fi
 # the other and the serve looks healthy while every POST returns 404.
 WT_ENV=""
 WT_ARG=""
-NCCL_NET_ENV=""
+NCCL_NET_ENV=${NCCL_NET_ENV:-}
 if [ "$MEGATRON_WEIGHT_TRANSFER" = "1" ]; then
   WT_ENV="VLLM_SERVER_DEV_MODE=1"
   WT_ARG="--weight-transfer-config '{\"backend\":\"nccl\"}'"
@@ -615,6 +651,7 @@ GATEWAY_DEV=0
 [ "$TRAIN_GPUS" -gt 1 ] && GATEWAY_DEV=""
 GATEWAY_CMD="$SAMPLER_WAIT; \
 CUDA_VISIBLE_DEVICES=$GATEWAY_DEV $QUEUE_ENV FLA_TILELANG=$FLA_TILELANG BASE_MODEL=$MODEL_NAME $SAMPLER_ENV $BACKEND_ENV \
+OPEN_RL_SAMPLER_TIMEOUT=${SAMPLER_TIMEOUT:-14400} \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 OPEN_RL_TRAIN_TOKEN_BUDGET=$TRAIN_TOKEN_BUDGET OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
 OPEN_RL_OPTIM_CPU_STEP=${OPTIM_CPU_STEP:-1} \
@@ -656,7 +693,7 @@ TRAIN_EXTRA=${TRAIN_EXTRA:-0}
 # 2e-5 is a 10x cut and still ~7x the recipe default in train.py.
 LEARNING_RATE=${LEARNING_RATE:-2e-5}
 
-TRAIN_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/train.py \
+TRAIN_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python -m harvey_labs.train \
 model_name=$MODEL_NAME renderer_name=$RENDERER base_url=http://127.0.0.1:9003 \
 learning_rate=$LEARNING_RATE lora_rank=32 \
 batch_size=$BATCH_SIZE rollouts_per_example=$ROLLOUTS max_steps=$MAX_STEPS eval_every=5 \
@@ -677,7 +714,7 @@ fi
 # the train window types the SFT warm-start script instead of RL. Traces
 # default to the public HF dataset inside sft.py.
 if [ "$WORKLOAD" = "sft" ]; then
-  TRAIN_CMD="TINKER_API_KEY=tml-dummy uv --project examples run python examples/harvey_labs/sft.py \
+  TRAIN_CMD="TINKER_API_KEY=tml-dummy uv --project examples run python -m harvey_labs.sft \
 model_name=$MODEL_NAME"
 elif [ "$WORKLOAD" != "rl" ]; then
   echo "Unknown WORKLOAD=$WORKLOAD (use 'rl' or 'sft')" >&2
@@ -699,7 +736,7 @@ if [ "$WORKLOAD" = "rl" ]; then
   fi
 fi
 
-EVAL_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/eval_checkpoint.py \
+EVAL_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python -m harvey_labs.eval_checkpoint \
 checkpoint=/tmp/open-rl/peft/CHANGE-ME/final model_name=$MODEL_NAME renderer_name=$RENDERER \
 base_url=http://127.0.0.1:9003 task_set=$TASK_SET judge_model=$JUDGE_MODEL \
 max_tokens=$GEN_TOKENS max_trajectory_tokens=$CONTEXT max_tool_result_tokens=$TOOL_TOKENS"
@@ -727,6 +764,8 @@ if [ "$TRAIN_GPUS" -gt 1 ]; then
   # install and torchrun is spelled as the module it actually is.
   if [ "$TRAINER_BACKEND" = "megatron" ]; then
     TRAINER_RUNNER="PYTHONPATH=$REPO/src $NCCL_NET_ENV $MEGATRON_PYTHON -m torch.distributed.run"
+  elif [ "$TRAINER_BACKEND" = "automodel" ]; then
+    TRAINER_RUNNER="PYTHONPATH=$REPO/src $NCCL_NET_ENV $AUTOMODEL_PYTHON -m torch.distributed.run"
   else
     TRAINER_RUNNER="uv run --extra gpu --extra fastpath torchrun"
   fi

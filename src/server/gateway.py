@@ -115,8 +115,15 @@ def trainer_publishes_adapter() -> bool:
   /v1/load_lora_adapter route rather than the sampler_full checkpoint route it
   could not reload anyway -- which is what makes an externally managed server
   usable under this backend at all.
+
+  The Automodel worker does the same, but only when it trains LoRA (rank > 0);
+  a full-parameter Automodel run publishes whole checkpoints. Its
+  publishes_sampler_adapter() reads the same variable, so both ends agree.
   """
-  return os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower() == "megatron"
+  backend = os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower()
+  if backend == "megatron":
+    return True
+  return backend == "automodel" and int(os.getenv("OPEN_RL_AUTOMODEL_LORA_RANK", "0")) > 0
 
 
 def sampler_session_id(model_id: str, seq_id: int | str) -> str:

@@ -21,6 +21,7 @@ from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_fr
 from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.store import RequestStore, get_store
 from training import paths
+from training.automodel_worker import AutomodelTrainingWorker
 from training.distributed import barrier, broadcast_object, is_distributed, is_primary, local_rank
 from training.distributed import close as close_distributed
 from training.distributed import initialize as initialize_distributed
@@ -32,21 +33,21 @@ from training.trainer_worker import Datum
 tracer = trace.get_tracer(__name__)
 
 
-TrainingWorker = FFTTrainingWorker | LoraTrainingWorker | MegatronTrainingWorker
+TrainingWorker = FFTTrainingWorker | LoraTrainingWorker | MegatronTrainingWorker | AutomodelTrainingWorker
 
 # Full-parameter backends. Both load their model from create_model rather than
 # BASE_MODEL, both run one torchrun process per GPU, and both take the
 # time-sliced GPU lease -- everything start_request_processing_loop and
 # run_training_requests_processor branch on.
-FULL_PARAMETER_WORKERS = (FFTTrainingWorker, MegatronTrainingWorker)
+FULL_PARAMETER_WORKERS = (FFTTrainingWorker, MegatronTrainingWorker, AutomodelTrainingWorker)
 
 
 def trainer_backend() -> str:
-  """Which trainer worker to run: "lora", "fft", or "megatron"."""
+  """Which trainer worker to run: "lora", "fft", "megatron", or "automodel"."""
   backend = os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower()
   if backend:
-    if backend not in ("lora", "fft", "megatron"):
-      raise RuntimeError(f"Unknown OPEN_RL_TRAINER_BACKEND={backend!r}; expected lora, fft, or megatron")
+    if backend not in ("lora", "fft", "megatron", "automodel"):
+      raise RuntimeError(f"Unknown OPEN_RL_TRAINER_BACKEND={backend!r}; expected lora, fft, megatron, or automodel")
     return backend
   return "fft" if is_fft_enabled() else "lora"
 
@@ -591,6 +592,7 @@ def start_request_processing_loop() -> None:
 
   worker: TrainingWorker = {
     "megatron": MegatronTrainingWorker,
+    "automodel": AutomodelTrainingWorker,
     "fft": FFTTrainingWorker,
     "lora": LoraTrainingWorker,
   }[backend]()
