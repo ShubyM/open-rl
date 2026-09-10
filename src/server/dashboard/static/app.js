@@ -253,8 +253,25 @@ function nodes() {
               !p.devices.length ||
               p.devices.some((d) => !devices.find((n) => n.id === d)),
           );
-          const bars = segments
-            .filter((p) => p.node === node.name)
+          const nodeSegments = segments.filter((p) => p.node === node.name);
+          // Shared seats put several allocations on one GPU at once. Each gets
+          // its own sub-lane so bars never paint over each other's text.
+          const slotOf = new Map();
+          const slotCounts = devices.map((device) => {
+            const ends = [];
+            nodeSegments
+              .filter((p) => p.devices.includes(device.id))
+              .sort((a, b) => a.start - b.start)
+              .forEach((p) => {
+                let slot = ends.findIndex((end) => end <= p.start);
+                if (slot < 0) slot = ends.push(0) - 1;
+                ends[slot] = p.end;
+                slotOf.set(`${p.key}:${device.id}`, slot);
+              });
+            return Math.max(1, ends.length);
+          });
+          const laneTops = slotCounts.reduce((tops, count, i) => [...tops, tops[i] + count * height], [0]);
+          const bars = nodeSegments
             .flatMap((p) => {
               const indexes = p.devices
                 .map((id) => devices.findIndex((d) => d.id === id))
@@ -268,12 +285,12 @@ function nodes() {
               });
               return groups.map(
                 (group) =>
-                  `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" aria-label="${escape(p.label)}, ${group.length} GPUs on ${escape(node.name)}" style="left:${Math.max(0, ((p.start - start) / duration) * 100)}%;width:${Math.max(0, ((Math.min(now, p.end) - Math.max(start, p.start)) / duration) * 100)}%;top:${group[0] * height + 2}px;height:${group.length * height - 4}px"><span class="allocation-name">${escape(p.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`,
+                  `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" aria-label="${escape(p.label)}, ${group.length} GPUs on ${escape(node.name)}" style="left:${Math.max(0, ((p.start - start) / duration) * 100)}%;width:${Math.max(0, ((Math.min(now, p.end) - Math.max(start, p.start)) / duration) * 100)}%;top:${laneTops[group[0]] + (slotOf.get(`${p.key}:${devices[group[0]].id}`) || 0) * height + 2}px;height:${group.length === 1 ? height - 4 : laneTops[group.at(-1) + 1] - laneTops[group[0]] - 4}px"><span class="allocation-name">${escape(p.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`,
               );
             })
             .join("");
           return `<div class="node-placement-group"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)} · ${nodeSelection.end === null ? "Current node status" : "At selected range end"}" aria-label="${escape(accelerator)}, ${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span><span class="claim-label">${escape(claimLabel)}</span></div><div>
-        ${devices.length ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(d.name)}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${gaps}${bars}</div></div>` : ""}
+        ${devices.length ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-template-rows:${slotCounts.map((count) => `${count * height}px`).join(" ")}">${devices.map((d) => `<span title="${escape(d.id)}">${escape(d.name)}</span>`).join("")}</div><div class="capacity-track" style="height:${laneTops.at(-1)}px;--gpu-lane-height:${height}px">${gaps}${bars}</div></div>` : ""}
         ${unmapped.map((p) => `<button type="button" class="capacity-allocation unknown-mapping ${family(p.runtime_id)}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}"><span class="allocation-name">${escape(p.label)}</span><span class="allocation-count">${p.device_count} GPUs</span></button>`).join("")}
         ${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : ""}
         ${!bars && !placements.length && !node.gpu_capacity ? empty("No GPUs") : ""}</div><span class="node-duty" title="GPU allocation time over the selected range; unavailable when observations or device mappings are incomplete">${duty(node)}</span></div>${current ? detail(current) : ""}</div>`;
