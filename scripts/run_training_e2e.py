@@ -12,17 +12,23 @@ Scenarios ("tiny-" = minimal overfit/smoke tests; the rest are real workloads):
                         two concurrent tiny-rl jobs on base_model and
                         second_base_model, one per model family (asserts each
                         job earns a reward, i.e. got its own tokenizer)
+  fft-textsql-rl-x2     two concurrent Text-to-SQL FFT RL jobs; extra_a= and
+                        extra_b= override each job separately on top of extra=,
+                        so one run can compare two configs or two base models
 
 Examples:
   uv run --extra gpu python scripts/run_training_e2e.py scenario=tiny-lora
   uv run --extra gpu python scripts/run_training_e2e.py scenario=tiny-rl steps=4
   uv run --extra gpu python scripts/run_training_e2e.py scenario=lora-textsql
   uv run --extra gpu python scripts/run_training_e2e.py scenario=fft-gsm8k extra='batch=2 rank=32'
+  uv run --extra gpu python scripts/run_training_e2e.py scenario=fft-textsql-rl-x2 steps=40 \
+      base_model=google/gemma-4-e2b extra_a='rl.learning_rate=1e-6' extra_b='rl.learning_rate=5e-6'
 
 The example scripts validate their own results and exit nonzero on failure.
 `base_url=...` targets an existing backend instead of starting one. `steps=N`
 sets the example's step count and `extra='k=v ...'` forwards additional chz
-overrides to it. The examples uv environment is kept separate from the root
+overrides to it; two-job scenarios also take `extra_a=` / `extra_b=`, applied on
+top of `extra=` to job-a / job-b only. The examples uv environment is kept separate from the root
 server/eval uv environment; override that path with
 OPEN_RL_EXAMPLES_UV_PROJECT_ENVIRONMENT if needed.
 """
@@ -99,6 +105,10 @@ class RunConfig:
   min_accuracy: float = 0.05
   weight_sync_strategy: str = ""
   extra: str = ""
+  # Per-job overrides for the *-x2 scenarios, layered over `extra`. Setting
+  # model.base_model in one of them also switches that job's tokenizer.
+  extra_a: str = ""
+  extra_b: str = ""
   host: str = "127.0.0.1"
   port: int | None = None
   uv_extra: str = "gpu"
@@ -395,8 +405,30 @@ def run_command(command: list[str], env: dict[str, str] | None = None, watch: li
   return output
 
 
-def run_example(config: RunConfig, script: list[str], defaults: dict[str, str], watch: list[ManagedProcess] | None = None, prefix: str = "") -> str:
-  overrides = dict(item.split("=", 1) for item in shlex.split(config.extra))
+def parse_overrides(*specs: str) -> dict[str, str]:
+  """Merge `k=v ...` strings left to right; later specs win."""
+  overrides: dict[str, str] = {}
+  for spec in specs:
+    overrides.update(item.split("=", 1) for item in shlex.split(spec))
+  return overrides
+
+
+def job_overrides(config: RunConfig, job: str) -> dict[str, str]:
+  """`extra` plus the per-job `extra_a` / `extra_b` for job-a / job-b."""
+  per_job = {"job-a": config.extra_a, "job-b": config.extra_b}.get(job, "")
+  return parse_overrides(config.extra, per_job)
+
+
+def run_example(
+  config: RunConfig,
+  script: list[str],
+  defaults: dict[str, str],
+  watch: list[ManagedProcess] | None = None,
+  prefix: str = "",
+  overrides: dict[str, str] | None = None,
+) -> str:
+  if overrides is None:
+    overrides = parse_overrides(config.extra)
   args = [f"{key}={value}" for key, value in {**defaults, **overrides}.items()]
   return run_command(["uv", "--project", "examples", "run", "python", *script, *args], env=examples_env(config), watch=watch, prefix=prefix)
 
@@ -1092,7 +1124,11 @@ def run_textsql(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -
 
 def run_textsql_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
   """Two concurrent Text-to-SQL FFT RL jobs against the same backend: each create_model spawns
-  its own trainer and dedicated sampler worker, and the accel timeslicer time-slices them."""
+  its own trainer and dedicated sampler worker, and the accel timeslicer time-slices them.
+
+  `extra_a` / `extra_b` override job-a / job-b separately (on top of `extra`), so
+  one run can compare two learning rates, or two base models when a job's
+  overrides set model.base_model; that job's tokenizer follows its base model."""
   results: dict[str, str | BaseException] = {}
 
   def train(job: str) -> None:
@@ -1100,12 +1136,15 @@ def run_textsql_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProce
       log_dir = Path(config.log_dir) / f"{config.scenario.replace('-', '_')}_{job}"
       if log_dir.exists():
         shutil.rmtree(log_dir)
+      overrides = job_overrides(config, job)
+      base_model = overrides.get("model.base_model", config.base_model)
+      print(f"[training-e2e] {job}: base_model={base_model} overrides={overrides}")
       defaults = {
         "phase": "rl_only",
         "base_url": base_url,
         "log_dir": str(log_dir),
-        "model.base_model": config.base_model,
-        "model.tokenizer_name": config.base_model,
+        "model.base_model": base_model,
+        "model.tokenizer_name": base_model,
         "model.rank": "16",
         "dataset.train_limit": "64",
         "dataset.rl_train_limit": "64",
@@ -1124,6 +1163,7 @@ def run_textsql_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProce
         defaults,
         watch=watch,
         prefix=f"[{job}] ",
+        overrides=overrides,
       )
     except BaseException as exc:
       results[job] = exc

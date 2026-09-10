@@ -297,6 +297,10 @@ To verify two concurrent jobs on different model families (each job must get its
 ```bash
 make test e2e tiny-fft-rl-x2-families TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=0 sampler_gpu=1 base_model=Qwen/Qwen3-0.6B second_base_model=google/gemma-4-e2b"
 ```
+To run two Text-to-SQL FFT RL experiments side by side, give each job its own overrides with `extra_a=` / `extra_b=` (layered over `extra=`); setting `model.base_model` in one of them switches that job's model and tokenizer:
+```bash
+make test e2e fft-textsql-rl-x2 TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=0 sampler_gpu=1 steps=40 base_model=google/gemma-4-e2b extra_a='rl.learning_rate=1e-6' extra_b='rl.learning_rate=5e-6'"
+```
 
 ---
 
