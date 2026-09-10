@@ -11,6 +11,31 @@ This directory contains examples, demos, and helper scripts for using the OpenRL
   uv sync
   ```
 
+## Client commands
+
+Run client tools from `examples/`; uv discovers this directory's
+`pyproject.toml`, installs its declared commands, and keeps the environment
+in sync automatically:
+
+```bash
+uv run harvey-train --help
+uv run harvey-eval --help
+uv run harvey-results log_dir=artifacts/harvey-labs/my-run json=True plot=True
+uv run harvey-plot log_dir=artifacts/harvey-labs/my-run out=run.png
+```
+
+From the repository root, use `uv run --project examples <command>`.
+Paths remain relative to your current directory. The root project is the
+server runtime; the client has its own lockfile and CPU dependencies.
+`[project.scripts]` declares CLI commands. Use `--locked` in CI to reject
+lockfile drift.
+
+Run the Harvey renderer regression test from the repository root with
+`uv run --project examples python -m harvey_labs.renderers.qwen35_renderer`.
+It uses standard `unittest` in the examples environment.
+
+See [Harvey LAB RL](harvey_labs) for setup and recipe options.
+
 ---
 
 ## Examples Overview

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
 from typing import Any
 
+import chz
 from tinker_cookbook.tool_use.tools import simple_tool_result
-from tinker_cookbook.tool_use.types import ToolInput, ToolResult
+from tinker_cookbook.tool_use.types import Tool, ToolInput, ToolResult
+
+from .sandbox import LabSandbox
 
 
 def bounded_tool_result(
@@ -44,10 +46,10 @@ def bounded_tool_result(
   return decoded.rstrip() + f"\n\n[Observation truncated at {max_tokens:,} tokens. {detail}]"
 
 
-@dataclass(frozen=True)
-class LabTool:
+@chz.chz
+class LabTool(Tool):
   spec: dict[str, Any]
-  executor: Any
+  sandbox: LabSandbox
   tokenizer: Any
   max_result_tokens: int
 
@@ -63,25 +65,16 @@ class LabTool:
   def parameters_schema(self) -> dict[str, Any]:
     return dict(self.spec.get("parameters", {"type": "object", "properties": {}}))
 
-  def to_spec(self) -> dict[str, Any]:
-    return {
-      "name": self.name,
-      "description": self.description,
-      "parameters": self.parameters_schema,
-    }
-
   async def run(self, input: ToolInput) -> ToolResult:
-    # The executor shells into podman synchronously (up to command_timeout);
-    # off the event loop so one env's slow tool call can't stall the group.
-    result = await asyncio.to_thread(self._execute_bounded, input)
-    return simple_tool_result(result, call_id=input.call_id or "", name=self.name)
-
-  def _execute_bounded(self, input: ToolInput) -> str:
-    result = self.executor.execute(self.name, input.arguments)
-    return bounded_tool_result(
+    result = await self.sandbox.execute_tool(self.name, input.arguments)
+    # Tokenizing a whole document read is GIL-bound work that would otherwise
+    # stall every other env's tool dispatch on the event loop.
+    result = await asyncio.to_thread(
+      bounded_tool_result,
       result,
       tool_name=self.name,
       arguments=input.arguments,
       tokenizer=self.tokenizer,
       max_tokens=self.max_result_tokens,
     )
+    return simple_tool_result(result, call_id=input.call_id or "", name=self.name)
