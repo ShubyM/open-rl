@@ -65,6 +65,10 @@ class GatewayPathTest(unittest.TestCase):
       # A resuming job passes the dead job's path under its own model id.
       self.assertEqual(gateway.checkpoint_state_path("job-b", "tinker://job-a/weights/step-5"), state_dir)
       self.assertEqual(gateway.tinker_state_path("/elsewhere/final"), "/elsewhere/final")
+      # Only weights paths are checkpoints. A sampler path is refused, not resolved under the caller.
+      self.assertIsNone(gateway.tinker_checkpoint_dir("tinker://job-a/sampler_weights/sampler-3"))
+      refused = asyncio.run(gateway.load_weights({"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"}))
+      self.assertEqual(refused.status_code, 400)
 
   def test_save_state_keeps_the_optimizer_and_answers_with_a_tinker_path(self) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir, patch.object(gateway, "TMP_DIR", tmp_dir):

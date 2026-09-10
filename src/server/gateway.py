@@ -126,15 +126,23 @@ def resolve_sampler_weights_path(model_id: str) -> str:
   return weights_path
 
 
+def tinker_checkpoint_dir(path: str) -> str | None:
+  """Disk directory for tinker://<model>/weights/<name>, else None."""
+  if not path.startswith("tinker://"):
+    return None
+  owner, sep, rest = path[len("tinker://") :].partition("/weights/")
+  if not (owner and sep):
+    return None
+  return os.path.join(TMP_DIR, "checkpoints", owner, "weights", rest)
+
+
 def checkpoint_state_path(model_id: str, name: str) -> str:
   """Where a named checkpoint lives. Names are scoped under the model that
   saved them, so two jobs calling save_state("final") never collide. A tinker
   path names its own model, which is how a resumed job reaches the
   checkpoint of the one that died."""
-  if name.startswith("tinker://"):
-    owner, sep, rest = name[len("tinker://") :].partition("/weights/")
-    if owner and sep:
-      return os.path.join(TMP_DIR, "checkpoints", owner, "weights", rest)
+  if (state_dir := tinker_checkpoint_dir(name)) is not None:
+    return state_dir
   if os.path.isabs(name):
     return name
   return os.path.join(TMP_DIR, "checkpoints", model_id, "weights", name)
@@ -493,9 +501,8 @@ async def create_model_from_state(
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "state_path is required"})
   # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
-  if state_path.startswith("tinker://"):
-    resolved_path = checkpoint_state_path("", state_path)
-  else:
+  resolved_path = tinker_checkpoint_dir(state_path)
+  if resolved_path is None:
     resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   try:
     model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="restored")
@@ -677,6 +684,8 @@ async def load_weights(req: dict):
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "path is required"})
+  if state_path.startswith("tinker://") and tinker_checkpoint_dir(state_path) is None:
+    return JSONResponse(status_code=400, content={"error": f"{state_path} is not a tinker://<model>/weights/<name> path"})
 
   resolved_path = checkpoint_state_path(model_id, state_path)
   req_id = await enqueue(
@@ -699,7 +708,7 @@ async def weights_info(req: dict):
   client and load_state into it. Answered from the checkpoint directory, so
   it survives a gateway or Redis restart."""
   path = req.get("tinker_path") or ""
-  state_dir = checkpoint_state_path("", path) if path.startswith("tinker://") else None
+  state_dir = tinker_checkpoint_dir(path)
   metadata_path = os.path.join(state_dir, "metadata.json") if state_dir else None
   if not metadata_path or not os.path.exists(metadata_path):
     return JSONResponse(status_code=404, content={"error": f"No checkpoint at {path}"})

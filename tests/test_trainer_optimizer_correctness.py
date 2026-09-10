@@ -306,6 +306,22 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
       self.assertEqual(worker.save_state("job-a", "/tmp/x", include_optimizer=True), {"path": "delta"})
     delta.assert_called_once()
 
+  def test_fft_save_state_skips_the_optimizer_until_fft_resume_exists(self) -> None:
+    param = torch.nn.Parameter(torch.tensor([1.0]))
+    worker = FFTTrainingWorker()
+    worker.model = _FullModelStub([param])
+    worker.model.save_pretrained = lambda path: None
+    worker.tokenizer = None
+    worker.optimizer = torch.optim.AdamW([param], lr=0.1)
+    worker.cpu_offload = False
+    worker.weight_sync_cfg.strategy = "full"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      state_dir = os.path.join(tmp_dir, "step-5")
+      worker.save_state("job-a", state_dir, include_optimizer=True)
+      self.assertFalse(os.path.exists(os.path.join(state_dir, "optimizer.pt")))
+      with open(os.path.join(state_dir, "metadata.json")) as f:
+        self.assertFalse(json.load(f)["has_optimizer"])
+
   def test_fft_create_model_loads_base_then_prepares_model(self) -> None:
     worker = FFTTrainingWorker()
     config = fft_trainer_worker_module.FFTConfig(seed=123)
