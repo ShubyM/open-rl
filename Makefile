@@ -355,3 +355,22 @@ push-vm:
 # Pull changes from the remote VM back to the local workspace
 pull-vm:
 	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' --exclude 'scratch' $(REMOTE_HOST):~/open-rl/ ./
+
+# Dashboard preview with fictional data.
+DASHBOARD_HOST ?= 127.0.0.1
+DASHBOARD_PORT ?= 9017
+.PHONY: dashboard-demo
+dashboard-demo:
+	uv --project src/server run --frozen python dev/dashboard_demo.py --host $(DASHBOARD_HOST) --port $(DASHBOARD_PORT)
+
+# Live dashboard in an isolated namespace of an existing Kind cluster.
+DASHBOARD_KIND_CLUSTER ?= open-rl-dashboard
+.PHONY: dashboard-kind dashboard-kind-apply
+dashboard-kind:
+	docker build -f src/server/Dockerfile.gateway -t open-rl-dashboard:$$(cat VERSION) .
+	kind load docker-image open-rl-dashboard:$$(cat VERSION) --name $(DASHBOARD_KIND_CLUSTER)
+	$(MAKE) dashboard-kind-apply
+
+dashboard-kind-apply:
+	kubectl --context kind-$(DASHBOARD_KIND_CLUSTER) apply -k dev/kind/dashboard
+	kubectl --context kind-$(DASHBOARD_KIND_CLUSTER) -n openrl-dashboard-check rollout status deployment/dashboard-check-gateway --timeout=60s

@@ -1,0 +1,124 @@
+#orl-design-lab .metric-chart {
+  --metric-stroke: var(--chart-line, var(--dim));
+  min-width: 0;
+}
+#orl-design-lab .metric-chart[data-chart-tone="accent"] {
+  --metric-stroke: color-mix(in srgb, var(--accent) 75%, var(--dim));
+}
+#orl-design-lab .metric-chart-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 5px 16px;
+  margin-bottom: 8px;
+}
+#orl-design-lab .metric-chart-head h2 {
+  font-size: 13px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+#orl-design-lab .metric-chart-latest {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  color: var(--dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+#orl-design-lab .metric-chart-latest strong {
+  font: 500 15px var(--mono);
+  color: var(--ink);
+}
+#orl-design-lab .metric-chart-plot {
+  position: relative;
+  min-width: 0;
+}
+#orl-design-lab .metric-chart svg {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  touch-action: pan-y;
+}
+#orl-design-lab .metric-chart svg:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+#orl-design-lab .metric-chart svg text {
+  fill: var(--dim);
+  font: 11px var(--mono);
+}
+#orl-design-lab .metric-gridline {
+  stroke: var(--line);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+#orl-design-lab .metric-series-line {
+  fill: none;
+  stroke: var(--metric-stroke);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+#orl-design-lab .metric-series-area {
+  fill: var(--metric-stroke);
+  fill-opacity: 0.07;
+}
+#orl-design-lab .metric-series-dot,
+#orl-design-lab .metric-series-latest {
+  fill: var(--metric-stroke);
+}
+#orl-design-lab .metric-series-latest {
+  stroke: var(--ground);
+  stroke-width: 1.5;
+}
+#orl-design-lab .metric-crosshair {
+  pointer-events: none;
+}
+#orl-design-lab .metric-crosshair line {
+  stroke: var(--control-border);
+  stroke-dasharray: 3 3;
+}
+#orl-design-lab .metric-crosshair circle {
+  fill: var(--metric-stroke);
+  stroke: var(--ground);
+  stroke-width: 1.5;
+}
+#orl-design-lab .metric-chart-tooltip {
+  position: absolute;
+  top: 2px;
+  z-index: 1;
+  max-width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  font: 11px/1.5 var(--mono);
+  pointer-events: none;
+  white-space: nowrap;
+}
+#orl-design-lab .metric-chart-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 18px;
+  margin-top: 7px;
+  color: var(--dim);
+  font-size: 11px;
+}
+#orl-design-lab .metric-chart-summary strong {
+  margin-left: 4px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-weight: 400;
+}
+#orl-design-lab .metric-chart-zone {
+  margin-left: auto;
+}
+#orl-design-lab .metric-chart-empty {
+  color: var(--dim);
+  padding: 18px 0;
+}

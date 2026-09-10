@@ -3,6 +3,15 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
+def display_metadata(value: Any) -> dict[str, str]:
+  """Keep bounded, explicitly supplied run/recipe labels from SDK metadata."""
+  if not isinstance(value, dict):
+    return {}
+  return {
+    key: value[key].strip()[:1024] for key in ("name", "run_name", "recipe_name", "git_rev") if isinstance(value.get(key), str) and value[key].strip()
+  }
+
+
 @dataclass
 class WeightSyncConfig:
   strategy: str = "delta"
