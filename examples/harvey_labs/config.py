@@ -27,6 +27,11 @@ class RunConfig:
   max_tokens: int = 3072
   max_trajectory_tokens: int = 128 * 1024
   max_tool_result_tokens: int = 8 * 1024
+  # When a turn stops on the per-turn max_tokens cap: False ends the episode
+  # there, as the reference LAB harness does, and it is graded on what was
+  # produced; True keeps the truncated turn in history and lets the agent
+  # continue (the cookbook's LENGTH-continue), bounded by max_trajectory_tokens.
+  continue_after_truncation: bool = False
   command_timeout: int = 60
   substrate_endpoint: str | None = None  # ate-env-api host:port; runs sandboxes on Agent Substrate instead of Podman.
   substrate_template: str = "lab-sandbox"

@@ -113,6 +113,7 @@ class LabEnvGroupBuilder(EnvGroupBuilder):
             max_turns=self.config.max_turns,
             max_trajectory_tokens=self.config.max_trajectory_tokens,
             max_generation_tokens=self.config.max_tokens,
+            terminate_on_length=not self.config.continue_after_truncation,
           ),
           criteria_count,
         )
