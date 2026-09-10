@@ -172,3 +172,42 @@ export function health(state) {
       ${issues.length ? `<div class="scheduler-table-wrap"><table class="scheduler-table"><thead><tr><th>Issue</th><th>Resource</th><th>Evidence</th><th></th></tr></thead><tbody>${issues.map(([issue, resource, evidence, link, tone]) => `<tr><td>${healthStatus(issue, tone)}</td><td>${escape(resource)}</td><td>${escape(evidence)}</td><td>${link}</td></tr>`).join("")}</tbody></table></div>` : `<p class="health-message">${healthStatus(complete ? "No issues reported by available sources" : "Health assessment is incomplete", complete ? "success" : "warning")}</p>`}
       <p class="run-json-link"><a href="/api/v1/dashboard/snapshot">Diagnostic JSON ↗</a> · <a href="/docs">API reference ↗</a></p>`;
 }
+
+const kindLabel = (config) => (config.lora_rank === undefined || config.lora_rank === null ? "FFT" : `LoRA r${config.lora_rank}`);
+const pct = (value) => (value === undefined ? "—" : `${(100 * value).toFixed(1)}%`);
+const ago = (seconds) => (seconds < 90 ? `${Math.round(seconds)}s` : seconds < 5400 ? `${Math.round(seconds / 60)}m` : `${(seconds / 3600).toFixed(1)}h`);
+
+// Training curves read from each run's metrics.jsonl on the shared volume,
+// grouped by the sweep directory they were written under.
+export function experiments(data) {
+  if (!data) return `<h1 class="heading">Experiments</h1>${empty("Loading run metrics…")}`;
+  if (data.error) return `<h1 class="heading">Experiments</h1>${empty(data.error)}`;
+  const sweeps = new Map();
+  data.runs.forEach((run) => {
+    if (!sweeps.has(run.sweep)) sweeps.set(run.sweep, []);
+    sweeps.get(run.sweep).push(run);
+  });
+  const now = Date.now() / 1000;
+  return `<h1 class="heading">Experiments</h1>
+    <p class="muted">Recipe metrics from ${escape(data.root)}. Newest sweep first.</p>
+    ${[...sweeps.entries()]
+      .map(([sweep, runs]) => {
+        const sorted = [...runs].sort((a, b) => a.name.localeCompare(b.name));
+        return `<section class="experiment-sweep"><h2>${escape(sweep || "runs")} <span class="muted micro">${runs.length} run${runs.length === 1 ? "" : "s"} · updated ${ago(now - Math.max(...runs.map((r) => r.updated_at)))} ago</span></h2>
+        <div class="job-list"><div class="job-list-head experiment-head"><span>Run</span><span>Model</span><span>Kind</span><span>Step</span><span>Reward</span><span>Correct</span><span>Format</span></div>
+        ${sorted
+          .map(
+            (run) => `<div class="job-list-row experiment-row"><span class="mono">${escape(run.name.replace(/^gsm8k_rl_(mega|rank_sweep)_/, ""))}</span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run.config))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span>${escape(pct(run.last.reward))}</span><span>${escape(pct(run.last.correct))}</span><span>${escape(pct(run.last.format))}</span></div>`,
+          )
+          .join("")}</div>
+        <div class="experiment-charts">${sorted
+          .flatMap((run) =>
+            ["reward", "correct"]
+              .filter((key) => run.series[key])
+              .map((key) => `<section class="operation-chart" data-experiment="${escape(run.path)}" data-series="${key}"></section>`),
+          )
+          .join("")}</div></section>`;
+      })
+      .join("")}
+    ${!data.runs.length ? empty("No run metrics found under the runs directory") : ""}`;
+}

@@ -93,7 +93,7 @@ export function renderMetricChart(container, options) {
     const last = points.at(-1);
     container.classList.add("metric-chart");
     container.dataset.chartTone = tone === "accent" ? "accent" : "neutral";
-    container.innerHTML = `<div class="metric-chart-head"><h2>${escape(title)}</h2>${last ? `<span class="metric-chart-latest" title="Latest sample at ${escape(new Date(last[0] * 1000).toISOString())}"><span>Latest</span> <strong>${escape(valueText(last[1]))}</strong></span>` : ""}</div>`;
+    container.innerHTML = `<div class="metric-chart-head"><h2>${escape(title)}</h2>${last ? `<span class="metric-chart-latest" title="Latest sample at ${escape(settings.xFormat ? settings.xFormat(last[0]) : new Date(last[0] * 1000).toISOString())}"><span>Latest</span> <strong>${escape(valueText(last[1]))}</strong></span>` : ""}</div>`;
     if (!points.length) {
       container.insertAdjacentHTML(
         "beforeend",
@@ -167,7 +167,8 @@ export function renderMetricChart(container, options) {
         end - start >= 86400
           ? `${new Date(at * 1000).toISOString().slice(5, 10)} `
           : "";
-      return `<text x="${x(at)}" y="${height - 5}" text-anchor="${index === 0 ? "start" : index === tickCount - 1 ? "end" : "middle"}">${escape(date + chartTime(at))}</text>`;
+      const label = settings.xFormat ? settings.xFormat(at) : date + chartTime(at);
+      return `<text x="${x(at)}" y="${height - 5}" text-anchor="${index === 0 ? "start" : index === tickCount - 1 ? "end" : "middle"}">${escape(label)}</text>`;
     }).join("");
     const series = segments
       .map((part) => {

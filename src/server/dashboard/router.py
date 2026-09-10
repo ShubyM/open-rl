@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from server import observability as telemetry
-from server.dashboard import gke, kubernetes, logs, metrics
+from server.dashboard import experiments, gke, kubernetes, logs, metrics
 from server.dashboard.data import observations
 from server.store import get_store
 
@@ -42,6 +42,7 @@ async def inspection_index():
       "run_metrics": "/api/v1/dashboard/runs/{run_id}/metrics",
       "pod_logs": "/api/v1/dashboard/pods/{pod}/logs",
       "gpu_metrics": "/api/v1/dashboard/allocations/{placement_id}/metrics",
+      "experiments": "/api/v1/dashboard/experiments",
       "openapi": "/openapi.json",
     },
     "workflow": [
@@ -59,6 +60,12 @@ async def inspection_index():
       "historical_queries_require_observed_pod_identity": True,
     },
   }
+
+
+@router.get("/api/v1/dashboard/experiments")
+async def experiment_metrics():
+  """Reward, correctness and optimizer curves from each run's metrics.jsonl on the shared volume."""
+  return await experiments.experiments()
 
 
 @router.get("/api/v1/dashboard/snapshot")

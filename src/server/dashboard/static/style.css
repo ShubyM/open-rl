@@ -867,3 +867,22 @@ body {
     var(--line) 4px 6px
   );
 }
+
+#orl-design-lab .experiment-sweep {
+  margin: 22px 0 30px;
+}
+#orl-design-lab .experiment-sweep h2 {
+  font-size: 15px;
+  font-weight: 500;
+  margin-bottom: 10px;
+}
+#orl-design-lab .experiment-head,
+#orl-design-lab .experiment-row {
+  grid-template-columns: minmax(120px, 1.2fr) minmax(90px, 1fr) 90px 90px 80px 80px 80px;
+}
+#orl-design-lab .experiment-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}

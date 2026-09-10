@@ -5,7 +5,7 @@ import {
 } from "./time-range.js";
 import { runIncidents } from "./timeline.js";
 import { escape, encode, empty, button, runStatus } from "./ui.js";
-import { runs, scheduler, health } from "./views.js";
+import { runs, scheduler, health, experiments } from "./views.js";
 import { renderMetricChart, disposeMetricCharts } from "./charts.js";
 
 const root = document.getElementById("orl-design-lab");
@@ -638,6 +638,43 @@ async function loadLogs(id, more = false) {
       document.getElementById("log-status").textContent = error.message;
   }
 }
+let experimentData = null;
+function experimentsPage() {
+  content.innerHTML = experiments(experimentData);
+  paintExperiments();
+  const url = "/api/v1/dashboard/experiments";
+  const entry = metricCache.get(url);
+  if (entry?.pending || (entry?.data && Date.now() - entry.fetchedAt < metricFreshFor)) return;
+  metricData(url)
+    .then((data) => {
+      experimentData = data;
+      if (route()[0] === "experiments") {
+        content.innerHTML = experiments(experimentData);
+        paintExperiments();
+      }
+    })
+    .catch((error) => {
+      if (route()[0] === "experiments" && !experimentData) content.innerHTML = experiments({ error: error.message, runs: [] });
+    });
+}
+function paintExperiments() {
+  if (!experimentData) return;
+  const byPath = new Map(experimentData.runs.map((run) => [run.path, run]));
+  content.querySelectorAll("[data-experiment]").forEach((element) => {
+    const run = byPath.get(element.dataset.experiment);
+    const points = run?.series[element.dataset.series] || [];
+    if (!points.length) return;
+    const shortName = run.name.replace(/^gsm8k_rl_(mega|rank_sweep)_/, "");
+    renderMetricChart(element, {
+      samples: points,
+      start: points[0][0],
+      end: points.at(-1)[0],
+      title: `${shortName} · ${element.dataset.series}`,
+      tone: "accent",
+      xFormat: (step) => `step ${Math.round(step)}`,
+    });
+  });
+}
 function render({ preserveAllocation = false } = {}) {
   if (!state) return;
   ++logRequest;
@@ -669,6 +706,7 @@ function render({ preserveAllocation = false } = {}) {
     location.replace("#health");
     return;
   } else if (page === "health") content.innerHTML = health(state);
+  else if (page === "experiments") experimentsPage();
   else {
     nodes();
     const replacement = document.getElementById("placement-detail");
