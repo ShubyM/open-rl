@@ -285,7 +285,7 @@ function nodes() {
               });
               return groups.map(
                 (group) =>
-                  `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" aria-label="${escape(p.label)}, ${group.length} GPUs on ${escape(node.name)}" style="left:${Math.max(0, ((p.start - start) / duration) * 100)}%;width:${Math.max(0, ((Math.min(now, p.end) - Math.max(start, p.start)) / duration) * 100)}%;top:${laneTops[group[0]] + (slotOf.get(`${p.key}:${devices[group[0]].id}`) || 0) * height + 2}px;height:${group.length === 1 ? height - 4 : laneTops[group.at(-1) + 1] - laneTops[group[0]] - 4}px"><span class="allocation-name">${escape(p.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`,
+                  `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" aria-label="${escape(p.label)}, ${group.length} GPUs on ${escape(node.name)}" style="left:${Math.max(0, ((p.start - start) / duration) * 100)}%;width:${Math.max(0, ((Math.min(now, p.end) - Math.max(start, p.start)) / duration) * 100)}%;top:${laneTops[group[0]] + (slotOf.get(`${p.key}:${devices[group[0]].id}`) || 0) * height + 2}px;height:${group.length === 1 ? height - 4 : laneTops[group.at(-1) + 1] - laneTops[group[0]] - 4}px"><span class="allocation-name">${escape(p.label)}${p.role ? " · " + escape(p.role) : ""}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`,
               );
             })
             .join("");
