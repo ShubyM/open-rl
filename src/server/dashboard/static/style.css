@@ -255,7 +255,7 @@ body {
   background: color-mix(in srgb, var(--allocation-color) 80%, var(--ground));
 }
 #orl-design-lab .capacity-allocation.selected {
-  background: var(--allocation-color);
+  z-index: 1;
   outline: 1px solid var(--ink);
   outline-offset: 1px;
 }

@@ -267,22 +267,6 @@ function nodes() {
               p.devices.some((d) => !devices.find((n) => n.id === d)),
           );
           const nodeSegments = segments.filter((p) => p.node === node.name);
-          // Shared seats put several allocations on one GPU at once. They split
-          // the GPU row into stripes; the legend below names them.
-          const slotOf = new Map();
-          const slotCount = devices.map((device) => {
-            const ends = [];
-            nodeSegments
-              .filter((p) => p.devices.includes(device.id))
-              .sort((a, b) => a.start - b.start)
-              .forEach((p) => {
-                let slot = ends.findIndex((end) => end <= p.start);
-                if (slot < 0) slot = ends.push(0) - 1;
-                ends[slot] = p.end;
-                slotOf.set(`${p.key}:${device.id}`, slot);
-              });
-            return Math.max(1, ends.length);
-          });
           const bars = nodeSegments
             .flatMap((p) => {
               const indexes = p.devices
@@ -296,14 +280,18 @@ function nodes() {
                 else groups.push([i]);
               });
               return groups.map((group) => {
-                const first = group[0];
-                const stripes = group.length === 1 ? slotCount[first] : 1;
-                const stripe = height / stripes;
-                const slot = group.length === 1 ? slotOf.get(`${p.key}:${devices[first].id}`) || 0 : 0;
-                const top = first * height + slot * stripe + (stripes > 1 ? 1 : 2);
-                const size = group.length === 1 ? stripe - (stripes > 1 ? 2 : 4) : group.length * height - 4;
-                const title = `${p.label}${p.role ? " · " + p.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}`;
-                return `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" title="${escape(title)}" aria-label="${escape(title)} on ${escape(node.name)}" style="left:${Math.max(0, ((p.start - start) / duration) * 100)}%;width:${Math.max(0, ((Math.min(now, p.end) - Math.max(start, p.start)) / duration) * 100)}%;top:${top}px;height:${size}px"></button>`;
+                // Shared seats put several allocations on one GPU at once. The
+                // bar carries every sharer's color; the legend below names them.
+                const sharers = nodeSegments
+                  .filter((q) => q.start < p.end && q.end > p.start && group.some((i) => q.devices.includes(devices[i].id)))
+                  .sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
+                const hues = [...new Set(sharers.map((q) => family(q.runtime_id)))];
+                const fill =
+                  hues.length > 1
+                    ? `background:repeating-linear-gradient(45deg, ${hues.map((hue, i) => `color-mix(in srgb, var(--${hue}) 62%, var(--ground)) ${i * 8}px ${(i + 1) * 8}px`).join(", ")});`
+                    : "";
+                const title = `${p.label}${p.role ? " · " + p.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}${sharers.length > 1 ? ` · shared with ${sharers.filter((q) => q.id !== p.id).map((q) => `${q.label} ${q.role || ""}`.trim()).join(", ")}` : ""}`;
+                return `<button type="button" class="capacity-allocation ${family(p.runtime_id)} ${p.id === expanded ? "selected" : ""}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}" title="${escape(title)}" aria-label="${escape(title)} on ${escape(node.name)}" style="left:${Math.max(0, ((p.start - start) / duration) * 100)}%;width:${Math.max(0, ((Math.min(now, p.end) - Math.max(start, p.start)) / duration) * 100)}%;top:${group[0] * height + 2}px;height:${group.length * height - 4}px;${fill}"></button>`;
               });
             })
             .join("");
