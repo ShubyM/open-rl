@@ -3,42 +3,25 @@ from unittest.mock import patch
 
 from server.dashboard import gke
 
-CONFIG = {"project": "proj", "location": "us-central1", "cluster": "c1", "mode": "auto", "enabled": True, "configured": True, "discovery": "explicit"}
-SOURCE = {
-  "pod": "orw-a",
-  "pod_uid": "u1",
-  "container": "worker",
-  "node": "n1",
-  "role": "trainer",
-  "created_at": "2026-09-10T10:00:00Z",
-  "until": "2026-09-10T11:00:00Z",
-}
+CONFIG = {"project": "proj", "location": "us-central1", "cluster": "c1", "mode": "auto", "enabled": True, "configured": True}
+SOURCE = {"pod": "orw-a", "node": "n1", "role": "trainer", "created_at": "2026-09-10T10:00:00+00:00", "until": "2026-09-10T11:00:00+00:00"}
 
 
-def entry(pod="orw-a", container="worker", at="2026-09-10T10:30:00Z", **extra):
+def entry(pod="orw-a", at="2026-09-10T10:30:00Z", **extra):
   return {
     "timestamp": at,
     "insertId": "i1",
     "logName": "projects/proj/logs/stdout",
     "severity": "INFO",
-    "resource": {
-      "labels": {
-        "project_id": "proj",
-        "location": "us-central1",
-        "cluster_name": "c1",
-        "namespace_name": "openrl-system",
-        "pod_name": pod,
-        "container_name": container,
-      }
-    },
+    "resource": {"labels": {"pod_name": pod, "container_name": "worker"}},
     **extra,
   }
 
 
 class GkeLogHelpersTest(unittest.TestCase):
   def setUp(self) -> None:
-    for target, value in (("configuration", lambda: CONFIG), ("kubernetes.k8s_namespace", lambda: "openrl-system")):
-      patcher = patch.object(gke if "." not in target else gke.kubernetes, target.split(".")[-1], value)
+    for module, name, value in ((gke, "configuration", lambda: CONFIG), (gke.cluster, "namespace", lambda: "openrl-system")):
+      patcher = patch.object(module, name, value)
       patcher.start()
       self.addCleanup(patcher.stop)
 
@@ -46,13 +29,14 @@ class GkeLogHelpersTest(unittest.TestCase):
     text = gke.logs_filter([SOURCE], "2026-09-10T10:00:00+00:00", "2026-09-10T11:00:00+00:00", "UNKNOWN", "oom")
     self.assertIn('resource.type="k8s_container"', text)
     self.assertIn('resource.labels.cluster_name="c1"', text)
+    self.assertIn('resource.labels.namespace_name="openrl-system"', text)
     self.assertIn('resource.labels.pod_name="orw-a"', text)
     self.assertIn('severity="DEFAULT"', text)
     self.assertIn('textPayload:"oom" OR jsonPayload.message:"oom"', text)
 
-  def test_entry_becomes_a_record_only_inside_an_observed_lifetime(self) -> None:
+  def test_entry_becomes_a_record_only_inside_a_source_lifetime(self) -> None:
     record = gke.entry_record(entry(textPayload="hello"), [SOURCE], "run-1")
-    self.assertEqual((record["pod"], record["role"], record["message"], record["severity"]), ("orw-a", "trainer", "hello", "INFO"))
+    self.assertEqual((record["pod"], record["container"], record["role"], record["message"]), ("orw-a", "worker", "trainer", "hello"))
     self.assertIsNone(gke.entry_record(entry(at="2026-09-10T12:00:00Z", textPayload="late"), [SOURCE], "run-1"))
     self.assertIsNone(gke.entry_record(entry(pod="someone-else", textPayload="x"), [SOURCE], "run-1"))
 
@@ -61,16 +45,14 @@ class GkeLogHelpersTest(unittest.TestCase):
     self.assertEqual(record["rank"], 2)
     self.assertIn('"message": "m"', record["message"])
 
-  def test_select_sources_applies_only_the_given_filters(self) -> None:
-    other = {**SOURCE, "pod": "orw-b", "node": "n2"}
-    self.assertEqual(gke.select_sources([SOURCE, other], None, None, None), [SOURCE, other])
-    self.assertEqual(gke.select_sources([SOURCE, other], None, None, "n2"), [other])
-
-  def test_cursor_round_trip_and_rejection(self) -> None:
-    fingerprint = gke.query_fingerprint("run-1", None, None, "", None, None, None, None, 200)
-    cursor = gke.remember_page(fingerprint, "s", "e", "page-2", [SOURCE])
-    self.assertEqual(gke.resume_page(cursor, fingerprint), ("s", "e", "page-2", [SOURCE]))
-    with self.assertRaises(ValueError):
-      gke.resume_page(cursor, "another-scope")
-    with self.assertRaises(ValueError):
-      gke.resume_page("gke.nope", fingerprint)
+  def test_pod_sources_cover_live_pods_and_recorded_placements(self) -> None:
+    run = {"run_id": "run-1", "pods": [{"name": "orw-live", "node": "n1", "role": "sampler", "created_at": "2026-09-10T10:00:00Z"}]}
+    past = [
+      {"pod": "orw-gone", "node": "n2", "role": "trainer", "run_ids": ["run-1"], "first_seen": 1789000000.0, "last_seen": 1789003600.0},
+      {"pod": "orw-other", "node": "n3", "role": "trainer", "run_ids": ["run-2"], "first_seen": 1789000000.0, "last_seen": 1789003600.0},
+    ]
+    sources = {s["pod"]: s for s in gke.pod_sources(run, past, "2026-09-10T11:00:00Z")}
+    self.assertEqual(set(sources), {"orw-live", "orw-gone"})
+    self.assertEqual(sources["orw-live"]["until"], "2026-09-10T11:00:00.000000+00:00")
+    self.assertEqual(sources["orw-gone"]["role"], "trainer")
+    self.assertGreater(sources["orw-gone"]["until"], sources["orw-gone"]["created_at"])

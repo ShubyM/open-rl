@@ -1,60 +1,36 @@
 export const escape = (value) =>
-  String(value ?? "—").replace(
-    /[&<>"']/g,
-    (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
-        c
-      ],
-  );
+  String(value ?? "—").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 export const encode = encodeURIComponent;
 export const empty = (text) => `<p class="empty-state">${escape(text)}</p>`;
-export const button = (label, attrs = "") =>
-  `<button type="button" class="appbutton" ${attrs}>${escape(label)}</button>`;
+export const button = (label, attrs = "") => `<button type="button" class="chip" ${attrs}>${escape(label)}</button>`;
+
 export const runStatus = (value) => {
-  const label = String(value || "Unknown");
+  const label = String(value || "unknown");
   const tone =
-    {
-      active: "running",
-      running: "running",
-      restarting: "pending",
-      starting: "pending",
-      "needs attention": "failed",
-      queued: "pending",
-      pending: "pending",
-      failed: "failed",
-      completed: "completed",
-    }[label.toLowerCase()] || "unknown";
-  return `<span class="run-state state-${tone}"><span aria-hidden="true"></span>${escape(label[0].toUpperCase() + label.slice(1))}</span>`;
+    { running: "running", starting: "running", queued: "pending", unassigned: "pending", "needs attention": "failed", failed: "failed", completed: "completed", unknown: "pending" }[
+      label.toLowerCase()
+    ] || "pending";
+  return `<span class="state state-${tone}"><span class="state-dot" aria-hidden="true"></span>${escape(label)}</span>`;
 };
 
+const seconds = (value) => (value === null || value === undefined || value === "" ? NaN : typeof value === "number" ? value : Date.parse(value) / 1000);
+
 export function elapsedTime(run, observedAt) {
-  const timestamp = (value) => {
-    if (value === null || value === undefined || value === "") return NaN;
-    return typeof value === "number" ? value * 1000 : Date.parse(value);
-  };
-  const start = timestamp(run.created_at);
-  const terminal = ["completed", "failed", "cancelled", "canceled"].includes(
-    String(run.status || "").toLowerCase(),
-  );
-  const end = timestamp(terminal ? run.completed_at : observedAt);
-  if (
-    !Number.isFinite(start) ||
-    start <= 0 ||
-    !Number.isFinite(end) ||
-    end < start
-  )
-    return "—";
-  const minutes = Math.floor((end - start) / 60000);
-  if (minutes < 1) return "<1m";
-  return minutes < 60
-    ? `${minutes}m`
-    : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  const start = seconds(run.created_at);
+  const end = ["completed", "failed"].includes(String(run.status || "").toLowerCase()) && run.completed_at ? seconds(run.completed_at) : seconds(observedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return "—";
+  return duration(Math.max(0, end - start));
 }
 
+export const duration = (total) => {
+  if (total < 90) return `${Math.round(total)}s`;
+  if (total < 5400) return `${Math.round(total / 60)}m`;
+  if (total < 172800) return `${(total / 3600).toFixed(1)}h`;
+  return `${(total / 86400).toFixed(1)}d`;
+};
+
 // morph patches a container toward new markup instead of replacing it, so a
-// 10-second refresh keeps scroll position, focus, open panels, and the charts
-// the chart module owns. Elements that carry the metric-chart class are
-// JS-rendered and are left alone apart from their data attributes.
+// refresh keeps scroll position, focus, open panels and typed input.
 export function morph(container, html) {
   const template = document.createElement("template");
   template.innerHTML = html;
@@ -78,16 +54,9 @@ function morphNode(node, next, parent) {
     if (node.data !== next.data) node.data = next.data;
     return;
   }
-  const chart = node.classList.contains("metric-chart") && !next.classList.contains("metric-chart");
-  syncAttributes(node, next, chart);
-  if (!chart) morphChildren(node, next);
-}
-function syncAttributes(node, next, keepChartAttributes) {
-  const owned = (name) => keepChartAttributes && (name === "class" || name === "data-chart-tone");
-  for (const { name } of Array.from(node.attributes)) {
-    if (!next.hasAttribute(name) && !owned(name)) node.removeAttribute(name);
-  }
-  for (const { name, value } of Array.from(next.attributes)) {
-    if (!owned(name) && node.getAttribute(name) !== value) node.setAttribute(name, value);
-  }
+  for (const { name } of Array.from(node.attributes)) if (!next.hasAttribute(name)) node.removeAttribute(name);
+  for (const { name, value } of Array.from(next.attributes)) if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+  // Live form values belong to the user, not the template.
+  if (node.tagName === "INPUT" || node.tagName === "SELECT") return;
+  morphChildren(node, next);
 }

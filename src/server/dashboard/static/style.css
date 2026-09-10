@@ -894,3 +894,176 @@ body {
   gap: 12px;
   margin-top: 14px;
 }
+
+/* ---- charts (pure markup, stretched SVG plot, HTML axes) ---- */
+#orl-design-lab .chart {
+  --metric-stroke: var(--chart-line, var(--dim));
+  min-width: 0;
+  margin: 0;
+}
+#orl-design-lab .chart[data-tone="accent"] {
+  --metric-stroke: color-mix(in srgb, var(--accent) 75%, var(--dim));
+}
+#orl-design-lab .chart-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 5px 16px;
+  margin-bottom: 8px;
+}
+#orl-design-lab .chart-head h2 {
+  font-size: 13px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+#orl-design-lab .chart-latest {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  color: var(--dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+#orl-design-lab .chart-latest strong {
+  font: 500 15px var(--mono);
+  color: var(--ink);
+}
+#orl-design-lab .chart-plot {
+  position: relative;
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  grid-template-rows: 140px auto;
+  column-gap: 8px;
+  min-width: 0;
+}
+#orl-design-lab .chart-y {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  text-align: right;
+  color: var(--dim);
+  font: 11px var(--mono);
+}
+#orl-design-lab .chart-plot svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  border-bottom: 1px solid var(--line);
+}
+#orl-design-lab .chart-x {
+  grid-column: 2;
+  display: flex;
+  justify-content: space-between;
+  padding-top: 4px;
+  color: var(--dim);
+  font: 11px var(--mono);
+}
+#orl-design-lab .chart-grid {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+#orl-design-lab .chart-line {
+  fill: none;
+  stroke: var(--metric-stroke);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+#orl-design-lab .chart-area {
+  fill: var(--metric-stroke);
+  fill-opacity: 0.07;
+}
+#orl-design-lab .chart-dot {
+  stroke: var(--metric-stroke);
+  stroke-width: 5;
+  stroke-linecap: round;
+}
+#orl-design-lab .chart-hover {
+  position: absolute;
+  top: 0;
+  height: 140px;
+  left: 0;
+  margin-left: 52px;
+  width: calc(100% - 52px);
+  pointer-events: none;
+}
+#orl-design-lab .chart-hover[hidden] {
+  display: none;
+}
+#orl-design-lab .chart-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border-left: 1px dashed var(--control-border);
+}
+#orl-design-lab .chart-tip {
+  position: absolute;
+  top: 2px;
+  left: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  font: 11px/1.5 var(--mono);
+  white-space: nowrap;
+}
+#orl-design-lab .chart-tip.flip {
+  left: auto;
+  right: 6px;
+}
+#orl-design-lab .chart-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 18px;
+  margin-top: 7px;
+  color: var(--dim);
+  font-size: 11px;
+}
+#orl-design-lab .chart-summary strong {
+  margin-left: 4px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-weight: 400;
+}
+#orl-design-lab .chart-zone {
+  margin-left: auto;
+}
+#orl-design-lab .chart-empty {
+  color: var(--dim);
+  padding: 18px 0;
+}
+#orl-design-lab .chart-grid-list,
+#orl-design-lab .chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 18px 12px;
+  margin-top: 14px;
+}
+
+/* ---- time window control ---- */
+#orl-design-lab .time-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  font-size: 12px;
+  color: var(--dim);
+}
+#orl-design-lab .time-control select,
+#orl-design-lab .time-control input {
+  margin-left: 6px;
+  font: inherit;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  padding: 3px 6px;
+}
+#orl-design-lab .chip-static {
+  color: var(--status-success);
+}

@@ -18,7 +18,7 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_session_lifecycle tests.test_dashboard_experiments tests.test_dashboard_gke_logs tests.test_gateway_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends
+UNIT_TESTS ?= tests.test_session_lifecycle tests.test_dashboard_experiments tests.test_dashboard_gke_logs tests.test_dashboard_history tests.test_dashboard_snapshot tests.test_gateway_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -355,22 +355,3 @@ push-vm:
 # Pull changes from the remote VM back to the local workspace
 pull-vm:
 	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' --exclude 'scratch' $(REMOTE_HOST):~/open-rl/ ./
-
-# Dashboard preview with fictional data.
-DASHBOARD_HOST ?= 127.0.0.1
-DASHBOARD_PORT ?= 9017
-.PHONY: dashboard-demo
-dashboard-demo:
-	uv --project src/server run --frozen python dev/dashboard_demo.py --host $(DASHBOARD_HOST) --port $(DASHBOARD_PORT)
-
-# Live dashboard in an isolated namespace of an existing Kind cluster.
-DASHBOARD_KIND_CLUSTER ?= open-rl-dashboard
-.PHONY: dashboard-kind dashboard-kind-apply
-dashboard-kind:
-	docker build -f src/server/Dockerfile.gateway -t open-rl-dashboard:$$(cat VERSION) .
-	kind load docker-image open-rl-dashboard:$$(cat VERSION) --name $(DASHBOARD_KIND_CLUSTER)
-	$(MAKE) dashboard-kind-apply
-
-dashboard-kind-apply:
-	kubectl --context kind-$(DASHBOARD_KIND_CLUSTER) apply -k dev/kind/dashboard
-	kubectl --context kind-$(DASHBOARD_KIND_CLUSTER) -n openrl-dashboard-check rollout status deployment/dashboard-check-gateway --timeout=60s

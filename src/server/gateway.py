@@ -19,8 +19,9 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-from server.dashboard import logs as dashboard_logs
+from server.dashboard import history as placement_history
 from server.dashboard.router import router as dashboard_router
+from server.dashboard.snapshot import snapshot as dashboard_snapshot
 from server.model_metadata import TrainingModelMetadata, display_metadata, extract_weight_sync_config
 from server.session_registry import SessionRegistry
 from server.store import get_store
@@ -419,7 +420,7 @@ async def lifespan(served_app: FastAPI):
         await asyncio.to_thread(worker.load_base_model, base_model)
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
   reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
-  log_task = asyncio.create_task(dashboard_logs.collector(served_app))
+  log_task = asyncio.create_task(placement_history.recorder(store, lambda: dashboard_snapshot.placements(store)))
   try:
     yield
   finally:

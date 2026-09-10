@@ -1,45 +1,54 @@
-"""Optional, read-only GKE telemetry using ADC and automatically detected cluster scope."""
+"""Cloud Logging as the run-log source on GKE.
+
+The gateway learns its project, cluster and location from the metadata
+server, authenticates with Application Default Credentials (Workload Identity
+in the cluster), and queries entries for the pods a run has owned. Paging is
+stateless: the cursor is Cloud Logging's own page token, valid for the same
+filters and window.
+"""
 
 import asyncio
 import hashlib
 import json
-import math
 import os
-import secrets
 import threading
 import time
-from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 
 import google.auth
 import httpx
 from google.auth.transport.requests import Request
 
-from server.dashboard import kubernetes, logs
+from server.dashboard import cluster
 
-_LOCK = threading.Lock()
-_credentials = None
-_pages = OrderedDict()
+MAX_MESSAGE = 16 * 1024
+MAX_SOURCES = 64
+REFUSED = "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"
+UNAVAILABLE = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
 
-
-_detected = {}
-_discovery_at = float("-inf")
+_METADATA = {"project": "project/project-id", "cluster": "instance/attributes/cluster-name", "location": "instance/attributes/cluster-location"}
+_detected: dict | None = None
+_discovery_at = 0.0
 _discovery_lock = asyncio.Lock()
-_METADATA = {
-  "project": "project/project-id",
-  "cluster": "instance/attributes/cluster-name",
-  "location": "instance/attributes/cluster-location",
-}
+_credentials = None
+_LOCK = threading.Lock()
+_refused_until = 0.0
+
+
+# ---- identity -------------------------------------------------------------------
 
 
 def configuration() -> dict:
-  mode = os.getenv("OPEN_RL_GKE_TELEMETRY", "auto").lower()
-  fields = {key: os.getenv(f"OPEN_RL_GKE_{key.upper()}", "") or _detected.get(key, "") for key in _METADATA}
-  complete = all(fields.values())
-  fields["mode"] = mode
+  mode = os.getenv("OPEN_RL_GKE_TELEMETRY", "auto").strip().lower()
+  fields = {
+    "project": os.getenv("OPEN_RL_GKE_PROJECT") or (_detected or {}).get("project", ""),
+    "cluster": os.getenv("OPEN_RL_GKE_CLUSTER") or (_detected or {}).get("cluster", ""),
+    "location": os.getenv("OPEN_RL_GKE_LOCATION") or (_detected or {}).get("location", ""),
+    "mode": mode,
+  }
+  complete = all(fields[key] for key in ("project", "cluster", "location"))
   fields["enabled"] = mode in {"1", "true"} or (mode == "auto" and complete)
   fields["configured"] = fields["enabled"] and complete
-  fields["discovery"] = "metadata" if _detected else "explicit" if complete else "unavailable"
   return fields
 
 
@@ -47,9 +56,7 @@ async def discover() -> dict:
   """Resolve GKE identity once; retry unavailable metadata after a minute."""
   global _detected, _discovery_at
   config = configuration()
-  if config["mode"] not in {"auto", "1", "true"} or config["configured"]:
-    return config
-  if not os.getenv("KUBERNETES_SERVICE_HOST"):
+  if config["mode"] not in {"auto", "1", "true"} or config["configured"] or not os.getenv("KUBERNETES_SERVICE_HOST"):
     return config
   async with _discovery_lock:
     if time.monotonic() - _discovery_at < 60:
@@ -57,10 +64,7 @@ async def discover() -> dict:
     async with httpx.AsyncClient(timeout=1, trust_env=False, follow_redirects=False) as client:
 
       async def read(key, path):
-        response = await client.get(
-          f"http://metadata.google.internal/computeMetadata/v1/{path}",
-          headers={"Metadata-Flavor": "Google"},
-        )
+        response = await client.get(f"http://metadata.google.internal/computeMetadata/v1/{path}", headers={"Metadata-Flavor": "Google"})
         response.raise_for_status()
         value = response.text.strip()
         if response.headers.get("Metadata-Flavor") != "Google" or not value or len(value) > 256:
@@ -93,140 +97,88 @@ async def request(method: str, url: str, **kwargs) -> dict:
     return response.json()
 
 
-def time_range(since=None, until=None) -> tuple[str, str]:
-  end = datetime.fromisoformat(logs.timestamp(until)) if until else datetime.now(UTC)
-  start = datetime.fromisoformat(logs.timestamp(since)) if since else end - timedelta(minutes=30)
-  if start >= end or end - start > timedelta(days=7):
-    raise ValueError("Time range must be positive and no longer than seven days")
-  return start.isoformat(), end.isoformat()
-
-
-def scope_filter() -> list[str]:
-  config = configuration()
-  return [
-    'resource.type="k8s_container"',
-    *[
-      f"resource.labels.{label}={json.dumps(value)}"
-      for label, value in (
-        ("project_id", config["project"]),
-        ("location", config["location"]),
-        ("cluster_name", config["cluster"]),
-        ("namespace_name", kubernetes.k8s_namespace()),
-      )
-    ],
-  ]
-
-
-def matches_resource(labels: dict) -> bool:
-  config = configuration()
-  return all(
-    labels.get(key) == value
-    for key, value in (
-      ("project_id", config["project"]),
-      ("location", config["location"]),
-      ("cluster_name", config["cluster"]),
-      ("namespace_name", kubernetes.k8s_namespace()),
-    )
-  )
-
-
-def pod_sources(run: dict | None, archived: list[dict], observed_at: str) -> list[dict]:
-  sources = {}
-  for source in archived:
-    if source.get("created_at") and source.get("collected_at"):
-      sources[(source["pod"], source.get("pod_uid"), source["container"])] = {**source, "until": source["collected_at"]}
-  for pod in (run or {}).get("pods", []):
-    for container in pod.get("containers", []):
-      if pod.get("created_at"):
-        sources[(pod["name"], pod.get("uid"), container["name"])] = {
-          "pod": pod["name"],
-          "pod_uid": pod.get("uid"),
-          "container": container["name"],
-          "node": pod.get("node"),
-          "role": pod.get("role", "unknown"),
-          "created_at": pod["created_at"],
-          "until": observed_at,
-          "shared_runtime": pod.get("shared_runtime", False),
-        }
-  return list(sources.values())
-
-
-def source_filter(sources: list[dict]) -> str:
-  # Standard GKE resource labels identify names, not pod UIDs. Bound names to observed lifetimes.
-  return (
-    "("
-    + " OR ".join(
-      "("
-      + " AND ".join(
-        [
-          f"resource.labels.pod_name={json.dumps(s['pod'])}",
-          f"resource.labels.container_name={json.dumps(s['container'])}",
-          f"timestamp>={json.dumps(logs.timestamp(s['created_at']))}",
-          f"timestamp<={json.dumps(logs.timestamp(s['until']))}",
-        ]
-      )
-      + ")"
-      for s in sources
-    )
-    + ")"
-  )
-
-
-_logging_refused_until = 0.0
-MAX_LOG_SOURCES = 64
-PAGE_TTL_SECONDS = 900
-REFUSED = "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"
-UNAVAILABLE = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
-
-
-def logging_refused() -> bool:
-  return time.monotonic() < _logging_refused_until
+def refused() -> bool:
+  return time.monotonic() < _refused_until
 
 
 def note_refusal() -> None:
   """A scope or IAM refusal does not clear itself; stop asking for a while."""
-  global _logging_refused_until
-  _logging_refused_until = time.monotonic() + 600
+  global _refused_until
+  _refused_until = time.monotonic() + 600
 
 
-def select_sources(sources: list[dict], pod, container, node) -> list[dict]:
-  wanted = (("pod", pod), ("container", container), ("node", node))
-  return [s for s in sources if all(value is None or s.get(key) == value for key, value in wanted)]
+# ---- time and sources -----------------------------------------------------------
 
 
-def query_fingerprint(run_id: str, *parts) -> str:
-  """Identifies one query scope, so a cursor cannot be replayed against another."""
-  return hashlib.sha256(json.dumps([configuration(), kubernetes.k8s_namespace(), run_id, *parts]).encode()).hexdigest()
+def timestamp(value) -> str:
+  """ISO-8601 in UTC with microseconds, the form Cloud Logging filters compare."""
+  if isinstance(value, (int, float)):
+    return datetime.fromtimestamp(value, UTC).isoformat(timespec="microseconds")
+  parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+  if parsed.tzinfo is None:
+    parsed = parsed.replace(tzinfo=UTC)
+  return parsed.astimezone(UTC).isoformat(timespec="microseconds")
 
 
-def resume_page(cursor: str, fingerprint: str) -> tuple[str, str, str, list[dict]]:
-  """The window, page token and sources a cursor stands for."""
-  try:
-    token = _pages[cursor]
-    if token["fingerprint"] != fingerprint or time.monotonic() > token["expires"]:
-      raise ValueError()
-  except (ValueError, TypeError, KeyError):
-    raise ValueError("Invalid or expired GKE cursor, or changed query scope") from None
-  return token["start"], token["end"], token["page"], token["sources"]
+def time_range(since=None, until=None) -> tuple[str, str]:
+  end = datetime.fromisoformat(timestamp(until)) if until else datetime.now(UTC)
+  start = datetime.fromisoformat(timestamp(since)) if since else end - timedelta(minutes=30)
+  if start >= end or end - start > timedelta(days=7):
+    raise ValueError("Time range must be positive and no longer than seven days")
+  return start.isoformat(timespec="microseconds"), end.isoformat(timespec="microseconds")
 
 
-def remember_page(fingerprint: str, start: str, end: str, page: str, sources: list[dict]) -> str:
-  cursor_id = "gke." + secrets.token_urlsafe(24)
-  _pages[cursor_id] = {
-    "fingerprint": fingerprint,
-    "start": start,
-    "end": end,
-    "page": page,
-    "sources": sources,
-    "expires": time.monotonic() + PAGE_TTL_SECONDS,
-  }
-  while len(_pages) > 256:
-    _pages.popitem(last=False)
-  return cursor_id
+def pod_sources(run: dict | None, past: list[dict], observed_at: str) -> list[dict]:
+  """The pods a run's logs can come from: live ones until now, and any recorded
+  placement of the run until it was last seen. Names bound to lifetimes, since
+  Cloud Logging labels carry pod names and not UIDs."""
+  sources: dict[str, dict] = {}
+  run_id = run["run_id"] if run else None
+  for entry in past:
+    if run_id in (entry.get("run_ids") or []) and entry.get("pod"):
+      sources[entry["pod"]] = {
+        "pod": entry["pod"],
+        "node": entry.get("node"),
+        "role": entry.get("role") or "unknown",
+        "created_at": timestamp(entry["first_seen"]),
+        "until": timestamp(entry["last_seen"] + 60),
+      }
+  for pod in (run or {}).get("pods", []):
+    if pod.get("created_at"):
+      sources[pod["name"]] = {
+        "pod": pod["name"],
+        "node": pod.get("node"),
+        "role": pod.get("role", "unknown"),
+        "created_at": timestamp(pod["created_at"]),
+        "until": timestamp(observed_at),
+        "shared_runtime": pod.get("shared_runtime", False),
+      }
+  return list(sources.values())
 
 
-def logs_filter(selected: list[dict], start: str, end: str, severity: str | None, q: str) -> str:
-  clauses = scope_filter() + [source_filter(selected), f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
+# ---- query -------------------------------------------------------------------------
+
+
+def scope_filter() -> list[str]:
+  config = configuration()
+  labels = (
+    ("project_id", config["project"]),
+    ("location", config["location"]),
+    ("cluster_name", config["cluster"]),
+    ("namespace_name", cluster.namespace()),
+  )
+  return ['resource.type="k8s_container"', *[f"resource.labels.{label}={json.dumps(value)}" for label, value in labels]]
+
+
+def source_filter(sources: list[dict]) -> str:
+  def clause(s: dict) -> str:
+    return f"(resource.labels.pod_name={json.dumps(s['pod'])} AND timestamp>={json.dumps(s['created_at'])} AND timestamp<={json.dumps(s['until'])})"
+
+  return "(" + " OR ".join(clause(s) for s in sources) + ")"
+
+
+def logs_filter(sources: list[dict], start: str, end: str, severity: str | None, q: str) -> str:
+  clauses = scope_filter() + [source_filter(sources), f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
   if severity:
     clauses.append(f"severity={json.dumps('DEFAULT' if severity == 'UNKNOWN' else severity)}")
   if q:
@@ -242,23 +194,11 @@ def entry_text(entry: dict) -> str:
   return json.dumps(fields, ensure_ascii=False) if fields else json.dumps(entry.get("protoPayload", {}), ensure_ascii=False)
 
 
-def entry_record(entry: dict, selected: list[dict], run_id: str) -> dict | None:
-  """One log entry as a dashboard record, or None when it belongs to no observed
-  container lifetime of this run."""
-  resource = entry.get("resource", {}).get("labels", {})
-  if not matches_resource(resource):
-    return None
-  at = logs.timestamp(entry["timestamp"])
-  match = next(
-    (
-      s
-      for s in selected
-      if s["pod"] == resource.get("pod_name")
-      and s["container"] == resource.get("container_name")
-      and logs.timestamp(s["created_at"]) <= at <= logs.timestamp(s["until"])
-    ),
-    None,
-  )
+def entry_record(entry: dict, sources: list[dict], run_id: str) -> dict | None:
+  """One log entry as a dashboard record, or None when it belongs to no source lifetime."""
+  labels = entry.get("resource", {}).get("labels", {})
+  at = timestamp(entry["timestamp"])
+  match = next((s for s in sources if s["pod"] == labels.get("pod_name") and s["created_at"] <= at <= s["until"]), None)
   if match is None:
     return None
   fields = entry.get("jsonPayload") or {}
@@ -269,71 +209,39 @@ def entry_record(entry: dict, selected: list[dict], run_id: str) -> dict | None:
     "run_id": run_id,
     "timestamp": entry.get("timestamp"),
     "pod": match["pod"],
-    "pod_uid": None,
-    "observed_pod_uid": match.get("pod_uid"),
-    "container": match["container"],
+    "container": labels.get("container_name"),
     "node": match.get("node"),
     "role": match.get("role", "unknown"),
-    "attempt": None,
     "severity": entry.get("severity", "UNKNOWN"),
     "rank": fields.get("rank"),
     "request_id": fields.get("request_id"),
-    "message": text[: logs.MAX_MESSAGE],
-    "message_truncated": len(text) > logs.MAX_MESSAGE,
+    "message": text[:MAX_MESSAGE],
+    "message_truncated": len(text) > MAX_MESSAGE,
   }
 
 
 async def run_logs(
-  run_id: str,
-  sources: list[dict],
-  *,
-  since=None,
-  until=None,
-  cursor=None,
-  limit=200,
-  q="",
-  pod=None,
-  container=None,
-  node=None,
-  severity=None,
-  attempt=None,
+  run_id: str, sources: list[dict], *, since=None, until=None, cursor=None, limit=200, q="", pod=None, node=None, severity=None
 ) -> dict:
-  result = {
-    "schema_version": 1,
-    "run_id": run_id,
-    "source": "gke",
-    "records": [],
-    "sources": sources,
-    "order": "newest_first",
-    "next_cursor": None,
-    "available": False,
-    "coverage": {"history_complete": False, "correlation": "pod_name_container_observed_lifetime", "pod_uid_verified": False},
-  }
+  result = {"run_id": run_id, "source": "gke", "records": [], "sources": sources, "order": "newest_first", "next_cursor": None, "available": False}
   if not configuration()["configured"]:
-    return {**result, "error": "GKE telemetry is not fully configured"}
-  if logging_refused():
+    return {**result, "error": "GKE telemetry is not configured"}
+  if refused():
     return {**result, "error": REFUSED}
-  if attempt is not None:
-    return {**result, "error": "GKE logs do not reliably identify restart attempts; use source=local"}
-  selected = select_sources(sources, pod, container, node)
+  selected = [s for s in sources if (pod is None or s["pod"] == pod) and (node is None or s.get("node") == node)]
   if not selected:
-    return {**result, "error": "No observed pod lifetimes match this run and filter"}
-  if len(selected) > MAX_LOG_SOURCES:
-    return {**result, "error": f"Select a pod to narrow this query to at most {MAX_LOG_SOURCES} container lifetimes"}
-  fingerprint = query_fingerprint(run_id, since, until, q, pod, container, node, severity, limit)
-  page_token = None
-  if cursor:
-    start, end, page_token, selected = resume_page(cursor, fingerprint)
-  else:
-    start, end = time_range(since, until)
+    return {**result, "error": "No pod lifetimes match this run and filter"}
+  if len(selected) > MAX_SOURCES:
+    return {**result, "error": f"Select a pod to narrow this query to at most {MAX_SOURCES} pod lifetimes"}
+  start, end = time_range(since, until)
   body = {
     "resourceNames": [f"projects/{configuration()['project']}"],
     "filter": logs_filter(selected, start, end, severity, q),
     "orderBy": "timestamp desc",
     "pageSize": limit,
   }
-  if page_token:
-    body["pageToken"] = page_token
+  if cursor:
+    body["pageToken"] = cursor
   try:
     payload = await request("POST", "https://logging.googleapis.com/v2/entries:list", json=body)
     records = [record for entry in payload.get("entries", []) if (record := entry_record(entry, selected, run_id))]
@@ -341,88 +249,9 @@ async def run_logs(
     if exc.response.status_code in (401, 403):
       note_refusal()
       return {**result, "error": REFUSED}
+    if exc.response.status_code == 400 and cursor:
+      raise ValueError("Invalid or expired log cursor; repeat the query without it") from None
     return {**result, "error": UNAVAILABLE}
   except Exception:
     return {**result, "error": UNAVAILABLE}
-  result.update(records=records, available=True)
-  if payload.get("nextPageToken"):
-    result["next_cursor"] = remember_page(fingerprint, start, end, payload["nextPageToken"], selected)
-  return result
-
-
-METRICS = {
-  "gpu_utilization": ("container/accelerator/duty_cycle", "%"),
-  "gpu_memory": ("container/accelerator/memory_used", "bytes"),
-  "cpu_usage": ("container/cpu/core_usage_time", "CPU seconds"),
-  "memory_usage": ("container/memory/used_bytes", "bytes"),
-}
-
-
-async def resource_metrics(sources: list[dict], since=None, until=None) -> dict:
-  start, end = time_range(since, until)
-  result = {
-    "source": "gke",
-    "available": False,
-    "series": [],
-    "since": start,
-    "until": end,
-    "coverage": {"history_complete": False, "correlation": "pod_name_container_observed_lifetime", "pod_uid_verified": False},
-  }
-  if not configuration()["configured"] or not sources:
-    return {**result, "error": "GKE configuration or observed pod lifetimes unavailable"}
-  if len(sources) > 64:
-    return {**result, "error": "Too many container lifetimes for one metrics query"}
-  names = sorted({s["pod"] for s in sources})
-
-  async def metric(name, definition):
-    suffix, unit = definition
-    clauses = scope_filter() + [
-      f'metric.type="kubernetes.io/{suffix}"',
-      # Monitoring filters refuse OR inside an AND chain on resource labels.
-      "resource.labels.pod_name = one_of(" + ", ".join(json.dumps(pod) for pod in names) + ")",
-    ]
-    params = {"filter": " AND ".join(clauses), "interval.startTime": start, "interval.endTime": end, "view": "FULL", "pageSize": 1000}
-    payload = await request("GET", f"https://monitoring.googleapis.com/v3/projects/{configuration()['project']}/timeSeries", params=params)
-    series = []
-    for item in payload.get("timeSeries", []):
-      labels = item.get("resource", {}).get("labels", {})
-      if not matches_resource(labels):
-        continue
-      matches = [s for s in sources if s["pod"] == labels.get("pod_name") and s["container"] == labels.get("container_name")]
-      points = []
-      for point in item.get("points", []):
-        at = point["interval"]["endTime"]
-        if not any(logs.timestamp(s["created_at"]) <= logs.timestamp(at) <= logs.timestamp(s["until"]) for s in matches):
-          continue
-        value = point.get("value", {})
-        number = float(value.get("doubleValue", value.get("int64Value", "nan")))
-        if math.isfinite(number):
-          points.append([datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp(), number])
-      if points:
-        series.append(
-          {
-            "name": name,
-            "unit": unit,
-            "pod": labels.get("pod_name"),
-            "container": labels.get("container_name"),
-            "role": matches[0].get("role", "unknown"),
-            "device": item.get("metric", {}).get("labels", {}).get("accelerator_id"),
-            "points": sorted(points),
-            "metric_kind": item.get("metricKind"),
-          }
-        )
-    return series, bool(payload.get("nextPageToken"))
-
-  values = await asyncio.gather(*(metric(name, definition) for name, definition in METRICS.items()), return_exceptions=True)
-  errors = []
-  for (name, _), value in zip(METRICS.items(), values, strict=True):
-    if isinstance(value, Exception):
-      errors.append(name)
-    else:
-      result["available"] = True
-      result["series"].extend(value[0])
-      if value[1]:
-        errors.append(f"{name}: truncated")
-  if errors:
-    result["error"] = "Unavailable or incomplete metrics: " + ", ".join(errors)
-  return result
+  return {**result, "records": records, "available": True, "next_cursor": payload.get("nextPageToken")}
