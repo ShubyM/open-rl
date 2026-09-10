@@ -261,9 +261,18 @@ async def lifespan(served_app: FastAPI):
       if base_model:
         await asyncio.to_thread(worker.load_base_model, base_model)
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
+  from server.dashboard import data as dashboard_data
+  from server.dashboard import logs as dashboard_logs
+
+  log_task = None
+  if not dashboard_data.demo_mode_enabled() and os.getenv("OPEN_RL_LOG_COLLECTOR", "1") != "0":
+    log_task = asyncio.create_task(dashboard_logs.collector(served_app))
   try:
     yield
   finally:
+    if log_task is not None:
+      log_task.cancel()
+      await asyncio.gather(log_task, return_exceptions=True)
     if task is not None:
       task.cancel()
     if worker_launch_task is not None:

@@ -63,6 +63,14 @@ def main() -> None:
   logs.add_argument("--tail", dest="tail_lines_flag", type=int, default=None)
   logs.add_argument("--previous", action="store_true", help="Read the previous terminated container instance")
 
+  run_logs = sub.add_parser("run-logs", help="Search retained logs across a run's pods (JSON, newest first)")
+  run_logs.add_argument("run_id")
+  for name in ("since", "until", "pod", "container", "node", "severity", "q", "cursor"):
+    run_logs.add_argument("--" + name)
+  run_logs.add_argument("--attempt", type=int)
+  run_logs.add_argument("--limit", type=int, default=200)
+  run_logs.add_argument("--archive-only", action="store_true")
+
   launch = sub.add_parser("launch", help="Launch a run (create_model)")
   launch.add_argument("base_model", nargs="?", metavar="BASE_MODEL")
   launch.add_argument("--base-model", dest="base_model_flag", help=argparse.SUPPRESS)
@@ -102,6 +110,15 @@ def main() -> None:
     if args.previous:
       params["previous"] = "true"
     emit(request("GET", f"/api/v1/dashboard/pods/{urllib.parse.quote(args.pod)}/logs?{urllib.parse.urlencode(params)}"))
+  elif args.command == "run-logs":
+    params = {
+      name: getattr(args, name)
+      for name in ("since", "until", "pod", "container", "node", "severity", "q", "cursor", "attempt", "limit")
+      if getattr(args, name) is not None
+    }
+    if args.archive_only:
+      params["refresh"] = "false"
+    emit(request("GET", f"/api/v1/dashboard/runs/{urllib.parse.quote(args.run_id, safe='')}/logs?{urllib.parse.urlencode(params)}"))
   elif args.command == "launch":
     base_model = args.base_model_flag or args.base_model
     if not base_model:

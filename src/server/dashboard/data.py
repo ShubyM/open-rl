@@ -711,6 +711,7 @@ def pod_to_dict(pod: Any) -> dict:
   ready_count = sum(1 for c in statuses if c.ready)
   return {
     "name": pod.metadata.name,
+    "uid": str(pod.metadata.uid) if getattr(pod.metadata, "uid", None) else None,
     "phase": pod.status.phase or "Unknown",
     "node": pod.spec.node_name,
     "app": (pod.metadata.labels or {}).get("app"),

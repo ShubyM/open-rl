@@ -4,11 +4,12 @@
 import asyncio
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from server.dashboard import data, demo
+from server.dashboard import logs as log_store
 from server.store import get_store
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -74,6 +75,61 @@ async def dashboard_run_detail(run_id: str, request: Request, logs: int = 0):
   if detail is None:
     return JSONResponse(status_code=404, content={"error": f"unknown run: {run_id}"})
   return detail
+
+
+@router.get("/runs/{run_id}/logs")
+async def dashboard_run_logs(
+  run_id: str,
+  request: Request,
+  since: str | None = None,
+  until: str | None = None,
+  pod: str | None = None,
+  container: str | None = None,
+  node: str | None = None,
+  severity: str | None = Query(None, pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL|UNKNOWN)$"),
+  q: str = Query("", max_length=512),
+  attempt: int | None = Query(None, ge=0),
+  limit: int = Query(200, ge=1, le=1000),
+  cursor: str | None = Query(None, max_length=2048),
+  refresh: bool = True,
+):
+  options = dict(
+    since=since, until=until, pod=pod, container=container, node=node, severity=severity, q=q, attempt=attempt, limit=limit, cursor=cursor
+  )
+  try:
+    # Validate filters/cursor before spending Kubernetes API calls.
+    result = await asyncio.to_thread(log_store.query, run_id, **options)
+    collection = None
+    discovery_available = None
+    events = []
+    if refresh and not cursor:
+      if data.demo_mode_enabled():
+        detail = demo.demo_run_detail(run_id, 0)
+        pods = (detail or {}).get("pods", [])
+        discovery_available = True
+      else:
+        k8s = await asyncio.to_thread(data.k8s_snapshot)
+        pods = data.model_pods(run_id, k8s["pods"])
+        discovery_available = k8s.get("available", False)
+      for item in pods:
+        events.extend({**event, "pod": item["name"], "node": item.get("node")} for event in item.get("events", []))
+      selected_pods = [item for item in pods if (not pod or item["name"] == pod) and (not node or item.get("node") == node)]
+      if container:
+        selected_pods = [{**item, "containers": [c for c in item.get("containers", []) if c["name"] == container]} for item in selected_pods]
+      collection = await asyncio.to_thread(log_store.collect, run_id, selected_pods, data.demo_mode_enabled())
+      result = await asyncio.to_thread(log_store.query, run_id, **options)
+    return {
+      **result,
+      "demo": data.demo_mode_enabled(),
+      "collection": collection,
+      "discovery_available": discovery_available,
+      "events": events,
+      "collector_error": getattr(request.app.state, "log_collector_error", None),
+    }
+  except ValueError as exc:
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+  except Exception:
+    return JSONResponse(status_code=503, content={"error": "Log archive unavailable"})
 
 
 @router.post("/runs/{run_id}/stop")

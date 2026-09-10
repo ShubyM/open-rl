@@ -43,6 +43,7 @@ def main() -> None:
       page = browser.new_page(viewport={"width": width, "height": 844})
       page.goto(f"{BASE_URL}/dashboard", wait_until="networkidle")
       page.wait_for_function("document.querySelector('#updated-at').textContent.includes('updated')")
+      page.locator(".control-details > summary").click()
 
       cards = page.locator("#control-col .card-title").all_text_contents()
       assert "gateway" in cards and "rollouts" in cards, cards

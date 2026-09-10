@@ -326,6 +326,11 @@ class DashboardEndpointsTest(unittest.TestCase):
         ("GET", "/api/v1/dashboard/pods/pod-a/logs?tail=42&container=trainer&previous=true"),
         None,
       ),
+      (
+        ["ops.py", "run-logs", "run-a", "--q", "CUDA OOM", "--limit", "40", "--archive-only"],
+        ("GET", "/api/v1/dashboard/runs/run-a/logs?q=CUDA+OOM&limit=40&refresh=false"),
+        None,
+      ),
       (["ops.py", "launch", "Qwen/Qwen3-0.6B"], ("POST", "/api/v1/dashboard/runs"), {"base_model": "Qwen/Qwen3-0.6B"}),
     ]
     for argv, call, payload in cases:

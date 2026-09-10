@@ -1,22 +1,26 @@
 // open-rl operations dashboard. Vanilla ES module, no build step. Views poll the JSON API
-// and reconcile the DOM in place so refreshes never rebuild the page or lose canvas
-// position, selection, or the open log panel.
+// and reconcile the DOM in place to retain selection and the open log panel.
 
 const POLL_MS = 8000;
 const LOG_POLL_MS = 3000;
 
 const $ = (id) => document.getElementById(id);
+const linkedRun = new URLSearchParams(location.search).get('run');
 
 const S = {
-  tab: sessionStorage.getItem("tab") || "cluster",
-  pool: sessionStorage.getItem("pool") || null,
+  tab: linkedRun ? "runs" : sessionStorage.getItem("tab") || "cluster",
+  pool: linkedRun ? null : sessionStorage.getItem("pool") || null,
   cluster: null,
   runs: null,
   health: null,
   problems: null,
-  canvas: JSON.parse(sessionStorage.getItem("canvas") || '{"x":0,"y":0,"k":1}'),
+  snapshot: null,
+  search: "",
+  filter: "all",
+  detailLoading: new Set(),
   panel: { pod: null, container: null },
-  openRun: sessionStorage.getItem("open-run") || null,
+  runLog: null,
+  openRun: linkedRun || sessionStorage.getItem("open-run") || null,
   runDetails: new Map(),
   stopConfirm: null,
   stopNotes: new Map(),
@@ -112,7 +116,7 @@ function latency(seconds) {
 }
 
 function compactNumber(value) {
-  if (!Number.isFinite(Number(value))) return "—";
+  if (value == null || !Number.isFinite(Number(value))) return "—";
   const number = Number(value);
   if (number === 0) return "0";
   if (Math.abs(number) >= 1000 || Math.abs(number) < 0.001) return number.toExponential(2);
@@ -120,7 +124,7 @@ function compactNumber(value) {
 }
 
 function bytes(value) {
-  if (!Number.isFinite(Number(value))) return "—";
+  if (value == null || !Number.isFinite(Number(value))) return "—";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let amount = Number(value);
   let unit = 0;
@@ -132,7 +136,7 @@ function bytes(value) {
 }
 
 function cores(value) {
-  return Number.isFinite(Number(value)) ? `${compactNumber(value)} cores` : "—";
+  return value != null && Number.isFinite(Number(value)) ? `${compactNumber(value)} cores` : "—";
 }
 
 function revisionLabel(value) {
@@ -156,15 +160,20 @@ $("theme-toggle").addEventListener("click", () => {
 // *** Navigation: three tabs, plus a per-pool drill-in screen under Cluster ***
 
 function activeViewId() {
+  if (S.tab === "runs" && S.runLog) return "logs";
   return S.pool && S.tab === "cluster" ? "pool" : S.tab;
 }
 
 function updateViews() {
-  for (const btn of document.querySelectorAll(".tab")) btn.classList.toggle("active", btn.dataset.tab === S.tab);
+  for (const btn of document.querySelectorAll(".tab")) {
+    btn.classList.toggle("active", btn.dataset.tab === S.tab);
+    btn.setAttribute("aria-selected", String(btn.dataset.tab === S.tab));
+  }
   for (const view of document.querySelectorAll(".view")) view.hidden = view.id !== `view-${activeViewId()}`;
 }
 
 function showTab(tab) {
+  closeRunLogs();
   S.tab = tab;
   S.pool = null;
   sessionStorage.setItem("tab", tab);
@@ -184,61 +193,6 @@ function openPool(poolId) {
 for (const btn of document.querySelectorAll(".tab")) btn.addEventListener("click", () => showTab(btn.dataset.tab));
 $("pool-back").addEventListener("click", () => showTab("cluster"));
 updateViews();
-
-// *** Canvas pan & zoom ***
-
-const canvas = $("canvas");
-const world = $("world");
-
-function applyTransform() {
-  // Edges live inside the transformed world, so panning/zooming never needs a redraw.
-  world.style.transform = `translate(${S.canvas.x}px, ${S.canvas.y}px) scale(${S.canvas.k})`;
-  sessionStorage.setItem("canvas", JSON.stringify(S.canvas));
-}
-applyTransform();
-
-let drag = null;
-canvas.addEventListener("pointerdown", (e) => {
-  if (e.target.closest("button, a, input, .pod")) return;
-  drag = { x: e.clientX, y: e.clientY, ox: S.canvas.x, oy: S.canvas.y };
-  canvas.setPointerCapture(e.pointerId);
-  canvas.classList.add("panning");
-});
-canvas.addEventListener("pointermove", (e) => {
-  if (!drag) return;
-  S.canvas.x = drag.ox + (e.clientX - drag.x);
-  S.canvas.y = drag.oy + (e.clientY - drag.y);
-  applyTransform();
-});
-canvas.addEventListener("pointerup", () => {
-  drag = null;
-  canvas.classList.remove("panning");
-});
-
-canvas.addEventListener(
-  "wheel",
-  (e) => {
-    e.preventDefault();
-    if (e.ctrlKey || e.metaKey) {
-      const k = Math.min(1.6, Math.max(0.4, S.canvas.k * (e.deltaY < 0 ? 1.1 : 0.9)));
-      const rect = canvas.getBoundingClientRect();
-      const cx = e.clientX - rect.left;
-      const cy = e.clientY - rect.top;
-      S.canvas.x = cx - ((cx - S.canvas.x) / S.canvas.k) * k;
-      S.canvas.y = cy - ((cy - S.canvas.y) / S.canvas.k) * k;
-      S.canvas.k = k;
-    } else {
-      S.canvas.x -= e.deltaX;
-      S.canvas.y -= e.deltaY;
-    }
-    applyTransform();
-  },
-  { passive: false }
-);
-
-$("zoom-in").addEventListener("click", () => { S.canvas.k = Math.min(1.6, S.canvas.k * 1.15); applyTransform(); });
-$("zoom-out").addEventListener("click", () => { S.canvas.k = Math.max(0.4, S.canvas.k / 1.15); applyTransform(); });
-$("zoom-reset").addEventListener("click", () => { S.canvas = { x: 0, y: 0, k: 1 }; applyTransform(); });
 
 // *** Cluster view ***
 
@@ -492,7 +446,7 @@ function renderPool() {
     },
     (row, node) => {
       setText(row.querySelector(".pool-node-name"), node.name);
-      setText(row.querySelector(".pool-node-gpus"), node.gpu_capacity ? `${node.gpu_allocatable}/${node.gpu_capacity} GPU` : "");
+      setText(row.querySelector(".pool-node-gpus"), node.gpu_capacity ? `${node.gpu_allocatable}/${node.gpu_capacity} GPU allocatable` : "");
       const meta = row.querySelector(".pool-node-meta");
       const pods = `${node.pods.length} pod${node.pods.length === 1 ? "" : "s"}`;
       const usage = node.usage ? `${compactNumber(node.usage.cpu_cores)} CPU · ${bytes(node.usage.memory_bytes)}` : null;
@@ -624,7 +578,7 @@ function renderCluster(data) {
           const meta = nodeEl.querySelector(".node-meta");
           const bits = [];
           if (node.instance_type) bits.push(node.instance_type);
-          if (node.gpu_capacity) bits.push(`${node.gpu_allocatable}/${node.gpu_capacity} GPU`);
+          if (node.gpu_capacity) bits.push(`${node.gpu_allocatable}/${node.gpu_capacity} GPU allocatable`);
           if (node.usage) bits.push(`${compactNumber(node.usage.cpu_cores)} CPU · ${bytes(node.usage.memory_bytes)}`);
           meta.replaceChildren(el("span", "", bits.join(" · ")));
           if (node.ready === false) meta.append(" ", el("span", "bad", "not ready"));
@@ -651,37 +605,20 @@ function renderCluster(data) {
     }
   );
 
-  requestAnimationFrame(drawEdges);
-}
-
-function drawEdges() {
-  const svg = $("edges");
-  const edges = S.cluster?.edges || [];
-  const paths = [];
-  for (const edge of edges) {
-    const from = $(`card-${edge.from}`);
-    const to = $(`card-${edge.to}`);
-    if (!from || !to) continue;
-    const x1 = from.offsetLeft + from.offsetWidth / 2;
-    const y1 = from.offsetTop + from.offsetHeight;
-    const x2 = to.offsetLeft + to.offsetWidth / 2;
-    const y2 = to.offsetTop;
-    const service = S.cluster.services.find((s) => s.id === edge.to);
-    const down = service && service.ok === false;
-    paths.push(`<path class="${down ? "down" : ""}" d="M ${x1} ${y1} C ${x1} ${y1 + 20}, ${x2} ${y2 - 20}, ${x2} ${y2}"><title>${edge.reason}</title></path>`);
-  }
-  svg.innerHTML = paths.join("");
+  renderFleet(data);
 }
 
 // *** Runs view ***
 
 function renderRuns(data) {
-  const runs = data.runs || [];
-  if (S.openRun && !runs.some((run) => run.run_id === S.openRun)) {
+  const allRuns = data.runs || [];
+  const runs = allRuns.filter(matchesRun).sort((a, b) => attentionRank(a) - attentionRank(b));
+  if (S.openRun && !allRuns.some((run) => run.run_id === S.openRun)) {
     S.openRun = null;
     sessionStorage.removeItem("open-run");
   }
-  setText($("runs-count"), String(runs.length || ""));
+  setText($("runs-count"), `${runs.length} / ${allRuns.length}`);
+  setText($("runs-empty"), allRuns.length ? "No runs match these filters." : "No runs yet.");
   $("runs-empty").hidden = runs.length > 0;
   sync(
     $("runs-list"),
@@ -696,7 +633,7 @@ function renderRuns(data) {
       info.append(el("div", "run-name"), el("div", "run-ids"), meta);
       const actions = el("div", "run-actions");
       main.append(info, actions);
-      row.append(main, el("div", "run-note"), el("div", "run-detail"));
+      row.append(main, el("div", "run-summary"), el("div", "run-note"), el("div", "run-detail"));
       return row;
     },
     (row, run) => {
@@ -707,6 +644,7 @@ function renderRuns(data) {
       setText(stateEl, state.phase);
       setClass(stateEl, `run-state ${state.status}`);
       setText(row.querySelector(".run-reason"), state.reason);
+      renderRunSummary(row.querySelector(".run-summary"), run);
       const actions = row.querySelector(".run-actions");
 
       let inspect = actions.querySelector(".inspect");
@@ -781,10 +719,26 @@ function renderRunDetail(container, run, detail) {
   }
 
   const head = el("div", "run-detail-head");
-  head.append(el("div", "eyebrow", "Live inspection"));
+  head.append(el("div", "eyebrow", `Live inspection · ${detail.inspected_at ? new Date(detail.inspected_at).toLocaleTimeString() : "latest observation"}`));
   const refreshButton = el("button", "btn", "Refresh inspection");
   refreshButton.addEventListener("click", () => loadRunDetail(run.run_id));
-  head.append(refreshButton);
+  const copy = el("button", "btn", "Copy diagnostic JSON");
+  copy.addEventListener("click", () => copyDiagnostic(copy, { schema_version: 1, exported_at: new Date().toISOString(), cluster_observation: S.cluster?.kubernetes?.observation, ...detail }));
+  const link = el("button", "btn", "Copy run link");
+  link.addEventListener("click", async () => {
+    const url = new URL('/dashboard', location.origin);
+    url.searchParams.set('run', run.run_id);
+    try {
+      await copyText(url.href);
+      setText(link, 'Copied');
+    } catch {
+      setText(link, 'Copy failed — retry');
+    }
+    setTimeout(() => setText(link, 'Copy run link'), 1800);
+  });
+  const logsButton = el("button", "btn", "Logs");
+  logsButton.addEventListener("click", () => openRunLogs(run.run_id));
+  head.append(logsButton, link, copy, refreshButton);
 
   const claims = Object.entries(detail.gpu_claims || {});
   const claimsText = claims.length ? claims.map(([pool, count]) => `${count} on ${pool}`).join(" · ") : "none visible";
@@ -858,7 +812,9 @@ function renderRunDetail(container, run, detail) {
       for (const [name, value] of latest) {
         const points = telemetry.metric_series?.[name] || [];
         const trend = points.length > 1 ? `${compactNumber(points[0].value)} → ${compactNumber(points.at(-1).value)} · ${points.length} samples` : `${points.length || 1} sample`;
-        workerMetrics.append(metric(name, compactNumber(value), trend));
+        const card = metric(name, compactNumber(value), trend);
+        card.append(metricChart(points, name, false, run.run_id));
+        workerMetrics.append(card);
       }
       telemetrySection.append(workerMetrics);
     }
@@ -888,7 +844,7 @@ function renderRunDetail(container, run, detail) {
   }
 
   const podSection = el("div", "run-pods");
-  podSection.append(el("div", "eyebrow", "Pods and recent logs"));
+  podSection.append(el("div", "eyebrow", "Pods"));
   if (!detail.pods?.length) {
     podSection.append(el("div", "run-detail-empty", "No run pods are visible."));
   }
@@ -896,7 +852,7 @@ function renderRunDetail(container, run, detail) {
     const card = el("div", "run-pod-card");
     const podButton = el("button", "run-pod");
     podButton.append(el("span", "run-pod-name", pod.name), el("span", podStateClass(pod), podStateText(pod)));
-    podButton.addEventListener("click", () => openPanel(pod.name));
+    podButton.addEventListener("click", () => openRunLogs(run.run_id, { pod: pod.name }));
     const podMeta = el(
       "div",
       "run-pod-meta",
@@ -906,21 +862,22 @@ function renderRunDetail(container, run, detail) {
     );
     card.append(podButton, podMeta);
     if (pod.problem) card.append(el("div", "run-pod-problem", pod.problem));
-    if (detail.logs && Object.hasOwn(detail.logs, pod.name)) card.append(el("pre", "run-log-preview", detail.logs[pod.name] || "(no log output)"));
     podSection.append(card);
   }
   container.replaceChildren(head, metrics, diagnostics, telemetrySection, workloadSection, podSection);
 }
 
 async function loadRunDetail(runId) {
-  S.runDetails.delete(runId);
+  if (S.detailLoading.has(runId)) return;
+  S.detailLoading.add(runId);
   if (S.runs) renderRuns(S.runs);
   try {
-    const detail = await fetchJSON(`/api/v1/dashboard/runs/${encodeURIComponent(runId)}?logs=120`);
-    S.runDetails.set(runId, detail);
+    const detail = await fetchJSON(`/api/v1/dashboard/runs/${encodeURIComponent(runId)}`);
+    S.runDetails.set(runId, { ...detail, inspected_at: new Date().toISOString() });
   } catch (err) {
     S.runDetails.set(runId, { error: err.message });
   }
+  S.detailLoading.delete(runId);
   if (S.runs && S.openRun === runId) renderRuns(S.runs);
 }
 
@@ -1184,6 +1141,8 @@ const panel = $("panel");
 let logTimer = null;
 
 function openPanel(podName) {
+  const run = S.runs?.runs.find(item => runPods(item).some(pod => pod.name === podName));
+  if (run) { openRunLogs(run.run_id, { pod: podName }); return; }
   S.panel.pod = podName;
   S.panel.container = null;
   $("log-previous").checked = false;
@@ -1345,6 +1304,7 @@ async function refresh() {
   refreshing = true;
   try {
     const snapshot = await fetchJSON("/api/v1/dashboard/snapshot");
+    S.snapshot = snapshot;
     S.cluster = snapshot.cluster;
     S.runs = snapshot.runs;
     S.health = snapshot.health;
@@ -1354,6 +1314,7 @@ async function refresh() {
     renderPool();
     renderRuns(S.runs);
     renderHealth(S.health, S.problems, S.cluster?.gateway?.http);
+    if (S.openRun) loadRunDetail(S.openRun);
     $("demo-banner").hidden = !snapshot.demo;
     const build = snapshot.cluster?.gateway?.build;
     setText($("build-at"), `build ${revisionLabel(build?.revision)}`);
@@ -1388,3 +1349,309 @@ setInterval(() => {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refresh();
 });
+
+// Fleet and run views use the same snapshot and exact pod membership as the API.
+function runPods(run) {
+  const names = new Set(run.pods || []);
+  return (S.cluster?.pods || []).filter(pod => names.has(pod.name));
+}
+
+function attentionRank(run) {
+  return ({ error: 0, warn: 1, ok: 2 })[run.state?.status] ?? 3;
+}
+
+function matchesRun(run) {
+  const query = S.search.toLowerCase();
+  const haystack = [run.name, run.run_id, run.base_model, ...runPods(run).map(pod => pod.node)].join(' ').toLowerCase();
+  return haystack.includes(query) && (S.filter === 'all' ||
+    (S.filter === 'attention' && attentionRank(run) < 2) ||
+    (S.filter === 'running' && run.state?.phase === 'running') ||
+    (S.filter === 'queued' && run.queue_depth > 0));
+}
+
+function inspectRun(runId) {
+  S.search = ''; S.filter = 'all';
+  $('run-search').value = ''; $('run-filter').value = 'all';
+  showTab('runs');
+  if (S.openRun !== runId) toggleRunDetail(runId);
+  else renderRuns(S.runs);
+  const row = [...$('runs-list').children].find(item => item.dataset.key === runId);
+  row?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+async function copyDiagnostic(button, payload) {
+  const label = button.textContent;
+  try {
+    await copyText(JSON.stringify(payload, null, 2));
+    setText(button, 'Copied');
+  } catch {
+    setText(button, 'Copy failed — retry');
+  }
+  setTimeout(() => setText(button, label), 1800);
+}
+
+$('copy-snapshot').addEventListener('click', () => {
+  if (S.snapshot) copyDiagnostic($('copy-snapshot'), S.snapshot);
+});
+$('fleet-attention').addEventListener('click', () => showTab('health'));
+$('run-search').addEventListener('input', event => { S.search = event.target.value; if (S.runs) renderRuns(S.runs); });
+$('run-filter').addEventListener('change', event => { S.filter = event.target.value; if (S.runs) renderRuns(S.runs); });
+
+function renderFleet(data) {
+  const runs = S.runs?.runs || [];
+  const nodes = data.pools.filter(pool => pool.id !== 'unscheduled').flatMap(pool => pool.nodes);
+  const capacity = nodes.reduce((sum, node) => sum + (node.gpu_capacity || 0), 0);
+  const scheduled = data.pods.filter(pod => pod.node && !['Succeeded', 'Failed'].includes(pod.phase));
+  const claims = scheduled.every(pod => Number.isFinite(pod.gpus)) ? scheduled.reduce((sum, pod) => sum + pod.gpus, 0) : null;
+  const running = runs.filter(run => run.state?.phase === 'running').length;
+  const queued = runs.reduce((sum, run) => sum + (run.queue_depth || 0), 0);
+  const summary = $('fleet-summary');
+  summary.replaceChildren(
+    metric('Running jobs', String(running), `${runs.length} discovered runs`),
+    metric('Queued requests', String(queued), 'Across all discovered runs'),
+    metric('GPU claims / capacity', data.kubernetes.available ? `${claims ?? "—"} / ${capacity}` : '—', 'Visible scheduled pods / visible nodes'),
+    metric('Nodes ready', data.kubernetes.available ? `${nodes.filter(node => node.ready === true).length} / ${nodes.length}` : '—', 'Observed Kubernetes readiness')
+  );
+  const problems = S.problems?.problems || [];
+  const attention = $('fleet-attention');
+  attention.hidden = !problems.length;
+  setText(attention, `${problems.length} issue${problems.length === 1 ? '' : 's'} need attention · ${problems[0]?.message || ''} → Inspect health`);
+  const sorted = [...runs].sort((a, b) => attentionRank(a) - attentionRank(b));
+  sync($('placement-list'), sorted, run => run.run_id, () => el('div', 'placement-row'), (row, run) => {
+    const identity = el('button', 'placement-identity');
+    identity.append(el('strong', '', run.name), el('span', `run-state ${run.state?.status || 'off'}`, run.state?.phase || 'unknown'));
+    identity.addEventListener('click', () => inspectRun(run.run_id));
+    const placement = el('div', 'placement-pods');
+    const pods = runPods(run);
+    for (const pod of pods) {
+      const button = el('button', 'placement-pod');
+      button.append(el('span', 'placement-node', pod.node || 'Unscheduled'), el('span', 'placement-pod-name', pod.name), el('span', podStateClass(pod), podStateText(pod)));
+      button.addEventListener('click', () => openPanel(pod.name));
+      placement.append(button);
+    }
+    if (!pods.length) placement.append(el('span', 'muted', 'No visible pod placement'));
+    const active = run.telemetry?.active_request;
+    const activity = el('div', 'placement-activity');
+    activity.append(el('span', '', active ? `${active.operation} · ${duration(active.age_seconds)}` : run.state?.reason || 'No activity reported'), el('span', 'muted', `${run.queue_depth || 0} queued`));
+    row.replaceChildren(identity, placement, activity);
+  });
+  if (!sorted.length) $('placement-list').replaceChildren(el('p', 'empty', 'No runs discovered. Compute pools below show other visible workloads.'));
+}
+
+function renderRunSummary(container, run) {
+  const telemetry = run.telemetry || {};
+  const active = telemetry.active_request;
+  const nodes = [...new Set(runPods(run).map(pod => pod.node).filter(Boolean))];
+  const latest = Object.entries(telemetry.latest_metrics || {}).slice(0, 2);
+  container.replaceChildren(
+    metric('Current operation', active?.operation || 'No active request', active ? `${duration(active.age_seconds)} executing` : telemetry.last_operation ? `Last: ${telemetry.last_operation}` : 'No worker activity reported'),
+    metric('Placement', nodes.length ? nodes.join(', ') : 'No visible node', `${run.pods?.length || 0} pods`),
+    metric('Queue', String(run.queue_depth || 0), run.queue_depth ? `oldest ${run.queue_oldest_seconds == null ? 'unknown' : duration(run.queue_oldest_seconds)}` : 'No queued requests'),
+    metric('Request failures', String(telemetry.requests_failed || 0), `${telemetry.requests_completed || 0} completed`)
+  );
+  for (const [name, value] of latest) {
+    const tile = metric(name, compactNumber(value), 'Latest worker report');
+    tile.append(metricChart(telemetry.metric_series?.[name] || [], name, true));
+    container.append(tile);
+  }
+}
+
+function metricChart(series, name, compact = false, runId = null) {
+  const points = series.filter(point => Number.isFinite(point.value) && Number.isFinite(point.at));
+  const wrap = el('div', 'metric-chart');
+  if (points.length < 2) {
+    wrap.append(el('span', 'muted', points.length ? 'Waiting for a second sample' : 'No trend samples reported'));
+    return wrap;
+  }
+  const low = Math.min(...points.map(point => point.value));
+  const high = Math.max(...points.map(point => point.value));
+  const start = Math.min(...points.map(point => point.at));
+  const end = Math.max(...points.map(point => point.at));
+  const coordinates = points.map(point => `${8 + (point.at - start) / (end - start || 1) * 284},${high === low ? 36 : 64 - (point.value - low) / (high - low) * 56}`).join(' ');
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 300 72');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', `${name}: ${points.length} samples, range ${compactNumber(low)} to ${compactNumber(high)}. Time ${timeLabel(start)} to ${timeLabel(end)}. Auto-scaled vertical axis.`);
+  const line = document.createElementNS(svg.namespaceURI, 'polyline');
+  line.setAttribute('points', coordinates); line.setAttribute('fill', 'none');
+  line.setAttribute('stroke', 'currentColor'); line.setAttribute('stroke-width', '2');
+  svg.append(line); wrap.append(svg);
+  if (runId) {
+    const openAt = at => openRunLogs(runId, { since: new Date((at - 120) * 1000).toISOString(), until: new Date((at + 120) * 1000).toISOString() });
+    svg.style.cursor = 'pointer';
+    svg.addEventListener('click', event => {
+      const bounds = svg.getBoundingClientRect();
+      const fraction = Math.max(0, Math.min(1, ((event.clientX - bounds.left) / bounds.width * 300 - 8) / 284));
+      openAt(start + fraction * (end - start));
+    });
+    const logsAtLatest = el('button', 'btn', 'Logs near latest sample');
+    logsAtLatest.addEventListener('click', () => openAt(end));
+    wrap.append(logsAtLatest);
+  }
+  if (!compact) {
+    wrap.append(el('div', 'muted', `${timeLabel(start)} – ${timeLabel(end)} · range ${compactNumber(low)}–${compactNumber(high)} · auto-scaled`));
+    const values = el('details', 'metric-samples');
+    values.append(el('summary', '', `Inspect ${points.length} samples`));
+    const table = el('table');
+    const header = el('tr');
+    for (const label of ['Time', 'Value', 'Operation']) header.append(el('th', '', label));
+    table.append(header);
+    for (const point of points) {
+      const row = el('tr');
+      for (const value of [new Date(point.at * 1000).toLocaleString(), String(point.value), point.operation || '—']) row.append(el('td', '', value));
+      table.append(row);
+    }
+    values.append(table); wrap.append(values);
+  }
+  return wrap;
+}
+
+// Run log filters are independent of snapshot polling, so typing and pagination stay put.
+let runLogTimer = null;
+let runLogRequest = null;
+let runLogGeneration = 0;
+function closeRunLogs() {
+  clearTimeout(runLogTimer);
+  runLogRequest?.abort();
+  runLogGeneration++;
+  S.runLog = null;
+}
+function localInput(iso) {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return '';
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+}
+function logOptions(id, values, selected) {
+  const select = $(id);
+  const label = {pod: 'All pods', container: 'All containers', node: 'All nodes', attempt: 'All attempts'}[id.split('-').at(-1)];
+  select.replaceChildren(new Option(label, ''));
+  for (const value of [...new Set([...values, selected].filter(Boolean))].sort()) select.add(new Option(value, value));
+  select.value = selected || '';
+}
+function openRunLogs(runId, filters = {}) {
+  closeRunLogs();
+  closePanel();
+  S.runLog = { runId, records: [], payload: null, filters };
+  S.tab = 'runs';
+  S.pool = null;
+  $('run-logs-name').textContent = (S.runs?.runs.find(run => run.run_id === runId)?.name || runId) + ' · ' + runId;
+  $('run-logs-search').value = filters.q || '';
+  $('run-logs-severity').value = filters.severity || '';
+  $('run-logs-since').value = localInput(filters.since);
+  $('run-logs-until').value = localInput(filters.until);
+  $('run-logs-follow').checked = !filters.until;
+  logOptions('run-logs-pod', [], filters.pod);
+  logOptions('run-logs-container', [], filters.container);
+  logOptions('run-logs-node', [], filters.node);
+  logOptions('run-logs-attempt', [], filters.attempt);
+  $('run-logs-lines').replaceChildren();
+  $('run-logs-sources').replaceChildren();
+  $('run-logs-events').replaceChildren();
+  $('run-logs-older').hidden = true;
+  updateViews();
+  loadRunLogs();
+}
+function runLogFilters() {
+  const params = new URLSearchParams({limit: '200'});
+  for (const [key, id] of Object.entries({q: 'search', pod: 'pod', container: 'container', node: 'node', attempt: 'attempt', severity: 'severity'})) {
+    if ($('run-logs-' + id).value) params.set(key, $('run-logs-' + id).value);
+  }
+  for (const key of ['since', 'until']) {
+    const value = $('run-logs-' + key).value;
+    if (value) params.set(key, new Date(value).toISOString());
+  }
+  return params;
+}
+async function loadRunLogs(older = false, automatic = false) {
+  clearTimeout(runLogTimer);
+  if (!S.runLog || (automatic && document.hidden)) {
+    if (S.runLog) runLogTimer = setTimeout(() => loadRunLogs(false, true), 15000);
+    return;
+  }
+  runLogRequest?.abort();
+  const abort = new AbortController();
+  runLogRequest = abort;
+  const generation = ++runLogGeneration;
+  const stickToBottom = automatic && window.scrollY + innerHeight >= document.documentElement.scrollHeight - 80;
+  const state = S.runLog;
+  const params = automatic || older ? new URLSearchParams(state.appliedParams) : runLogFilters();
+  if (older && state.payload?.next_cursor) {
+    params.set('cursor', state.payload.next_cursor);
+    $('run-logs-follow').checked = false;
+  }
+  state.appliedParams = new URLSearchParams(params);
+  state.appliedParams.delete('cursor');
+  $('run-logs-status').textContent = 'Loading logs…';
+  try {
+    const payload = await fetchJSON(`/api/v1/dashboard/runs/${encodeURIComponent(state.runId)}/logs?${params}`, { signal: abort.signal });
+    if (generation !== runLogGeneration) return;
+    state.records = older ? [...state.records, ...payload.records] : payload.records;
+    // Bound the browser independently of the archive and API.
+    state.records = [...new Map(state.records.map(record => [record.id, record])).values()].slice(0, 2000);
+    state.payload = { ...payload, events: older ? state.payload?.events || [] : payload.events };
+    const sources = payload.sources || [];
+    logOptions('run-logs-pod', sources.map(source => source.pod), params.get('pod'));
+    logOptions('run-logs-container', sources.filter(source => !params.get('pod') || source.pod === params.get('pod')).map(source => source.container), params.get('container'));
+    logOptions('run-logs-node', sources.map(source => source.node), params.get('node'));
+    logOptions('run-logs-attempt', sources.map(source => String(source.attempt)), params.get('attempt'));
+    const unavailable = sources.filter(source => source.status !== 'ok').length;
+    const limited = sources.some(source => source.tail_limited) || payload.collection?.sources_omitted;
+    $('run-logs-status').textContent = `${state.records.length} records${unavailable ? ` · ${unavailable} sources unavailable` : ''}${limited ? ' · collection limit reached' : ''}${payload.collector_error ? ' · background collector unavailable' : ''}${payload.discovery_available === false ? ' · Kubernetes discovery unavailable; showing archive' : ''}${!state.records.length ? ' · no collected output matches these filters' : ''}`;
+    $('run-logs-sources').replaceChildren(el('p', 'muted', payload.coverage.note));
+    $('run-logs-sources').append(el('p', 'muted', `Retention: up to ${payload.coverage.retention_days} days / ${payload.coverage.max_archive_records} records across all runs. Previous attempts are included when available.`));
+    if (!sources.length) $('run-logs-sources').append(el('p', '', 'No container sources have been collected for this run.'));
+    for (const source of sources) $('run-logs-sources').append(el('p', '', `${source.pod} / ${source.container} · attempt ${source.attempt}${source.previous ? ' (previous)' : ''} · ${source.status}${source.tail_limited ? ' · bounded tail' : ''} · observed ${source.collected_at}`));
+    $('run-logs-events').replaceChildren();
+    for (const event of state.payload.events) $('run-logs-events').append(el('p', '', `${event.pod} · ${event.reason || event.type || ''} · ${event.message || ''}`));
+    if (!state.payload.events.length) $('run-logs-events').append(el('p', 'muted', 'No current Kubernetes events returned. Events are not archived.'));
+    $('run-logs-lines').replaceChildren();
+    for (const record of [...state.records].reverse()) {
+      const row = el('div', 'log-record');
+      const time = el('time', 'log-record-time', record.timestamp ? new Date(record.timestamp).toISOString().slice(11, 23) + 'Z' : 'No time');
+      time.title = record.timestamp || 'Timestamp unavailable';
+      const source = el('button', 'log-record-source', record.pod + ' / ' + record.container);
+      source.title = `${record.pod} / ${record.container} · ${record.node || 'Node unavailable'} · attempt ${record.attempt}`;
+      source.setAttribute('aria-expanded', 'false');
+      let message = record.message;
+      try {
+        const parsed = JSON.parse(message);
+        if (typeof parsed?.message === 'string') message = parsed.message;
+        else if (typeof parsed?.msg === 'string') message = parsed.msg;
+      } catch { /* Plain-text output stays intact. */ }
+      const metadata = el('div', 'log-record-metadata');
+      metadata.hidden = true;
+      metadata.append(el('div', '', `${record.timestamp || 'Time unavailable'} · ${record.pod} / ${record.container} · ${record.node || 'Node unavailable'} · attempt ${record.attempt}${record.rank !== null ? ` · rank ${record.rank}` : ''} · ${record.severity}`));
+      metadata.append(el('pre', 'log-record-message', record.message));
+      source.addEventListener('click', () => { metadata.hidden = !metadata.hidden; source.setAttribute('aria-expanded', String(!metadata.hidden)); });
+      row.append(time, source, el('pre', `log-record-message ${['ERROR','CRITICAL'].includes(record.severity) ? 'log-record-error' : ''}`, `${record.severity}  ${message}${record.message_truncated ? ' [truncated]' : ''}`), metadata);
+      $('run-logs-lines').append(row);
+    }
+    $('run-logs-older').hidden = !payload.next_cursor || state.records.length >= 2000;
+    if (stickToBottom) window.scrollTo(0, document.documentElement.scrollHeight);
+  } catch (error) {
+    if (generation !== runLogGeneration || error.name === 'AbortError') return;
+    $('run-logs-status').textContent = `Logs unavailable: ${error.message}`;
+  } finally {
+    if (generation === runLogGeneration && $('run-logs-follow').checked) runLogTimer = setTimeout(() => loadRunLogs(false, true), 15000);
+  }
+}
+$('run-logs-filters').addEventListener('submit', event => { event.preventDefault(); loadRunLogs(); });
+$('run-logs-reset').addEventListener('click', () => { if (S.runLog) openRunLogs(S.runLog.runId); });
+$('run-logs-follow').addEventListener('change', () => { clearTimeout(runLogTimer); if ($('run-logs-follow').checked) loadRunLogs(); });
+$('run-logs-older').addEventListener('click', () => loadRunLogs(true));
+$('run-logs-back').addEventListener('click', () => { const runId = S.runLog?.runId; closeRunLogs(); if (runId) inspectRun(runId); });
+$('run-logs-json').addEventListener('click', () => {
+  if (S.runLog?.payload) copyDiagnostic($('run-logs-json'), {...S.runLog.payload, records: S.runLog.records, query: Object.fromEntries(S.runLog.appliedParams), exported_at: new Date().toISOString()});
+});
+$('run-logs-link').addEventListener('click', async () => {
+  if (!S.runLog) return;
+  const url = new URL('/dashboard', location.origin);
+  url.searchParams.set('run', S.runLog.runId); url.searchParams.set('view', 'logs');
+  for (const [key, value] of S.runLog.appliedParams || runLogFilters()) if (key !== 'limit') url.searchParams.set(key, value);
+  try { await copyText(url.href); $('run-logs-status').textContent = 'Log link copied'; }
+  catch { $('run-logs-status').textContent = 'Could not copy link'; }
+});
+if (linkedRun && new URLSearchParams(location.search).get('view') === 'logs') {
+  openRunLogs(linkedRun, Object.fromEntries(new URLSearchParams(location.search)));
+}

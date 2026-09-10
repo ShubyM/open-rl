@@ -26,17 +26,15 @@
 
   <main>
     <section id="view-cluster" class="view" hidden>
-      <div id="canvas" class="canvas">
-        <div id="world" class="world">
-          <svg id="edges" class="edges" aria-hidden="true"></svg>
-          <div id="control-col" class="control-col"></div>
-          <div id="pools-col" class="pools-col"></div>
-        </div>
-        <div class="canvas-controls">
-          <button id="zoom-out" class="icon-btn" title="Zoom out">&minus;</button>
-          <button id="zoom-in" class="icon-btn" title="Zoom in">+</button>
-          <button id="zoom-reset" class="icon-btn" title="Reset view">&#8862;</button>
-        </div>
+      <div class="page fleet-page">
+        <div class="page-head"><div><div class="eyebrow">OPEN-RL / OPERATIONS</div><h1>Cluster overview</h1><p class="page-description">Where work is running. What needs your attention.</p></div><button id="copy-snapshot" class="btn">Copy diagnostic JSON</button></div>
+        <div id="fleet-summary" class="fleet-summary"></div>
+        <button id="fleet-attention" class="fleet-attention" hidden></button>
+        <div class="section-heading"><h2>Job placement</h2><span class="muted">Run → node → pod</span></div>
+        <div id="placement-list" class="placement-list"></div>
+        <div class="section-heading"><h2>Compute pools</h2><span class="muted">GPU claims are allocation, not device utilization</span></div>
+        <div id="pools-col" class="pools-col"></div>
+        <details class="control-details"><summary>Control plane &amp; services</summary><div id="control-col" class="control-col"></div></details>
       </div>
     </section>
 
@@ -66,7 +64,7 @@
     <section id="view-runs" class="view" hidden>
       <div class="page">
         <div class="page-head">
-          <h1>Runs</h1>
+          <div><h1>Runs</h1><p class="page-description">Progress, placement, and evidence in one place.</p></div>
           <span id="runs-count" class="page-count"></span>
         </div>
         <form id="launch-form" class="launch-form">
@@ -75,6 +73,7 @@
           <button id="launch-button" class="btn" type="submit">Launch run</button>
           <span id="launch-note" class="launch-note" aria-live="polite"></span>
         </form>
+        <div class="run-filters"><input id="run-search" type="search" aria-label="Search runs" placeholder="Search name, model, run ID, or node…"><select id="run-filter" aria-label="Filter runs"><option value="all">All runs</option><option value="attention">Needs attention</option><option value="running">Running</option><option value="queued">Queued work</option></select></div>
         <div id="runs-list" class="runs-list"></div>
         <p id="runs-empty" class="empty" hidden>No runs yet.</p>
       </div>
@@ -104,6 +103,28 @@
           </div>
         </div>
         <div id="checks"></div>
+      </div>
+    </section>
+    <section id="view-logs" class="view" hidden>
+      <div class="page page-wide run-log-page">
+        <div class="page-head"><div><button id="run-logs-back" class="btn">← Run</button><h1>Logs</h1><div id="run-logs-name" class="muted"></div></div><div class="log-actions"><button id="run-logs-link" class="btn">Copy link</button><button id="run-logs-json" class="btn">Copy JSON</button></div></div>
+        <form id="run-logs-filters" class="log-filters">
+          <label>Search<input id="run-logs-search" type="search" maxlength="512" placeholder="Search log messages"></label>
+          <label>Pod<select id="run-logs-pod"><option value="">All pods</option></select></label>
+          <label>Container<select id="run-logs-container"><option value="">All containers</option></select></label>
+          <label>Node<select id="run-logs-node"><option value="">All nodes</option></select></label>
+          <label>Attempt<select id="run-logs-attempt"><option value="">All attempts</option></select></label>
+          <label>Severity<select id="run-logs-severity"><option value="">All levels</option><option>ERROR</option><option>WARNING</option><option>INFO</option><option>DEBUG</option><option>CRITICAL</option><option>UNKNOWN</option></select></label>
+          <label>From (local)<input id="run-logs-since" type="datetime-local" step="1"></label>
+          <label>To (local)<input id="run-logs-until" type="datetime-local" step="1"></label>
+          <button class="btn" type="submit">Apply</button><button id="run-logs-reset" class="btn" type="button">Reset</button>
+          <label class="log-follow"><input id="run-logs-follow" type="checkbox" checked> Follow</label>
+        </form>
+        <p id="run-logs-status" role="status"></p>
+        <details class="log-source-details"><summary>Sources &amp; collection coverage</summary><div id="run-logs-sources"></div></details>
+        <details class="log-source-details"><summary>Kubernetes events</summary><div id="run-logs-events"></div></details>
+        <button id="run-logs-older" class="btn" hidden>Load older</button>
+        <div id="run-logs-lines" class="log-lines" aria-label="Run log output"></div>
       </div>
     </section>
   </main>
