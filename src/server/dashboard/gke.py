@@ -173,10 +173,114 @@ def source_filter(sources: list[dict]) -> str:
 
 
 _logging_refused_until = 0.0
+MAX_LOG_SOURCES = 64
+PAGE_TTL_SECONDS = 900
+REFUSED = "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"
+UNAVAILABLE = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
 
 
 def logging_refused() -> bool:
   return time.monotonic() < _logging_refused_until
+
+
+def note_refusal() -> None:
+  """A scope or IAM refusal does not clear itself; stop asking for a while."""
+  global _logging_refused_until
+  _logging_refused_until = time.monotonic() + 600
+
+
+def select_sources(sources: list[dict], pod, container, node) -> list[dict]:
+  wanted = (("pod", pod), ("container", container), ("node", node))
+  return [s for s in sources if all(value is None or s.get(key) == value for key, value in wanted)]
+
+
+def query_fingerprint(run_id: str, *parts) -> str:
+  """Identifies one query scope, so a cursor cannot be replayed against another."""
+  return hashlib.sha256(json.dumps([configuration(), kubernetes.k8s_namespace(), run_id, *parts]).encode()).hexdigest()
+
+
+def resume_page(cursor: str, fingerprint: str) -> tuple[str, str, str, list[dict]]:
+  """The window, page token and sources a cursor stands for."""
+  try:
+    token = _pages[cursor]
+    if token["fingerprint"] != fingerprint or time.monotonic() > token["expires"]:
+      raise ValueError()
+  except (ValueError, TypeError, KeyError):
+    raise ValueError("Invalid or expired GKE cursor, or changed query scope") from None
+  return token["start"], token["end"], token["page"], token["sources"]
+
+
+def remember_page(fingerprint: str, start: str, end: str, page: str, sources: list[dict]) -> str:
+  cursor_id = "gke." + secrets.token_urlsafe(24)
+  _pages[cursor_id] = {
+    "fingerprint": fingerprint,
+    "start": start,
+    "end": end,
+    "page": page,
+    "sources": sources,
+    "expires": time.monotonic() + PAGE_TTL_SECONDS,
+  }
+  while len(_pages) > 256:
+    _pages.popitem(last=False)
+  return cursor_id
+
+
+def logs_filter(selected: list[dict], start: str, end: str, severity: str | None, q: str) -> str:
+  clauses = scope_filter() + [source_filter(selected), f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
+  if severity:
+    clauses.append(f"severity={json.dumps('DEFAULT' if severity == 'UNKNOWN' else severity)}")
+  if q:
+    clauses.append(f"(textPayload:{json.dumps(q)} OR jsonPayload.message:{json.dumps(q)})")
+  return " AND ".join(clauses)
+
+
+def entry_text(entry: dict) -> str:
+  text = entry.get("textPayload")
+  if text is not None:
+    return text
+  fields = entry.get("jsonPayload") or {}
+  return json.dumps(fields, ensure_ascii=False) if fields else json.dumps(entry.get("protoPayload", {}), ensure_ascii=False)
+
+
+def entry_record(entry: dict, selected: list[dict], run_id: str) -> dict | None:
+  """One log entry as a dashboard record, or None when it belongs to no observed
+  container lifetime of this run."""
+  resource = entry.get("resource", {}).get("labels", {})
+  if not matches_resource(resource):
+    return None
+  at = logs.timestamp(entry["timestamp"])
+  match = next(
+    (
+      s
+      for s in selected
+      if s["pod"] == resource.get("pod_name")
+      and s["container"] == resource.get("container_name")
+      and logs.timestamp(s["created_at"]) <= at <= logs.timestamp(s["until"])
+    ),
+    None,
+  )
+  if match is None:
+    return None
+  fields = entry.get("jsonPayload") or {}
+  text = entry_text(entry)
+  identity = hashlib.sha256(json.dumps([entry.get("logName"), entry.get("insertId"), entry.get("timestamp"), text]).encode()).hexdigest()
+  return {
+    "id": identity,
+    "run_id": run_id,
+    "timestamp": entry.get("timestamp"),
+    "pod": match["pod"],
+    "pod_uid": None,
+    "observed_pod_uid": match.get("pod_uid"),
+    "container": match["container"],
+    "node": match.get("node"),
+    "role": match.get("role", "unknown"),
+    "attempt": None,
+    "severity": entry.get("severity", "UNKNOWN"),
+    "rank": fields.get("rank"),
+    "request_id": fields.get("request_id"),
+    "message": text[: logs.MAX_MESSAGE],
+    "message_truncated": len(text) > logs.MAX_MESSAGE,
+  }
 
 
 async def run_logs(
@@ -208,39 +312,23 @@ async def run_logs(
   if not configuration()["configured"]:
     return {**result, "error": "GKE telemetry is not fully configured"}
   if logging_refused():
-    return {**result, "error": "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"}
+    return {**result, "error": REFUSED}
   if attempt is not None:
     return {**result, "error": "GKE logs do not reliably identify restart attempts; use source=local"}
-  selected = [
-    s for s in sources if all(value is None or s.get(key) == value for key, value in (("pod", pod), ("container", container), ("node", node)))
-  ]
+  selected = select_sources(sources, pod, container, node)
   if not selected:
     return {**result, "error": "No observed pod lifetimes match this run and filter"}
-  if len(selected) > 64:
-    return {**result, "error": "Select a pod to narrow this query to at most 64 container lifetimes"}
-  fingerprint = hashlib.sha256(
-    json.dumps([configuration(), kubernetes.k8s_namespace(), run_id, since, until, q, pod, container, node, severity, limit]).encode()
-  ).hexdigest()
+  if len(selected) > MAX_LOG_SOURCES:
+    return {**result, "error": f"Select a pod to narrow this query to at most {MAX_LOG_SOURCES} container lifetimes"}
+  fingerprint = query_fingerprint(run_id, since, until, q, pod, container, node, severity, limit)
   page_token = None
   if cursor:
-    try:
-      token = _pages[cursor]
-      if token["fingerprint"] != fingerprint or time.monotonic() > token["expires"]:
-        raise ValueError()
-      start, end, page_token = token["start"], token["end"], token["page"]
-      selected = token["sources"]
-    except (ValueError, TypeError, KeyError):
-      raise ValueError("Invalid or expired GKE cursor, or changed query scope") from None
+    start, end, page_token, selected = resume_page(cursor, fingerprint)
   else:
     start, end = time_range(since, until)
-  clauses = scope_filter() + [source_filter(selected), f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
-  if severity:
-    clauses.append(f"severity={json.dumps('DEFAULT' if severity == 'UNKNOWN' else severity)}")
-  if q:
-    clauses.append(f"(textPayload:{json.dumps(q)} OR jsonPayload.message:{json.dumps(q)})")
   body = {
     "resourceNames": [f"projects/{configuration()['project']}"],
-    "filter": " AND ".join(clauses),
+    "filter": logs_filter(selected, start, end, severity, q),
     "orderBy": "timestamp desc",
     "pageSize": limit,
   }
@@ -248,72 +336,17 @@ async def run_logs(
     body["pageToken"] = page_token
   try:
     payload = await request("POST", "https://logging.googleapis.com/v2/entries:list", json=body)
-    records = []
-    for entry in payload.get("entries", []):
-      resource = entry.get("resource", {}).get("labels", {})
-      if not matches_resource(resource):
-        continue
-      fields = entry.get("jsonPayload") or {}
-      text = entry.get("textPayload")
-      if text is None:
-        text = json.dumps(fields, ensure_ascii=False) if fields else json.dumps(entry.get("protoPayload", {}), ensure_ascii=False)
-      match = next(
-        (
-          s
-          for s in selected
-          if s["pod"] == resource.get("pod_name")
-          and s["container"] == resource.get("container_name")
-          and logs.timestamp(s["created_at"]) <= logs.timestamp(entry["timestamp"]) <= logs.timestamp(s["until"])
-        ),
-        None,
-      )
-      if match is None:
-        continue
-      identity = hashlib.sha256(json.dumps([entry.get("logName"), entry.get("insertId"), entry.get("timestamp"), text]).encode()).hexdigest()
-      records.append(
-        {
-          "id": identity,
-          "run_id": run_id,
-          "timestamp": entry.get("timestamp"),
-          "pod": match["pod"],
-          "pod_uid": None,
-          "observed_pod_uid": match.get("pod_uid"),
-          "container": match["container"],
-          "node": match.get("node"),
-          "role": match.get("role", "unknown"),
-          "attempt": None,
-          "severity": entry.get("severity", "UNKNOWN"),
-          "rank": fields.get("rank"),
-          "request_id": fields.get("request_id"),
-          "message": text[: logs.MAX_MESSAGE],
-          "message_truncated": len(text) > logs.MAX_MESSAGE,
-        }
-      )
-    result.update(records=records, available=True)
-    if payload.get("nextPageToken"):
-      cursor_id = "gke." + secrets.token_urlsafe(24)
-      _pages[cursor_id] = {
-        "fingerprint": fingerprint,
-        "start": start,
-        "end": end,
-        "page": payload["nextPageToken"],
-        "sources": selected,
-        "expires": time.monotonic() + 900,
-      }
-      while len(_pages) > 256:
-        _pages.popitem(last=False)
-      result["next_cursor"] = cursor_id
-
+    records = [record for entry in payload.get("entries", []) if (record := entry_record(entry, selected, run_id))]
   except httpx.HTTPStatusError as exc:
     if exc.response.status_code in (401, 403):
-      # A scope or IAM refusal does not clear itself; stop asking for a while.
-      global _logging_refused_until
-      _logging_refused_until = time.monotonic() + 600
-      result["error"] = "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"
-    else:
-      result["error"] = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
+      note_refusal()
+      return {**result, "error": REFUSED}
+    return {**result, "error": UNAVAILABLE}
   except Exception:
-    result["error"] = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
+    return {**result, "error": UNAVAILABLE}
+  result.update(records=records, available=True)
+  if payload.get("nextPageToken"):
+    result["next_cursor"] = remember_page(fingerprint, start, end, payload["nextPageToken"], selected)
   return result
 
 

@@ -84,6 +84,23 @@ async def run_detail(run_id: str):
   return {"schema_version": 1, "observed_at": state["observed_at"], "coverage": state["coverage"], **run}
 
 
+LOCAL_FALLBACK_NOTE = "Cloud Logging is not readable from this gateway; showing the local archive"
+
+
+async def run_context(run_id: str) -> tuple[dict | None, dict]:
+  """The run's current record and the pod lifetimes (live and archived) its logs can come from."""
+  state = await snapshot()
+  run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
+  archive = await asyncio.to_thread(logs.query, run_id, limit=1)
+  return run, {"run": run, "sources": gke.pod_sources(run, archive["sources"], state["observed_at"])}
+
+
+def with_run_identity(result: dict, run: dict | None, sources: list[dict]) -> dict:
+  result["shared_runtime"] = bool(run and run["shared_runtime"]) or any(s.get("shared_runtime") for s in sources)
+  result["runtime_run_ids"] = run["runtime_run_ids"] if run else []
+  return result
+
+
 @router.get("/api/v1/dashboard/runs/{run_id}/logs")
 async def run_logs(
   run_id: str,
@@ -99,67 +116,34 @@ async def run_logs(
   limit: int = Query(200, ge=1, le=1000),
   cursor: str | None = Query(None, max_length=4096),
 ):
+  filters = dict(
+    q=q, pod=pod, container=container, node=node, severity=severity, attempt=attempt, since=since, until=until, limit=limit, cursor=cursor
+  )
+  note = None
   if source != "local":
     await gke.discover()
-  use_gke = source == "gke" or (source == "auto" and gke.configuration()["enabled"])
-  if use_gke:
-    state = await snapshot()
-    run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
-    archive = await asyncio.to_thread(logs.query, run_id, limit=1)
-    sources = gke.pod_sources(run, archive["sources"], state["observed_at"])
+  if source == "gke" or (source == "auto" and gke.configuration()["enabled"]):
+    run, context = await run_context(run_id)
     try:
-      result = await gke.run_logs(
-        run_id,
-        sources,
-        since=since,
-        until=until,
-        cursor=cursor,
-        limit=limit,
-        q=q,
-        pod=pod,
-        container=container,
-        node=node,
-        severity=severity,
-        attempt=attempt,
-      )
+      result = await gke.run_logs(run_id, context["sources"], **filters)
     except ValueError as exc:
       raise HTTPException(400, str(exc)) from exc
-    fallback = source == "auto" and result.get("error") and not cursor
-    if not fallback:
-      result["shared_runtime"] = bool(run and run["shared_runtime"]) or any(s.get("shared_runtime") for s in sources)
-      result["runtime_run_ids"] = run["runtime_run_ids"] if run else []
-      return result
-    # Auto means "the best source that works". Cloud Logging said no, so the
-    # local archive answers and says why the switch happened.
-    note = "Cloud Logging is not readable from this gateway; showing the local archive"
-  else:
-    note = None
+    # Auto means "the best source that works". When Cloud Logging says no on
+    # a first page, the local archive answers and says why the switch happened.
+    if not (source == "auto" and result.get("error") and not cursor):
+      return with_run_identity(result, run, context["sources"])
+    note = LOCAL_FALLBACK_NOTE
   # Archive queries remain valid after a run or pod has gone away.
   try:
-    result = await asyncio.to_thread(
-      logs.query,
-      run_id,
-      q=q,
-      pod=pod,
-      container=container,
-      node=node,
-      severity=severity,
-      attempt=attempt,
-      since=since,
-      until=until,
-      limit=limit,
-      cursor=cursor,
-    )
+    result = await asyncio.to_thread(logs.query, run_id, **filters)
   except ValueError as exc:
     raise HTTPException(400, str(exc)) from exc
-  state = await snapshot()
-  run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
+  if note is None:
+    run, _ = await run_context(run_id)
   result["source"] = "local"
   if note:
     result["source_note"] = note
-  result["shared_runtime"] = bool(run and run["shared_runtime"]) or any(source.get("shared_runtime") for source in result["sources"])
-  result["runtime_run_ids"] = run["runtime_run_ids"] if run else []
-  return result
+  return with_run_identity(result, run, result["sources"])
 
 
 @router.get("/api/v1/dashboard/allocations/{placement_id}/metrics")
