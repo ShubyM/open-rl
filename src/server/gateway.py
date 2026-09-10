@@ -354,11 +354,17 @@ def translate_future_result(result: dict) -> dict:
 async def reap_dead_sessions():
   while True:
     await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
-    for owner in await session_registry.owners():
+    # Nothing in a sweep may end the loop. A failed call is retried next sweep.
+    try:
+      owners = await session_registry.owners()
+    except Exception:
+      traceback.print_exc()
+      continue
+    for owner in owners:
       try:
         await reap_owner(owner)
       except Exception:
-        traceback.print_exc()  # still unused next sweep, so it is retried then
+        traceback.print_exc()
 
 
 @asynccontextmanager
