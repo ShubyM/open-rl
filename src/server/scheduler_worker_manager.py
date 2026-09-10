@@ -15,30 +15,20 @@ The Workload name is what the pod label and the time-slicer call job_id.
 
 import logging
 import os
-import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from kubernetes import client, config
 
 from server.estimator import Footprint, footprint
-from server.worker_manager import base_model_of, runtime_of, worker_args, worker_env, worker_module
+from server.worker_manager import base_model_of, owner_id, runtime_of, worker_args, worker_env, worker_module
 
 logger = logging.getLogger(__name__)
 
 GROUP = "openrl.io"
 VERSION = "v1alpha1"
 PLURAL = "workloads"
-
-# Owners double as label values and pod name stems.
-LABEL_UNSAFE = re.compile(r"[^a-z0-9-]+")
-
-
-def owner_of(runtime: str) -> str:
-  cleaned = LABEL_UNSAFE.sub("-", runtime.lower()).strip("-")
-  if not cleaned:
-    raise ValueError(f"model_id {runtime!r} has no label-safe characters")
-  return cleaned[:63]
 
 
 def workload_name(role: str, owner: str, is_lora: bool) -> str:
@@ -64,7 +54,7 @@ class Worker:
 
   @property
   def owner(self) -> str:
-    return owner_of(self.runtime)
+    return owner_id(self.runtime)
 
   @property
   def name(self) -> str:
@@ -164,13 +154,30 @@ class SchedulerWorkerManager:
 
   def ensure(self, model_id: str, role: str) -> None:
     worker = describe_worker(model_id, role)
+    deadline = time.monotonic() + 180
+    while True:
+      try:
+        self.custom_api.create_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, workload_body(worker))
+        logger.info("requested %s workload %s (%s, owner %s)", role, worker.name, worker.footprint.accelerator, worker.owner)
+        return
+      except Exception as exc:
+        if getattr(exc, "status", None) != 409:
+          raise
+      # AlreadyExists is the reuse, unless the old one is still being deleted.
+      if not self.still_deleting(worker.name):
+        return
+      if time.monotonic() > deadline:
+        raise RuntimeError(f"workload {worker.name} has been terminating for over three minutes")
+      time.sleep(2)
+
+  def still_deleting(self, name: str) -> bool:
     try:
-      self.custom_api.create_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, workload_body(worker))
-      logger.info("requested %s workload %s (%s, owner %s)", role, worker.name, worker.footprint.accelerator, worker.owner)
+      workload = self.custom_api.get_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, name)
     except Exception as exc:
-      # AlreadyExists is the reuse: this runtime was requested before.
-      if getattr(exc, "status", None) != 409:
-        raise
+      if getattr(exc, "status", None) == 404:
+        return True  # gone since the create failed, so the next create will go through
+      raise
+    return bool(workload["metadata"].get("deletionTimestamp"))
 
   def release(self, model_id: str) -> None:
     try:
@@ -179,8 +186,16 @@ class SchedulerWorkerManager:
       runtime, is_lora = model_id, False
     if is_lora:
       return  # a shared runtime outlives any one job
-    for role in ("trainer", "sampler"):
-      self.delete_workload(workload_name(role, owner_of(runtime), is_lora))
+    self.release_owner(owner_id(runtime))
+
+  def release_owner(self, owner: str) -> set[str]:
+    """Delete the owner's workloads. The scheduler's finalizer frees the seats."""
+    selector = "app.kubernetes.io/managed-by=open-rl-gateway"
+    found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
+    ours = [item for item in found["items"] if item["spec"]["ownerID"] == owner]
+    for item in ours:
+      self.delete_workload(item["metadata"]["name"])
+    return {item["spec"]["modelID"] for item in ours}
 
   def close(self) -> None:
     pass  # Workloads outlive the gateway; the scheduler owns them from here

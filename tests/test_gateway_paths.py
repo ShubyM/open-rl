@@ -72,6 +72,42 @@ class GatewayPathTest(unittest.TestCase):
         os.path.join(tmp_dir, "checkpoints", "job-b", "weights", "final"),
       )
 
+  def test_a_tinker_path_names_the_model_that_saved_it(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(gateway, "TMP_DIR", tmp_dir):
+      state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
+      self.assertEqual(gateway.tinker_state_path(state_dir), "tinker://job-a/weights/step-5")
+      # A resuming job passes the dead job's path under its own model id.
+      self.assertEqual(gateway.checkpoint_state_path("job-b", "tinker://job-a/weights/step-5"), state_dir)
+      self.assertEqual(gateway.tinker_state_path("/elsewhere/final"), "/elsewhere/final")
+      # Only weights paths are checkpoints. A sampler path is refused, not resolved under the caller.
+      self.assertIsNone(gateway.tinker_checkpoint_dir("tinker://job-a/sampler_weights/sampler-3"))
+      refused = asyncio.run(gateway.load_weights({"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"}))
+      self.assertEqual(refused.status_code, 400)
+
+  def test_save_state_keeps_the_optimizer_and_answers_with_a_tinker_path(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(gateway, "TMP_DIR", tmp_dir):
+      asyncio.run(gateway.save_weights({"model_id": "job-a", "path": "step-5"}))
+      queued = asyncio.run(gateway.store.get_requests())
+      self.assertEqual(queued[0]["op"], "save_state")
+      self.assertTrue(queued[0]["payload"]["include_optimizer"])
+      saved = gateway.translate_future_result({"type": "state_saved", "path": queued[0]["payload"]["state_path"]})
+    self.assertEqual(saved, {"type": "save_weights", "path": "tinker://job-a/weights/step-5"})
+
+  def test_weights_info_reads_the_checkpoint_on_disk(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(gateway, "TMP_DIR", tmp_dir):
+      state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
+      os.makedirs(os.path.join(state_dir, "job-a"))
+      with open(os.path.join(state_dir, "metadata.json"), "w") as f:
+        json.dump({"base_model": "google/gemma-4-e2b", "model_id": "job-a", "has_optimizer": True}, f)
+      with open(os.path.join(state_dir, "job-a", "adapter_config.json"), "w") as f:
+        json.dump({"r": 8}, f)
+      info = asyncio.run(gateway.weights_info({"tinker_path": "tinker://job-a/weights/step-5"}))
+      missing = asyncio.run(gateway.weights_info({"tinker_path": "tinker://job-a/weights/never"}))
+    self.assertEqual(info["base_model"], "google/gemma-4-e2b")
+    self.assertTrue(info["is_lora"])
+    self.assertEqual(info["lora_rank"], 8)
+    self.assertEqual(missing.status_code, 404)
+
   def test_checkpoint_state_paths_accept_explicit_output_directories(self) -> None:
     self.assertEqual(gateway.checkpoint_state_path("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
 

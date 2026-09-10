@@ -93,6 +93,18 @@ Labeling a node opts its GPUs in **exclusively**: the scheduler assumes its
 own claims are the only GPU consumers there, so other GPU workloads on an
 enabled node will collide with it. Give OpenRL whole nodes.
 
+## Session cleanup
+
+The tinker client heartbeats its session every ten seconds. The gateway
+records which sessions use which owners, where an owner is the trainer and
+sampler pair behind a Workload's `ownerID`. Every 30 seconds it drops
+sessions silent for 120 seconds and deletes the workloads of any owner no
+live session uses anymore. An FFT job has its own owner, so its pair goes
+when the job's session does. LoRA jobs on one base model share an owner, so
+the pair stays until the last of their sessions is gone. The registry lives
+in Redis, so a gateway restart keeps it. Run one gateway replica. The lock
+that keeps a session from attaching to an owner mid-teardown is in-process.
+
 ## Everything else
 
 Assumptions and caveats, the estimator, worker identity, claim lifecycle,

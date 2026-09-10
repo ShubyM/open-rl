@@ -58,8 +58,8 @@ class RequestStore(ABC):
     pass
 
   @abstractmethod
-  async def set_value(self, key: str, value: str) -> None:
-    """Store a simple string value by key."""
+  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
+    """Store a simple string value by key, gone after ttl_seconds if given."""
     pass
 
   @abstractmethod
@@ -75,6 +75,18 @@ class RequestStore(ABC):
   @abstractmethod
   async def delete_values(self, *keys: str) -> None:
     """Delete one or more keys."""
+    pass
+
+  @abstractmethod
+  async def add_to_set(self, key: str, member: str) -> None:
+    pass
+
+  @abstractmethod
+  async def remove_from_set(self, key: str, member: str) -> None:
+    pass
+
+  @abstractmethod
+  async def set_members(self, key: str) -> set[str]:
     pass
 
   @abstractmethod
@@ -98,6 +110,8 @@ class InMemoryStore(RequestStore):
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, asyncio.Event] = {}
     self.kv_store: dict[str, str] = {}
+    self.expiries: dict[str, float] = {}
+    self.sets: dict[str, set[str]] = {}
     self.sampling_queues: dict[str, asyncio.Queue] = {}
 
   async def list_jobs_metadata(self) -> list[dict[str, Any]]:
@@ -231,18 +245,35 @@ class InMemoryStore(RequestStore):
     finally:
       self.futures_events.pop(req_id, None)
 
-  async def set_value(self, key: str, value: str) -> None:
+  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
+    self.expiries.pop(key, None)
+    if ttl_seconds is not None:
+      self.expiries[key] = time.monotonic() + ttl_seconds
 
   async def get_value(self, key: str) -> str | None:
-    return self.kv_store.get(key)
+    return self.get_value_sync(key)
 
   def get_value_sync(self, key: str) -> str | None:
+    if key in self.expiries and time.monotonic() >= self.expiries[key]:
+      self.kv_store.pop(key, None)
+      self.expiries.pop(key, None)
     return self.kv_store.get(key)
 
   async def delete_values(self, *keys: str) -> None:
     for k in keys:
       self.kv_store.pop(k, None)
+      self.expiries.pop(k, None)
+      self.sets.pop(k, None)
+
+  async def add_to_set(self, key: str, member: str) -> None:
+    self.sets.setdefault(key, set()).add(member)
+
+  async def remove_from_set(self, key: str, member: str) -> None:
+    self.sets.get(key, set()).discard(member)
+
+  async def set_members(self, key: str) -> set[str]:
+    return set(self.sets.get(key, set()))
 
 
 class RedisStore(RequestStore):
@@ -413,8 +444,8 @@ class RedisStore(RequestStore):
 
       await asyncio.sleep(0.1)
 
-  async def set_value(self, key: str, value: str) -> None:
-    await self.redis.set(key, value)
+  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
+    await self.redis.set(key, value, px=None if ttl_seconds is None else int(ttl_seconds * 1000))
 
   async def get_value(self, key: str) -> str | None:
     return await self.redis.get(key)
@@ -428,6 +459,15 @@ class RedisStore(RequestStore):
   async def delete_values(self, *keys: str) -> None:
     if keys:
       await self.redis.delete(*keys)
+
+  async def add_to_set(self, key: str, member: str) -> None:
+    await self.redis.sadd(key, member)
+
+  async def remove_from_set(self, key: str, member: str) -> None:
+    await self.redis.srem(key, member)
+
+  async def set_members(self, key: str) -> set[str]:
+    return set(await self.redis.smembers(key))
 
   async def list_jobs_metadata(self) -> list[dict[str, Any]]:
     keys = await self.redis.keys("open_rl:model_meta:*")

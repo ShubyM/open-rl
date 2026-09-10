@@ -7,6 +7,7 @@ import os
 import time
 import traceback
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -19,11 +20,37 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config
+from server.session_registry import SessionRegistry
 from server.store import get_store
-from server.worker_manager import WorkerManager, create_worker_manager
+from server.worker_manager import WorkerManager, create_worker_manager, owner_of
 
 store = get_store()
 worker_manager: WorkerManager | None = None
+
+session_registry = SessionRegistry(store)
+SESSION_REAP_INTERVAL_SEC = 30
+# Attaching a session to an owner and reaping that owner take turns, so a
+# session cannot attach between the reaper deciding an owner is unused and
+# deleting its workers. In-process, which is why there is one gateway replica.
+owner_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+async def bind_session(session_id: str | None, model_id: str) -> None:
+  if worker_manager is not None and session_id:
+    owner = await asyncio.to_thread(owner_of, model_id)
+    async with owner_locks[owner]:
+      await session_registry.attach(session_id, owner)
+
+
+async def reap_owner(owner: str) -> None:
+  async with owner_locks[owner]:
+    if await session_registry.in_use(owner):
+      return
+    print(f"[GATEWAY] No live session uses {owner}; tearing its workers down")
+    for model in await asyncio.to_thread(worker_manager.release_owner, owner):
+      await store.delete_values(f"open_rl:sampler_ready:{model}")
+    await session_registry.forget(owner)
+
 
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
@@ -99,10 +126,38 @@ def resolve_sampler_weights_path(model_id: str) -> str:
   return weights_path
 
 
+def tinker_checkpoint_dir(path: str) -> str | None:
+  """Disk directory for tinker://<model>/weights/<name>, else None."""
+  if not path.startswith("tinker://"):
+    return None
+  owner, sep, rest = path[len("tinker://") :].partition("/weights/")
+  if not (owner and sep):
+    return None
+  return os.path.join(TMP_DIR, "checkpoints", owner, "weights", rest)
+
+
 def checkpoint_state_path(model_id: str, name: str) -> str:
+  """Where a named checkpoint lives. Names are scoped under the model that
+  saved them, so two jobs calling save_state("final") never collide. A tinker
+  path names its own model, which is how a resumed job reaches the
+  checkpoint of the one that died."""
+  if (state_dir := tinker_checkpoint_dir(name)) is not None:
+    return state_dir
   if os.path.isabs(name):
     return name
   return os.path.join(TMP_DIR, "checkpoints", model_id, "weights", name)
+
+
+def tinker_state_path(state_path: str) -> str:
+  """The tinker path for a checkpoint directory under TMP_DIR/checkpoints,
+  which is the form the client hands back to weights_info and load_state.
+  Anything else is returned unchanged."""
+  root = os.path.join(TMP_DIR, "checkpoints") + os.sep
+  if state_path.startswith(root):
+    model_id, sep, rest = state_path[len(root) :].partition("/weights/")
+    if model_id and sep:
+      return f"tinker://{model_id}/weights/{rest}"
+  return state_path
 
 
 def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
@@ -292,9 +347,27 @@ def translate_future_result(result: dict) -> dict:
   if result_type in public_type_by_internal_type:
     response = dict(result)
     response["type"] = public_type_by_internal_type[result_type]
+    if result_type == "state_saved" and isinstance(response.get("path"), str):
+      response["path"] = tinker_state_path(response["path"])
     return response
 
   return result
+
+
+async def reap_dead_sessions():
+  while True:
+    await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
+    # Nothing in a sweep may end the loop. A failed call is retried next sweep.
+    try:
+      owners = await session_registry.owners()
+    except Exception:
+      traceback.print_exc()
+      continue
+    for owner in owners:
+      try:
+        await reap_owner(owner)
+      except Exception:
+        traceback.print_exc()
 
 
 @asynccontextmanager
@@ -320,9 +393,12 @@ async def lifespan(_: FastAPI):
       if base_model:
         await asyncio.to_thread(worker.load_base_model, base_model)
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
+  reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
   try:
     yield
   finally:
+    if reap_task is not None:
+      reap_task.cancel()
     if task is not None:
       task.cancel()
     if worker_manager is not None:
@@ -362,11 +438,15 @@ async def client_config(_: dict):
 
 @app.post("/api/v1/create_session")
 async def create_session(_: dict):
-  return {"session_id": "sess-real-123", "type": "create_session"}
+  session_id = f"sess-{uuid.uuid4().hex[:12]}"
+  await session_registry.heartbeat(session_id)
+  return {"session_id": session_id, "type": "create_session"}
 
 
 @app.post("/api/v1/session_heartbeat")
-async def session_heartbeat(_: dict):
+async def session_heartbeat(req: dict):
+  if session_id := req.get("session_id"):
+    await session_registry.heartbeat(session_id)
   return {"type": "session_heartbeat"}
 
 
@@ -385,6 +465,7 @@ async def create_model(
   except ValueError as exc:
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
+  await bind_session(req.get("session_id"), model_id)
   command = make_training_request(
     "create_model",
     model_id,
@@ -429,12 +510,15 @@ async def create_model_from_state(
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "state_path is required"})
   # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
-  resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
+  resolved_path = tinker_checkpoint_dir(state_path)
+  if resolved_path is None:
+    resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   try:
     model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="restored")
   except ValueError as exc:
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
+  await bind_session(req.get("session_id"), model_id)
   command = make_training_request(
     "create_model_from_state",
     model_id,
@@ -597,7 +681,9 @@ async def save_weights(req: dict):
       model_id,
       {
         "state_path": state_path,
-        "include_optimizer": bool(req.get("include_optimizer", False)),
+        # save_state is the whole training state in tinker's API. The client
+        # chooses on load whether the optimizer comes back.
+        "include_optimizer": True,
         "kind": "weights",
       },
       request_id=req_id,
@@ -615,6 +701,8 @@ async def load_weights(req: dict):
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
   if not state_path:
     return JSONResponse(status_code=400, content={"error": "path is required"})
+  if state_path.startswith("tinker://") and tinker_checkpoint_dir(state_path) is None:
+    return JSONResponse(status_code=400, content={"error": f"{state_path} is not a tinker://<model>/weights/<name> path"})
 
   resolved_path = checkpoint_state_path(model_id, state_path)
   req_id = await enqueue(
@@ -628,6 +716,28 @@ async def load_weights(req: dict):
     )
   )
   return {"request_id": req_id}
+
+
+@app.post("/api/v1/weights_info")
+async def weights_info(req: dict):
+  """RestClient.get_weights_info_by_tinker_path(). What a checkpoint was
+  trained from, so create_training_client_from_state can open a matching
+  client and load_state into it. Answered from the checkpoint directory, so
+  it survives a gateway or Redis restart."""
+  path = req.get("tinker_path") or ""
+  state_dir = tinker_checkpoint_dir(path)
+  metadata_path = os.path.join(state_dir, "metadata.json") if state_dir else None
+  if not metadata_path or not os.path.exists(metadata_path):
+    return JSONResponse(status_code=404, content={"error": f"No checkpoint at {path}"})
+  with open(metadata_path) as f:
+    saved = json.load(f)
+  adapter_config_path = os.path.join(state_dir, saved.get("model_id", ""), "adapter_config.json")
+  is_lora = os.path.exists(adapter_config_path)
+  rank = None
+  if is_lora:
+    with open(adapter_config_path) as f:
+      rank = json.load(f).get("r")
+  return {"base_model": saved["base_model"], "is_lora": is_lora, "lora_rank": rank, "type": "weights_info"}
 
 
 # *** SamplingClient endpoints ***
@@ -653,6 +763,8 @@ async def create_sampling_session(req: dict):
   model_meta = await store.get_model_metadata(target_model_id) if target_model_id else None
   fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
   ready_check_id = (model_meta.get("base_model") or target_model_id) if (fine_tuning_type == "lora" and model_meta) else target_model_id
+
+  await bind_session(req.get("session_id"), target_model_id)
 
   if get_sampler_backend() == "vllm" and ready_check_id:
     # Launch by model ID so the worker manager retains the training kind.

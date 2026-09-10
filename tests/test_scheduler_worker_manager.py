@@ -10,53 +10,62 @@ from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWor
 from server.store import InMemoryStore
 
 
-class _ApiError(Exception):
+class ApiError(Exception):
   def __init__(self, status: int):
     super().__init__(f"api error {status}")
     self.status = status
 
 
-class _FakeCustomObjectsApi:
+class FakeCustomObjectsApi:
   def __init__(self):
     self.created: list[dict[str, Any]] = []
     self.deleted: list[str] = []
-    self.existing: set[str] = set()
+    self.existing: dict[str, dict] = {}
+    self.deleting: set[str] = set()
 
   def create_namespaced_custom_object(self, group: str, version: str, namespace: str, plural: str, body: dict) -> dict:
     assert (group, version, plural) == (GROUP, VERSION, PLURAL)
     name = body["metadata"]["name"]
     if name in self.existing:
-      raise _ApiError(409)
-    self.existing.add(name)
+      raise ApiError(409)
+    self.existing[name] = body
     self.created.append(body)
     return body
 
+  def get_namespaced_custom_object(self, group: str, version: str, namespace: str, plural: str, name: str) -> dict:
+    if name not in self.existing:
+      raise ApiError(404)
+    metadata = dict(self.existing[name]["metadata"])
+    if name in self.deleting:
+      metadata["deletionTimestamp"] = "2026-09-08T00:00:00Z"
+    return {"metadata": metadata}
+
   def delete_namespaced_custom_object(self, group: str, version: str, namespace: str, plural: str, name: str) -> dict:
     if name not in self.existing:
-      raise _ApiError(404)
-    self.existing.remove(name)
+      raise ApiError(404)
+    del self.existing[name]
     self.deleted.append(name)
     return {}
 
-  def list_namespaced_custom_object(self, group: str, version: str, namespace: str, plural: str) -> dict:
-    return {"items": [{"metadata": {"name": name}} for name in sorted(self.existing)]}
+  def list_namespaced_custom_object(self, group: str, version: str, namespace: str, plural: str, label_selector: str = "") -> dict:
+    key, _, value = label_selector.partition("=")
+    items = [body for name, body in sorted(self.existing.items()) if not key or body["metadata"]["labels"].get(key) == value]
+    return {"items": items}
 
 
 class SchedulerWorkerManagerTest(unittest.TestCase):
   def setUp(self) -> None:
-    self._env = patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}, clear=False)
-    self._env.start()
-    self.addCleanup(self._env.stop)
-    self.api = _FakeCustomObjectsApi()
+    self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}))
+    self.api = FakeCustomObjectsApi()
     self.manager = SchedulerWorkerManager(custom_api=self.api)
 
-  def _store_with(self, model_id: str, meta: dict) -> InMemoryStore:
+  def store_with(self, model_id: str, meta: dict) -> InMemoryStore:
     s = InMemoryStore()
     s.kv_store[f"open_rl:model_meta:{model_id}"] = json.dumps(meta)
     return s
 
   def test_lora_trainer_and_sampler_share_an_owner(self) -> None:
-    s = self._store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.store.get_store", return_value=s):
       self.manager.ensure("job-lora-1", "trainer")
       self.manager.ensure("job-lora-1", "sampler")
@@ -77,7 +86,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertIn("--active-tenant-set-id", t_container["args"])
 
   def test_fft_worker_is_its_own_owner(self) -> None:
-    s = self._store_with("Model_A.1", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    s = self.store_with("Model_A.1", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
     with patch("server.store.get_store", return_value=s):
       self.manager.ensure("Model_A.1", "trainer")
 
@@ -97,7 +106,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(env["OPEN_RL_WORKLOAD_ID"], worker["metadata"]["name"])
 
   def test_mutable_worker_images_use_the_requested_pull_policy(self) -> None:
-    s = self._store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with (
       patch("server.store.get_store", return_value=s),
       patch.dict(os.environ, {"OPEN_RL_WORKER_IMAGE": "localhost:5001/open-rl-server:kind-dev", "OPEN_RL_WORKER_IMAGE_PULL_POLICY": "Always"}),
@@ -109,14 +118,14 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(container["imagePullPolicy"], "Always")
 
   def test_launch_is_idempotent(self) -> None:
-    s = self._store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.store.get_store", return_value=s):
       self.manager.ensure("job-lora-1", "trainer")
       self.manager.ensure("job-lora-1", "trainer")
     self.assertEqual(len(self.api.created), 1)
 
   def test_placement_knowledge_stays_out_of_the_template(self) -> None:
-    s = self._store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.store.get_store", return_value=s):
       self.manager.ensure("job-lora-1", "trainer")
 
@@ -133,7 +142,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertNotIn("resourceClaims", template_spec)
 
   def test_release_deletes_an_fft_jobs_workloads_and_tolerates_absence(self) -> None:
-    s = self._store_with("Model_A.1", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    s = self.store_with("Model_A.1", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
     with patch("server.store.get_store", return_value=s):
       self.manager.ensure("Model_A.1", "trainer")
       self.manager.release("Model_A.1")
@@ -142,12 +151,51 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(self.api.deleted, ["fft-model-a-1-trainer"])
 
   def test_release_leaves_a_shared_lora_runtime_alone(self) -> None:
-    s = self._store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.store.get_store", return_value=s):
       self.manager.ensure("job-lora-1", "trainer")
       self.manager.release("job-lora-1")
 
     self.assertEqual(self.api.deleted, [])
+
+  def test_release_owner_deletes_a_shared_lora_pair_and_nothing_else(self) -> None:
+    s = self.store_with("adapter", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    s.kv_store["open_rl:model_meta:other"] = json.dumps({"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora"})
+    with patch("server.store.get_store", return_value=s):
+      self.manager.ensure("adapter", "trainer")
+      self.manager.ensure("adapter", "sampler")
+      self.manager.ensure("other", "trainer")
+    self.assertEqual(self.manager.release_owner("qwen-qwen2-5-0-5b"), {"Qwen/Qwen2.5-0.5B"})
+    self.assertEqual(self.manager.release_owner("qwen-qwen2-5-0-5b"), set())
+
+    self.assertEqual(self.api.deleted, ["lora-qwen-qwen2-5-0-5b-0-sampler", "lora-qwen-qwen2-5-0-5b-0-trainer"])
+    self.assertEqual(list(self.api.existing), ["lora-qwen-qwen3-0-6b-0-trainer"])
+
+  def test_release_owner_finds_workloads_by_their_spec_not_their_labels(self) -> None:
+    # A workload from before this gateway carries only the managed-by label.
+    self.api.existing["fft-old-trainer"] = {
+      "metadata": {"name": "fft-old-trainer", "labels": {"app.kubernetes.io/managed-by": "open-rl-gateway"}},
+      "spec": {"ownerID": "old", "modelID": "old"},
+    }
+    self.assertEqual(self.manager.release_owner("old"), {"old"})
+    self.assertEqual(self.api.deleted, ["fft-old-trainer"])
+
+  def test_ensure_waits_for_a_terminating_workload_before_recreating_it(self) -> None:
+    s = self.store_with("adapter", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    with patch("server.store.get_store", return_value=s):
+      self.manager.ensure("adapter", "trainer")
+      name = self.api.created[0]["metadata"]["name"]
+      self.api.deleting.add(name)
+
+      def finalizer_finishes(_seconds: float) -> None:
+        self.api.deleting.discard(name)
+        self.api.existing.pop(name, None)
+
+      with patch("server.scheduler_worker_manager.time.sleep", side_effect=finalizer_finishes) as sleep:
+        self.manager.ensure("adapter", "trainer")
+
+    self.assertEqual(sleep.call_count, 1)
+    self.assertEqual(len(self.api.created), 2)
 
   def test_create_worker_manager_selects_scheduler_mode(self) -> None:
     from server.worker_manager import create_worker_manager
@@ -165,7 +213,7 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
     store = InMemoryStore()
     for model_id, kind in (("lora-a", "lora"), ("lora-b", "lora"), ("fft-a", "full")):
       await store.set_value(f"open_rl:model_meta:{model_id}", json.dumps({"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": kind}))
-    api = _FakeCustomObjectsApi()
+    api = FakeCustomObjectsApi()
     with (
       patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}),
       patch("server.store.get_store", return_value=store),
