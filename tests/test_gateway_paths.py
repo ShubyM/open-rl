@@ -23,6 +23,20 @@ class GetInfoTest(unittest.TestCase):
     self.assertEqual(info["model_data"]["tokenizer_id"], "env-model")
     self.assertEqual(info["model_id"], "model-a")
 
+  def test_get_info_prefers_the_models_own_base_model(self) -> None:
+    meta = json.dumps({"base_model": "google/gemma-4-e2b", "fine_tuning_type": "full"})
+    asyncio.run(gateway.store.set_value("open_rl:model_meta:model-g", meta))
+    with patch.dict(os.environ, {"BASE_MODEL": "Qwen/Qwen2.5-0.5B"}, clear=True):
+      info = asyncio.run(gateway.get_info({"model_id": "model-g"}))
+      via_sampler_ref = asyncio.run(gateway.get_info({"model_id": "tinker://model-g/sampler_weights/sampler-1"}))
+      unknown = asyncio.run(gateway.get_info({"model_id": "model-unknown"}))
+
+    # The client loads its tokenizer from this name, so it must be the job's model.
+    self.assertEqual(info["model_name"], "google/gemma-4-e2b")
+    self.assertEqual(info["model_data"]["tokenizer_id"], "google/gemma-4-e2b")
+    self.assertEqual(via_sampler_ref["model_name"], "google/gemma-4-e2b")
+    self.assertEqual(unknown["model_name"], "Qwen/Qwen2.5-0.5B")
+
   def test_get_info_404s_without_base_model_env(self) -> None:
     with patch.dict(os.environ, {}, clear=True):
       response = asyncio.run(gateway.get_info({"model_id": "model-a"}))
