@@ -328,7 +328,8 @@ async def resource_metrics(sources: list[dict], since=None, until=None) -> dict:
     suffix, unit = definition
     clauses = scope_filter() + [
       f'metric.type="kubernetes.io/{suffix}"',
-      "(" + " OR ".join(f"resource.labels.pod_name={json.dumps(pod)}" for pod in names) + ")",
+      # Monitoring filters refuse OR inside an AND chain on resource labels.
+      "resource.labels.pod_name = one_of(" + ", ".join(json.dumps(pod) for pod in names) + ")",
     ]
     params = {"filter": " AND ".join(clauses), "interval.startTime": start, "interval.endTime": end, "view": "FULL", "pageSize": 1000}
     payload = await request("GET", f"https://monitoring.googleapis.com/v3/projects/{configuration()['project']}/timeSeries", params=params)

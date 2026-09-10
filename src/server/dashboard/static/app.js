@@ -241,6 +241,7 @@ function nodes() {
           const accelerator = node.accelerator
             ? node.accelerator
                 .replace(/^nvidia[- ]/i, "")
+                .replace(/-\d+gb$/i, "")
                 .replace(/-/g, " ")
                 .toUpperCase()
             : node.gpu_capacity
@@ -276,7 +277,7 @@ function nodes() {
         ${devices.length ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(d.name)}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${gaps}${bars}</div></div>` : ""}
         ${unmapped.map((p) => `<button type="button" class="capacity-allocation unknown-mapping ${family(p.runtime_id)}" data-placement="${escape(p.id)}" aria-expanded="${p.id === expanded}"><span class="allocation-name">${escape(p.label)}</span><span class="allocation-count">${p.device_count} GPUs</span></button>`).join("")}
         ${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : ""}
-        ${!bars && !placements.length ? empty(node.gpu_capacity ? "No observed allocations" : "No GPUs") : ""}</div><span class="node-duty" title="GPU allocation time over the selected range; unavailable when observations or device mappings are incomplete">${duty(node)}</span></div>${current ? detail(current) : ""}</div>`;
+        ${!bars && !placements.length && !node.gpu_capacity ? empty("No GPUs") : ""}</div><span class="node-duty" title="GPU allocation time over the selected range; unavailable when observations or device mappings are incomplete">${duty(node)}</span></div>${current ? detail(current) : ""}</div>`;
         })
         .join("") || empty("No nodes available")
     }`;
