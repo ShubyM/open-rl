@@ -148,6 +148,25 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
           return buffers[p_name]
     return tensor
 
+  @staticmethod
+  def _check_index_bounds(name: str, indices: torch.Tensor, offset: int, numel: int) -> None:
+    """Rejects a sparse patch whose flat indices fall outside the target parameter.
+
+    Checked on the host before anything is copied to the device: an out-of-range
+    index in a CUDA index_copy_ is a device-side assert that kills the engine,
+    and a negative one on the CPU snapshot silently writes to the tensor's tail.
+    """
+    if indices.numel() == 0:
+      return
+    lo = int(indices.min()) + offset
+    hi = int(indices.max()) + offset
+    if lo < 0 or hi >= numel:
+      raise ValueError(
+        f"[DeltaSnapshotEngine] Sparse delta for '{name}' addresses flat indices {lo}..{hi} "
+        f"(offset {offset}) but the parameter has {numel} elements; the delta indices are corrupt "
+        "or were written in a dtype too narrow for this tensor."
+      )
+
   def _validate_patch(self, patch: SparseWeightPatch, param: torch.Tensor) -> None:
     """Defensive pre-condition guards before executing VRAM mutations."""
     if not param.data.is_contiguous():
@@ -328,22 +347,22 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
   def _build_bulk_tensor_slices(
     self,
-    resolved_ops: list[tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]],
+    resolved_ops: list[tuple[str, torch.Tensor, int, torch.Tensor, torch.Tensor]],
     changed_elements: int,
     param_dtype: torch.dtype,
-  ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, int, int]]]:
+  ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[str, torch.Tensor, int, int]]]:
     """Allocates flat bulk 1D CPU index & value tensors and computes GPU parameter slice offsets (DRY helper)."""
     bulk_indices_cpu = torch.empty(changed_elements, dtype=torch.long)
     bulk_values_cpu = torch.empty(changed_elements, dtype=param_dtype)
 
     curr_offset = 0
-    op_slices: list[tuple[torch.Tensor, int, int]] = []
-    for gpu_param, offset, idx_cpu, val_cpu in resolved_ops:
+    op_slices: list[tuple[str, torch.Tensor, int, int]] = []
+    for name, gpu_param, offset, idx_cpu, val_cpu in resolved_ops:
       n = idx_cpu.numel()
       end_offset = curr_offset + n
       bulk_indices_cpu[curr_offset:end_offset] = idx_cpu.to(dtype=torch.long) + offset
       bulk_values_cpu[curr_offset:end_offset] = val_cpu.to(dtype=param_dtype)
-      op_slices.append((gpu_param, curr_offset, end_offset))
+      op_slices.append((name, gpu_param, curr_offset, end_offset))
       curr_offset = end_offset
 
     return bulk_indices_cpu, bulk_values_cpu, op_slices
@@ -373,14 +392,15 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
       if split_indices[i].numel() == 0:
         continue
       gpu_param, offset = self._resolve_gpu_param_and_offset(name)
-      resolved_ops.append((gpu_param, offset, split_indices[i], split_values[i]))
+      self._check_index_bounds(name, split_indices[i], offset, gpu_param.numel())
+      resolved_ops.append((name, gpu_param, offset, split_indices[i], split_values[i]))
 
     t_resolve_ms = (time.perf_counter() - t0_resolve) * 1000.0
 
     t0_copy = time.perf_counter()
     if resolved_ops:
-      target_device = self.device or resolved_ops[0][0].device
-      param_dtype = resolved_ops[0][0].dtype
+      target_device = self.device or resolved_ops[0][1].device
+      param_dtype = resolved_ops[0][1].dtype
 
       bulk_indices_cpu, bulk_values_cpu, op_slices = self._build_bulk_tensor_slices(resolved_ops, changed_elements, param_dtype)
 
@@ -394,11 +414,12 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
       bulk_values_gpu = bulk_values_cpu.to(device=target_device, non_blocking=True)
 
       # Mutate VRAM in-place using slices from the bulk GPU tensors
-      for gpu_param, start_idx, end_idx in op_slices:
+      for name, gpu_param, start_idx, end_idx in op_slices:
         flat_param = gpu_param.data.view(-1)
         idx_slice = bulk_indices_gpu[start_idx:end_idx]
         val_slice = bulk_values_gpu[start_idx:end_idx]
-        patch = SparseWeightPatch(name=str(gpu_param), indices=idx_slice, values=val_slice)
+        # The HF name, not str(gpu_param): repr formats the whole tensor on the device.
+        patch = SparseWeightPatch(name=name, indices=idx_slice, values=val_slice)
         self._validate_patch(patch, flat_param)
         flat_param.index_copy_(0, idx_slice, val_slice)
 
@@ -538,6 +559,7 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
         raise KeyError(f"Parameter '{name}' found in sparse delta but missing from CPU snapshot.")
       if i < len(split_indices) and split_indices[i].numel() > 0:
         snap_flat = self._cpu_snapshot[name].view(-1)
+        self._check_index_bounds(name, split_indices[i], 0, snap_flat.numel())
         snap_flat[split_indices[i]] = split_values[i]
 
     t_apply_ms = (time.perf_counter() - t0_apply) * 1000.0

@@ -245,12 +245,15 @@ class FFTTrainingWorker(BaseTrainerWorker):
       indices_list = []
       values_list = []
 
+    # int64 indices: a flat index into a tensor with more than 2**31 elements
+    # (Gemma 4's per-layer embedding table is 2.35e9) does not fit an int32, and
+    # a wrapped negative index made the sampler's index_copy_ assert mid-run.
     if indices_list:
-      indices_flat = torch.cat(indices_list).to(torch.int32).contiguous()
+      indices_flat = torch.cat(indices_list).to(torch.int64).contiguous()
       values_flat = torch.cat(values_list).contiguous()
     else:
       fallback_dtype = next(self.model.parameters()).dtype if self.model else torch.float32
-      indices_flat = torch.empty(0, dtype=torch.int32, device="cpu")
+      indices_flat = torch.empty(0, dtype=torch.int64, device="cpu")
       values_flat = torch.empty(0, dtype=fallback_dtype, device="cpu")
 
     layer_lengths_tensor = torch.tensor(layer_lengths_list, dtype=torch.int64, device="cpu")
@@ -469,7 +472,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
         diff_mask = param.data.view(-1).ne(prev_gpu.view(-1))
         indices = diff_mask.nonzero(as_tuple=True)[0]
         if indices.numel() > 0:
-          idx_cpu = indices.to(torch.int32).contiguous().cpu()
+          idx_cpu = indices.to(torch.int64).contiguous().cpu()
           val_cpu = param.data.view(-1)[diff_mask].contiguous().cpu()
           layer_names_list.append(name)
           indices_list.append(idx_cpu)

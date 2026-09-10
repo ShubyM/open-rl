@@ -444,6 +444,75 @@ class DeltaSnapshotWeightTransferEngineTest(unittest.TestCase):
     q_numel = 14 * 64 * 896
     self.assertEqual(qkv_param.data.view(-1)[q_numel + 10].item(), 42.0)
 
+  def test_in_place_patch_rejects_out_of_range_indices(self):
+    """A flat index outside the target parameter is refused on the host, naming the parameter.
+
+    Guards the failure seen with Gemma 4: its 2.35e9-element per-layer embedding
+    overflowed int32 delta indices, and the wrapped negative index became a CUDA
+    device-side assert in index_copy_ that killed the sampler's engine mid-run."""
+    import json
+
+    from safetensors.torch import save_file
+
+    param = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+
+    class SmallModel(torch.nn.Module):
+      def get_parameter(self, name):
+        if name == "model.embed_tokens.weight":
+          return param
+        raise AttributeError(name)
+
+    engine = DeltaSnapshotWeightTransferEngine(config=None, vllm_config=MagicMock(), device=torch.device("cpu"), model=SmallModel())
+
+    for bad_index in (16, -2001493954):
+      with tempfile.TemporaryDirectory() as tmpdir:
+        save_file(
+          {
+            "delta.indices_flat": torch.tensor([1, bad_index], dtype=torch.int64),
+            "delta.values_flat": torch.tensor([7.0, 42.0], dtype=torch.float32),
+            "delta.layer_lengths": torch.tensor([2], dtype=torch.int64),
+          },
+          os.path.join(tmpdir, "delta.safetensors"),
+        )
+        with open(os.path.join(tmpdir, "metadata.json"), "w") as f:
+          json.dump({"format": "sparse_delta", "layer_names": ["model.embed_tokens.weight"]}, f)
+        with patch.dict(os.environ, {"OPEN_RL_IN_PLACE_DELTA": "1"}), self.assertRaises(ValueError) as ctx:
+          engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=tmpdir))
+        self.assertIn("model.embed_tokens.weight", str(ctx.exception))
+        self.assertIn("16 elements", str(ctx.exception))
+    # Nothing was written: the check runs before any element is touched.
+    self.assertEqual(param.data.abs().sum().item(), 0.0)
+
+  def test_cpu_snapshot_patch_rejects_negative_indices(self):
+    """The full_replace path refuses a negative index instead of writing to the tensor's tail."""
+    import json
+
+    from safetensors.torch import save_file
+
+    class SmallModel:
+      def named_parameters(self):
+        return [("model.embed_tokens.weight", torch.nn.Parameter(torch.zeros(4, 4)))]
+
+      def named_buffers(self):
+        return []
+
+    engine = DeltaSnapshotWeightTransferEngine(config=None, parallel_config=None, model=SmallModel())  # type: ignore
+    with tempfile.TemporaryDirectory() as tmpdir:
+      save_file(
+        {
+          "delta.indices_flat": torch.tensor([-1], dtype=torch.int64),
+          "delta.values_flat": torch.tensor([9.0], dtype=torch.float32),
+          "delta.layer_lengths": torch.tensor([1], dtype=torch.int64),
+        },
+        os.path.join(tmpdir, "delta.safetensors"),
+      )
+      with open(os.path.join(tmpdir, "metadata.json"), "w") as f:
+        json.dump({"format": "sparse_delta", "layer_names": ["model.embed_tokens.weight"]}, f)
+      env = {"OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD": "full_replace", "OPEN_RL_IN_PLACE_DELTA": "0"}
+      with patch.dict(os.environ, env), self.assertRaises(ValueError) as ctx:
+        engine.receive_weights(DeltaSnapshotUpdateInfo(target_weights_path=tmpdir), lambda items: None)
+    self.assertIn("model.embed_tokens.weight", str(ctx.exception))
+
   def test_sparse_delta_names_follow_hf_to_vllm_mapper_full_replace(self):
     """CPU-snapshot patching (full_replace) keys the delta by the model's names, not the checkpoint's."""
     import json
