@@ -8,9 +8,10 @@ Scenarios ("tiny-" = minimal overfit/smoke tests; the rest are real workloads):
   fft-gsm8k             examples/sft/gsm8k/gsm8k_sft.py + vLLM eval (min_accuracy gate)
   fft-gsm8k-x2          two concurrent fft-gsm8k jobs sharing one GPU through the
                         accel timeslicer (asserts both workers checkpoint/restore)
-
-There is no FFT RL scenario: the FFT backend does not support sampling during
-training yet (no vLLM sampling mid-training).
+  tiny-rl-x2-families / tiny-fft-rl-x2-families
+                        two concurrent tiny-rl jobs on base_model and
+                        second_base_model, one per model family (asserts each
+                        job earns a reward, i.e. got its own tokenizer)
 
 Examples:
   uv run --extra gpu python scripts/run_training_e2e.py scenario=tiny-lora
@@ -60,6 +61,8 @@ class RunConfig:
     "tiny-rl",
     "tiny-fft-rl",
     "tiny-fft-rl-x2",
+    "tiny-rl-x2-families",
+    "tiny-fft-rl-x2-families",
     "lora-textsql",
     "lora-gsm8k-rl",
     "lora-gsm8k-rl-x2",
@@ -81,6 +84,9 @@ class RunConfig:
   sampler_gpu: str = "1"
   base_url: str = ""
   base_model: str = "Qwen/Qwen2.5-0.5B"
+  # The other model family for the *-x2-families scenarios; must differ from
+  # base_model in vocabulary, not just in size.
+  second_base_model: str = "google/gemma-4-e2b"
   jitter_sec: int = 180
   steps: int | None = None
   group_size: int = 8
@@ -985,6 +991,55 @@ def run_tiny_fft_rl_x2(config: RunConfig, base_url: str, watch: list[ManagedProc
   check_snapshot_interleaving(config)
 
 
+def run_tiny_rl_x2_families(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
+  """Two concurrent tiny RL jobs on base models from different families
+  (base_model and second_base_model), LoRA or FFT by scenario name.
+
+  One gateway, two vocabularies: anything that resolves a job's tokenizer,
+  parameter names or worker from a gateway-wide default instead of the job's
+  own metadata hands one job the other model's tokens. That does not crash
+  tiny_rl, the samples just turn into token soup and the reward stays at 0,
+  so each job must also earn a reward at least once."""
+  models = {"job-a": config.base_model, "job-b": config.second_base_model}
+  if len(set(models.values())) != 2:
+    raise RuntimeError(f"{config.scenario} needs two different base models, got {models}")
+  log_dirs = {job: Path(config.log_dir) / f"{config.scenario.replace('-', '_')}_{job}" for job in models}
+  results: dict[str, str | BaseException] = {}
+
+  def train(job: str) -> None:
+    try:
+      defaults = {"base_model": models[job], "base_url": base_url, "log_dir": str(log_dirs[job])}
+      if "fft" in config.scenario:
+        defaults["learning_rate"] = "1e-5"
+      if config.steps is not None:
+        defaults["steps"] = str(config.steps)
+      results[job] = run_example(config, ["examples/tiny/tiny_rl.py"], defaults, watch=watch, prefix=f"[{job}] ")
+    except BaseException as exc:
+      results[job] = exc
+
+  threads = [threading.Thread(target=train, args=(job,)) for job in models]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+
+  for job, result in sorted(results.items()):
+    if isinstance(result, BaseException):
+      raise RuntimeError(f"{config.scenario} {job} ({models[job]}) failed") from result
+
+  for job, model in models.items():
+    rows = [row for row in read_jsonl(log_dirs[job] / "metrics.jsonl") if row.get("phase") == "train"]
+    if not rows:
+      raise RuntimeError(f"{job} ({model}) logged no training steps in {log_dirs[job]}")
+    best = max(require_finite_metric(row, "mean_reward") for row in rows)
+    if best <= 0:
+      raise RuntimeError(
+        f"{job} ({model}) never earned a reward in {len(rows)} steps; its samples are most likely "
+        "token soup from the other model's tokenizer (check the gateway's per-model metadata)"
+      )
+    print(f"[training-e2e] {job} {model}: best mean_reward={best:.2f} over {len(rows)} steps")
+
+
 def read_jsonl(path: Path) -> list[dict]:
   if not path.exists() or path.stat().st_size == 0:
     raise RuntimeError(f"Expected {path} to exist and be non-empty")
@@ -1128,6 +1183,8 @@ def main() -> None:
       run_textsql_rl_x2(config, base_url, processes)
     elif config.scenario == "tiny-fft-rl-x2":
       run_tiny_fft_rl_x2(config, base_url, processes)
+    elif config.scenario in {"tiny-rl-x2-families", "tiny-fft-rl-x2-families"}:
+      run_tiny_rl_x2_families(config, base_url, processes)
     else:
       run_tiny(config, base_url, processes)
   finally:

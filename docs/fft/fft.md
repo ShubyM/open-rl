@@ -293,6 +293,10 @@ To execute concurrent dual-job time-slicing verification:
 ```bash
 make test e2e tiny-fft-rl-x2 TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=0 sampler_gpu=1 steps=5"
 ```
+To verify two concurrent jobs on different model families (each job must get its own tokenizer, names and workers):
+```bash
+make test e2e tiny-fft-rl-x2-families TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=0 sampler_gpu=1 base_model=Qwen/Qwen3-0.6B second_base_model=google/gemma-4-e2b"
+```
 
 ---
 
