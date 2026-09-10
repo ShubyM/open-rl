@@ -172,6 +172,13 @@ def source_filter(sources: list[dict]) -> str:
   )
 
 
+_logging_refused_until = 0.0
+
+
+def logging_refused() -> bool:
+  return time.monotonic() < _logging_refused_until
+
+
 async def run_logs(
   run_id: str,
   sources: list[dict],
@@ -200,6 +207,8 @@ async def run_logs(
   }
   if not configuration()["configured"]:
     return {**result, "error": "GKE telemetry is not fully configured"}
+  if logging_refused():
+    return {**result, "error": "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"}
   if attempt is not None:
     return {**result, "error": "GKE logs do not reliably identify restart attempts; use source=local"}
   selected = [
@@ -295,6 +304,14 @@ async def run_logs(
         _pages.popitem(last=False)
       result["next_cursor"] = cursor_id
 
+  except httpx.HTTPStatusError as exc:
+    if exc.response.status_code in (401, 403):
+      # A scope or IAM refusal does not clear itself; stop asking for a while.
+      global _logging_refused_until
+      _logging_refused_until = time.monotonic() + 600
+      result["error"] = "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"
+    else:
+      result["error"] = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
   except Exception:
     result["error"] = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
   return result

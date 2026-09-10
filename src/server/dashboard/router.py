@@ -117,9 +117,16 @@ async def run_logs(
       )
     except ValueError as exc:
       raise HTTPException(400, str(exc)) from exc
-    result["shared_runtime"] = bool(run and run["shared_runtime"]) or any(s.get("shared_runtime") for s in sources)
-    result["runtime_run_ids"] = run["runtime_run_ids"] if run else []
-    return result
+    fallback = source == "auto" and result.get("error") and not cursor
+    if not fallback:
+      result["shared_runtime"] = bool(run and run["shared_runtime"]) or any(s.get("shared_runtime") for s in sources)
+      result["runtime_run_ids"] = run["runtime_run_ids"] if run else []
+      return result
+    # Auto means "the best source that works". Cloud Logging said no, so the
+    # local archive answers and says why the switch happened.
+    note = "Cloud Logging is not readable from this gateway; showing the local archive"
+  else:
+    note = None
   # Archive queries remain valid after a run or pod has gone away.
   try:
     result = await asyncio.to_thread(
@@ -141,6 +148,8 @@ async def run_logs(
   state = await snapshot()
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
   result["source"] = "local"
+  if note:
+    result["source_note"] = note
   result["shared_runtime"] = bool(run and run["shared_runtime"]) or any(source.get("shared_runtime") for source in result["sources"])
   result["runtime_run_ids"] = run["runtime_run_ids"] if run else []
   return result

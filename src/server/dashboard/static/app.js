@@ -629,7 +629,7 @@ async function loadLogs(id, more = false) {
     logCursor = data.next_cursor;
     document.getElementById("log-status").textContent =
       data.error ||
-      `${data.source === "gke" ? "GKE logs" : "Collected logs"} · Newest first · History may be incomplete`;
+      `${data.source === "gke" ? "GKE logs" : "Collected logs"} · Newest first · History may be incomplete${data.source_note ? " · " + data.source_note : ""}`;
     document.getElementById("log-more").innerHTML = logCursor
       ? button("Older logs", 'data-older="true"')
       : "";
