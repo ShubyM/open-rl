@@ -241,7 +241,6 @@ function nodes() {
           const accelerator = node.accelerator
             ? node.accelerator
                 .replace(/^nvidia[- ]/i, "")
-                .replace(/-\d+gb$/i, "")
                 .replace(/-/g, " ")
                 .toUpperCase()
             : node.gpu_capacity
@@ -455,7 +454,7 @@ function paintRunMetrics(view) {
         .map((sample) => [sample.at, sample.metrics[name]]),
     ]),
     ...(data.gke?.series || []).map((series) => [
-      `${series.role} · ${series.pod}/${series.container} · ${series.name} (${series.unit})${series.device ? " · " + series.device : ""}`,
+      `${series.name} (${series.unit}) · ${series.role}${series.device ? " · " + series.device : ""}`,
       series.points,
     ]),
   ]
