@@ -173,7 +173,10 @@ body {
 #orl-design-lab .node-duty {
   text-align: right;
   font-variant-numeric: tabular-nums;
-  padding-top: 3px;
+  line-height: 26px;
+}
+#orl-design-lab .node-time-header .node-duty {
+  line-height: inherit;
 }
 #orl-design-lab .node-axis span:not(:first-child):not(:last-child) {
   transform: translateX(-50%);

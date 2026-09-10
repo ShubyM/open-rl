@@ -226,12 +226,16 @@ function nodes() {
         `<span class="allocation-unobserved" style="left:${((from - start) / duration) * 100}%;width:${((to - from) / duration) * 100}%" aria-label="No allocation observations"></span>`,
     )
     .join("");
+  // Allocated GPU-time over the time this gateway actually observed, so a
+  // recent restart shortens the denominator instead of blanking the column.
   const duty = (node) => {
-    if (missing.length || !node.gpu_capacity) return "—";
+    if (!node.gpu_capacity || !observations.length) return "—";
     const devices = new Set((node.devices || []).map((item) => item.id));
     if (devices.size !== node.gpu_capacity) return "—";
     let allocated = 0;
+    let observed = 0;
     for (const sample of observations) {
+      observed += sample.end - sample.start;
       const placements = sample.placements.filter(
         (placement) => placement.node === node.name,
       );
@@ -247,7 +251,7 @@ function nodes() {
         new Set(placements.flatMap((placement) => placement.devices)).size *
         (sample.end - sample.start);
     }
-    return `${Math.round((100 * allocated) / (duration * node.gpu_capacity))}%`;
+    return observed > 0 ? `${Math.round((100 * allocated) / (observed * node.gpu_capacity))}%` : "—";
   };
   const segments = [];
   // Successful observations define both allocation blocks and duty; gaps stay unknown.
@@ -270,7 +274,7 @@ function nodes() {
     ${
       state.cluster.nodes
         .map((node) => {
-          const height = node.gpu_capacity === 1 ? 30 : 22;
+          const height = 26;
           const devices = node.devices || [];
           const placements = (
             nodeSelection.end === null
