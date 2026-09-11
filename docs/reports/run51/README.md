@@ -75,3 +75,19 @@ results uncapped) and 0.8/0.2 reward, GLM judge, renderer `gemma4`.
 Context 180000 (readable observation window 180000 - 65536), chosen so that
 reserved memory stays near run49's 123 GiB rather than the 135 GiB of the 200k
 ladder point.
+
+## Step-0 eval (held-out 50 tasks, base model, reference limits)
+
+| | Gemma 4 31B (run51) | Qwen3.8-27B (run49, 16k cap) |
+|---|---|---|
+| criterion pass rate, graded episodes | 61.6% (44 graded) | 22.6% |
+| all criteria passed | 0 | 0 |
+| mean reward (0.8 pass fraction + 0.2 all pass, -0.1 ungraded) | 0.405 | |
+| turns per episode | 9.9 mean, 15 max | |
+| generated tokens per episode | 9.6k mean, 74k max | |
+| longest observation | 52k mean, 114k max | |
+| lost before grading | 4 parse errors (3 on the first turn), 2 no output, 1 context overflow | 27 killed by the 16k cap |
+
+The cookbook's streaming loop awaits the step-0 eval before it launches any
+train rollouts, so the first 35 minutes of the run are eval only; the 48 train
+episodes started at 21:10Z.
