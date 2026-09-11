@@ -145,7 +145,7 @@ def widest_head_dim(text_config: Any) -> int:
     return 0
 
 
-def flex_kernel_options(text_config: Any) -> dict[str, Any]:
+def flex_kernel_options(text_config: Any, flex_runs_widest: bool) -> dict[str, Any]:
   """Smaller FlexAttention tiles for models with heads 256 wide or wider.
 
   Flex's default 128-wide tiles do not fit an H200's shared memory at
@@ -155,16 +155,20 @@ def flex_kernel_options(text_config: Any) -> dict[str, Any]:
   call. The FSDP path used 16-wide tiles for the same reason; the backward
   needs smaller tiles than the forward.
   """
-  if widest_head_dim(text_config) < 256:
+  widest = widest_head_dim(text_config)
+  if widest < 256:
     return {}
+  # 64/32 fits head_dim 256; when flex also has to run the widest heads
+  # (no FFPA), only the 16-wide tiles the FSDP path used fit at 512.
+  fwd, bwd = (16, 16) if flex_runs_widest and widest > 256 else (64, 32)
   tile = {
-    "fwd_BLOCK_M": 64,
-    "fwd_BLOCK_N": 64,
+    "fwd_BLOCK_M": fwd,
+    "fwd_BLOCK_N": fwd,
     "fwd_num_stages": 1,
-    "bwd_BLOCK_M1": 32,
-    "bwd_BLOCK_N1": 32,
-    "bwd_BLOCK_M2": 32,
-    "bwd_BLOCK_N2": 32,
+    "bwd_BLOCK_M1": bwd,
+    "bwd_BLOCK_N1": bwd,
+    "bwd_BLOCK_M2": bwd,
+    "bwd_BLOCK_N2": bwd,
     "bwd_num_stages": 1,
   }
   return {"kernel_options": tile}
@@ -465,7 +469,11 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     text_config = self.load_hf_config(base_model_name).get_text_config()
     model_type = text_config.model_type
     extra = attention_kwargs(model_type, self.cp_size)
-    self.forward_kwargs = flex_kernel_options(text_config) if "ffpa" in str(extra) else {}
+    attn = extra.get("attn_implementation")
+    if attn == "flex_attention" or "ffpa" in str(extra):
+      self.forward_kwargs = flex_kernel_options(text_config, flex_runs_widest=(attn == "flex_attention"))
+    else:
+      self.forward_kwargs = {}
     if model_type.startswith("qwen3_5"):
       extra["num_nextn_predict_layers"] = 0
     print(f"[Automodel Worker] {model_type}: {extra}")
