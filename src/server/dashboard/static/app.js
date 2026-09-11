@@ -7,6 +7,7 @@ import { runs, scheduler, health, experiments } from "./views.js";
 import { hoverChart, inspectChart } from "./charts.js";
 import { root, content, ui, route, get, nodeNow } from "./store.js";
 import { renderNodes } from "./nodes.js";
+import { installNodeTime, cancelNodeGesture, timeWindow } from "./node-time.js";
 import { runPage, ensureLogs, loadLogs, runView, resetRunWindow, syncRunRoute, setLogFilter, setLogEvent, toggleLogFollow } from "./run.js";
 import { use, beginRender, endRender } from "./cache.js";
 
@@ -35,6 +36,7 @@ function render() {
   if (page === "run" && tab === "logs") ensureLogs(id);
 }
 ui.render = render;
+installNodeTime();
 
 // ---- interactions ----------------------------------------------------------
 
@@ -79,9 +81,9 @@ root.addEventListener("click", (event) => {
     render();
   }
   if (target.dataset.timeShift) {
-    const now = nodeNow();
-    const end = (ui.nodeSelection.end ?? now) + Number(target.dataset.timeShift) * ui.nodeSelection.duration;
-    ui.nodeSelection = { ...ui.nodeSelection, end: end >= now ? null : end };
+    const range = timeWindow();
+    const end = range.now + Number(target.dataset.timeShift) * (range.now - range.start);
+    ui.nodeSelection = { ...ui.nodeSelection, end: end >= nodeNow() ? null : end };
     render();
   }
   if (target.dataset.logFollow !== undefined) toggleLogFollow();
@@ -135,7 +137,7 @@ root.addEventListener("change", (event) => {
     render();
   }
   if (target.dataset.timeDuration !== undefined) {
-    ui.nodeSelection = { ...ui.nodeSelection, duration: Number(target.value) };
+    ui.nodeSelection = { duration: Number(target.value), end: ui.nodeSelection.end === null ? null : timeWindow().now };
     render();
   }
   if (target.dataset.timeEnd !== undefined) {
@@ -148,7 +150,7 @@ root.addEventListener("change", (event) => {
 
 root.addEventListener("pointermove", (event) => {
   const plot = event.target.closest(".chart-plot");
-  if (plot) hoverChart(plot, event.clientX);
+  if (plot && !ui.nodeNavigating) hoverChart(plot, event.clientX);
 });
 root.addEventListener("pointerleave", (event) => event.target.classList?.contains("chart-plot") && (event.target.querySelector(".chart-hover").hidden = true), true);
 root.addEventListener("focusout", (event) => {
@@ -162,6 +164,7 @@ document.addEventListener("click", (event) => {
 });
 
 window.addEventListener("hashchange", () => {
+  cancelNodeGesture();
   clearTimeout(searchTimer);
   syncRunRoute(...route());
   content.innerHTML = "";

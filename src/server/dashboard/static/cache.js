@@ -30,7 +30,7 @@ export function use(url, scope = url) {
   entry.used = generation;
   entries.delete(scope);
   entries.set(scope, entry);
-  if (!entry.pending && (entry.url !== url || Date.now() - entry.fetchedAt >= FRESH_MS)) {
+  if (!ui.nodeNavigating && !entry.pending && (entry.url !== url || Date.now() - entry.fetchedAt >= FRESH_MS)) {
     entry.url = url;
     entry.pending = true;
     entry.controller = new AbortController();

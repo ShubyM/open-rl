@@ -6,57 +6,20 @@ import { escape, encode, empty, button, morph } from "./ui.js";
 import { chart } from "./charts.js";
 import { ui, content, nodeNow, nodeTime, family } from "./store.js";
 import { use } from "./cache.js";
+import { timeWindow, timeControl } from "./node-time.js";
 
 const laneHeight = (devices) => (devices.length === 1 ? 30 : 22);
-export const WINDOWS = [
-  [60, "1 minute"],
-  [600, "10 minutes"],
-  [1800, "30 minutes"],
-  [3600, "1 hour"],
-  [10800, "3 hours"],
-  [21600, "6 hours"],
-  [86400, "24 hours"],
-];
-
-// ---- window ----------------------------------------------------------------------
-
-export function timeWindow() {
-  const observed = nodeNow();
-  const now = Number.isFinite(ui.nodeSelection.end) ? Math.min(ui.nodeSelection.end, observed) : observed;
-  const duration = Math.min(86400, Math.max(60, Number(ui.nodeSelection.duration) || 1800));
-  return { start: now - duration, now, live: ui.nodeSelection.end === null };
-}
-
-function timeControl(range) {
-  const { end, duration } = ui.nodeSelection;
-  const local = (at) => new Date(at * 1000).toISOString().slice(0, 16);
-  const chevron = (rotation = 0) =>
-    `<svg class="time-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 5.5 5 5 5-5" transform="rotate(${rotation} 8 8)"/></svg>`;
-  const label =
-    end === null
-      ? `Last ${WINDOWS.find(([seconds]) => seconds === duration)?.[1] || `${duration / 60} minutes`}`
-      : `${local(range.now).slice(5, 10)} · ${nodeTime(range.start)} – ${nodeTime(range.now)}`;
-  return `<div class="time-control" aria-label="Node time range">
-    <button type="button" class="time-shift" data-time-shift="-1" aria-label="Previous time window">${chevron(90)}</button>
-    <details class="time-picker" data-key="node-time-picker"><summary class="time-summary">${escape(label)}${chevron()}</summary>
-      <div class="time-popover"><label>Window <select data-time-duration>${WINDOWS.map(([seconds, text]) => `<option value="${seconds}" ${seconds === duration ? "selected" : ""}>${text}</option>`).join("")}</select></label>
-      <label>Until (UTC)<input type="datetime-local" data-time-end value="${end === null ? "" : local(end)}" max="${local(nodeNow())}" step="60"></label>
-      ${end === null ? '<span class="muted">Following current time</span>' : button("Return to live", 'data-time-live="true"')}</div>
-    </details><button type="button" class="time-shift" data-time-shift="1" aria-label="Next time window" ${range.live ? "disabled" : ""}>${chevron(-90)}</button></div>`;
-}
-
 // ---- history -> segments -----------------------------------------------------------
 
-// Every placement that touched the window, as [start, end] on its node. Live
-// placements run to now; a placement not recorded yet shows from now.
-function segments({ start, now }) {
+// Keep the selected placement available when panning beyond its lifetime.
+// Lanes clip history to the visible window; live placements run to now.
+function segments({ now }) {
   const live = new Map(ui.state.placements.map((p) => [p.id, p]));
   const seen = new Set();
   const found = [];
   for (const entry of ui.state.history) {
     seen.add(entry.id);
     const end = live.has(entry.id) ? now : entry.last_seen;
-    if (end < start || entry.first_seen > now) continue;
     found.push({
       ...entry,
       ...(live.get(entry.id) || {}),
@@ -65,7 +28,7 @@ function segments({ start, now }) {
       ended: !live.has(entry.id),
     });
   }
-  for (const placement of ui.state.placements) if (!seen.has(placement.id) && now >= nodeNow()) found.push({ ...placement, start: now, end: now });
+  for (const placement of ui.state.placements) if (!seen.has(placement.id)) found.push({ ...placement, start: nodeNow(), end: now });
   // A shared LoRA process can serve several runs on the same allocation.
   return found.flatMap((placement) => (placement.run_ids?.length > 1 ? placement.run_ids.map((id) => {
     const run = ui.state.runs.find((r) => r.run_id === id);
@@ -101,16 +64,17 @@ function duty(node, nodeSegments, { start, now }) {
 
 // ---- who held a shared GPU ---------------------------------------------------------
 
-// Shared lanes paint completed operation activity. Leave gaps unpainted:
-// another workload can run between even closely spaced operations.
-const holdUrl = (runId, { start, now }) =>
-  `/api/v1/dashboard/runs/${encode(runId)}/metrics?${new URLSearchParams({ since: new Date(start * 1000).toISOString(), until: new Date(now * 1000).toISOString() })}`;
+// Fetch retained operations through the snapshot, then clip locally: an
+// operation can finish beyond the viewed window while overlapping its edge.
+// Leave gaps unpainted; another workload can run between recorded operations.
+const holdUrl = (runId) =>
+  `/api/v1/dashboard/runs/${encode(runId)}/metrics?${new URLSearchParams({ since: new Date((nodeNow() - 86400) * 1000).toISOString(), until: new Date(nodeNow() * 1000).toISOString() })}`;
 
 function operationActivity(placement, range) {
   const intervals = [];
   let error = "", loading = false;
   for (const runId of placement.run_ids || []) {
-    const entry = use(holdUrl(runId, range), range.live ? `holds:${runId}:${ui.nodeSelection.duration}` : undefined);
+    const entry = use(holdUrl(runId), `holds:${runId}`);
     if (entry.error) error = entry.error;
     if (!entry.data && entry.pending && !entry.error) loading = true;
     for (const sample of entry.data?.samples || []) {
@@ -213,9 +177,10 @@ function trackBars(devices, nodeSegments, range) {
 
 function lane(node, all, range) {
   const devices = node.devices || [];
-  const nodeSegments = all.filter((s) => s.node === node.name);
+  const neighbours = all.filter((s) => s.node === node.name);
+  const nodeSegments = neighbours.filter((s) => s.start <= range.now && s.end >= range.start);
   const placements = range.live ? ui.state.placements.filter((p) => p.node === node.name) : nodeSegments.filter((p) => p.start <= range.now && p.end >= range.now);
-  const current = nodeSegments.find((s) => s.id === ui.expanded);
+  const current = neighbours.find((s) => s.id === ui.expanded);
   const bars = trackBars(devices, nodeSegments, range);
   const accelerator = acceleratorLabel(node);
   const height = laneHeight(devices);
@@ -229,7 +194,7 @@ function lane(node, all, range) {
   const track = devices.length
     ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(deviceLabel(d.name))}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${bars}</div></div>`
     : "";
-  return `<div class="node-placement-group" data-key="${escape(node.name)}"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span>${node.gpu_capacity ? `<span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span>` : ""}</div><div>${track}${unknown}${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : !devices.length && node.gpu_capacity ? empty("GPUs without DRA devices") : ""}</div><span class="node-duty" title="Recorded GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${current ? detail(current, range, nodeSegments) : ""}</div>`;
+  return `<div class="node-placement-group" data-key="${escape(node.name)}"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span>${node.gpu_capacity ? `<span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span>` : ""}</div><div>${track}${unknown}${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : !devices.length && node.gpu_capacity ? empty("GPUs without DRA devices") : ""}</div><span class="node-duty" title="Recorded GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${current ? detail(current, range, neighbours) : ""}</div>`;
 }
 
 // ---- expansion ---------------------------------------------------------------------
@@ -282,7 +247,7 @@ function detail(placement, range, neighbours) {
   const { state } = ui;
   const node = state.cluster.nodes.find((n) => n.name === anchor.node);
   const devices = (node?.devices || []).filter((d) => anchor.devices.includes(d.id));
-  const group = neighbours.filter((p) => p.id === anchor.id || p.devices.some((id) => anchor.devices.includes(id)));
+  const group = neighbours.filter((p) => p.id === anchor.id || p.id === placement.id || (p.start <= range.now && p.end >= range.start && p.devices.some((id) => anchor.devices.includes(id))));
   const visible = group.filter((p) => ui.device === "all" || p.devices.includes(ui.device));
   const run = visible.some((p) => p.id === placement.id) && state.runs.find((r) => (placement.run_ids || []).includes(r.run_id));
   const workload = run?.workloads?.find((w) => w.uid === (placement.allocation_id || placement.id));
@@ -295,15 +260,16 @@ function detail(placement, range, neighbours) {
     .filter(Boolean)
     .join(" · ");
   const allocationId = anchor.allocation_id || anchor.id;
+  const query = ui.nodeQueryRange || range;
   const metrics = use(
-    `/api/v1/dashboard/allocations/${encode(allocationId)}/metrics?${new URLSearchParams({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() })}`,
-    range.live ? `allocation:${allocationId}:${ui.nodeSelection.duration}` : undefined,
+    `/api/v1/dashboard/allocations/${encode(allocationId)}/metrics?${new URLSearchParams({ since: new Date(query.start * 1000).toISOString(), until: new Date(query.now * 1000).toISOString() })}`,
+    `allocation:${allocationId}`,
   );
   const picker = (anchor.devices.length > 1 ? [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)] : [])
     .concat(
       anchor.devices.map((id) => {
         const name = deviceLabel(devices.find((d) => d.id === id)?.name || id.split("/").at(-1));
-        const value = metrics.data?.devices?.find((d) => d.id === id)?.utilization?.at(-1)?.[1];
+        const value = lastValue(metrics.data?.devices?.find((d) => d.id === id)?.utilization, range);
         return button(
           `GPU ${name}${Number.isFinite(value) ? ` · ${Math.round(value)}%` : ""}`,
           `data-device="${escape(id)}" aria-pressed="${ui.device === id}"`,
@@ -312,7 +278,7 @@ function detail(placement, range, neighbours) {
     )
     .join("");
   const label = devices.length ? `${acceleratorLabel(node)} · GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : "GPU activity";
-  return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(anchor.id)}" data-view="${ui.activityView}"><div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)}</h2><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics)}</strong></span></div>
+  return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(anchor.id)}" data-view="${ui.activityView}"><div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)}</h2><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div>
     <div class="allocation-controls"><div class="allocation-device-picker" aria-label="GPU selection">${picker}</div><div class="activity-view" role="group" aria-label="Activity layout">${[ ["gpu", "By GPU"], ["run", "By run"] ].map(([view, text]) => button(text, `data-activity-view="${view}" aria-pressed="${ui.activityView === view}"`)).join("")}</div></div>
     ${activityTimeline(visible, devices.filter((d) => ui.device === "all" || d.id === ui.device), range)}
     <div>${gpuChart(metrics, range)}</div>
@@ -348,8 +314,10 @@ function gpuChart(metrics, range) {
   })}${metrics.error ? `<p class="muted" role="status">${escape(metrics.error)} · Showing the last available samples</p>` : ""}`;
 }
 
-function gpuMemory(metrics) {
-  const latest = selectedDevices(metrics).map((d) => d.memory_mib?.at(-1)?.[1]);
+const lastValue = (points, range) => points?.findLast(([at]) => at >= range.start && at <= range.now)?.[1];
+
+function gpuMemory(metrics, range) {
+  const latest = selectedDevices(metrics).map((d) => lastValue(d.memory_mib, range));
   return latest.length && latest.every(Number.isFinite) ? `${(latest.reduce((a, b) => a + b, 0) / 1024).toFixed(1)} GiB` : "—";
 }
 

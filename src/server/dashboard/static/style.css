@@ -497,6 +497,14 @@ body {
       calc(var(--gpu-lane-height) - 1px) var(--gpu-lane-height)
   );
 }
+#orl-design-lab :is(.capacity-track, .node-axis, .activity-track, .activity-axis, .allocation-expansion .chart-plot svg, .allocation-expansion .chart-empty) {
+  touch-action: pan-y;
+  cursor: grab;
+}
+#orl-design-lab.node-navigating :is(.capacity-track, .node-axis, .activity-track, .activity-axis, .allocation-expansion .chart-plot svg, .allocation-expansion .chart-empty) {
+  cursor: grabbing;
+  user-select: none;
+}
 #orl-design-lab .capacity-track::before {
   content: "";
   position: absolute;
@@ -862,6 +870,9 @@ body {
 #orl-design-lab .allocation-expansion .chart-plot {
   grid-template-columns: var(--activity-label-width) minmax(0, 1fr);
   column-gap: 12px;
+}
+#orl-design-lab .allocation-expansion .chart-empty {
+  margin-left: calc(var(--activity-label-width) + 12px);
 }
 #orl-design-lab .allocation-expansion .chart-line {
   stroke-width: 1.5;

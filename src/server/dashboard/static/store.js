@@ -12,6 +12,8 @@ export const ui = {
   device: "all", // GPU selected in the expansion
   activityView: "gpu", // combined GPU strips or individual run rows
   nodeSelection: { duration: 1800, end: null },
+  nodeNavigating: false, // redraw cached data while a timeline gesture is active
+  nodeQueryRange: null, // GPU query frozen until the gesture settles
   // Installed by app.js once the page is wired up.
   render: () => {},
 };
