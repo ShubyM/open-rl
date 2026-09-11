@@ -355,3 +355,19 @@ push-vm:
 # Pull changes from the remote VM back to the local workspace
 pull-vm:
 	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' --exclude 'scratch' $(REMOTE_HOST):~/open-rl/ ./
+
+# ---------------------------------------------------------------------------
+# Dashboard development
+# ---------------------------------------------------------------------------
+# A port-forward to the gateway that restarts itself when kubectl wedges.
+FORWARD_PORT ?= 18000
+.PHONY: forward dashboard-capture dashboard-fixture
+forward:
+	dev/gateway-forward.sh openrl-system $(FORWARD_PORT)
+
+# Record the live dashboard API into dev/fixtures/dashboard (real data), and
+# serve the UI over that recording without a cluster.
+dashboard-capture:
+	python3 dev/capture_dashboard_fixture.py --base http://127.0.0.1:$(FORWARD_PORT) --out dev/fixtures/dashboard
+dashboard-fixture:
+	python3 dev/dashboard_fixture.py --port 9017
