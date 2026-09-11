@@ -749,13 +749,24 @@ body {
 #orl-design-lab .allocation-expansion .chart {
   --plot-height: clamp(180px, 24vw, 260px);
 }
-#orl-design-lab .chart-activity {
+#orl-design-lab .chart-activity-color {
   fill: var(--allocation-color);
-  fill-opacity: 0.3;
+  fill-opacity: 0.7;
+}
+#orl-design-lab .chart-activity-color.selected {
+  fill-opacity: 1;
+}
+#orl-design-lab :is(.chart-activity, .chart-overlap) {
+  fill: none;
+  stroke-width: 2.5;
+  stroke-linejoin: round;
+}
+#orl-design-lab .chart-activity {
+  stroke: var(--allocation-color);
 }
 #orl-design-lab .chart-activity.selected,
 #orl-design-lab .chart-activity[data-placement]:hover {
-  fill-opacity: 0.6;
+  stroke-width: 3.5;
 }
 #orl-design-lab .chart-activity[data-placement] {
   cursor: pointer;

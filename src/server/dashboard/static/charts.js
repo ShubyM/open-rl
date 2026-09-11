@@ -20,9 +20,8 @@ export const valueText = (value, unit) =>
 
 const SCALE = 1000;
 
-// Color observed activity beneath one measured curve; concurrent jobs share stripes,
-// never stacked or independently inferred utilization. The area clip retains gaps.
-function activityLayers(activities, areas, start, end, x, title) {
+// Color the measured line at operation boundaries, retaining telemetry gaps.
+function activityLayers(activities, segments, start, end, x, y, title) {
   const events = [];
   activities.forEach((activity, index) => {
     for (const [from, to] of activity.intervals || []) {
@@ -31,8 +30,25 @@ function activityLayers(activities, areas, start, end, x, title) {
       if (Number.isFinite(a) && Number.isFinite(b) && b > a) events.push([a, index, 1], [b, index, -1]);
     }
   });
-  if (!events.length || !areas.length) return "";
+  if (!events.length) return "";
   events.sort((a, b) => a[0] - b[0]);
+  const edges = segments.flatMap((segment) => segment.slice(1).map((point, i) => [segment[i], point, i === 0]));
+  let cursor = 0;
+  const trace = (from, to) => {
+    while (cursor < edges.length && edges[cursor][1][0] <= from) cursor++;
+    let path = "",
+      previousEnd = null;
+    for (let i = cursor; i < edges.length && edges[i][0][0] < to; i++) {
+      const [[a, value], [b, next], newSegment] = edges[i];
+      if (b <= a) continue;
+      const left = Math.max(from, a), right = Math.min(to, b), firstY = Number(y(value)), lastY = Number(y(next));
+      const point = (at) => `${x(at)},${(firstY + ((at - a) / (b - a)) * (lastY - firstY)).toFixed(1)}`;
+      if (newSegment || previousEnd !== left) path += `M${point(left)} `;
+      path += `L${point(right)} `;
+      previousEnd = right;
+    }
+    return path.trim();
+  };
   const active = new Map(),
     regions = [],
     patterns = new Map();
@@ -44,19 +60,21 @@ function activityLayers(activities, areas, start, end, x, title) {
     if (at > previous && active.size) {
       const indices = [...active.keys()].sort((a, b) => a - b),
         jobs = indices.map((index) => activities[index]);
+      const path = trace(previous, at);
       let attrs = `class="${classes(jobs[0])}" data-placement="${escape(jobs[0].id)}"`;
       if (jobs.length > 1) {
         const key = indices.join("-");
         if (!patterns.has(key))
           patterns.set(
             key,
-            `<pattern id="${id}-${key}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)" width="${jobs.length * 10}" height="${SCALE}">${jobs.map((job, j) => `<rect class="${classes(job)}" x="${j * 10}" width="10" height="${SCALE}"/>`).join("")}</pattern>`,
+            `<pattern id="${id}-${key}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)" width="${jobs.length * 10}" height="${SCALE}">${jobs.map((job, j) => `<rect class="chart-activity-color ${escape(job.tone || "")} ${job.selected ? "selected" : ""}" x="${j * 10}" width="10" height="${SCALE}"/>`).join("")}</pattern>`,
           );
-        attrs = `class="chart-overlap" fill="url(#${id}-${key})"`;
+        attrs = `class="chart-overlap" stroke="url(#${id}-${key})"`;
       }
-      regions.push(
-        `<rect ${attrs} data-key="${indices.join("-")}:${previous}" x="${x(previous)}" width="${Math.max(0, Number(x(at)) - Number(x(previous)))}" height="${SCALE}"><title>${jobs.length > 1 ? "Concurrent activity: " : ""}${escape(jobs.map((job) => job.label).join(" · "))}</title></rect>`,
-      );
+      if (path)
+        regions.push(
+          `<path ${attrs} data-key="${indices.join("-")}:${previous}" d="${path}" vector-effect="non-scaling-stroke"><title>${jobs.length > 1 ? "Concurrent activity: " : ""}${escape(jobs.map((job) => job.label).join(" · "))}</title></path>`,
+        );
     }
     while (i < events.length && events[i][0] === at) {
       const [, index, delta] = events[i++],
@@ -66,7 +84,7 @@ function activityLayers(activities, areas, start, end, x, title) {
     }
     previous = at;
   }
-  return `<defs><clipPath id="${id}">${areas.map((d) => `<path d="${d}"/>`).join("")}</clipPath>${[...patterns.values()].join("")}</defs><g clip-path="url(#${id})">${regions.join("")}</g>`;
+  return `<defs>${[...patterns.values()].join("")}</defs>${regions.join("")}`;
 }
 
 export function chart({
@@ -126,7 +144,7 @@ export function chart({
       return `<path class="chart-line" d="${line}" vector-effect="non-scaling-stroke"/>`;
     })
     .join("");
-  const paths = areas.map((d) => `<path class="chart-area" d="${d}"/>`).join("") + activityLayers(activities, areas, data[0][0], data.at(-1)[0], x, title) + lines;
+  const paths = (activities.length ? "" : areas.map((d) => `<path class="chart-area" d="${d}"/>`).join("")) + lines + activityLayers(activities, segments, data[0][0], data.at(-1)[0], x, y, title);
   const tickCount = xFormat === "step" ? Math.max(1, Math.min(4, Math.floor(end - start))) : 4;
   const label = (at) =>
     xFormat === "step" ? `step ${Math.round(at)}` : `${end - start >= 86400 ? new Date(at * 1000).toISOString().slice(5, 10) + " " : ""}${chartTime(at, end - start <= 120)}`;
