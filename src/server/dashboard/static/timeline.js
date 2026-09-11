@@ -92,7 +92,7 @@ export function runIncidents(run, minutes, end) {
       const timestamp = new Date(event.at * 1000).toISOString();
       const label =
         event.reason === "WorkerRestarted" ? "Worker restarted" : event.reason;
-      return `<div class="run-incident incident-${event.tone}"><time class="incident-time" datetime="${timestamp}" title="${timestamp}">${timestamp.slice(11, 19)} UTC</time><span class="incident-label">${escape(label)}</span><span class="incident-context" title="${escape(event.message)}">${escape(event.pod)}${event.container ? ` / ${escape(event.container)}` : ""}${event.restart_count ? ` · ${escape(event.restart_count)} total restarts` : event.count > 1 ? ` · ${escape(event.count)} reported occurrences` : ""}</span><a href="#run/${encode(run.run_id)}/logs" data-event-at="${event.at}" aria-label="View logs near ${escape(label)} on ${escape(event.pod)}">View logs</a></div>`;
+      return `<div class="run-incident incident-${event.tone}"><time class="incident-time" datetime="${timestamp}" title="${timestamp}">${timestamp.slice(11, 19)}</time><span class="incident-label">${escape(label)}</span><span class="incident-context" title="${escape(event.message)}">${escape(event.pod)}${event.container ? ` / ${escape(event.container)}` : ""}${event.restart_count ? ` · ${escape(event.restart_count)} total restarts` : event.count > 1 ? ` · ${escape(event.count)} reported occurrences` : ""}</span><a href="#run/${encode(run.run_id)}/logs" data-event-at="${event.at}" aria-label="View logs near ${escape(label)} on ${escape(event.pod)}">View logs</a></div>`;
     })
     .join("")}</section>`;
 }

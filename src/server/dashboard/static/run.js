@@ -195,7 +195,7 @@ function logsPanel(id, run) {
   const scope =
     runView.eventAt === null
       ? ""
-      : `<div class="log-time-scope" data-key="log-scope"><span>${escape(range.since.slice(0, 10))} · ${escape(range.since.slice(11, 19))}–${escape(range.until.slice(11, 19))} UTC</span><a href="#run/${encode(id)}/logs" data-all-logs="true">All logs</a></div>`;
+      : `<div class="log-time-scope" data-key="log-scope"><span>${escape(range.since.slice(0, 10))} · ${escape(range.since.slice(11, 19))}–${escape(range.until.slice(11, 19))}</span><a href="#run/${encode(id)}/logs" data-all-logs="true">All logs</a></div>`;
   const sources = new Map((run.pods || []).map((p) => [p.name, p]));
   for (const record of logState.records) if (record.pod && !sources.has(record.pod)) sources.set(record.pod, { ...record, name: record.pod });
   if (logState.pod && !sources.has(logState.pod)) sources.set(logState.pod, { name: logState.pod });

@@ -10,6 +10,7 @@ const entries = new Map();
 const FRESH_MS = 15000;
 const MAX_ENTRIES = 24;
 let generation = 0;
+let repaint = 0;
 
 export const beginRender = () => generation++;
 export function endRender() {
@@ -45,7 +46,12 @@ export function use(url, scope = url) {
         entry.fetchedAt = Date.now();
         entry.pending = false;
         entry.controller = null;
-        if (entries.get(scope) === entry && entry.used === generation) ui.render();
+        if (entries.get(scope) === entry && entry.used === generation) {
+          // Several metrics requests can finish together; paint their results once.
+          cancelAnimationFrame(repaint);
+          const used = generation;
+          repaint = requestAnimationFrame(() => { if (used === generation) ui.render(); });
+        }
       });
   }
   return entry;

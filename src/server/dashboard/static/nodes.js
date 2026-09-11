@@ -33,7 +33,7 @@ function timeControl(range) {
   const label =
     end === null
       ? `Last ${WINDOWS.find(([seconds]) => seconds === duration)?.[1] || `${duration / 60} minutes`}`
-      : `${local(range.now).slice(5, 10)} · ${nodeTime(range.start)} – ${nodeTime(range.now)} UTC`;
+      : `${local(range.now).slice(5, 10)} · ${nodeTime(range.start)} – ${nodeTime(range.now)}`;
   return `<div class="time-control" aria-label="Node time range">
     <button type="button" class="time-shift" data-time-shift="-1" aria-label="Previous time window">‹</button>
     <details class="time-picker" data-key="node-time-picker"><summary class="time-summary">${escape(label)}<span class="select-chevron" aria-hidden="true"></span></summary>
