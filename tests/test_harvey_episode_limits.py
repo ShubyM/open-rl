@@ -10,6 +10,7 @@ import unittest
 from dataclasses import dataclass, field
 
 from harvey_labs.episode import LabEpisodeEnv
+from harvey_labs.reward import reward_from_scores
 
 
 @dataclass
@@ -90,6 +91,23 @@ class EpisodeLimitTest(unittest.TestCase):
     self.assertEqual(stepped.reward, -0.1)
     self.assertIsNone(message_env.graded_with)
     self.assertEqual(stepped.metrics["lab/failed_before_grading"], 1.0)
+
+
+class RewardFromScoresTest(unittest.TestCase):
+  def test_reward_weights_pass_fraction_and_all_pass(self):
+    reward, metrics = reward_from_scores({"n_criteria": 10, "n_passed": 9, "all_pass": False})
+    self.assertAlmostEqual(reward, 0.72)
+    self.assertEqual(metrics["lab/criteria_pass_fraction"], 0.9)
+    self.assertEqual(metrics["lab/all_pass"], 0.0)
+
+  def test_perfect_deliverable_scores_one(self):
+    reward, metrics = reward_from_scores({"n_criteria": 10, "n_passed": 10, "all_pass": True})
+    self.assertAlmostEqual(reward, 1.0)
+    self.assertEqual(metrics["lab/all_pass"], 1.0)
+
+  def test_no_criteria_scores_zero(self):
+    reward, _ = reward_from_scores({})
+    self.assertEqual(reward, 0.0)
 
 
 if __name__ == "__main__":

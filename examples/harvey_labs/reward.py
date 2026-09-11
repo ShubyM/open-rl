@@ -109,13 +109,24 @@ class LabRubricReward:
     (self.run_dir / "metrics.json").write_text(json.dumps(self.tool_metrics(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+# The leaderboard metric is all-pass (every criterion), which is too sparse
+# to learn from alone: a 60-criterion task pays nothing until it is perfect.
+# The criterion pass rate carries the gradient; the all-pass term is the
+# bonus for closing the last few, so a perfect deliverable scores 1.0 and a
+# 90%-there one 0.72 rather than 0.9.
+CRITERIA_WEIGHT = 0.8
+ALL_PASS_WEIGHT = 0.2
+
+
 def reward_from_scores(scores: dict[str, Any]) -> tuple[float, dict[str, float]]:
   n_criteria = int(scores.get("n_criteria", 0) or 0)
   n_passed = int(scores.get("n_passed", 0) or 0)
-  reward = n_passed / n_criteria if n_criteria else 0.0
+  pass_fraction = n_passed / n_criteria if n_criteria else 0.0
+  all_pass = float(bool(scores.get("all_pass")))
+  reward = CRITERIA_WEIGHT * pass_fraction + ALL_PASS_WEIGHT * all_pass
   return reward, {
     "lab/criteria_total": float(n_criteria),
     "lab/criteria_passed": float(n_passed),
-    "lab/criteria_pass_fraction": reward,
-    "lab/all_pass": float(bool(scores.get("all_pass"))),
+    "lab/criteria_pass_fraction": pass_fraction,
+    "lab/all_pass": all_pass,
   }
