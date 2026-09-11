@@ -194,7 +194,7 @@ class LayerGroup:
 
   def run(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
     for layer in self.layers:
-      x = layer(x=x, **kwargs)
+      x = layer(x, **kwargs)
     return x
 
   def __call__(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
@@ -223,15 +223,29 @@ class GroupCheckpointedLayers(torch.nn.ModuleDict):
 
 
 def install_group_checkpointing(model: torch.nn.Module, group_size: int) -> None:
+  """Checkpoint groups of layers on Automodel's native backbones.
+
+  Automodel's native models keep their layers in a ModuleDict and iterate its
+  values, which the class swap below hooks. A stock HF backbone (what Automodel
+  builds for architectures it has no native class for) keeps a ModuleList and
+  computes per-layer arguments inside its own loop, so it gets HF's per-layer
+  gradient checkpointing instead: one stash per layer rather than per group.
+  """
   backbone = model.model.language_model if hasattr(model.model, "language_model") else model.model
   layers = getattr(backbone, "layers", None)
-  if not isinstance(layers, torch.nn.ModuleDict):
-    raise RuntimeError(
-      f"Group activation checkpointing expects the native backbone's layers ModuleDict, found {type(layers).__name__}; "
-      "set OPEN_RL_AUTOMODEL_RECOMPUTE_NUM_LAYERS=0 to run without checkpointing."
-    )
-  layers.__class__ = GroupCheckpointedLayers
-  layers.group_size = group_size
+  if isinstance(layers, torch.nn.ModuleDict):
+    layers.__class__ = GroupCheckpointedLayers
+    layers.group_size = group_size
+    print(f"[Automodel Worker] activation checkpointing in groups of {group_size} layers.")
+    return
+  if isinstance(layers, torch.nn.ModuleList) and hasattr(model, "gradient_checkpointing_enable"):
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    print("[Automodel Worker] HF backbone: per-layer gradient checkpointing (group size not configurable here).")
+    return
+  raise RuntimeError(
+    f"Activation checkpointing found neither a ModuleDict nor a ModuleList of layers ({type(layers).__name__}); "
+    "set OPEN_RL_AUTOMODEL_RECOMPUTE_NUM_LAYERS=0 to run without checkpointing."
+  )
 
 
 class AutomodelConfig(BaseModel):
@@ -411,7 +425,6 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     )
     if RECOMPUTE_NUM_LAYERS > 0:
       install_group_checkpointing(self.model, RECOMPUTE_NUM_LAYERS)
-      print(f"[Automodel Worker] activation checkpointing in groups of {RECOMPUTE_NUM_LAYERS} layers.")
     self.model.train()
     if self.is_lora:
       trainable = sum(param.numel() for param in self.model.parameters() if param.requires_grad)
