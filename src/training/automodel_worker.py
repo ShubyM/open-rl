@@ -126,6 +126,31 @@ def attention_kwargs(model_type: str, cp_size: int, choice: str = AUTOMODEL_ATTN
   return {"attn_implementation": choice}
 
 
+def flex_kernel_options(text_config: Any) -> dict[str, Any]:
+  """Smaller FlexAttention tiles for models with heads 256 wide or wider.
+
+  Flex's default 128-wide tiles do not fit an H200's shared memory at
+  head_dim 256 (Gemma 4's sliding layers; its 512-wide global layers run on
+  FFPA). HF's flex integration reads kernel_options from the forward kwargs
+  and Automodel's FFPA route passes them through, so they travel with the
+  call. The FSDP path used 16-wide tiles for the same reason.
+  """
+  head_dim = getattr(text_config, "head_dim", 0) or 0
+  if head_dim < 256 and (getattr(text_config, "global_head_dim", 0) or 0) <= 256:
+    return {}
+  tile = {
+    "fwd_BLOCK_M": 64,
+    "fwd_BLOCK_N": 64,
+    "fwd_num_stages": 1,
+    "bwd_BLOCK_M1": 64,
+    "bwd_BLOCK_N1": 64,
+    "bwd_BLOCK_M2": 64,
+    "bwd_BLOCK_N2": 64,
+    "bwd_num_stages": 1,
+  }
+  return {"kernel_options": tile}
+
+
 def require_automodel():
   """Import NeMo Automodel, or explain how to get it."""
   try:
@@ -272,6 +297,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.peft_config: Any = None
     self.checkpointer: Any = None
     self.hf_config: Any = None
+    self.forward_kwargs: dict[str, Any] = {}
     self.cp_context: contextlib.ExitStack | None = None
     self.base_model_name: str | None = None
     self.trainable_params: list[torch.nn.Parameter] = []
@@ -323,7 +349,14 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     prefix = "model.language_model" if architectures and architectures[0].endswith("ForConditionalGeneration") else "model"
     plan: dict[str, Any] = {f"{prefix}.embed_tokens": RowwiseParallel(input_layouts=Replicate())}
     for name, style_name in (getattr(text_config, "base_model_tp_plan", None) or {}).items():
-      style = translate_to_torch_parallel_style(style_name)
+      try:
+        style = translate_to_torch_parallel_style(style_name)
+      except ValueError:
+        # HF ships one plan per family; the MoE-only entries (packed experts)
+        # match no module on a dense checkpoint and Automodel has no style for
+        # them. Dropping them leaves those modules replicated, never wrong.
+        print(f"[Automodel Worker] TP plan: skipping {name} ({style_name}) with no torch parallel style.")
+        continue
       if style is not None:
         plan[f"{prefix}.{name}"] = style
     plan["lm_head"] = ColwiseParallel(output_layouts=Replicate())
@@ -410,8 +443,10 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     # plain HF graph. Qwen3.5 checkpoints ship a multi-token-prediction head
     # that the native model would build and run over the whole sequence on
     # every training forward; the loss never reads it, so it is not built.
-    model_type = self.load_hf_config(base_model_name).get_text_config().model_type
+    text_config = self.load_hf_config(base_model_name).get_text_config()
+    model_type = text_config.model_type
     extra = attention_kwargs(model_type, self.cp_size)
+    self.forward_kwargs = flex_kernel_options(text_config) if "ffpa" in str(extra) else {}
     if model_type.startswith("qwen3_5"):
       extra["num_nextn_predict_layers"] = 0
     print(f"[Automodel Worker] {model_type}: {extra}")
@@ -498,7 +533,9 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     # it lets SDPA pick flash attention instead of building an additive mask.
     if attention_mask is not None and bool(attention_mask.all()):
       attention_mask = None
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, logits_to_keep=1, output_hidden_states=True)
+    outputs = model(
+      input_ids=input_ids, attention_mask=attention_mask, use_cache=False, logits_to_keep=1, output_hidden_states=True, **self.forward_kwargs
+    )
     hidden = self.final_hidden_states(outputs)[:, :seq_len]
     return self.project_target_logprobs(model, hidden, target_token_ids)
 
@@ -573,7 +610,14 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.close_cp_context()
     self.cp_context = contextlib.ExitStack()
     self.cp_context.enter_context(context())
-    outputs = model(input_ids=batch["input_ids"], position_ids=batch["position_ids"], use_cache=False, logits_to_keep=1, output_hidden_states=True)
+    outputs = model(
+      input_ids=batch["input_ids"],
+      position_ids=batch["position_ids"],
+      use_cache=False,
+      logits_to_keep=1,
+      output_hidden_states=True,
+      **self.forward_kwargs,
+    )
     local_targets = batch["labels"]
     local_hidden = self.final_hidden_states(outputs)
     # Padding slots carry an ignore index; they are cut off after the gather.
