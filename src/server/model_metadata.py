@@ -87,6 +87,7 @@ class TrainingModelMetadata:
   total_steps_completed: int = 0
   max_steps: int | None = None
   tenant_id: str = "default"
+  session_id: str | None = None
 
   @classmethod
   def from_dict(cls, data: dict[str, Any]) -> "TrainingModelMetadata":
@@ -120,6 +121,7 @@ class TrainingModelMetadata:
       completed_at=data.get("completed_at"),
       total_steps_completed=data.get("total_steps_completed", 0),
       max_steps=data.get("max_steps"),
+      session_id=data.get("session_id"),
       tenant_id=data.get("tenant_id", "default"),
     )
 

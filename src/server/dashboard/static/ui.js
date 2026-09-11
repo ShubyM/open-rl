@@ -7,7 +7,7 @@ export const button = (label, attrs = "") => `<button type="button" class="chip"
 export const runStatus = (value) => {
   const label = String(value || "unknown");
   const tone =
-    { running: "running", starting: "running", queued: "pending", unassigned: "pending", "needs attention": "failed", failed: "failed", completed: "completed", unknown: "pending" }[
+    { running: "running", starting: "running", queued: "pending", unassigned: "pending", "needs attention": "failed", failed: "failed", completed: "completed", ended: "completed", unknown: "pending" }[
       label.toLowerCase()
     ] || "pending";
   return `<span class="state state-${tone}"><span class="state-dot" aria-hidden="true"></span>${escape(label)}</span>`;

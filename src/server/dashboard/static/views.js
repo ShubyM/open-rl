@@ -8,7 +8,7 @@ export function runs(state) {
   const summary = [
     [count((r) => ["active", "running"].includes(String(r.status || "").toLowerCase())), "Active"],
     [count((r) => r.status === "failed"), "Failed"],
-    [count((r) => r.status === "completed"), "Completed"],
+    [count((r) => ["completed", "ended"].includes(r.status)), "Finished"],
   ]
     .map(([n, label]) => `<span><strong>${n}</strong> ${label}</span>`)
     .join("");

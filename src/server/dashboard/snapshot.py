@@ -19,7 +19,7 @@ def iso(ts: float) -> str:
 def observed_status(metadata: dict, workloads: list[dict], pods: list[dict], available: bool) -> str:
   """Recorded lifecycle first; otherwise what Kubernetes shows right now."""
   recorded = str(metadata.get("status", "")).lower()
-  if recorded in {"completed", "failed"}:
+  if recorded in {"completed", "failed", "ended"}:
     return recorded.capitalize()
   if not available:
     return "Unknown"

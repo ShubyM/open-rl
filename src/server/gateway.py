@@ -39,10 +39,39 @@ owner_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 async def bind_session(session_id: str | None, model_id: str) -> None:
-  if worker_manager is not None and session_id:
+  if not session_id:
+    return
+  await remember_session(store, model_id, session_id)
+  if worker_manager is not None:
     owner = await asyncio.to_thread(owner_of, model_id)
     async with owner_locks[owner]:
       await session_registry.attach(session_id, owner)
+
+
+async def remember_session(job_store, model_id: str, session_id: str) -> None:
+  """A run belongs to the first session that touched it; that session's death ends the run."""
+  raw = await job_store.get_value(f"open_rl:model_meta:{model_id}")
+  if raw and not json.loads(raw).get("session_id"):
+    await job_store.update_job_metadata(model_id, {"session_id": session_id})
+
+
+TERMINAL_STATUSES = {"completed", "failed", "ended"}
+
+
+async def settle_runs(job_store, registry) -> list[str]:
+  """Mark runs whose owning session stopped heartbeating. The gateway cannot
+  tell a clean exit from a crash, so the status is "ended", not completed."""
+  settled = []
+  now = time.time()
+  for row in await job_store.list_jobs_metadata():
+    session_id = row.get("session_id")
+    if not session_id or str(row.get("status", "")).lower() in TERMINAL_STATUSES:
+      continue
+    if await registry.live(session_id):
+      continue
+    await job_store.update_job_metadata(row["model_id"], {"status": "ended", "completed_at": now, "updated_at": now})
+    settled.append(row["model_id"])
+  return settled
 
 
 async def reap_owner(owner: str) -> None:
@@ -394,6 +423,10 @@ async def reap_dead_sessions():
         await reap_owner(owner)
       except Exception:
         traceback.print_exc()
+    try:
+      await settle_runs(store, session_registry)
+    except Exception:
+      traceback.print_exc()
 
 
 @asynccontextmanager

@@ -161,7 +161,7 @@ function lane(node, all, range) {
   const track = devices.length
     ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${LANE}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(d.name)}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * LANE}px;--gpu-lane-height:${LANE}px">${bars}</div></div>`
     : "";
-  return `<div class="node-placement-group"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span><span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span></div><div>${track}${!devices.length ? empty("No GPUs") : ""}</div><span class="node-duty" title="GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${current ? detail(current, range) : ""}</div>`;
+  return `<div class="node-placement-group"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span><span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span></div><div>${track}${!devices.length ? empty(node.gpu_capacity ? "GPUs without DRA devices" : "No GPUs") : ""}</div><span class="node-duty" title="GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${current ? detail(current, range) : ""}</div>`;
 }
 
 // ---- expansion ---------------------------------------------------------------------
