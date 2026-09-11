@@ -66,8 +66,14 @@ function segments({ start, now }) {
     });
   }
   for (const placement of ui.state.placements) if (!seen.has(placement.id) && now >= nodeNow()) found.push({ ...placement, start: now, end: now });
-  return found;
+  // A shared LoRA process can serve several runs on the same allocation.
+  return found.flatMap((placement) => (placement.run_ids?.length > 1 ? placement.run_ids.map((id) => {
+    const run = ui.state.runs.find((r) => r.run_id === id);
+    return { ...placement, id: `${placement.id}:${id}`, allocation_id: placement.id, run_ids: [id], label: `${(run?.model || placement.label).split("/").at(-1)} · ${id.slice(0, 8)}` };
+  }) : [placement]));
 }
+
+const placementColor = (placement) => family(placement.allocation_id ? placement.run_ids[0] : placement.runtime_id || placement.run_ids?.[0]);
 
 function mergeIntervals(intervals) {
   const merged = [];
@@ -104,8 +110,9 @@ function holdIntervals(placement, range, errors) {
   const intervals = [];
   for (const runId of placement.run_ids || []) {
     const entry = use(holdUrl(runId, range), range.live ? `holds:${runId}:${ui.nodeSelection.duration}` : undefined);
-    if (entry.error) errors?.add(entry.error);
+    if (entry.error) errors?.add(`${runId.slice(0, 8)}: ${entry.error}`);
     for (const sample of entry.data?.samples || []) {
+      if (sample.run_id && sample.run_id !== runId) continue;
       if (sample.role !== placement.role || (sample.node && sample.node !== placement.node) || (sample.runtime_id && sample.runtime_id !== placement.runtime_id)) continue;
       const from = Math.max(range.start, placement.start, sample.started_at ?? sample.at - (sample.elapsed_seconds || 0));
       const to = Math.min(range.now, placement.end, sample.at);
@@ -179,7 +186,7 @@ function trackBars(devices, nodeSegments, range) {
       const holds = sharers
         .flatMap((s) =>
           holdIntervals(s, range).map(
-            ([a, b]) => `<span class="hold ${family(s.runtime_id)} ${s.id === ui.expanded ? "selected" : ""}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`,
+            ([a, b]) => `<span class="hold ${placementColor(s)} ${s.id === ui.expanded ? "selected" : ""}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`,
           ),
         )
         .join("");
@@ -195,7 +202,7 @@ function trackBars(devices, nodeSegments, range) {
         .sort((a, b) => a - b);
       return deviceGroups(indexes).map((group) => {
         const title = `${s.label}${s.role ? " · " + s.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}`;
-        return `<button type="button" class="capacity-allocation ${family(s.runtime_id)} ${s.ended ? "ended" : ""} ${s.id === ui.expanded ? "selected" : ""}" data-key="${escape(s.id)}:${group[0]}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(s.start, s.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px"><span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`;
+        return `<button type="button" class="capacity-allocation ${placementColor(s)} ${s.ended ? "ended" : ""} ${s.id === ui.expanded ? "selected" : ""}" data-key="${escape(s.id)}:${group[0]}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(s.start, s.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px"><span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`;
       });
     })
     .join("");
@@ -214,13 +221,13 @@ function lane(node, all, range) {
   const unknown = unmapped
     .map(
       (s) =>
-        `<button type="button" class="capacity-allocation unknown-mapping ${family(s.runtime_id)}" data-key="unmapped:${escape(s.id)}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}"><span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${s.device_count} GPU${s.device_count === 1 ? "" : "s"}</span></button>`,
+        `<button type="button" class="capacity-allocation unknown-mapping ${placementColor(s)}" data-key="unmapped:${escape(s.id)}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}"><span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${s.device_count} GPU${s.device_count === 1 ? "" : "s"}</span></button>`,
     )
     .join("");
   const track = devices.length
     ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(deviceLabel(d.name))}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${bars}</div></div>`
     : "";
-  return `<div class="node-placement-group" data-key="${escape(node.name)}"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span><span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span></div><div>${track}${unknown}${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : !devices.length ? empty(node.gpu_capacity ? "GPUs without DRA devices" : "No GPUs") : ""}</div><span class="node-duty" title="Recorded GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${current ? detail(current, range, nodeSegments) : ""}</div>`;
+  return `<div class="node-placement-group" data-key="${escape(node.name)}"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span>${node.gpu_capacity ? `<span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span>` : ""}</div><div>${track}${unknown}${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : !devices.length && node.gpu_capacity ? empty("GPUs without DRA devices") : ""}</div><span class="node-duty" title="Recorded GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${current ? detail(current, range, nodeSegments) : ""}</div>`;
 }
 
 // ---- expansion ---------------------------------------------------------------------
@@ -236,10 +243,10 @@ function detail(placement, range, neighbours) {
   const group = neighbours.filter((p) => p.id === anchor.id || p.devices.some((id) => anchor.devices.includes(id)));
   const visible = group.filter((p) => ui.device === "all" || p.devices.includes(ui.device));
   const run = visible.some((p) => p.id === placement.id) && state.runs.find((r) => (placement.run_ids || []).includes(r.run_id));
-  const workload = run?.workloads?.find((w) => w.uid === placement.id);
+  const workload = run?.workloads?.find((w) => w.uid === (placement.allocation_id || placement.id));
   const title = [
     (run?.model || placement.runtime_id || placement.label).split("/").at(-1),
-    (placement.owner_id || run?.run_id)?.slice(0, 8),
+    (run?.run_id || placement.owner_id)?.slice(0, 8),
     { trainer: "Trainer", sampler: "Sampler" }[placement.role] || "Unknown process",
     placement.role === "trainer" ? { lora: "LoRA", fft: "FFT" }[workload?.training_kind] : null,
   ]
@@ -248,12 +255,13 @@ function detail(placement, range, neighbours) {
   const legend = visible
     .map(
       (p) =>
-        `<button type="button" class="legend-entry ${family(p.runtime_id)}" data-key="${escape(p.id)}" data-placement="${escape(p.id)}" aria-pressed="${p.id === placement.id}" title="${escape(p.label)}"><span class="legend-swatch"></span><span class="legend-name">${escape(p.label)}</span><span class="legend-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""}</span></button>`,
+        `<button type="button" class="legend-entry ${placementColor(p)}" data-key="${escape(p.id)}" data-placement="${escape(p.id)}" aria-pressed="${p.id === placement.id}" title="${escape(p.label)}"><span class="legend-swatch"></span><span class="legend-name">${escape(p.label)}</span><span class="legend-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""}</span></button>`,
     )
     .join("");
+  const allocationId = anchor.allocation_id || anchor.id;
   const metrics = use(
-    `/api/v1/dashboard/allocations/${encode(anchor.id)}/metrics?${new URLSearchParams({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() })}`,
-    range.live ? `allocation:${anchor.id}:${ui.nodeSelection.duration}` : undefined,
+    `/api/v1/dashboard/allocations/${encode(allocationId)}/metrics?${new URLSearchParams({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() })}`,
+    range.live ? `allocation:${allocationId}:${ui.nodeSelection.duration}` : undefined,
   );
   const picker = (anchor.devices.length > 1 ? [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)] : [])
     .concat(
@@ -268,7 +276,7 @@ function detail(placement, range, neighbours) {
     )
     .join("");
   const activityErrors = new Set();
-  const activities = visible.map((p) => ({ id: p.id, label: p.label, tone: family(p.runtime_id), selected: p.id === placement.id, intervals: holdIntervals(p, range, activityErrors) }));
+  const activities = visible.map((p) => ({ id: p.id, label: p.label, tone: placementColor(p), selected: p.id === placement.id, intervals: holdIntervals(p, range, activityErrors) }));
   const label = devices.length ? `${acceleratorLabel(node)} · GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : "GPU activity";
   return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(anchor.id)}"><div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)}</h2><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics)}</strong></span></div>
     <div class="allocation-device-picker" aria-label="GPU selection">${picker}</div>
@@ -317,12 +325,15 @@ function gpuMemory(metrics) {
 export function renderNodes() {
   const range = timeWindow();
   const all = segments(range);
+  if (ui.expanded && !all.some((p) => p.id === ui.expanded)) ui.expanded = all.find((p) => p.allocation_id === ui.expanded)?.id || ui.expanded;
   const { cluster } = ui.state;
+  const occupied = new Set(all.map((p) => p.node));
+  const nodes = [...cluster.nodes].sort((a, b) => Number(occupied.has(b.name)) - Number(occupied.has(a.name)) || Number(b.gpu_capacity > 0) - Number(a.gpu_capacity > 0));
   const axis = [0, 1, 2, 3].map((tick) => `<span>${nodeTime(range.start + ((range.now - range.start) * tick) / 3, range.now - range.start <= 120)}</span>`).join("");
   morph(
     content,
     `<div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>${timeControl(range)}</div>${!cluster.available ? empty(cluster.error || "Kubernetes unavailable") : ""}
     <div class="node-time-header"><span>Node</span><div class="node-axis">${axis}</div><span class="node-duty" title="GPU allocation time divided by capacity over the selected window">Duty</span></div>
-    ${cluster.nodes.map((node) => lane(node, all, range)).join("") || empty("No nodes available")}`,
+    ${nodes.map((node) => lane(node, all, range)).join("") || empty("No nodes available")}`,
   );
 }

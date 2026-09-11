@@ -42,12 +42,20 @@ Set `OPEN_RL_PROMETHEUS_URL` to a Prometheus-compatible endpoint that scrapes th
 
 ## Pages
 
-- **Overview**: every recorded run with status, kind, completed steps and elapsed time.
+- **Overview**: every recorded run with status, kind, completed steps and elapsed time, with active runs first.
 - **Nodes**: one lane per node, one row per GPU, allocation bars over the selected window from placement history. Click a bar to expand one full-width utilization chart for those GPUs. The line and faint fill beneath it change color with each workload's recorded operations, using multiple colors for concurrent activity. Selecting a workload highlights its periods without changing the GPU group; GPU buttons select individual cards. Colors provide operation context, not per-job utilization measurements or proof that a gray interval was idle.
 - **Scheduler**: workloads waiting for placement with the scheduler's reason, and claim reservations.
-- **Experiments**: recipe metrics per run, grouped by sweep directory, with reward and correctness curves.
+- **Experiments**: recipe metrics per run, grouped by sweep directory. Select a run for its reward and correctness curves.
 - **Health**: source errors, pod problems and unready nodes.
-- **Run**: operation-timing charts and worker metrics, the process table, and Cloud Logging with search, pod filter and paging.
+- **Run**: operation-timing charts separated by trainer and sampler, worker metrics, the process table, and Cloud Logging with search, pod filter and paging.
+
+Runs sharing a LoRA process retain distinct colors and links on Nodes. Their recorded operations determine the colored intervals; GPU utilization still comes from the physical allocation. Short sampler bursts may be narrower than the GPU telemetry's sampling interval.
+
+## Recorded preview
+
+`make dashboard-capture` records gateway responses through the port-forward, and `make dashboard-fixture` serves the capture locally at `http://127.0.0.1:9017/dashboard`. The fixture server reads static assets from the working tree and marks responses with `recorded_at`; the UI labels the page as a recording and does not follow live logs.
+
+Time and log filters work within the captured rows. Pagination covers only those rows, and missing run metrics remain explicitly unavailable. The capture defaults to three detailed runs; use `python3 dev/capture_dashboard_fixture.py --runs N` to include more. Captured JSON is never modified by replay.
 
 ## Front end
 

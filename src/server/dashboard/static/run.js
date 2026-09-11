@@ -31,7 +31,7 @@ export function syncRunRoute(page, id, tab = "metrics") {
   stopLogs();
   clearInterval(poll);
   active = next;
-  if (page === "run" && tab === "logs")
+  if (page === "run" && tab === "logs" && !ui.state?.recorded_at)
     poll = setInterval(() => {
       if (!document.hidden && runView.follow && !logState.loading) loadLogs(id);
     }, 5000);
@@ -118,7 +118,9 @@ function metricsPanel(id, run) {
     ),
   ].slice(0, 12);
   const charts = [
-    chart({ title: "Operation duration", unit: "s", points: samples.map((s) => [s.at, s.elapsed_seconds]), start, end, min: 0, tone: "accent" }),
+    ...[...new Set(samples.length ? samples.map((s) => s.role || "process") : ["process"])].map((role) =>
+      chart({ title: `${{ trainer: "Trainer", sampler: "Sampler", process: "Process" }[role] || role} operation duration`, unit: "s", points: samples.filter((s) => (s.role || "process") === role).map((s) => [s.at, s.elapsed_seconds]), start, end, min: 0, tone: "accent" }),
+    ),
     ...names.map((name) =>
       chart({ title: name, points: samples.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]]), start, end, tone: "accent" }),
     ),
@@ -214,9 +216,9 @@ function logsPanel(id, run) {
     })
     .join("");
   const source = { gke: "Cloud Logging", demo: "Demo logs", kubernetes: "Kubernetes pod logs" }[logState.source] || logState.source || "Logs";
-  const status = `${source} · ${logState.records.length.toLocaleString()} ${logState.records.length === 1 ? "record" : "records"} · Newest first · ${logState.loading ? (rows ? "Updating…" : "Loading…") : runView.follow ? "Updates every 5s" : "Paused"}`;
+  const status = `${source} · ${logState.records.length.toLocaleString()} ${logState.records.length === 1 ? "record" : "records"} · Newest first · ${logState.loading ? (rows ? "Updating…" : "Loading…") : ui.state.recorded_at ? "Recorded logs" : runView.follow ? "Updates every 5s" : "Paused"}`;
   return `${run.shared_runtime ? '<p class="muted">These pods serve a shared LoRA runtime. Their logs can include other runs.</p>' : ""}${scope}
-    <div class="log-toolbar" data-key="log-toolbar"><input id="log-search" type="search" value="${escape(logState.q)}" placeholder="Search logs" aria-label="Search logs"><select id="log-source" aria-label="Pod"><option value="" ${!logState.pod ? "selected" : ""}>All pods</option>${pods}</select>${button(runView.follow ? "Pause updates" : "Follow logs", 'data-log-follow="true"')}</div>
+    <div class="log-toolbar" data-key="log-toolbar"><input id="log-search" type="search" value="${escape(logState.q)}" placeholder="Search logs" aria-label="Search logs"><select id="log-source" aria-label="Pod"><option value="" ${!logState.pod ? "selected" : ""}>All pods</option>${pods}</select>${ui.state.recorded_at ? "" : button(runView.follow ? "Pause updates" : "Follow logs", 'data-log-follow="true"')}</div>
     <div id="log-status" class="log-status" role="status"><span>${escape(status)}</span>${logState.error ? `<span class="log-error">${escape(logState.error)}${rows ? " · Showing previously fetched records" : ""}</span>` : ""}</div>
     <div id="log-lines" tabindex="0" aria-label="Run logs">${rows || (logState.loading ? "" : empty(logState.error ? "Logs unavailable" : "No logs match this time range and filter"))}</div>
     <div id="log-more">${logState.cursor ? button(logState.loading ? "Loading…" : "Older logs", `data-older="true" ${logState.loading ? "disabled" : ""}`) : logState.records.length === MAX_LOGS ? '<p class="muted">2,000 records shown. Narrow the time range or search to inspect more.</p>' : ""}</div>`;

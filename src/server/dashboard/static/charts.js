@@ -148,10 +148,10 @@ export function chart({
     .join("");
   const [regions, activity] = activityLayers(activities, segments, areas, data[0][0], data.at(-1)[0], x, y, title);
   const paths = (activities.length ? "" : areas.map((d) => `<path class="chart-area" d="${d}"/>`).join("")) + regions + lines + activity;
-  const tickCount = xFormat === "step" ? Math.max(1, Math.min(4, Math.floor(end - start))) : 4;
+  const tickCount = end === start ? 0 : xFormat === "step" ? Math.max(1, Math.min(4, Math.floor(end - start))) : 4;
   const label = (at) =>
     xFormat === "step" ? `step ${Math.round(at)}` : `${end - start >= 86400 ? new Date(at * 1000).toISOString().slice(5, 10) + " " : ""}${chartTime(at, end - start <= 120)}`;
-  const xLabels = Array.from({ length: tickCount + 1 }, (_, i) => `<span>${escape(label(start + ((end - start) * i) / tickCount))}</span>`).join("");
+  const xLabels = Array.from({ length: tickCount + 1 }, (_, i) => `<span>${escape(label(start + ((end - start) * i) / (tickCount || 1)))}</span>`).join("");
   const yLabels = ticks.map((value) => `<span>${escape(chartNumber(value))}</span>`).join("");
   const grid = ticks.map((value) => `<line class="chart-grid" x1="0" x2="${SCALE}" y1="${y(value)}" y2="${y(value)}" vector-effect="non-scaling-stroke"/>`).join("");
   const average = values.reduce((sum, value) => sum + value, 0) / values.length;

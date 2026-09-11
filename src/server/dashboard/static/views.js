@@ -1,18 +1,21 @@
-// Pure page renderers: state in, markup out. Nothing here touches the DOM.
+// Page renderers return markup; DOM updates stay in app.js.
 
 import { escape, encode, empty, runStatus, elapsedTime, duration } from "./ui.js";
-import { chart } from "./charts.js";
+import { chart, chartNumber } from "./charts.js";
+import { route } from "./store.js";
 
 export function runs(state) {
+  const active = (r) => ["active", "running"].includes(String(r.status || "").toLowerCase());
   const count = (test) => state.runs.filter(test).length;
   const summary = [
-    [count((r) => ["active", "running"].includes(String(r.status || "").toLowerCase())), "Active"],
+    [count(active), "Active"],
     [count((r) => r.status === "failed"), "Failed"],
     [count((r) => ["completed", "ended"].includes(r.status)), "Finished"],
   ]
     .map(([n, label]) => `<span><strong>${n}</strong> ${label}</span>`)
     .join("");
-  const rows = state.runs
+  const rows = [...state.runs]
+    .sort((a, b) => Number(active(b)) - Number(active(a)))
     .map((r) => {
       const label = [r.display_name, r.recipe_name].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ");
       return `<a class="job-list-row" data-key="${escape(r.run_id)}" href="#run/${encode(r.run_id)}/metrics"><span class="job-identity"><span>${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></span>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape({ lora: "LoRA", full: "FFT", fft: "FFT" }[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(elapsedTime(r, state.observed_at))}</span></a>`;
@@ -94,8 +97,20 @@ export function health(state) {
 // The recipe config carries a lora_rank even for full fine-tuning runs; the
 // run directory name is the reliable signal the sweep scripts leave behind.
 const kindLabel = (run) => (/(^|[-_])fft([-_]|$)/.test(run.name) || run.config.lora_rank == null ? "FFT" : `LoRA r${run.config.lora_rank}`);
-const pct = (value) => (value === undefined ? "—" : `${(100 * value).toFixed(1)}%`);
+const pct = (value) => (Number.isFinite(value) ? `${(100 * value).toFixed(1)}%` : "—");
 const shortName = (name) => name.replace(/^gsm8k_rl_(mega|rank_sweep)_/, "");
+
+function experimentCharts(run) {
+  return ["reward", "correct"].map((key) => {
+    const points = run.series[key] || [], percent = key === "correct";
+    return chart({
+      title: percent ? "Correctness" : "Reward",
+      points: percent ? points.map(([step, value]) => [step, Number.isFinite(value) ? value * 100 : value]) : points,
+      start: points[0]?.[0] ?? 0, end: points.at(-1)?.[0] ?? 0,
+      unit: percent ? "%" : "", ...(percent ? { min: 0, max: 100 } : {}), tone: "accent", xFormat: "step",
+    });
+  }).join("");
+}
 
 // Training curves read from each run's metrics.jsonl on the shared volume,
 // grouped by the sweep directory they were written under.
@@ -103,29 +118,22 @@ export function experiments(entry) {
   const data = entry.data;
   if (!data) return `<h1 class="heading">Experiments</h1>${empty(entry.error || "Loading run metrics…")}`;
   if (data.error) return `<h1 class="heading">Experiments</h1>${empty(data.error)}`;
+  const ordered = [...data.runs].sort((a, b) => b.updated_at - a.updated_at);
+  const selected = ordered.find((run) => run.path === route()[1]) || ordered.find((run) => ["reward", "correct"].some((key) => run.series[key]?.filter(([, value]) => Number.isFinite(value)).length > 1)) || ordered[0];
   const sweeps = new Map();
-  for (const run of data.runs) sweeps.set(run.sweep, [...(sweeps.get(run.sweep) || []), run]);
+  for (const run of ordered) sweeps.set(run.sweep, [...(sweeps.get(run.sweep) || []), run]);
   const now = Date.now() / 1000;
   const sections = [...sweeps.entries()]
     .map(([sweep, members]) => {
-      const sorted = [...members].sort((a, b) => a.name.localeCompare(b.name));
-      const rows = sorted
-        .map(
-          (run) =>
-            `<div class="job-list-row experiment-row" data-key="${escape(run.name)}"><span class="mono">${escape(shortName(run.name))}</span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span>${escape(pct(run.last.reward))}</span><span>${escape(pct(run.last.correct))}</span><span>${escape(pct(run.last.format))}</span></div>`,
-        )
-        .join("");
-      const charts = sorted
-        .flatMap((run) =>
-          ["reward", "correct"]
-            .filter((key) => run.series[key])
-            .map((key) => chart({ title: `${shortName(run.name)} · ${key}`, points: run.series[key], start: run.series[key][0][0], end: run.series[key].at(-1)[0], tone: "accent", xFormat: "step" })),
-        )
+      const rows = members
+        .map((run) => {
+          const charts = run === selected ? `<div class="chart-grid" data-key="charts:${escape(run.path)}">${experimentCharts(run)}</div>` : "";
+          return `<a class="job-list-row experiment-row" data-key="${escape(run.path)}" href="#experiments/${encode(run.path)}"${run === selected ? ' aria-current="true"' : ""}><span class="job-identity"><span class="mono">${escape(shortName(run.name))}</span></span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span>${Number.isFinite(run.last.reward) ? escape(chartNumber(run.last.reward)) : "—"}</span><span>${escape(pct(run.last.correct))}</span><span>${escape(pct(run.last.format))}</span></a>${charts}`;
+        })
         .join("");
       return `<section class="experiment-sweep"><h2>${escape(sweep || "runs")} <span class="muted micro">${members.length} run${members.length === 1 ? "" : "s"} · updated ${duration(now - Math.max(...members.map((r) => r.updated_at)))} ago</span></h2>
-        <div class="job-list"><div class="job-list-head experiment-head"><span>Run</span><span>Model</span><span>Kind</span><span>Step</span><span>Reward</span><span>Correct</span><span>Format</span></div>${rows}</div>
-        <div class="chart-grid">${charts}</div></section>`;
+        <div class="job-list"><div class="job-list-head experiment-head"><span>Run</span><span>Model</span><span>Kind</span><span>Step</span><span>Reward</span><span>Correct</span><span>Format</span></div>${rows}</div></section>`;
     })
     .join("");
-  return `<h1 class="heading">Experiments</h1><p class="muted">Recipe metrics from ${escape(data.root)}. Newest sweep first.</p>${entry.error ? empty(`${entry.error} · Showing previously fetched metrics`) : ""}${sections}${!data.runs.length ? empty("No run metrics found under the runs directory") : ""}`;
+  return `<h1 class="heading">Experiments</h1><p class="muted">Select a run to inspect reward and correctness.</p>${entry.error ? empty(`${entry.error} · Showing previously fetched metrics`) : ""}${sections}${!data.runs.length ? empty("No run metrics found under the runs directory") : ""}`;
 }

@@ -172,7 +172,8 @@ async function refresh() {
   refreshing = true;
   try {
     ui.state = await get("/api/v1/dashboard/snapshot");
-    document.getElementById("connection").textContent = ui.state.demo ? "Demo" : ui.state.cluster.available ? "Connected" : "Cluster unavailable";
+    document.getElementById("connection").textContent = ui.state.recorded_at ? "Recording" : ui.state.demo ? "Demo" : ui.state.cluster.available ? "Connected" : "Cluster unavailable";
+    document.getElementById("connection").title = ui.state.recorded_at ? `Captured ${ui.state.recorded_at}` : "";
     render();
   } catch (error) {
     document.getElementById("connection").textContent = error.message;
@@ -182,7 +183,7 @@ async function refresh() {
 }
 refresh();
 setInterval(() => {
-  if (!document.hidden) refresh();
+  if (!document.hidden && !ui.state?.recorded_at) refresh();
 }, 10000);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refresh();
