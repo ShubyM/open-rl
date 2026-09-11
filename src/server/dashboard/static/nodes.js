@@ -112,6 +112,14 @@ function holdIntervals(placement, range) {
 
 // ---- lane markup ------------------------------------------------------------------
 
+// DRA drivers name devices as they like ("gpu-0" from NVIDIA, "GPU 0" in
+// fixtures). The lane shows the index the name ends in; a name without one
+// is shown whole rather than mangled.
+const deviceLabel = (name) => {
+  const index = /(\d+)$/.exec(String(name ?? ""));
+  return index ? index[1] : String(name ?? "");
+};
+
 const acceleratorLabel = (node) =>
   node.accelerator
     ? node.accelerator
@@ -205,7 +213,7 @@ function lane(node, all, range) {
     )
     .join("");
   const track = devices.length
-    ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(String(d.name).replace(/^gpu\s*/i, ""))}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${bars}</div></div>`
+    ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(deviceLabel(d.name))}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${bars}</div></div>`
     : "";
   return `<div class="node-placement-group" data-key="${escape(node.name)}"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)}</span><span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span></div><div>${track}${unknown}${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : !devices.length ? empty(node.gpu_capacity ? "GPUs without DRA devices" : "No GPUs") : ""}</div><span class="node-duty" title="Recorded GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${current ? detail(current, range, nodeSegments) : ""}</div>`;
 }
@@ -239,10 +247,10 @@ function detail(placement, range, neighbours) {
   const picker = [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)]
     .concat(
       placement.devices.map((id) => {
-        const name = devices.find((d) => d.id === id)?.name || id.split("/").at(-1);
+        const name = deviceLabel(devices.find((d) => d.id === id)?.name || id.split("/").at(-1));
         const value = metrics.data?.devices?.find((d) => d.id === id)?.utilization?.at(-1)?.[1];
         return button(
-          `${/^gpu/i.test(name) ? name : `GPU ${name}`}${Number.isFinite(value) ? ` · ${Math.round(value)}%` : ""}`,
+          `GPU ${name}${Number.isFinite(value) ? ` · ${Math.round(value)}%` : ""}`,
           `data-device="${escape(id)}" aria-pressed="${ui.device === id}"`,
         );
       }),
