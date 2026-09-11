@@ -175,7 +175,7 @@ function trackBars(devices, nodeSegments, range) {
       const holds = sharers
         .flatMap((s) =>
           holdIntervals(s, range).map(
-            ([a, b]) => `<span class="hold ${family(s.runtime_id)}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`,
+            ([a, b]) => `<span class="hold ${family(s.runtime_id)} ${s.id === ui.expanded ? "selected" : ""}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`,
           ),
         )
         .join("");
@@ -223,6 +223,7 @@ function lane(node, all, range) {
 
 function detail(placement, range, neighbours) {
   if (ui.device !== "all" && !placement.devices.includes(ui.device)) ui.device = "all";
+  if (placement.devices.length === 1) ui.device = placement.devices[0];
   const { state } = ui;
   const run = state.runs.find((r) => (placement.run_ids || []).includes(r.run_id));
   const devices = state.cluster.nodes.find((n) => n.name === placement.node)?.devices || [];
@@ -245,7 +246,7 @@ function detail(placement, range, neighbours) {
     `/api/v1/dashboard/allocations/${encode(placement.id)}/metrics?${new URLSearchParams({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() })}`,
     range.live ? `allocation:${placement.id}:${ui.nodeSelection.duration}` : undefined,
   );
-  const picker = [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)]
+  const picker = (placement.devices.length > 1 ? [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)] : [])
     .concat(
       placement.devices.map((id) => {
         const name = deviceLabel(devices.find((d) => d.id === id)?.name || id.split("/").at(-1));

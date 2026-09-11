@@ -55,7 +55,7 @@ root.addEventListener("click", (event) => {
   }
   const allocation = event.target.closest("[data-placement]");
   if (allocation) {
-    ui.expanded = ui.expanded === allocation.dataset.placement ? null : allocation.dataset.placement;
+    ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.classList.contains("hold") ? null : allocation.dataset.placement;
     ui.device = "all";
     render();
     return;

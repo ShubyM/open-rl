@@ -210,7 +210,7 @@ function logsPanel(id, run) {
       const at = Date.parse(r.timestamp);
       const timestamp = Number.isFinite(at) ? new Date(at).toISOString() : "";
       const severity = ["ERROR", "CRITICAL", "ALERT", "EMERGENCY"].includes(r.severity) ? "error" : r.severity === "WARNING" ? "warning" : "";
-      return `<div class="workspace-logrow" data-key="${escape(recordKey(r))}" data-severity="${severity}"><time class="log-time" datetime="${escape(timestamp)}" title="${escape(timestamp || "No timestamp")}">${timestamp ? timestamp.slice(11, 23) : "—"}</time><span class="log-origin" title="${escape(`${r.pod || "Unknown pod"} / ${r.container || "Unknown container"}`)}">${escape(r.role || "Unknown")} · ${escape(r.node || "Unknown node")}<small>${escape(r.pod)} / ${escape(r.container)}</small></span><pre class="log-message">${escape(r.message)}${r.message_truncated ? '<span class="muted">\n[Message truncated by source]</span>' : ""}</pre></div>`;
+      return `<div class="workspace-logrow" data-key="${escape(recordKey(r))}" data-severity="${severity}"><time class="log-time" datetime="${escape(timestamp)}" title="${escape(timestamp || "No timestamp")}">${timestamp ? timestamp.slice(11, 23) : "—"}</time><pre class="log-message">${escape(r.message)}${r.message_truncated ? '<span class="muted">\n[Message truncated by source]</span>' : ""}</pre></div>`;
     })
     .join("");
   const source = { gke: "Cloud Logging", demo: "Demo logs", kubernetes: "Kubernetes pod logs" }[logState.source] || logState.source || "Logs";
