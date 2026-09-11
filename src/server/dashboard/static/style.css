@@ -768,11 +768,22 @@ body {
   width: 100%;
   height: 24px;
 }
+#orl-design-lab .activity-combined .activity-track {
+  height: 64px;
+}
+#orl-design-lab .activity-combined svg {
+  height: 48px;
+}
+#orl-design-lab .activity-device {
+  padding-left: 8px;
+  color: var(--dim);
+  font-size: 12px;
+}
 #orl-design-lab .activity-block {
   fill: color-mix(in srgb, var(--allocation-color) 35%, var(--ground));
   cursor: pointer;
 }
-#orl-design-lab .activity-row[data-selected="true"] .activity-block,
+#orl-design-lab .activity-block[data-selected="true"],
 #orl-design-lab .activity-block:hover {
   fill: color-mix(in srgb, var(--allocation-color) 65%, var(--ground));
 }
@@ -1270,6 +1281,10 @@ body {
   }
   #orl-design-lab .activity-track {
     height: 34px;
+  }
+  #orl-design-lab .activity-device {
+    padding-left: 0;
+    font-size: 11px;
   }
   #orl-design-lab .activity-axis span:not(:first-child):not(:last-child) {
     display: none;

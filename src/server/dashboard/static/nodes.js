@@ -234,20 +234,41 @@ function lane(node, all, range) {
 
 // ---- expansion ---------------------------------------------------------------------
 
-function activityTimeline(placements, range) {
+function activityTimeline(placements, devices, range) {
   const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
+  const block = (from, to, top = 0, bottom = 24) => `M${x(from)},${top} H${x(to)} V${bottom} H${x(from)} Z`;
+  const path = (p, blocks) => `<path class="activity-block ${placementColor(p)}" data-placement="${escape(p.id)}" data-selected="${p.id === ui.expanded}" d="${blocks}"><title>${escape(p.label)}</title></path>`;
   const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${nodeTime(range.start + ((range.now - range.start) * tick) / 4, range.now - range.start <= 120)}</span>`).join("");
-  const rows = [...placements].sort((a, b) => a.start - b.start || a.id.localeCompare(b.id)).map((p) => {
-    const { intervals, error, loading } = operationActivity(p, range);
+  const activities = [...placements].sort((a, b) => a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
+  const combined = devices.map((device) => {
+    const jobs = activities.filter((p) => p.devices.includes(device.id));
+    const events = jobs.flatMap((p, i) => p.intervals.flatMap(([from, to]) => [[from, i, true], [to, i, false]])).sort((a, b) => a[0] - b[0]);
+    const active = new Set(), blocks = jobs.map(() => []);
+    let previous = range.start;
+    for (let i = 0; i < events.length;) {
+      const at = events[i][0];
+      // Concurrent operations share the strip vertically; no run hides another.
+      if (at > previous) [...active].sort((a, b) => a - b).forEach((job, row) => blocks[job].push(block(previous, at, (row * 24) / active.size, ((row + 1) * 24) / active.size)));
+      while (i < events.length && events[i][0] === at) {
+        const [, job, starts] = events[i++];
+        if (starts) active.add(job);
+        else active.delete(job);
+      }
+      previous = at;
+    }
+    return `<div class="activity-row activity-combined" data-key="combined:${escape(device.id)}"><span class="activity-device">GPU ${escape(deviceLabel(device.name))}</span><div class="activity-track"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-hidden="true">${jobs.map((p, i) => path(p, blocks[i].join(" "))).join("")}</svg></div></div>`;
+  }).join("");
+  const rows = activities.map((p) => {
+    const { intervals, error, loading } = p;
     const status = error ? (error.includes("not recorded") ? "Not recorded" : "Unavailable") : loading ? "Loading…" : !intervals.length ? "No recorded operations" : "";
     // One path per run, with separate blocks at their exact times. Dense
     // histories stay cheap, and labels remain selectable even for tiny bursts.
-    const blocks = intervals.map(([from, to]) => `M${x(from)},0 H${x(to)} V24 H${x(from)} Z`).join(" ");
+    const blocks = intervals.map(([from, to]) => block(from, to)).join(" ");
     return `<div class="activity-row ${placementColor(p)}" data-key="${escape(p.id)}" data-selected="${p.id === ui.expanded}">
       <button type="button" class="activity-label" data-placement="${escape(p.id)}" aria-pressed="${p.id === ui.expanded}" title="${escape(p.label)}"><span class="activity-swatch"></span><span class="activity-name">${escape(p.label)}<span class="activity-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""}</span></span></button>
-      <div class="activity-track"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-hidden="true"><path class="activity-block" data-placement="${escape(p.id)}" d="${blocks}"><title>${escape(p.label)}</title></path></svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}${error && intervals.length ? " · Showing last available operations" : ""}</span>` : ""}</div></div>`;
+      <div class="activity-track"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-hidden="true">${path(p, blocks)} </svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}${error && intervals.length ? " · Showing last available operations" : ""}</span>` : ""}</div></div>`;
   }).join("");
-  return `<div class="activity-timeline" aria-label="Recorded run activity"><div class="activity-header"><h3>Run activity</h3><div class="activity-axis">${axis}</div></div>${rows}</div>`;
+  return `<div class="activity-timeline" aria-label="Recorded run activity"><div class="activity-header"><h3>Run activity</h3><div class="activity-axis">${axis}</div></div>${combined}${rows}</div>`;
 }
 
 function detail(placement, range, neighbours) {
@@ -290,7 +311,7 @@ function detail(placement, range, neighbours) {
   const label = devices.length ? `${acceleratorLabel(node)} · GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : "GPU activity";
   return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(anchor.id)}"><div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)}</h2><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics)}</strong></span></div>
     <div class="allocation-device-picker" aria-label="GPU selection">${picker}</div>
-    ${activityTimeline(visible, range)}
+    ${activityTimeline(visible, devices.filter((d) => ui.device === "all" || d.id === ui.device), range)}
     <div>${gpuChart(metrics, range)}</div>
     <div class="allocation-detail-footer"><span>Blocks show recorded operations; gaps may include unrecorded activity.</span>${run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : ""}</div></section>`;
 }
