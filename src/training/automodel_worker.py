@@ -126,6 +126,25 @@ def attention_kwargs(model_type: str, cp_size: int, choice: str = AUTOMODEL_ATTN
   return {"attn_implementation": choice}
 
 
+def widest_head_dim(text_config: Any) -> int:
+  """The largest attention head width in the model.
+
+  transformers 5.15 makes head_dim a per-layer attribute on heterogeneous
+  models (Gemma 4: 256 on sliding layers, 512 on global ones) and raises on
+  the config-level read, so look through the per-layer views when present.
+  """
+  try:
+    layers = list(text_config.per_layer_config)
+  except Exception:
+    layers = []
+  if layers:
+    return max(int(getattr(layer, "head_dim", 0) or 0) for layer in layers)
+  try:
+    return int(getattr(text_config, "head_dim", 0) or 0)
+  except Exception:
+    return 0
+
+
 def flex_kernel_options(text_config: Any) -> dict[str, Any]:
   """Smaller FlexAttention tiles for models with heads 256 wide or wider.
 
@@ -135,8 +154,7 @@ def flex_kernel_options(text_config: Any) -> dict[str, Any]:
   and Automodel's FFPA route passes them through, so they travel with the
   call. The FSDP path used 16-wide tiles for the same reason.
   """
-  head_dim = getattr(text_config, "head_dim", 0) or 0
-  if head_dim < 256 and (getattr(text_config, "global_head_dim", 0) or 0) <= 256:
+  if widest_head_dim(text_config) < 256:
     return {}
   tile = {
     "fwd_BLOCK_M": 64,
