@@ -15,7 +15,7 @@ export function runs(state) {
   const rows = state.runs
     .map((r) => {
       const label = [r.display_name, r.recipe_name].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ");
-      return `<a class="job-list-row" href="#run/${encode(r.run_id)}/metrics"><span class="job-identity"><span>${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></span>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape({ lora: "LoRA", full: "FFT", fft: "FFT" }[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(elapsedTime(r, state.observed_at))}</span></a>`;
+      return `<a class="job-list-row" data-key="${escape(r.run_id)}" href="#run/${encode(r.run_id)}/metrics"><span class="job-identity"><span>${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></span>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape({ lora: "LoRA", full: "FFT", fft: "FFT" }[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(elapsedTime(r, state.observed_at))}</span></a>`;
     })
     .join("");
   return `<h1 class="heading">Overview</h1><div class="overview-summary">${summary}</div>${state.store_error ? empty(state.store_error) : ""}
@@ -48,7 +48,7 @@ export function scheduler(state) {
           return `<div class="scheduler-seat"><span>${w ? label(w) : escape(seat.workload)}</span><span class="muted">${w ? role(w) + " · " : ""}${seat.exclusive ? "Exclusive" : "Shared"}</span>${seat.owner ? `<span class="muted">Owner ID: ${escape(seat.owner)}</span>` : ""}${placement ? `<a href="#nodes" data-scheduler-placement="${escape(placement.id)}">${escape(placement.node)} ↗</a>` : ""}</div>`;
         })
         .join("");
-      return `<div class="scheduler-reservation"><div>${escape(ledger.claim_name || ledger.name)}<div class="muted">${ledger.seats.length} reservation${ledger.seats.length === 1 ? "" : "s"}</div></div><div class="scheduler-seat-list">${seats}</div></div>`;
+      return `<div class="scheduler-reservation" data-key="${escape(ledger.name || ledger.claim_name)}"><div>${escape(ledger.claim_name || ledger.name)}<div class="muted">${ledger.seats.length} reservation${ledger.seats.length === 1 ? "" : "s"}</div></div><div class="scheduler-seat-list">${seats}</div></div>`;
     })
     .join("");
   return `<h1 class="heading">Scheduler</h1>
@@ -112,7 +112,7 @@ export function experiments(entry) {
       const rows = sorted
         .map(
           (run) =>
-            `<div class="job-list-row experiment-row"><span class="mono">${escape(shortName(run.name))}</span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span>${escape(pct(run.last.reward))}</span><span>${escape(pct(run.last.correct))}</span><span>${escape(pct(run.last.format))}</span></div>`,
+            `<div class="job-list-row experiment-row" data-key="${escape(run.name)}"><span class="mono">${escape(shortName(run.name))}</span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span>${escape(pct(run.last.reward))}</span><span>${escape(pct(run.last.correct))}</span><span>${escape(pct(run.last.format))}</span></div>`,
         )
         .join("");
       const charts = sorted
@@ -127,5 +127,5 @@ export function experiments(entry) {
         <div class="chart-grid">${charts}</div></section>`;
     })
     .join("");
-  return `<h1 class="heading">Experiments</h1><p class="muted">Recipe metrics from ${escape(data.root)}. Newest sweep first.</p>${sections}${!data.runs.length ? empty("No run metrics found under the runs directory") : ""}`;
+  return `<h1 class="heading">Experiments</h1><p class="muted">Recipe metrics from ${escape(data.root)}. Newest sweep first.</p>${entry.error ? empty(`${entry.error} · Showing previously fetched metrics`) : ""}${sections}${!data.runs.length ? empty("No run metrics found under the runs directory") : ""}`;
 }

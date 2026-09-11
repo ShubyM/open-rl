@@ -1,35 +1,51 @@
 // The one way pages fetch anything besides the snapshot. A page asks for a
 // URL and gets whatever is cached, possibly nothing; the fetch runs in the
 // background and re-renders when it lands. Rendering is idempotent, so no
-// page tracks whether a reply is still wanted.
+// page tracks request ownership. Live windows share one entry and in-flight
+// request; only entries used by the current render can repaint it.
 
 import { get, ui } from "./store.js";
 
 const entries = new Map();
 const FRESH_MS = 15000;
 const MAX_ENTRIES = 24;
+let generation = 0;
 
-export function use(url) {
-  let entry = entries.get(url);
-  if (!entry) {
-    entry = { data: null, error: null, fetchedAt: 0, pending: false };
-    entries.set(url, entry);
-    while (entries.size > MAX_ENTRIES) entries.delete(entries.keys().next().value);
+export const beginRender = () => generation++;
+export function endRender() {
+  for (const [scope, entry] of entries) {
+    if (entries.size <= MAX_ENTRIES) break;
+    if (entry.used === generation) continue;
+    entry.controller?.abort();
+    entries.delete(scope);
   }
-  if (!entry.pending && Date.now() - entry.fetchedAt >= FRESH_MS) {
+}
+
+export function use(url, scope = url) {
+  let entry = entries.get(scope);
+  if (!entry) {
+    entry = { url: null, data: null, error: null, fetchedAt: 0, pending: false, controller: null, used: generation };
+  }
+  entry.used = generation;
+  entries.delete(scope);
+  entries.set(scope, entry);
+  if (!entry.pending && (entry.url !== url || Date.now() - entry.fetchedAt >= FRESH_MS)) {
+    entry.url = url;
     entry.pending = true;
-    get(url)
+    entry.controller = new AbortController();
+    get(url, entry.controller.signal)
       .then((data) => {
-        entry.data = data;
-        entry.error = null;
+        entry.error = data.error || null;
+        if (!entry.error || !entry.data) entry.data = data;
       })
       .catch((error) => {
-        entry.error = error.message;
+        if (error.name !== "AbortError") entry.error = error.message;
       })
       .finally(() => {
         entry.fetchedAt = Date.now();
         entry.pending = false;
-        ui.render();
+        entry.controller = null;
+        if (entries.get(scope) === entry && entry.used === generation) ui.render();
       });
   }
   return entry;

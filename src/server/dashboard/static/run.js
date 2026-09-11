@@ -4,17 +4,67 @@
 import { runIncidents } from "./timeline.js";
 import { escape, encode, empty, button, runStatus } from "./ui.js";
 import { chart } from "./charts.js";
-import { ui, get } from "./store.js";
+import { ui, get, nodeNow } from "./store.js";
 import { use } from "./cache.js";
 
 // The inspected run's window, and the log page that was loaded for it.
-export const runView = { id: null, windowMinutes: 30, windowEnd: 0, eventAt: null };
-export const logState = { key: null, records: [], cursor: null, loading: false, error: null, request: 0 };
+export const runView = { id: null, windowMinutes: 30, windowEnd: 0, eventAt: null, follow: true };
+export const logState = { key: null, records: [], cursor: null, loading: false, error: null, source: null, q: "", pod: "", params: null };
+const MAX_LOGS = 2000;
+let active = "",
+  poll,
+  controller,
+  request = 0;
+
+function stopLogs(clear = false) {
+  controller?.abort();
+  request++;
+  logState.loading = false;
+  if (!logState.params) logState.key = null;
+  if (clear) Object.assign(logState, { key: null, records: [], cursor: null, error: null, source: null, params: null });
+}
+
+// The only background log work belongs to the visible run's Logs tab.
+export function syncRunRoute(page, id, tab = "metrics") {
+  const next = page === "run" ? `${id}/${tab}` : "";
+  if (active === next) return;
+  stopLogs();
+  clearInterval(poll);
+  active = next;
+  if (page === "run" && tab === "logs")
+    poll = setInterval(() => {
+      if (!document.hidden && runView.follow && !logState.loading) loadLogs(id);
+    }, 5000);
+}
 
 export function resetRunWindow() {
   runView.eventAt = null;
-  runView.windowEnd = Date.parse(ui.state.observed_at) / 1000;
-  logState.key = null;
+  runView.follow = true;
+  runView.windowEnd = nodeNow();
+  stopLogs(true);
+}
+
+export function setLogFilter(field, value) {
+  if (logState[field] === value) return;
+  logState[field] = value;
+  stopLogs(true);
+}
+
+export function setLogEvent(at) {
+  runView.eventAt = at;
+  runView.follow = at === null;
+  if (at === null) runView.windowEnd = nodeNow();
+  stopLogs(true);
+}
+
+export function toggleLogFollow(follow = !runView.follow) {
+  if (follow) resetRunWindow();
+  else {
+    runView.follow = false;
+    if (logState.params) runView.windowEnd = Date.parse(logState.params.get("until")) / 1000;
+    stopLogs();
+  }
+  ui.render();
 }
 
 function runRange(nearEvent = false) {
@@ -29,8 +79,12 @@ function runRange(nearEvent = false) {
 export function runPage(id, tab = "metrics") {
   if (runView.id !== id) {
     runView.id = id;
+    logState.q = logState.pod = "";
     resetRunWindow();
   }
+  // A snapshot advances time once; cache completions never create new windows.
+  const observedAt = Date.parse(ui.state.observed_at) / 1000;
+  if (runView.follow && Number.isFinite(observedAt)) runView.windowEnd = observedAt;
   const run = ui.state.runs.find((r) => r.run_id === id);
   if (!run) return empty("Run not found");
   if (!["metrics", "logs"].includes(tab)) tab = "metrics";
@@ -41,7 +95,7 @@ export function runPage(id, tab = "metrics") {
   return `<p class="overview-back"><a href="#overview">← Overview</a></p>
     <div class="run-heading"><h1 class="heading" title="${escape(run.run_id)}">${escape(title)}</h1>${runStatus(run.display_status || run.status)}</div>
     ${description ? `<p class="run-description">${escape(description)}</p>` : ""}
-    <div class="run-toolbar"><nav class="workspace-tabs" aria-label="Run views">${tabs}</nav><div class="run-time-controls"><label>Time range <select id="event-range" aria-label="Time range">${ranges}</select></label>${button("Latest", 'data-latest="true"')}</div></div>
+    <div class="run-toolbar" data-key="run-toolbar"><nav class="workspace-tabs" aria-label="Run views">${tabs}</nav><div class="run-time-controls"><label>Time range <select id="event-range" aria-label="Time range">${ranges}</select></label></div></div>
     ${runIncidents(run, runView.windowMinutes, runView.windowEnd)}
     <div id="run-panel">${tab === "logs" ? logsPanel(id, run) : metricsPanel(id, run)}</div>
     <p class="run-json-link"><a href="/api/v1/dashboard/runs/${encode(id)}">Agent JSON ↗</a></p>`;
@@ -51,53 +105,88 @@ function metricsPanel(id, run) {
   const range = runRange();
   const start = Date.parse(range.since) / 1000;
   const end = Date.parse(range.until) / 1000;
-  const metrics = use(`/api/v1/dashboard/runs/${encode(id)}/metrics?${new URLSearchParams(range)}`);
+  const url = `/api/v1/dashboard/runs/${encode(id)}/metrics?${new URLSearchParams(range)}`;
+  const metrics = use(url, runView.follow ? `run:${id}:${runView.windowMinutes}` : url);
   const samples = (metrics.data?.samples || []).filter((s) => s.at >= start && s.at <= end);
-  const names = [...new Set(samples.flatMap((s) => Object.keys(s.metrics || {})))].slice(0, 12);
+  const names = [
+    ...new Set(
+      samples.flatMap((s) =>
+        Object.entries(s.metrics || {})
+          .filter(([, value]) => Number.isFinite(value))
+          .map(([name]) => name),
+      ),
+    ),
+  ].slice(0, 12);
   const charts = [
-    chart({ title: "Operation duration (s)", points: samples.map((s) => [s.at, s.elapsed_seconds]), start, end, tone: "accent" }),
-    ...names.map((name) => chart({ title: name, points: samples.filter((s) => s.metrics[name] !== undefined).map((s) => [s.at, s.metrics[name]]), start, end, tone: "accent" })),
+    chart({ title: "Operation duration", unit: "s", points: samples.map((s) => [s.at, s.elapsed_seconds]), start, end, min: 0, tone: "accent" }),
+    ...names.map((name) =>
+      chart({ title: name, points: samples.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]]), start, end, tone: "accent" }),
+    ),
   ];
-  const status = metrics.error || (!metrics.data ? "Loading metrics…" : metrics.data.error || "");
-  const rows = run.pods
-    .map((p) => `<tr><td>${escape(p.name)}</td><td>${escape(p.role ? p.role[0].toUpperCase() + p.role.slice(1) : "Unknown")}</td><td>${escape(p.node)}</td><td>${escape(p.problem || p.phase)}</td><td>${p.restarts}</td></tr>`)
+  const error = metrics.error || metrics.data?.error;
+  const status = error ? `${error}${samples.length ? " · Showing previously fetched metrics" : ""}` : !metrics.data ? "Loading metrics…" : metrics.pending ? "Updating…" : "";
+  const rows = (run.pods || [])
+    .map(
+      (p) =>
+        `<tr data-key="${escape(p.uid || p.name)}"><td>${escape(p.name)}</td><td>${escape(p.role ? p.role[0].toUpperCase() + p.role.slice(1) : "Unknown")}</td><td>${escape(p.node)}</td><td>${runStatus(p.problem || p.phase)}</td><td>${escape(p.restarts)}</td></tr>`,
+    )
     .join("");
-  return `<p>Completed steps: ${escape(run.steps)}</p><p class="muted" role="status">${escape(status)}</p>
-    <div class="chart-grid">${samples.length ? charts.join("") : metrics.data ? empty("No operations recorded in this time range") : ""}</div>
+  return `<div class="run-metric-summary" data-key="metric-summary"><span>Completed steps <strong>${escape(run.steps)}</strong></span>${status ? `<span class="muted" role="status">${escape(status)}</span>` : ""}</div>
+    <div class="chart-grid" data-key="run-charts">${samples.length ? charts.join("") : metrics.data ? empty(metrics.error || metrics.data.error ? "Metrics unavailable" : "No operations recorded in this time range") : ""}</div>
     <h2 class="scheduler-title">Processes</h2>${run.shared_runtime ? '<p class="muted">Shared LoRA runtime</p>' : ""}
-    <table class="run-table"><thead><tr><th>Process</th><th>Kind</th><th>Node</th><th>State</th><th>Restarts</th></tr></thead><tbody>${rows}</tbody></table>${!run.pods.length ? empty("No current pods") : ""}`;
+    <div class="table-scroll" data-key="run-processes"><table class="run-table"><thead><tr><th>Process</th><th>Kind</th><th>Node</th><th>State</th><th>Restarts</th></tr></thead><tbody>${rows}</tbody></table></div>${!run.pods?.length ? empty("No current pods") : ""}`;
 }
 
 // ---- logs -----------------------------------------------------------------------------
 
-const logQuery = (id) => {
-  const params = new URLSearchParams({ q: document.getElementById("log-search")?.value || "", limit: "200", ...runRange(true) });
-  const pod = document.getElementById("log-source")?.value;
-  if (pod) params.set("pod", pod);
+const logQuery = () => {
+  const params = new URLSearchParams({ q: logState.q, limit: "200", ...runRange(true) });
+  if (logState.pod) params.set("pod", logState.pod);
   return params;
 };
+const recordKey = (r) => r._key ?? r.id ?? JSON.stringify([r.timestamp, r.pod, r.container, r.message]);
 
 export async function loadLogs(id, more = false) {
-  const params = logQuery(id);
+  if (active !== `${id}/logs` || runView.id !== id || logState.loading || (more && !logState.cursor)) return;
+  if (more) {
+    runView.follow = false;
+    runView.windowEnd = Date.parse(logState.params.get("until")) / 1000;
+  } else if (runView.follow) runView.windowEnd = nodeNow();
+  // Paging reuses the exact query that issued the cursor, including its end time.
+  const params = more ? new URLSearchParams(logState.params) : logQuery();
   const key = `${id}?${params}`;
-  if (more && logState.cursor) params.set("cursor", logState.cursor);
-  else if (!more && logState.key === key && logState.loading) return;
-  const request = ++logState.request;
+  const current = ++request;
+  controller = new AbortController();
+  const query = new URLSearchParams(params);
+  if (more) params.set("cursor", logState.cursor);
   logState.loading = true;
-  if (!more) logState.key = key;
+  logState.key = key;
   ui.render();
   try {
-    const data = await get(`/api/v1/dashboard/runs/${encode(id)}/logs?${params}`);
-    if (request !== logState.request) return;
-    logState.records = more ? [...logState.records, ...(data.records || [])] : data.records || [];
-    logState.cursor = data.next_cursor;
+    const data = await get(`/api/v1/dashboard/runs/${encode(id)}/logs?${params}`, controller.signal);
+    if (current !== request) return;
+    if (!data.error) {
+      const occurrences = new Map();
+      const incoming = (data.records || []).map((r) => {
+        const key = recordKey(r),
+          occurrence = occurrences.get(key) || 0;
+        occurrences.set(key, occurrence + 1);
+        return { ...r, _key: r.id ?? `${key}/${occurrence}` };
+      });
+      const records = [...(more ? logState.records : []), ...incoming];
+      logState.records = [...new Map(records.map((r) => [recordKey(r), r])).values()].slice(0, MAX_LOGS);
+      logState.cursor = logState.records.length < MAX_LOGS ? data.next_cursor : null;
+      logState.params = query;
+    }
     logState.error = data.error || null;
     logState.source = data.source;
   } catch (error) {
-    if (request === logState.request) logState.error = error.message;
+    if (current === request && error.name !== "AbortError") logState.error = error.message;
   } finally {
-    if (request === logState.request) logState.loading = false;
-    ui.render();
+    if (current === request) {
+      logState.loading = false;
+      ui.render();
+    }
   }
 }
 
@@ -106,24 +195,39 @@ function logsPanel(id, run) {
   const scope =
     runView.eventAt === null
       ? ""
-      : `<div class="log-time-scope"><span>${escape(range.since.slice(0, 10))} · ${escape(range.since.slice(11, 19))}–${escape(range.until.slice(11, 19))} UTC</span><a href="#run/${encode(id)}/logs" data-all-logs="true">All logs</a></div>`;
-  const pods = run.pods.map((p) => `<option value="${escape(p.name)}">${escape(p.role || "Unknown")} · ${escape(p.node)} / ${escape(p.name)}</option>`).join("");
-  const rows = logState.records
+      : `<div class="log-time-scope" data-key="log-scope"><span>${escape(range.since.slice(0, 10))} · ${escape(range.since.slice(11, 19))}–${escape(range.until.slice(11, 19))} UTC</span><a href="#run/${encode(id)}/logs" data-all-logs="true">All logs</a></div>`;
+  const sources = new Map((run.pods || []).map((p) => [p.name, p]));
+  for (const record of logState.records) if (record.pod && !sources.has(record.pod)) sources.set(record.pod, { ...record, name: record.pod });
+  if (logState.pod && !sources.has(logState.pod)) sources.set(logState.pod, { name: logState.pod });
+  const pods = [...sources.values()]
     .map(
-      (r) =>
-        `<div class="workspace-logrow"><span class="log-origin">${escape(r.timestamp || "No timestamp")} ${escape(r.role || "Unknown")} · ${escape(r.pod)}/${escape(r.container)}</span>${escape(r.message)}</div>`,
+      (p) =>
+        `<option value="${escape(p.name)}" ${logState.pod === p.name ? "selected" : ""}>${escape(p.role || "Unknown")} · ${escape(p.node || p.name)} / ${escape(p.name)}</option>`,
     )
     .join("");
-  const status = logState.loading ? "Loading…" : logState.error || "Cloud Logging · Newest first";
+  const rows = logState.records
+    .map((r) => {
+      const at = Date.parse(r.timestamp);
+      const timestamp = Number.isFinite(at) ? new Date(at).toISOString() : "";
+      const severity = ["ERROR", "CRITICAL", "ALERT", "EMERGENCY"].includes(r.severity) ? "error" : r.severity === "WARNING" ? "warning" : "";
+      return `<div class="workspace-logrow" data-key="${escape(recordKey(r))}" data-severity="${severity}"><time class="log-time" datetime="${escape(timestamp)}" title="${escape(timestamp || "No timestamp")}">${timestamp ? timestamp.slice(11, 23) : "—"}</time><span class="log-origin" title="${escape(`${r.pod || "Unknown pod"} / ${r.container || "Unknown container"}`)}">${escape(r.role || "Unknown")} · ${escape(r.node || "Unknown node")}<small>${escape(r.pod)} / ${escape(r.container)}</small></span><pre class="log-message">${escape(r.message)}${r.message_truncated ? '<span class="muted">\n[Message truncated by source]</span>' : ""}</pre></div>`;
+    })
+    .join("");
+  const source = { gke: "Cloud Logging", demo: "Demo logs", kubernetes: "Kubernetes pod logs" }[logState.source] || logState.source || "Logs";
+  const status = `${source} · ${logState.records.length.toLocaleString()} ${logState.records.length === 1 ? "record" : "records"} · Newest first · ${logState.loading ? (rows ? "Updating…" : "Loading…") : runView.follow ? "Updates every 5s" : "Paused"}`;
   return `${run.shared_runtime ? '<p class="muted">These pods serve a shared LoRA runtime. Their logs can include other runs.</p>' : ""}${scope}
-    <div class="log-toolbar"><input id="log-search" type="search" placeholder="Search logs" aria-label="Search logs"><select id="log-source" aria-label="Pod"><option value="">All pods</option>${pods}</select></div>
-    <div id="log-status" role="status">${escape(status)}</div>
-    <div id="log-lines">${rows || (logState.loading ? "" : empty("No logs match"))}</div>
-    <div id="log-more">${logState.cursor && !logState.loading ? button("Older logs", 'data-older="true"') : ""}</div>`;
+    <div class="log-toolbar" data-key="log-toolbar"><input id="log-search" type="search" value="${escape(logState.q)}" placeholder="Search logs" aria-label="Search logs"><select id="log-source" aria-label="Pod"><option value="" ${!logState.pod ? "selected" : ""}>All pods</option>${pods}</select>${button(runView.follow ? "Pause updates" : "Follow logs", 'data-log-follow="true"')}</div>
+    <div id="log-status" class="log-status" role="status"><span>${escape(status)}</span>${logState.error ? `<span class="log-error">${escape(logState.error)}${rows ? " · Showing previously fetched records" : ""}</span>` : ""}</div>
+    <div id="log-lines" tabindex="0" aria-label="Run logs">${rows || (logState.loading ? "" : empty(logState.error ? "Logs unavailable" : "No logs match this time range and filter"))}</div>
+    <div id="log-more">${logState.cursor ? button(logState.loading ? "Loading…" : "Older logs", `data-older="true" ${logState.loading ? "disabled" : ""}`) : logState.records.length === MAX_LOGS ? '<p class="muted">2,000 records shown. Narrow the time range or search to inspect more.</p>' : ""}</div>`;
 }
 
-// Called after the logs tab is on screen: load when the query changed.
+// Input changes clear the current query; rendering the loading state never refetches.
 export function ensureLogs(id) {
-  if (!document.getElementById("log-lines")) return;
-  if (logState.key !== `${id}?${logQuery(id)}`) loadLogs(id);
+  const lines = document.getElementById("log-lines");
+  if (!lines) return;
+  lines.onscroll = () => {
+    if (runView.follow && lines.scrollTop > 24) toggleLogFollow(false);
+  };
+  if (!logState.key) loadLogs(id);
 }
