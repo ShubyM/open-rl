@@ -30,17 +30,19 @@ export function timeWindow() {
 function timeControl(range) {
   const { end, duration } = ui.nodeSelection;
   const local = (at) => new Date(at * 1000).toISOString().slice(0, 16);
+  const chevron = (rotation = 0) =>
+    `<svg class="time-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 5.5 5 5 5-5" transform="rotate(${rotation} 8 8)"/></svg>`;
   const label =
     end === null
       ? `Last ${WINDOWS.find(([seconds]) => seconds === duration)?.[1] || `${duration / 60} minutes`}`
       : `${local(range.now).slice(5, 10)} · ${nodeTime(range.start)} – ${nodeTime(range.now)}`;
   return `<div class="time-control" aria-label="Node time range">
-    <button type="button" class="time-shift" data-time-shift="-1" aria-label="Previous time window">‹</button>
-    <details class="time-picker" data-key="node-time-picker"><summary class="time-summary">${escape(label)}<span class="select-chevron" aria-hidden="true"></span></summary>
+    <button type="button" class="time-shift" data-time-shift="-1" aria-label="Previous time window">${chevron(90)}</button>
+    <details class="time-picker" data-key="node-time-picker"><summary class="time-summary">${escape(label)}${chevron()}</summary>
       <div class="time-popover"><label>Window <select data-time-duration>${WINDOWS.map(([seconds, text]) => `<option value="${seconds}" ${seconds === duration ? "selected" : ""}>${text}</option>`).join("")}</select></label>
       <label>Until (UTC)<input type="datetime-local" data-time-end value="${end === null ? "" : local(end)}" max="${local(nodeNow())}" step="60"></label>
       ${end === null ? '<span class="muted">Following current time</span>' : button("Return to live", 'data-time-live="true"')}</div>
-    </details><button type="button" class="time-shift" data-time-shift="1" aria-label="Next time window" ${range.live ? "disabled" : ""}>›</button></div>`;
+    </details><button type="button" class="time-shift" data-time-shift="1" aria-label="Next time window" ${range.live ? "disabled" : ""}>${chevron(-90)}</button></div>`;
 }
 
 // ---- history -> segments -----------------------------------------------------------

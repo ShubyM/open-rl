@@ -335,26 +335,30 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  min-height: 32px;
+  gap: 8px;
+  height: 32px;
   padding: 5px 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--paper);
   list-style: none;
   cursor: pointer;
+  line-height: 20px;
+  white-space: nowrap;
 }
 #orl-design-lab .time-summary::-webkit-details-marker {
   display: none;
 }
-#orl-design-lab .time-summary .select-chevron {
+#orl-design-lab .time-chevron {
+  display: block;
   flex: none;
-  width: 6px;
-  height: 6px;
-  margin: -3px 2px 0 4px;
-  border-right: 1px solid var(--dim);
-  border-bottom: 1px solid var(--dim);
-  transform: rotate(45deg);
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: var(--dim);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 #orl-design-lab .time-summary:hover,
 #orl-design-lab .time-picker[open] .time-summary {
@@ -365,11 +369,12 @@ body {
   outline-offset: 3px;
 }
 #orl-design-lab .time-shift {
+  display: grid;
+  place-items: center;
   width: 32px;
   height: 32px;
   padding: 0;
   line-height: 20px;
-  font-size: 16px;
 }
 #orl-design-lab .time-popover {
   position: absolute;
@@ -749,6 +754,9 @@ body {
 #orl-design-lab .allocation-expansion .chart {
   --plot-height: clamp(180px, 24vw, 260px);
 }
+#orl-design-lab .allocation-expansion .chart-line {
+  stroke-width: 2;
+}
 #orl-design-lab .chart-activity-color {
   fill: var(--allocation-color);
   fill-opacity: 0.7;
@@ -765,15 +773,16 @@ body {
 }
 #orl-design-lab :is(.chart-activity, .chart-overlap) {
   fill: none;
-  stroke-width: 2.5;
+  stroke-width: 2;
   stroke-linejoin: round;
 }
 #orl-design-lab .chart-activity {
   stroke: var(--allocation-color);
+  stroke-opacity: 0.8;
 }
 #orl-design-lab .chart-activity.selected,
 #orl-design-lab .chart-activity[data-placement]:hover {
-  stroke-width: 3.5;
+  stroke-opacity: 1;
 }
 #orl-design-lab .chart-activity[data-placement] {
   cursor: pointer;
