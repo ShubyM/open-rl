@@ -1,6 +1,6 @@
 import torch
 
-from training.automodel_worker import GroupCheckpointedLayers, round_robin_permutation
+from training.automodel_worker import GroupCheckpointedLayers, attention_kwargs, round_robin_permutation
 
 
 def rank_shards(cp_size: int, padded: int) -> list[torch.Tensor]:
@@ -54,3 +54,12 @@ def test_group_checkpointing_matches_plain_forward_and_backward():
 
   layers.eval()
   assert len(list(layers.values())) == 6
+
+
+def test_attention_kwargs_by_model_family():
+  assert attention_kwargs("qwen3_5_text", cp_size=4, choice="auto") == {"attn_implementation": "sdpa"}
+  assert attention_kwargs("gemma4_text", cp_size=1, choice="auto") == {"attn_implementation": "ffpa", "use_sdpa_patching": False}
+  under_cp = attention_kwargs("gemma4_text", cp_size=4, choice="auto")
+  assert under_cp["attn_implementation"] == "sdpa"
+  assert under_cp["text_config"]["cp_full_attn_backend"] == "ffpa"
+  assert attention_kwargs("gemma4_text", cp_size=1, choice="flex_attention") == {"attn_implementation": "flex_attention"}

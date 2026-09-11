@@ -101,6 +101,30 @@ if os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") != "1":
 # vocab, which an H200 does not notice, and cuts the Python loop 8x.
 LOGPROB_CHUNK = int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "1024"))
 
+# Attention kernels. "auto" picks by model family: Gemma 4's global layers have
+# 512-wide heads, past what SDPA's fused kernels take, so they go through
+# Automodel's FFPA route (FFPA for the 512 heads, FlexAttention for the
+# sliding-window layers). Under CP the ring swaps SDPA itself, so the model is
+# built with sdpa and FFPA is requested for the full-attention ring chunks via
+# the text config, the way Automodel's own Gemma 4 CP recipes do. Everything
+# else is plain SDPA, which is what the CP ring-attention context patches.
+AUTOMODEL_ATTN = os.getenv("OPEN_RL_AUTOMODEL_ATTN", "auto")
+
+
+def attention_kwargs(model_type: str, cp_size: int, choice: str = AUTOMODEL_ATTN) -> dict[str, Any]:
+  """from_pretrained kwargs selecting the attention kernels for this model."""
+  if choice == "auto":
+    choice = "ffpa" if model_type.startswith("gemma4") else "sdpa"
+  if choice == "ffpa" and cp_size > 1:
+    return {
+      "attn_implementation": "sdpa",
+      "use_sdpa_patching": False,
+      "text_config": {"use_cache": False, "cp_full_attn_backend": "ffpa"},
+    }
+  if choice == "ffpa":
+    return {"attn_implementation": "ffpa", "use_sdpa_patching": False}
+  return {"attn_implementation": choice}
+
 
 def require_automodel():
   """Import NeMo Automodel, or explain how to get it."""
@@ -233,6 +257,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.device_mesh: Any = None
     self.peft_config: Any = None
     self.checkpointer: Any = None
+    self.hf_config: Any = None
     self.cp_context: contextlib.ExitStack | None = None
     self.base_model_name: str | None = None
     self.trainable_params: list[torch.nn.Parameter] = []
@@ -278,7 +303,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
-    config = AutoConfig.from_pretrained(base_model_name)
+    config = self.load_hf_config(base_model_name)
     text_config = config.get_text_config()
     architectures = config.architectures or []
     prefix = "model.language_model" if architectures and architectures[0].endswith("ForConditionalGeneration") else "model"
@@ -289,6 +314,12 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
         plan[f"{prefix}.{name}"] = style
     plan["lm_head"] = ColwiseParallel(output_layouts=Replicate())
     return plan
+
+  def load_hf_config(self, base_model_name: str) -> Any:
+    if self.hf_config is None or getattr(self.hf_config, "name_or_path", None) != base_model_name:
+      self.hf_config = AutoConfig.from_pretrained(base_model_name)
+      self.hf_config.name_or_path = base_model_name
+    return self.hf_config
 
   def dp_mesh(self):
     return self.device_mesh["dp_shard"]
@@ -362,18 +393,21 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     # from_pretrained applies LoRA to the matched linears before FSDP2 shards
     # anything, loads the base weights, freezes everything but the adapters,
     # and wraps with the strategy above. Liger stays off so the forward is the
-    # plain HF graph; SDPA is what the CP ring-attention context patches.
-    # Qwen3.5 checkpoints ship a multi-token-prediction head that the native
-    # model would build and run over the whole sequence on every training
-    # forward; the loss never reads it, so it is not built.
+    # plain HF graph. Qwen3.5 checkpoints ship a multi-token-prediction head
+    # that the native model would build and run over the whole sequence on
+    # every training forward; the loss never reads it, so it is not built.
+    model_type = self.load_hf_config(base_model_name).get_text_config().model_type
+    extra = attention_kwargs(model_type, self.cp_size)
+    if model_type.startswith("qwen3_5"):
+      extra["num_nextn_predict_layers"] = 0
+    print(f"[Automodel Worker] {model_type}: {extra}")
     self.model = NeMoAutoModelForCausalLM.from_pretrained(
       base_model_name,
       torch_dtype=torch.bfloat16,
-      attn_implementation="sdpa",
       use_liger_kernel=False,
       distributed_setup=self.distributed_setup,
       peft_config=self.peft_config,
-      num_nextn_predict_layers=0,
+      **extra,
     )
     if RECOMPUTE_NUM_LAYERS > 0:
       install_group_checkpointing(self.model, RECOMPUTE_NUM_LAYERS)
@@ -451,7 +485,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     # it lets SDPA pick flash attention instead of building an additive mask.
     if attention_mask is not None and bool(attention_mask.all()):
       attention_mask = None
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, logits_to_keep=1)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, logits_to_keep=1, output_hidden_states=True)
     hidden = self.final_hidden_states(outputs)[:, :seq_len]
     return self.project_target_logprobs(model, hidden, target_token_ids)
 
@@ -526,7 +560,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.close_cp_context()
     self.cp_context = contextlib.ExitStack()
     self.cp_context.enter_context(context())
-    outputs = model(input_ids=batch["input_ids"], position_ids=batch["position_ids"], use_cache=False, logits_to_keep=1)
+    outputs = model(input_ids=batch["input_ids"], position_ids=batch["position_ids"], use_cache=False, logits_to_keep=1, output_hidden_states=True)
     local_targets = batch["labels"]
     local_hidden = self.final_hidden_states(outputs)
     # Padding slots carry an ignore index; they are cut off after the gather.
