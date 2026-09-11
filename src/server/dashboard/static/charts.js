@@ -20,75 +20,6 @@ export const valueText = (value, unit) =>
 
 const SCALE = 1000;
 
-// Color the measured line at operation boundaries, retaining telemetry gaps.
-function activityLayers(activities, segments, areas, start, end, x, y, title) {
-  const events = [];
-  activities.forEach((activity, index) => {
-    for (const [from, to] of activity.intervals || []) {
-      const a = Math.max(start, from),
-        b = Math.min(end, to);
-      if (Number.isFinite(a) && Number.isFinite(b) && b > a) events.push([a, index, 1], [b, index, -1]);
-    }
-  });
-  if (!events.length) return ["", ""];
-  events.sort((a, b) => a[0] - b[0]);
-  const edges = segments.flatMap((segment) => segment.slice(1).map((point, i) => [segment[i], point, i === 0]));
-  let cursor = 0;
-  const trace = (from, to) => {
-    while (cursor < edges.length && edges[cursor][1][0] <= from) cursor++;
-    let path = "",
-      previousEnd = null;
-    for (let i = cursor; i < edges.length && edges[i][0][0] < to; i++) {
-      const [[a, value], [b, next], newSegment] = edges[i];
-      if (b <= a) continue;
-      const left = Math.max(from, a), right = Math.min(to, b), firstY = Number(y(value)), lastY = Number(y(next));
-      const point = (at) => `${x(at)},${(firstY + ((at - a) / (b - a)) * (lastY - firstY)).toFixed(1)}`;
-      if (newSegment || previousEnd !== left) path += `M${point(left)} `;
-      path += `L${point(right)} `;
-      previousEnd = right;
-    }
-    return path.trim();
-  };
-  const active = new Map(),
-    regions = new Map();
-  const id = `activity-${Array.from(title).reduce((hash, c) => (Math.imul(hash, 31) + c.charCodeAt(0)) >>> 0, 0)}`;
-  let previous = events[0][0];
-  for (let i = 0; i < events.length; ) {
-    const at = events[i][0];
-    if (at > previous && active.size) {
-      const indices = [...active.keys()].sort((a, b) => a - b), key = indices.join("-");
-      const path = trace(previous, at);
-      if (path) {
-        if (!regions.has(key)) regions.set(key, { jobs: indices.map((index) => activities[index]), lines: [], bands: [] });
-        const region = regions.get(key);
-        region.lines.push(path);
-        region.bands.push(`M${x(previous)},0 H${x(at)} V${SCALE} H${x(previous)} Z`);
-      }
-    }
-    while (i < events.length && events[i][0] === at) {
-      const [, index, delta] = events[i++],
-        count = (active.get(index) || 0) + delta;
-      if (count) active.set(index, count);
-      else active.delete(index);
-    }
-    previous = at;
-  }
-  // One pair of paths per workload, regardless of how many operations it ran.
-  const bands = [], lines = [], patterns = [];
-  for (const [key, region] of regions) {
-    const { jobs } = region, concurrent = jobs.length > 1;
-    const tone = concurrent ? "" : escape(jobs[0].tone || "");
-    const selected = jobs.some((job) => job.selected) ? "selected" : "";
-    const placement = concurrent ? "" : `data-placement="${escape(jobs[0].id)}"`;
-    const label = `<title>${concurrent ? "Concurrent activity: " : ""}${escape(jobs.map((job) => job.label).join(" · "))}</title>`;
-    if (concurrent) patterns.push(`<pattern id="${id}-${key}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)" width="${jobs.length * 10}" height="${SCALE}">${jobs.map((job, j) => `<rect class="chart-activity-color ${escape(job.tone || "")} ${job.selected ? "selected" : ""}" x="${j * 10}" width="10" height="${SCALE}"/>`).join("")}</pattern>`);
-    bands.push(`<path class="chart-region ${tone} ${selected}" ${placement} data-key="region:${key}" ${concurrent ? `fill="url(#${id}-${key})"` : ""} d="${region.bands.join(" ")}">${label}</path>`);
-    lines.push(`<path class="${concurrent ? "chart-overlap" : "chart-activity"} ${tone} ${selected}" ${placement} data-key="line:${key}" ${concurrent ? `stroke="url(#${id}-${key})"` : ""} d="${region.lines.join(" ")}" vector-effect="non-scaling-stroke">${label}</path>`);
-  }
-  const clip = areas.map((path) => `<path d="${path}"/>`).join("");
-  return [`<defs><clipPath id="${id}">${clip}</clipPath>${patterns.join("")}</defs><g clip-path="url(#${id})">${bands.join("")}</g>`, lines.join("")];
-}
-
 export function chart({
   title,
   unit = "",
@@ -100,7 +31,6 @@ export function chart({
   tone = "neutral",
   xFormat = "time",
   gapSeconds = Infinity,
-  activities = [],
   empty = "No samples in this time range",
 }) {
   const samples = points.filter(([x]) => Number.isFinite(x) && x >= start && x <= end).sort((a, b) => a[0] - b[0]);
@@ -146,8 +76,7 @@ export function chart({
       return `<path class="chart-line" d="${line}" vector-effect="non-scaling-stroke"/>`;
     })
     .join("");
-  const [regions, activity] = activityLayers(activities, segments, areas, data[0][0], data.at(-1)[0], x, y, title);
-  const paths = (activities.length ? "" : areas.map((d) => `<path class="chart-area" d="${d}"/>`).join("")) + regions + lines + activity;
+  const paths = areas.map((d) => `<path class="chart-area" d="${d}"/>`).join("") + lines;
   const tickCount = end === start ? 0 : xFormat === "step" ? Math.max(1, Math.min(4, Math.floor(end - start))) : 4;
   const label = (at) =>
     xFormat === "step" ? `step ${Math.round(at)}` : `${end - start >= 86400 ? new Date(at * 1000).toISOString().slice(5, 10) + " " : ""}${chartTime(at, end - start <= 120)}`;

@@ -60,7 +60,7 @@ root.addEventListener("click", (event) => {
       ui.gpuGroup = null;
       ui.device = "all";
     }
-    ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.matches(".hold, .legend-entry, .chart-activity, .chart-region") ? null : allocation.dataset.placement;
+    ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.matches(".hold, .activity-label, .activity-block") ? null : allocation.dataset.placement;
     render();
     return;
   }

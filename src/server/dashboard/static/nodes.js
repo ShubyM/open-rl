@@ -1,6 +1,6 @@
 // The Nodes page: one lane per node, one row per GPU, allocation bars over
 // the selected window from the recorded placement history, and an expansion
-// with one GPU-group chart and the workloads that used those devices.
+// with run activity lanes and GPU utilization for those devices.
 
 import { escape, encode, empty, button, morph } from "./ui.js";
 import { chart } from "./charts.js";
@@ -106,11 +106,13 @@ function duty(node, nodeSegments, { start, now }) {
 const holdUrl = (runId, { start, now }) =>
   `/api/v1/dashboard/runs/${encode(runId)}/metrics?${new URLSearchParams({ since: new Date(start * 1000).toISOString(), until: new Date(now * 1000).toISOString() })}`;
 
-function holdIntervals(placement, range, errors) {
+function operationActivity(placement, range) {
   const intervals = [];
+  let error = "", loading = false;
   for (const runId of placement.run_ids || []) {
     const entry = use(holdUrl(runId, range), range.live ? `holds:${runId}:${ui.nodeSelection.duration}` : undefined);
-    if (entry.error) errors?.add(`${runId.slice(0, 8)}: ${entry.error}`);
+    if (entry.error) error = entry.error;
+    if (!entry.data && entry.pending && !entry.error) loading = true;
     for (const sample of entry.data?.samples || []) {
       if (sample.run_id && sample.run_id !== runId) continue;
       if (sample.role !== placement.role || (sample.node && sample.node !== placement.node) || (sample.runtime_id && sample.runtime_id !== placement.runtime_id)) continue;
@@ -119,7 +121,7 @@ function holdIntervals(placement, range, errors) {
       if (to > from) intervals.push([from, to]);
     }
   }
-  return mergeIntervals(intervals);
+  return { intervals: mergeIntervals(intervals), error, loading };
 }
 
 // ---- lane markup ------------------------------------------------------------------
@@ -185,7 +187,7 @@ function trackBars(devices, nodeSegments, range) {
       const within = (a, b) => `left:${((Math.max(a, from) - from) / (to - from || 1)) * 100}%;width:${((Math.min(b, to) - Math.max(a, from)) / (to - from || 1)) * 100}%`;
       const holds = sharers
         .flatMap((s) =>
-          holdIntervals(s, range).map(
+          operationActivity(s, range).intervals.map(
             ([a, b]) => `<span class="hold ${placementColor(s)} ${s.id === ui.expanded ? "selected" : ""}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`,
           ),
         )
@@ -232,6 +234,22 @@ function lane(node, all, range) {
 
 // ---- expansion ---------------------------------------------------------------------
 
+function activityTimeline(placements, range) {
+  const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
+  const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${nodeTime(range.start + ((range.now - range.start) * tick) / 4, range.now - range.start <= 120)}</span>`).join("");
+  const rows = [...placements].sort((a, b) => a.start - b.start || a.id.localeCompare(b.id)).map((p) => {
+    const { intervals, error, loading } = operationActivity(p, range);
+    const status = error ? (error.includes("not recorded") ? "Not recorded" : "Unavailable") : loading ? "Loading…" : !intervals.length ? "No recorded operations" : "";
+    // One path per run, with separate blocks at their exact times. Dense
+    // histories stay cheap, and labels remain selectable even for tiny bursts.
+    const blocks = intervals.map(([from, to]) => `M${x(from)},0 H${x(to)} V24 H${x(from)} Z`).join(" ");
+    return `<div class="activity-row ${placementColor(p)}" data-key="${escape(p.id)}" data-selected="${p.id === ui.expanded}">
+      <button type="button" class="activity-label" data-placement="${escape(p.id)}" aria-pressed="${p.id === ui.expanded}" title="${escape(p.label)}"><span class="activity-swatch"></span><span class="activity-name">${escape(p.label)}<span class="activity-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""}</span></span></button>
+      <div class="activity-track"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-hidden="true"><path class="activity-block" data-placement="${escape(p.id)}" d="${blocks}"><title>${escape(p.label)}</title></path></svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}${error && intervals.length ? " · Showing last available operations" : ""}</span>` : ""}</div></div>`;
+  }).join("");
+  return `<div class="activity-timeline" aria-label="Recorded run activity"><div class="activity-header"><h3>Run activity</h3><div class="activity-axis">${axis}</div></div>${rows}</div>`;
+}
+
 function detail(placement, range, neighbours) {
   const anchor = neighbours.find((p) => p.id === ui.gpuGroup && p.devices.some((id) => placement.devices.includes(id))) || placement;
   ui.gpuGroup = anchor.id;
@@ -252,12 +270,6 @@ function detail(placement, range, neighbours) {
   ]
     .filter(Boolean)
     .join(" · ");
-  const legend = visible
-    .map(
-      (p) =>
-        `<button type="button" class="legend-entry ${placementColor(p)}" data-key="${escape(p.id)}" data-placement="${escape(p.id)}" aria-pressed="${p.id === placement.id}" title="${escape(p.label)}"><span class="legend-swatch"></span><span class="legend-name">${escape(p.label)}</span><span class="legend-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""}</span></button>`,
-    )
-    .join("");
   const allocationId = anchor.allocation_id || anchor.id;
   const metrics = use(
     `/api/v1/dashboard/allocations/${encode(allocationId)}/metrics?${new URLSearchParams({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() })}`,
@@ -275,19 +287,17 @@ function detail(placement, range, neighbours) {
       }),
     )
     .join("");
-  const activityErrors = new Set();
-  const activities = visible.map((p) => ({ id: p.id, label: p.label, tone: placementColor(p), selected: p.id === placement.id, intervals: holdIntervals(p, range, activityErrors) }));
   const label = devices.length ? `${acceleratorLabel(node)} · GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : "GPU activity";
   return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(anchor.id)}"><div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)}</h2><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics)}</strong></span></div>
     <div class="allocation-device-picker" aria-label="GPU selection">${picker}</div>
-    <div class="allocation-legend" aria-label="Workloads on these GPUs">${legend}</div>
-    <div>${gpuChart(metrics, range, activities)}${activityErrors.size ? `<p class="activity-error" role="status">Operation history unavailable: ${escape([...activityErrors].join(" · "))}</p>` : ""}</div>
-    <div class="allocation-detail-footer"><span>Colors show recorded operations; utilization is GPU-wide.</span>${run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : ""}</div></section>`;
+    ${activityTimeline(visible, range)}
+    <div>${gpuChart(metrics, range)}</div>
+    <div class="allocation-detail-footer"><span>Blocks show recorded operations; gaps may include unrecorded activity.</span>${run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : ""}</div></section>`;
 }
 
 const selectedDevices = (metrics) => [...new Map((metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id).map((d) => [d.uuid || d.id, d])).values()];
 
-function gpuChart(metrics, range, activities) {
+function gpuChart(metrics, range) {
   if (!metrics.data) return chart({ title: "GPU utilization", start: range.start, end: range.now, empty: metrics.error || "Loading GPU metrics…" });
   const selected = selectedDevices(metrics);
   const byTime = new Map();
@@ -310,7 +320,6 @@ function gpuChart(metrics, range, activities) {
     min: 0,
     max: 100,
     gapSeconds: 60,
-    activities,
     empty: reason,
   })}${metrics.error ? `<p class="muted" role="status">${escape(metrics.error)} · Showing the last available samples</p>` : ""}`;
 }

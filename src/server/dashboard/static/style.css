@@ -629,6 +629,7 @@ body {
   pointer-events: none;
 }
 #orl-design-lab .allocation-expansion {
+  --activity-label-width: 240px;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 12px 20px;
@@ -691,49 +692,101 @@ body {
   font-size: 12px;
   overflow-wrap: anywhere;
 }
-#orl-design-lab .allocation-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  margin: 0;
-}
-#orl-design-lab .legend-entry {
-  display: inline-flex;
+#orl-design-lab :is(.activity-header, .activity-row) {
+  display: grid;
+  grid-template-columns: var(--activity-label-width) minmax(0, 1fr);
+  column-gap: 12px;
   align-items: center;
-  gap: 7px;
+}
+#orl-design-lab .activity-header {
+  padding-block: 4px 10px;
+}
+#orl-design-lab .activity-header h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+}
+#orl-design-lab .activity-axis {
+  display: flex;
+  justify-content: space-between;
+  color: var(--dim);
+  font: 11px var(--mono);
+}
+#orl-design-lab .activity-row {
+  min-height: 46px;
+  border-top: 1px solid var(--line);
+}
+#orl-design-lab .activity-label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
   min-width: 0;
-  max-width: 100%;
-  padding: 3px 7px;
+  padding: 6px 8px;
   border: 1px solid transparent;
   border-radius: var(--radius);
   background: none;
   text-align: left;
   font-size: 12px;
 }
-#orl-design-lab .legend-entry:hover {
+#orl-design-lab .activity-label:hover {
   background: var(--hover);
 }
-#orl-design-lab .legend-entry[aria-pressed="true"] {
+#orl-design-lab .activity-label[aria-pressed="true"] {
   border-color: var(--line);
   background: var(--paper);
 }
-#orl-design-lab .legend-swatch {
+#orl-design-lab .activity-swatch {
   flex: none;
   width: 9px;
   height: 9px;
   border-radius: 2px;
   background: color-mix(in srgb, var(--allocation-color) 65%, var(--ground));
 }
-#orl-design-lab .legend-name {
+#orl-design-lab .activity-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-#orl-design-lab .legend-meta {
-  flex: none;
+#orl-design-lab .activity-meta {
+  display: block;
+  margin-top: 2px;
   color: var(--dim);
   font-size: 11px;
+}
+#orl-design-lab .activity-track {
+  position: relative;
+  min-width: 0;
+  height: 46px;
+  display: flex;
+  align-items: center;
+  background: repeating-linear-gradient(to right, var(--line) 0 1px, transparent 1px 25%);
+  box-shadow: inset -1px 0 var(--line);
+}
+#orl-design-lab .activity-track svg {
+  display: block;
+  width: 100%;
+  height: 24px;
+}
+#orl-design-lab .activity-block {
+  fill: color-mix(in srgb, var(--allocation-color) 35%, var(--ground));
+  cursor: pointer;
+}
+#orl-design-lab .activity-row[data-selected="true"] .activity-block,
+#orl-design-lab .activity-block:hover {
+  fill: color-mix(in srgb, var(--allocation-color) 65%, var(--ground));
+}
+#orl-design-lab .activity-status {
+  position: absolute;
+  left: 8px;
+  max-width: calc(100% - 16px);
+  padding: 2px 4px;
+  color: var(--dim);
+  background: var(--ground);
+  font-size: 11px;
+}
+#orl-design-lab .activity-status.unavailable {
+  color: var(--status-warning);
 }
 
 /* Chart layout stays separate from the SVG gridlines. */
@@ -752,45 +805,15 @@ body {
   --metric-stroke: color-mix(in srgb, var(--accent) 75%, var(--dim));
 }
 #orl-design-lab .allocation-expansion .chart {
-  --plot-height: clamp(180px, 24vw, 260px);
+  --plot-height: 100px;
+  margin-top: 8px;
+}
+#orl-design-lab .allocation-expansion .chart-plot {
+  grid-template-columns: var(--activity-label-width) minmax(0, 1fr);
+  column-gap: 12px;
 }
 #orl-design-lab .allocation-expansion .chart-line {
-  stroke-width: 2;
-}
-#orl-design-lab .chart-activity-color {
-  fill: var(--allocation-color);
-  fill-opacity: 0.7;
-}
-#orl-design-lab .chart-activity-color.selected {
-  fill-opacity: 1;
-}
-#orl-design-lab .chart-region {
-  fill-opacity: 0.07;
-}
-#orl-design-lab .chart-region[data-placement] {
-  fill: var(--allocation-color);
-  cursor: pointer;
-}
-#orl-design-lab :is(.chart-activity, .chart-overlap) {
-  fill: none;
-  stroke-width: 2;
-  stroke-linejoin: round;
-}
-#orl-design-lab .chart-activity {
-  stroke: var(--allocation-color);
-  stroke-opacity: 0.8;
-}
-#orl-design-lab .chart-activity.selected,
-#orl-design-lab .chart-activity[data-placement]:hover {
-  stroke-opacity: 1;
-}
-#orl-design-lab .chart-activity[data-placement] {
-  cursor: pointer;
-}
-#orl-design-lab .activity-error {
-  margin-top: 8px;
-  color: var(--status-warning);
-  font-size: 12px;
+  stroke-width: 1.5;
 }
 #orl-design-lab .chart-head {
   display: flex;
@@ -1227,6 +1250,29 @@ body {
   #orl-design-lab .capacity-track::before {
     background: none;
     border-right: 1px solid var(--line);
+  }
+  #orl-design-lab .allocation-expansion {
+    --activity-label-width: 40px;
+  }
+  #orl-design-lab .activity-header h3,
+  #orl-design-lab .activity-label {
+    grid-column: 1 / -1;
+  }
+  #orl-design-lab .activity-header {
+    row-gap: 10px;
+  }
+  #orl-design-lab .activity-label {
+    margin-top: 4px;
+  }
+  #orl-design-lab .activity-track,
+  #orl-design-lab .activity-axis {
+    grid-column: 2;
+  }
+  #orl-design-lab .activity-track {
+    height: 34px;
+  }
+  #orl-design-lab .activity-axis span:not(:first-child):not(:last-child) {
+    display: none;
   }
   #orl-design-lab .chart-tip {
     max-width: 230px;
