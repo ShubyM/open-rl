@@ -152,7 +152,8 @@ def flex_kernel_options(text_config: Any) -> dict[str, Any]:
   head_dim 256 (Gemma 4's sliding layers; its 512-wide global layers run on
   FFPA). HF's flex integration reads kernel_options from the forward kwargs
   and Automodel's FFPA route passes them through, so they travel with the
-  call. The FSDP path used 16-wide tiles for the same reason.
+  call. The FSDP path used 16-wide tiles for the same reason; the backward
+  needs smaller tiles than the forward.
   """
   if widest_head_dim(text_config) < 256:
     return {}
@@ -160,10 +161,10 @@ def flex_kernel_options(text_config: Any) -> dict[str, Any]:
     "fwd_BLOCK_M": 64,
     "fwd_BLOCK_N": 64,
     "fwd_num_stages": 1,
-    "bwd_BLOCK_M1": 64,
-    "bwd_BLOCK_N1": 64,
-    "bwd_BLOCK_M2": 64,
-    "bwd_BLOCK_N2": 64,
+    "bwd_BLOCK_M1": 32,
+    "bwd_BLOCK_N1": 32,
+    "bwd_BLOCK_M2": 32,
+    "bwd_BLOCK_N2": 32,
     "bwd_num_stages": 1,
   }
   return {"kernel_options": tile}
