@@ -20,7 +20,69 @@ export const valueText = (value, unit) =>
 
 const SCALE = 1000;
 
-export function chart({ title, unit = "", points = [], start, end, min, max, tone = "neutral", xFormat = "time", gapSeconds = Infinity, empty = "No samples in this time range" }) {
+// Color observed activity beneath one measured curve; concurrent jobs share stripes,
+// never stacked or independently inferred utilization. The area clip retains gaps.
+function activityLayers(activities, areas, start, end, x, title) {
+  const events = [];
+  activities.forEach((activity, index) => {
+    for (const [from, to] of activity.intervals || []) {
+      const a = Math.max(start, from),
+        b = Math.min(end, to);
+      if (Number.isFinite(a) && Number.isFinite(b) && b > a) events.push([a, index, 1], [b, index, -1]);
+    }
+  });
+  if (!events.length || !areas.length) return "";
+  events.sort((a, b) => a[0] - b[0]);
+  const active = new Map(),
+    regions = [],
+    patterns = new Map();
+  const id = `activity-${Array.from(title).reduce((hash, c) => (Math.imul(hash, 31) + c.charCodeAt(0)) >>> 0, 0)}`;
+  const classes = (activity) => `chart-activity ${escape(activity.tone || "")} ${activity.selected ? "selected" : ""}`;
+  let previous = events[0][0];
+  for (let i = 0; i < events.length; ) {
+    const at = events[i][0];
+    if (at > previous && active.size) {
+      const indices = [...active.keys()].sort((a, b) => a - b),
+        jobs = indices.map((index) => activities[index]);
+      let attrs = `class="${classes(jobs[0])}" data-placement="${escape(jobs[0].id)}"`;
+      if (jobs.length > 1) {
+        const key = indices.join("-");
+        if (!patterns.has(key))
+          patterns.set(
+            key,
+            `<pattern id="${id}-${key}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)" width="${jobs.length * 10}" height="${SCALE}">${jobs.map((job, j) => `<rect class="${classes(job)}" x="${j * 10}" width="10" height="${SCALE}"/>`).join("")}</pattern>`,
+          );
+        attrs = `class="chart-overlap" fill="url(#${id}-${key})"`;
+      }
+      regions.push(
+        `<rect ${attrs} data-key="${indices.join("-")}:${previous}" x="${x(previous)}" width="${Math.max(0, Number(x(at)) - Number(x(previous)))}" height="${SCALE}"><title>${jobs.length > 1 ? "Concurrent activity: " : ""}${escape(jobs.map((job) => job.label).join(" · "))}</title></rect>`,
+      );
+    }
+    while (i < events.length && events[i][0] === at) {
+      const [, index, delta] = events[i++],
+        count = (active.get(index) || 0) + delta;
+      if (count) active.set(index, count);
+      else active.delete(index);
+    }
+    previous = at;
+  }
+  return `<defs><clipPath id="${id}">${areas.map((d) => `<path d="${d}"/>`).join("")}</clipPath>${[...patterns.values()].join("")}</defs><g clip-path="url(#${id})">${regions.join("")}</g>`;
+}
+
+export function chart({
+  title,
+  unit = "",
+  points = [],
+  start,
+  end,
+  min,
+  max,
+  tone = "neutral",
+  xFormat = "time",
+  gapSeconds = Infinity,
+  activities = [],
+  empty = "No samples in this time range",
+}) {
   const samples = points.filter(([x]) => Number.isFinite(x) && x >= start && x <= end).sort((a, b) => a[0] - b[0]);
   const data = samples.filter(([, y]) => Number.isFinite(y));
   const head = (latest) =>
@@ -55,15 +117,19 @@ export function chart({ title, unit = "", points = [], start, end, min, max, ton
     if (!current || sample[0] - current.at(-1)[0] > gapSeconds) segments.push((current = []));
     current.push(sample);
   }
-  const paths = segments
+  const areas = [];
+  const lines = segments
     .map((segment) => {
       if (segment.length === 1) return `<path class="chart-dot" d="M${x(segment[0][0])},${y(segment[0][1])} h0.01" vector-effect="non-scaling-stroke"/>`;
       const line = segment.map(([at, value], i) => `${i ? "L" : "M"}${x(at)},${y(value)}`).join(" ");
-      return `<path class="chart-area" d="${line} L${x(segment.at(-1)[0])},${SCALE} L${x(segment[0][0])},${SCALE} Z"/><path class="chart-line" d="${line}" vector-effect="non-scaling-stroke"/>`;
+      areas.push(`${line} L${x(segment.at(-1)[0])},${SCALE} L${x(segment[0][0])},${SCALE} Z`);
+      return `<path class="chart-line" d="${line}" vector-effect="non-scaling-stroke"/>`;
     })
     .join("");
+  const paths = areas.map((d) => `<path class="chart-area" d="${d}"/>`).join("") + activityLayers(activities, areas, data[0][0], data.at(-1)[0], x, title) + lines;
   const tickCount = xFormat === "step" ? Math.max(1, Math.min(4, Math.floor(end - start))) : 4;
-  const label = (at) => (xFormat === "step" ? `step ${Math.round(at)}` : `${end - start >= 86400 ? new Date(at * 1000).toISOString().slice(5, 10) + " " : ""}${chartTime(at, end - start <= 120)}`);
+  const label = (at) =>
+    xFormat === "step" ? `step ${Math.round(at)}` : `${end - start >= 86400 ? new Date(at * 1000).toISOString().slice(5, 10) + " " : ""}${chartTime(at, end - start <= 120)}`;
   const xLabels = Array.from({ length: tickCount + 1 }, (_, i) => `<span>${escape(label(start + ((end - start) * i) / tickCount))}</span>`).join("");
   const yLabels = ticks.map((value) => `<span>${escape(chartNumber(value))}</span>`).join("");
   const grid = ticks.map((value) => `<line class="chart-grid" x1="0" x2="${SCALE}" y1="${y(value)}" y2="${y(value)}" vector-effect="non-scaling-stroke"/>`).join("");

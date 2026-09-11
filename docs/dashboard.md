@@ -43,7 +43,7 @@ Set `OPEN_RL_PROMETHEUS_URL` to a Prometheus-compatible endpoint that scrapes th
 ## Pages
 
 - **Overview**: every recorded run with status, kind, completed steps and elapsed time.
-- **Nodes**: one lane per node, one row per GPU, allocation bars over the selected window from the placement history. A GPU held by several allocations at once shows who actually held it, painted from the workers' operation records. Click a bar for the legend and the GPU utilization chart.
+- **Nodes**: one lane per node, one row per GPU, allocation bars over the selected window from placement history. Click a bar to expand one full-width utilization chart for those GPUs, with colors for every workload's recorded operation activity and stripes for concurrent activity. Selecting a workload highlights its periods without changing the GPU group; GPU buttons select individual cards. Colors provide operation context, not per-job utilization measurements or proof that an unpainted interval was idle.
 - **Scheduler**: workloads waiting for placement with the scheduler's reason, and claim reservations.
 - **Experiments**: recipe metrics per run, grouped by sweep directory, with reward and correctness curves.
 - **Health**: source errors, pod problems and unready nodes.

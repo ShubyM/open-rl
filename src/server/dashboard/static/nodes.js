@@ -1,9 +1,9 @@
 // The Nodes page: one lane per node, one row per GPU, allocation bars over
 // the selected window from the recorded placement history, and an expansion
-// with the GPU chart and a legend of everything on that node.
+// with one GPU-group chart and the workloads that used those devices.
 
 import { escape, encode, empty, button, morph } from "./ui.js";
-import { chart, valueText } from "./charts.js";
+import { chart } from "./charts.js";
 import { ui, content, nodeNow, nodeTime, family } from "./store.js";
 import { use } from "./cache.js";
 
@@ -98,10 +98,12 @@ function duty(node, nodeSegments, { start, now }) {
 const holdUrl = (runId, { start, now }) =>
   `/api/v1/dashboard/runs/${encode(runId)}/metrics?${new URLSearchParams({ since: new Date(start * 1000).toISOString(), until: new Date(now * 1000).toISOString() })}`;
 
-function holdIntervals(placement, range) {
+function holdIntervals(placement, range, errors) {
   const intervals = [];
   for (const runId of placement.run_ids || []) {
-    for (const sample of use(holdUrl(runId, range), range.live ? `holds:${runId}:${ui.nodeSelection.duration}` : undefined).data?.samples || []) {
+    const entry = use(holdUrl(runId, range), range.live ? `holds:${runId}:${ui.nodeSelection.duration}` : undefined);
+    if (entry.error) errors?.add(entry.error);
+    for (const sample of entry.data?.samples || []) {
       if (sample.role !== placement.role || (sample.node && sample.node !== placement.node) || (sample.runtime_id && sample.runtime_id !== placement.runtime_id)) continue;
       const from = Math.max(range.start, placement.start, sample.started_at ?? sample.at - (sample.elapsed_seconds || 0));
       const to = Math.min(range.now, placement.end, sample.at);
@@ -222,11 +224,16 @@ function lane(node, all, range) {
 // ---- expansion ---------------------------------------------------------------------
 
 function detail(placement, range, neighbours) {
-  if (ui.device !== "all" && !placement.devices.includes(ui.device)) ui.device = "all";
-  if (placement.devices.length === 1) ui.device = placement.devices[0];
+  const anchor = neighbours.find((p) => p.id === ui.gpuGroup && p.devices.some((id) => placement.devices.includes(id))) || placement;
+  ui.gpuGroup = anchor.id;
+  if (ui.device !== "all" && !anchor.devices.includes(ui.device)) ui.device = "all";
+  if (anchor.devices.length === 1) ui.device = anchor.devices[0];
   const { state } = ui;
-  const run = state.runs.find((r) => (placement.run_ids || []).includes(r.run_id));
-  const devices = state.cluster.nodes.find((n) => n.name === placement.node)?.devices || [];
+  const node = state.cluster.nodes.find((n) => n.name === anchor.node);
+  const devices = (node?.devices || []).filter((d) => anchor.devices.includes(d.id));
+  const group = neighbours.filter((p) => p.id === anchor.id || p.devices.some((id) => anchor.devices.includes(id)));
+  const visible = group.filter((p) => ui.device === "all" || p.devices.includes(ui.device));
+  const run = visible.some((p) => p.id === placement.id) && state.runs.find((r) => (placement.run_ids || []).includes(r.run_id));
   const workload = run?.workloads?.find((w) => w.uid === placement.id);
   const title = [
     (run?.model || placement.runtime_id || placement.label).split("/").at(-1),
@@ -236,19 +243,19 @@ function detail(placement, range, neighbours) {
   ]
     .filter(Boolean)
     .join(" · ");
-  const legend = neighbours
+  const legend = visible
     .map(
       (p) =>
-        `<button type="button" class="legend-entry ${family(p.runtime_id)}" data-key="${escape(p.id)}" data-placement="${escape(p.id)}" aria-pressed="${p.id === placement.id}" title="${escape(p.label)}"><span class="legend-swatch"></span><span class="legend-name">${escape(p.label)}</span><span class="legend-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""} · ${p.device_count} GPU${p.device_count === 1 ? "" : "s"}</span></button>`,
+        `<button type="button" class="legend-entry ${family(p.runtime_id)}" data-key="${escape(p.id)}" data-placement="${escape(p.id)}" aria-pressed="${p.id === placement.id}" title="${escape(p.label)}"><span class="legend-swatch"></span><span class="legend-name">${escape(p.label)}</span><span class="legend-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""}</span></button>`,
     )
     .join("");
   const metrics = use(
-    `/api/v1/dashboard/allocations/${encode(placement.id)}/metrics?${new URLSearchParams({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() })}`,
-    range.live ? `allocation:${placement.id}:${ui.nodeSelection.duration}` : undefined,
+    `/api/v1/dashboard/allocations/${encode(anchor.id)}/metrics?${new URLSearchParams({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() })}`,
+    range.live ? `allocation:${anchor.id}:${ui.nodeSelection.duration}` : undefined,
   );
-  const picker = (placement.devices.length > 1 ? [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)] : [])
+  const picker = (anchor.devices.length > 1 ? [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)] : [])
     .concat(
-      placement.devices.map((id) => {
+      anchor.devices.map((id) => {
         const name = deviceLabel(devices.find((d) => d.id === id)?.name || id.split("/").at(-1));
         const value = metrics.data?.devices?.find((d) => d.id === id)?.utilization?.at(-1)?.[1];
         return button(
@@ -258,16 +265,19 @@ function detail(placement, range, neighbours) {
       }),
     )
     .join("");
-  const mfu = metrics.data?.mfu;
-  return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(placement.id)}"><div class="allocation-detail-head"><h2>${run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : escape(title)}${placement.ended ? ' <span class="allocation-status">Ended</span>' : ""}</h2><div class="allocation-legend" aria-label="Allocations on this node">${legend}</div></div>
+  const activityErrors = new Set();
+  const activities = visible.map((p) => ({ id: p.id, label: p.label, tone: family(p.runtime_id), selected: p.id === placement.id, intervals: holdIntervals(p, range, activityErrors) }));
+  const label = devices.length ? `${acceleratorLabel(node)} · GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : "GPU activity";
+  return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(anchor.id)}"><div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)}</h2><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics)}</strong></span></div>
     <div class="allocation-device-picker" aria-label="GPU selection">${picker}</div>
-    <div>${gpuChart(metrics, range)}${run?.shared_runtime ? '<p class="muted">Shared LoRA runtime</p>' : ""}</div>
-    <div class="allocation-metrics"><p class="muted">GPU memory</p><p>${gpuMemory(metrics)}</p>${Number.isFinite(mfu?.value) && mfu.value >= 0 && mfu.value <= 1 ? `<p class="muted">Run MFU${mfu.estimated ? " (estimated)" : ""}</p><p>${valueText(mfu.value * 100, "%")}</p>` : ""}</div></section>`;
+    <div class="allocation-legend" aria-label="Workloads on these GPUs">${legend}</div>
+    <div>${gpuChart(metrics, range, activities)}${activityErrors.size ? `<p class="activity-error" role="status">Operation history unavailable: ${escape([...activityErrors].join(" · "))}</p>` : ""}</div>
+    <div class="allocation-detail-footer"><span>Colors show recorded operations; utilization is GPU-wide.</span>${run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : ""}</div></section>`;
 }
 
-const selectedDevices = (metrics) => (metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id);
+const selectedDevices = (metrics) => [...new Map((metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id).map((d) => [d.uuid || d.id, d])).values()];
 
-function gpuChart(metrics, range) {
+function gpuChart(metrics, range, activities) {
   if (!metrics.data) return chart({ title: "GPU utilization", start: range.start, end: range.now, empty: metrics.error || "Loading GPU metrics…" });
   const selected = selectedDevices(metrics);
   const byTime = new Map();
@@ -290,6 +300,7 @@ function gpuChart(metrics, range) {
     min: 0,
     max: 100,
     gapSeconds: 60,
+    activities,
     empty: reason,
   })}${metrics.error ? `<p class="muted" role="status">${escape(metrics.error)} · Showing the last available samples</p>` : ""}`;
 }

@@ -8,6 +8,7 @@ export const content = document.getElementById("content");
 export const ui = {
   state: null, // latest /snapshot
   expanded: null, // placement id open on the Nodes page
+  gpuGroup: null, // allocation anchoring the expansion's physical GPUs
   device: "all", // GPU selected in the expansion
   nodeSelection: { duration: 1800, end: null },
   // Installed by app.js once the page is wired up.

@@ -43,6 +43,7 @@ root.addEventListener("click", (event) => {
   if (jump) {
     ui.nodeSelection = { duration: ui.nodeSelection.duration, end: null };
     ui.expanded = jump.dataset.schedulerPlacement;
+    ui.gpuGroup = null;
     ui.device = "all";
   }
   const incident = event.target.closest("[data-event-at], [data-all-logs]");
@@ -55,8 +56,11 @@ root.addEventListener("click", (event) => {
   }
   const allocation = event.target.closest("[data-placement]");
   if (allocation) {
-    ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.classList.contains("hold") ? null : allocation.dataset.placement;
-    ui.device = "all";
+    if (!ui.expanded) {
+      ui.gpuGroup = null;
+      ui.device = "all";
+    }
+    ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.matches(".hold, .legend-entry, .chart-activity") ? null : allocation.dataset.placement;
     render();
     return;
   }
@@ -98,6 +102,7 @@ root.addEventListener("keydown", (event) => {
   if (!event.defaultPrevented && event.key === "Escape" && ui.expanded) {
     const previous = ui.expanded;
     ui.expanded = null;
+    ui.gpuGroup = null;
     render();
     root.querySelector(`[data-placement="${CSS.escape(previous)}"]`)?.focus();
   }
@@ -145,6 +150,7 @@ root.addEventListener("pointerleave", (event) => event.target.classList?.contain
 root.addEventListener("focusout", (event) => {
   if (event.target.matches(".chart-plot")) event.target.querySelector(".chart-hover")?.setAttribute("hidden", "");
 });
+window.addEventListener("resize", () => root.querySelectorAll(".chart-hover").forEach((hover) => { hover.hidden = true; }));
 document.addEventListener("click", (event) => {
   root.querySelectorAll(".time-picker[open]").forEach((picker) => {
     if (!picker.contains(event.target)) picker.open = false;
