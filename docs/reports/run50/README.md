@@ -40,3 +40,12 @@ dominant terminal; xhigh triples generated tokens per episode (65k median vs
 
 Trainer on real trajectories: 220k-token backward peaks 100 GiB per GPU
 (ladder: 92 GiB at 200k, 115 at 262k), no OOM through two steps.
+
+## Outcome
+
+Stopped after two training steps (2026-09-11) to move the box to Gemma 4 31B.
+The step-1 policy's adapter is saved on the box as `run50-final-adapter`. What
+the two steps established: the reference-limit baseline for this model is
+~70% criterion pass rate and 14% all-pass; with untruncated tool results and
+xhigh reasoning the 262k window (196k readable under the 64k generation
+reserve) becomes the dominant terminal, and steps cost ~2.5-3 h.
