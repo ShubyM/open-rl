@@ -38,7 +38,7 @@ Other clusters can keep the same pages by pointing the run-log source at a colle
 
 ## GPU metrics
 
-Set `OPEN_RL_PROMETHEUS_URL` to a Prometheus-compatible endpoint that scrapes the DCGM exporter. On GKE with Managed Prometheus that is a `prometheus-engine/frontend` deployment with `--query.project-id`, running as a service account with `roles/monitoring.viewer`. The exporter must be running on every GPU node; one started before the driver installer finishes logs "NVML doesn't exist" and exports nothing until restarted.
+Set `OPEN_RL_PROMETHEUS_URL` to a Prometheus-compatible endpoint that scrapes the DCGM exporter. On GKE with Managed Prometheus that is a `prometheus-engine/frontend` deployment with `--query.project-id`, running as a service account with `roles/monitoring.viewer`. The exporter DaemonSet in `k8s/deploy/distributed-fft-timeslice/10-dcgm-monitoring.yaml` waits for the driver library in an init container; without that, an exporter scheduled onto a freshly created node before the driver installer finishes logs "NVML doesn't exist" and exports nothing until restarted.
 
 ## Pages
 
