@@ -9,6 +9,7 @@ import { use } from "./cache.js";
 
 const laneHeight = (devices) => (devices.length === 1 ? 30 : 22);
 export const WINDOWS = [
+  [60, "1 minute"],
   [600, "10 minutes"],
   [1800, "30 minutes"],
   [3600, "1 hour"],
@@ -66,11 +67,11 @@ function segments({ start, now }) {
   return found;
 }
 
-function mergeIntervals(intervals, tolerance = 0) {
+function mergeIntervals(intervals) {
   const merged = [];
   for (const [from, to] of intervals.sort((a, b) => a[0] - b[0])) {
     const last = merged.at(-1);
-    if (last && from <= last[1] + tolerance) last[1] = Math.max(last[1], to);
+    if (last && from <= last[1]) last[1] = Math.max(last[1], to);
     else merged.push([from, to]);
   }
   return merged;
@@ -92,8 +93,8 @@ function duty(node, nodeSegments, { start, now }) {
 
 // ---- who held a shared GPU ---------------------------------------------------------
 
-// Time-sliced GPUs run one job at a time. The workers' own operation records
-// say who held the device when, so shared lanes paint those intervals.
+// Shared lanes paint completed operation activity. Leave gaps unpainted:
+// another workload can run between even closely spaced operations.
 const holdUrl = (runId, { start, now }) =>
   `/api/v1/dashboard/runs/${encode(runId)}/metrics?${new URLSearchParams({ since: new Date(start * 1000).toISOString(), until: new Date(now * 1000).toISOString() })}`;
 
@@ -107,7 +108,7 @@ function holdIntervals(placement, range) {
       if (to > from) intervals.push([from, to]);
     }
   }
-  return mergeIntervals(intervals, 3);
+  return mergeIntervals(intervals);
 }
 
 // ---- lane markup ------------------------------------------------------------------
@@ -154,7 +155,7 @@ function trackBars(devices, nodeSegments, range) {
   const duration = now - start || 1;
   const span = (from, to) =>
     `left:${(Math.max(0, Math.max(start, from) - start) / duration) * 100}%;width:${(Math.max(0, Math.min(now, to) - Math.max(start, from)) / duration) * 100}%`;
-  const sharersOf = (i) => nodeSegments.filter((s) => s.devices.length === 1 && s.devices[0] === devices[i].id).sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
+  const sharersOf = (i) => nodeSegments.filter((s) => s.devices.includes(devices[i].id)).sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
   const shared = new Set(
     devices
       .map((_, i) => i)
@@ -174,23 +175,23 @@ function trackBars(devices, nodeSegments, range) {
       const holds = sharers
         .flatMap((s) =>
           holdIntervals(s, range).map(
-            ([a, b]) => `<span class="hold ${family(s.runtime_id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`,
+            ([a, b]) => `<span class="hold ${family(s.runtime_id)}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`,
           ),
         )
         .join("");
-      const title = `Shared GPU: ${[...new Map(sharers.map((s) => [s.id, s])).values()].map((s) => `${s.label} ${s.role || ""}`.trim()).join(", ")}`;
-      return `<button type="button" class="capacity-allocation shared ${open ? "selected" : ""}" data-key="shared:${escape(devices[i].id)}" data-placement="${escape(chosen.id)}" aria-expanded="${open}" title="${escape(title)}" style="${span(from, to)};top:${i * height + 2}px;height:${height - 4}px">${holds}<span class="allocation-name">${sharers.length} workloads</span><span class="allocation-count">1 GPU</span></button>`;
+      const title = `Shared GPU operation activity: ${sharers.map((s) => `${s.label} ${s.role || ""}`.trim()).join(", ")}`;
+      return `<button type="button" class="capacity-allocation shared ${open ? "selected" : ""}" data-key="shared:${escape(devices[i].id)}" data-placement="${escape(chosen.id)}" aria-expanded="${open}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(from, to)};top:${i * height + 2}px;height:${height - 4}px">${holds}</button>`;
     })
     .join("");
   const solid = nodeSegments
     .flatMap((s) => {
       const indexes = s.devices
         .map((id) => devices.findIndex((d) => d.id === id))
-        .filter((i) => i >= 0 && !(s.devices.length === 1 && shared.has(i)))
+        .filter((i) => i >= 0 && !shared.has(i))
         .sort((a, b) => a - b);
       return deviceGroups(indexes).map((group) => {
         const title = `${s.label}${s.role ? " · " + s.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}`;
-        return `<button type="button" class="capacity-allocation ${family(s.runtime_id)} ${s.ended ? "ended" : ""} ${s.id === ui.expanded ? "selected" : ""}" data-key="${escape(s.id)}:${group[0]}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}" title="${escape(title)}" style="${span(s.start, s.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px"><span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`;
+        return `<button type="button" class="capacity-allocation ${family(s.runtime_id)} ${s.ended ? "ended" : ""} ${s.id === ui.expanded ? "selected" : ""}" data-key="${escape(s.id)}:${group[0]}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(s.start, s.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px"><span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`;
       });
     })
     .join("");
@@ -237,7 +238,7 @@ function detail(placement, range, neighbours) {
   const legend = neighbours
     .map(
       (p) =>
-        `<button type="button" class="legend-entry ${family(p.runtime_id)}" data-key="${escape(p.id)}" data-placement="${escape(p.id)}" aria-pressed="${p.id === placement.id}"><span class="legend-swatch"></span><span class="legend-name">${escape(p.label)}</span><span class="legend-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""} · ${p.device_count} GPU${p.device_count === 1 ? "" : "s"}</span></button>`,
+        `<button type="button" class="legend-entry ${family(p.runtime_id)}" data-key="${escape(p.id)}" data-placement="${escape(p.id)}" aria-pressed="${p.id === placement.id}" title="${escape(p.label)}"><span class="legend-swatch"></span><span class="legend-name">${escape(p.label)}</span><span class="legend-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""} · ${p.device_count} GPU${p.device_count === 1 ? "" : "s"}</span></button>`,
     )
     .join("");
   const metrics = use(
@@ -303,7 +304,7 @@ export function renderNodes() {
   const range = timeWindow();
   const all = segments(range);
   const { cluster } = ui.state;
-  const axis = [0, 1, 2, 3].map((tick) => `<span>${nodeTime(range.start + ((range.now - range.start) * tick) / 3)}</span>`).join("");
+  const axis = [0, 1, 2, 3].map((tick) => `<span>${nodeTime(range.start + ((range.now - range.start) * tick) / 3, range.now - range.start <= 120)}</span>`).join("");
   morph(
     content,
     `<div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>${timeControl(range)}</div>${!cluster.available ? empty(cluster.error || "Kubernetes unavailable") : ""}

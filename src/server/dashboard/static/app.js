@@ -53,13 +53,15 @@ root.addEventListener("click", (event) => {
     else location.hash = `run/${encode(route()[1])}/logs`;
     return;
   }
-  const target = event.target.closest("button");
-  if (!target) return;
-  if (target.dataset.placement) {
-    ui.expanded = ui.expanded === target.dataset.placement ? null : target.dataset.placement;
+  const allocation = event.target.closest("[data-placement]");
+  if (allocation) {
+    ui.expanded = ui.expanded === allocation.dataset.placement ? null : allocation.dataset.placement;
     ui.device = "all";
     render();
+    return;
   }
+  const target = event.target.closest("button");
+  if (!target) return;
   if (target.dataset.device) {
     ui.device = target.dataset.device;
     render();

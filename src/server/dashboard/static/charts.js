@@ -63,7 +63,7 @@ export function chart({ title, unit = "", points = [], start, end, min, max, ton
     })
     .join("");
   const tickCount = xFormat === "step" ? Math.max(1, Math.min(4, Math.floor(end - start))) : 4;
-  const label = (at) => (xFormat === "step" ? `step ${Math.round(at)}` : `${end - start >= 86400 ? new Date(at * 1000).toISOString().slice(5, 10) + " " : ""}${chartTime(at)}`);
+  const label = (at) => (xFormat === "step" ? `step ${Math.round(at)}` : `${end - start >= 86400 ? new Date(at * 1000).toISOString().slice(5, 10) + " " : ""}${chartTime(at, end - start <= 120)}`);
   const xLabels = Array.from({ length: tickCount + 1 }, (_, i) => `<span>${escape(label(start + ((end - start) * i) / tickCount))}</span>`).join("");
   const yLabels = ticks.map((value) => `<span>${escape(chartNumber(value))}</span>`).join("");
   const grid = ticks.map((value) => `<line class="chart-grid" x1="0" x2="${SCALE}" y1="${y(value)}" y2="${y(value)}" vector-effect="non-scaling-stroke"/>`).join("");
