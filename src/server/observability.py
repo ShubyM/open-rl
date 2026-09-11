@@ -5,7 +5,7 @@ import math
 import os
 import time
 from collections.abc import Awaitable, Callable
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from itertools import islice
 
 from opentelemetry import context, propagate, trace
@@ -109,3 +109,42 @@ async def read(store, run_id: str) -> dict:
     }
   except Exception:
     return {"available": False, "samples": [], "error": "Operation telemetry unavailable"}
+
+
+TURN_KEY_PREFIX = "open_rl:turns:"
+
+
+def turn_key(workload: str) -> str:
+  return TURN_KEY_PREFIX + workload
+
+
+@asynccontextmanager
+async def gpu_turn(time_slicer, workload, store, role: str, runtime_id: str | None):
+  """Hold the GPU through the time-slicer and record the turn: the interval the
+  device was ours, which by construction never overlaps another workload's."""
+  async with time_slicer.acquire(workload):
+    started = time.time()
+    try:
+      yield
+    finally:
+      sample = {
+        "at": time.time(),
+        "started_at": started,
+        "operation": "gpu_turn",
+        "workload": workload.name,
+        "role": os.getenv("OPEN_RL_PROCESS_ROLE") or role,
+        "runtime_id": runtime_id,
+        "node": os.getenv("NODE_NAME"),
+        "pod_uid": os.getenv("POD_UID"),
+      }
+      try:
+        await asyncio.wait_for(store.append_sample(turn_key(workload.name), sample, SAMPLE_LIMIT), timeout=0.1)
+      except Exception:
+        pass
+
+
+async def read_turns(store, workload: str) -> list[dict]:
+  try:
+    return await asyncio.wait_for(store.read_samples(turn_key(workload)), timeout=1)
+  except Exception:
+    return []

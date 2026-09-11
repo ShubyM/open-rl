@@ -43,6 +43,7 @@ async def inspection_index():
       "run_metrics": "/api/v1/dashboard/runs/{run_id}/metrics",
       "pod_logs": "/api/v1/dashboard/pods/{pod}/logs",
       "gpu_metrics": "/api/v1/dashboard/allocations/{placement_id}/metrics",
+      "gpu_turns": "/api/v1/dashboard/allocations/{placement_id}/turns",
       "experiments": "/api/v1/dashboard/experiments",
       "openapi": "/openapi.json",
     },
@@ -126,6 +127,24 @@ async def pod_logs(pod: str, container: str | None = None, previous: bool = Fals
     return await asyncio.to_thread(cluster.pod_logs, pod, container, tail, previous)
   except Exception as exc:
     raise HTTPException(503, "Pod logs unavailable in the configured namespace") from exc
+
+
+@router.get("/api/v1/dashboard/allocations/{placement_id}/turns")
+async def allocation_turns(placement_id: str, since: str | None = None, until: str | None = None):
+  """The exclusive GPU turns the time-slicer granted this allocation's worker, recorded by the worker itself."""
+  try:
+    start, end = gke.time_range(since, until)
+  except ValueError as exc:
+    raise HTTPException(400, str(exc)) from exc
+  state = await snapshot.current(get_store())
+  placement = next((p for p in state["placements"] if p["id"] == placement_id), None) or next(
+    (p for p in state["history"] if p["id"] == placement_id), None
+  )
+  if placement is None:
+    raise HTTPException(404, "Allocation not found")
+  low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
+  turns = [t for t in await telemetry.read_turns(get_store(), placement["name"]) if t.get("at", 0) >= low and t.get("started_at", 0) <= high]
+  return {"placement_id": placement_id, "workload": placement["name"], "samples": turns, "available": bool(turns), "since": start, "until": end}
 
 
 @router.get("/api/v1/dashboard/allocations/{placement_id}/metrics")

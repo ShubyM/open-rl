@@ -70,7 +70,21 @@ function duty(node, nodeSegments, { start, now }) {
 const holdUrl = (runId) =>
   `/api/v1/dashboard/runs/${encode(runId)}/metrics?${new URLSearchParams({ since: new Date((nodeNow() - 86400) * 1000).toISOString(), until: new Date(nodeNow() * 1000).toISOString() })}`;
 
+const turnsUrl = (placementId) =>
+  `/api/v1/dashboard/allocations/${encode(placementId)}/turns?${new URLSearchParams({ since: new Date((nodeNow() - 86400) * 1000).toISOString(), until: new Date(nodeNow() * 1000).toISOString() })}`;
+
+// Workers record every GPU turn the time-slicer grants them. Those intervals
+// are exclusive by construction; operation timings (below) include time
+// spent waiting for the turn and overlapping in-flight requests, so they are
+// only the fallback for workers that predate turn recording.
 function operationActivity(placement, range) {
+  const turns = use(turnsUrl(placement.id), `turns:${placement.id}`);
+  if (turns.data?.samples?.length) {
+    const intervals = turns.data.samples
+      .map((t) => [Math.max(range.start, placement.start, t.started_at), Math.min(range.now, placement.end, t.at)])
+      .filter(([from, to]) => to > from);
+    return { intervals: mergeIntervals(intervals), error: "", loading: false, exact: true };
+  }
   const intervals = [];
   let error = "", loading = false;
   for (const runId of placement.run_ids || []) {
@@ -282,7 +296,7 @@ function detail(placement, range, neighbours) {
     <div class="allocation-controls"><div class="allocation-device-picker" aria-label="GPU selection">${picker}</div><div class="activity-view" role="group" aria-label="Activity layout">${[ ["gpu", "By GPU"], ["run", "By run"] ].map(([view, text]) => button(text, `data-activity-view="${view}" aria-pressed="${ui.activityView === view}"`)).join("")}</div></div>
     ${activityTimeline(visible, devices.filter((d) => ui.device === "all" || d.id === ui.device), range)}
     <div>${gpuChart(metrics, range)}</div>
-    <div class="allocation-detail-footer"><span>Blocks show recorded operations; gaps may include unrecorded activity.</span>${run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : ""}</div></section>`;
+    <div class="allocation-detail-footer"><span>Blocks show the GPU turns the time-slicer granted; workers without turn records show their operations instead.</span>${run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : ""}</div></section>`;
 }
 
 const selectedDevices = (metrics) => [...new Map((metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id).map((d) => [d.uuid || d.id, d])).values()];

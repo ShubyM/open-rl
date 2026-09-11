@@ -15,7 +15,7 @@ from opentelemetry import trace
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
-from server.observability import observe_operation
+from server.observability import gpu_turn, observe_operation
 from server.store import RequestStore, get_store
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
@@ -374,7 +374,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
 
         if gpu_reqs:
-          async with self.time_slicer.acquire(self.workload):
+          async with gpu_turn(self.time_slicer, self.workload, self.store, "trainer", self.model_id):
             if hasattr(self.worker, "wake_up"):
               await asyncio.to_thread(self.worker.wake_up)
             try:
@@ -385,7 +385,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
                 await asyncio.to_thread(self.worker.sleep)
 
         if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload and save_reqs:
-          async with self.time_slicer.acquire(self.workload):
+          async with gpu_turn(self.time_slicer, self.workload, self.store, "trainer", self.model_id):
             for request in save_reqs:
               results.append(await self.handle_request(request, self.model_id))
         else:

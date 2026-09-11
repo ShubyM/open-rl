@@ -11,7 +11,7 @@ from typing import Any
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
-from server.observability import observe_operation
+from server.observability import gpu_turn, observe_operation
 from server.vllm_options import gpu_memory_utilization, split_stop, text_only_engine_kwargs
 
 try:
@@ -312,7 +312,7 @@ async def run_sampling_worker(model_id: str) -> None:
       print(f"[vLLM Worker] Registering workload {workload.name} for initialization lock...")
       await time_slicer.register(workload)
       snapshot_registered = True
-      async with time_slicer.acquire(workload):
+      async with gpu_turn(time_slicer, workload, store, "sampler", model_id):
         print("[vLLM Worker] Initializing vLLM engine under parent lock...")
         init_engine()
         print("[vLLM Worker] Engine initialized successfully.")
@@ -407,7 +407,7 @@ async def run_sampling_worker(model_id: str) -> None:
           unanswered = list(sampling_reqs)
           if time_slicer is not None:
             assert workload is not None
-            async with time_slicer.acquire(workload):
+            async with gpu_turn(time_slicer, workload, store, "sampler", model_id):
               if engine is not None and IS_ENGINE_SLEEPING:
                 print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")
                 await engine.wake_up(tags=["weights", "kv_cache"])
