@@ -322,6 +322,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.hf_config: Any = None
     self.forward_kwargs: dict[str, Any] = {}
     self.cp_context: contextlib.ExitStack | None = None
+    self.final_norm_output: torch.Tensor | None = None
     self.base_model_name: str | None = None
     self.trainable_params: list[torch.nn.Parameter] = []
     self.optimizer: torch.optim.Optimizer | None = None
@@ -487,6 +488,11 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     )
     if RECOMPUTE_NUM_LAYERS > 0:
       install_group_checkpointing(self.model, RECOMPUTE_NUM_LAYERS)
+    # Model-owned CP forwards (Gemma4) drop output_hidden_states on the way to
+    # the text model, so the final normed hidden states are taken from the
+    # backbone's last norm instead.
+    backbone = self.model.model.language_model if hasattr(self.model.model, "language_model") else self.model.model
+    backbone.norm.register_forward_hook(self.keep_final_norm_output)
     self.model.train()
     if self.is_lora:
       trainable = sum(param.numel() for param in self.model.parameters() if param.requires_grad)
@@ -566,10 +572,15 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     hidden = self.final_hidden_states(outputs)[:, :seq_len]
     return self.project_target_logprobs(model, hidden, target_token_ids)
 
+  def keep_final_norm_output(self, module: torch.nn.Module, args: Any, output: torch.Tensor) -> None:
+    self.final_norm_output = output
+
   def final_hidden_states(self, outputs: Any) -> torch.Tensor:
     hidden = outputs.hidden_states
     if isinstance(hidden, (tuple, list)):
       hidden = hidden[-1]
+    if hidden is None:
+      hidden = self.final_norm_output
     if hidden is None:
       raise RuntimeError("Automodel forward returned no hidden_states; the logprob path needs the final hidden states.")
     if is_dtensor(hidden):
@@ -621,12 +632,19 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     cp_mesh = self.device_mesh["cp"]
     cp_group = cp_mesh.get_group()
     cp_rank = cp_mesh.get_local_rank()
-
-    # Automodel pads and round-robin shards the aux streams (labels,
-    # position_ids) in place and installs the ring-attention context; the model
-    # embeds the full input_ids and shards its own hidden states the same way.
     batch = {"input_ids": input_ids, "labels": target_token_ids.clone()}
-    context, batch, layout = shard_batch_aux_only(cp_mesh, self.device_mesh["tp"], batch)
+    # Two CP contracts. Models that own their CP (Gemma4) shard the aux streams
+    # into contiguous slices, embed the full input_ids and slice their own hidden
+    # states, and run a p2p ring inside every attention layer, so no context is
+    # needed and the gather comes back in order. Everything else goes through
+    # Automodel's round-robin shard plus torch's ring-attention context.
+    owns_cp = bool(getattr(model, "_owns_cp_attention", False))
+    if owns_cp:
+      sharder = model.prepare_model_inputs_for_cp(batch)["cp_sharder"]
+      context, batch, layout = sharder.shard_batch(cp_mesh, self.device_mesh["tp"], batch)
+    else:
+      context, batch, layout = shard_batch_aux_only(cp_mesh, self.device_mesh["tp"], batch)
+    aux = {key: batch[key] for key in ("padding_mask", "_packed_seq_ids") if key in batch}
     # The context must outlive this call. It swaps SDPA for ring attention by
     # dispatch, and the backward dispatches SDPA again, both for the attention
     # gradient and for the activation-checkpoint recompute of the forward.
@@ -643,6 +661,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       use_cache=False,
       logits_to_keep=1,
       output_hidden_states=True,
+      **aux,
       **self.forward_kwargs,
     )
     local_targets = batch["labels"]
@@ -651,6 +670,8 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     local_logprobs = self.project_target_logprobs(model, local_hidden, local_targets.clamp_min(0))
 
     gathered = GatherSequenceShards.apply(local_logprobs, cp_group, self.cp_size, cp_rank)
+    if owns_cp:
+      return gathered[:, :seq_len]
     perm = round_robin_permutation(self.cp_size, layout.padded_seq_len, gathered.device)
     ordered = torch.zeros_like(gathered).index_copy(1, perm, gathered)
     return ordered[:, :seq_len]

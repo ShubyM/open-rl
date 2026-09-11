@@ -2,8 +2,9 @@
 # run51 driver: run50's client settings (reference LAB episode limits, 0.8/0.2
 # reward, 304 train tasks) against the Gemma 4 31B stack from scripts/launch51.sh.
 # Gemma has one renderer (the recipe's tool-calling gemma4), no reasoning
-# effort levels. max_trajectory_tokens must match the trainer's CONTEXT and
-# the samplers' max-model-len from that launch.
+# effort levels. max_trajectory_tokens must match the trainer's CONTEXT from
+# that launch (180k by default, see launch51.sh for why not 262k); the
+# samplers accept up to that as well.
 # Run in the tmux "train" window after all four samplers report /v1/models.
 set -uo pipefail
 cd "$HOME/open-rl-k8s/examples" || exit 1
@@ -14,7 +15,7 @@ export FORCE_COLOR=1 COLUMNS=${COLUMNS:-160}
 # RUN_LABEL and CONTEXT from the launch script, and an inherited RUN_LABEL
 # points the cookbook at the previous run's directory, where it auto-resumes
 # from that run's checkpoints.jsonl.
-CONTEXT=${RUN51_CONTEXT:-262144}
+CONTEXT=${RUN51_CONTEXT:-180000}
 RUN_LABEL=run51-gemma4-31b-automodel-reference-limits
 echo "=== $RUN_LABEL driver start $(date -u +%FT%TZ) context=$CONTEXT"
 curl -sf -m 10 "$OPENAI_BASE_URL/models" >/dev/null || { echo "judge at $OPENAI_BASE_URL is not answering"; exit 1; }
