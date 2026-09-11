@@ -91,7 +91,9 @@ export function health(state) {
     <p class="run-json-link"><a href="/api/v1/dashboard/snapshot">Diagnostic JSON ↗</a> · <a href="/docs">API reference ↗</a></p>`;
 }
 
-const kindLabel = (config) => (config.lora_rank === undefined || config.lora_rank === null ? "FFT" : `LoRA r${config.lora_rank}`);
+// The recipe config carries a lora_rank even for full fine-tuning runs; the
+// run directory name is the reliable signal the sweep scripts leave behind.
+const kindLabel = (run) => (/(^|[-_])fft([-_]|$)/.test(run.name) || run.config.lora_rank == null ? "FFT" : `LoRA r${run.config.lora_rank}`);
 const pct = (value) => (value === undefined ? "—" : `${(100 * value).toFixed(1)}%`);
 const shortName = (name) => name.replace(/^gsm8k_rl_(mega|rank_sweep)_/, "");
 
@@ -110,7 +112,7 @@ export function experiments(entry) {
       const rows = sorted
         .map(
           (run) =>
-            `<div class="job-list-row experiment-row"><span class="mono">${escape(shortName(run.name))}</span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run.config))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span>${escape(pct(run.last.reward))}</span><span>${escape(pct(run.last.correct))}</span><span>${escape(pct(run.last.format))}</span></div>`,
+            `<div class="job-list-row experiment-row"><span class="mono">${escape(shortName(run.name))}</span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span>${escape(pct(run.last.reward))}</span><span>${escape(pct(run.last.correct))}</span><span>${escape(pct(run.last.format))}</span></div>`,
         )
         .join("");
       const charts = sorted

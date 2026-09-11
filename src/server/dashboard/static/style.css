@@ -64,17 +64,6 @@ body {
   font: inherit;
   color: inherit;
 }
-#orl-design-lab input,
-#orl-design-lab select,
-#orl-design-lab .appbutton {
-  font: 13px/1.5 var(--sans);
-  color: var(--ink);
-  background: var(--paper);
-  border: 1px solid var(--line);
-  min-height: 32px;
-  padding: 5px 9px;
-  border-radius: var(--radius);
-}
 #orl-design-lab input:hover,
 #orl-design-lab select:hover {
   border-color: var(--control-border);
@@ -318,19 +307,6 @@ body {
   color: var(--dim);
   font-size: 11px;
 }
-#orl-design-lab .allocation-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-#orl-design-lab .allocation-count {
-  font-size: 11px;
-  color: var(--dim);
-  white-space: nowrap;
-  flex: none;
-  margin-left: auto;
-}
 #orl-design-lab .capacity-allocation.unknown-mapping {
   position: relative;
   width: 100%;
@@ -363,14 +339,6 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-}
-#orl-design-lab .appbutton:hover:not(:disabled) {
-  background: var(--hover);
-  border-color: var(--control-border);
-}
-#orl-design-lab .appbutton[aria-pressed="true"] {
-  background: var(--selected);
-  border-color: var(--control-border);
 }
 #orl-design-lab .allocation-device-picker .appbutton {
   border-color: transparent;
@@ -529,9 +497,6 @@ body {
   gap: 16px;
   margin-top: 16px;
 }
-#orl-design-lab .operation-chart {
-  min-width: 0;
-}
 #orl-design-lab .node-accelerator {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -651,30 +616,11 @@ body {
   min-width: 0;
   overflow-wrap: anywhere;
 }
-#orl-design-lab .job-metadata {
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 #orl-design-lab .job-steps,
 #orl-design-lab .job-elapsed,
 #orl-design-lab .job-list-head > :nth-child(4),
 #orl-design-lab .job-list-head > :last-child {
   text-align: right;
-}
-#orl-design-lab .run-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  color: var(--dim);
-}
-#orl-design-lab .run-state > span {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-  flex-shrink: 0;
 }
 #orl-design-lab .state-running {
   color: var(--status-success);
@@ -701,23 +647,6 @@ body {
   }
   #orl-design-lab .job-list-row > :nth-child(3) {
     grid-column: 1;
-  }
-  #orl-design-lab .job-steps::after {
-    content: " steps";
-    font:
-      12px ui-sans-serif,
-      system-ui,
-      sans-serif;
-    color: var(--dim);
-  }
-  #orl-design-lab .job-elapsed {
-    grid-column: 1 / -1;
-    text-align: left;
-    color: var(--dim);
-    font-size: 12px;
-  }
-  #orl-design-lab .job-elapsed::before {
-    content: "Elapsed ";
   }
 }
 
@@ -860,21 +789,6 @@ body {
 #orl-design-lab .nodes-heading .heading {
   margin: 0;
 }
-#orl-design-lab .history-coverage {
-  font-size: 12px;
-  margin-bottom: 12px;
-}
-#orl-design-lab .allocation-unobserved {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  pointer-events: none;
-  background: repeating-linear-gradient(
-    135deg,
-    transparent 0 4px,
-    var(--line) 4px 6px
-  );
-}
 
 #orl-design-lab .experiment-sweep {
   margin: 22px 0 30px;
@@ -887,12 +801,6 @@ body {
 #orl-design-lab .experiment-head,
 #orl-design-lab .experiment-row {
   grid-template-columns: minmax(120px, 1.2fr) minmax(90px, 1fr) 90px 90px 80px 80px 80px;
-}
-#orl-design-lab .experiment-charts {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
-  gap: 12px;
-  margin-top: 14px;
 }
 
 /* ---- charts (pure markup, stretched SVG plot, HTML axes) ---- */
