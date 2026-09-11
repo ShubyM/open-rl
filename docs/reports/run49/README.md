@@ -44,3 +44,19 @@ CP4 shards the sequence itself and reaches the model's full 262144 window with
 GPUs 0-3 at CP4, four single-GPU vLLM samplers at max-model-len 262144, LoRA
 rank 32, lr 2e-4, batch 8 x 6, 16k generation, 4k tool results, GLM judge
 (`gpt-glm-5.2` on b200-vm), medium-reasoning Qwen3.8 renderer.
+
+## Outcome
+
+37 of 38 steps trained; the run hung at step 37, minibatch 3/8, because the
+last batch of a 300-task split holds only 4 groups while the streaming loop
+waits for 8 (run50 uses 304 tasks). The final eval therefore did not run; the
+last published adapter is saved on the box for a standalone eval.
+
+| held-out, 50 tasks | step 0 | step 10 | step 20 | step 30 |
+|---|---|---|---|---|
+| criterion pass rate | 22.6% | 37.0% | 74.4% | 69.9% |
+| all criteria passed | 0 | 0 | 1 | 1 |
+
+Train reward EMA went 0.11 to ~0.7. The step-0 baseline was depressed by the
+16k per-turn cap (27 of 50 eval episodes killed before grading); run50 lifts
+that cap. Plot: `run49.png` (recipe `harvey-plot`, all 37 steps).
