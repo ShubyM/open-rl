@@ -10,6 +10,7 @@ export const ui = {
   expanded: null, // placement id open on the Nodes page
   gpuGroup: null, // allocation anchoring the expansion's physical GPUs
   device: "all", // GPU selected in the expansion
+  activityView: "gpu", // combined GPU strips or individual run rows
   nodeSelection: { duration: 1800, end: null },
   // Installed by app.js once the page is wired up.
   render: () => {},

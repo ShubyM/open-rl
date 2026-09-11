@@ -70,6 +70,10 @@ root.addEventListener("click", (event) => {
     ui.device = target.dataset.device;
     render();
   }
+  if (target.dataset.activityView) {
+    ui.activityView = target.dataset.activityView;
+    render();
+  }
   if (target.dataset.timeLive) {
     ui.nodeSelection = { ...ui.nodeSelection, end: null };
     render();

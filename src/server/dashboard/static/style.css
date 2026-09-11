@@ -640,6 +640,9 @@ body {
 #orl-design-lab .allocation-expansion > div {
   min-width: 0;
 }
+#orl-design-lab .allocation-expansion[data-view="gpu"] {
+  --activity-label-width: 40px;
+}
 #orl-design-lab .allocation-detail-head {
   display: flex;
   flex-wrap: wrap;
@@ -653,18 +656,25 @@ body {
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
-#orl-design-lab .allocation-device-picker {
+#orl-design-lab .allocation-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+#orl-design-lab :is(.allocation-device-picker, .activity-view) {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
 }
-#orl-design-lab .allocation-device-picker .chip {
+#orl-design-lab :is(.allocation-device-picker, .activity-view) .chip {
   border-color: transparent;
   background: transparent;
   color: var(--dim);
 }
-#orl-design-lab .allocation-device-picker .chip[aria-pressed="true"],
-#orl-design-lab .allocation-device-picker .chip:hover {
+#orl-design-lab :is(.allocation-device-picker, .activity-view) .chip[aria-pressed="true"],
+#orl-design-lab :is(.allocation-device-picker, .activity-view) .chip:hover {
   border-color: var(--line);
   background: var(--paper);
   color: var(--ink);
@@ -742,7 +752,11 @@ body {
   border-radius: 2px;
   background: color-mix(in srgb, var(--allocation-color) 65%, var(--ground));
 }
+#orl-design-lab .activity-label-text {
+  min-width: 0;
+}
 #orl-design-lab .activity-name {
+  display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -751,6 +765,30 @@ body {
 #orl-design-lab .activity-meta {
   display: block;
   margin-top: 2px;
+  color: var(--dim);
+  font-size: 11px;
+}
+#orl-design-lab .activity-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: 8px;
+}
+#orl-design-lab .activity-legend .activity-label {
+  max-width: 100%;
+  gap: 7px;
+  padding: 4px 7px;
+}
+#orl-design-lab .activity-legend .activity-label-text {
+  display: contents;
+}
+#orl-design-lab .activity-legend .activity-name {
+  max-width: 220px;
+}
+#orl-design-lab .activity-legend .activity-meta,
+#orl-design-lab .activity-notice {
+  flex: none;
+  margin: 0;
   color: var(--dim);
   font-size: 11px;
 }
@@ -775,9 +813,11 @@ body {
   height: 48px;
 }
 #orl-design-lab .activity-device {
-  padding-left: 8px;
   color: var(--dim);
   font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 #orl-design-lab .activity-block {
   fill: color-mix(in srgb, var(--allocation-color) 35%, var(--ground));
@@ -796,7 +836,7 @@ body {
   background: var(--ground);
   font-size: 11px;
 }
-#orl-design-lab .activity-status.unavailable {
+#orl-design-lab :is(.activity-status, .activity-notice).unavailable {
   color: var(--status-warning);
 }
 
@@ -1265,7 +1305,6 @@ body {
   #orl-design-lab .allocation-expansion {
     --activity-label-width: 40px;
   }
-  #orl-design-lab .activity-header h3,
   #orl-design-lab .activity-label {
     grid-column: 1 / -1;
   }
