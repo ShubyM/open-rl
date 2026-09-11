@@ -30,8 +30,12 @@ cd "$HOME/open-rl-k8s/examples" || exit 1
 set -a; source "$HOME/open-rl/.env.judge"; set +a
 export TINKER_API_KEY=tml-dummy
 export FORCE_COLOR=1 COLUMNS=${COLUMNS:-160}
-CONTEXT=${CONTEXT:-262144}
-RUN_LABEL=${RUN_LABEL:-run50-qwen38-27b-automodel-reference-limits}
+# Set unconditionally: shells in the launch_work tmux session inherit
+# RUN_LABEL and CONTEXT from the launch script, and an inherited RUN_LABEL
+# points the cookbook at the previous run's directory, where it auto-resumes
+# from that run's checkpoints.jsonl.
+CONTEXT=262144
+RUN_LABEL=run50-qwen38-27b-automodel-reference-limits
 echo "=== $RUN_LABEL driver start $(date -u +%FT%TZ) context=$CONTEXT"
 curl -sf -m 10 "$OPENAI_BASE_URL/models" >/dev/null || { echo "judge at $OPENAI_BASE_URL is not answering"; exit 1; }
 .venv/bin/harvey-train \
