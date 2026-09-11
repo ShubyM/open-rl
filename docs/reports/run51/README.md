@@ -91,3 +91,21 @@ ladder point.
 The cookbook's streaming loop awaits the step-0 eval before it launches any
 train rollouts, so the first 35 minutes of the run are eval only; the 48 train
 episodes started at 21:10Z.
+
+## Step 0 (train, 8 groups x 6)
+
+| metric | value |
+|---|---|
+| sampler-trainer KL (`optim/kl_sample_train_v1`) | 0.0004 (Qwen run49: 0.0007) |
+| train reward | 0.505 |
+| criterion pass fraction | 0.631 |
+| all criteria passed | 0 |
+| graded / no output / context overflow | 91.7% / 8.3% / 1.1% |
+| turns per episode, generated tokens per turn | 11.7, 1154 |
+| observation tokens per turn | 40.9k |
+| every group mixed (frac_mixed) | 1.0 |
+| trainer peak at 113k tokens, CP4 | 73.7 GiB allocated / 88.6 reserved per rank |
+
+The KL confirms the FFPA-plus-flex trainer path scores Gemma's samples the way
+vLLM produced them; the raw-text mismatch numbers earlier in this report do not
+apply to the model's own outputs.
