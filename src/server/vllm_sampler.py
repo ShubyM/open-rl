@@ -326,10 +326,10 @@ async def run_sampling_worker(model_id: str) -> None:
   else:
     init_engine()
 
-  async def exit_gracefully(code: int = 0) -> None:
+  async def exit_gracefully(code: int = 0, unregister: bool = True) -> None:
     print(f"[vLLM Worker] Initiating immediate exit for model {model_id} sampler worker (code {code})...")
     nonlocal snapshot_registered
-    if snapshot_registered and time_slicer is not None:
+    if unregister and snapshot_registered and time_slicer is not None:
       assert workload is not None
       try:
         await time_slicer.unregister(workload)
@@ -419,6 +419,13 @@ async def run_sampling_worker(model_id: str) -> None:
                 print("[vLLM Worker] Exiting batch: sleeping engine (CPU offload weights) to yield GPU memory...")
                 await engine.sleep(level=1)
                 IS_ENGINE_SLEEPING = True
+            faulted = getattr(time_slicer, "faulted", None)
+            if faulted:
+              # This process still holds the accelerator, so it exits without
+              # unregistering and the pod restarts; the grant moves on once
+              # the memory is gone.
+              print(f"[vLLM Worker] Time slicer could not park this process: {faulted}. Exiting for a restart.")
+              await exit_gracefully(code=1, unregister=False)
           else:
             if engine is not None and IS_ENGINE_SLEEPING:
               print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")

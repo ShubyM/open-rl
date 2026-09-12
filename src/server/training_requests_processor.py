@@ -315,9 +315,9 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     self.time_slicer = time_slicer
     self.snapshot_registered = False
 
-  async def exit_gracefully(self) -> None:
+  async def exit_gracefully(self, unregister: bool = True) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if self.snapshot_registered:
+    if unregister and self.snapshot_registered:
       try:
         await self.time_slicer.unregister(self.workload)
         self.snapshot_registered = False
@@ -376,28 +376,48 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
         save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
 
-        if gpu_reqs:
-          async with self.time_slicer.acquire(self.workload):
-            if hasattr(self.worker, "wake_up"):
-              await asyncio.to_thread(self.worker.wake_up)
-            try:
-              for request in gpu_reqs:
-                results.append(await self.handle_request(request, self.model_id))
-            finally:
-              if hasattr(self.worker, "sleep"):
-                await asyncio.to_thread(self.worker.sleep)
+        failure: Exception | None = None
+        try:
+          if gpu_reqs:
+            async with self.time_slicer.acquire(self.workload):
+              if hasattr(self.worker, "wake_up"):
+                await asyncio.to_thread(self.worker.wake_up)
+              try:
+                for request in gpu_reqs:
+                  results.append(await self.handle_request(request, self.model_id))
+              finally:
+                if hasattr(self.worker, "sleep"):
+                  await asyncio.to_thread(self.worker.sleep)
 
-        if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload and save_reqs:
-          async with self.time_slicer.acquire(self.workload):
+          if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload and save_reqs:
+            async with self.time_slicer.acquire(self.workload):
+              for request in save_reqs:
+                results.append(await self.handle_request(request, self.model_id))
+          else:
             for request in save_reqs:
               results.append(await self.handle_request(request, self.model_id))
-        else:
-          for request in save_reqs:
-            results.append(await self.handle_request(request, self.model_id))
+        except Exception as exc:
+          # Whatever the batch did not answer is failed now, so no client waits forever.
+          failure = exc
+          answered = {request_id for request_id, _ in results}
+          for request in training_reqs:
+            request_id = request.get("request_id")
+            if request_id and request_id not in answered:
+              results.append((request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
 
         for request_id, result in results:
           if request_id is not None:
             await self.store.set_future(request_id, result)
+        if failure is not None:
+          raise failure
+
+    faulted = getattr(self.time_slicer, "faulted", None)
+    if faulted:
+      # This process still holds the accelerator. Exit without unregistering so
+      # the grant moves on only once the memory is gone. Exit 0 keeps the pod
+      # from restarting on fresh weights mid-run; the run fails on its next call.
+      print(f"[WORKER] Time slicer could not park this process: {faulted}. Exiting to free the accelerator.")
+      await self.exit_gracefully(unregister=False)
 
     if has_shutdown:
       await self.exit_gracefully()
