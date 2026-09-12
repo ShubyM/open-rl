@@ -108,7 +108,20 @@ class SingleNodeTimeSlicer(TimeSlicer):
 
     # The grant is held through the checkpoint, so the next waiter is not
     # granted until this workload is off the devices.
-    checkpointed = await self.run_checkpoint(state)
+    try:
+      checkpointed = await self.run_checkpoint(state)
+    except Exception as exc:
+      # A workload that could not be parked is still on the devices. It keeps
+      # the grant so nobody is restored on top of its memory; the seat frees
+      # when its process exits and the connection closes.
+      logger.error("checkpoint failed for workload %s claim %s; it keeps the grant until its process exits: %s", name, claim, exc)
+      async with self.condition:
+        state = self.workloads.get(name)
+        if state is not None:
+          state.failed = True
+          state.checkpointed = False
+        self.condition.notify_all()
+      return {"ok": False, "faulted": True, "error": f"checkpoint failed for workload {name}; it still holds the accelerator and must exit: {exc}"}
 
     async with self.condition:
       state = self.workloads.get(name)
@@ -149,18 +162,15 @@ class SingleNodeTimeSlicer(TimeSlicer):
         del self.running[claim]
 
   async def run_checkpoint(self, state: WorkloadState) -> bool | None:
+    """Parks the workload. Raises when the restorer could not, since the workload then still holds the devices."""
     workload = state.workload
     start = time.monotonic()
-    try:
-      checkpointed = await asyncio.to_thread(self.restorer.checkpoint, workload)
-      if checkpointed is False:
-        logger.info("released workload %s claim %s without checkpoint in %.2fs", workload.name, workload.claim, time.monotonic() - start)
-      else:
-        logger.info("checkpointed workload %s claim %s in %.2fs", workload.name, workload.claim, time.monotonic() - start)
-      return checkpointed
-    except Exception as exc:
-      logger.warning("checkpoint failed for workload %s claim %s: %s", workload.name, workload.claim, exc)
-      return False
+    checkpointed = await asyncio.to_thread(self.restorer.checkpoint, workload)
+    if checkpointed is False:
+      logger.info("released workload %s claim %s without checkpoint in %.2fs", workload.name, workload.claim, time.monotonic() - start)
+    else:
+      logger.info("checkpointed workload %s claim %s in %.2fs", workload.name, workload.claim, time.monotonic() - start)
+    return checkpointed
 
   async def run_restore(self, state: WorkloadState) -> None:
     workload = state.workload

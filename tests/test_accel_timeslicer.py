@@ -61,6 +61,12 @@ class NoSnapshotRestorer(RecordingRestorer):
     return False
 
 
+class FailingCheckpointRestorer(RecordingRestorer):
+  def checkpoint(self, target: WorkloadRef) -> None:
+    super().checkpoint(target)
+    raise RuntimeError("cuda-checkpoint refused the process")
+
+
 class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
   async def test_agent_grants_only_one_active_process_at_a_time(self) -> None:
     restorer = RecordingRestorer()
@@ -256,6 +262,55 @@ class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue((await agent.release(workload))["ok"])
 
     self.assertEqual(restorer.simple_labels(), [("checkpoint", "job-a")])
+
+
+class FailedCheckpointTest(unittest.IsolatedAsyncioTestCase):
+  async def test_failed_checkpoint_keeps_the_grant_until_the_process_is_gone(self) -> None:
+    agent = SingleNodeTimeSlicer(FailingCheckpointRestorer())
+    await agent.register(WorkloadRef(name="101"), connection_id=1)
+    await agent.register(WorkloadRef(name="202"), connection_id=2)
+    self.assertTrue((await agent.acquire(WorkloadRef(name="101")))["ok"])
+    blocked = asyncio.create_task(agent.acquire(WorkloadRef(name="202")))
+    await asyncio.sleep(0.05)
+
+    release = await agent.release(WorkloadRef(name="101"))
+    self.assertFalse(release["ok"])
+    self.assertTrue(release["faulted"])
+    await asyncio.sleep(0.05)
+    # 101 still holds the memory, so 202 is not restored on top of it.
+    self.assertFalse(blocked.done())
+    self.assertEqual(agent.running, {"shared-accelerator": "101"})
+    self.assertFalse((await agent.acquire(WorkloadRef(name="101")))["ok"])
+
+    await agent.connection_closed(1)
+    self.assertTrue((await asyncio.wait_for(blocked, timeout=1.0))["ok"])
+    self.assertEqual(agent.running, {"shared-accelerator": "202"})
+
+  async def test_socket_client_remembers_the_fault_and_keeps_its_connection(self) -> None:
+    agent = SingleNodeTimeSlicer(FailingCheckpointRestorer())
+    with tempfile.TemporaryDirectory() as tmp:
+      socket_path = str(Path(tmp) / "accel-timeslicer.sock")
+      server = await start_time_slicer(agent, socket_path)
+      client_a = SocketTimeSlicerClient(socket_path)
+      client_b = SocketTimeSlicerClient(socket_path)
+      try:
+        await client_a.register(WorkloadRef(name="101"))
+        await client_b.register(WorkloadRef(name="202"))
+        blocked = asyncio.create_task(acquire_once(client_b, WorkloadRef(name="202")))
+        async with client_a.acquire(WorkloadRef(name="101")):
+          await asyncio.sleep(0.05)
+        self.assertIn("must exit", client_a.faulted or "")
+        self.assertIsNotNone(client_a.writer)
+        await asyncio.sleep(0.05)
+        self.assertFalse(blocked.done())
+
+        await client_a.close()
+        self.assertEqual(await asyncio.wait_for(blocked, timeout=1.0), "202")
+      finally:
+        await client_a.close()
+        await client_b.close()
+        server.close()
+        await server.wait_closed()
 
 
 class SingleNodeTimeSlicerSocketTest(unittest.IsolatedAsyncioTestCase):
