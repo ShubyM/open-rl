@@ -130,3 +130,10 @@ the driver when the judge is unreachable for five minutes.
 | 3 | 0.441 | 0.551 | 98% | 0.0007 |
 | 4 | 0.340 | 0.430 | 81% | 0.0005 |
 | 5 | 0.195 | 0.244 | 56% (judge dying) | 0.0005 |
+
+Resumed 06:34Z on 2026-09-12 from checkpoint 000010 (adapter and optimizer
+restored) after `b200-vm` came back (10 start attempts against a stockout, then
+`~/judge/serve.sh`, reconstructed from the engine settings vLLM had recorded:
+TP8, 131072 context, 0.9 memory, prefix caching, reasoning parser glm45).
+`metrics.jsonl` therefore holds two rows for steps 11-14: the void ones from the
+outage and the resumed ones; keep the last row per step when plotting.
