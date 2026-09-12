@@ -109,3 +109,24 @@ episodes started at 21:10Z.
 The KL confirms the FFPA-plus-flex trainer path scores Gemma's samples the way
 vLLM produced them; the raw-text mismatch numbers earlier in this report do not
 apply to the model's own outputs.
+
+## Judge outage (steps 6-14 are void)
+
+The spot judge VM `b200-vm` (GLM, 10.142.0.15) was preempted at about 00:10Z on
+2026-09-12, during step 5. Grading fails silently (see the memory note on the
+reward floor): steps 6-14 show `lab/graded` 0 and `lab/reward_error` 0.85-1.0,
+reward about 0, and the step-10 eval is meaningless. Sampling and the trainer
+were healthy throughout (KL 0.0004-0.0009). The driver was stopped at 05:30Z.
+Only the step-10 checkpoint exists (save_every 10; per-step sampler adapters
+rotate), so the run resumes from step 10, which carries steps 6-9 trained on
+all-zero groups (near-zero advantages). `scripts/judge-watchdog.sh` now stops
+the driver when the judge is unreachable for five minutes.
+
+| step | reward | criterion pass fraction | graded | kl_sample_train |
+|---|---|---|---|---|
+| 0 | 0.505 | 0.631 | 92% | 0.0004 |
+| 1 | 0.458 | 0.573 | 98% | 0.0007 |
+| 2 | 0.446 | 0.557 | 81% | 0.0006 |
+| 3 | 0.441 | 0.551 | 98% | 0.0007 |
+| 4 | 0.340 | 0.430 | 81% | 0.0005 |
+| 5 | 0.195 | 0.244 | 56% (judge dying) | 0.0005 |

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Bring up run51 end to end on h200-vm: fresh tmux stack from scripts/launch51.sh,
 # wait for the four samplers and the trainer ranks, then start the driver in the
-# train window. Run under nohup; it logs to ~/open-rl/artifacts/box-logs/run51-start.log.
+# train window, with a judge watchdog beside it. Re-running it after a stop
+# resumes the run: the driver keeps the same log_path and the cookbook picks
+# up the last entry of checkpoints.jsonl. Run under nohup; it logs to
+# ~/open-rl/artifacts/box-logs/run51-start.log.
 log() { echo "$(date -u +%FT%TZ) $*"; }
 cd "$HOME/open-rl" || exit 1
 set -a; source "$HOME/open-rl/.env.judge"; set +a
@@ -25,5 +28,7 @@ log "samplers up: $up/4, trainer ranks: $ranks"
 log "waiting 120s for the trainer to finish loading"; sleep 120
 tmux send-keys -t work:train C-c; sleep 1
 tmux send-keys -t work:train "bash scripts/run51-driver.sh" C-m
+tmux new-window -d -t work -n judge -c "$HOME/open-rl"
+tmux send-keys -t work:judge "bash scripts/judge-watchdog.sh work:train 2>&1 | tee -a artifacts/box-logs/judge-watchdog.log" C-m
 sleep 45; tmux capture-pane -p -t work:train | grep -v "^\s*$" | tail -6 | cut -c1-160
 log "run51 driver started"
