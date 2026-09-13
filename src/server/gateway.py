@@ -22,6 +22,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from server import external_sampler
 from server.external_sampler import get_sampler_base_url
 from server.store import get_store
+from server.trainer_config import trainer_publishes_adapter, uses_dedicated_trainer
 from server.worker_manager import WorkerManager, create_fft_worker_manager
 from training import paths
 
@@ -89,10 +90,6 @@ def get_default_model_name() -> str | None:
   return os.getenv("BASE_MODEL")
 
 
-def is_fft_enabled() -> bool:
-  return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
-
-
 def gateway_launches_trainers() -> bool:
   """Whether this gateway starts a trainer subprocess per model.
 
@@ -102,28 +99,7 @@ def gateway_launches_trainers() -> bool:
   idempotent per *model_id*, which cannot see a trainer it did not start: the
   two would race for requests with a full copy of the model each.
   """
-  return is_fft_enabled() and os.getenv("OPEN_RL_EXTERNAL_TRAINER") != "1"
-
-
-def trainer_publishes_adapter() -> bool:
-  """Whether a full-parameter backend nonetheless publishes a LoRA adapter.
-
-  The Megatron worker does. It registers as full-parameter (OPEN_RL_ENABLE_FFT)
-  because its checkpoints are whole HF models, but it trains LoRA, and
-  megatron-bridge's save_hf_adapter writes the adapter on its own without
-  merging it into the base weights. So the sampler side takes the ordinary
-  /v1/load_lora_adapter route rather than the sampler_full checkpoint route it
-  could not reload anyway -- which is what makes an externally managed server
-  usable under this backend at all.
-
-  The Automodel worker does the same, but only when it trains LoRA (rank > 0);
-  a full-parameter Automodel run publishes whole checkpoints. Its
-  publishes_sampler_adapter() reads the same variable, so both ends agree.
-  """
-  backend = os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower()
-  if backend == "megatron":
-    return True
-  return backend == "automodel" and int(os.getenv("OPEN_RL_AUTOMODEL_LORA_RANK", "0")) > 0
+  return uses_dedicated_trainer() and os.getenv("OPEN_RL_EXTERNAL_TRAINER") != "1"
 
 
 def sampler_session_id(model_id: str, seq_id: int | str) -> str:
@@ -368,11 +344,17 @@ def translate_future_result(result: dict) -> dict:
 async def lifespan(_: FastAPI):
   global fft_worker_manager
   task = None
+  if get_sampler_base_url() and get_sampler_backend() == "vllm" and not trainer_publishes_adapter():
+    raise RuntimeError(
+      "Externally managed vLLM servers require a trainer that publishes LoRA adapters. "
+      "For Automodel, set OPEN_RL_AUTOMODEL_LORA_RANK to a positive rank, or use managed "
+      "sampler workers by unsetting SAMPLER_BASE_URL and SAMPLER_BASE_URLS."
+    )
   # The per-model vLLM sampler workers are launched on demand for FFT *and*
   # LoRA models alike; the manager just needs the shared queue store. With an
   # external SAMPLER_BASE_URL server there is nothing to launch (FFT still
   # needs the manager for its trainer workers).
-  if is_fft_enabled() or (get_sampler_backend() == "vllm" and not is_single_process_mode() and not get_sampler_base_url()):
+  if uses_dedicated_trainer() or (get_sampler_backend() == "vllm" and not is_single_process_mode() and not get_sampler_base_url()):
     fft_worker_manager = create_fft_worker_manager()
   if get_sampler_base_url() and get_sampler_backend() == "vllm" and not is_single_process_mode():
     for sampler_url in external_sampler.get_sampler_base_urls():
@@ -384,7 +366,7 @@ async def lifespan(_: FastAPI):
     print("=" * 50)
     print(f"-> Base model: {base_model or 'unset'}")
     print(f"-> Sampling backend: {get_sampler_backend()}")
-    print(f"-> FFT enabled     : {is_fft_enabled()}")
+    print(f"-> Dedicated trainer: {uses_dedicated_trainer()}")
     print("-> Server mode     : API server + worker loop in one process\n")
     await preflight_vllm()
   if os.getenv("OPEN_RL_EXTERNAL_TRAINER") == "1":
@@ -392,12 +374,9 @@ async def lifespan(_: FastAPI):
     # drains the training queue; running the in-gateway worker too would race
     # it for requests.
     if not os.getenv("REDIS_URL"):
-      raise RuntimeError(
-        "OPEN_RL_EXTERNAL_TRAINER=1 requires REDIS_URL: a dedicated trainer "
-        "process can only share the queue through Redis."
-      )
+      raise RuntimeError("OPEN_RL_EXTERNAL_TRAINER=1 requires REDIS_URL: a dedicated trainer process can only share the queue through Redis.")
     print("-> Training: dedicated external trainer process (in-gateway worker disabled)")
-  elif not is_fft_enabled():
+  elif not uses_dedicated_trainer():
     from server import training_requests_processor
 
     worker = training_requests_processor.LoraTrainingWorker()
@@ -487,9 +466,12 @@ async def delete_model(req: dict):
   model_id = req.get("model_id")
   if not model_id:
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
-  if is_fft_enabled():
+  if uses_dedicated_trainer():
     print(f"[GATEWAY] Requesting shutdown of workers for model {model_id}...")
-    await store.put_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
+    # An external trainer drains the shared queue for successive models.
+    # Deleting one model must not terminate that independently owned service.
+    if gateway_launches_trainers():
+      await store.put_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
   await store.delete_values(f"open_rl:model_meta:{model_id}", f"open_rl:model_base:{model_id}")
   return {"status": "ok"}
@@ -550,7 +532,7 @@ async def get_training_run(training_run_id: str):
     "training_run_id": training_run_id,
     "base_model": meta.get("base_model") or "unknown",
     "model_owner": "local",
-    "is_lora": not is_fft_enabled(),
+    "is_lora": trainer_publishes_adapter(),
     "corrupted": False,
     "lora_rank": None,
     "last_request_time": datetime.fromtimestamp(created_at, tz=UTC).isoformat(),
@@ -834,7 +816,7 @@ async def create_sampling_session(req: dict):
     target_model_id = sess_id
 
   if get_sampler_backend() == "vllm" and target_model_id:
-    if is_fft_enabled():
+    if uses_dedicated_trainer():
       await ensure_sampler_launched(target_model_id, base_model)
     s = get_store()
     # Only managed queue workers (RedisStore) publish sampler_ready flags; the
@@ -896,7 +878,7 @@ async def asample(req: dict):
   propagate.inject(carrier)
   await store.set_future(req_id, {"status": "pending"})
 
-  if is_fft_enabled() and not trainer_publishes_adapter():
+  if not trainer_publishes_adapter():
     rel_path = model_id[len("tinker://") :] if model_id.startswith("tinker://") else model_id.lstrip("/")
     local_path = os.path.join(TMP_DIR, "sampler_full", rel_path)
     weights_path = local_path
@@ -928,7 +910,7 @@ async def asample(req: dict):
   # hot-reloads an adapter but not a checkpoint, so it falls back to the managed
   # queue workers — unless the trainer publishes an adapter after all, which is
   # a thing a stock server does know how to load.
-  if get_sampler_base_url() and (not is_fft_enabled() or trainer_publishes_adapter()):
+  if get_sampler_base_url() and trainer_publishes_adapter():
     task = asyncio.create_task(_sample_via_external_server(req_id, sampling_req))
     _external_sampler_tasks.add(task)
     task.add_done_callback(_external_sampler_tasks.discard)

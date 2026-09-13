@@ -21,7 +21,7 @@ data:
       restartPolicy: OnFailure
       containers:
       - name: trainer-worker
-        image: gcr.io/cdrollouts-sunilarora/open-rl-server:0.1.30
+        image: gcr.io/cdrollouts-sunilarora/open-rl-server:0.1.32
         imagePullPolicy: IfNotPresent
         command: ["uv", "run", "--no-sync", "torchrun", "--standalone", "--nproc-per-node=2", "-m", "server.training_requests_processor"]
         env:

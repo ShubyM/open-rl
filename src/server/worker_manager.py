@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Protocol
 
 from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
+from server.trainer_config import trainer_backend
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
@@ -29,9 +30,20 @@ def _py_cmd(extras: list[str], module: str, model_id: str) -> list[str]:
 
 def _trainer_cmd(model_id: str) -> list[str]:
   world_size = int(os.getenv("OPEN_RL_FSDP_WORLD_SIZE", "1"))
-  if world_size <= 1:
-    return _py_cmd(["gpu"], "server.training_requests_processor", model_id)
-  runner = ["uv", "run", "--extra", "gpu", "torchrun"] if shutil.which("uv") else [sys.executable, "-u", "-m", "torch.distributed.run"]
+  if world_size < 1:
+    raise ValueError("OPEN_RL_FSDP_WORLD_SIZE must be a positive integer")
+  if trainer_backend() == "automodel":
+    interpreter = os.path.expanduser(os.getenv("AUTOMODEL_PYTHON", ""))
+    if not interpreter or not os.path.isfile(interpreter) or not os.access(interpreter, os.X_OK):
+      raise RuntimeError(
+        "Managed Automodel trainers require AUTOMODEL_PYTHON pointing to an executable Python interpreter. "
+        "Build it with scripts/setup_automodel_env.sh, then set AUTOMODEL_PYTHON=<venv>/bin/python."
+      )
+    runner = [os.path.abspath(interpreter), "-u", "-m", "torch.distributed.run"]
+  else:
+    if world_size == 1:
+      return _py_cmd(["gpu"], "server.training_requests_processor", model_id)
+    runner = ["uv", "run", "--extra", "gpu", "torchrun"] if shutil.which("uv") else [sys.executable, "-u", "-m", "torch.distributed.run"]
   return runner + [
     "--standalone",
     f"--nproc-per-node={world_size}",
@@ -89,6 +101,11 @@ class FFTWorkerManager:
     }
     if base_model:
       env["BASE_MODEL"] = base_model
+    if trainer_backend() == "automodel":
+      # The isolated Automodel environment imports this checkout rather than
+      # installing the gateway's dependency set alongside NeMo's dependencies.
+      env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(self.project_dir / "src"), env.get("PYTHONPATH")]))
+      env.setdefault("OPEN_RL_CONTROL_BACKEND", "cpu:gloo,cuda:nccl")
     self.train_processes[model_id] = subprocess.Popen(
       _trainer_cmd(model_id),
       cwd=self.project_dir,

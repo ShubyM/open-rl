@@ -22,6 +22,7 @@ import yaml
 from kubernetes import client, config
 
 from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
+from server.trainer_config import trainer_backend
 
 POD_NAME_PREFIX = "open-rl-trainer-"
 TERMINAL_POD_PHASES = {"Succeeded", "Failed"}
@@ -67,6 +68,12 @@ class KubernetesFFTWorkerManager:
     self.launch_trainer(model_id, base_model)
 
   def launch_trainer(self, model_id: str, base_model: str | None = None) -> None:
+    if trainer_backend() == "automodel":
+      raise RuntimeError(
+        "Managed Kubernetes Automodel trainers are not supported by the server image. "
+        "Use an external Automodel trainer with OPEN_RL_EXTERNAL_TRAINER=1, or launch locally "
+        "with OPEN_RL_WORKER_MANAGER=local and AUTOMODEL_PYTHON."
+      )
     self._launch_pod(model_id, role="trainer", base_model=base_model)
 
   def launch_sampler(self, model_id: str, base_model: str | None = None) -> None:
@@ -126,6 +133,11 @@ class KubernetesFFTWorkerManager:
       container["image"] = worker_image
     if role == "sampler":
       container["command"] = ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"]
+      # Templates may default to FFT. Match the gateway's actual publication
+      # format so an external Automodel LoRA trainer gets an adapter-enabled sampler.
+      set_env(container, "OPEN_RL_TRAINER_BACKEND", trainer_backend())
+      if trainer_backend() == "automodel":
+        set_env(container, "OPEN_RL_AUTOMODEL_LORA_RANK", os.getenv("OPEN_RL_AUTOMODEL_LORA_RANK", "0"))
     container.setdefault("args", []).extend(["--model-id", model_id])
     if base_model:
       set_env(container, "BASE_MODEL", base_model)

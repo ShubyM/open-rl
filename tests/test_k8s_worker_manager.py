@@ -88,6 +88,26 @@ class KubernetesFFTWorkerManagerTest(unittest.TestCase):
     self.assertIn({"name": "OPEN_RL_TIME_SLICE_JOB_ID", "value": "trainer-model-a-1"}, container["env"])
     self.assertIn({"name": "OPEN_RL_TIME_SLICE_GROUP", "value": "trainers"}, container["env"])
 
+  def test_automodel_fails_before_creating_an_unsupported_trainer_pod(self) -> None:
+    api = _FakeCoreApi()
+    manager = self._manager(api)
+    with (
+      patch.dict(os.environ, {"OPEN_RL_TRAINER_BACKEND": "automodel"}, clear=True),
+      self.assertRaisesRegex(RuntimeError, "Managed Kubernetes Automodel trainers are not supported"),
+    ):
+      manager.launch("model-a")
+    self.assertEqual(api.created, [])
+
+  def test_external_automodel_trainer_can_launch_adapter_enabled_samplers(self) -> None:
+    api = _FakeCoreApi()
+    manager = self._manager(api)
+    env = {"OPEN_RL_TRAINER_BACKEND": "automodel", "OPEN_RL_AUTOMODEL_LORA_RANK": "32", "OPEN_RL_EXTERNAL_TRAINER": "1"}
+    with patch.dict(os.environ, env, clear=True):
+      manager.launch_sampler("model-a")
+    container = api.created[0][1]["spec"]["containers"][0]
+    self.assertIn({"name": "OPEN_RL_TRAINER_BACKEND", "value": "automodel"}, container["env"])
+    self.assertIn({"name": "OPEN_RL_AUTOMODEL_LORA_RANK", "value": "32"}, container["env"])
+
   def test_launch_replaces_stale_job_id_env_from_template(self) -> None:
     api = _FakeCoreApi()
     manager = self._manager(api)

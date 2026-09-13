@@ -25,7 +25,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 from training import paths
-from training.distributed import is_primary
+from training.distributed import broadcast_object, is_primary
 
 SNAPSHOT_KEEP = 4
 
@@ -47,7 +47,7 @@ def publish(
   """
   adapter_root = os.path.join(paths.snapshot_root(), adapter_id)
   final_dir = os.path.join(adapter_root, session_label or adapter_id)
-  staging_root = os.path.join(adapter_root, f".staging-{os.getpid()}-{time.time_ns()}")
+  staging_root = broadcast_object(os.path.join(adapter_root, f".staging-{os.getpid()}-{time.time_ns()}"))
   if is_primary():
     os.makedirs(staging_root, exist_ok=True)
 
@@ -75,7 +75,10 @@ def publish(
         os.replace(alias_path, os.path.join(staging_root, "replaced-alias"))
       os.replace(staged_link, alias_path)
   finally:
-    shutil.rmtree(staging_root, ignore_errors=True)
+    # Other ranks finish their collective export before rank 0 publishes it.
+    # They must not remove the shared staging tree while rank 0 still uses it.
+    if is_primary():
+      shutil.rmtree(staging_root, ignore_errors=True)
 
   metadata = {"model_id": adapter_id, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
   if alias is not None:

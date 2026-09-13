@@ -14,6 +14,7 @@ PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
 UNIT_TESTS ?= tests.test_compute_target_logprobs tests.test_external_sampler tests.test_gateway_paths tests.test_accel_timeslicer tests.test_sampler_hot_reload tests.test_trainer_optimizer_correctness tests.test_lora_distributed tests.test_worker_manager tests.test_k8s_worker_manager tests.test_redis_store tests.test_cluster_eval_script
+UNIT_TESTS += tests.test_automodel_worker tests.test_automodel_models tests.test_automodel_activation_checkpointing tests.test_automodel_checkpoint tests.test_trainer_config tests.test_launch_work tests.test_worker_thread_device
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)

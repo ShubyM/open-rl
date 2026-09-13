@@ -20,6 +20,7 @@ from opentelemetry import propagate, trace
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.store import RequestStore, get_store
+from server.trainer_config import trainer_backend
 from training import paths
 from training.automodel_worker import AutomodelTrainingWorker
 from training.distributed import barrier, broadcast_object, is_distributed, is_primary, local_rank
@@ -35,25 +36,11 @@ tracer = trace.get_tracer(__name__)
 
 TrainingWorker = FFTTrainingWorker | LoraTrainingWorker | MegatronTrainingWorker | AutomodelTrainingWorker
 
-# Full-parameter backends. Both load their model from create_model rather than
-# BASE_MODEL, both run one torchrun process per GPU, and both take the
+# Dedicated backends load their model from create_model rather than
+# BASE_MODEL, run one torchrun process per GPU, and take the
 # time-sliced GPU lease -- everything start_request_processing_loop and
 # run_training_requests_processor branch on.
-FULL_PARAMETER_WORKERS = (FFTTrainingWorker, MegatronTrainingWorker, AutomodelTrainingWorker)
-
-
-def trainer_backend() -> str:
-  """Which trainer worker to run: "lora", "fft", "megatron", or "automodel"."""
-  backend = os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower()
-  if backend:
-    if backend not in ("lora", "fft", "megatron", "automodel"):
-      raise RuntimeError(f"Unknown OPEN_RL_TRAINER_BACKEND={backend!r}; expected lora, fft, megatron, or automodel")
-    return backend
-  return "fft" if is_fft_enabled() else "lora"
-
-
-def is_fft_enabled() -> bool:
-  return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
+DEDICATED_WORKERS = (FFTTrainingWorker, MegatronTrainingWorker, AutomodelTrainingWorker)
 
 
 def parse_datum(raw: dict[str, Any]) -> Datum:
@@ -278,7 +265,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
-    worker: FFTTrainingWorker | MegatronTrainingWorker,
+    worker: FFTTrainingWorker | MegatronTrainingWorker | AutomodelTrainingWorker,
     model_id: str | None,
     time_slicer: TimeSlicerClient | None,
   ):
@@ -296,9 +283,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     # (gateway.gateway_launches_trainers), so there is no second trainer to
     # contend with, and the time slicer is a no-op on a box it owns outright.
     self.model_id = model_id
-    self.workload = workload_from_env(
-      os.getpid(), job_id=workload_job_id("trainer", model_id or "shared"), group=TRAINER_TIME_SLICE_GROUP
-    )
+    self.workload = workload_from_env(os.getpid(), job_id=workload_job_id("trainer", model_id or "shared"), group=TRAINER_TIME_SLICE_GROUP)
     self.time_slicer = time_slicer
     self.snapshot_registered = False
 
@@ -345,9 +330,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
   async def run_once(self) -> None:
     if is_primary():
-      batch = await (
-        self.store.get_requests_for_model(self.model_id) if self.model_id else self.store.get_requests()
-      )
+      batch = await (self.store.get_requests_for_model(self.model_id) if self.model_id else self.store.get_requests())
     else:
       batch = None
     if is_distributed():
@@ -567,7 +550,7 @@ async def run_training_requests_processor(
 ) -> None:
   pin_worker_threads_to_this_rank()
   store = get_store()
-  if isinstance(worker, FULL_PARAMETER_WORKERS):
+  if isinstance(worker, DEDICATED_WORKERS):
     time_slicer = (time_slicer or time_slicer_client_from_env()) if is_primary() else None
     processor = FFTTrainingRequestsProcessor(store, worker, model_id, time_slicer)
   else:
@@ -579,12 +562,12 @@ def start_request_processing_loop() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated trainer worker drains.")
   args = parser.parse_args()
-  initialize_distributed()
+  backend = trainer_backend()
+  initialize_distributed(require_process_group=backend in {"automodel", "megatron"})
 
   print("\n" + "=" * 50)
   print("      Open-RL PyTorch Training Worker")
   print("=" * 50)
-  backend = trainer_backend()
   cuda_devs = os.getenv("CUDA_VISIBLE_DEVICES", "ALL")
   print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
   print(f"-> Trainer backend: {backend}")
@@ -596,20 +579,20 @@ def start_request_processing_loop() -> None:
     "fft": FFTTrainingWorker,
     "lora": LoraTrainingWorker,
   }[backend]()
-  full_parameter = isinstance(worker, FULL_PARAMETER_WORKERS)
+  dedicated = isinstance(worker, DEDICATED_WORKERS)
   preload_target = os.getenv("BASE_MODEL")
   is_ready = False
-  if preload_target and not full_parameter:
+  if preload_target and not dedicated:
     worker.load_base_model(preload_target)
     is_ready = True
   else:
-    if full_parameter:
+    if dedicated:
       print(f"[WORKER] {backend} mode loads its model from the create_model request.")
     else:
       print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
     is_ready = True
 
-  if not full_parameter and is_primary():
+  if not dedicated and is_primary():
     probe_app = FastAPI()
 
     @probe_app.get("/healthz")

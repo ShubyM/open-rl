@@ -1,4 +1,8 @@
+import os
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from server import gateway
@@ -106,6 +110,40 @@ class GatewayLifespanTest(unittest.IsolatedAsyncioTestCase):
 
 
 class FFTWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
+  async def test_automodel_uses_isolated_interpreter_and_torchrun_on_one_gpu(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      env = {
+        "REDIS_URL": "redis://localhost:6379",
+        "OPEN_RL_TRAINER_BACKEND": "automodel",
+        "AUTOMODEL_PYTHON": sys.executable,
+        "PYTHONPATH": "/existing/path",
+      }
+      with patch.dict(os.environ, env, clear=True), patch("server.worker_manager.subprocess.Popen") as popen:
+        FFTWorkerManager(project_dir=Path(tmp)).launch("model-a")
+
+    command = popen.call_args.args[0]
+    self.assertEqual(command[:4], [sys.executable, "-u", "-m", "torch.distributed.run"])
+    self.assertIn("--nproc-per-node=1", command)
+    self.assertEqual(command[-2:], ["--model-id", "model-a"])
+    self.assertEqual(popen.call_args.kwargs["env"]["PYTHONPATH"], f"{tmp}/src{os.pathsep}/existing/path")
+    self.assertEqual(popen.call_args.kwargs["env"]["OPEN_RL_CONTROL_BACKEND"], "cpu:gloo,cuda:nccl")
+
+  async def test_automodel_requires_an_executable_interpreter_before_spawning(self) -> None:
+    for interpreter in ("", "/missing/automodel/python"):
+      env = {
+        "REDIS_URL": "redis://localhost:6379",
+        "OPEN_RL_TRAINER_BACKEND": "automodel",
+        "AUTOMODEL_PYTHON": interpreter,
+      }
+      with (
+        self.subTest(interpreter=interpreter),
+        patch.dict(os.environ, env, clear=True),
+        patch("server.worker_manager.subprocess.Popen") as popen,
+      ):
+        with self.assertRaisesRegex(RuntimeError, "AUTOMODEL_PYTHON"):
+          FFTWorkerManager().launch("model-a")
+        popen.assert_not_called()
+
   async def test_requires_redis(self) -> None:
     with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
       FFTWorkerManager()

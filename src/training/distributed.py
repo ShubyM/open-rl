@@ -31,9 +31,9 @@ def is_primary() -> bool:
   return rank() == 0
 
 
-def initialize() -> None:
-  """Initialize the process group created by torchrun and select this rank's GPU."""
-  if not is_distributed() or dist.is_initialized():
+def initialize(*, require_process_group: bool = False) -> None:
+  """Initialize torchrun's group, including one rank for mesh-based backends."""
+  if (not is_distributed() and not require_process_group) or dist.is_initialized():
     return
   if torch.cuda.is_available():
     torch.cuda.set_device(local_rank())

@@ -510,7 +510,7 @@ class MegatronTrainingWorker(BaseTrainerWorker):
     memory for tensors that never get one.
 
     This deliberately does not make the worker a LoRA worker as far as the rest
-    of the system is concerned, and it stays in FULL_PARAMETER_WORKERS.
+    of the system is concerned, and it stays in DEDICATED_WORKERS.
     save_checkpoint keeps emitting an ordinary whole HF checkpoint, because the
     bridge's export path merges adapters into the base weights by default
     (export_hf_weights(merge_adapter_weights=True), which save_hf_pretrained

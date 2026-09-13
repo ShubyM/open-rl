@@ -30,6 +30,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from accel_timeslicer.time_slicer import is_time_slicing_enabled
+from server.trainer_config import sampler_uses_full_weights
 
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
@@ -75,10 +76,6 @@ async def wait_for_generation_drain() -> None:
     await generation_idle.wait_for(lambda: ACTIVE_GENERATIONS == 0)
 
 
-def is_fft_enabled() -> bool:
-  return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
-
-
 def vllm_sleep_level() -> int:
   """Use weight-preserving sleep unless the deployment opts into discard/reload."""
   level = int(os.getenv("OPEN_RL_VLLM_SLEEP_LEVEL", "1"))
@@ -105,7 +102,7 @@ def architecture_override_missing_for_fft() -> bool:
   weights were not loaded from checkpoint"), so multimodal base models must set
   VLLM_ARCHITECTURE_OVERRIDE (e.g. Gemma4ForCausalLM) to build the text graph.
   """
-  return is_fft_enabled() and vllm_language_model_only() and not os.getenv("VLLM_ARCHITECTURE_OVERRIDE")
+  return sampler_uses_full_weights() and vllm_language_model_only() and not os.getenv("VLLM_ARCHITECTURE_OVERRIDE")
 
 
 async def publish_sampler_ready(store: Any, model_id: str, instance_id: str) -> None:
@@ -125,7 +122,7 @@ async def clear_sampler_ready(store: Any, model_id: str, instance_id: str) -> No
 
 
 time_slicer: Any = None
-if is_fft_enabled() and is_time_slicing_enabled():
+if sampler_uses_full_weights() and is_time_slicing_enabled():
   from accel_timeslicer.time_slicer import time_slicer_client_from_env, workload_from_env
   from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, workload_job_id
 
@@ -140,8 +137,8 @@ def build_engine_kwargs(model_name: str) -> dict:
 
   engine_kwargs = {
     "model": model_name,
-    "enable_sleep_mode": is_fft_enabled(),
-    "enable_lora": not is_fft_enabled(),
+    "enable_sleep_mode": sampler_uses_full_weights(),
+    "enable_lora": not sampler_uses_full_weights(),
     "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", "8192")),
     "max_num_seqs": int(os.getenv("VLLM_MAX_NUM_SEQS", "64")),
     "gpu_memory_utilization": float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")),
@@ -151,7 +148,7 @@ def build_engine_kwargs(model_name: str) -> dict:
   }
   if attention_backend := os.getenv("OPEN_RL_VLLM_ATTENTION_BACKEND"):
     engine_kwargs["attention_backend"] = attention_backend
-  if not is_fft_enabled():
+  if not sampler_uses_full_weights():
     engine_kwargs["max_loras"] = 8
     engine_kwargs["max_lora_rank"] = 64
   if hf_overrides:
@@ -386,7 +383,7 @@ async def process_sampling_request(req: dict, store: Any) -> None:
       weights_path = req.get("weights_path")
       weights_revision = req.get("weights_revision") or weights_path
       generation_registered = False
-      if is_fft_enabled():
+      if sampler_uses_full_weights():
         async with reload_lock:
           await prepare_engine(weights_path, weights_revision)
           # Register before releasing the lock so a reload for a different

@@ -11,8 +11,8 @@
 #
 # Windows:
 #   sampler   vllm serve, data-parallel on the non-trainer GPUs   auto-starts
-#   gateway   API gateway (in-gateway trainer when TRAIN_GPUS=1)  auto-starts (waits for sampler)
-#   trainer   torchrun data-parallel LoRA trainer                 auto-starts (TRAIN_GPUS>1 only)
+#   gateway   API gateway (in-gateway FSDP trainer on one GPU)    auto-starts (waits for sampler)
+#   trainer   torchrun trainer (multiple GPUs or custom backend) auto-starts
 #   train     training command — TYPED, press Enter to launch
 #   eval      eval_checkpoint command — TYPED, edit checkpoint= then Enter
 #   gpu       nvidia-smi watch
@@ -132,6 +132,10 @@ fi
 # what fits -- see the 12b CONTEXT block -- so it is read before the model cases.
 # It needs AFFINITY=1 and its own environment; see the backend block below.
 TRAINER_BACKEND=${TRAINER_BACKEND:-fsdp}
+case "$TRAINER_BACKEND" in
+  fsdp|megatron|automodel) ;;
+  *) echo "ERROR: unknown TRAINER_BACKEND=$TRAINER_BACKEND (use fsdp, megatron, or automodel)." >&2; exit 1 ;;
+esac
 
 # The 27B ceiling on a 141GB H200 is 98K tokens (measured, activation offload
 # on); 9B fits its full 262K window with room to spare.
@@ -453,16 +457,24 @@ case "$GPU0" in
 esac
 echo "[work] GPU: $GPU0 -> FLA_TILELANG=$FLA_TILELANG"
 
-# TRAIN_GPUS=1 (default): trainer runs inside the gateway on GPU 0.
-# TRAIN_GPUS=N>1: dedicated torchrun trainer (data-parallel LoRA) on GPUs
-# 0..N-1 via the Redis queue; the sampler shrinks to the remaining GPUs.
+# FSDP on one GPU runs inside the gateway. Multi-GPU and custom backends use
+# torchrun via Redis; Automodel and Megatron need their own interpreter even
+# on one GPU, and Automodel requires an initialized process group.
 TRAIN_GPUS=${TRAIN_GPUS:-1}
-NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l); NUM_GPUS=${NUM_GPUS:-8}
+NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [[ ! "$TRAIN_GPUS" =~ ^[1-9][0-9]*$ ]] || [ "$TRAIN_GPUS" -ge "$NUM_GPUS" ]; then
+  echo "ERROR: TRAIN_GPUS must be a positive integer smaller than the available GPU count ($NUM_GPUS), got $TRAIN_GPUS." >&2
+  exit 1
+fi
 SAMPLER_DP=$((NUM_GPUS - TRAIN_GPUS))
 SAMPLER_DEV=$(seq -s, "$TRAIN_GPUS" $((NUM_GPUS - 1)))
 TRAIN_DEV=$(seq -s, 0 $((TRAIN_GPUS - 1)))
+EXTERNAL_TRAINER=0
+if [ "$TRAIN_GPUS" -gt 1 ] || [ "$TRAINER_BACKEND" != "fsdp" ]; then
+  EXTERNAL_TRAINER=1
+fi
 QUEUE_ENV=""
-if [ "$TRAIN_GPUS" -gt 1 ]; then
+if [ "$EXTERNAL_TRAINER" = "1" ]; then
   # Ephemeral queue: no RDB snapshots or AOF — background persistence of
   # multi-MB training payloads is pure stall risk for zero value. Raise the
   # fd limit before daemonizing: redis derives maxclients from it, and every
@@ -579,13 +591,24 @@ if [ "$TRAINER_BACKEND" = "automodel" ]; then
   fi
   AUTOMODEL_TP=${AUTOMODEL_TP:-1}
   AUTOMODEL_CP=${AUTOMODEL_CP:-1}
+  AUTOMODEL_LORA_RANK=${AUTOMODEL_LORA_RANK:-16}
+  for setting in AUTOMODEL_TP AUTOMODEL_CP; do
+    if [[ ! "${!setting}" =~ ^[1-9][0-9]*$ ]] || [ "${!setting}" -gt "$TRAIN_GPUS" ]; then
+      echo "ERROR: $setting must be a positive integer no larger than TRAIN_GPUS=$TRAIN_GPUS, got ${!setting}." >&2
+      exit 1
+    fi
+  done
   if [ $((TRAIN_GPUS % (AUTOMODEL_TP * AUTOMODEL_CP))) -ne 0 ]; then
     echo "ERROR: TRAIN_GPUS=$TRAIN_GPUS is not divisible by AUTOMODEL_TP=$AUTOMODEL_TP * AUTOMODEL_CP=$AUTOMODEL_CP." >&2
     exit 1
   fi
+  if [[ ! "$AUTOMODEL_LORA_RANK" =~ ^[1-9][0-9]*$ ]] || [ "$AUTOMODEL_LORA_RANK" -gt 64 ]; then
+    echo "ERROR: AUTOMODEL_LORA_RANK must be between 1 and 64 for this launcher's external vLLM samplers, got $AUTOMODEL_LORA_RANK." >&2
+    exit 1
+  fi
   BACKEND_ENV="OPEN_RL_TRAINER_BACKEND=automodel OPEN_RL_ENABLE_FFT=true \
 OPEN_RL_AUTOMODEL_TP=$AUTOMODEL_TP OPEN_RL_AUTOMODEL_CP=$AUTOMODEL_CP \
-OPEN_RL_AUTOMODEL_LORA_RANK=${AUTOMODEL_LORA_RANK:-16} \
+OPEN_RL_AUTOMODEL_LORA_RANK=$AUTOMODEL_LORA_RANK \
 OPEN_RL_TIME_SLICING=off OPEN_RL_CONTROL_BACKEND=cpu:gloo,cuda:nccl"
   # Same single-vNIC NCCL fix as the Megatron trainer: the A3 profile pins the
   # gIB plugin and NCCL aborts on the first collective instead of falling back.
@@ -648,7 +671,7 @@ uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
 fi
 
 GATEWAY_DEV=0
-[ "$TRAIN_GPUS" -gt 1 ] && GATEWAY_DEV=""
+[ "$EXTERNAL_TRAINER" = "1" ] && GATEWAY_DEV=""
 GATEWAY_CMD="$SAMPLER_WAIT; \
 CUDA_VISIBLE_DEVICES=$GATEWAY_DEV $QUEUE_ENV FLA_TILELANG=$FLA_TILELANG BASE_MODEL=$MODEL_NAME $SAMPLER_ENV $BACKEND_ENV \
 OPEN_RL_SAMPLER_TIMEOUT=${SAMPLER_TIMEOUT:-14400} \
@@ -758,7 +781,7 @@ tmux send-keys -t "$SESSION:sampler" "$SAMPLER_CMD" C-m
 tmux new-window -t "$SESSION" -n gateway -c "$REPO"
 tmux send-keys -t "$SESSION:gateway" "$GATEWAY_CMD" C-m
 
-if [ "$TRAIN_GPUS" -gt 1 ]; then
+if [ "$EXTERNAL_TRAINER" = "1" ]; then
   # The Megatron trainer runs on the interpreter that has megatron-bridge, which
   # is not the project venv, so the package comes off PYTHONPATH rather than an
   # install and torchrun is spelled as the module it actually is.
