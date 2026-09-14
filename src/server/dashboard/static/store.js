@@ -18,7 +18,10 @@ export const ui = {
   render: () => {},
 };
 
-export const route = () => location.hash.slice(1).split("/").map(decodeURIComponent);
+export const route = () => location.hash.slice(1).split("/").map((part) => {
+  try { return decodeURIComponent(part); }
+  catch { return part; }
+});
 
 export async function get(url, signal) {
   const timeout = AbortSignal.timeout(15000);

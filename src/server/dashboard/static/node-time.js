@@ -15,16 +15,17 @@ export function timeWindow() {
 export function timeControl(range) {
   const duration = range.now - range.start, seconds = duration <= 120;
   const local = (at) => new Date(at * 1000).toISOString().slice(0, seconds ? 19 : 16);
+  const recording = !!ui.state?.recorded_at, startDate = local(range.start).slice(0, 10), endDate = local(range.now).slice(0, 10);
   const custom = [[Math.floor(duration / 3600), "h"], [Math.floor(duration / 60) % 60, "m"], [duration % 60, "s"]].filter(([n]) => n).map(([n, unit]) => `${n}${unit}`).join(" ");
   const options = WINDOWS.some(([n]) => n === duration) ? WINDOWS : [[duration, `${custom} (custom)`], ...WINDOWS];
   const chevron = (rotation = 0) => `<svg class="time-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 5.5 5 5 5-5" transform="rotate(${rotation} 8 8)"/></svg>`;
-  const label = range.live ? `Last ${WINDOWS.find(([n]) => n === duration)?.[1] || custom}` : `${local(range.now).slice(5, 10)} · ${nodeTime(range.start, seconds)} – ${nodeTime(range.now, seconds)}`;
+  const label = range.live ? `Last ${WINDOWS.find(([n]) => n === duration)?.[1] || custom}` : `${startDate.slice(5)} · ${nodeTime(range.start, seconds)} – ${startDate === endDate ? "" : `${endDate.slice(5)} · `}${nodeTime(range.now, seconds)}`;
   return `<div class="time-control" aria-label="Node time range">
     <button type="button" class="time-shift" data-time-shift="-1" aria-label="Previous time window" ${range.start <= nodeNow() - 86400 ? "disabled" : ""}>${chevron(90)}</button>
     <details class="time-picker" data-key="node-time-picker"><summary class="time-summary" title="${escape(label)}"><span>${escape(label)}</span>${chevron()}</summary>
       <div class="time-popover"><label>Window <select data-time-duration>${options.map(([n, text]) => `<option value="${n}" ${n === duration ? "selected" : ""}>${escape(text)}</option>`).join("")}</select></label>
       <label>Until (UTC)<input type="datetime-local" data-time-end value="${range.live ? "" : local(range.now)}" min="${local(nodeNow() - 86400 + duration)}" max="${local(nodeNow())}" step="${seconds ? 1 : 60}"></label>
-      ${range.live ? '<span class="muted">Following current time</span>' : button("Return to live", 'data-time-live="true"')}</div>
+      ${range.live ? `<span class="muted">${recording ? "At recording end" : "Following current time"}</span>` : button(recording ? "Return to recording end" : "Return to live", 'data-time-live="true"')}</div>
     </details><button type="button" class="time-shift" data-time-shift="1" aria-label="Next time window" ${range.now >= nodeNow() ? "disabled" : ""}>${chevron(-90)}</button></div>`;
 }
 

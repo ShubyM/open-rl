@@ -9,7 +9,7 @@ import { installActivityHover, hideActivityHover } from "./activity.js";
 import { root, content, ui, route, get, nodeNow } from "./store.js";
 import { renderNodes } from "./nodes.js";
 import { installNodeTime, cancelNodeGesture, timeWindow } from "./node-time.js";
-import { runPage, ensureLogs, loadLogs, runView, resetRunWindow, syncRunRoute, setLogFilter, setLogEvent, toggleLogFollow } from "./run.js";
+import { runPage, openRun, ensureLogs, loadLogs, runView, resetRunWindow, syncRunRoute, setLogFilter, setLogEvent, toggleLogFollow } from "./run.js";
 import { use, beginRender, endRender } from "./cache.js";
 
 const pageOf = (page) => (!page || ["run", "runs"].includes(page) ? "overview" : page);
@@ -19,11 +19,6 @@ function render() {
   hideActivityHover();
   const [page, id, tab] = route();
   syncRunRoute(page, id, tab);
-  const current = pageOf(page);
-  root.querySelectorAll(".appbar nav a").forEach((link) => {
-    if (link.hash === `#${current}`) link.setAttribute("aria-current", "page");
-    else link.removeAttribute("aria-current");
-  });
   beginRender();
   try {
     if (page === "nodes") renderNodes();
@@ -35,6 +30,11 @@ function render() {
   } finally {
     endRender();
   }
+  const current = page === "run" ? runView.origin : pageOf(page);
+  root.querySelectorAll(".appbar nav a").forEach((link) => {
+    if (link.hash === `#${current}`) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  });
   if (page === "run" && tab === "logs") ensureLogs(id);
 }
 ui.render = render;
@@ -43,7 +43,16 @@ installActivityHover();
 
 // ---- interactions ----------------------------------------------------------
 
+function closeDetails() {
+  const previous = ui.expanded;
+  ui.expanded = ui.gpuGroup = null;
+  render();
+  if (previous) content.querySelector(`[data-placement="${CSS.escape(previous)}"]`)?.focus({ preventScroll: true });
+}
+
 root.addEventListener("click", (event) => {
+  const runLink = event.target.closest('a[href^="#run/"]');
+  if (runLink && route()[0] !== "run") openRun(decodeURIComponent(runLink.hash.split("/")[1]), route()[0] === "nodes" ? timeWindow() : null);
   const jump = event.target.closest("a[data-scheduler-placement]");
   if (jump) {
     ui.nodeSelection = { duration: ui.nodeSelection.duration, end: null };
@@ -62,17 +71,20 @@ root.addEventListener("click", (event) => {
   const allocation = event.target.closest("[data-placement]");
   if (allocation) {
     const acrossNodes = allocation.closest(".cross-node-activity");
+    const top = acrossNodes?.getBoundingClientRect().top;
     if (!ui.expanded || acrossNodes) {
       ui.gpuGroup = null;
       ui.device = "all";
     }
     ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.matches(".hold, .activity-label, .activity-block") ? null : allocation.dataset.placement;
     render();
-    if (acrossNodes) content.querySelector(".cross-node-activity")?.scrollIntoView({ block: "nearest" });
+    const comparison = content.querySelector(".cross-node-activity");
+    if (acrossNodes && comparison) window.scrollBy(0, comparison.getBoundingClientRect().top - top);
     return;
   }
   const target = event.target.closest("button");
   if (!target) return;
+  if (target.hasAttribute("data-close-details")) return closeDetails();
   if (target.hasAttribute("data-retry-snapshot")) refresh();
   if (target.dataset.device) {
     ui.device = target.dataset.device;
@@ -112,11 +124,7 @@ root.addEventListener("keydown", (event) => {
     }
   }
   if (!event.defaultPrevented && event.key === "Escape" && ui.expanded) {
-    const previous = ui.expanded;
-    ui.expanded = null;
-    ui.gpuGroup = null;
-    render();
-    root.querySelector(`[data-placement="${CSS.escape(previous)}"]`)?.focus();
+    closeDetails();
   }
 });
 
@@ -169,13 +177,14 @@ document.addEventListener("click", (event) => {
   });
 });
 
-window.addEventListener("hashchange", () => {
+window.addEventListener("hashchange", (event) => {
   cancelNodeGesture();
   clearTimeout(searchTimer);
   syncRunRoute(...route());
   content.innerHTML = "";
   render();
   if (route()[0] === "experiments") content.querySelector('.experiment-row[aria-current="true"]')?.scrollIntoView({ block: "nearest" });
+  if (route()[0] === "nodes" && new URL(event.oldURL).hash.startsWith("#run/")) content.querySelector("#placement-detail")?.scrollIntoView({ block: "start" });
 });
 
 // ---- polling -----------------------------------------------------------------

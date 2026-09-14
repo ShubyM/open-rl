@@ -9,6 +9,7 @@ import { use } from "./cache.js";
 import { timeWindow, timeControl } from "./node-time.js";
 
 const laneHeight = (devices) => (devices.length === 1 ? 30 : 22);
+const axisTime = (at, range) => `${range.now - range.start >= 86400 ? `${new Date(at * 1000).toISOString().slice(5, 10)} ` : ""}${nodeTime(at, range.now - range.start <= 120)}`;
 // ---- history -> segments -----------------------------------------------------------
 
 // Keep the selected placement available when panning beyond its lifetime.
@@ -235,7 +236,7 @@ function activityTimeline(placements, devices, range, { acrossNodes = false } = 
   const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
   const block = (from, to, top = 0, bottom = 24) => `M${x(from)},${top} H${x(to)} V${bottom} H${x(from)} Z`;
   const path = (p, blocks) => `<path class="activity-block ${placementColor(p)}" ${canSelect(p) ? `data-placement="${escape(p.id)}"` : ""} data-selected="${p.id === ui.expanded}" data-label="${escape(acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
-  const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${nodeTime(range.start + ((range.now - range.start) * tick) / 4, range.now - range.start <= 120)}</span>`).join("");
+  const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${axisTime(range.start + ((range.now - range.start) * tick) / 4, range)}</span>`).join("");
   const activities = [...placements].sort((a, b) => (acrossNodes ? (a.role || "").localeCompare(b.role || "") || a.node.localeCompare(b.node) : 0) || a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
   const combined = byGpu ? devices.map((device) => {
     const jobs = activities.filter((p) => p.devices.includes(device.id));
@@ -277,7 +278,7 @@ function runAcrossNodes(placement, all, range) {
   const related = all.filter((p) => p.node && p.run_ids?.includes(runId));
   if (new Set(related.map((p) => p.node).filter(Boolean)).size < 2) return "";
   const warnings = [...new Set(related.map((p) => operationActivity(p, range)).flatMap((a) => [a.warning, a.errorStatus !== 404 && a.error]).filter(Boolean))];
-  return `<div class="cross-node-activity" data-key="across:${escape(runId)}"><div class="allocation-detail-head"><h2>Run across nodes</h2><a href="#run/${encode(runId)}/metrics">${escape(placement.label)} ↗</a></div>${activityTimeline(related, [], range, { acrossNodes: true })}${warnings.length ? `<p class="source-error" role="status">${escape(warnings.join(" · "))}</p>` : ""}</div>`;
+  return `<div class="cross-node-activity" data-key="across:${escape(runId)}"><div class="allocation-detail-head"><h2>${escape(placement.label)} <span class="muted">· Across nodes</span></h2><a href="#run/${encode(runId)}/metrics">Run details ↗</a></div>${activityTimeline(related, [], range, { acrossNodes: true })}${warnings.length ? `<p class="source-error" role="status">${escape(warnings.join(" · "))}</p>` : ""}</div>`;
 }
 
 function detail(placement, range, neighbours, all) {
@@ -323,13 +324,13 @@ function detail(placement, range, neighbours, all) {
   const warnings = [...new Set(activities.flatMap((a) => [a.warning, a.errorStatus !== 404 && a.error]).filter(Boolean))];
   const source = activities.every((a) => a.exact) ? "GPU turns" : activities.some((a) => a.exact) ? "GPU turns and recorded operations" : "Recorded operations; may include GPU wait time";
   const acrossNodes = runAcrossNodes(placement, all, range);
-  return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(anchor.id)}" data-view="${ui.activityView}"><div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)}</h2><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div>
+  return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(anchor.id)}" data-view="${ui.activityView}"><div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)}</h2><div class="allocation-detail-actions"><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span><button type="button" class="detail-close" data-close-details aria-label="Close GPU details" title="Close (Esc)">×</button></div></div>
     <div class="allocation-controls"><div class="allocation-device-picker" aria-label="GPU selection">${picker}</div><div class="activity-view" role="group" aria-label="Activity layout">${[ ["gpu", "By GPU"], ["run", "By run"] ].map(([view, text]) => button(text, `data-activity-view="${view}" aria-pressed="${ui.activityView === view}"`)).join("")}</div></div>
     ${activityTimeline(visible, devices.filter((d) => ui.device === "all" || d.id === ui.device), range)}
     ${warnings.length ? `<p class="source-error" role="status">${escape(warnings.join(" · "))}</p>` : ""}
+    ${acrossNodes}
     <div>${gpuChart(metrics, range)}</div>
-    <div class="allocation-detail-footer"><span>${source}. Gaps may include unrecorded activity.</span>${run && !acrossNodes ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : ""}</div>
-    ${acrossNodes}</section>`;
+    <div class="allocation-detail-footer"><span>${source}. Gaps may include unrecorded activity.</span>${run && !acrossNodes ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} · Run details ↗</a>` : ""}</div></section>`;
 }
 
 const selectedDevices = (metrics) => [...new Map((metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id).map((d) => [d.uuid || d.id, d])).values()];
@@ -380,12 +381,12 @@ export function renderNodes() {
   const { cluster } = ui.state;
   const occupied = new Set(ui.state.placements.map((p) => p.node));
   const nodes = [...cluster.nodes].sort((a, b) => Number(occupied.has(b.name)) - Number(occupied.has(a.name)) || Number(b.gpu_capacity > 0) - Number(a.gpu_capacity > 0));
-  const axis = [0, 1, 2, 3].map((tick) => `<span>${nodeTime(range.start + ((range.now - range.start) * tick) / 3, range.now - range.start <= 120)}</span>`).join("");
+  const axis = [0, 1, 2, 3].map((tick) => `<span>${axisTime(range.start + ((range.now - range.start) * tick) / 3, range)}</span>`).join("");
   const errors = [...new Set([cluster.error, cluster.nodes_error, cluster.devices?.error, cluster.scheduler?.error, ui.state.history_error].filter(Boolean))];
   morph(
     content,
     `<div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>${timeControl(range)}</div>${errors.map((error) => `<p class="source-error" role="status">${escape(error)}</p>`).join("")}${!cluster.available && !errors.length ? empty("Kubernetes unavailable") : ""}
-    <div class="node-time-header"><span>Node</span><div class="node-axis">${axis}</div><span class="node-duty" title="GPU allocation time divided by capacity over the selected window">Duty</span></div>
+    <div class="node-time-header"><span>Node</span><div class="node-axis">${axis}</div><span class="node-duty" title="GPU claimed time over this window, not measured GPU utilization">Claimed</span></div>
     ${nodes.map((node) => lane(node, all, range)).join("") || (!errors.length && cluster.available ? empty("No nodes reported by Kubernetes") : "")}`,
   );
 }

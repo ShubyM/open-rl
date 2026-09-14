@@ -670,6 +670,29 @@ body {
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
+#orl-design-lab .allocation-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+#orl-design-lab .detail-close {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--dim);
+  background: transparent;
+  font-size: 22px;
+  line-height: 1;
+}
+#orl-design-lab .detail-close:hover {
+  border-color: var(--line);
+  background: var(--paper);
+  color: var(--ink);
+}
 #orl-design-lab .allocation-controls {
   display: flex;
   align-items: center;
@@ -1444,7 +1467,8 @@ body {
     max-width: 100%;
   }
   #orl-design-lab .workspace-logrow {
-    gap: 10px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
     padding-block: 8px;
   }
   #orl-design-lab .scheduler-reservation {
