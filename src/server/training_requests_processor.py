@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import threading
 import time
 import traceback
@@ -295,6 +296,19 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     return {"status": "ok", "type": "weights_saved"}
 
 
+# Every Nth sampler save is a full snapshot instead of a delta. The deltas
+# before it are then dead weight: the sampler has applied them and the full
+# replaces the chain. An 8B run otherwise leaves 3 GiB per step on the volume.
+SAMPLER_FULL_EVERY = int(os.getenv("OPEN_RL_SAMPLER_FULL_EVERY", "10"))
+
+
+def sibling_versions(path: str) -> list[str]:
+  parent = os.path.dirname(path)
+  if not os.path.isdir(parent):
+    return []
+  return [p for p in (os.path.join(parent, name) for name in os.listdir(parent)) if os.path.isdir(p) and p != path]
+
+
 class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
@@ -314,6 +328,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM)
     self.time_slicer = time_slicer
     self.snapshot_registered = False
+    self.sampler_saves = 0
 
   async def exit_gracefully(self, unregister: bool = True) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
@@ -510,13 +525,20 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
     rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
     local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
-    await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
+    self.sampler_saves += 1
+    full = SAMPLER_FULL_EVERY > 0 and self.sampler_saves % SAMPLER_FULL_EVERY == 0
+    older = sibling_versions(local_path) if full else []
+    await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler", full=full)
     if hasattr(self.store, "redis"):
       num_subs = await self.store.redis.publish(
         f"open_rl:weight_update:{model_id}",
         json.dumps({"weights_path": local_path}),
       )
       print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")
+    for path in older:
+      shutil.rmtree(path, ignore_errors=True)
+    if older:
+      print(f"[Trainer] Wrote a full sampler snapshot to {local_path} and removed {len(older)} earlier versions")
     return {
       "path": payload.get("path"),
       "sampling_session_id": payload.get("sampling_session_id"),

@@ -171,7 +171,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     print(f"Saved full fine-tuning model to {save_path}")
     return {"path": save_path}
 
-  def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
+  def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state", full: bool = False) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     if self.cpu_offload and not self._is_offloaded:
       raise RuntimeError(
@@ -180,8 +180,9 @@ class FFTTrainingWorker(BaseTrainerWorker):
       )
 
     # Under the delta strategy save_state writes the sparse delta the sampler
-    # consumes. load_from_state cannot open it, so FFT is not resumable yet.
-    if self.weight_sync_cfg.strategy == "delta":
+    # consumes, unless the caller asks for a full snapshot. load_from_state
+    # cannot open a delta, so FFT is not resumable yet.
+    if self.weight_sync_cfg.strategy == "delta" and not full:
       if kind != "sampler":
         logger.warning("save_state for %s under the delta strategy writes a delta, not a resumable checkpoint", model_id)
       return self.save_state_delta(model_id=model_id, state_path=state_path, kind=kind)
