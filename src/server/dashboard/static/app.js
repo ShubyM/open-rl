@@ -2,20 +2,22 @@
 // Every page is a function of the shared store; this file decides which page
 // runs, keeps the snapshot fresh, and turns user input into state changes.
 
-import { encode, morph } from "./ui.js";
+import { morph } from "./ui.js";
 import { runs, scheduler, health, experiments } from "./views.js";
 import { hoverChart, inspectChart } from "./charts.js";
 import { installActivityHover, hideActivityHover } from "./activity.js";
 import { root, content, ui, route, get, nodeNow } from "./store.js";
 import { renderNodes } from "./nodes.js";
 import { installNodeTime, cancelNodeGesture, timeWindow } from "./node-time.js";
-import { runPage, openRun, ensureLogs, loadLogs, runView, resetRunWindow, syncRunRoute, setLogFilter, setLogEvent, toggleLogFollow } from "./run.js";
+import { runPage, ensureLogs, loadLogs, runView, resetRunWindow, syncRunRoute, setLogFilter, setLogEvent, toggleLogFollow } from "./run.js";
+import { restoreView, syncViewURL, currentView, copyView, viewReady } from "./navigation.js";
 import { use, beginRender, endRender } from "./cache.js";
 
 const pageOf = (page) => (!page || ["run", "runs"].includes(page) ? "overview" : page);
+let scrollToSelection = false;
 
 function render() {
-  if (!ui.state) return;
+  if (!ui.state || !viewReady()) return;
   hideActivityHover();
   const [page, id, tab] = route();
   syncRunRoute(page, id, tab);
@@ -32,14 +34,26 @@ function render() {
   }
   const current = page === "run" ? runView.origin : pageOf(page);
   root.querySelectorAll(".appbar nav a").forEach((link) => {
-    if (link.hash === `#${current}`) link.setAttribute("aria-current", "page");
+    if (route(link.hash)[0] === current) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   });
+  syncViewURL();
+  if (page === "nodes" && scrollToSelection) {
+    content.querySelector("#placement-detail")?.scrollIntoView({ block: "start" });
+    scrollToSelection = false;
+  }
   if (page === "run" && tab === "logs") ensureLogs(id);
 }
 ui.render = render;
+restoreView();
+scrollToSelection = route()[0] === "nodes" && !!ui.expanded;
 installNodeTime();
 installActivityHover();
+root.addEventListener("toggle", (event) => {
+  if (!event.target.matches("details[data-run-metrics]")) return;
+  syncViewURL();
+  if (event.target.open && !event.target.querySelector(".run-metric-summary")) render();
+}, true);
 
 // ---- interactions ----------------------------------------------------------
 
@@ -51,21 +65,12 @@ function closeDetails() {
 }
 
 root.addEventListener("click", (event) => {
-  const runLink = event.target.closest('a[href^="#run/"]');
-  if (runLink && route()[0] !== "run") openRun(decodeURIComponent(runLink.hash.split("/")[1]), route()[0] === "nodes" ? timeWindow() : null);
-  const jump = event.target.closest("a[data-scheduler-placement]");
-  if (jump) {
-    ui.nodeSelection = { duration: ui.nodeSelection.duration, end: null };
-    ui.expanded = jump.dataset.schedulerPlacement;
-    ui.gpuGroup = null;
-    ui.device = "all";
-  }
   const incident = event.target.closest("[data-event-at], [data-all-logs]");
   if (incident) {
     event.preventDefault();
     setLogEvent(incident.dataset.eventAt ? Number(incident.dataset.eventAt) : null);
     if (route()[2] === "logs") render();
-    else location.hash = `run/${encode(route()[1])}/logs`;
+    else location.hash = currentView(false, "logs");
     return;
   }
   const allocation = event.target.closest("[data-placement]");
@@ -84,6 +89,7 @@ root.addEventListener("click", (event) => {
   }
   const target = event.target.closest("button");
   if (!target) return;
+  if (target.hasAttribute("data-copy-view")) return void copyView(target);
   if (target.hasAttribute("data-close-details")) return closeDetails();
   if (target.hasAttribute("data-retry-snapshot")) refresh();
   if (target.dataset.device) {
@@ -132,6 +138,7 @@ let searchTimer;
 root.addEventListener("input", (event) => {
   if (event.target.id === "log-search") {
     setLogFilter("q", event.target.value);
+    syncViewURL();
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
       if (route()[0] === "run" && route()[2] === "logs") loadLogs(route()[1]);
@@ -177,14 +184,15 @@ document.addEventListener("click", (event) => {
   });
 });
 
-window.addEventListener("hashchange", (event) => {
-  cancelNodeGesture();
+window.addEventListener("hashchange", () => {
+  cancelNodeGesture(false);
   clearTimeout(searchTimer);
+  restoreView();
+  scrollToSelection = route()[0] === "nodes" && !!ui.expanded;
   syncRunRoute(...route());
   content.innerHTML = "";
   render();
   if (route()[0] === "experiments") content.querySelector('.experiment-row[aria-current="true"]')?.scrollIntoView({ block: "nearest" });
-  if (route()[0] === "nodes" && new URL(event.oldURL).hash.startsWith("#run/")) content.querySelector("#placement-detail")?.scrollIntoView({ block: "start" });
 });
 
 // ---- polling -----------------------------------------------------------------

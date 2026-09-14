@@ -29,7 +29,7 @@ body {
   --status-complete: light-dark(#496a97, #9bb0ce);
   --radius: 5px;
   --gutter: 22px;
-  --node-label-width: 140px;
+  --node-label-width: 200px;
   --gpu-index-width: 38px;
   --gpu-index-gap: 6px;
   --sans: Inter, ui-sans-serif, system-ui, sans-serif;
@@ -321,8 +321,8 @@ body {
 #orl-design-lab .time-control {
   position: relative;
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) 32px;
-  width: 336px;
+  grid-template-columns: 32px minmax(0, 1fr) 32px 80px;
+  width: 424px;
   max-width: 100%;
   align-items: center;
   gap: 8px;
@@ -385,9 +385,9 @@ body {
 #orl-design-lab .time-popover {
   position: absolute;
   z-index: 5;
-  top: calc(100% + 6px);
+  top: 38px;
   left: 0;
-  right: 0;
+  right: 88px;
   display: grid;
   gap: 12px;
   padding: 14px;
@@ -463,8 +463,17 @@ body {
   white-space: nowrap;
 }
 #orl-design-lab .node-accelerator {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+#orl-design-lab .unavailable-selection {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  color: var(--status-warning);
 }
 #orl-design-lab .claim-label {
   flex: none;
@@ -884,6 +893,9 @@ body {
 #orl-design-lab .cross-node-activity .activity-block:not([data-placement]) {
   cursor: default;
 }
+#orl-design-lab .cross-node-activity a > .activity-block {
+  cursor: pointer;
+}
 #orl-design-lab .cross-node-activity[data-inspecting] .activity-track::after {
   content: "";
   position: absolute;
@@ -1171,6 +1183,24 @@ body {
   gap: 8px 16px;
   margin-bottom: 16px;
 }
+#orl-design-lab .run-activity {
+  border-top: 0;
+  padding-top: 0;
+}
+#orl-design-lab .activity-source {
+  margin-top: 12px;
+  color: var(--dim);
+  font-size: 11px;
+}
+#orl-design-lab .run-metrics {
+  margin-top: 20px;
+  border-top: 1px solid var(--line);
+}
+#orl-design-lab .run-metrics > summary {
+  padding: 14px 0;
+  cursor: pointer;
+  font-size: 13px;
+}
 #orl-design-lab .log-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -1410,6 +1440,16 @@ body {
     gap: 6px;
     font-size: 12px;
   }
+  #orl-design-lab .time-control {
+    grid-template-columns: 32px minmax(0, 1fr) 32px;
+  }
+  #orl-design-lab .time-control > [data-copy-view] {
+    grid-column: 1 / -1;
+    justify-self: end;
+  }
+  #orl-design-lab .time-popover {
+    right: 0;
+  }
   #orl-design-lab .claim-label {
     padding-inline: 3px;
     font-size: 10px;
@@ -1447,6 +1487,15 @@ body {
   }
   #orl-design-lab .activity-axis span:not(:first-child):not(:last-child) {
     display: none;
+  }
+  #orl-design-lab .cross-node-activity :is(.activity-header, .activity-row) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  #orl-design-lab .cross-node-activity .activity-header h3 {
+    display: none;
+  }
+  #orl-design-lab .cross-node-activity :is(.activity-track, .activity-axis) {
+    grid-column: 1;
   }
   #orl-design-lab .chart-tip {
     max-width: 230px;

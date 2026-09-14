@@ -3,6 +3,16 @@ export const encode = encodeURIComponent;
 export const empty = (text) => `<p class="empty-state">${escape(text)}</p>`;
 export const button = (label, attrs = "") => `<button type="button" class="chip" ${attrs}>${escape(label)}</button>`;
 
+export function shortNodeName(name, nodes = []) {
+  const full = String(name || "—"), parts = full.split("-");
+  const others = nodes.map((node) => typeof node === "string" ? node : node.name).filter((other) => other && other !== full);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const suffix = parts.slice(i).join("-");
+    if (suffix && !others.some((other) => other === suffix || other.endsWith(`-${suffix}`))) return suffix;
+  }
+  return full;
+}
+
 export const runStatus = (value) => {
   const label = String(value || "unknown");
   const tone =

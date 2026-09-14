@@ -1,14 +1,14 @@
-// One run's page: a metrics tab with the worker's operation timings, and a
-// logs tab over Cloud Logging with search, pod filter and paging.
+// One run's activity across its workers, with optional metrics and pod logs.
 
 import { runIncidents } from "./timeline.js";
 import { escape, encode, empty, button, runStatus } from "./ui.js";
 import { chart } from "./charts.js";
+import { runActivity } from "./nodes.js";
 import { ui, get, nodeNow } from "./store.js";
 import { use } from "./cache.js";
 
 // The inspected run's window, and the log page that was loaded for it.
-export const runView = { id: null, origin: "overview", windowMinutes: 30, windowEnd: 0, eventAt: null, follow: true };
+export const runView = { id: null, origin: "overview", nodeBack: null, windowMinutes: 30, windowEnd: 0, eventAt: null, follow: true };
 export const logState = { key: null, records: [], cursor: null, loading: false, error: null, source: null, q: "", pod: "", params: null };
 const MAX_LOGS = 2000;
 let active = "",
@@ -25,7 +25,7 @@ function stopLogs(clear = false) {
 }
 
 // The only background log work belongs to the visible run's Logs tab.
-export function syncRunRoute(page, id, tab = "metrics") {
+export function syncRunRoute(page, id, tab = "activity") {
   const next = page === "run" ? `${id}/${tab}` : "";
   if (active === next) return;
   stopLogs();
@@ -44,12 +44,12 @@ export function resetRunWindow() {
   stopLogs(true);
 }
 
-export function openRun(id, range = null) {
+export function openRun(id) {
   runView.id = id;
-  runView.origin = range ? "nodes" : "overview";
+  runView.origin = "overview";
+  runView.nodeBack = null;
   logState.q = logState.pod = "";
   resetRunWindow();
-  if (range) Object.assign(runView, { windowMinutes: (range.now - range.start) / 60, windowEnd: range.now, follow: range.live });
 }
 
 export function setLogFilter(field, value) {
@@ -84,19 +84,19 @@ function runRange(nearEvent = false) {
   };
 }
 
-export function runPage(id, tab = "metrics") {
+export function runPage(id, tab = "activity") {
   if (runView.id !== id) openRun(id);
   // A snapshot advances time once; cache completions never create new windows.
   const observedAt = Date.parse(ui.state.observed_at) / 1000;
   if (runView.follow && Number.isFinite(observedAt)) runView.windowEnd = observedAt;
   const run = ui.state.runs.find((r) => r.run_id === id);
-  const back = `<p class="overview-back"><a href="#${runView.origin}">← ${runView.origin === "nodes" ? "Nodes" : "Overview"}</a></p>`;
+  const back = `<p class="overview-back"><a href="${escape(runView.nodeBack || "#overview")}">← ${runView.origin === "nodes" ? "Nodes" : "Overview"}</a></p>`;
   const sourceError = ui.state.store_error ? `<p class="source-error" role="status">${escape(ui.state.store_error)}</p>` : "";
   if (!run) return `${back}<h1 class="heading">Run</h1>${sourceError || empty("Run not found")}`;
-  if (!["metrics", "logs"].includes(tab)) tab = "metrics";
+  if (!["activity", "metrics", "logs"].includes(tab)) tab = "activity";
   const title = [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), { lora: "LoRA", full: "FFT", fft: "FFT" }[run.fine_tuning_type]].filter(Boolean).join(" · ");
   const description = [run.display_name, run.recipe_name].filter((value, index, values) => value && value !== title && values.indexOf(value) === index).join(" · ");
-  const tabs = ["metrics", "logs"].map((t) => `<a href="#run/${encode(id)}/${t}" ${tab === t ? 'aria-current="page"' : ""}>${t[0].toUpperCase() + t.slice(1)}</a>`).join("");
+  const tabs = ["activity", "logs"].map((t) => `<a href="#run/${encode(id)}/${t}" ${(tab === "metrics" ? "activity" : tab) === t ? 'aria-current="page"' : ""}>${t[0].toUpperCase() + t.slice(1)}</a>`).join("");
   const customWindow = !runView.follow || ![10, 30, 60].includes(runView.windowMinutes);
   const range = runRange();
   const ranges = (customWindow ? `<option value="${runView.windowMinutes}" selected>${runView.origin === "nodes" ? "Selected node window" : "Selected time window"}</option>` : "") +
@@ -105,10 +105,16 @@ export function runPage(id, tab = "metrics") {
     <div class="run-heading"><h1 class="heading" title="${escape(run.run_id)}">${escape(title)}</h1>${runStatus(run.display_status || run.status)}</div>
     ${sourceError}
     ${description ? `<p class="run-description">${escape(description)}</p>` : ""}
-    <div class="run-toolbar" data-key="run-toolbar"><nav class="workspace-tabs" aria-label="Run views">${tabs}</nav><div class="run-time-controls"><label>Time range <select id="event-range" aria-label="Time range" title="${range.since} – ${range.until}">${ranges}</select></label></div></div>
+    <div class="run-toolbar" data-key="run-toolbar"><nav class="workspace-tabs" aria-label="Run views">${tabs}</nav><div class="run-time-controls"><label>Time range <select id="event-range" aria-label="Time range" title="${range.since} – ${range.until}">${ranges}</select></label>${button("Copy link", "data-copy-view")}</div></div>
     ${runIncidents(run, runView.windowMinutes, runView.windowEnd)}
-    <div id="run-panel">${tab === "logs" ? logsPanel(id, run) : metricsPanel(id, run)}</div>
+    <div id="run-panel">${tab === "logs" ? logsPanel(id, run) : activityPanel(id, run, tab)}</div>
     <p class="run-json-link"><a href="/api/v1/dashboard/runs/${encode(id)}">Agent JSON ↗</a></p>`;
+}
+
+function activityPanel(id, run, tab) {
+  const range = { start: runView.windowEnd - runView.windowMinutes * 60, now: runView.windowEnd, live: runView.follow };
+  const metricsOpen = tab === "metrics" || document.querySelector(`details[data-run-metrics="${CSS.escape(id)}"]`)?.open;
+  return `${runActivity(id, range)}<details class="run-metrics" data-run-metrics="${escape(id)}" data-key="metrics:${escape(id)}:${tab === "metrics"}" ${tab === "metrics" ? "open" : ""}><summary>Metrics</summary>${metricsOpen ? metricsPanel(id, run) : ""}</details>`;
 }
 
 function metricsPanel(id, run) {

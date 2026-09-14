@@ -42,14 +42,25 @@ Set `OPEN_RL_PROMETHEUS_URL` to a Prometheus-compatible endpoint that scrapes th
 
 ## Pages
 
-- **Overview**: every recorded run with status, kind, completed steps and elapsed time, with active runs first.
+- **Overview**: every recorded run with status, kind, completed steps and elapsed time, with active runs first. Selecting a run opens its activity comparison.
 - **Nodes**: one lane per node, one row per GPU, allocation bars over the selected window from placement history. Click a bar for a full-width activity timeline. **By GPU** shows combined colored strips and a compact run legend; **By run** replaces them with individual Gantt rows. A smaller GPU utilization chart shares the time scale below either view. Switching views keeps the selected run, GPU group and time window. Blocks retain the exact times of recorded operations; concurrent operations share the combined strip vertically. Select a block or run label without changing the GPU group; GPU buttons select individual cards. Pinch or Ctrl/⌘-scroll over a timeline to zoom around the pointer; drag empty timeline space to pan. Ordinary scrolling still moves the page. The picker, both activity views and utilization chart share the same window, from one minute to 24 hours within the snapshot’s retained day. GPU queries wait until gestures finish; cached samples are redrawn while moving. Missing operation recordings are shown explicitly. Blocks provide operation context, not per-job utilization measurements or proof that a gap was idle.
 - **Scheduler**: workloads waiting for placement with the scheduler's reason, and claim reservations.
 - **Experiments**: recipe metrics per run, grouped by sweep directory. Select a run for its reward and correctness curves.
 - **Health**: source errors, pod problems and unready nodes.
-- **Run**: operation-timing charts separated by trainer and sampler, worker metrics, the process table, and Cloud Logging with search, pod filter and paging.
+- **Run**: aligned trainer and sampler activity across nodes, with links to each node's GPU inspector. Expand Metrics for operation timings, worker metrics and the process table. Logs provides Cloud Logging with search, pod filter and paging.
 
 Runs sharing a LoRA process retain distinct colors and links on Nodes. The UI fetches each run’s retained operation records through the snapshot time and clips their intervals locally, so zooming through an operation does not hide it when its completion falls outside the visible window. Their recorded operations determine the colored intervals; GPU utilization still comes from the physical allocation. Short sampler bursts may be narrower than the GPU telemetry's sampling interval.
+
+## Sharing an inspection
+
+The address bar preserves the selected view. **Copy link** freezes its exact time window, including when the current view follows live data. A fresh tab restores the selection; it fetches the same underlying APIs and still requires access to the dashboard.
+
+- `#run/{run_id}/activity` opens a run's process comparison; `/logs` opens logs and `/metrics` expands advanced metrics.
+- `#nodes?placement={id}&gpu={device_id}&group={anchor_placement_id}&layout=run` opens a GPU inspection. Omit `gpu` for all GPUs, `group` when the selection also anchors the GPU group, and `layout` for the combined GPU strips.
+- `duration` is the window length in seconds (60–86400); `end` is its end as Unix seconds, including fractions. Without `end`, the window follows the current snapshot.
+- Run links also preserve log search `q`, `pod`, an incident's `event` timestamp, and the originating node view in `back`.
+
+Query parameters follow the hash route and use URL encoding. For an agent, convert `end - duration` and `end` to ISO timestamps for the API's `since` and `until` parameters. Short node labels use unique hostname suffixes; full node names remain in tooltips and JSON.
 
 ## Recorded preview
 
@@ -59,4 +70,4 @@ Time and log filters work within the captured rows. Pagination covers only those
 
 ## Front end
 
-Plain ES modules, no build step. `app.js` routes and polls; `store.js` holds the snapshot and selection; `cache.js` fetches anything else and re-renders when it lands; every page is a function from state to markup, patched into the document by `morph` so a refresh keeps scroll, focus and open panels. Charts are markup too: an SVG stretched to its box with HTML axes, so nothing is measured.
+Plain ES modules, no build step. `app.js` routes and polls; `store.js` holds the snapshot and selection; `navigation.js` restores and shares inspection URLs; `cache.js` fetches anything else and re-renders when it lands. Every page is a function from state to markup, patched into the document by `morph` so a refresh keeps scroll, focus and open panels. Charts are markup too: an SVG stretched to its box with HTML axes, so nothing is measured.

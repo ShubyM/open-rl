@@ -1,6 +1,6 @@
 // Page renderers return markup; DOM updates stay in app.js.
 
-import { escape, encode, empty, runStatus, elapsedTime, duration } from "./ui.js";
+import { escape, encode, empty, runStatus, elapsedTime, duration, shortNodeName } from "./ui.js";
 import { chart, chartNumber } from "./charts.js";
 import { route } from "./store.js";
 
@@ -20,7 +20,7 @@ export function runs(state) {
     .sort((a, b) => Number(active(b)) - Number(active(a)))
     .map((r) => {
       const label = [r.display_name, r.recipe_name].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ");
-      return `<a class="job-list-row" data-key="${escape(r.run_id)}" href="#run/${encode(r.run_id)}/metrics"><span class="job-identity"><span>${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></span>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape({ lora: "LoRA", full: "FFT", fft: "FFT" }[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(elapsedTime(r, state.observed_at))}</span></a>`;
+      return `<a class="job-list-row" data-key="${escape(r.run_id)}" href="#run/${encode(r.run_id)}/activity"><span class="job-identity"><span>${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></span>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape({ lora: "LoRA", full: "FFT", fft: "FFT" }[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(elapsedTime(r, state.observed_at))}</span></a>`;
     })
     .join("");
   return `<h1 class="heading">Overview</h1><div class="overview-summary">${summary}</div>${error}
@@ -35,7 +35,7 @@ export function scheduler(state) {
   const runFor = (w) => state.runs.find((r) => (r.workloads || []).some((item) => item.uid === w.uid));
   const label = (w) => {
     const run = runFor(w);
-    return run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(run.name)} ↗</a>` : escape(w.model_id || w.name);
+    return run ? `<a href="#run/${encode(run.run_id)}/activity">${escape(run.name)} ↗</a>` : escape(w.model_id || w.name);
   };
   const role = (w) => ({ trainer: "Trainer", sampler: "Sampler" })[w.role] || "Unknown process";
   const rows = pending
@@ -50,7 +50,7 @@ export function scheduler(state) {
         .map((seat) => {
           const w = workloads.find((item) => item.uid === seat.workload_uid);
           const placement = w && state.placements.find((item) => item.id === w.uid);
-          return `<div class="scheduler-seat"><span>${w ? label(w) : escape(seat.workload)}</span><span class="muted">${w ? role(w) + " · " : ""}${seat.exclusive ? "Exclusive" : "Shared"}</span>${seat.owner ? `<span class="muted">Owner ID: ${escape(seat.owner)}</span>` : ""}${placement ? `<a href="#nodes" data-scheduler-placement="${escape(placement.id)}">${escape(placement.node)} ↗</a>` : ""}</div>`;
+          return `<div class="scheduler-seat"><span>${w ? label(w) : escape(seat.workload)}</span><span class="muted">${w ? role(w) + " · " : ""}${seat.exclusive ? "Exclusive" : "Shared"}</span>${seat.owner ? `<span class="muted">Owner ID: ${escape(seat.owner)}</span>` : ""}${placement ? `<a href="#nodes" data-scheduler-placement="${escape(placement.id)}" title="${escape(placement.node)}">Node ${escape(shortNodeName(placement.node, state.cluster.nodes))} ↗</a>` : ""}</div>`;
         })
         .join("");
       return `<div class="scheduler-reservation" data-key="${escape(ledger.name || ledger.claim_name)}"><div>${escape(ledger.claim_name || ledger.name)}<div class="muted">${ledger.seats.length} reservation${ledger.seats.length === 1 ? "" : "s"}</div></div><div class="scheduler-seat-list">${seats}</div></div>`;

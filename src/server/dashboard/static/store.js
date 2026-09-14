@@ -18,10 +18,16 @@ export const ui = {
   render: () => {},
 };
 
-export const route = () => location.hash.slice(1).split("/").map((part) => {
+export const route = (hash = location.hash) => hash.slice(1).split("?", 1)[0].split("/").map((part) => {
   try { return decodeURIComponent(part); }
   catch { return part; }
 });
+export const viewParams = (hash = location.hash) => new URLSearchParams(hash.includes("?") ? hash.slice(hash.indexOf("?") + 1) : "");
+export const viewLink = (path, params = {}) => {
+  const query = new URLSearchParams(Object.entries(params).filter(([, value]) => value !== null && value !== undefined && value !== "")).toString();
+  return `#${path}${query ? `?${query}` : ""}`;
+};
+export const nodeLink = (placement, range) => viewLink("nodes", { placement, duration: range.now - range.start, end: range.now });
 
 export async function get(url, signal) {
   const timeout = AbortSignal.timeout(15000);

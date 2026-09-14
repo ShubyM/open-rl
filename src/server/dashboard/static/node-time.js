@@ -26,7 +26,7 @@ export function timeControl(range) {
       <div class="time-popover"><label>Window <select data-time-duration>${options.map(([n, text]) => `<option value="${n}" ${n === duration ? "selected" : ""}>${escape(text)}</option>`).join("")}</select></label>
       <label>Until (UTC)<input type="datetime-local" data-time-end value="${range.live ? "" : local(range.now)}" min="${local(nodeNow() - 86400 + duration)}" max="${local(nodeNow())}" step="${seconds ? 1 : 60}"></label>
       ${range.live ? `<span class="muted">${recording ? "At recording end" : "Following current time"}</span>` : button(recording ? "Return to recording end" : "Return to live", 'data-time-live="true"')}</div>
-    </details><button type="button" class="time-shift" data-time-shift="1" aria-label="Next time window" ${range.now >= nodeNow() ? "disabled" : ""}>${chevron(-90)}</button></div>`;
+    </details><button type="button" class="time-shift" data-time-shift="1" aria-label="Next time window" ${range.now >= nodeNow() ? "disabled" : ""}>${chevron(-90)}</button>${button("Copy link", "data-copy-view")}</div>`;
 }
 
 const SURFACES = ".capacity-track, .node-axis, .activity-track, .activity-axis, #placement-detail .chart-plot svg, #placement-detail .chart-empty";
@@ -50,7 +50,7 @@ function select(duration, end) {
   frame = requestAnimationFrame(() => { frame = 0; ui.render(); });
 }
 
-function finish(cancel = false) {
+function finish(cancel = false, render = true) {
   clearTimeout(settle);
   cancelAnimationFrame(frame);
   frame = 0;
@@ -63,10 +63,10 @@ function finish(cancel = false) {
   ui.nodeQueryRange = null;
   ui.nodeNavigating = false;
   root.classList.remove("node-navigating");
-  ui.render();
+  if (render) ui.render();
 }
 
-export const cancelNodeGesture = () => finish(true);
+export const cancelNodeGesture = (render = true) => finish(true, render);
 
 function moveDrag(x, y, touch = false) {
   if (!drag) return false;
@@ -143,5 +143,5 @@ export function installNodeTime() {
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && (gesture || drag || pinch)) { event.preventDefault(); event.stopImmediatePropagation(); finish(true); }
   }, true);
-  window.addEventListener("blur", cancelNodeGesture);
+  window.addEventListener("blur", () => cancelNodeGesture());
 }
