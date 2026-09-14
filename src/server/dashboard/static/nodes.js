@@ -77,19 +77,25 @@ const turnsUrl = (placementId) =>
 // are exclusive by construction; operation timings (below) include time
 // spent waiting for the turn and overlapping in-flight requests, so they are
 // only the fallback for workers that predate turn recording.
+const activityCache = new Map();
 function operationActivity(placement, range) {
-  const turns = use(turnsUrl(placement.id), `turns:${placement.id}`);
-  if (turns.data?.samples?.length) {
+  if (activityCache.has(placement.id)) return activityCache.get(placement.id);
+  const save = (value) => { activityCache.set(placement.id, value); return value; };
+  const allocationId = placement.allocation_id || placement.id;
+  const turns = use(turnsUrl(allocationId), `turns:${allocationId}`);
+  // A shared worker's turn has no logical run ID. Its operations remain the
+  // per-run evidence; copying the worker's turns to every run would duplicate it.
+  if (!placement.allocation_id && turns.data?.samples?.length) {
     const intervals = turns.data.samples
       .map((t) => [Math.max(range.start, placement.start, t.started_at), Math.min(range.now, placement.end, t.at)])
       .filter(([from, to]) => to > from);
-    return { intervals: mergeIntervals(intervals), error: "", loading: false, exact: true };
+    return save({ intervals: mergeIntervals(intervals), error: turns.error || "", loading: false, exact: true });
   }
   const intervals = [];
-  let error = "", loading = false;
+  let error = "", errorStatus = null, loading = false;
   for (const runId of placement.run_ids || []) {
     const entry = use(holdUrl(runId), `holds:${runId}`);
-    if (entry.error) error = entry.error;
+    if (entry.error) { error = entry.error; errorStatus = entry.errorStatus; }
     if (!entry.data && entry.pending && !entry.error) loading = true;
     for (const sample of entry.data?.samples || []) {
       if (sample.run_id && sample.run_id !== runId) continue;
@@ -99,7 +105,8 @@ function operationActivity(placement, range) {
       if (to > from) intervals.push([from, to]);
     }
   }
-  return { intervals: mergeIntervals(intervals), error, loading };
+  const warning = turns.error && turns.errorStatus !== 404 ? `GPU turns unavailable: ${turns.error}` : "";
+  return save({ intervals: mergeIntervals(intervals), error, errorStatus, loading, warning, exact: false });
 }
 
 // ---- lane markup ------------------------------------------------------------------
@@ -217,7 +224,7 @@ function activityTimeline(placements, devices, range) {
   const byGpu = ui.activityView === "gpu";
   const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
   const block = (from, to, top = 0, bottom = 24) => `M${x(from)},${top} H${x(to)} V${bottom} H${x(from)} Z`;
-  const path = (p, blocks) => `<path class="activity-block ${placementColor(p)}" data-placement="${escape(p.id)}" data-selected="${p.id === ui.expanded}" d="${blocks}"><title>${escape(p.label)}</title></path>`;
+  const path = (p, blocks) => `<path class="activity-block ${placementColor(p)}" data-placement="${escape(p.id)}" data-selected="${p.id === ui.expanded}" data-label="${escape(p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
   const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${nodeTime(range.start + ((range.now - range.start) * tick) / 4, range.now - range.start <= 120)}</span>`).join("");
   const activities = [...placements].sort((a, b) => a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
   const combined = byGpu ? devices.map((device) => {
@@ -236,11 +243,11 @@ function activityTimeline(placements, devices, range) {
       }
       previous = at;
     }
-    return `<div class="activity-row activity-combined" data-key="combined:${escape(device.id)}"><span class="activity-device">GPU ${escape(deviceLabel(device.name))}</span><div class="activity-track"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-hidden="true">${jobs.map((p, i) => path(p, blocks[i].join(" "))).join("")}</svg></div></div>`;
+    return `<div class="activity-row activity-combined" data-key="combined:${escape(device.id)}"><span class="activity-device">GPU ${escape(deviceLabel(device.name))}</span><div class="activity-track" data-start="${range.start}" data-end="${range.now}"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-hidden="true">${jobs.map((p, i) => path(p, blocks[i].join(" "))).join("")}</svg></div></div>`;
   }).join("") : "";
   const rows = activities.map((p) => {
     const { intervals, error, loading } = p;
-    const status = error ? (error.includes("not recorded") ? "Not recorded" : "Unavailable") : loading ? "Loading…" : !intervals.length ? "No recorded operations" : "";
+    const status = error ? (intervals.length ? "Stale" : error.includes("not recorded") ? "Not recorded" : "Unavailable") : loading ? "Loading…" : !intervals.length ? "No recorded activity" : "";
     const label = `<button type="button" class="activity-label ${placementColor(p)}" data-key="label:${escape(p.id)}" data-placement="${escape(p.id)}" aria-pressed="${p.id === ui.expanded}" title="${escape(p.label)}"><span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">${escape(p.label)}</span><span class="activity-meta">${escape(p.role || "process")}${p.ended ? " · Ended" : ""}</span></span>${byGpu && status ? `<span class="activity-notice ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}</span>` : ""}</button>`;
     if (byGpu) return label;
     // One path per run, with separate blocks at their exact times. Dense
@@ -248,7 +255,7 @@ function activityTimeline(placements, devices, range) {
     const blocks = intervals.map(([from, to]) => block(from, to)).join(" ");
     return `<div class="activity-row ${placementColor(p)}" data-key="${escape(p.id)}" data-selected="${p.id === ui.expanded}">
       ${label}
-      <div class="activity-track"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-hidden="true">${path(p, blocks)} </svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}${error && intervals.length ? " · Showing last available operations" : ""}</span>` : ""}</div></div>`;
+      <div class="activity-track" data-start="${range.start}" data-end="${range.now}"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-hidden="true">${path(p, blocks)}</svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}</span>` : ""}</div></div>`;
   }).join("");
   return `<div class="activity-timeline" aria-label="Recorded run activity"><div class="activity-header"><h3>${byGpu ? "GPU" : "Run"}</h3><div class="activity-axis">${axis}</div></div>${byGpu ? `${combined || empty("Device mapping unavailable")}<div class="activity-legend" aria-label="Runs on these GPUs">${rows}</div>` : rows}</div>`;
 }
@@ -292,11 +299,15 @@ function detail(placement, range, neighbours) {
     )
     .join("");
   const label = devices.length ? `${acceleratorLabel(node)} · GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : "GPU activity";
+  const activities = visible.map((p) => operationActivity(p, range));
+  const warnings = [...new Set(activities.flatMap((a) => [a.warning, a.errorStatus !== 404 && a.error]).filter(Boolean))];
+  const source = activities.every((a) => a.exact) ? "GPU turns" : activities.some((a) => a.exact) ? "GPU turns and recorded operations" : "Recorded operations; may include GPU wait time";
   return `<section class="allocation-expansion" id="placement-detail" data-key="${escape(anchor.id)}" data-view="${ui.activityView}"><div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)}</h2><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div>
     <div class="allocation-controls"><div class="allocation-device-picker" aria-label="GPU selection">${picker}</div><div class="activity-view" role="group" aria-label="Activity layout">${[ ["gpu", "By GPU"], ["run", "By run"] ].map(([view, text]) => button(text, `data-activity-view="${view}" aria-pressed="${ui.activityView === view}"`)).join("")}</div></div>
     ${activityTimeline(visible, devices.filter((d) => ui.device === "all" || d.id === ui.device), range)}
+    ${warnings.length ? `<p class="source-error" role="status">${escape(warnings.join(" · "))}</p>` : ""}
     <div>${gpuChart(metrics, range)}</div>
-    <div class="allocation-detail-footer"><span>Blocks show the GPU turns the time-slicer granted; workers without turn records show their operations instead.</span>${run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : ""}</div></section>`;
+    <div class="allocation-detail-footer"><span>${source}. Gaps may include unrecorded activity.</span>${run ? `<a href="#run/${encode(run.run_id)}/metrics">${escape(title)} ↗</a>` : ""}</div></section>`;
 }
 
 const selectedDevices = (metrics) => [...new Map((metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id).map((d) => [d.uuid || d.id, d])).values()];
@@ -315,6 +326,8 @@ function gpuChart(metrics, range) {
     values.size === selected.length && [...values.values()].every(Number.isFinite) ? [...values.values()].reduce((a, b) => a + b, 0) / selected.length : null,
   ]);
   const reason = metrics.data.reason || selected.find((d) => d.reason)?.reason || "No samples for this GPU";
+  const failures = [...new Set([metrics.error, ...selected.map((d) => d.reason)].filter(Boolean))];
+  const hasSamples = points.some(([at, value]) => at >= range.start && at <= range.now && Number.isFinite(value));
   return `${chart({
     title: "GPU utilization",
     unit: "%",
@@ -324,8 +337,8 @@ function gpuChart(metrics, range) {
     min: 0,
     max: 100,
     gapSeconds: 60,
-    empty: reason,
-  })}${metrics.error ? `<p class="muted" role="status">${escape(metrics.error)} · Showing the last available samples</p>` : ""}`;
+    empty: metrics.error || reason,
+  })}${hasSamples && failures.length ? `<p class="source-error" role="status">${escape(failures.join(" · "))}${metrics.error ? " · Showing previously fetched samples" : ""}</p>` : ""}`;
 }
 
 const lastValue = (points, range) => points?.findLast(([at]) => at >= range.start && at <= range.now)?.[1];
@@ -338,17 +351,19 @@ function gpuMemory(metrics, range) {
 // ---- page -----------------------------------------------------------------------------
 
 export function renderNodes() {
+  activityCache.clear();
   const range = timeWindow();
   const all = segments(range);
   if (ui.expanded && !all.some((p) => p.id === ui.expanded)) ui.expanded = all.find((p) => p.allocation_id === ui.expanded)?.id || ui.expanded;
   const { cluster } = ui.state;
-  const occupied = new Set(all.map((p) => p.node));
+  const occupied = new Set(ui.state.placements.map((p) => p.node));
   const nodes = [...cluster.nodes].sort((a, b) => Number(occupied.has(b.name)) - Number(occupied.has(a.name)) || Number(b.gpu_capacity > 0) - Number(a.gpu_capacity > 0));
   const axis = [0, 1, 2, 3].map((tick) => `<span>${nodeTime(range.start + ((range.now - range.start) * tick) / 3, range.now - range.start <= 120)}</span>`).join("");
+  const errors = [...new Set([cluster.error, cluster.nodes_error, cluster.devices?.error, cluster.scheduler?.error, ui.state.history_error].filter(Boolean))];
   morph(
     content,
-    `<div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>${timeControl(range)}</div>${!cluster.available ? empty(cluster.error || "Kubernetes unavailable") : ""}
+    `<div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>${timeControl(range)}</div>${errors.map((error) => `<p class="source-error" role="status">${escape(error)}</p>`).join("")}${!cluster.available && !errors.length ? empty("Kubernetes unavailable") : ""}
     <div class="node-time-header"><span>Node</span><div class="node-axis">${axis}</div><span class="node-duty" title="GPU allocation time divided by capacity over the selected window">Duty</span></div>
-    ${nodes.map((node) => lane(node, all, range)).join("") || empty("No nodes available")}`,
+    ${nodes.map((node) => lane(node, all, range)).join("") || (!errors.length && cluster.available ? empty("No nodes reported by Kubernetes") : "")}`,
   );
 }

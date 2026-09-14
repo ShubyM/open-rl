@@ -86,14 +86,17 @@ export function runPage(id, tab = "metrics") {
   const observedAt = Date.parse(ui.state.observed_at) / 1000;
   if (runView.follow && Number.isFinite(observedAt)) runView.windowEnd = observedAt;
   const run = ui.state.runs.find((r) => r.run_id === id);
-  if (!run) return empty("Run not found");
+  const back = '<p class="overview-back"><a href="#overview">← Overview</a></p>';
+  const sourceError = ui.state.store_error ? `<p class="source-error" role="status">${escape(ui.state.store_error)}</p>` : "";
+  if (!run) return `${back}<h1 class="heading">Run</h1>${sourceError || empty("Run not found")}`;
   if (!["metrics", "logs"].includes(tab)) tab = "metrics";
   const title = [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), { lora: "LoRA", full: "FFT", fft: "FFT" }[run.fine_tuning_type]].filter(Boolean).join(" · ");
   const description = [run.display_name, run.recipe_name].filter((value, index, values) => value && value !== title && values.indexOf(value) === index).join(" · ");
   const tabs = ["metrics", "logs"].map((t) => `<a href="#run/${encode(id)}/${t}" ${tab === t ? 'aria-current="page"' : ""}>${t[0].toUpperCase() + t.slice(1)}</a>`).join("");
   const ranges = [10, 30, 60].map((value) => `<option value="${value}" ${runView.windowMinutes === value ? "selected" : ""}>Last ${value} minutes</option>`).join("");
-  return `<p class="overview-back"><a href="#overview">← Overview</a></p>
+  return `${back}
     <div class="run-heading"><h1 class="heading" title="${escape(run.run_id)}">${escape(title)}</h1>${runStatus(run.display_status || run.status)}</div>
+    ${sourceError}
     ${description ? `<p class="run-description">${escape(description)}</p>` : ""}
     <div class="run-toolbar" data-key="run-toolbar"><nav class="workspace-tabs" aria-label="Run views">${tabs}</nav><div class="run-time-controls"><label>Time range <select id="event-range" aria-label="Time range">${ranges}</select></label></div></div>
     ${runIncidents(run, runView.windowMinutes, runView.windowEnd)}
@@ -133,10 +136,10 @@ function metricsPanel(id, run) {
         `<tr data-key="${escape(p.uid || p.name)}"><td>${escape(p.name)}</td><td>${escape(p.role ? p.role[0].toUpperCase() + p.role.slice(1) : "Unknown")}</td><td>${escape(p.node)}</td><td>${runStatus(p.problem || p.phase)}</td><td>${escape(p.restarts)}</td></tr>`,
     )
     .join("");
-  return `<div class="run-metric-summary" data-key="metric-summary"><span>Completed steps <strong>${escape(run.steps)}</strong></span>${status ? `<span class="muted" role="status">${escape(status)}</span>` : ""}</div>
-    <div class="chart-grid" data-key="run-charts">${samples.length ? charts.join("") : metrics.data ? empty(metrics.error || metrics.data.error ? "Metrics unavailable" : "No operations recorded in this time range") : ""}</div>
+  return `<div class="run-metric-summary" data-key="metric-summary"><span>Completed steps <strong>${escape(run.steps)}</strong></span>${status ? `<span class="${error ? "source-error" : "muted"}" role="status">${escape(status)}</span>` : ""}</div>
+    <div class="chart-grid" data-key="run-charts">${samples.length ? charts.join("") : metrics.data && !error && !metrics.pending ? empty("No operations recorded in this time range") : ""}</div>
     <h2 class="scheduler-title">Processes</h2>${run.shared_runtime ? '<p class="muted">Shared LoRA runtime</p>' : ""}
-    <div class="table-scroll" data-key="run-processes"><table class="run-table"><thead><tr><th>Process</th><th>Kind</th><th>Node</th><th>State</th><th>Restarts</th></tr></thead><tbody>${rows}</tbody></table></div>${!run.pods?.length ? empty("No current pods") : ""}`;
+    <div class="table-scroll" data-key="run-processes"><table class="run-table"><thead><tr><th>Process</th><th>Kind</th><th>Node</th><th>State</th><th>Restarts</th></tr></thead><tbody>${rows}</tbody></table></div>${!run.pods?.length ? empty(ui.state.cluster.available ? "No current pods" : ui.state.cluster.error || "Process information unavailable") : ""}`;
 }
 
 // ---- logs -----------------------------------------------------------------------------
@@ -216,11 +219,11 @@ function logsPanel(id, run) {
     })
     .join("");
   const source = { gke: "Cloud Logging", demo: "Demo logs", kubernetes: "Kubernetes pod logs" }[logState.source] || logState.source || "Logs";
-  const status = `${source} · ${logState.records.length.toLocaleString()} ${logState.records.length === 1 ? "record" : "records"} · Newest first · ${logState.loading ? (rows ? "Updating…" : "Loading…") : ui.state.recorded_at ? "Recorded logs" : runView.follow ? "Updates every 5s" : "Paused"}`;
+  const status = [source, rows || !logState.error ? `${logState.records.length.toLocaleString()} ${logState.records.length === 1 ? "record" : "records"} · Newest first` : "", logState.loading ? (rows ? "Updating…" : "Loading…") : logState.error ? "" : ui.state.recorded_at ? "Recorded logs" : runView.follow ? "Updates every 5s" : "Paused"].filter(Boolean).join(" · ");
   return `${run.shared_runtime ? '<p class="muted">These pods serve a shared LoRA runtime. Their logs can include other runs.</p>' : ""}${scope}
     <div class="log-toolbar" data-key="log-toolbar"><input id="log-search" type="search" value="${escape(logState.q)}" placeholder="Search logs" aria-label="Search logs"><select id="log-source" aria-label="Pod"><option value="" ${!logState.pod ? "selected" : ""}>All pods</option>${pods}</select>${ui.state.recorded_at ? "" : button(runView.follow ? "Pause updates" : "Follow logs", 'data-log-follow="true"')}</div>
     <div id="log-status" class="log-status" role="status"><span>${escape(status)}</span>${logState.error ? `<span class="log-error">${escape(logState.error)}${rows ? " · Showing previously fetched records" : ""}</span>` : ""}</div>
-    <div id="log-lines" tabindex="0" aria-label="Run logs">${rows || (logState.loading ? "" : empty(logState.error ? "Logs unavailable" : "No logs match this time range and filter"))}</div>
+    <div id="log-lines" tabindex="0" aria-label="Run logs">${rows || (logState.loading || logState.error ? "" : empty("No logs match this time range and filter"))}</div>
     <div id="log-more">${logState.cursor ? button(logState.loading ? "Loading…" : "Older logs", `data-older="true" ${logState.loading ? "disabled" : ""}`) : logState.records.length === MAX_LOGS ? '<p class="muted">2,000 records shown. Narrow the time range or search to inspect more.</p>' : ""}</div>`;
 }
 

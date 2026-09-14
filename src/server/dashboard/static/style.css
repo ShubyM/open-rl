@@ -272,6 +272,7 @@ body {
 }
 #orl-design-lab .run-table {
   table-layout: fixed;
+  min-width: 720px;
 }
 #orl-design-lab .run-table th:first-child {
   width: 38%;
@@ -284,6 +285,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  white-space: nowrap;
   padding: 4px 8px;
   border-radius: var(--radius);
   color: var(--health-tone);
@@ -348,6 +350,10 @@ body {
 }
 #orl-design-lab .time-summary::-webkit-details-marker {
   display: none;
+}
+#orl-design-lab .time-summary > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 #orl-design-lab .time-chevron {
   display: block;
@@ -835,6 +841,31 @@ body {
 #orl-design-lab .activity-block:hover {
   fill: color-mix(in srgb, var(--allocation-color) 65%, var(--ground));
 }
+#orl-design-lab .activity-block[data-selected="true"] {
+  stroke: var(--allocation-color);
+  stroke-width: 1px;
+}
+#orl-design-lab .activity-tooltip {
+  position: fixed;
+  z-index: 10;
+  pointer-events: none;
+  max-width: min(360px, calc(100vw - 16px));
+  max-height: calc(100dvh - 16px);
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  padding: 9px 12px;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  background: var(--paper);
+  font-size: 12px;
+}
+#orl-design-lab .activity-tooltip-label {
+  display: block;
+  margin-bottom: 4px;
+}
+#orl-design-lab :is(.activity-tooltip-time, .activity-tooltip-detail) {
+  color: var(--dim);
+}
 #orl-design-lab .activity-status {
   position: absolute;
   left: 8px;
@@ -1098,6 +1129,9 @@ body {
   gap: 8px;
   margin-bottom: 12px;
 }
+#orl-design-lab #run-panel > p + .log-toolbar {
+  margin-top: 8px;
+}
 #orl-design-lab .log-toolbar input {
   flex: 1;
   min-width: 100px;
@@ -1106,11 +1140,35 @@ body {
   max-width: min(100%, 340px);
 }
 #orl-design-lab #log-status {
+  display: grid;
+  gap: 6px;
   color: var(--dim);
   font-size: 12px;
 }
 #orl-design-lab #log-status:not(:empty) {
   margin-bottom: 12px;
+}
+#orl-design-lab .source-error {
+  margin: 8px 0;
+  color: var(--status-warning);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+#orl-design-lab .snapshot-error:not([hidden]) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin: 16px var(--gutter) 0;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--status-warning) 35%, var(--line));
+  border-radius: var(--radius);
+  color: var(--status-warning);
+  background: var(--paper);
+  overflow-wrap: anywhere;
+}
+#orl-design-lab .snapshot-error button {
+  flex: none;
 }
 #orl-design-lab #log-more:not(:empty) {
   margin-top: 12px;
@@ -1172,7 +1230,7 @@ body {
   font-weight: 500;
   line-height: 1.4;
 }
-#orl-design-lab .scheduler-table-wrap {
+#orl-design-lab :is(.scheduler-table-wrap, .table-scroll) {
   overflow-x: auto;
 }
 #orl-design-lab .scheduler-table {
@@ -1264,6 +1322,9 @@ body {
   }
 }
 @media (max-width: 580px) {
+  #orl-design-lab .time-control {
+    width: 100%;
+  }
   #orl-design-lab {
     --gutter: 14px;
     --gpu-index-width: 24px;

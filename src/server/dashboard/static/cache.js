@@ -25,7 +25,7 @@ export function endRender() {
 export function use(url, scope = url) {
   let entry = entries.get(scope);
   if (!entry) {
-    entry = { url: null, data: null, error: null, fetchedAt: 0, pending: false, controller: null, used: generation };
+    entry = { url: null, data: null, error: null, errorStatus: null, fetchedAt: 0, pending: false, controller: null, used: generation };
   }
   entry.used = generation;
   entries.delete(scope);
@@ -37,10 +37,11 @@ export function use(url, scope = url) {
     get(url, entry.controller.signal)
       .then((data) => {
         entry.error = data.error || null;
+        entry.errorStatus = null;
         if (!entry.error || !entry.data) entry.data = data;
       })
       .catch((error) => {
-        if (error.name !== "AbortError") entry.error = error.message;
+        if (error.name !== "AbortError") { entry.error = error.message; entry.errorStatus = error.status || null; }
       })
       .finally(() => {
         entry.fetchedAt = Date.now();

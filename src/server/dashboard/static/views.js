@@ -5,6 +5,8 @@ import { chart, chartNumber } from "./charts.js";
 import { route } from "./store.js";
 
 export function runs(state) {
+  const error = state.store_error ? `<p class="source-error" role="status">${escape(state.store_error)}</p>` : "";
+  if (error && !state.runs.length) return `<h1 class="heading">Overview</h1>${error}`;
   const active = (r) => ["active", "running"].includes(String(r.status || "").toLowerCase());
   const count = (test) => state.runs.filter(test).length;
   const summary = [
@@ -21,7 +23,7 @@ export function runs(state) {
       return `<a class="job-list-row" data-key="${escape(r.run_id)}" href="#run/${encode(r.run_id)}/metrics"><span class="job-identity"><span>${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></span>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape({ lora: "LoRA", full: "FFT", fft: "FFT" }[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(elapsedTime(r, state.observed_at))}</span></a>`;
     })
     .join("");
-  return `<h1 class="heading">Overview</h1><div class="overview-summary">${summary}</div>${state.store_error ? empty(state.store_error) : ""}
+  return `<h1 class="heading">Overview</h1><div class="overview-summary">${summary}</div>${error}
     <div class="job-list"><div class="job-list-head"><span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Elapsed</span></div>${rows}</div>${!state.runs.length ? empty("No runs recorded") : ""}`;
 }
 
@@ -78,7 +80,7 @@ const healthStatus = (label, tone) => `<span class="health-status health-${tone}
 
 export function health(state) {
   const cluster = state.cluster;
-  const errors = [state.store_error, cluster.error, cluster.nodes_error, cluster.events_error, cluster.devices?.error, cluster.scheduler?.error].filter(Boolean);
+  const errors = [...new Set([state.store_error, state.history_error, cluster.error, cluster.nodes_error, cluster.events_error, cluster.devices?.error, cluster.scheduler?.error].filter(Boolean))];
   const issues = [];
   for (const pod of cluster.pods || []) {
     if (!pod.problem) continue;
@@ -89,7 +91,7 @@ export function health(state) {
   for (const node of cluster.nodes || []) if (node.ready !== true) issues.push(["Node not ready", node.name, "Ready condition is false or unknown", '<a href="#nodes">Nodes ↗</a>', "error"]);
   const rows = issues.map(([issue, resource, evidence, link, tone]) => `<tr><td>${healthStatus(issue, tone)}</td><td>${escape(resource)}</td><td>${escape(evidence)}</td><td>${link}</td></tr>`).join("");
   const complete = cluster.available === true && errors.length === 0;
-  return `<h1 class="heading">Health</h1>${errors.map((error) => `<p class="health-message">${healthStatus("Source unavailable", "warning")}<span>${escape(error)}</span></p>`).join("")}
+  return `<h1 class="heading">Health</h1>${errors.map((error) => `<p class="health-message" role="status">${healthStatus("Source unavailable", "warning")}<span>${escape(error)}</span></p>`).join("")}
     ${issues.length ? `<div class="scheduler-table-wrap"><table class="scheduler-table"><thead><tr><th>Issue</th><th>Resource</th><th>Evidence</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : complete ? `<p class="health-message">${healthStatus("Healthy", "success")}<span>No pod problems, node problems or source errors.</span></p>` : ""}
     <p class="run-json-link"><a href="/api/v1/dashboard/snapshot">Diagnostic JSON ↗</a> · <a href="/docs">API reference ↗</a></p>`;
 }

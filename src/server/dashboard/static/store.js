@@ -22,12 +22,21 @@ export const route = () => location.hash.slice(1).split("/").map(decodeURICompon
 
 export async function get(url, signal) {
   const timeout = AbortSignal.timeout(15000);
-  const response = await fetch(url, { cache: "no-store", signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error([error?.detail, error?.error].find((message) => typeof message === "string") || `Request failed (${response.status})`);
+  let response;
+  try {
+    response = await fetch(url, { cache: "no-store", signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    throw new Error(timeout.aborted ? "Dashboard request timed out. Try again." : "Cannot reach the dashboard. Check the connection and try again.");
   }
-  return response.json();
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    const message = [data?.detail, data?.error].find((message) => typeof message === "string");
+    const error = new Error(message || ({ 401: "Authentication required", 403: "Access denied", 404: "Requested data not found", 429: "Too many requests. Try again shortly." }[response.status] || `Dashboard request failed (${response.status})`));
+    error.status = response.status;
+    throw error;
+  }
+  return response.json().catch(() => { throw new Error("The dashboard returned an invalid response. Try again."); });
 }
 
 export const nodeNow = () => Date.parse(ui.state?.observed_at) / 1000 || Date.now() / 1000;

@@ -5,6 +5,7 @@
 import { encode, morph } from "./ui.js";
 import { runs, scheduler, health, experiments } from "./views.js";
 import { hoverChart, inspectChart } from "./charts.js";
+import { installActivityHover, hideActivityHover } from "./activity.js";
 import { root, content, ui, route, get, nodeNow } from "./store.js";
 import { renderNodes } from "./nodes.js";
 import { installNodeTime, cancelNodeGesture, timeWindow } from "./node-time.js";
@@ -15,6 +16,7 @@ const pageOf = (page) => (!page || ["run", "runs"].includes(page) ? "overview" :
 
 function render() {
   if (!ui.state) return;
+  hideActivityHover();
   const [page, id, tab] = route();
   syncRunRoute(page, id, tab);
   const current = pageOf(page);
@@ -37,6 +39,7 @@ function render() {
 }
 ui.render = render;
 installNodeTime();
+installActivityHover();
 
 // ---- interactions ----------------------------------------------------------
 
@@ -68,6 +71,7 @@ root.addEventListener("click", (event) => {
   }
   const target = event.target.closest("button");
   if (!target) return;
+  if (target.hasAttribute("data-retry-snapshot")) refresh();
   if (target.dataset.device) {
     ui.device = target.dataset.device;
     render();
@@ -169,6 +173,7 @@ window.addEventListener("hashchange", () => {
   syncRunRoute(...route());
   content.innerHTML = "";
   render();
+  if (route()[0] === "experiments") content.querySelector('.experiment-row[aria-current="true"]')?.scrollIntoView({ block: "nearest" });
 });
 
 // ---- polling -----------------------------------------------------------------
@@ -179,11 +184,17 @@ async function refresh() {
   refreshing = true;
   try {
     ui.state = await get("/api/v1/dashboard/snapshot");
+    document.getElementById("snapshot-error").hidden = true;
     document.getElementById("connection").textContent = ui.state.recorded_at ? "Recording" : ui.state.demo ? "Demo" : ui.state.cluster.available ? "Connected" : "Cluster unavailable";
     document.getElementById("connection").title = ui.state.recorded_at ? `Captured ${ui.state.recorded_at}` : "";
     render();
   } catch (error) {
-    document.getElementById("connection").textContent = error.message;
+    document.getElementById("connection").textContent = ui.state ? "Stale snapshot" : "Unavailable";
+    document.getElementById("connection").title = error.message;
+    const notice = document.getElementById("snapshot-error");
+    notice.querySelector("span").textContent = `${error.message}${ui.state ? ` Showing the snapshot from ${ui.state.observed_at}.` : ""}`;
+    notice.hidden = false;
+    if (!ui.state) content.replaceChildren();
   } finally {
     refreshing = false;
   }

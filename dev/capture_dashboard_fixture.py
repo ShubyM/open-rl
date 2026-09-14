@@ -42,7 +42,7 @@ def main() -> None:
     rid = run["run_id"]
     paths += [f"{API}/runs/{rid}", f"{API}/runs/{rid}/metrics", f"{API}/runs/{rid}/logs?limit=200"]
   for placement in snapshot["placements"][: args.runs * 2]:
-    paths.append(f"{API}/allocations/{placement['id']}/metrics")
+    paths += [f"{API}/allocations/{placement['id']}/{resource}" for resource in ("metrics", "turns")]
 
   recorded = {}
   for path in paths:

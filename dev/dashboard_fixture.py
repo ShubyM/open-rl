@@ -68,6 +68,11 @@ def replay(data: dict, path: str, query: dict, captured_at: str) -> dict:
         "older_not_recorded": bool(data.get("next_cursor")),
       },
     )
+  elif path.endswith("/turns"):
+    # Keep whole turns overlapping the window, including those that finish
+    # after its end; the timeline clips their visible geometry locally.
+    data["samples"] = [sample for sample in data.get("samples", []) if sample["at"] >= start and sample["started_at"] <= end]
+    data["available"] = bool(data["samples"])
   elif path.endswith("/metrics"):
     if "samples" in data:
       data["samples"] = [sample for sample in data["samples"] if start <= sample["at"] <= end]

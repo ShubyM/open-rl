@@ -21,7 +21,7 @@ export function timeControl(range) {
   const label = range.live ? `Last ${WINDOWS.find(([n]) => n === duration)?.[1] || custom}` : `${local(range.now).slice(5, 10)} · ${nodeTime(range.start, seconds)} – ${nodeTime(range.now, seconds)}`;
   return `<div class="time-control" aria-label="Node time range">
     <button type="button" class="time-shift" data-time-shift="-1" aria-label="Previous time window" ${range.start <= nodeNow() - 86400 ? "disabled" : ""}>${chevron(90)}</button>
-    <details class="time-picker" data-key="node-time-picker"><summary class="time-summary">${escape(label)}${chevron()}</summary>
+    <details class="time-picker" data-key="node-time-picker"><summary class="time-summary" title="${escape(label)}"><span>${escape(label)}</span>${chevron()}</summary>
       <div class="time-popover"><label>Window <select data-time-duration>${options.map(([n, text]) => `<option value="${n}" ${n === duration ? "selected" : ""}>${escape(text)}</option>`).join("")}</select></label>
       <label>Until (UTC)<input type="datetime-local" data-time-end value="${range.live ? "" : local(range.now)}" min="${local(nodeNow() - 86400 + duration)}" max="${local(nodeNow())}" step="${seconds ? 1 : 60}"></label>
       ${range.live ? '<span class="muted">Following current time</span>' : button("Return to live", 'data-time-live="true"')}</div>
