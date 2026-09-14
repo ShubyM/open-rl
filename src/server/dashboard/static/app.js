@@ -61,12 +61,14 @@ root.addEventListener("click", (event) => {
   }
   const allocation = event.target.closest("[data-placement]");
   if (allocation) {
-    if (!ui.expanded) {
+    const acrossNodes = allocation.closest(".cross-node-activity");
+    if (!ui.expanded || acrossNodes) {
       ui.gpuGroup = null;
       ui.device = "all";
     }
     ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.matches(".hold, .activity-label, .activity-block") ? null : allocation.dataset.placement;
     render();
+    if (acrossNodes) content.querySelector(".cross-node-activity")?.scrollIntoView({ block: "nearest" });
     return;
   }
   const target = event.target.closest("button");

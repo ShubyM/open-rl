@@ -2,8 +2,12 @@ import { chartTime, valueText } from "./charts.js";
 import { root, ui } from "./store.js";
 
 const inspected = new WeakMap();
-let tooltip;
-export const hideActivityHover = () => { if (tooltip) tooltip.hidden = true; };
+let tooltip, inspection;
+export const hideActivityHover = () => {
+  if (tooltip) tooltip.hidden = true;
+  inspection?.removeAttribute("data-inspecting");
+  inspection = undefined;
+};
 
 export function installActivityHover() {
   if (tooltip) return;
@@ -19,8 +23,20 @@ export function installActivityHover() {
   });
   root.append(tooltip);
   root.addEventListener("pointermove", (event) => {
-    const block = event.target.closest(".activity-block"), track = block?.closest(".activity-track");
-    if (!track || ui.nodeNavigating || event.buttons) return hideActivityHover();
+    if (ui.nodeNavigating || event.buttons) return hideActivityHover();
+    const track = event.target.closest(".activity-track"), section = track?.closest(".cross-node-activity");
+    if (section !== inspection) {
+      hideActivityHover();
+      inspection = section;
+    }
+    if (section) {
+      const box = track.getBoundingClientRect();
+      section.style.setProperty("--activity-cursor", `${Math.max(0, Math.min(100, (event.clientX - box.left) / box.width * 100))}%`);
+      section.setAttribute("data-inspecting", "");
+    }
+    tooltip.hidden = true;
+    const block = event.target.closest(".activity-block");
+    if (!track || !block) return;
     const source = block.dataset.intervals || "[]";
     let entry = inspected.get(block);
     if (entry?.source !== source) inspected.set(block, entry = { source, intervals: JSON.parse(source) });
@@ -33,7 +49,7 @@ export function installActivityHover() {
       else right = middle;
     }
     const interval = entry.intervals[left];
-    if (!interval || at < interval[0] || at > interval[1]) return hideActivityHover();
+    if (!interval || at < interval[0] || at > interval[1]) return;
     const [from, to] = interval, date = (time) => new Date(time * 1000).toISOString().slice(0, 10);
     fields[0].textContent = block.dataset.label || "";
     fields[1].textContent = `${date(from)} · ${chartTime(from, true)} – ${date(from) === date(to) ? "" : date(to) + " · "}${chartTime(to, true)}`;
@@ -43,6 +59,7 @@ export function installActivityHover() {
     tooltip.style.top = `${Math.max(8, Math.min(event.clientY + 12, innerHeight - tooltip.offsetHeight - 8))}px`;
   });
   root.addEventListener("pointerleave", hideActivityHover);
+  root.addEventListener("pointerdown", hideActivityHover, true);
   root.addEventListener("click", hideActivityHover, true);
   for (const event of ["scroll", "resize", "hashchange"]) window.addEventListener(event, hideActivityHover, true);
 }

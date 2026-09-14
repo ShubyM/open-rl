@@ -845,6 +845,30 @@ body {
   stroke: var(--allocation-color);
   stroke-width: 1px;
 }
+#orl-design-lab .cross-node-activity {
+  --activity-label-width: 240px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+#orl-design-lab .cross-node-activity .allocation-detail-head {
+  margin-bottom: 8px;
+}
+#orl-design-lab .cross-node-activity .activity-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#orl-design-lab .cross-node-activity .activity-block:not([data-placement]) {
+  cursor: default;
+}
+#orl-design-lab .cross-node-activity[data-inspecting] .activity-track::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  inset-block: 0;
+  left: var(--activity-cursor);
+  border-left: 1px dashed var(--dim);
+}
 #orl-design-lab .activity-tooltip {
   position: fixed;
   z-index: 10;
@@ -896,6 +920,7 @@ body {
 }
 #orl-design-lab .allocation-expansion .chart {
   --plot-height: 100px;
+  min-height: calc(var(--plot-height) + 82px);
   margin-top: 8px;
 }
 #orl-design-lab .allocation-expansion .chart-plot {
@@ -1374,7 +1399,7 @@ body {
     background: none;
     border-right: 1px solid var(--line);
   }
-  #orl-design-lab .allocation-expansion {
+  #orl-design-lab :is(.allocation-expansion, .cross-node-activity) {
     --activity-label-width: 40px;
   }
   #orl-design-lab .activity-label {
