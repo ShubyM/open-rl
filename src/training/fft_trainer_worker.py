@@ -38,6 +38,8 @@ from server.model_metadata import WeightSyncConfig
 
 
 class FFTTrainingWorker(BaseTrainerWorker):
+  full_parameter = True
+
   def __init__(self):
     super().__init__()
     self.model: PreTrainedModel | None = None
