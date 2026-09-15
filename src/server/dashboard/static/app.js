@@ -80,7 +80,7 @@ root.addEventListener("click", (event) => {
     if (node !== ui.inspectorNode) {
       root.style.removeProperty("min-height");
     }
-    ui.device = "all";
+    if (!allocation.closest("#placement-detail")) ui.device = "all";
     ui.expanded = allocation.dataset.placement;
     ui.inspectorNode = node;
     render();

@@ -832,7 +832,7 @@ body {
   fill: color-mix(in srgb, var(--allocation-color) 35%, var(--ground));
   cursor: default;
 }
-#orl-design-lab .activity-track a > .activity-block {
+#orl-design-lab .activity-block[data-placement] {
   cursor: pointer;
 }
 #orl-design-lab .activity-block[data-selected="true"],

@@ -235,10 +235,7 @@ function activityTimeline(placements, range, { acrossNodes = false, activeOnly =
   const href = (p) => acrossNodes ? ui.state.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : p.run_ids?.[0] ? `#run/${encode(p.run_ids[0])}/activity` : null;
   const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
   const block = (from, to) => `M${x(from)},0 H${x(to)} V24 H${x(from)} Z`;
-  const path = (p, blocks) => {
-    const shape = `<path class="activity-block ${placementColor(p)}" data-selected="${!acrossNodes && p.id === ui.expanded}" data-label="${escape(acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
-    return href(p) ? `<a href="${escape(href(p))}" aria-label="${escape(acrossNodes ? `View ${processLabel(p)} on ${p.node}` : `Open run ${p.label}`)}">${shape}</a>` : shape;
-  };
+  const path = (p, blocks) => `<path class="activity-block ${placementColor(p)}" ${!acrossNodes ? `data-placement="${escape(p.id)}"` : ""} data-selected="${!acrossNodes && p.id === ui.expanded}" data-label="${escape(acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
   const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${axisTime(range.start + ((range.now - range.start) * tick) / 4, range)}</span>`).join("");
   const activities = [...placements].sort((a, b) => (acrossNodes ? processOrder(a, b) : 0) || a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
   const shown = activeOnly ? activities.filter((p) => p.intervals.length) : activities;
