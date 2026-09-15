@@ -215,7 +215,7 @@ function lane(node, all, range) {
   const track = devices.length
     ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(deviceLabel(d.name))}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${bars}</div></div>`
     : "";
-  return `<div class="node-placement-group" data-key="${escape(node.name)}"><div class="node-lane"><div class="node-lane-label" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)} <span class="muted">· ${escape(shortNodeName(node.name, ui.state.cluster.nodes))}</span></span>${node.gpu_capacity ? `<span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span>` : ""}</div><div>${track}${unknown}${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : !devices.length && node.gpu_capacity ? empty("GPUs without DRA devices") : ""}</div><span class="node-duty" title="Recorded GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${node.name === ui.inspectorNode ? detail(all.find((p) => p.id === ui.expanded), range, all) : ""}</div>`;
+  return `<div class="node-placement-group" data-key="${escape(node.name)}"><div class="node-lane"><button type="button" class="node-lane-label" data-node-details="${escape(node.name)}" aria-expanded="${ui.inspectorNode === node.name}" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)} <span class="muted">· ${escape(shortNodeName(node.name, ui.state.cluster.nodes))}</span></span>${node.gpu_capacity ? `<span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span>` : ""}</button><div>${track}${unknown}${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : !devices.length && node.gpu_capacity ? empty("GPUs without DRA devices") : ""}</div><span class="node-duty" title="Recorded GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${node.name === ui.inspectorNode ? detail(node, range, neighbours) : ""}</div>`;
 }
 
 // ---- expansion ---------------------------------------------------------------------
@@ -231,13 +231,13 @@ function processLabel(placement) {
 
 const processOrder = (a, b) => ({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""));
 
-function activityTimeline(placements, range, { acrossNodes = false, navigate = false, activeOnly = false } = {}) {
-  const canSelect = (p) => !acrossNodes || ui.state.cluster.nodes.some((n) => n.name === p.node);
+function activityTimeline(placements, range, { acrossNodes = false, activeOnly = false } = {}) {
+  const href = (p) => acrossNodes ? ui.state.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : p.run_ids?.[0] ? `#run/${encode(p.run_ids[0])}/activity` : null;
   const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
   const block = (from, to) => `M${x(from)},0 H${x(to)} V24 H${x(from)} Z`;
   const path = (p, blocks) => {
-    const shape = `<path class="activity-block ${placementColor(p)}" ${canSelect(p) && !navigate ? `data-placement="${escape(p.id)}" data-node="${escape(p.node)}"` : ""} data-selected="${!navigate && p.id === ui.expanded}" data-label="${escape(acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
-    return navigate && canSelect(p) ? `<a href="${escape(nodeLink(p.id, range))}" aria-label="View ${escape(processLabel(p))} on ${escape(p.node)}">${shape}</a>` : shape;
+    const shape = `<path class="activity-block ${placementColor(p)}" data-selected="${!acrossNodes && p.id === ui.expanded}" data-label="${escape(acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
+    return href(p) ? `<a href="${escape(href(p))}" aria-label="${escape(acrossNodes ? `View ${processLabel(p)} on ${p.node}` : `Open run ${p.label}`)}">${shape}</a>` : shape;
   };
   const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${axisTime(range.start + ((range.now - range.start) * tick) / 4, range)}</span>`).join("");
   const activities = [...placements].sort((a, b) => (acrossNodes ? processOrder(a, b) : 0) || a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
@@ -251,15 +251,15 @@ function activityTimeline(placements, range, { acrossNodes = false, navigate = f
     const { intervals, error, loading } = p;
     const status = error ? (intervals.length ? "Stale" : error.includes("not recorded") ? "Not recorded" : "Unavailable") : loading ? "Loading…" : !intervals.length ? "No recorded activity" : "";
     const name = acrossNodes ? processLabel(p) : p.label, meta = acrossNodes ? p.node ? shortNodeName(p.node, ui.state.cluster.nodes) : "Node unassigned" : p.role || "process";
-    const tag = navigate ? canSelect(p) ? "a" : "span" : "button";
-    const attrs = navigate ? canSelect(p) ? `href="${escape(nodeLink(p.id, range))}"` : 'aria-disabled="true"' : `type="button" data-placement="${escape(p.id)}" data-node="${escape(p.node)}" ${canSelect(p) ? "" : "disabled"} aria-pressed="${p.id === ui.expanded}"`;
-    const label = `<${tag} class="activity-label ${placementColor(p)}" data-key="label:${escape(p.id)}" ${attrs} title="${escape(acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !canSelect(p) ? " · Node no longer reported" : ""}` : p.label)}"><span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">${escape(name)}</span><span class="activity-meta">${escape(meta)}${p.ended ? " · Ended" : ""}${p.node && !canSelect(p) ? " · Node no longer reported" : ""}</span></span></${tag}>`;
+    const tag = href(p) ? "a" : "span";
+    const attrs = href(p) ? `href="${escape(href(p))}"` : 'aria-disabled="true"';
+    const label = `<${tag} class="activity-label ${placementColor(p)}" data-key="label:${escape(p.id)}" ${attrs} title="${escape(acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !href(p) ? " · Node no longer reported" : ""}` : p.label)}"><span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">${escape(name)}</span><span class="activity-meta">${escape(meta)}${p.ended ? " · Ended" : ""}${!href(p) ? acrossNodes ? " · Node no longer reported" : " · Run ID unavailable" : ""}</span></span></${tag}>`;
     // One path per run, with separate blocks at their exact times. Dense
     // histories stay cheap, and labels remain selectable even for tiny bursts.
     const blocks = intervals.map(([from, to]) => block(from, to)).join(" ");
-    return `<div class="activity-row ${placementColor(p)}" data-key="${escape(p.id)}" data-selected="${!navigate && p.id === ui.expanded}">
+    return `<div class="activity-row ${placementColor(p)}" data-key="${escape(p.id)}" data-selected="${!acrossNodes && p.id === ui.expanded}">
       ${label}
-      <div class="activity-track" data-start="${range.start}" data-end="${range.now}"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" ${navigate ? 'aria-label="Recorded activity"' : 'aria-hidden="true"'}>${path(p, blocks)}</svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}</span>` : ""}</div></div>`;
+      <div class="activity-track" data-start="${range.start}" data-end="${range.now}"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-label="Recorded activity">${path(p, blocks)}</svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}</span>` : ""}</div></div>`;
   }).join("");
   return `<div class="activity-timeline" aria-label="Recorded run activity"><div class="activity-header"><h3>${acrossNodes ? "Process" : "Run"}</h3><div class="activity-axis">${axis}</div></div>${rows}</div>`;
 }
@@ -268,7 +268,7 @@ function activityNotes(placements, range) {
   const activities = placements.map((p) => operationActivity(p, range));
   const warnings = [...new Set(activities.flatMap((a) => [a.warning, a.errorStatus !== 404 && a.error]).filter(Boolean))];
   const source = activities.every((a) => a.exact) ? "GPU turns" : activities.some((a) => a.exact) ? "GPU turns and recorded operations" : "Recorded operations; may include GPU wait time";
-  return { warnings: warnings.length ? `<p class="source-error" role="status">${escape(warnings.join(" · "))}</p>` : "", source: `${source}. Gaps may include unrecorded activity.` };
+  return { warnings: warnings.length ? `<p class="source-error" role="status">${escape(warnings.join(" · "))}</p>` : "", source: activities.length ? `${source}. Gaps may include unrecorded activity.` : "" };
 }
 
 export function runActivity(runId, range) {
@@ -277,71 +277,52 @@ export function runActivity(runId, range) {
   const error = ui.state.history_error;
   if (!placements.length) return empty(error ? `Placement history unavailable: ${error}` : "No placement history for this run");
   const notes = activityNotes(placements, range);
-  return `<section class="cross-node-activity run-activity" data-key="activity:${escape(runId)}" aria-label="Run process activity">${activityTimeline(placements, range, { acrossNodes: true, navigate: true })}${error ? `<p class="source-error" role="status">Placement history unavailable: ${escape(error)}</p>` : ""}${notes.warnings}<p class="activity-source">${notes.source}</p></section>`;
+  return `<section class="cross-node-activity run-activity" data-key="activity:${escape(runId)}" aria-label="Run process activity">${activityTimeline(placements, range, { acrossNodes: true })}${error ? `<p class="source-error" role="status">Placement history unavailable: ${escape(error)}</p>` : ""}${notes.warnings}<p class="activity-source">${notes.source}</p></section>`;
 }
 
-function detail(placement, range, all) {
-  if (!placement || !ui.state.cluster.nodes.some((n) => n.name === placement.node)) return "";
-  const neighbours = all.filter((p) => p.node === placement.node);
-  const anchor = neighbours.find((p) => p.id === ui.gpuGroup && p.devices.some((id) => placement.devices.includes(id))) || placement;
-  ui.gpuGroup = anchor.id;
-  if (ui.device !== "all" && !anchor.devices.includes(ui.device)) ui.device = "all";
-  if (anchor.devices.length === 1) ui.device = anchor.devices[0];
-  ui.deviceByNode.set(anchor.node, ui.device);
-  const { state } = ui;
-  const node = state.cluster.nodes.find((n) => n.name === anchor.node);
-  const devices = (node?.devices || []).filter((d) => anchor.devices.includes(d.id));
-  const group = neighbours.filter((p) => p.id === anchor.id || p.id === placement.id || (p.start <= range.now && p.end >= range.start && p.devices.some((id) => anchor.devices.includes(id))));
-  const visible = group.filter((p) => ui.device === "all" || p.devices.includes(ui.device));
-  const run = state.runs.find((r) => (placement.run_ids || []).includes(r.run_id));
-  const allocationId = anchor.allocation_id || anchor.id;
-  const query = ui.nodeQueryRange || range;
-  const metrics = use(
-    `/api/v1/dashboard/allocations/${encode(allocationId)}/metrics?${new URLSearchParams({ since: new Date(query.start * 1000).toISOString(), until: new Date(query.now * 1000).toISOString() })}`,
-    `allocation:${allocationId}`,
-  );
-  const picker = (anchor.devices.length > 1 ? [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)] : [])
-    .concat(
-      anchor.devices.map((id) => {
-        const name = deviceLabel(devices.find((d) => d.id === id)?.name || id.split("/").at(-1));
-        const value = lastValue(metrics.data?.devices?.find((d) => d.id === id)?.utilization, range);
-        return button(
-          `GPU ${name}${Number.isFinite(value) ? ` · ${Math.round(value)}%` : ""}`,
-          `data-device="${escape(id)}" aria-pressed="${ui.device === id}"`,
-        );
-      }),
-    )
-    .join("");
-  const label = `${acceleratorLabel(node)} · ${shortNodeName(anchor.node, ui.state.cluster.nodes)}`;
-  const runId = placement.run_ids?.[0];
-  const related = runId ? all.filter((p) => p.node && p.run_ids?.includes(runId)).sort(processOrder) : [placement];
-  const canCompare = related.length > 1;
-  if (!canCompare) ui.activityView = "node";
-  const across = ui.activityView === "across";
-  const displayed = across ? related : visible;
-  const notes = activityNotes(displayed, range);
-  const nodePicker = related.map((p) => {
-    const target = state.cluster.nodes.find((n) => n.name === p.node);
-    const role = p.role ? p.role[0].toUpperCase() + p.role.slice(1) : "Process";
-    const peers = related.filter((other) => other.node === p.node && other.role === p.role);
-    const process = peers.length > 1 ? processLabel(p) : `${role}${target ? " · " + acceleratorLabel(target) : ""}`;
-    const repeated = peers.some((other) => other.id !== p.id && [...other.devices].sort().join() === [...p.devices].sort().join());
-    const name = `${process} · ${shortNodeName(p.node, state.cluster.nodes)}${repeated ? " · " + nodeTime(p.start, true) : ""}${p.ended ? " · Ended" : ""}`;
-    return canCompare ? button(name, `data-key="node:${escape(p.id)}" data-placement="${escape(p.id)}" data-node="${escape(p.node)}" aria-pressed="${p.id === placement.id}" title="${escape(p.node)}${target ? "" : " · Node no longer reported"}" ${target ? "" : "disabled"}`) : `<span title="${escape(p.node)}">${escape(name)}</span>`;
-  }).join("");
-  return `<section class="allocation-expansion" id="placement-detail"><div class="allocation-detail-head inspector-heading"><h2 class="${placementColor(placement)}" title="${escape(placement.label)}"><span class="activity-swatch" aria-hidden="true"></span>${escape(placement.label)}</h2><div class="allocation-detail-actions">${canCompare ? button("Compare run", `data-activity-view="${across ? "node" : "across"}" aria-pressed="${across}" title="Compare this run's processes on the same timeline"`) : ""}${run ? `<a href="#run/${encode(run.run_id)}/activity">Run details ↗</a>` : ""}<button type="button" class="detail-close" data-close-details aria-label="Close GPU details" title="Close (Esc)">×</button></div></div>
-    <div class="allocation-node-picker" role="group" aria-label="Run processes">${nodePicker}</div>
-    <div class="allocation-controls"><div class="allocation-device-picker" data-node="${escape(anchor.node)}" aria-label="GPU selection">${picker}</div><span class="allocation-scope">${across ? "Run comparison · all assigned GPUs" : "Runs on selected GPUs"}</span></div>
-    <div class="${across ? "cross-node-activity node-comparison" : "node-activity"}" data-key="node-timeline">${activityTimeline(displayed, range, { acrossNodes: across, activeOnly: !across })}${notes.warnings}</div>
-    <div class="node-gpu-detail" data-key="node-gpu-detail" data-node="${escape(anchor.node)}"><div>${gpuChart(metrics, range, label)}</div>
-    <div class="allocation-detail-footer"><span>${notes.source}</span><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div></div></section>`;
+// Allocation metrics cover their physical devices for the full requested window.
+// Query only enough allocations to cover the node, including shared workers once.
+function nodeMetrics(node, placements, range) {
+  const sources = new Map(), query = ui.nodeQueryRange || range;
+  const params = new URLSearchParams({ since: new Date(query.start * 1000).toISOString(), until: new Date(query.now * 1000).toISOString() });
+  for (const p of [...placements].sort((a, b) => Number(!!a.ended) - Number(!!b.ended) || b.devices.length - a.devices.length)) {
+    const ids = p.devices.filter((id) => node.devices.some((d) => d.id === id) && !sources.has(id));
+    if (!ids.length) continue;
+    const id = p.allocation_id || p.id;
+    const entry = use(`/api/v1/dashboard/allocations/${encode(id)}/metrics?${params}`, `allocation:${id}`);
+    for (const device of ids) sources.set(device, entry);
+  }
+  const devices = node.devices.map((device) => {
+    const source = sources.get(device.id), data = source?.data?.devices?.find((d) => d.id === device.id);
+    return data || { ...device, utilization: [], memory_mib: [], reason: source?.error || source?.data?.reason || (source?.pending ? "Loading GPU metrics…" : "No recorded telemetry for this GPU") };
+  });
+  const errors = [...new Set([...sources].filter(([id]) => ui.device === "all" || id === ui.device).map(([, source]) => source.error).filter(Boolean))];
+  return { data: { devices, reason: !devices.length ? "GPU device mapping unavailable" : null }, error: errors.join(" · ") };
+}
+
+function detail(node, range, placements) {
+  const devices = node.devices || [];
+  if (ui.device !== "all" && !devices.some((d) => d.id === ui.device)) ui.device = "all";
+  if (devices.length === 1) ui.device = "all";
+  const visible = placements.filter((p) => (ui.device === "all" || p.devices.includes(ui.device)) && p.start <= range.now && p.end >= range.start);
+  const metrics = nodeMetrics(node, placements, range);
+  const picker = (devices.length > 1 ? [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)] : [])
+    .concat(devices.map((d) => {
+      const value = lastValue(metrics.data.devices.find((device) => device.id === d.id)?.utilization, range);
+      return button(`GPU ${deviceLabel(d.name)}${Number.isFinite(value) ? ` · ${Math.round(value)}%` : ""}`, `data-device="${escape(d.id)}" aria-pressed="${devices.length === 1 || ui.device === d.id}"`);
+    })).join("");
+  const label = `${acceleratorLabel(node)} · ${shortNodeName(node.name, ui.state.cluster.nodes)}`;
+  const notes = activityNotes(visible, range);
+  return `<section class="allocation-expansion" id="placement-detail"><div class="allocation-detail-head inspector-heading"><h2 title="${escape(node.name)}">${escape(label)}</h2><button type="button" class="detail-close" data-close-details aria-label="Close node details" title="Close (Esc)">×</button></div>
+    ${devices.length ? `<div class="allocation-device-picker" aria-label="GPU selection">${picker}</div>` : ""}
+    <div class="node-activity" data-key="node-timeline">${activityTimeline(visible, range, { activeOnly: true })}${notes.warnings}</div>
+    ${node.gpu_capacity ? `<div class="node-gpu-detail" data-key="node-gpu-detail"><div>${gpuChart(metrics, range, label)}</div><div class="allocation-detail-footer"><span>${notes.source}</span><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div></div>` : ""}</section>`;
 }
 
 const selectedDevices = (metrics) => [...new Map((metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id).map((d) => [d.uuid || d.id, d])).values()];
 
 function gpuChart(metrics, range, label) {
   const title = `GPU utilization · ${label}`;
-  if (!metrics.data) return chart({ title, start: range.start, end: range.now, empty: metrics.error || "Loading GPU metrics…" });
   const selected = selectedDevices(metrics);
   const byTime = new Map();
   for (const device of selected)
@@ -385,9 +366,11 @@ export function renderNodes() {
   if (ui.expanded && !all.some((p) => p.id === ui.expanded)) ui.expanded = all.find((p) => p.allocation_id === ui.expanded)?.id || ui.expanded;
   const { cluster } = ui.state;
   const selected = all.find((p) => p.id === ui.expanded);
-  const unavailable = ui.expanded && (!selected || !cluster.nodes.some((n) => n.name === selected.node));
-  if (!selected || unavailable) ui.inspectorNode = null;
-  else if (!cluster.nodes.some((n) => n.name === ui.inspectorNode)) ui.inspectorNode = selected.node;
+  // Older shared links identify a placement; resolve it to its physical node.
+  if (!ui.inspectorNode && selected) ui.inspectorNode = selected.node;
+  const node = cluster.nodes.find((n) => n.name === ui.inspectorNode);
+  const unavailable = (ui.inspectorNode || ui.expanded) && !node;
+  if (node && selected?.node !== node.name) ui.expanded = null;
   const occupied = new Set(ui.state.placements.map((p) => p.node));
   const nodes = [...cluster.nodes].sort((a, b) => Number(occupied.has(b.name)) - Number(occupied.has(a.name)) || Number(b.gpu_capacity > 0) - Number(a.gpu_capacity > 0));
   const axis = [0, 1, 2, 3].map((tick) => `<span>${axisTime(range.start + ((range.now - range.start) * tick) / 3, range)}</span>`).join("");
@@ -395,7 +378,7 @@ export function renderNodes() {
   morph(
     content,
     `<div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>${timeControl(range)}</div>${errors.map((error) => `<p class="source-error" role="status">${escape(error)}</p>`).join("")}${!cluster.available && !errors.length ? empty("Kubernetes unavailable") : ""}
-    ${unavailable ? `<div class="unavailable-selection" role="status"><span>${selected ? "The selected placement's node is no longer reported." : "The selected placement is not in retained history."}</span><button type="button" class="detail-close" data-close-details aria-label="Clear unavailable selection" title="Clear selection">×</button></div>` : ""}
+    ${unavailable ? `<div class="unavailable-selection" role="status"><span>${ui.inspectorNode ? "The selected node is no longer reported." : "The selected placement is not in retained history."}</span><button type="button" class="detail-close" data-close-details aria-label="Clear unavailable selection" title="Clear selection">×</button></div>` : ""}
     <div class="node-time-header"><span>Node</span><div class="node-axis">${axis}</div><span class="node-duty" title="GPU claimed time over this window, not measured GPU utilization">Claimed</span></div>
     ${nodes.map((node) => lane(node, all, range)).join("") || (!errors.length && cluster.available ? empty("No nodes reported by Kubernetes") : "")}`,
   );

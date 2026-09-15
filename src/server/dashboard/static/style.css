@@ -460,7 +460,15 @@ body {
   gap: 7px;
   min-width: 0;
   min-height: 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
   white-space: nowrap;
+}
+#orl-design-lab .node-lane-label:hover .node-accelerator {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 #orl-design-lab .node-accelerator {
   min-width: 0;
@@ -663,14 +671,6 @@ body {
 #orl-design-lab .allocation-expansion > div {
   min-width: 0;
 }
-#orl-design-lab .inspector-heading h2 {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-#orl-design-lab .inspector-heading .allocation-detail-actions {
-  margin-left: auto;
-}
 #orl-design-lab .node-gpu-detail {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -678,14 +678,10 @@ body {
   border-top: 1px solid var(--line);
   padding-top: 16px;
 }
-#orl-design-lab .allocation-expansion .node-comparison {
-  border-top: 0;
-  padding-top: 0;
-}
 #orl-design-lab .allocation-detail-head {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
 }
@@ -694,11 +690,6 @@ body {
   font-weight: 500;
   line-height: 1.4;
   overflow-wrap: anywhere;
-}
-#orl-design-lab .allocation-detail-actions {
-  display: flex;
-  align-items: center;
-  gap: 12px;
 }
 #orl-design-lab .detail-close {
   display: grid;
@@ -718,36 +709,21 @@ body {
   background: var(--paper);
   color: var(--ink);
 }
-#orl-design-lab .allocation-controls {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
-}
-#orl-design-lab :is(.allocation-device-picker, .allocation-node-picker) {
+#orl-design-lab .allocation-device-picker {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
 }
-#orl-design-lab :is(.allocation-device-picker, .allocation-node-picker) .chip {
+#orl-design-lab .allocation-device-picker .chip {
   border-color: transparent;
   background: transparent;
   color: var(--dim);
 }
-#orl-design-lab :is(.allocation-device-picker, .allocation-node-picker) .chip[aria-pressed="true"],
-#orl-design-lab :is(.allocation-device-picker, .allocation-node-picker) .chip:hover {
+#orl-design-lab .allocation-device-picker .chip[aria-pressed="true"],
+#orl-design-lab .allocation-device-picker .chip:hover {
   border-color: var(--line);
   background: var(--paper);
   color: var(--ink);
-}
-#orl-design-lab .allocation-node-picker > span {
-  padding-block: 6px;
-  color: var(--dim);
-}
-#orl-design-lab .allocation-scope {
-  color: var(--dim);
-  font-size: 12px;
 }
 #orl-design-lab .allocation-memory {
   color: var(--dim);
@@ -808,10 +784,10 @@ body {
   text-align: left;
   font-size: 12px;
 }
-#orl-design-lab .activity-label:hover {
+#orl-design-lab a.activity-label:hover {
   background: var(--hover);
 }
-#orl-design-lab .activity-label[aria-pressed="true"] {
+#orl-design-lab .activity-row[data-selected="true"] .activity-label {
   border-color: var(--line);
   background: var(--paper);
 }
@@ -854,6 +830,9 @@ body {
 }
 #orl-design-lab .activity-block {
   fill: color-mix(in srgb, var(--allocation-color) 35%, var(--ground));
+  cursor: default;
+}
+#orl-design-lab .activity-track a > .activity-block {
   cursor: pointer;
 }
 #orl-design-lab .activity-block[data-selected="true"],
@@ -876,12 +855,6 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-#orl-design-lab .cross-node-activity .activity-block:not([data-placement]) {
-  cursor: default;
-}
-#orl-design-lab .cross-node-activity a > .activity-block {
-  cursor: pointer;
 }
 #orl-design-lab .cross-node-activity[data-inspecting] .activity-track::after {
   content: "";
@@ -1450,13 +1423,6 @@ body {
   }
   #orl-design-lab :is(.allocation-expansion, .cross-node-activity) {
     --activity-label-width: 40px;
-  }
-  #orl-design-lab .inspector-heading .allocation-detail-actions {
-    width: 100%;
-    margin-left: 0;
-  }
-  #orl-design-lab .inspector-heading .allocation-detail-actions a {
-    margin-left: auto;
   }
   #orl-design-lab :is(.activity-header, .activity-row) {
     grid-template-columns: minmax(0, 1fr);

@@ -7,12 +7,9 @@ export const content = document.getElementById("content");
 
 export const ui = {
   state: null, // latest /snapshot
-  expanded: null, // placement id open on the Nodes page
-  inspectorNode: null, // fleet row hosting the inspector while comparing nodes
-  gpuGroup: null, // allocation anchoring the expansion's physical GPUs
-  deviceByNode: new Map(), // remember each node's GPU while comparing processes
+  expanded: null, // optional placement highlighted in the node overview
+  inspectorNode: null, // physical node expanded on the Nodes page
   device: "all", // GPU selected in the expansion
-  activityView: "node", // all active runs here or one run across nodes
   nodeSelection: { duration: 1800, end: null },
   nodeNavigating: false, // redraw cached data while a timeline gesture is active
   nodeQueryRange: null, // GPU query frozen until the gesture settles

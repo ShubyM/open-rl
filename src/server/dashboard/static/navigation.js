@@ -11,10 +11,8 @@ export const viewReady = () => location.hash === appliedHash;
 function restoreNodes(params) {
   ui.nodeSelection = windowFrom(params);
   ui.expanded = params.get("placement") || null;
-  ui.inspectorNode = params.get("panel") || null;
-  ui.gpuGroup = params.get("group") || null;
+  ui.inspectorNode = params.get("node") || null;
   ui.device = params.get("gpu") || "all";
-  ui.activityView = params.get("layout") === "across" ? "across" : "node";
 }
 
 export function restoreView() {
@@ -41,9 +39,8 @@ export function restoreView() {
 
 function nodeParams(freeze = false) {
   const range = timeWindow();
-  return { duration: range.now - range.start, end: freeze || !range.live ? range.now : null, placement: ui.expanded,
-    panel: ui.expanded ? ui.inspectorNode : null,
-    group: ui.expanded && ui.gpuGroup !== ui.expanded ? ui.gpuGroup : null, gpu: ui.expanded && ui.device !== "all" ? ui.device : null, layout: ui.activityView === "across" ? "across" : null };
+  return { duration: range.now - range.start, end: freeze || !range.live ? range.now : null,
+    node: ui.inspectorNode, placement: ui.expanded, gpu: ui.inspectorNode && ui.device !== "all" ? ui.device : null };
 }
 
 function runParams(freeze = false) {
@@ -69,7 +66,7 @@ export function syncViewURL() {
   appliedHash = hash;
   root.querySelector('.appbar nav a[href^="#nodes"]').href = viewLink("nodes", nodeParams());
   root.querySelectorAll('a[href^="#run/"]').forEach((link) => {
-    const [, runId, tab] = route(link.hash);
+    const [, runId, tab] = route(link.getAttribute("href"));
     if (page === "run" && id === runId) link.setAttribute("href", currentView(false, tab));
     else if (page === "nodes") {
       const range = timeWindow();

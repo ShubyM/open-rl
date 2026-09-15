@@ -46,7 +46,7 @@ function render() {
 }
 ui.render = render;
 restoreView();
-scrollToSelection = route()[0] === "nodes" && !!ui.expanded;
+scrollToSelection = route()[0] === "nodes" && !!(ui.inspectorNode || ui.expanded);
 installNodeTime();
 installActivityHover();
 root.addEventListener("toggle", (event) => {
@@ -58,11 +58,11 @@ root.addEventListener("toggle", (event) => {
 // ---- interactions ----------------------------------------------------------
 
 function closeDetails() {
-  const previous = ui.expanded;
-  ui.expanded = ui.gpuGroup = ui.inspectorNode = null;
+  const previous = ui.inspectorNode;
+  ui.expanded = ui.inspectorNode = null;
   root.style.removeProperty("min-height");
   render();
-  if (previous) content.querySelector(`[data-placement="${CSS.escape(previous)}"]`)?.focus({ preventScroll: true });
+  if (previous) content.querySelector(`[data-node-details="${CSS.escape(previous)}"]`)?.focus({ preventScroll: true });
 }
 
 root.addEventListener("click", (event) => {
@@ -76,19 +76,13 @@ root.addEventListener("click", (event) => {
   }
   const allocation = event.target.closest("[data-placement]");
   if (allocation) {
-    const nodeChoice = allocation.closest(".cross-node-activity, .allocation-node-picker");
-    if (nodeChoice && ui.expanded === allocation.dataset.placement) return;
-    if (allocation.closest("#placement-detail")) keepViewport();
-    else {
+    const node = allocation.closest(".node-placement-group").dataset.key;
+    if (node !== ui.inspectorNode) {
       root.style.removeProperty("min-height");
-      ui.activityView = "node";
-      ui.inspectorNode = allocation.closest(".node-placement-group")?.dataset.key || null;
     }
-    if (!ui.expanded || nodeChoice) {
-      ui.gpuGroup = null;
-      ui.device = nodeChoice ? ui.deviceByNode.get(allocation.dataset.node) || "all" : "all";
-    }
-    ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.matches(".hold, .activity-label, .activity-block") ? null : allocation.dataset.placement;
+    ui.device = "all";
+    ui.expanded = allocation.dataset.placement;
+    ui.inspectorNode = node;
     render();
     return;
   }
@@ -96,16 +90,18 @@ root.addEventListener("click", (event) => {
   if (!target) return;
   if (target.hasAttribute("data-copy-view")) return void copyView(target);
   if (target.hasAttribute("data-close-details")) return closeDetails();
+  if (target.dataset.nodeDetails) {
+    if (ui.inspectorNode === target.dataset.nodeDetails) return closeDetails();
+    root.style.removeProperty("min-height");
+    ui.inspectorNode = target.dataset.nodeDetails;
+    ui.expanded = null;
+    ui.device = "all";
+    render();
+  }
   if (target.hasAttribute("data-retry-snapshot")) refresh();
   if (target.dataset.device) {
     keepViewport();
     ui.device = target.dataset.device;
-    ui.deviceByNode.set(target.closest(".allocation-device-picker").dataset.node, ui.device);
-    render();
-  }
-  if (target.dataset.activityView) {
-    keepViewport();
-    ui.activityView = target.dataset.activityView;
     render();
   }
   if (target.dataset.timeLive) {
@@ -143,7 +139,7 @@ root.addEventListener("keydown", (event) => {
       return;
     }
   }
-  if (!event.defaultPrevented && event.key === "Escape" && ui.expanded) {
+  if (!event.defaultPrevented && event.key === "Escape" && route()[0] === "nodes" && (ui.inspectorNode || ui.expanded)) {
     closeDetails();
   }
 });
@@ -203,7 +199,7 @@ window.addEventListener("hashchange", () => {
   root.style.removeProperty("min-height");
   clearTimeout(searchTimer);
   restoreView();
-  scrollToSelection = route()[0] === "nodes" && !!ui.expanded;
+  scrollToSelection = route()[0] === "nodes" && !!(ui.inspectorNode || ui.expanded);
   syncRunRoute(...route());
   content.innerHTML = "";
   render();

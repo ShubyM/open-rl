@@ -100,7 +100,7 @@ export function installNodeTime() {
 
   root.addEventListener("pointerdown", (event) => {
     const track = surface(event.target);
-    if (!track || event.pointerType === "touch" || event.button !== 0 || event.target.closest("[data-placement]")) return;
+    if (!track || event.pointerType === "touch" || event.button !== 0 || event.target.closest("[data-placement], a")) return;
     finish();
     drag = { x: event.clientX, y: event.clientY, box: track.getBoundingClientRect(), range: timeWindow(), pointerId: event.pointerId };
   });
@@ -121,7 +121,7 @@ export function installNodeTime() {
       drag = null;
       const [a, b] = event.touches;
       pinch = { box: track.getBoundingClientRect(), range: timeWindow(), x: (a.clientX + b.clientX) / 2, distance: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1 };
-    } else if (event.touches.length === 1 && !event.target.closest("[data-placement]")) {
+    } else if (event.touches.length === 1 && !event.target.closest("[data-placement], a")) {
       const touch = event.touches[0];
       drag = { x: touch.clientX, y: touch.clientY, box: track.getBoundingClientRect(), range: timeWindow() };
     }
