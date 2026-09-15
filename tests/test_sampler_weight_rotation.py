@@ -34,9 +34,10 @@ class SamplerWeightRotationTest(unittest.TestCase):
         if step == 2:
           self.assertEqual(sorted(os.listdir(versions)), ["sampler-1", "sampler-2"])
         if step == 3:
-          # The full replaces the chain, so only it remains.
+          # The full snapshot sits beside the delta, and the versions before it are gone.
           self.assertEqual(os.listdir(versions), ["sampler-3"])
-      self.assertEqual(worker.saves, [("sampler-1", False), ("sampler-2", False), ("sampler-3", True), ("sampler-4", False)])
+          self.assertTrue(os.path.isdir(os.path.join(versions, "sampler-3", "full")))
+      self.assertEqual(worker.saves, [("sampler-1", False), ("sampler-2", False), ("sampler-3", False), ("full", True), ("sampler-4", False)])
       self.assertEqual(sorted(os.listdir(versions)), ["sampler-3", "sampler-4"])
 
 
