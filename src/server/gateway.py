@@ -639,7 +639,11 @@ async def save_weights_for_sampler(req: dict):
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
 
   await ensure_sampler_launched(model_id)
-  seq_id = req.get("sampling_session_seq_id") or int(time.time() * 1000)
+  # The client's counter is 0-based; `or` would treat the first save's seq_id
+  # of 0 as missing and mint a timestamp id instead.
+  seq_id = req.get("sampling_session_seq_id")
+  if seq_id is None:
+    seq_id = int(time.time() * 1000)
   alias = req.get("name") or req.get("alias") or req.get("path")
 
   session_id = sampler_session_id(model_id, seq_id)
@@ -670,7 +674,10 @@ async def save_weights(req: dict):
   if not model_id:
     return JSONResponse(status_code=400, content={"error": "model_id is required"})
 
-  seq_id = req.get("seq_id") or int(time.time() * 1000)
+  # 0 is a valid seq_id; only fall back when the field is absent.
+  seq_id = req.get("seq_id")
+  if seq_id is None:
+    seq_id = int(time.time() * 1000)
   alias = req.get("path") or f"{model_id}-samp-{seq_id}"
   state_path = checkpoint_state_path(model_id, alias)
 

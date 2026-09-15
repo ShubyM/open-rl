@@ -56,6 +56,21 @@ class GetInfoTest(unittest.TestCase):
     self.assertEqual(meta["base_model"], "my-model")
 
 
+class SaveSeqIdZeroTest(unittest.TestCase):
+  def setUp(self) -> None:
+    patcher = patch.object(gateway, "store", InMemoryStore())
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def test_the_first_saves_zero_seq_id_is_kept(self) -> None:
+    # The client's counter is 0-based; 0 must not fall back to a timestamp id.
+    asyncio.run(gateway.save_weights_for_sampler({"model_id": "job-a", "sampling_session_seq_id": 0}))
+    asyncio.run(gateway.save_weights({"model_id": "job-a", "seq_id": 0}))
+    queued = asyncio.run(gateway.store.get_requests())
+    self.assertEqual(queued[0]["payload"]["sampling_session_id"], "tinker://job-a/sampler_weights/sampler-0")
+    self.assertTrue(queued[1]["payload"]["state_path"].endswith("job-a-samp-0"))
+
+
 class GatewayPathTest(unittest.TestCase):
   def test_checkpoint_state_paths_are_model_scoped(self) -> None:
     old_tmp_dir = gateway.TMP_DIR
