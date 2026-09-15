@@ -229,6 +229,8 @@ function processLabel(placement) {
   return [role[0].toUpperCase() + role.slice(1), accelerator === "GPU" ? null : accelerator, gpus].filter(Boolean).join(" · ");
 }
 
+const processOrder = (a, b) => ({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""));
+
 function activityTimeline(placements, range, { acrossNodes = false, navigate = false, activeOnly = false } = {}) {
   const canSelect = (p) => !acrossNodes || ui.state.cluster.nodes.some((n) => n.name === p.node);
   const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
@@ -238,7 +240,7 @@ function activityTimeline(placements, range, { acrossNodes = false, navigate = f
     return navigate && canSelect(p) ? `<a href="${escape(nodeLink(p.id, range))}" aria-label="View ${escape(processLabel(p))} on ${escape(p.node)}">${shape}</a>` : shape;
   };
   const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${axisTime(range.start + ((range.now - range.start) * tick) / 4, range)}</span>`).join("");
-  const activities = [...placements].sort((a, b) => (acrossNodes ? ({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || "")) : 0) || a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
+  const activities = [...placements].sort((a, b) => (acrossNodes ? processOrder(a, b) : 0) || a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
   const shown = activeOnly ? activities.filter((p) => p.intervals.length) : activities;
   if (!shown.length) {
     const loading = activities.some((p) => p.loading);
@@ -311,29 +313,35 @@ function detail(placement, range, all) {
     )
     .join("");
   const label = `${acceleratorLabel(node)} · ${shortNodeName(anchor.node, ui.state.cluster.nodes)}`;
-  const shownDevices = devices.filter((d) => ui.device === "all" || d.id === ui.device);
-  const scope = shownDevices.length === 1 ? `GPU ${deviceLabel(shownDevices[0].name)}` : shownDevices.length ? `${shownDevices.length} GPUs` : "selected GPUs";
-  const related = run ? all.filter((p) => p.node && p.run_ids?.includes(run.run_id)) : [];
-  const canCompare = new Set(related.map((p) => p.node)).size > 1;
+  const runId = placement.run_ids?.[0];
+  const related = runId ? all.filter((p) => p.node && p.run_ids?.includes(runId)).sort(processOrder) : [placement];
+  const canCompare = related.length > 1;
   if (!canCompare) ui.activityView = "node";
   const across = ui.activityView === "across";
   const displayed = across ? related : visible;
   const notes = activityNotes(displayed, range);
-  const gpuPicker = `<div class="allocation-device-picker" data-node="${escape(anchor.node)}" aria-label="GPU selection">${picker}</div>`;
-  const memory = `<span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span>`;
-  const title = across ? `<span class="activity-swatch" aria-hidden="true"></span>${escape(placement.label)}` : `${escape(label)} <span class="muted">· All runs</span>`;
-  return `<section class="allocation-expansion" id="placement-detail"><div class="allocation-detail-head inspector-heading"><h2 class="${across ? placementColor(placement) : ""}" title="${escape(across ? placement.label : anchor.node)}">${title}</h2><div class="allocation-detail-actions">${run ? `<a href="#run/${encode(run.run_id)}/activity">Run details ↗</a>` : ""}<button type="button" class="detail-close" data-close-details aria-label="Close GPU details" title="Close (Esc)">×</button></div></div>
-    <div class="allocation-controls">${canCompare ? `<div class="activity-view" role="group" aria-label="Activity scope">${[["node", "This node"], ["across", "Across nodes"]].map(([view, text]) => button(text, `data-activity-view="${view}" aria-pressed="${ui.activityView === view}"`)).join("")}</div>` : ""}${across ? "" : gpuPicker}</div>
+  const nodePicker = related.map((p) => {
+    const target = state.cluster.nodes.find((n) => n.name === p.node);
+    const role = p.role ? p.role[0].toUpperCase() + p.role.slice(1) : "Process";
+    const peers = related.filter((other) => other.node === p.node && other.role === p.role);
+    const process = peers.length > 1 ? processLabel(p) : `${role}${target ? " · " + acceleratorLabel(target) : ""}`;
+    const repeated = peers.some((other) => other.id !== p.id && [...other.devices].sort().join() === [...p.devices].sort().join());
+    const name = `${process} · ${shortNodeName(p.node, state.cluster.nodes)}${repeated ? " · " + nodeTime(p.start, true) : ""}${p.ended ? " · Ended" : ""}`;
+    return canCompare ? button(name, `data-key="node:${escape(p.id)}" data-placement="${escape(p.id)}" data-node="${escape(p.node)}" aria-pressed="${p.id === placement.id}" title="${escape(p.node)}${target ? "" : " · Node no longer reported"}" ${target ? "" : "disabled"}`) : `<span title="${escape(p.node)}">${escape(name)}</span>`;
+  }).join("");
+  return `<section class="allocation-expansion" id="placement-detail"><div class="allocation-detail-head inspector-heading"><h2 class="${placementColor(placement)}" title="${escape(placement.label)}"><span class="activity-swatch" aria-hidden="true"></span>${escape(placement.label)}</h2><div class="allocation-detail-actions">${canCompare ? button("Compare run", `data-activity-view="${across ? "node" : "across"}" aria-pressed="${across}" title="Compare this run's processes on the same timeline"`) : ""}${run ? `<a href="#run/${encode(run.run_id)}/activity">Run details ↗</a>` : ""}<button type="button" class="detail-close" data-close-details aria-label="Close GPU details" title="Close (Esc)">×</button></div></div>
+    <div class="allocation-node-picker" role="group" aria-label="Run processes">${nodePicker}</div>
+    <div class="allocation-controls"><div class="allocation-device-picker" data-node="${escape(anchor.node)}" aria-label="GPU selection">${picker}</div><span class="allocation-scope">${across ? "Run comparison · all assigned GPUs" : "Runs on selected GPUs"}</span></div>
     <div class="${across ? "cross-node-activity node-comparison" : "node-activity"}" data-key="node-timeline">${activityTimeline(displayed, range, { acrossNodes: across, activeOnly: !across })}${notes.warnings}</div>
-    <div class="node-gpu-detail" data-key="node-gpu-detail" data-node="${escape(anchor.node)}">${across ? `<div class="allocation-detail-head"><h2 title="${escape(anchor.node)}">${escape(label)} <span class="muted">· ${escape(scope)}</span></h2>${memory}</div>${gpuPicker}` : ""}
-    <div>${gpuChart(metrics, range)}</div>
-    <div class="allocation-detail-footer"><span>${notes.source}</span>${across ? "" : memory}</div></div></section>`;
+    <div class="node-gpu-detail" data-key="node-gpu-detail" data-node="${escape(anchor.node)}"><div>${gpuChart(metrics, range, label)}</div>
+    <div class="allocation-detail-footer"><span>${notes.source}</span><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div></div></section>`;
 }
 
 const selectedDevices = (metrics) => [...new Map((metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id).map((d) => [d.uuid || d.id, d])).values()];
 
-function gpuChart(metrics, range) {
-  if (!metrics.data) return chart({ title: "GPU utilization", start: range.start, end: range.now, empty: metrics.error || "Loading GPU metrics…" });
+function gpuChart(metrics, range, label) {
+  const title = `GPU utilization · ${label}`;
+  if (!metrics.data) return chart({ title, start: range.start, end: range.now, empty: metrics.error || "Loading GPU metrics…" });
   const selected = selectedDevices(metrics);
   const byTime = new Map();
   for (const device of selected)
@@ -349,7 +357,7 @@ function gpuChart(metrics, range) {
   const failures = [...new Set([metrics.error, ...selected.map((d) => d.reason)].filter(Boolean))];
   const hasSamples = points.some(([at, value]) => at >= range.start && at <= range.now && Number.isFinite(value));
   return `${chart({
-    title: "GPU utilization",
+    title,
     unit: "%",
     points,
     start: range.start,

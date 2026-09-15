@@ -725,21 +725,29 @@ body {
   flex-wrap: wrap;
   gap: 12px;
 }
-#orl-design-lab :is(.allocation-device-picker, .activity-view) {
+#orl-design-lab :is(.allocation-device-picker, .allocation-node-picker) {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
 }
-#orl-design-lab :is(.allocation-device-picker, .activity-view) .chip {
+#orl-design-lab :is(.allocation-device-picker, .allocation-node-picker) .chip {
   border-color: transparent;
   background: transparent;
   color: var(--dim);
 }
-#orl-design-lab :is(.allocation-device-picker, .activity-view) .chip[aria-pressed="true"],
-#orl-design-lab :is(.allocation-device-picker, .activity-view) .chip:hover {
+#orl-design-lab :is(.allocation-device-picker, .allocation-node-picker) .chip[aria-pressed="true"],
+#orl-design-lab :is(.allocation-device-picker, .allocation-node-picker) .chip:hover {
   border-color: var(--line);
   background: var(--paper);
   color: var(--ink);
+}
+#orl-design-lab .allocation-node-picker > span {
+  padding-block: 6px;
+  color: var(--dim);
+}
+#orl-design-lab .allocation-scope {
+  color: var(--dim);
+  font-size: 12px;
 }
 #orl-design-lab .allocation-memory {
   color: var(--dim);
@@ -1442,6 +1450,13 @@ body {
   }
   #orl-design-lab :is(.allocation-expansion, .cross-node-activity) {
     --activity-label-width: 40px;
+  }
+  #orl-design-lab .inspector-heading .allocation-detail-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+  #orl-design-lab .inspector-heading .allocation-detail-actions a {
+    margin-left: auto;
   }
   #orl-design-lab :is(.activity-header, .activity-row) {
     grid-template-columns: minmax(0, 1fr);

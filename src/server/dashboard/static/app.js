@@ -76,17 +76,17 @@ root.addEventListener("click", (event) => {
   }
   const allocation = event.target.closest("[data-placement]");
   if (allocation) {
-    const acrossNodes = allocation.closest(".cross-node-activity");
-    if (acrossNodes && ui.expanded === allocation.dataset.placement) return;
+    const nodeChoice = allocation.closest(".cross-node-activity, .allocation-node-picker");
+    if (nodeChoice && ui.expanded === allocation.dataset.placement) return;
     if (allocation.closest("#placement-detail")) keepViewport();
     else {
       root.style.removeProperty("min-height");
       ui.activityView = "node";
       ui.inspectorNode = allocation.closest(".node-placement-group")?.dataset.key || null;
     }
-    if (!ui.expanded || acrossNodes) {
+    if (!ui.expanded || nodeChoice) {
       ui.gpuGroup = null;
-      ui.device = acrossNodes ? ui.deviceByNode.get(allocation.dataset.node) || "all" : "all";
+      ui.device = nodeChoice ? ui.deviceByNode.get(allocation.dataset.node) || "all" : "all";
     }
     ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.matches(".hold, .activity-label, .activity-block") ? null : allocation.dataset.placement;
     render();
