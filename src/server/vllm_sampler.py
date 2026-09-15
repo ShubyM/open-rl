@@ -432,6 +432,7 @@ async def run_sampling_worker(model_id: str) -> None:
                 IS_ENGINE_SLEEPING = False
               unanswered = []
               await sample_batch(sampling_reqs)
+              await store.ack_sampling_requests_for_model(model_id)
               if has_shutdown:
                 await exit_gracefully()
               if engine is not None:
@@ -452,9 +453,11 @@ async def run_sampling_worker(model_id: str) -> None:
               IS_ENGINE_SLEEPING = False
             unanswered = []
             await sample_batch(sampling_reqs)
+            await store.ack_sampling_requests_for_model(model_id)
 
         if has_shutdown:
           print("[vLLM Worker] Shutdown sentinel popped from queue. Initiating clean exit...")
+          await store.ack_sampling_requests_for_model(model_id)
           await exit_gracefully()
       except asyncio.CancelledError:
         break
@@ -462,6 +465,7 @@ async def run_sampling_worker(model_id: str) -> None:
         print(f"Error in sampling worker loop: {exc}")
         traceback.print_exc()
         await fail_requests(unanswered, exc)
+        await store.ack_sampling_requests_for_model(model_id)
         if engine_is_dead(exc):
           # A dead EngineCore (e.g. a CUDA assert during a weight patch) never
           # recovers in-process; exit non-zero so the pod restarts instead of

@@ -174,6 +174,9 @@ class _TrainingRequestsStoreStub(_FutureStoreStub):
     self.batches = list(batches)
     self.queried_model_ids = []
 
+  async def ack_requests_for_model(self, model_id):
+    return None
+
   async def get_requests_for_model(self, model_id):
     self.queried_model_ids.append(model_id)
     if self.batches:

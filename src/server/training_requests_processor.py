@@ -198,6 +198,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
       for request in batch:
         target_model_id = request.get("adapter_id") or request.get("model_id") or model_id
         await self.process_request(request, target_model_id)
+      await self.store.ack_requests_for_model(model_id)
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     base_model, _, raw_config, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="lora")
@@ -423,8 +424,11 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         for request_id, result in results:
           if request_id is not None:
             await self.store.set_future(request_id, result)
+        await self.store.ack_requests_for_model(self.model_id)
         if failure is not None:
           raise failure
+      else:
+        await self.store.ack_requests_for_model(self.model_id)
 
     faulted = getattr(self.time_slicer, "faulted", None)
     if faulted:
