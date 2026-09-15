@@ -8,7 +8,9 @@ export const content = document.getElementById("content");
 export const ui = {
   state: null, // latest /snapshot
   expanded: null, // placement id open on the Nodes page
+  inspectorNode: null, // fleet row hosting the inspector while comparing nodes
   gpuGroup: null, // allocation anchoring the expansion's physical GPUs
+  deviceByNode: new Map(), // remember each node's GPU while comparing processes
   device: "all", // GPU selected in the expansion
   activityView: "gpu", // combined GPU strips or individual run rows
   nodeSelection: { duration: 1800, end: null },

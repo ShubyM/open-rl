@@ -59,7 +59,8 @@ root.addEventListener("toggle", (event) => {
 
 function closeDetails() {
   const previous = ui.expanded;
-  ui.expanded = ui.gpuGroup = null;
+  ui.expanded = ui.gpuGroup = ui.inspectorNode = null;
+  root.style.removeProperty("min-height");
   render();
   if (previous) content.querySelector(`[data-placement="${CSS.escape(previous)}"]`)?.focus({ preventScroll: true });
 }
@@ -76,15 +77,18 @@ root.addEventListener("click", (event) => {
   const allocation = event.target.closest("[data-placement]");
   if (allocation) {
     const acrossNodes = allocation.closest(".cross-node-activity");
-    const top = acrossNodes?.getBoundingClientRect().top;
+    if (acrossNodes && ui.expanded === allocation.dataset.placement) return;
+    if (allocation.closest("#placement-detail")) keepViewport();
+    else {
+      root.style.removeProperty("min-height");
+      ui.inspectorNode = allocation.closest(".node-placement-group")?.dataset.key || null;
+    }
     if (!ui.expanded || acrossNodes) {
       ui.gpuGroup = null;
-      ui.device = "all";
+      ui.device = acrossNodes ? ui.deviceByNode.get(allocation.dataset.node) || "all" : "all";
     }
     ui.expanded = ui.expanded === allocation.dataset.placement && !allocation.matches(".hold, .activity-label, .activity-block") ? null : allocation.dataset.placement;
     render();
-    const comparison = content.querySelector(".cross-node-activity");
-    if (acrossNodes && comparison) window.scrollBy(0, comparison.getBoundingClientRect().top - top);
     return;
   }
   const target = event.target.closest("button");
@@ -93,10 +97,13 @@ root.addEventListener("click", (event) => {
   if (target.hasAttribute("data-close-details")) return closeDetails();
   if (target.hasAttribute("data-retry-snapshot")) refresh();
   if (target.dataset.device) {
+    keepViewport();
     ui.device = target.dataset.device;
+    ui.deviceByNode.set(target.closest(".node-gpu-detail").dataset.node, ui.device);
     render();
   }
   if (target.dataset.activityView) {
+    keepViewport();
     ui.activityView = target.dataset.activityView;
     render();
   }
@@ -113,6 +120,12 @@ root.addEventListener("click", (event) => {
   if (target.dataset.logFollow !== undefined) toggleLogFollow();
   if (target.dataset.older) loadLogs(route()[1], true);
 });
+
+function keepViewport() {
+  // A smaller GPU section must not shorten the document past the viewport
+  // and make the browser clamp scroll. Any extra space stays below the fleet.
+  root.style.minHeight = `${window.scrollY + innerHeight}px`;
+}
 
 root.addEventListener("keydown", (event) => {
   const plot = event.target.closest(".chart-plot");
@@ -186,6 +199,7 @@ document.addEventListener("click", (event) => {
 
 window.addEventListener("hashchange", () => {
   cancelNodeGesture(false);
+  root.style.removeProperty("min-height");
   clearTimeout(searchTimer);
   restoreView();
   scrollToSelection = route()[0] === "nodes" && !!ui.expanded;

@@ -51,12 +51,15 @@ Set `OPEN_RL_PROMETHEUS_URL` to a Prometheus-compatible endpoint that scrapes th
 
 Runs sharing a LoRA process retain distinct colors and links on Nodes. The UI fetches each run’s retained operation records through the snapshot time and clips their intervals locally, so zooming through an operation does not hide it when its completion falls outside the visible window. Their recorded operations determine the colored intervals; GPU utilization still comes from the physical allocation. Short sampler bursts may be narrower than the GPU telemetry's sampling interval.
 
+On Nodes, the inspector stays below the fleet row where it was opened. The selected run's cross-node comparison comes first; choosing a process updates only the GPU section below it. Its heading names the node and the selected GPU scope, such as **H100 · vcxu · All runs on GPU 7**. The **Inspecting** label identifies that process, and each node remembers its GPU selection while switching. Selecting a different colored run in the local GPU section changes the compared run. GPU selectors filter the local section; the comparison continues to show the run's processes across nodes.
+
 ## Sharing an inspection
 
 The address bar preserves the selected view. **Copy link** freezes its exact time window, including when the current view follows live data. A fresh tab restores the selection; it fetches the same underlying APIs and still requires access to the dashboard.
 
 - `#run/{run_id}/activity` opens a run's process comparison; `/logs` opens logs and `/metrics` expands advanced metrics.
 - `#nodes?placement={id}&gpu={device_id}&group={anchor_placement_id}&layout=run` opens a GPU inspection. Omit `gpu` for all GPUs, `group` when the selection also anchors the GPU group, and `layout` for the combined GPU strips.
+- `panel` preserves the fleet node hosting the inspector when its selected process is on another node.
 - `duration` is the window length in seconds (60–86400); `end` is its end as Unix seconds, including fractions. Without `end`, the window follows the current snapshot.
 - Run links also preserve log search `q`, `pod`, an incident's `event` timestamp, and the originating node view in `back`.
 
