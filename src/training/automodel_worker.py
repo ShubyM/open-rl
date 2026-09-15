@@ -26,11 +26,11 @@ backward of that gather scales by CP to cancel FSDP2's mean over the
 dp_shard x cp mesh, matching how the base class scales by the DP size.
 
 A wrong CP trains on a corrupted gradient without crashing, so this one was
-checked before use: scripts/automodel_probe.py on Qwen3.5-9B (LoRA r32, 4096
-tokens, 2026-09-10) against a single-GPU reference gave per-position logprobs
-within bf16 noise on every chunk and adapter gradients at cosine >= 0.9987 for
-CP2, CP4 and TP2xCP2, the same agreement TP2 alone shows. Rerun that probe
-after touching this path.
+checked before use on Qwen3.5-9B (LoRA r32, 4096 tokens, 2026-09-10) against a
+single-GPU reference: per-position logprobs within bf16 noise on every chunk
+and adapter gradients at cosine >= 0.9987 for CP2, CP4 and TP2xCP2, the same
+agreement TP2 alone shows. Compare against a single-GPU reference again after
+touching this path.
 
 Two modes, chosen by the model's fine-tuning type. LoRA (the default) freezes
 the base, trains PEFT adapters with the rank and alpha the client sent, and
