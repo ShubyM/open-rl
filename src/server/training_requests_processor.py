@@ -420,16 +420,14 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
         if gpu_reqs:
           async with self.gpu_lease():
-            if hasattr(self.worker, "wake_up"):
-              await asyncio.to_thread(self.worker.wake_up)
+            await asyncio.to_thread(self.worker.wake_up)
             try:
               for request in gpu_reqs:
                 results.append(await self.handle_request(request, model_id))
             finally:
-              if hasattr(self.worker, "sleep"):
-                await asyncio.to_thread(self.worker.sleep)
+              await asyncio.to_thread(self.worker.sleep)
 
-        if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload and save_reqs:
+        if not self.worker.cpu_offload and save_reqs:
           async with self.gpu_lease():
             for request in save_reqs:
               results.append(await self.handle_request(request, model_id))
