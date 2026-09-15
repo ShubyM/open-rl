@@ -133,6 +133,36 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     batch = await self.store.get_requests(active_set_id="base-1")
     self.assertEqual([r["request_id"] for r in batch], ["a0", "a1"])
 
+  async def test_unacknowledged_requests_are_handed_out_again(self) -> None:
+    await self.store.put_request({"request_id": "a", "model_id": "m", "op": "forward_backward"})
+    await self.store.put_request({"request_id": "b", "model_id": "m", "op": "optim_step"})
+    first = await self.store.get_requests_for_model("m")
+    self.assertEqual([r["request_id"] for r in first], ["a", "b"])
+    # Nothing was acknowledged, as after a lost reply or a crash: the same
+    # batch comes back, ahead of anything queued since.
+    await self.store.put_request({"request_id": "c", "model_id": "m", "op": "save_state"})
+    again = await self.store.get_requests_for_model("m")
+    self.assertEqual([r["request_id"] for r in again], ["a", "b", "c"])
+    await self.store.ack_requests_for_model("m")
+    await self.store.put_request({"request_id": "d", "model_id": "m", "op": "optim_step"})
+    self.assertEqual([r["request_id"] for r in await self.store.get_requests_for_model("m")], ["d"])
+
+  async def test_sampling_requests_wait_for_their_ack_too(self) -> None:
+    await self.store.put_sampling_request({"request_id": "s1", "model_id": "m"})
+    self.assertEqual([r["request_id"] for r in await self.store.get_sampling_requests_for_model("m")], ["s1"])
+    await self.store.put_sampling_request({"request_id": "s2", "model_id": "m"})
+    self.assertEqual([r["request_id"] for r in await self.store.get_sampling_requests_for_model("m")], ["s1", "s2"])
+    await self.store.ack_sampling_requests_for_model("m")
+    await self.store.put_sampling_request({"request_id": "s3", "model_id": "m"})
+    self.assertEqual([r["request_id"] for r in await self.store.get_sampling_requests_for_model("m")], ["s3"])
+
+  async def test_tenant_rotation_hands_unacknowledged_requests_out_again(self) -> None:
+    await self.store.put_request({"request_id": "a", "model_id": "t1", "op": "forward_backward"}, active_set_id="s")
+    self.assertEqual([r["request_id"] for r in await self.store.get_requests(active_set_id="s")], ["a"])
+    await self.store.put_request({"request_id": "b", "model_id": "t1", "op": "optim_step"}, active_set_id="s")
+    self.assertEqual([r["request_id"] for r in await self.store.get_requests(active_set_id="s")], ["a", "b"])
+    await self.store.ack_requests_for_model("t1")
+
   async def test_values_expire_and_sets_hold_members(self) -> None:
     await self.store.set_value("k", "v", ttl_seconds=60)
     self.assertEqual(await self.store.get_value("k"), "v")
