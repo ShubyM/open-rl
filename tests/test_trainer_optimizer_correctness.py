@@ -6,7 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from unittest.mock import patch
 
 import torch
@@ -746,6 +746,172 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
 
     self.assertEqual(len(result["loss_fn_outputs"]), len(data))
     self.assertGreater(len(worker.model.calls), 0)
+
+
+class TestZeroAdvantageBackward(unittest.TestCase):
+  """A policy-gradient batch without effective advantages carries no gradient
+  and skips its backward; a KL penalty brings the gradient back."""
+
+  def _worker(self) -> BaseTrainerWorker:
+    worker = BaseTrainerWorker()
+    worker.device = torch.device("cpu")
+    worker.tokenizer = _TokenizerStub()
+    return worker
+
+  def test_zero_effective_advantages_skip_policy_backward(self) -> None:
+    for loss_fn in ("importance_sampling", "ppo"):
+      with self.subTest(loss_fn=loss_fn):
+        worker = self._worker()
+        parameter = torch.nn.Parameter(torch.tensor(0.25))
+        model = _FullModelStub([parameter])
+        data = [_datum([3, 4], [1, 2], weights=[1.0, 0.0], logprobs=[-0.1, -0.2], advantages=[0.0, 2.0])]
+
+        with patch.object(
+          worker,
+          "compute_target_logprobs",
+          side_effect=lambda _model, _inputs, _mask, targets, parameter=parameter: parameter.expand_as(targets),
+        ):
+          result = worker.forward_backward(model, data, loss_fn)
+
+        self.assertIsNone(parameter.grad)
+        self.assertEqual(result["metrics"], {"loss:mean": 0.0, "loss:sum": 0.0})
+        self.assertEqual(result["loss_fn_outputs"][0]["logprobs"]["shape"], [2])
+
+  def test_ppo_kl_penalty_keeps_backward_for_zero_advantages(self) -> None:
+    worker = self._worker()
+    parameter = torch.nn.Parameter(torch.tensor(0.25))
+    model = _FullModelStub([parameter])
+    data = [_datum([3], [1], weights=[1.0], logprobs=[-0.1], advantages=[0.0])]
+
+    with patch.object(
+      worker,
+      "compute_target_logprobs",
+      side_effect=lambda _model, _inputs, _mask, targets: parameter.expand_as(targets),
+    ):
+      worker.forward_backward(model, data, "ppo", {"kl_coeff": 0.1})
+
+    self.assertIsNotNone(parameter.grad)
+    self.assertNotEqual(parameter.grad.item(), 0.0)
+
+
+class TestDataParallelForwardBackward(unittest.TestCase):
+  """Datum sharding must reproduce single-process gradients under FSDP's per-backward averaging."""
+
+  PLACEHOLDER = {"logprobs": {"data": [], "dtype": "float32", "shape": [0]}}
+
+  def _data(self):
+    return [
+      _datum([3, 4, 5], [1, 2, 3], weights=[1.0, 0.5, 0.25]),
+      _datum([7, 8], [2, 3], weights=[2.0, 0.75]),
+      _datum([9], [4], weights=[1.5]),
+    ]
+
+  def _run_forward_backward(self, data, *, loss_fn="cross_entropy", rank=None, world=2, captured=None):
+    """Run one rank of a fake two-rank group, or a single process when rank is None."""
+    worker = BaseTrainerWorker()
+    worker.device = torch.device("cpu")
+    worker.tokenizer = _TokenizerStub()
+    parameter = torch.nn.Parameter(torch.tensor(0.25))
+    model = _FullModelStub([parameter])
+    captured = {} if captured is None else captured
+
+    def gather(part, _group):
+      captured["part"] = part
+      return [part, {idx: self.PLACEHOLDER for idx in range(len(data)) if idx not in part}]
+
+    def reduce_sum(value, _group):
+      captured["total"] = value
+      return value
+
+    fakes = {
+      "group_rank": lambda _group: rank,
+      "group_size": lambda _group: world,
+      "all_reduce_max": lambda _passes, _group: 2,
+      "all_reduce_sum": reduce_sum,
+      "all_gather_object": gather,
+    }
+    with ExitStack() as stack:
+      if rank is not None:
+        stack.enter_context(patch.object(worker, "data_parallel_group", return_value=object()))
+        for name, fake in fakes.items():
+          stack.enter_context(patch.object(trainer_worker_module, name, fake))
+      compute_calls = stack.enter_context(
+        patch.object(
+          worker,
+          "compute_target_logprobs",
+          side_effect=lambda _model, _inputs, _mask, targets, parameter=parameter: parameter.expand_as(targets),
+        )
+      )
+      result = worker.forward_backward(model, data, loss_fn)
+    return result, parameter, compute_calls
+
+  def test_sharded_gradients_average_to_single_process_gradient(self) -> None:
+    data = self._data()
+    reference, reference_param, _calls = self._run_forward_backward(data)
+
+    rank_grads, rank_totals, rank_parts = [], [], {}
+    for rank in (0, 1):
+      captured = {}
+      _result, parameter, _calls = self._run_forward_backward(data, rank=rank, captured=captured)
+      rank_grads.append(parameter.grad)
+      rank_totals.append(captured["total"])
+      rank_parts.update(captured["part"])
+
+    # FSDP averages each backward across ranks; the group-size loss scaling
+    # must make that average equal the single-process gradient sum.
+    torch.testing.assert_close((rank_grads[0] + rank_grads[1]) / 2, reference_param.grad)
+    self.assertAlmostEqual(sum(rank_totals), reference["metrics"]["loss:sum"], places=5)
+    self.assertEqual(sorted(rank_parts), list(range(len(data))))
+
+  def test_short_rank_pads_with_zero_scaled_filler_passes(self) -> None:
+    data = self._data()
+    result, parameter, compute_calls = self._run_forward_backward(data, rank=1)
+
+    # Rank 1 owns one datum but must run two passes; the filler pass leaves
+    # gradients and reported loss untouched.
+    self.assertEqual(compute_calls.call_count, 2)
+    weights_rank1 = 2.0 + 0.75
+    torch.testing.assert_close(parameter.grad, torch.tensor(2 * -weights_rank1))
+    self.assertAlmostEqual(result["metrics"]["loss:sum"], 0.25 * -weights_rank1, places=5)
+    self.assertEqual(result["loss_fn_outputs"][1]["logprobs"]["shape"], [2])
+
+  def test_distributed_ranks_never_skip_zero_advantage_backward(self) -> None:
+    data = [_datum([3, 4], [1, 2], weights=[1.0, 0.0], logprobs=[-0.1, -0.2], advantages=[0.0, 2.0])]
+    result, parameter, _calls = self._run_forward_backward(data, loss_fn="importance_sampling", rank=0)
+
+    # Single-process mode skips this backward entirely; a distributed rank
+    # must still run it so the group's collective counts stay aligned.
+    self.assertIsNotNone(parameter.grad)
+    torch.testing.assert_close(parameter.grad, torch.tensor(0.0))
+    self.assertEqual(result["metrics"]["loss:sum"], 0.0)
+
+
+class TestRankGating(unittest.TestCase):
+  def test_non_primary_rank_does_not_publish_futures(self) -> None:
+    trp = training_requests_processor_module
+
+    class Store:
+      def __init__(self):
+        self.published = []
+
+      async def set_future(self, request_id, result):
+        self.published.append(request_id)
+
+    class Proc(trp.LoraTrainingRequestsProcessor):
+      def __init__(self, store):
+        self.store = store
+
+      async def handle_request(self, raw_request, model_id=None):
+        return raw_request["request_id"], {"type": "ok"}
+
+    store = Store()
+    proc = Proc(store)
+    with patch.object(trp, "is_primary", return_value=False):
+      asyncio.run(proc.process_request({"request_id": "r1"}, "m"))
+    self.assertEqual(store.published, [])
+    with patch.object(trp, "is_primary", return_value=True):
+      asyncio.run(proc.process_request({"request_id": "r2"}, "m"))
+    self.assertEqual(store.published, ["r2"])
 
 
 if __name__ == "__main__":
