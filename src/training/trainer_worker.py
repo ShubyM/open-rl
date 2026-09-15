@@ -51,6 +51,9 @@ class BaseTrainerWorker:
   # Whether samplers receive whole checkpoints (True) or LoRA adapters (False).
   # The request processor picks its loop and save routes by this.
   full_parameter = False
+  # Whether the worker parks its model on the host between GPU leases. A
+  # worker that does overrides sleep/wake_up; the default holds the GPU.
+  cpu_offload = False
 
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
@@ -62,6 +65,12 @@ class BaseTrainerWorker:
       self.device = torch.device("mps")
     else:
       self.device = torch.device("cpu")
+
+  def sleep(self) -> None:
+    pass
+
+  def wake_up(self) -> None:
+    pass
 
   def data_parallel_group(self) -> dist.ProcessGroup | None:
     """The process group whose ranks split the datums of one forward_backward.
