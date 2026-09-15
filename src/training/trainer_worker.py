@@ -2,13 +2,40 @@
 
 import math
 import os
+from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from pydantic import BaseModel
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
+from training.distributed import all_gather_object, all_reduce_max, all_reduce_sum, group_rank, group_size, local_rank
+
+# Position marker for a filler pass, see forward_backward.
+FILLER_DATUM_INDEX = -1
+
+
+def chunk_target_logprob(
+  hidden_chunk: torch.Tensor,
+  weight: torch.Tensor,
+  bias: torch.Tensor | None,
+  target_chunk: torch.Tensor,
+  softcap: float | None,
+) -> torch.Tensor:
+  """logit[target] - logsumexp for one chunk of hidden states.
+
+  The [chunk, vocab] logits are local to this call, so a backend that runs it
+  under activation checkpointing never stores full-sequence logits.
+  """
+  logits = torch.nn.functional.linear(hidden_chunk, weight, bias)
+  if logits.dtype in (torch.float16, torch.bfloat16):
+    logits = logits.float()
+  if softcap is not None:
+    logits = softcap * torch.tanh(logits / softcap)
+  target_logit = logits.gather(dim=-1, index=target_chunk.unsqueeze(-1)).squeeze(-1)
+  return target_logit - torch.logsumexp(logits, dim=-1)
 
 
 class TensorData(BaseModel):
@@ -21,37 +48,79 @@ class Datum(BaseModel):
 
 
 class BaseTrainerWorker:
+  # Whether samplers receive whole checkpoints (True) or LoRA adapters (False).
+  # The request processor picks its loop and save routes by this.
+  full_parameter = False
+
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
+    self.ratio_stats = self.fresh_ratio_stats()
 
     if torch.cuda.is_available():
-      self.device = torch.device("cuda")
+      self.device = torch.device("cuda", local_rank())
     elif torch.backends.mps.is_available():
       self.device = torch.device("mps")
     else:
       self.device = torch.device("cpu")
 
+  def data_parallel_group(self) -> dist.ProcessGroup | None:
+    """The process group whose ranks split the datums of one forward_backward.
+
+    None means this process trains alone. Ranks that share one model replica
+    (tensor or context parallel) must see identical datums, so a backend with
+    such ranks returns its data-parallel subgroup, not the world.
+    """
+    return None
+
   def forward_backward(self, model: PreTrainedModel, data: list[Datum], loss_fn: str, loss_config: dict | None = None) -> dict[str, Any]:
-    """Run a forward/backward pass on model and return Tinker-shaped loss outputs."""
+    """Run a forward/backward pass on model and return Tinker-shaped loss outputs.
+
+    Under data parallelism each rank owns a round-robin shard of the datums.
+    FSDP averages gradients over the group inside every backward, so each real
+    pass scales its loss by the group size to recover the sum over all datums,
+    and every rank runs the same number of passes (short ranks run zero-scaled
+    fillers) so the collectives inside backward line up.
+    """
+    group = self.data_parallel_group()
+    dp_rank, dp_size = group_rank(group), group_size(group)
+    local_indices = list(range(dp_rank, len(data), dp_size))
+    local_batches = self.make_training_batches([data[idx] for idx in local_indices])
+    if dp_size > 1:
+      filler_passes = all_reduce_max(len(local_batches), group) - len(local_batches)
+      filler = data[local_indices[0]] if local_indices else data[0]
+      local_batches.extend([[(FILLER_DATUM_INDEX, filler)]] * filler_passes)
+
     total_loss = 0.0
     loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
 
     model.train()
 
-    for batch in self.make_training_batches(data):
-      batch_indices = [idx for idx, _ in batch]
+    for batch in local_batches:
+      is_filler = batch[0][0] == FILLER_DATUM_INDEX
+      batch_indices = [] if is_filler else [local_indices[position] for position, _ in batch]
       batch_data = [datum for _, datum in batch]
 
       input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
       target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
-      target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+
+      old_logprobs = advantages = None
+      if loss_fn in ("importance_sampling", "ppo"):
+        old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
+        advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
+
+      # A batch without gradient (a GRPO group whose rewards all tied) still
+      # costs a full backward unless its forward runs without a graph. Under
+      # data parallelism the pass must still happen for the collectives.
+      skip_backward = dp_size == 1 and self.batch_has_no_gradient(loss_fn, loss_config, weights, advantages)
+      with torch.no_grad() if skip_backward else nullcontext():
+        target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+      if old_logprobs is not None and not is_filler:
+        self.record_ratio_stats(target_logprobs, old_logprobs, weights, advantages)
 
       match loss_fn:
         case "cross_entropy":
           elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
         case "importance_sampling":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
           elementwise_loss = losses.importance_sampling_loss(
             target_logprobs,
             weights,
@@ -59,8 +128,6 @@ class BaseTrainerWorker:
             advantages,
           )
         case "ppo":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
           elementwise_loss = losses.ppo_loss(
             target_logprobs,
             weights,
@@ -73,8 +140,11 @@ class BaseTrainerWorker:
 
       per_datum_loss = elementwise_loss.sum(dim=1)
       loss = per_datum_loss.sum()
-      loss.backward()
-      total_loss += loss.item()
+      if not skip_backward:
+        backward_loss = loss * (0.0 if is_filler else float(dp_size)) if dp_size > 1 else loss
+        backward_loss.backward()
+      if not is_filler:
+        total_loss += loss.item()
 
       detached_logprobs = target_logprobs.detach().cpu()
       for row, original_idx in enumerate(batch_indices):
@@ -82,6 +152,12 @@ class BaseTrainerWorker:
         logprobs_list = detached_logprobs[row, :row_len].tolist()
         logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
         loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
+
+    if dp_size > 1:
+      total_loss = all_reduce_sum(total_loss, group)
+      for part in all_gather_object({idx: loss_fn_outputs[idx] for idx in local_indices}, group):
+        for idx, output in part.items():
+          loss_fn_outputs[idx] = output
 
     mean_loss = total_loss / max(1, len(data))
     completed_loss_fn_outputs = []
@@ -94,6 +170,47 @@ class BaseTrainerWorker:
       "metrics": {"loss:mean": self.sanitize_float(mean_loss), "loss:sum": self.sanitize_float(total_loss)},
       "loss_fn_outputs": completed_loss_fn_outputs,
       "loss_fn_output_type": "ArrayRecord",
+    }
+
+  def batch_has_no_gradient(self, loss_fn: str, loss_config: dict | None, weights: torch.Tensor, advantages: torch.Tensor | None) -> bool:
+    if advantages is None or bool(((advantages != 0) & (weights != 0)).any()):
+      return False
+    has_kl_penalty = loss_fn == "ppo" and bool(loss_config and loss_config.get("kl_coeff", 0.0) > 0)
+    return not has_kl_penalty
+
+  def fresh_ratio_stats(self) -> dict[str, float]:
+    return {"max_abs_log_ratio": 0.0, "tokens": 0.0, "tokens_abs_log_ratio_gt1": 0.0, "tokens_abs_log_ratio_gt5": 0.0}
+
+  def record_ratio_stats(self, target_logprobs: torch.Tensor, old_logprobs: torch.Tensor, weights: torch.Tensor, advantages: torch.Tensor) -> None:
+    """Tail of the sampler/trainer log-ratio over action tokens, accumulated
+    until the next optim_step reports it. The mean KL is blind to a handful of
+    tokens with a huge ratio, and under an unclipped loss those few tokens can
+    be most of the gradient. Prompt positions carry weight 1 but no advantage
+    and a sampled logprob of 0, so only positions with an advantage count."""
+    active = (weights != 0) & (advantages != 0)
+    if not bool(active.any()):
+      return
+    log_ratio = (target_logprobs.detach().float() - old_logprobs.float())[active].abs()
+    log_ratio = torch.nan_to_num(log_ratio, nan=0.0, posinf=1e4)
+    stats = self.ratio_stats
+    stats["max_abs_log_ratio"] = max(stats["max_abs_log_ratio"], float(log_ratio.max()))
+    stats["tokens"] += float(active.sum())
+    stats["tokens_abs_log_ratio_gt1"] += float((log_ratio > 1.0).sum())
+    stats["tokens_abs_log_ratio_gt5"] += float((log_ratio > 5.0).sum())
+
+  def ratio_metrics(self) -> dict[str, float]:
+    """Reduce the accumulated tail stats over the data-parallel group and reset them."""
+    group = self.data_parallel_group()
+    stats, self.ratio_stats = self.ratio_stats, self.fresh_ratio_stats()
+    max_abs = max(all_gather_object(stats["max_abs_log_ratio"], group))
+    tokens = all_reduce_sum(stats["tokens"], group)
+    gt1 = all_reduce_sum(stats["tokens_abs_log_ratio_gt1"], group)
+    gt5 = all_reduce_sum(stats["tokens_abs_log_ratio_gt5"], group)
+    return {
+      "ratio/max_abs_log:max": max_abs,
+      "ratio/tokens_abs_log_gt1:sum": gt1,
+      "ratio/tokens_abs_log_gt5:sum": gt5,
+      "ratio/frac_abs_log_gt1:mean": gt1 / tokens if tokens else 0.0,
     }
 
   def make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:

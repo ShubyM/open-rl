@@ -7,8 +7,11 @@ import os
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from typing import Any, Protocol
 
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from opentelemetry import context as otel_context
@@ -17,14 +20,17 @@ from opentelemetry import propagate, trace
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.store import RequestStore, get_store
+from training.distributed import barrier, broadcast_object, is_distributed, is_primary, local_rank
+from training.distributed import close as close_distributed
+from training.distributed import initialize as initialize_distributed
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
-from training.trainer_worker import Datum
+from training.trainer_worker import BaseTrainerWorker, Datum
 
 tracer = trace.get_tracer(__name__)
 
 
-TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
+TrainingWorker = BaseTrainerWorker
 
 
 def is_fft_enabled() -> bool:
@@ -53,7 +59,7 @@ class TrainingRequestsProcessor(Protocol):
 
   async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
     request_id, result = await self.handle_request(raw_request, model_id)
-    if request_id is not None:
+    if request_id is not None and is_primary():
       await self.store.set_future(request_id, result)
 
   async def handle_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> tuple[str | None, dict[str, Any]]:
@@ -182,9 +188,14 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
         await asyncio.sleep(1)
 
   async def run_once(self) -> None:
-    batch = await self.store.get_requests(active_set_id=self.active_tenant_set_id)
+    batch = await self.store.get_requests(active_set_id=self.active_tenant_set_id) if is_primary() else None
+    if is_distributed():
+      # Every rank must execute the same request sequence (collectives are
+      # positional); rank 0 owns the queue and fans the batch out.
+      batch = await asyncio.to_thread(broadcast_object, batch)
     if not batch:
-      await asyncio.sleep(0.1)
+      if is_primary():
+        await asyncio.sleep(0.1)
       return
 
     model_id = batch[0].get("model_id", "default")
@@ -299,32 +310,36 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
-    worker: FFTTrainingWorker,
+    worker: TrainingWorker,
     model_id: str | None,
-    time_slicer: TimeSlicerClient,
+    time_slicer: TimeSlicerClient | None,
   ):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
-    if not model_id:
-      raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
 
     self.store = store
     self.worker = worker
+    # With --model-id this is a per-model worker the gateway launched and it
+    # drains that model's queue. Without one it is the only trainer on the box
+    # (a torchrun trainer started by hand), so it drains the shared queue like
+    # the LoRA worker does and takes whatever model_id the requests carry.
     self.model_id = model_id
-    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM)
+    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id or "shared"), claim=TRAINER_CLAIM)
+    # Only rank 0 talks to the time slicer; the other ranks follow it through barriers.
     self.time_slicer = time_slicer
     self.snapshot_registered = False
 
   async def exit_gracefully(self) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if self.snapshot_registered:
+    if self.snapshot_registered and self.time_slicer is not None:
       try:
         await self.time_slicer.unregister(self.workload)
         self.snapshot_registered = False
       except Exception as exc:
         print(f"[WORKER] Failed to unregister: {exc}")
     try:
-      await self.time_slicer.close()
+      if self.time_slicer is not None:
+        await self.time_slicer.close()
     except Exception:
       pass
     os._exit(0)
@@ -333,8 +348,9 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     print("[WORKER] Full fine-tuning training requests processor started.")
 
     try:
-      await self.time_slicer.register(self.workload)
-      self.snapshot_registered = True
+      if self.time_slicer is not None:
+        await self.time_slicer.register(self.workload)
+        self.snapshot_registered = True
       while True:
         try:
           await self.run_once()
@@ -346,17 +362,41 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
           await asyncio.sleep(1)
     finally:
       try:
-        if self.snapshot_registered:
+        if self.snapshot_registered and self.time_slicer is not None:
           await self.time_slicer.unregister(self.workload)
       finally:
-        await self.time_slicer.close()
+        if self.time_slicer is not None:
+          await self.time_slicer.close()
+        close_distributed()
+
+  @asynccontextmanager
+  async def gpu_lease(self):
+    lease = None
+    if self.time_slicer is not None:
+      lease = self.time_slicer.acquire(self.workload)
+      await lease.__aenter__()
+    await asyncio.to_thread(barrier)
+    try:
+      yield
+    finally:
+      await asyncio.to_thread(barrier)
+      if lease is not None:
+        await lease.__aexit__(None, None, None)
 
   async def run_once(self) -> None:
-    batch = await self.store.get_requests_for_model(self.model_id)
+    if is_primary():
+      batch = await (self.store.get_requests_for_model(self.model_id) if self.model_id else self.store.get_requests())
+    else:
+      batch = None
+    if is_distributed():
+      batch = await asyncio.to_thread(broadcast_object, batch)
     if not batch:
-      await asyncio.sleep(0.1)
+      if is_primary():
+        await asyncio.sleep(0.1)
       return
 
+    # get_requests() batches one model at a time, so a batch is single-model either way.
+    model_id = self.model_id or batch[0].get("model_id", "default")
     has_shutdown = False
     training_reqs = []
     for req in batch:
@@ -367,36 +407,38 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
     with tracer.start_as_current_span("training_requests_batch") as batch_span:
       batch_span.set_attribute("batch_size", len(training_reqs))
-      batch_span.set_attribute("model_id", self.model_id)
+      batch_span.set_attribute("model_id", model_id)
 
       if training_reqs:
-        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}: {describe_requests(training_reqs)}")
+        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {model_id}: {describe_requests(training_reqs)}")
         results = []
-        save_ops = {"save_state", "save_weights", "save_weights_for_sampler"}
+        # A distributed save gathers shards over the GPUs, so it stays inside
+        # the lease; the single-process CPU-offloaded save runs outside it.
+        save_ops = set() if is_distributed() else {"save_state", "save_weights", "save_weights_for_sampler"}
         gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
         save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
 
         if gpu_reqs:
-          async with self.time_slicer.acquire(self.workload):
+          async with self.gpu_lease():
             if hasattr(self.worker, "wake_up"):
               await asyncio.to_thread(self.worker.wake_up)
             try:
               for request in gpu_reqs:
-                results.append(await self.handle_request(request, self.model_id))
+                results.append(await self.handle_request(request, model_id))
             finally:
               if hasattr(self.worker, "sleep"):
                 await asyncio.to_thread(self.worker.sleep)
 
         if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload and save_reqs:
-          async with self.time_slicer.acquire(self.workload):
+          async with self.gpu_lease():
             for request in save_reqs:
-              results.append(await self.handle_request(request, self.model_id))
+              results.append(await self.handle_request(request, model_id))
         else:
           for request in save_reqs:
-            results.append(await self.handle_request(request, self.model_id))
+            results.append(await self.handle_request(request, model_id))
 
         for request_id, result in results:
-          if request_id is not None:
+          if request_id is not None and is_primary():
             await self.store.set_future(request_id, result)
 
     if has_shutdown:
@@ -508,15 +550,33 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     return {"status": "ok", "type": "weights_saved"}
 
 
+def pin_worker_threads_to_this_rank() -> None:
+  """Give every executor thread this rank's CUDA device.
+
+  Torch's current device is thread-local and every worker call is handed to a
+  thread with asyncio.to_thread. Without this, a thread the pool spawns later
+  still points at cuda:0, and a device-less allocation on it lands there:
+  correct on rank 0, wrong on every other rank, surfacing as a NCCL fault.
+  """
+  if not torch.cuda.is_available() or not is_distributed():
+    return
+  device = local_rank()
+  torch.cuda.set_device(device)
+  asyncio.get_running_loop().set_default_executor(
+    ThreadPoolExecutor(thread_name_prefix="trainer-worker", initializer=torch.cuda.set_device, initargs=(device,))
+  )
+
+
 async def run_training_requests_processor(
   worker: TrainingWorker,
   model_id: str | None = None,
   time_slicer: TimeSlicerClient | None = None,
   active_tenant_set_id: str | None = None,
 ) -> None:
+  pin_worker_threads_to_this_rank()
   store = get_store()
-  if isinstance(worker, FFTTrainingWorker):
-    time_slicer = time_slicer or time_slicer_client_from_env()
+  if worker.full_parameter:
+    time_slicer = (time_slicer or time_slicer_client_from_env()) if is_primary() else None
     processor = FFTTrainingRequestsProcessor(store, worker, model_id, time_slicer)
   else:
     processor = LoraTrainingRequestsProcessor(store, worker, model_id, active_tenant_set_id)
@@ -538,7 +598,13 @@ async def main_async(args: argparse.Namespace) -> None:
   is_lora = fine_tuning_type == "lora"
   print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")
 
-  worker: TrainingWorker = LoraTrainingWorker() if is_lora else FFTTrainingWorker()
+  worker: TrainingWorker
+  if os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower() == "automodel":
+    from training.automodel_worker import AutomodelTrainingWorker
+
+    worker = AutomodelTrainingWorker(full_parameter=not is_lora)
+  else:
+    worker = LoraTrainingWorker() if is_lora else FFTTrainingWorker()
   preload_target = os.getenv("BASE_MODEL")
   is_ready = False
   if preload_target and is_lora:
@@ -551,7 +617,7 @@ async def main_async(args: argparse.Namespace) -> None:
       print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
     is_ready = True
 
-  if is_lora:
+  if is_lora and is_primary():
     probe_app = FastAPI()
 
     @probe_app.get("/healthz")
@@ -560,11 +626,14 @@ async def main_async(args: argparse.Namespace) -> None:
         return {"status": "ready"}
       raise HTTPException(status_code=503, detail="Model Loading")
 
+    # Configurable so a trainer can share a box with a vLLM server on 8000.
+    probe_port = int(os.getenv("OPEN_RL_WORKER_PROBE_PORT", "8000"))
+
     def run_probe_server():
       try:
-        uvicorn.run(probe_app, host="0.0.0.0", port=8000, log_level="warning")
+        uvicorn.run(probe_app, host="0.0.0.0", port=probe_port, log_level="warning")
       except Exception as exc:
-        print(f"[WORKER] Probe server on port 8000 skipped: {exc}")
+        print(f"[WORKER] Probe server on port {probe_port} skipped: {exc}")
 
     threading.Thread(target=run_probe_server, daemon=True).start()
 
@@ -580,6 +649,7 @@ def start_request_processing_loop() -> None:
   parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated trainer worker drains.")
   parser.add_argument("--active-tenant-set-id", help="Active tenant rotation set ID for LoRA workers (e.g. Qwen/Qwen3-0.6B-1).")
   args = parser.parse_args()
+  initialize_distributed()
 
   print("\n" + "=" * 50)
   print("      Open-RL PyTorch Training Worker")
