@@ -12,7 +12,7 @@ export const ui = {
   gpuGroup: null, // allocation anchoring the expansion's physical GPUs
   deviceByNode: new Map(), // remember each node's GPU while comparing processes
   device: "all", // GPU selected in the expansion
-  activityView: "gpu", // combined GPU strips or individual run rows
+  activityView: "node", // all active runs here or one run across nodes
   nodeSelection: { duration: 1800, end: null },
   nodeNavigating: false, // redraw cached data while a timeline gesture is active
   nodeQueryRange: null, // GPU query frozen until the gesture settles

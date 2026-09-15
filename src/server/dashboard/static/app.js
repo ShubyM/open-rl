@@ -81,6 +81,7 @@ root.addEventListener("click", (event) => {
     if (allocation.closest("#placement-detail")) keepViewport();
     else {
       root.style.removeProperty("min-height");
+      ui.activityView = "node";
       ui.inspectorNode = allocation.closest(".node-placement-group")?.dataset.key || null;
     }
     if (!ui.expanded || acrossNodes) {
@@ -99,7 +100,7 @@ root.addEventListener("click", (event) => {
   if (target.dataset.device) {
     keepViewport();
     ui.device = target.dataset.device;
-    ui.deviceByNode.set(target.closest(".node-gpu-detail").dataset.node, ui.device);
+    ui.deviceByNode.set(target.closest(".allocation-device-picker").dataset.node, ui.device);
     render();
   }
   if (target.dataset.activityView) {

@@ -14,7 +14,7 @@ function restoreNodes(params) {
   ui.inspectorNode = params.get("panel") || null;
   ui.gpuGroup = params.get("group") || null;
   ui.device = params.get("gpu") || "all";
-  ui.activityView = params.get("layout") === "run" ? "run" : "gpu";
+  ui.activityView = params.get("layout") === "across" ? "across" : "node";
 }
 
 export function restoreView() {
@@ -43,7 +43,7 @@ function nodeParams(freeze = false) {
   const range = timeWindow();
   return { duration: range.now - range.start, end: freeze || !range.live ? range.now : null, placement: ui.expanded,
     panel: ui.expanded ? ui.inspectorNode : null,
-    group: ui.expanded && ui.gpuGroup !== ui.expanded ? ui.gpuGroup : null, gpu: ui.expanded && ui.device !== "all" ? ui.device : null, layout: ui.activityView === "run" ? "run" : null };
+    group: ui.expanded && ui.gpuGroup !== ui.expanded ? ui.gpuGroup : null, gpu: ui.expanded && ui.device !== "all" ? ui.device : null, layout: ui.activityView === "across" ? "across" : null };
 }
 
 function runParams(freeze = false) {
