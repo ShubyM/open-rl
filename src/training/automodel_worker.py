@@ -54,10 +54,11 @@ import torch.utils.checkpoint
 from torch.distributed.tensor import DTensor
 from transformers import AutoConfig, AutoTokenizer
 
+from training.commands import SaveWeightsForSampler
 from training.distributed import barrier, group_rank, group_size, is_primary
-from training.fft_trainer_worker import FFTConfig, trainable_model_parameters
-from training.lora_trainer_worker import LoraConfig
+from training.fft_trainer_worker import trainable_model_parameters
 from training.trainer_worker import ENABLE_GRADIENT_CHECKPOINTING, BaseTrainerWorker, Datum, chunk_target_logprob, tmp_dir
+from training.types import FFTConfig, LoraConfig, SamplerWeights
 
 # Parallel layout. DP is inferred as world / (CP * TP).
 AUTOMODEL_TP = int(os.getenv("OPEN_RL_AUTOMODEL_TP", "1"))
@@ -417,7 +418,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       return [[(idx, datum)] for idx, datum in enumerate(data)]
     return super().make_training_batches(data)
 
-  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
+  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     try:
       res = super().forward_backward(self.model, data, loss_fn, loss_config)
@@ -551,7 +552,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
 
   # -- optimizer ------------------------------------------------------------
 
-  def optim_step(self, adam_params: dict[str, Any], model_id: str | None = None) -> dict[str, Any]:
+  def optim_step(self, adam_params: dict[str, Any]) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
@@ -565,8 +566,8 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       adam_params,
       default_clip=GRAD_CLIP_NORM,
     )
-    if self.is_lora and model_id:
-      self.save_adapter(model_id)
+    if self.is_lora:
+      self.save_adapter(self.model_id)
     return {
       "metrics": {
         "grad_norm:mean": self.sanitize_float(total_norm),
@@ -647,14 +648,14 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       shutil.rmtree(previous_dir, ignore_errors=True)
     barrier()
 
-  def save_state(self, model_id: str | None, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
+  def save_state(self, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     include_optimizer = include_optimizer and self.optimizer is not None
     if include_optimizer:
       from torch.distributed.checkpoint.state_dict import StateDictOptions, get_optimizer_state_dict
 
       optimizer_state = get_optimizer_state_dict(self.model, self.optimizer, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
-    metadata = self.checkpoint_metadata(model_id, kind=kind, has_optimizer=include_optimizer, lora=self.is_lora)
+    metadata = self.checkpoint_metadata(self.model_id, kind=kind, has_optimizer=include_optimizer, lora=self.is_lora)
 
     def write_extra(staged: str) -> None:
       if include_optimizer:
@@ -669,9 +670,9 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
   def save_model(self, alias: str | None = None) -> dict[str, Any]:
     name = alias or "automodel-model"
     save_path = name if os.path.isabs(name) else os.path.join(tmp_dir(), "automodel", name)
-    return self.save_state(alias, save_path, kind="weights")
+    return self.save_state(save_path, kind="weights")
 
-  def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
+  def load_from_state(self, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
     meta_file = next((p for f in ("metadata.json", "adapter_config.json") if os.path.exists(p := os.path.join(state_path, f))), None)
     if not meta_file:
       raise FileNotFoundError(f"{state_path} has neither metadata.json nor adapter_config.json")
@@ -702,16 +703,27 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       set_optimizer_state_dict(self.model, self.optimizer, optim_state_dict=full_state, options=StateDictOptions(full_state_dict=True))
       print(f"Restored Automodel optimizer state from {optimizer_path}")
     print(f"Loaded Automodel state from {state_path}")
-    return {"model_id": model_id, "base_model": base_model}
+    return {"model_id": self.model_id, "base_model": base_model}
 
   # -- sampler weights ------------------------------------------------------
 
-  def save_adapter(self, adapter_id: str, alias: str | None = None) -> None:
+  def publish_sampler_weights(self, command: SaveWeightsForSampler) -> SamplerWeights:
+    if self.full_parameter:
+      return super().publish_sampler_weights(command)
+    return self.save_adapter(self.model_id, command.alias)
+
+  def save_weights(self, alias: str | None = None) -> dict[str, Any]:
+    if self.full_parameter:
+      return super().save_weights(alias)
+    return {"path": self.save_adapter(self.model_id, alias).path}
+
+  def save_adapter(self, adapter_id: str, alias: str | None = None) -> SamplerWeights:
     """Publish the LoRA adapter where the sampler workers load it."""
     if not self.is_lora:
       raise RuntimeError("A full-parameter Automodel worker has no adapter to publish; it saves whole checkpoints.")
     adapter_root = os.path.join(tmp_dir(), "peft", adapter_id)
-    self.stage_and_swap(os.path.join(adapter_root, adapter_id))
+    final_dir = os.path.join(adapter_root, adapter_id)
+    self.stage_and_swap(final_dir)
     if is_primary():
       metadata = {
         "model_id": adapter_id,
@@ -721,7 +733,8 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       }
       with open(os.path.join(adapter_root, "metadata.json"), "w") as f:
         json.dump(metadata, f)
-      print(f"[Automodel Worker] Saved LoRA adapter to {adapter_root}/{adapter_id}.")
+      print(f"[Automodel Worker] Saved LoRA adapter to {final_dir}.")
+    return SamplerWeights(kind="adapter", path=final_dir)
 
   def generate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
     raise RuntimeError("Sampling from the Automodel trainer is unsupported; use the vLLM sampler worker.")

@@ -12,16 +12,12 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 import torch
-from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
 from training.trainer_worker import BaseTrainerWorker, Datum, tmp_dir
+from training.types import FFTConfig
 
-
-class FFTConfig(BaseModel):
-  seed: int | None = None
-  cpu_offload: bool = True
-  weight_sync_strategy: str | None = None
+__all__ = ["FFTConfig", "FFTTrainingWorker", "trainable_model_parameters"]
 
 
 def trainable_model_parameters(model: PreTrainedModel) -> list[torch.nn.Parameter]:
@@ -157,8 +153,9 @@ class FFTTrainingWorker(BaseTrainerWorker):
     print(f"Saved full fine-tuning model to {save_path}")
     return {"path": save_path}
 
-  def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
+  def save_state(self, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
+    model_id = self.model_id
     if self.cpu_offload and not self._is_offloaded:
       raise RuntimeError(
         "Cannot save state while worker is not offloaded (self._is_offloaded is False) when cpu_offload=True. "
@@ -281,7 +278,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
     print(f"Saved sparse delta ({metadata['density_pct']}% changed elements, {total_changed}/{total_elements}) to {state_path}")
     return {"path": state_path, "density_pct": metadata["density_pct"]}
 
-  def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
+  def load_from_state(self, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
+    model_id = self.model_id
     metadata_path = os.path.join(state_path, "metadata.json")
     if not os.path.exists(metadata_path):
       raise FileNotFoundError(f"No metadata.json found at {state_path}")
@@ -311,7 +309,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     print(f"Loaded full fine-tuning state from {state_path}")
     return {"model_id": model_id, "base_model": base_model}
 
-  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
+  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     res = super().forward_backward(self.model, data, loss_fn, loss_config)
     if torch.cuda.is_available():
@@ -376,7 +374,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
     return mapped_names, mapped_indices
 
-  def optim_step(self, adam_params: dict[str, Any], model_id: str | None = None) -> dict[str, Any]:
+  def optim_step(self, adam_params: dict[str, Any]) -> dict[str, Any]:
+    model_id = self.model_id
     assert self.model is not None, "Model must be loaded first."
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
@@ -465,7 +464,6 @@ class FFTTrainingWorker(BaseTrainerWorker):
     max_tokens: int,
     num_samples: int = 1,
     temperature: float = 0.0,
-    model_id: str | None = None,
     include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
     return super().generate(self.model, prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)

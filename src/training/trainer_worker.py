@@ -9,11 +9,14 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from pydantic import BaseModel
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
+from training.commands import CreateModel, CreateModelFromState, SaveWeightsForSampler
 from training.distributed import all_gather_object, all_reduce_max, all_reduce_sum, group_rank, group_size, local_rank
+from training.types import Datum, SamplerWeights, TensorData
+
+__all__ = ["BaseTrainerWorker", "Datum", "TensorData", "chunk_target_logprob", "tmp_dir"]
 
 # Position marker for a filler pass, see forward_backward.
 FILLER_DATUM_INDEX = -1
@@ -47,23 +50,24 @@ def chunk_target_logprob(
   return target_logit - torch.logsumexp(logits, dim=-1)
 
 
-class TensorData(BaseModel):
-  data: list[int] | list[float]
-
-
-class Datum(BaseModel):
-  loss_fn_inputs: dict[str, TensorData]
-  model_input: list[int]
-
-
 class BaseTrainerWorker:
+  """Loss computation shared by every backend, plus the worker API the request
+  loop drives.
+
+  A worker owns one trainable model: create() builds it, trainer() returns it,
+  and the Trainer methods (forward_backward, optim_step, save_state,
+  load_from_state, publish_sampler_weights, save_weights, generate) act on it.
+  A host that serves several adapters from one base model overrides create()
+  and trainer() to hand back a bound adapter instead of itself.
+  """
+
   # Whether samplers receive whole checkpoints (True) or LoRA adapters (False).
-  # The request processor picks its loop and save routes by this.
   full_parameter = False
 
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
     self.base_model_name: str | None = None
+    self.model_id: str | None = None
     self.ratio_stats = dict(RATIO_STATS_ZERO)
 
     if torch.cuda.is_available():
@@ -77,6 +81,37 @@ class BaseTrainerWorker:
   def is_lora(self) -> bool:
     return not self.full_parameter
 
+  # -- worker API -----------------------------------------------------------
+
+  def create(self, command: CreateModel) -> "BaseTrainerWorker":
+    """Build the model the command describes and return its Trainer."""
+    self.model_id = command.model_id
+    config = command.full_config if self.full_parameter else command.lora_config
+    self.create_model(command.base_model, command.model_id, config)
+    return self
+
+  def restore(self, command: CreateModelFromState) -> "BaseTrainerWorker":
+    self.model_id = command.model_id
+    self.load_from_state(command.state_path, command.restore_optimizer)
+    return self
+
+  def trainer(self, model_id: str) -> "BaseTrainerWorker":
+    """The Trainer for model_id. A single-model worker is its own trainer."""
+    return self
+
+  def publish_sampler_weights(self, command: SaveWeightsForSampler) -> SamplerWeights:
+    """Write what the samplers load. A full-parameter worker writes a whole
+    checkpoint at the path the sampling ref names."""
+    ref = command.path or command.sampling_session_id
+    if not ref:
+      raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
+    path = os.path.join(tmp_dir(), "sampler_full", ref.removeprefix("tinker://").lstrip("/"))
+    self.save_state(path, include_optimizer=False, kind="sampler")
+    return SamplerWeights(kind="checkpoint", path=path)
+
+  def save_weights(self, alias: str | None = None) -> dict[str, Any]:
+    return self.save_model(alias or self.model_id)
+
   # Hooks for the GPU lease a dedicated worker runs under. sleep and wake_up
   # bracket the lease; save_needs_gpu says whether a save must run inside it.
   def sleep(self) -> None:
@@ -87,12 +122,6 @@ class BaseTrainerWorker:
 
   def save_needs_gpu(self) -> bool:
     return False
-
-  def save_weights(self, model_id: str, alias: str | None = None) -> None:
-    if self.is_lora:
-      self.save_adapter(model_id, alias)
-    else:
-      self.save_model(alias or model_id)
 
   def enable_gradient_checkpointing(self, model: torch.nn.Module) -> None:
     if not ENABLE_GRADIENT_CHECKPOINTING:

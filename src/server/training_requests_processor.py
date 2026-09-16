@@ -1,4 +1,12 @@
-# This file contains the training request processor implementation for Open-RL.
+"""The trainer process: drains typed training commands from the queue and runs
+them against one worker.
+
+Layers, top to bottom. The gateway turns API calls into training.commands
+and enqueues them. This loop pops them (rank 0 reads the queue and fans each
+batch out to the other torchrun ranks), takes the GPU lease when the
+deployment needs one, and dispatches each command to the worker's Trainer
+for that model. Results go back through the store's futures from rank 0.
+"""
 
 import argparse
 import asyncio
@@ -7,8 +15,8 @@ import os
 import threading
 import time
 import traceback
-from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from dataclasses import dataclass
 from typing import Any
 
 import uvicorn
@@ -19,12 +27,14 @@ from opentelemetry import propagate, trace
 from accel_timeslicer.time_slicer import NoOpTimeSlicer, TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.store import RequestStore, get_store
+from training import commands
+from training.commands import GPU_COMMANDS, Command, Shutdown, parse_command
 from training.distributed import barrier, broadcast_object, is_distributed, is_primary, pin_executor_threads
 from training.distributed import close as close_distributed
 from training.distributed import initialize as initialize_distributed
-from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
-from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
-from training.trainer_worker import BaseTrainerWorker, Datum, tmp_dir
+from training.fft_trainer_worker import FFTTrainingWorker
+from training.lora_trainer_worker import LoraTrainingWorker
+from training.trainer_worker import BaseTrainerWorker
 
 tracer = trace.get_tracer(__name__)
 
@@ -33,71 +43,49 @@ def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
 
-def parse_datum(raw: dict[str, Any]) -> Datum:
-  """Convert Tinker wire-format datum with chunks to the flat Datum type."""
-  tokens: list[int] = []
-  for chunk in raw.get("model_input", {}).get("chunks", []):
-    tokens.extend(chunk.get("tokens", []))
-
-  loss_fn_inputs = {
-    key: value if isinstance(value, dict) and "data" in value else {"data": value} for key, value in raw.get("loss_fn_inputs", {}).items()
-  }
-  return Datum(model_input=tokens, loss_fn_inputs=loss_fn_inputs)
+def describe_commands(batch: list[Command]) -> str:
+  """`op:request_id` per command, matching the gateway's enqueue log line."""
+  return ", ".join(f"{command.op}:{command.request_id}" for command in batch)
 
 
-def describe_requests(batch: list[dict[str, Any]]) -> str:
-  """`op:request_id` per request, matching the gateway's enqueue log line."""
-  return ", ".join(f"{r.get('op')}:{r.get('request_id')}" for r in batch)
+@dataclass(frozen=True)
+class Deployment:
+  """How this process is wired into the system.
+
+  model_id: set for a dedicated per-model worker, which drains that model's
+    queue; None for a shared worker draining the round-robin queue.
+  active_tenant_set_id: which tenant rotation a shared worker serves.
+  leased: whether GPU work runs under the time slicer's lease. A shared LoRA
+    worker owns its GPU; a dedicated worker shares the card with samplers.
+  """
+
+  model_id: str | None = None
+  active_tenant_set_id: str | None = None
+  leased: bool = False
+
+  @property
+  def dedicated(self) -> bool:
+    return self.model_id is not None
 
 
 class TrainingRequestsProcessor:
-  """Drains training requests for one worker.
-
-  A LoRA worker serves many adapters from the shared queue; a full-parameter
-  worker serves one model from its own queue under a GPU lease. Both run the
-  same loop, and under torchrun every rank runs it in lockstep with rank 0.
-  """
-
-  def __init__(
-    self,
-    store: RequestStore,
-    worker: BaseTrainerWorker,
-    model_id: str | None = None,
-    time_slicer: TimeSlicerClient | None = None,
-    active_tenant_set_id: str | None = None,
-  ):
+  def __init__(self, store: RequestStore, worker: BaseTrainerWorker, deployment: Deployment, time_slicer: TimeSlicerClient | None = None):
+    if deployment.dedicated and not os.getenv("REDIS_URL"):
+      raise RuntimeError("A dedicated trainer needs REDIS_URL so it can share its queue and futures with the gateway")
     self.store = store
     self.worker = worker
-    if not self.is_lora and not os.getenv("REDIS_URL"):
-      raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
-    self.model_id = model_id
-    self.active_tenant_set_id = active_tenant_set_id or (f"{model_id}-1" if model_id and self.is_lora else None)
+    self.deployment = deployment
     self.time_slicer = time_slicer or NoOpTimeSlicer()
-    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id or "shared"), claim=TRAINER_CLAIM)
-    self.snapshot_registered = False
+    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", deployment.model_id or "shared"), claim=TRAINER_CLAIM)
+    self.registered = False
 
-  @property
-  def is_lora(self) -> bool:
-    return self.worker.is_lora
-
-  async def exit_gracefully(self) -> None:
-    print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if self.snapshot_registered:
-      with suppress(Exception):
-        await self.time_slicer.unregister(self.workload)
-        self.snapshot_registered = False
-    with suppress(Exception):
-      await self.time_slicer.close()
-    os._exit(0)
+  # -- loop -----------------------------------------------------------------
 
   async def run(self) -> None:
-    if self.is_lora:
-      print(f"[WORKER] LoRA training requests processor started (Active Set ID: {self.active_tenant_set_id}).")
-    else:
-      print("[WORKER] Full fine-tuning training requests processor started.")
+    print(f"[WORKER] training requests processor started ({self.deployment}).")
     try:
       await self.time_slicer.register(self.workload)
-      self.snapshot_registered = True
+      self.registered = True
       while True:
         try:
           await self.run_once()
@@ -109,11 +97,41 @@ class TrainingRequestsProcessor:
           await asyncio.sleep(1)
     finally:
       try:
-        if self.snapshot_registered:
+        if self.registered:
           await self.time_slicer.unregister(self.workload)
       finally:
         await self.time_slicer.close()
         close_distributed()
+
+  async def exit_gracefully(self) -> None:
+    print(f"[WORKER] Initiating immediate exit for {self.deployment.model_id or 'shared'} trainer worker...")
+    if self.registered:
+      with suppress(Exception):
+        await self.time_slicer.unregister(self.workload)
+        self.registered = False
+    with suppress(Exception):
+      await self.time_slicer.close()
+    os._exit(0)
+
+  async def fetch_requests(self) -> list[dict[str, Any]] | None:
+    if self.deployment.dedicated:
+      return await self.store.get_requests_for_model(self.deployment.model_id)
+    return await self.store.get_requests(active_set_id=self.deployment.active_tenant_set_id)
+
+  async def next_batch(self) -> list[Command]:
+    """The next batch of commands, identical on every rank.
+
+    Collectives are positional, so every rank must execute the same command
+    sequence: rank 0 owns the queue and fans each batch out.
+    """
+    raw = await self.fetch_requests() if is_primary() else None
+    if is_distributed():
+      raw = await asyncio.to_thread(broadcast_object, raw)
+    if not raw:
+      if is_primary():
+        await asyncio.sleep(0.1)
+      return []
+    return [parse_command(item) for item in raw]
 
   @asynccontextmanager
   async def gpu_lease(self):
@@ -126,78 +144,124 @@ class TrainingRequestsProcessor:
       finally:
         await asyncio.to_thread(barrier)
 
-  async def fetch_requests(self) -> list[dict[str, Any]] | None:
-    if self.is_lora:
-      return await self.store.get_requests(active_set_id=self.active_tenant_set_id)
-    if self.model_id:
-      return await self.store.get_requests_for_model(self.model_id)
-    return await self.store.get_requests()
+  def needs_gpu(self, command: Command) -> bool:
+    return isinstance(command, GPU_COMMANDS) or self.worker.save_needs_gpu()
 
   async def run_once(self) -> None:
     batch = await self.next_batch()
     if not batch:
       return
+    shutdown = any(isinstance(command, Shutdown) for command in batch)
+    work = [command for command in batch if not isinstance(command, Shutdown)]
 
-    model_id = self.model_id or batch[0].get("model_id", "default")
-    has_shutdown = False
-    training_reqs = []
-    for req in batch:
-      if req.get("request_id") == "SHUTDOWN_SENTINEL" or req.get("op") in {"shutdown", "shutdown_workers"}:
-        has_shutdown = True
-      else:
-        training_reqs.append(req)
-
-    with tracer.start_as_current_span("training_requests_batch") as batch_span:
-      batch_span.set_attribute("batch_size", len(training_reqs))
-      batch_span.set_attribute("model_id", model_id)
-
-      if training_reqs:
-        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {model_id}: {describe_requests(training_reqs)}")
-        results = []
-        save_ops = set() if self.worker.save_needs_gpu() else {"save_state", "save_weights", "save_weights_for_sampler"}
-        gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
-        save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
-
-        if gpu_reqs:
+    with tracer.start_as_current_span("training_requests_batch") as span:
+      span.set_attribute("batch_size", len(work))
+      if work:
+        print(f"\n[TRAINING REQUESTS] Popped {len(work)} requests: {describe_commands(work)}")
+        results: list[tuple[str, dict[str, Any]]] = []
+        gpu_work = [command for command in work if self.needs_gpu(command)]
+        host_work = [command for command in work if not self.needs_gpu(command)]
+        if gpu_work:
           async with self.gpu_lease():
             await asyncio.to_thread(self.worker.wake_up)
             try:
-              for req in gpu_reqs:
-                target_id = req.get("adapter_id") or req.get("model_id") or model_id
-                results.append(await self.handle_request(req, target_id))
+              for command in gpu_work:
+                results.append(await self.handle(command))
             finally:
               await asyncio.to_thread(self.worker.sleep)
-
-        for req in save_reqs:
-          target_id = req.get("adapter_id") or req.get("model_id") or model_id
-          results.append(await self.handle_request(req, target_id))
-
+        for command in host_work:
+          results.append(await self.handle(command))
         for request_id, result in results:
           await self.publish_result(request_id, result)
 
-    if has_shutdown:
+    if shutdown:
       await self.exit_gracefully()
 
-  async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
-    request_id, result = await self.handle_request(raw_request, model_id)
-    await self.publish_result(request_id, result)
-
-  async def publish_result(self, request_id: str | None, result: dict[str, Any]) -> None:
-    if request_id is not None and is_primary():
+  async def publish_result(self, request_id: str, result: dict[str, Any]) -> None:
+    # Only rank 0 writes to the store; the other ranks computed the same result.
+    if is_primary():
       await self.store.set_future(request_id, result)
 
-  async def next_batch(
-    self,
-    fetch: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
-  ) -> list[dict[str, Any]] | None:
-    """The next request batch, identical on every rank."""
-    fetch_fn = fetch or self.fetch_requests
-    batch = await fetch_fn() if is_primary() else None
-    if is_distributed():
-      batch = await asyncio.to_thread(broadcast_object, batch)
-    if not batch and is_primary():
-      await asyncio.sleep(0.1)
-    return batch or None
+  # -- dispatch -------------------------------------------------------------
+
+  async def handle(self, command: Command) -> tuple[str, dict[str, Any]]:
+    """Run one command and return (request_id, result). Failures become a
+    RequestFailedResponse so the client's future resolves either way."""
+    ctx = propagate.extract(command.trace_context) if command.trace_context else None
+    token = otel_context.attach(ctx) if ctx else None
+    try:
+      return command.request_id, await self.dispatch(command)
+    except Exception as exc:
+      traceback.print_exc()
+      return command.request_id, {"type": "RequestFailedResponse", "error_message": str(exc)}
+    finally:
+      if token:
+        otel_context.detach(token)
+
+  async def dispatch(self, command: Command) -> dict[str, Any]:
+    match command:
+      case commands.CreateModel():
+        await asyncio.to_thread(self.worker.create, command)
+        result = {
+          "base_model": command.base_model,
+          "model_id": command.model_id,
+          "fine_tuning_type": command.fine_tuning_type,
+          "type": "model_created",
+        }
+        if command.fine_tuning_type == "lora":
+          result["rank"] = command.lora_config.rank
+        return result
+      case commands.CreateModelFromState():
+        await asyncio.to_thread(self.worker.restore, command)
+        return {
+          "base_model": self.worker.base_model_name,
+          "model_id": command.model_id,
+          "fine_tuning_type": command.fine_tuning_type,
+          "type": "model_loaded_from_state",
+        }
+      case commands.ForwardBackward():
+        trainer = self.worker.trainer(command.model_id)
+        result = await asyncio.to_thread(trainer.forward_backward, command.data, command.loss_fn, command.loss_config)
+        return {**result, "type": "forward_backward_completed"}
+      case commands.OptimStep():
+        trainer = self.worker.trainer(command.model_id)
+        result = await asyncio.to_thread(trainer.optim_step, command.adam_params)
+        await self.bump_step_count(command.model_id)
+        return {**result, "type": "optim_step_completed"}
+      case commands.Sample():
+        trainer = self.worker.trainer(command.model_id)
+        result = await asyncio.to_thread(
+          trainer.generate, command.prompt_tokens, command.max_tokens, command.num_samples, command.temperature, command.prompt_logprobs
+        )
+        return {**result, "type": "sample_completed"}
+      case commands.SaveState():
+        trainer = self.worker.trainer(command.model_id)
+        result = await asyncio.to_thread(trainer.save_state, command.state_path, command.include_optimizer, command.kind)
+        return {"path": result.get("path", command.state_path), "type": "state_saved"}
+      case commands.LoadWeights():
+        trainer = self.worker.trainer(command.model_id)
+        await asyncio.to_thread(trainer.load_from_state, command.state_path, command.restore_optimizer)
+        return {"path": command.state_path, "type": "weights_loaded"}
+      case commands.SaveWeightsForSampler():
+        trainer = self.worker.trainer(command.model_id)
+        published = await asyncio.to_thread(trainer.publish_sampler_weights, command)
+        if published.kind == "checkpoint":
+          await self.announce_checkpoint(command.model_id, published.path)
+        return {
+          "path": command.path,
+          "sampling_session_id": command.sampling_session_id,
+          "sampler_weights": published.model_dump(),
+          "type": "sampler_weights_saved",
+        }
+      case commands.SaveWeights():
+        trainer = self.worker.trainer(command.model_id)
+        await asyncio.to_thread(trainer.save_weights, command.alias)
+        return {"status": "ok", "type": "weights_saved"}
+      case commands.Shutdown():
+        return {"status": "ok", "type": "shutdown_acknowledged"}
+    raise NotImplementedError(f"Training command {type(command).__name__} is not supported")
+
+  # -- store bookkeeping, rank 0 only ---------------------------------------
 
   async def bump_step_count(self, model_id: str) -> None:
     if not is_primary():
@@ -209,156 +273,15 @@ class TrainingRequestsProcessor:
     except Exception as exc:
       print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
 
-  async def handle_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> tuple[str | None, dict[str, Any]]:
-    request_id = raw_request.get("request_id")
-    token = None
-    try:
-      op = raw_request["op"]
-      request_id = raw_request["request_id"]
-      resolved_model_id = model_id or raw_request.get("model_id") or "default"
+  async def announce_checkpoint(self, model_id: str, path: str) -> None:
+    """Tell the model's vLLM sampler workers to reload a full checkpoint."""
+    if not is_primary() or not hasattr(self.store, "redis"):
+      return
+    num_subs = await self.store.redis.publish(f"open_rl:weight_update:{model_id}", json.dumps({"weights_path": path}))
+    print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {path}")
 
-      carrier = raw_request.get("trace_context")
-      ctx = propagate.extract(carrier) if carrier else None
-      token = otel_context.attach(ctx) if ctx else None
 
-      return request_id, await self.dispatch_operation(op, raw_request.get("payload", {}), resolved_model_id)
-    except Exception as exc:
-      traceback.print_exc()
-      if request_id is None:
-        raise
-      return request_id, {"type": "RequestFailedResponse", "error_message": str(exc)}
-    finally:
-      if token:
-        otel_context.detach(token)
-
-  async def dispatch_operation(self, op: str, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    match op:
-      case "create_model":
-        return await self.create_model(payload, model_id)
-      case "create_model_from_state":
-        return await self.create_model_from_state(payload, model_id)
-      case "forward_backward":
-        return await self.forward_backward(payload, model_id)
-      case "optim_step":
-        return await self.optim_step(payload, model_id)
-      case "sample":
-        return await self.sample(payload, model_id)
-      case "save_state":
-        return await self.save_state(payload, model_id)
-      case "load_weights":
-        return await self.load_weights(payload, model_id)
-      case "save_weights_for_sampler":
-        return await self.save_weights_for_sampler(payload, model_id)
-      case "save_weights":
-        return await self.save_weights(payload, model_id)
-      case "shutdown_workers":
-        return {"status": "ok", "type": "shutdown_acknowledged"}
-      case _:
-        raise NotImplementedError(f"Training request op {op!r} is not supported")
-
-  async def fetch_model_meta(self, model_id: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
-    meta: dict[str, Any] = {}
-    if hasattr(self.store, "get_value"):
-      with suppress(Exception):
-        val = await self.store.get_value(f"open_rl:model_meta:{model_id}")
-        meta = json.loads(val) if isinstance(val, str) else (val if isinstance(val, dict) else {})
-
-    def get(key: str, default: Any) -> Any:
-      return meta.get(key) or payload.get(key) or default
-
-    cfg_key = "lora_config" if self.is_lora else "full_config"
-    default_ft = "lora" if self.is_lora or "lora_config" in meta or "lora_config" in payload else "full"
-    return get("base_model", ""), get(cfg_key, {}), get("fine_tuning_type", default_ft)
-
-  async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, raw, fine_tuning_type = await self.fetch_model_meta(model_id, payload)
-    cfg_cls = LoraConfig if self.is_lora else FFTConfig
-    config = cfg_cls(**{k: v for k, v in raw.items() if k in cfg_cls.model_fields})
-    await asyncio.to_thread(self.worker.create_model, base_model, model_id, config)
-    res = {"base_model": base_model, "model_id": model_id, "fine_tuning_type": fine_tuning_type, "type": "model_created"}
-    if self.is_lora:
-      res["rank"] = config.rank
-    return res
-
-  async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, _, fine_tuning_type = await self.fetch_model_meta(model_id, payload)
-    result = await asyncio.to_thread(
-      self.worker.load_from_state,
-      model_id,
-      payload["state_path"],
-      bool(payload.get("restore_optimizer", False)),
-    )
-    return {
-      "base_model": result.get("base_model") or base_model,
-      "model_id": result.get("model_id", model_id),
-      "fine_tuning_type": fine_tuning_type,
-      "type": "model_loaded_from_state",
-    }
-
-  async def forward_backward(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    typed_data = [parse_datum(item) for item in payload.get("data", [])]
-    result = await asyncio.to_thread(
-      self.worker.forward_backward,
-      typed_data,
-      payload.get("loss_fn", "cross_entropy"),
-      payload.get("loss_config"),
-      model_id,
-    )
-    return {**result, "type": "forward_backward_completed"}
-
-  async def optim_step(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.optim_step, payload.get("adam_params", {}), model_id)
-    await self.bump_step_count(model_id)
-    return {**result, "type": "optim_step_completed"}
-
-  async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(
-      self.worker.generate,
-      payload.get("prompt_tokens", []),
-      payload.get("max_tokens", 20),
-      payload.get("num_samples", 1),
-      payload.get("temperature", 0.0),
-      model_id,
-      bool(payload.get("prompt_logprobs", False)),
-    )
-    return {**result, "type": "sample_completed"}
-
-  async def save_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(
-      self.worker.save_state,
-      model_id,
-      payload["state_path"],
-      bool(payload.get("include_optimizer", False)),
-      payload.get("kind", "state"),
-    )
-    return {"path": result.get("path", payload["state_path"]), "type": "state_saved"}
-
-  async def load_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(
-      self.worker.load_from_state,
-      model_id,
-      payload["state_path"],
-      bool(payload.get("restore_optimizer", False)),
-    )
-    return {"path": payload["state_path"], "type": "weights_loaded"}
-
-  async def save_weights_for_sampler(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    if self.is_lora:
-      await asyncio.to_thread(self.worker.save_adapter, model_id, payload.get("alias"))
-    else:
-      ref = payload.get("path") or payload.get("sampling_session_id")
-      if not ref:
-        raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
-      local_path = os.path.join(tmp_dir(), "sampler_full", ref.removeprefix("tinker://").lstrip("/"))
-      await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
-      if is_primary() and hasattr(self.store, "redis"):
-        num_subs = await self.store.redis.publish(f"open_rl:weight_update:{model_id}", json.dumps({"weights_path": local_path}))
-        print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")
-    return {"path": payload.get("path"), "sampling_session_id": payload.get("sampling_session_id"), "type": "sampler_weights_saved"}
-
-  async def save_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.save_weights, model_id, payload.get("alias"))
-    return {"status": "ok", "type": "weights_saved"}
+# -- process entry point ------------------------------------------------------
 
 
 async def run_training_requests_processor(
@@ -366,70 +289,79 @@ async def run_training_requests_processor(
   model_id: str | None = None,
   time_slicer: TimeSlicerClient | None = None,
   active_tenant_set_id: str | None = None,
+  leased: bool | None = None,
 ) -> None:
   pin_executor_threads()
-  if worker.full_parameter and time_slicer is None and is_primary():
+  if leased is None:
+    leased = worker.full_parameter
+  if leased and time_slicer is None and is_primary():
     time_slicer = time_slicer_client_from_env()
-  await TrainingRequestsProcessor(
-    get_store(),
-    worker,
-    model_id,
-    time_slicer=time_slicer,
-    active_tenant_set_id=active_tenant_set_id,
-  ).run()
+  deployment = Deployment(
+    model_id=model_id,
+    active_tenant_set_id=active_tenant_set_id or (f"{model_id}-1" if model_id and not worker.full_parameter else None),
+    leased=leased,
+  )
+  await TrainingRequestsProcessor(get_store(), worker, deployment, time_slicer).run()
 
 
-async def main_async(args: argparse.Namespace) -> None:
+async def fine_tuning_type_for(model_id: str | None) -> str:
+  """What kind of model this process trains: the env default, or the metadata
+  of the model a dedicated worker was launched for."""
   fine_tuning_type = os.getenv("OPEN_RL_FINE_TUNING_TYPE") or ("full" if is_fft_enabled() else "lora")
-  if args.model_id:
+  if model_id:
     try:
-      raw_meta = await get_store().get_value(f"open_rl:model_meta:{args.model_id}")
+      raw_meta = await get_store().get_value(f"open_rl:model_meta:{model_id}")
       if raw_meta:
         fine_tuning_type = json.loads(raw_meta).get("fine_tuning_type", fine_tuning_type)
     except Exception as exc:
-      print(f"[WORKER] Failed to fetch model metadata for {args.model_id}: {exc}")
+      print(f"[WORKER] Failed to fetch model metadata for {model_id}: {exc}")
+  return fine_tuning_type
 
-  is_lora = fine_tuning_type == "lora"
-  print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")
 
-  worker: BaseTrainerWorker
+def build_worker(is_lora: bool) -> BaseTrainerWorker:
   if os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower() == "automodel":
     from training.automodel_worker import AutomodelTrainingWorker
 
-    worker = AutomodelTrainingWorker(full_parameter=not is_lora)
-  else:
-    worker = LoraTrainingWorker() if is_lora else FFTTrainingWorker()
-  preload_target = os.getenv("BASE_MODEL")
+    return AutomodelTrainingWorker(full_parameter=not is_lora)
+  return LoraTrainingWorker() if is_lora else FFTTrainingWorker()
+
+
+def serve_health_probe() -> None:
+  """A readiness endpoint for shared LoRA workers, on rank 0 only. The port
+  is configurable so a trainer can share a box with a vLLM server on 8000."""
+  probe_app = FastAPI()
+  probe_port = int(os.getenv("OPEN_RL_WORKER_PROBE_PORT", "8000"))
+
+  @probe_app.get("/healthz")
+  def healthz():
+    return {"status": "ready"}
+
+  def run_probe_server():
+    try:
+      uvicorn.run(probe_app, host="0.0.0.0", port=probe_port, log_level="warning")
+    except Exception as exc:
+      print(f"[WORKER] Probe server on port {probe_port} skipped: {exc}")
+
+  threading.Thread(target=run_probe_server, daemon=True).start()
+
+
+async def main_async(args: argparse.Namespace) -> None:
+  fine_tuning_type = await fine_tuning_type_for(args.model_id)
+  is_lora = fine_tuning_type == "lora"
+  print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")
+
+  worker = build_worker(is_lora)
   if is_lora:
-    if preload_target:
+    if preload_target := os.getenv("BASE_MODEL"):
       worker.load_base_model(preload_target)
     else:
       print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
     if is_primary():
-      probe_app = FastAPI()
-
-      @probe_app.get("/healthz")
-      def healthz():
-        return {"status": "ready"}
-
-      # Configurable so a trainer can share a box with a vLLM server on 8000.
-      probe_port = int(os.getenv("OPEN_RL_WORKER_PROBE_PORT", "8000"))
-
-      def run_probe_server():
-        try:
-          uvicorn.run(probe_app, host="0.0.0.0", port=probe_port, log_level="warning")
-        except Exception as exc:
-          print(f"[WORKER] Probe server on port {probe_port} skipped: {exc}")
-
-      threading.Thread(target=run_probe_server, daemon=True).start()
+      serve_health_probe()
   else:
     print("[WORKER] Full fine-tuning mode loads its model from the create_model request.")
 
-  await run_training_requests_processor(
-    worker,
-    args.model_id,
-    active_tenant_set_id=args.active_tenant_set_id,
-  )
+  await run_training_requests_processor(worker, args.model_id, active_tenant_set_id=args.active_tenant_set_id, leased=not is_lora)
 
 
 def start_request_processing_loop() -> None:
