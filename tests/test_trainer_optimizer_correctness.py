@@ -885,6 +885,14 @@ class TestDataParallelForwardBackward(unittest.TestCase):
     torch.testing.assert_close(parameter.grad, torch.tensor(0.0))
     self.assertEqual(result["metrics"]["loss:sum"], 0.0)
 
+  def test_empty_batch_on_a_distributed_rank_returns_nothing(self) -> None:
+    result, parameter, compute_calls = self._run_forward_backward([], rank=0)
+
+    self.assertEqual(result["loss_fn_outputs"], [])
+    self.assertEqual(result["metrics"]["loss:sum"], 0.0)
+    self.assertIsNone(parameter.grad)
+    self.assertEqual(compute_calls.call_count, 0)
+
 
 class TestRankGating(unittest.TestCase):
   def test_non_primary_rank_does_not_publish_futures(self) -> None:

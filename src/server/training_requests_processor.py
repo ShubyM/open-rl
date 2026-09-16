@@ -252,7 +252,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     result = await asyncio.to_thread(self.worker.optim_step, payload.get("adam_params", {}), model_id)
     result["type"] = "optim_step_completed"
     await asyncio.to_thread(self.worker.save_adapter, model_id)
-    if hasattr(self, "store") and self.store:
+    if is_primary():
       try:
         raw_meta = await self.store.get_value(f"open_rl:model_meta:{model_id}")
         current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
@@ -483,7 +483,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   async def optim_step(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     result = await asyncio.to_thread(self.worker.optim_step, payload.get("adam_params", {}), model_id)
     result["type"] = "optim_step_completed"
-    if hasattr(self, "store") and self.store:
+    if is_primary():
       try:
         raw_meta = await self.store.get_value(f"open_rl:model_meta:{model_id}")
         current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
@@ -531,7 +531,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
     local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
     await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
-    if hasattr(self.store, "redis"):
+    if is_primary() and hasattr(self.store, "redis"):
       num_subs = await self.store.redis.publish(
         f"open_rl:weight_update:{model_id}",
         json.dumps({"weights_path": local_path}),

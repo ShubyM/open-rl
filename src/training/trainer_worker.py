@@ -90,14 +90,18 @@ class BaseTrainerWorker:
     and every rank runs the same number of passes (short ranks run zero-scaled
     fillers) so the collectives inside backward line up.
     """
+    if not data:
+      return {"metrics": {"loss:mean": 0.0, "loss:sum": 0.0}, "loss_fn_outputs": [], "loss_fn_output_type": "ArrayRecord"}
+
     group = self.data_parallel_group()
     dp_rank, dp_size = group_rank(group), group_size(group)
     local_indices = list(range(dp_rank, len(data), dp_size))
     local_batches = self.make_training_batches([data[idx] for idx in local_indices])
     if dp_size > 1:
       filler_passes = all_reduce_max(len(local_batches), group) - len(local_batches)
-      filler = data[local_indices[0]] if local_indices else data[0]
-      local_batches.extend([[(FILLER_DATUM_INDEX, filler)]] * filler_passes)
+      if filler_passes > 0:
+        filler = data[local_indices[0]] if local_indices else data[0]
+        local_batches.extend([[(FILLER_DATUM_INDEX, filler)]] * filler_passes)
 
     total_loss = 0.0
     loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)

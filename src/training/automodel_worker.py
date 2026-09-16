@@ -496,6 +496,8 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       res = super().forward_backward(self.model, data, loss_fn, loss_config)
     finally:
       self.close_cp_context()
+      # The norm hook's output keeps the last forward's graph alive otherwise.
+      self.final_norm_output = None
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
     return res
@@ -644,17 +646,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       torch.cuda.empty_cache()
 
     if self.optimizer is None:
-      lr = adam_params.get("learning_rate", 1e-4)
-      print(f"Initializing AdamW for Automodel with lr={lr}")
-      # A plain AdamW over the sharded DTensor params is the standard FSDP2 step.
-      self.optimizer = torch.optim.AdamW(
-        self.trainable_params,
-        lr=lr,
-        betas=(adam_params.get("beta1", 0.9), adam_params.get("beta2", 0.95)),
-        eps=adam_params.get("eps", 1e-12),
-        weight_decay=adam_params.get("weight_decay", 0.0),
-        foreach=False,
-      )
+      self.optimizer = self.build_optimizer(adam_params)
 
     learning_rate = adam_params.get("learning_rate")
     if learning_rate is not None:
@@ -676,6 +668,19 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
         **self.ratio_metrics(),
       }
     }
+
+  def build_optimizer(self, adam_params: dict[str, Any]) -> torch.optim.Optimizer:
+    """A plain AdamW over the sharded DTensor params, the standard FSDP2 step."""
+    lr = adam_params.get("learning_rate", 1e-4)
+    print(f"Initializing AdamW for Automodel with lr={lr}")
+    return torch.optim.AdamW(
+      self.trainable_params,
+      lr=lr,
+      betas=(adam_params.get("beta1", 0.9), adam_params.get("beta2", 0.95)),
+      eps=adam_params.get("eps", 1e-12),
+      weight_decay=adam_params.get("weight_decay", 0.0),
+      foreach=False,
+    )
 
   def clip_gradients(self, max_grad_norm: float) -> float:
     """Global grad norm over DTensors that may live on different meshes.
@@ -761,8 +766,10 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     and swap it into place, so a save killed mid-write never leaves a
     directory that loads as mixed old and new."""
     assert self.model is not None, "Model must be loaded first."
-    staging_path = f"{path}.staging-{os.getpid()}"
-    previous_path = f"{path}.previous-{os.getpid()}"
+    # Rank-invariant names: every rank passes the staging path into the
+    # collective save, so it must be the same directory on every rank.
+    staging_path = f"{path}.staging"
+    previous_path = f"{path}.previous"
     if is_primary():
       shutil.rmtree(staging_path, ignore_errors=True)
       os.makedirs(staging_path, exist_ok=True)
@@ -844,7 +851,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     if restore_optimizer and metadata.get("has_optimizer") and os.path.exists(optimizer_path):
       from torch.distributed.checkpoint.state_dict import StateDictOptions, set_optimizer_state_dict
 
-      self.optimizer = torch.optim.AdamW(self.trainable_params, lr=1e-4, foreach=False)
+      self.optimizer = self.build_optimizer({})
       # Every rank reads the full state and slices its own shards; no broadcast.
       full_state = torch.load(optimizer_path, map_location="cpu", weights_only=False)
       set_optimizer_state_dict(self.model, self.optimizer, optim_state_dict=full_state, options=StateDictOptions(full_state_dict=True))
@@ -866,14 +873,14 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       raise RuntimeError("A full-parameter Automodel worker has no adapter to publish; it saves whole checkpoints.")
     adapter_root = os.path.join(tmp_dir(), "peft", adapter_id)
     final_dir = os.path.join(adapter_root, adapter_id)
-    staging_dir = os.path.join(adapter_root, f".staging-{os.getpid()}")
+    staging_dir = os.path.join(adapter_root, ".staging")
     if is_primary():
       shutil.rmtree(staging_dir, ignore_errors=True)
       os.makedirs(staging_dir, exist_ok=True)
     barrier()
     self.write_weights(staging_dir)
     if is_primary():
-      replaced_dir = os.path.join(adapter_root, f".replaced-{os.getpid()}")
+      replaced_dir = os.path.join(adapter_root, ".replaced")
       shutil.rmtree(replaced_dir, ignore_errors=True)
       if os.path.exists(final_dir):
         os.rename(final_dir, replaced_dir)
