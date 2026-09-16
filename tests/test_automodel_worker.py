@@ -86,8 +86,9 @@ class AutomodelWorkerHelpersTest(unittest.TestCase):
       seen: list[str] = []
       worker.write_weights = lambda path: seen.append(path) or (open(f"{path}/w", "w").close() if os.path.isdir(path) else None)  # type: ignore[method-assign]
       with patch("training.automodel_worker.is_primary", side_effect=[True, True, False, False]):
-        worker.save_state("job", target)
-        worker.save_state("job", target)
+        worker.model_id = "job"
+        worker.save_state(target)
+        worker.save_state(target)
       self.assertEqual(seen, [f"{target}.staging", f"{target}.staging"])
       self.assertTrue(os.path.isfile(f"{target}/metadata.json"))
 
