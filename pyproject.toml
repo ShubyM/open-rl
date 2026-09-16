@@ -62,9 +62,17 @@ cluster = [
     # docs/setup/gke-fft-timeslice.md: both come from this upstream release.
     "timeslice @ git+https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git@v0.1.0#subdirectory=pkg/client/python",
 ]
+
+[dependency-groups]
 dev = [
+    # Tests are plain unittest; pytest is only the runner (-k, -x, nicer diffs).
+    "pytest>=8",
     "ruff>=0.5.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
 
 [tool.setuptools.package-dir]
 "" = "src"

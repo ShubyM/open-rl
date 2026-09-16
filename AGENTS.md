@@ -46,11 +46,12 @@ export PATH=$PATH:$HOME/.local/bin && make fmt
 *Note: Keep `import ...` statements at the module top-level where possible and verify lines stay within the 150-character limit to ensure CI checks pass under `ruff check`.*
 
 ### Running the Standard Unit Test Suite
-To run the standard unit test suite:
+To run the unit test suite:
 ```bash
-make test
+uv run pytest
 ```
-*Note: This command runs package discovery inside the client/examples environment. Because the Makefile targets run `uv` under the hood, you must ensure that `uv` is in your `PATH` (typically installed at `~/.local/bin`). For example, prepend `export PATH=$PATH:$HOME/.local/bin` to your command.*
+Tests are plain `unittest` classes under `tests/`; nothing imports pytest, so `uv run python -m unittest discover` runs the same suite. pytest is only the runner (`-k`, `-x`, better diffs). Tests that need a CUDA device skip themselves with `unittest.skipUnless`, so the same command works on a laptop and on a GPU box.
+*Note: `uv` must be in your `PATH` (typically installed at `~/.local/bin`). For example, prepend `export PATH=$PATH:$HOME/.local/bin` to your command.*
 
 ---
 

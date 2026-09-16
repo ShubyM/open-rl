@@ -6,9 +6,12 @@ Non-gated model kept small for CI speed. Skips the baseline eval and runs
 
 import unittest
 
-from piglatin_sft import PRESETS, run_training
-
 from tests._server_fixture import REPO_ROOT, OpenRlServerCase
+
+try:
+  from piglatin_sft import PRESETS, run_training
+except ImportError:
+  PRESETS = run_training = None
 
 CLIENT_DIR = REPO_ROOT / "examples" / "sft" / "pig-latin"
 
@@ -27,6 +30,7 @@ PIGLATIN_EVAL_EXAMPLES = [
 ]
 
 
+@unittest.skipIf(PRESETS is None, "run from the examples project with PYTHONPATH=examples/sft/pig-latin")
 class TestPigLatinQwen(OpenRlServerCase):
   BASE_MODEL = "Qwen/Qwen3-0.6B"
   PORT = 9010

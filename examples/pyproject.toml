@@ -27,6 +27,11 @@ dependencies = [
     "ipykernel",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
 [project.scripts]
 harvey-train = "harvey_labs.train:main"
 harvey-eval = "harvey_labs.eval_checkpoint:main"

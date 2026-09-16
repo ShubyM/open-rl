@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: pytest (cpu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync
+        run: uv sync --frozen --extra cpu --extra cluster
+
+      # GPU tests skip themselves here; the same command runs them on the gpu job.
+      - name: Run tests
+        run: uv run --frozen pytest
+
+  # Runs only on manual dispatch until a self-hosted L4 runner is registered
+  # with the labels below. A pull_request trigger would queue forever without one.
+  gpu:
+    name: pytest (gpu)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync
+        run: uv sync --frozen --extra gpu --extra cluster
+
+      - name: Run tests
+        run: uv run --frozen pytest

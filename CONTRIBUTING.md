@@ -89,8 +89,9 @@ make server SAMPLING_BACKEND=vllm             # use vLLM for sampling
 ### Running tests
 
 ```bash
-make test                                     # fast unit tests
-make test piglatin                            # pig-latin example end-to-end tests
+uv run pytest                                 # unit tests; GPU tests skip themselves without a device
+uv run python -m unittest discover            # same suite with only the standard library runner
+PYTHONPATH=examples/sft/pig-latin uv --project examples run pytest tests/test_piglatin_qwen.py   # pig-latin end-to-end
 ```
 
 End-to-end GPU integration tests boot a real backend and run actual SFT/RL training. They
