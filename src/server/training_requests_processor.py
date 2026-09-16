@@ -58,18 +58,119 @@ class TrainingRequestsProcessor:
   worker: TrainingWorker
   default_kind: str = "full"
 
-  async def run_loop(self) -> None:
-    while True:
-      try:
-        await self.run_once()
-      except asyncio.CancelledError:
-        break
-      except Exception as exc:
-        print(f"Error in training requests processor: {exc}")
-        traceback.print_exc()
-        await asyncio.sleep(1)
+  def __init__(
+    self,
+    store: RequestStore,
+    worker: BaseTrainerWorker,
+    model_id: str | None = None,
+    time_slicer: TimeSlicerClient | None = None,
+    active_tenant_set_id: str | None = None,
+  ):
+    if self.default_kind == "full" and not os.getenv("REDIS_URL"):
+      raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
+    self.store = store
+    self.worker = worker
+    self.model_id = model_id
+    self.active_tenant_set_id = active_tenant_set_id or (f"{model_id}-1" if model_id and self.default_kind == "lora" else None)
+    self.time_slicer = time_slicer or NoOpTimeSlicer()
+    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id or "shared"), claim=TRAINER_CLAIM)
+    self.snapshot_registered = False
 
-  async def run_once(self) -> None: ...
+  async def exit_gracefully(self) -> None:
+    print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
+    if self.snapshot_registered:
+      with suppress(Exception):
+        await self.time_slicer.unregister(self.workload)
+        self.snapshot_registered = False
+    with suppress(Exception):
+      await self.time_slicer.close()
+    os._exit(0)
+
+  async def run(self) -> None:
+    if self.default_kind == "lora":
+      print(f"[WORKER] LoRA training requests processor started (Active Set ID: {self.active_tenant_set_id}).")
+    else:
+      print("[WORKER] Full fine-tuning training requests processor started.")
+    try:
+      await self.time_slicer.register(self.workload)
+      self.snapshot_registered = True
+      while True:
+        try:
+          await self.run_once()
+        except asyncio.CancelledError:
+          break
+        except Exception as exc:
+          print(f"Error in training requests processor: {exc}")
+          traceback.print_exc()
+          await asyncio.sleep(1)
+    finally:
+      try:
+        if self.snapshot_registered:
+          await self.time_slicer.unregister(self.workload)
+      finally:
+        await self.time_slicer.close()
+        close_distributed()
+
+  @asynccontextmanager
+  async def gpu_lease(self):
+    """Rank 0 holds the lease; the other ranks enter and leave with it."""
+    async with AsyncExitStack() as stack:
+      await stack.enter_async_context(self.time_slicer.acquire(self.workload))
+      await asyncio.to_thread(barrier)
+      try:
+        yield
+      finally:
+        await asyncio.to_thread(barrier)
+
+  async def run_once(self) -> None:
+    fetch = (
+      (lambda: self.store.get_requests(active_set_id=self.active_tenant_set_id))
+      if self.default_kind == "lora"
+      else (lambda: self.store.get_requests_for_model(self.model_id) if self.model_id else self.store.get_requests())
+    )
+    batch = await self.next_batch(fetch)
+    if not batch:
+      return
+
+    model_id = self.model_id or batch[0].get("model_id", "default")
+    has_shutdown = False
+    training_reqs = []
+    for req in batch:
+      if req.get("request_id") == "SHUTDOWN_SENTINEL" or req.get("op") in {"shutdown", "shutdown_workers"}:
+        has_shutdown = True
+      else:
+        training_reqs.append(req)
+
+    with tracer.start_as_current_span("training_requests_batch") as batch_span:
+      batch_span.set_attribute("batch_size", len(training_reqs))
+      batch_span.set_attribute("model_id", model_id)
+
+      if training_reqs:
+        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {model_id}: {describe_requests(training_reqs)}")
+        results = []
+        save_ops = set() if self.worker.save_needs_gpu() else {"save_state", "save_weights", "save_weights_for_sampler"}
+        gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
+        save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
+
+        if gpu_reqs:
+          async with self.gpu_lease():
+            await asyncio.to_thread(self.worker.wake_up)
+            try:
+              for req in gpu_reqs:
+                target_id = req.get("adapter_id") or req.get("model_id") or model_id
+                results.append(await self.handle_request(req, target_id))
+            finally:
+              await asyncio.to_thread(self.worker.sleep)
+
+        for req in save_reqs:
+          target_id = req.get("adapter_id") or req.get("model_id") or model_id
+          results.append(await self.handle_request(req, target_id))
+
+        for request_id, result in results:
+          await self.publish_result(request_id, result)
+
+    if has_shutdown:
+      await self.exit_gracefully()
 
   async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
     request_id, result = await self.handle_request(raw_request, model_id)
@@ -121,22 +222,29 @@ class TrainingRequestsProcessor:
         otel_context.detach(token)
 
   async def dispatch_operation(self, op: str, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    if op == "shutdown_workers":
-      return {"status": "ok", "type": "shutdown_acknowledged"}
-    allowed = {
-      "create_model",
-      "create_model_from_state",
-      "forward_backward",
-      "optim_step",
-      "sample",
-      "save_state",
-      "load_weights",
-      "save_weights_for_sampler",
-      "save_weights",
-    }
-    if op not in allowed:
-      raise NotImplementedError(f"Training request op {op!r} is not supported")
-    return await getattr(self, op)(payload, model_id)
+    match op:
+      case "create_model":
+        return await self.create_model(payload, model_id)
+      case "create_model_from_state":
+        return await self.create_model_from_state(payload, model_id)
+      case "forward_backward":
+        return await self.forward_backward(payload, model_id)
+      case "optim_step":
+        return await self.optim_step(payload, model_id)
+      case "sample":
+        return await self.sample(payload, model_id)
+      case "save_state":
+        return await self.save_state(payload, model_id)
+      case "load_weights":
+        return await self.load_weights(payload, model_id)
+      case "save_weights_for_sampler":
+        return await self.save_weights_for_sampler(payload, model_id)
+      case "save_weights":
+        return await self.save_weights(payload, model_id)
+      case "shutdown_workers":
+        return {"status": "ok", "type": "shutdown_acknowledged"}
+      case _:
+        raise NotImplementedError(f"Training request op {op!r} is not supported")
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     base_model, full_raw, lora_raw, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind=self.default_kind)
@@ -263,128 +371,16 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
-    worker: LoraTrainingWorker,
+    worker: BaseTrainerWorker,
     model_id: str | None = None,
     active_tenant_set_id: str | None = None,
+    **kwargs: Any,
   ):
-    self.store = store
-    self.worker = worker
-    self.model_id = model_id
-    self.active_tenant_set_id = active_tenant_set_id or (f"{model_id}-1" if model_id else None)
-
-  async def run(self) -> None:
-    print(f"[WORKER] LoRA training requests processor started (Active Set ID: {self.active_tenant_set_id}).")
-    await self.run_loop()
-
-  async def run_once(self) -> None:
-    batch = await self.next_batch(lambda: self.store.get_requests(active_set_id=self.active_tenant_set_id))
-    if not batch:
-      return
-
-    model_id = batch[0].get("model_id", "default")
-    with tracer.start_as_current_span("training_requests_batch") as batch_span:
-      batch_span.set_attribute("batch_size", len(batch))
-      batch_span.set_attribute("model_id", model_id)
-      print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {model_id}: {describe_requests(batch)}")
-      for request in batch:
-        target_model_id = request.get("adapter_id") or request.get("model_id") or model_id
-        await self.process_request(request, target_model_id)
+    super().__init__(store, worker, model_id, active_tenant_set_id=active_tenant_set_id, **kwargs)
 
 
 class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
-  def __init__(
-    self,
-    store: RequestStore,
-    worker: BaseTrainerWorker,
-    model_id: str | None,
-    time_slicer: TimeSlicerClient,
-  ):
-    if not os.getenv("REDIS_URL"):
-      raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
-    self.store = store
-    self.worker = worker
-    self.model_id = model_id
-    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id or "shared"), claim=TRAINER_CLAIM)
-    self.time_slicer = time_slicer
-    self.snapshot_registered = False
-
-  async def exit_gracefully(self) -> None:
-    print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if self.snapshot_registered:
-      with suppress(Exception):
-        await self.time_slicer.unregister(self.workload)
-        self.snapshot_registered = False
-    with suppress(Exception):
-      await self.time_slicer.close()
-    os._exit(0)
-
-  async def run(self) -> None:
-    print("[WORKER] Full fine-tuning training requests processor started.")
-    try:
-      await self.time_slicer.register(self.workload)
-      self.snapshot_registered = True
-      await self.run_loop()
-    finally:
-      try:
-        if self.snapshot_registered:
-          await self.time_slicer.unregister(self.workload)
-      finally:
-        await self.time_slicer.close()
-        close_distributed()
-
-  @asynccontextmanager
-  async def gpu_lease(self):
-    """Rank 0 holds the lease; the other ranks enter and leave with it."""
-    async with AsyncExitStack() as stack:
-      await stack.enter_async_context(self.time_slicer.acquire(self.workload))
-      await asyncio.to_thread(barrier)
-      try:
-        yield
-      finally:
-        await asyncio.to_thread(barrier)
-
-  async def run_once(self) -> None:
-    batch = await self.next_batch(lambda: self.store.get_requests_for_model(self.model_id) if self.model_id else self.store.get_requests())
-    if not batch:
-      return
-
-    model_id = self.model_id or batch[0].get("model_id", "default")
-    has_shutdown = False
-    training_reqs = []
-    for req in batch:
-      if req.get("request_id") == "SHUTDOWN_SENTINEL" or req.get("op") in {"shutdown", "shutdown_workers"}:
-        has_shutdown = True
-      else:
-        training_reqs.append(req)
-
-    with tracer.start_as_current_span("training_requests_batch") as batch_span:
-      batch_span.set_attribute("batch_size", len(training_reqs))
-      batch_span.set_attribute("model_id", model_id)
-
-      if training_reqs:
-        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {model_id}: {describe_requests(training_reqs)}")
-        results = []
-        save_ops = set() if self.worker.save_needs_gpu() else {"save_state", "save_weights", "save_weights_for_sampler"}
-        gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
-        save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
-
-        if gpu_reqs:
-          async with self.gpu_lease():
-            await asyncio.to_thread(self.worker.wake_up)
-            try:
-              for request in gpu_reqs:
-                results.append(await self.handle_request(request, model_id))
-            finally:
-              await asyncio.to_thread(self.worker.sleep)
-
-        for request in save_reqs:
-          results.append(await self.handle_request(request, model_id))
-
-        for request_id, result in results:
-          await self.publish_result(request_id, result)
-
-    if has_shutdown:
-      await self.exit_gracefully()
+  default_kind = "full"
 
 
 async def run_training_requests_processor(
@@ -396,7 +392,6 @@ async def run_training_requests_processor(
   pin_executor_threads()
   store = get_store()
   if worker.full_parameter:
-    # Rank 0 holds the GPU lease for the whole group; the other ranks follow it through barriers.
     time_slicer = time_slicer or (time_slicer_client_from_env() if is_primary() else NoOpTimeSlicer())
     processor = FFTTrainingRequestsProcessor(store, worker, model_id, time_slicer)
   else:

@@ -2,7 +2,9 @@
 
 import math
 import os
+import time
 from contextlib import nullcontext
+from datetime import datetime
 from typing import Any
 
 import torch
@@ -15,6 +17,7 @@ from training.distributed import all_gather_object, all_reduce_max, all_reduce_s
 
 # Position marker for a filler pass, see forward_backward.
 FILLER_DATUM_INDEX = -1
+ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
 
 RATIO_STATS_ZERO = {"max_abs_log_ratio": 0.0, "tokens": 0.0, "tokens_abs_log_ratio_gt1": 0.0, "tokens_abs_log_ratio_gt5": 0.0}
 
@@ -79,6 +82,73 @@ class BaseTrainerWorker:
 
   def save_needs_gpu(self) -> bool:
     return False
+
+  def enable_gradient_checkpointing(self, model: torch.nn.Module) -> None:
+    if not ENABLE_GRADIENT_CHECKPOINTING:
+      return
+    try:
+      if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+      if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+      print("Gradient checkpointing and input require grads enabled.")
+    except Exception as e:
+      print(f"Failed to enable gradient checkpointing: {e}")
+
+  def checkpoint_metadata(self, model_id: str | None, kind: str = "state", has_optimizer: bool = False, **extra: Any) -> dict[str, Any]:
+    return {
+      "base_model": getattr(self, "base_model_name", None),
+      "created_at": datetime.now().isoformat(),
+      "kind": kind,
+      "has_optimizer": has_optimizer,
+      "model_id": model_id,
+      "timestamp": time.time(),
+      **extra,
+    }
+
+  def build_optimizer(
+    self,
+    params: list[torch.nn.Parameter],
+    adam_params: dict[str, Any],
+    label: str = "model",
+    **kwargs: Any,
+  ) -> torch.optim.Optimizer:
+    lr = adam_params.get("learning_rate", 1e-4)
+    print(f"Initializing AdamW optimizer for {label} with lr={lr}")
+    return torch.optim.AdamW(
+      params,
+      lr=lr,
+      betas=(adam_params.get("beta1", 0.9), adam_params.get("beta2", 0.95)),
+      eps=adam_params.get("eps", 1e-12),
+      weight_decay=adam_params.get("weight_decay", 0.0),
+      **kwargs,
+    )
+
+  def clip_gradients(self, params: list[torch.nn.Parameter], max_grad_norm: float) -> tuple[float, float]:
+    total_norm = float(torch.nn.utils.clip_grad_norm_(params, max_grad_norm))
+    clip_coef = min(1.0, max_grad_norm / (total_norm + 1e-6))
+    return total_norm, clip_coef
+
+  def step_optimizer(
+    self,
+    optimizer: torch.optim.Optimizer,
+    params: list[torch.nn.Parameter],
+    adam_params: dict[str, Any],
+    default_clip: float = 0.0,
+  ) -> tuple[float, float, float, float]:
+    if (lr := adam_params.get("learning_rate")) is not None:
+      for group in optimizer.param_groups:
+        group["lr"] = lr
+    max_grad_norm = adam_params.get("grad_clip_norm") or default_clip or math.inf
+    if max_grad_norm <= 0.0:
+      max_grad_norm = math.inf
+    t0 = time.perf_counter()
+    total_norm, clip_coef = self.clip_gradients(params, max_grad_norm)
+    t1 = time.perf_counter()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    t2 = time.perf_counter()
+    return total_norm, clip_coef, t1 - t0, t2 - t1
 
   def data_parallel_group(self) -> dist.ProcessGroup | None:
     """The process group whose ranks split the datums of one forward_backward.

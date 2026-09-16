@@ -4,7 +4,6 @@ import gc
 import itertools
 import json
 import logging
-import math
 import os
 import time
 from datetime import datetime
@@ -16,9 +15,7 @@ import torch
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
-from training.trainer_worker import BaseTrainerWorker, Datum
-
-ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
+from training.trainer_worker import BaseTrainerWorker, Datum, tmp_dir
 
 
 class FFTConfig(BaseModel):
@@ -118,14 +115,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
           cpu_buf.copy_(param.data, non_blocking=True)
           self._param_shadow[param] = (param.device, cpu_buf)
 
-    if ENABLE_GRADIENT_CHECKPOINTING:
-      try:
-        self.model.gradient_checkpointing_enable()
-        self.model.enable_input_require_grads()
-        print("Gradient checkpointing and input require grads enabled on full fine-tuning model.")
-      except Exception as e:
-        print(f"Failed to enable gradient checkpointing: {e}")
-
+    self.enable_gradient_checkpointing(self.model)
     self.model.train()
 
   def _prepare_for_save(self) -> bool:
@@ -150,9 +140,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
         "GPU time-slicer lock is not held during save operations."
       )
 
-    tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
     name = alias or "fft-model"
-    save_path = name if os.path.isabs(name) else os.path.join(tmp_dir, "fft", name)
+    save_path = name if os.path.isabs(name) else os.path.join(tmp_dir(), "fft", name)
     os.makedirs(save_path, exist_ok=True)
 
     was_offloaded = self._prepare_for_save()
@@ -163,15 +152,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
     finally:
       self._cleanup_after_save(was_offloaded)
 
-    metadata = {
-      "base_model": self.base_model_name,
-      "created_at": datetime.now().isoformat(),
-      "kind": "weights",
-      "model_id": alias,
-      "timestamp": time.time(),
-    }
     with open(os.path.join(save_path, "metadata.json"), "w") as f:
-      json.dump(metadata, f)
+      json.dump(self.checkpoint_metadata(alias, kind="weights"), f)
 
     print(f"Saved full fine-tuning model to {save_path}")
     return {"path": save_path}
@@ -184,15 +166,11 @@ class FFTTrainingWorker(BaseTrainerWorker):
         "GPU time-slicer lock is not held during save operations."
       )
 
-    # Under the delta strategy save_state writes the sparse delta the sampler
-    # consumes. load_from_state cannot open it, so FFT is not resumable yet.
     if self.weight_sync_cfg.strategy == "delta":
       if kind != "sampler":
         logger.warning("save_state for %s under the delta strategy writes a delta, not a resumable checkpoint", model_id)
       return self.save_state_delta(model_id=model_id, state_path=state_path, kind=kind)
 
-    # FFT cannot be resumed yet, so a saved optimizer has no reader and only
-    # costs disk. include_optimizer is ignored until FFT resume exists.
     os.makedirs(state_path, exist_ok=True)
     was_offloaded = self._prepare_for_save()
     try:
@@ -202,16 +180,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
     finally:
       self._cleanup_after_save(was_offloaded)
 
-    metadata = {
-      "base_model": self.base_model_name,
-      "created_at": datetime.now().isoformat(),
-      "kind": kind,
-      "has_optimizer": False,
-      "model_id": model_id,
-      "timestamp": time.time(),
-    }
     with open(os.path.join(state_path, "metadata.json"), "w") as f:
-      json.dump(metadata, f)
+      json.dump(self.checkpoint_metadata(model_id, kind=kind, has_optimizer=False), f)
 
     print(f"Saved full fine-tuning state to {state_path}")
     return {"path": state_path}
@@ -415,43 +385,9 @@ class FFTTrainingWorker(BaseTrainerWorker):
       self.trainable_params = trainable_model_parameters(self.model)
 
     if self.optimizer is None:
-      lr = adam_params.get("learning_rate", 1e-4)
-      beta1 = adam_params.get("beta1", 0.9)
-      beta2 = adam_params.get("beta2", 0.95)
-      eps = adam_params.get("eps", 1e-12)
-      weight_decay = adam_params.get("weight_decay", 0.0)
+      self.optimizer = self.build_optimizer(self.trainable_params, adam_params, label="full fine-tuning model")
 
-      print(f"Initializing AdamW optimizer for full fine-tuning model with lr={lr}")
-      self.optimizer = torch.optim.AdamW(
-        self.trainable_params,
-        lr=lr,
-        betas=(beta1, beta2),
-        eps=eps,
-        weight_decay=weight_decay,
-      )
-
-    learning_rate = adam_params.get("learning_rate")
-    if learning_rate is not None:
-      for param_group in self.optimizer.param_groups:
-        param_group["lr"] = learning_rate
-
-    max_grad_norm = adam_params.get("grad_clip_norm") or math.inf
-    if max_grad_norm <= 0.0:
-      max_grad_norm = math.inf
-
-    t_clip_start = time.perf_counter()
-    total_norm = torch.nn.utils.clip_grad_norm_(
-      self.trainable_params,
-      max_grad_norm,
-    )
-    t_clip_end = time.perf_counter()
-    clip_time = t_clip_end - t_clip_start
-
-    t_step_start = time.perf_counter()
-    self.optimizer.step()
-    self.optimizer.zero_grad()
-    t_step_end = time.perf_counter()
-    step_time = t_step_end - t_step_start
+    total_norm, _, clip_time, step_time = self.step_optimizer(self.optimizer, self.trainable_params, adam_params)
 
     delta_compute_time = 0.0
     if self.weight_sync_cfg.strategy == "delta" and self.model is not None and hasattr(self.model, "named_parameters"):
@@ -516,7 +452,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
     return {
       "metrics": {
-        "grad_norm:mean": self.sanitize_float(total_norm.item()),
+        "grad_norm:mean": self.sanitize_float(total_norm),
         **self.ratio_metrics(),
         "time/compute_delta_diff": self.sanitize_float(delta_compute_time),
         "time/optimizer_step": self.sanitize_float(step_time),

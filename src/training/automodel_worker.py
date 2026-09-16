@@ -41,7 +41,6 @@ trains everything and publishes whole checkpoints through the FFT route.
 
 import contextlib
 import json
-import math
 import os
 import shutil
 import time
@@ -56,9 +55,9 @@ from torch.distributed.tensor import DTensor
 from transformers import AutoConfig, AutoTokenizer
 
 from training.distributed import barrier, group_rank, group_size, is_primary
-from training.fft_trainer_worker import ENABLE_GRADIENT_CHECKPOINTING, FFTConfig, trainable_model_parameters
+from training.fft_trainer_worker import FFTConfig, trainable_model_parameters
 from training.lora_trainer_worker import LoraConfig
-from training.trainer_worker import BaseTrainerWorker, Datum, chunk_target_logprob, tmp_dir
+from training.trainer_worker import ENABLE_GRADIENT_CHECKPOINTING, BaseTrainerWorker, Datum, chunk_target_logprob, tmp_dir
 
 # Parallel layout. DP is inferred as world / (CP * TP).
 AUTOMODEL_TP = int(os.getenv("OPEN_RL_AUTOMODEL_TP", "1"))
@@ -565,16 +564,12 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     if self.optimizer is None:
       self.optimizer = self.build_optimizer(adam_params)
 
-    learning_rate = adam_params.get("learning_rate")
-    if learning_rate is not None:
-      for param_group in self.optimizer.param_groups:
-        param_group["lr"] = learning_rate
-
-    max_grad_norm = adam_params.get("grad_clip_norm") or GRAD_CLIP_NORM or math.inf
-    total_norm, clip_coef = self.clip_gradients(max_grad_norm)
-
-    self.optimizer.step()
-    self.optimizer.zero_grad(set_to_none=True)
+    total_norm, clip_coef, *_ = self.step_optimizer(
+      self.optimizer,
+      self.trainable_params,
+      adam_params,
+      default_clip=GRAD_CLIP_NORM,
+    )
     return {
       "metrics": {
         "grad_norm:mean": self.sanitize_float(total_norm),
@@ -583,22 +578,14 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       }
     }
 
-  def build_optimizer(self, adam_params: dict[str, Any]) -> torch.optim.Optimizer:
-    """A plain AdamW over the sharded DTensor params, the standard FSDP2 step."""
-    lr = adam_params.get("learning_rate", 1e-4)
-    print(f"Initializing AdamW for Automodel with lr={lr}")
-    return torch.optim.AdamW(
-      self.trainable_params,
-      lr=lr,
-      betas=(adam_params.get("beta1", 0.9), adam_params.get("beta2", 0.95)),
-      eps=adam_params.get("eps", 1e-12),
-      weight_decay=adam_params.get("weight_decay", 0.0),
-      foreach=False,
-    )
+  def build_optimizer(self, adam_params: dict[str, Any], *args: Any, **kwargs: Any) -> torch.optim.Optimizer:
+    return super().build_optimizer(self.trainable_params, adam_params, label="Automodel", foreach=False)
 
-  def clip_gradients(self, max_grad_norm: float) -> tuple[float, float]:
+  def clip_gradients(self, params: list[torch.nn.Parameter] | float, max_grad_norm: float | None = None) -> tuple[float, float]:
     """Clip to a global grad norm over DTensors across potentially heterogeneous meshes."""
-    grads = [p.grad for p in self.trainable_params if p.grad is not None]
+    if max_grad_norm is None:
+      params, max_grad_norm = self.trainable_params, float(params)
+    grads = [p.grad for p in params if p.grad is not None]
     if not grads:
       return 0.0, 1.0
     norms = [n.full_tensor() if isinstance(n := torch.linalg.vector_norm(g.detach().float()), DTensor) else n for g in grads]
@@ -663,17 +650,6 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       shutil.rmtree(previous_dir, ignore_errors=True)
     barrier()
 
-  def checkpoint_metadata(self, kind: str, model_id: str | None, has_optimizer: bool) -> dict[str, Any]:
-    return {
-      "base_model": self.base_model_name,
-      "created_at": datetime.now().isoformat(),
-      "kind": kind,
-      "lora": self.is_lora,
-      "has_optimizer": has_optimizer,
-      "model_id": model_id,
-      "timestamp": time.time(),
-    }
-
   def save_state(self, model_id: str | None, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     include_optimizer = include_optimizer and self.optimizer is not None
@@ -681,7 +657,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       from torch.distributed.checkpoint.state_dict import StateDictOptions, get_optimizer_state_dict
 
       optimizer_state = get_optimizer_state_dict(self.model, self.optimizer, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
-    metadata = self.checkpoint_metadata(kind, model_id, include_optimizer)
+    metadata = self.checkpoint_metadata(model_id, kind=kind, has_optimizer=include_optimizer, lora=self.is_lora)
 
     def write_extra(staged: str) -> None:
       if include_optimizer:
