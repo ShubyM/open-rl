@@ -63,6 +63,7 @@ class BaseTrainerWorker:
 
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
+    self.base_model_name: str | None = None
     self.ratio_stats = dict(RATIO_STATS_ZERO)
 
     if torch.cuda.is_available():
@@ -107,7 +108,7 @@ class BaseTrainerWorker:
 
   def checkpoint_metadata(self, model_id: str | None, kind: str = "state", has_optimizer: bool = False, **extra: Any) -> dict[str, Any]:
     return {
-      "base_model": getattr(self, "base_model_name", None),
+      "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
       "kind": kind,
       "has_optimizer": has_optimizer,

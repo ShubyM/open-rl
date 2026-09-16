@@ -43,7 +43,6 @@ class FFTTrainingWorker(BaseTrainerWorker):
   def __init__(self):
     super().__init__()
     self.model: PreTrainedModel | None = None
-    self.base_model_name: str | None = None
     self.trainable_params: list[torch.nn.Parameter] = []
     self.optimizer: torch.optim.Optimizer | None = None
     self.cpu_offload: bool = True

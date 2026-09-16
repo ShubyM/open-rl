@@ -249,7 +249,6 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.forward_kwargs: dict[str, Any] = {}
     self.cp_context: contextlib.ExitStack | None = None
     self.final_norm_output: torch.Tensor | None = None
-    self.base_model_name: str | None = None
     self.trainable_params: list[torch.nn.Parameter] = []
     self.optimizer: torch.optim.Optimizer | None = None
     self.tp_size = AUTOMODEL_TP

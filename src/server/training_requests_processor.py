@@ -62,7 +62,7 @@ class TrainingRequestsProcessor:
   def is_lora(self) -> bool:
     if self.default_kind is not None:
       return self.default_kind == "lora"
-    return getattr(self.worker, "is_lora", not getattr(self.worker, "full_parameter", False))
+    return self.worker.is_lora
 
   def __init__(
     self,
@@ -440,7 +440,7 @@ async def main_async(args: argparse.Namespace) -> None:
   await run_training_requests_processor(
     worker,
     args.model_id,
-    active_tenant_set_id=getattr(args, "active_tenant_set_id", None),
+    active_tenant_set_id=args.active_tenant_set_id,
   )
 
 

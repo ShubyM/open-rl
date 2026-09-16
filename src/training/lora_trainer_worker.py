@@ -39,7 +39,6 @@ class LoraTrainingWorker(BaseTrainerWorker):
     super().__init__()
     self.base_model: PreTrainedModel | None = None
     self.peft_model: PeftModelForCausalLM | None = None
-    self.base_model_name: str | None = None
     self.adapter_states: dict[str, dict[str, Any]] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
 
