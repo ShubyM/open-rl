@@ -155,7 +155,6 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
   def save_state(self, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
-    model_id = self.model_id
     if self.cpu_offload and not self._is_offloaded:
       raise RuntimeError(
         "Cannot save state while worker is not offloaded (self._is_offloaded is False) when cpu_offload=True. "
@@ -164,8 +163,8 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
     if self.weight_sync_cfg.strategy == "delta":
       if kind != "sampler":
-        logger.warning("save_state for %s under the delta strategy writes a delta, not a resumable checkpoint", model_id)
-      return self.save_state_delta(model_id=model_id, state_path=state_path, kind=kind)
+        logger.warning("save_state for %s under the delta strategy writes a delta, not a resumable checkpoint", self.model_id)
+      return self.save_state_delta(model_id=self.model_id, state_path=state_path, kind=kind)
 
     os.makedirs(state_path, exist_ok=True)
     was_offloaded = self._prepare_for_save()
@@ -177,7 +176,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       self._cleanup_after_save(was_offloaded)
 
     with open(os.path.join(state_path, "metadata.json"), "w") as f:
-      json.dump(self.checkpoint_metadata(model_id, kind=kind, has_optimizer=False), f)
+      json.dump(self.checkpoint_metadata(self.model_id, kind=kind, has_optimizer=False), f)
 
     print(f"Saved full fine-tuning state to {state_path}")
     return {"path": state_path}
@@ -279,7 +278,6 @@ class FFTTrainingWorker(BaseTrainerWorker):
     return {"path": state_path, "density_pct": metadata["density_pct"]}
 
   def load_from_state(self, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
-    model_id = self.model_id
     metadata_path = os.path.join(state_path, "metadata.json")
     if not os.path.exists(metadata_path):
       raise FileNotFoundError(f"No metadata.json found at {state_path}")
@@ -307,7 +305,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
         print(f"Restored optimizer state from {optimizer_path}")
 
     print(f"Loaded full fine-tuning state from {state_path}")
-    return {"model_id": model_id, "base_model": base_model}
+    return {"model_id": self.model_id, "base_model": base_model}
 
   def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
@@ -375,7 +373,6 @@ class FFTTrainingWorker(BaseTrainerWorker):
     return mapped_names, mapped_indices
 
   def optim_step(self, adam_params: dict[str, Any]) -> dict[str, Any]:
-    model_id = self.model_id
     assert self.model is not None, "Model must be loaded first."
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
@@ -437,13 +434,13 @@ class FFTTrainingWorker(BaseTrainerWorker):
       t_delta_end = time.perf_counter()
       delta_compute_time = t_delta_end - t_delta_start
       logger.info(
-        f"[OPTIM_STEP] model_id={model_id} | delta_compute_time={delta_compute_time:.4f}s | "
+        f"[OPTIM_STEP] model_id={self.model_id} | delta_compute_time={delta_compute_time:.4f}s | "
         f"changed={self._latest_total_changed}/{self._latest_total_elements} "
         f"({100.0 * self._latest_total_changed / max(1, self._latest_total_elements):.2f}%) across {len(layer_names_list)} layers"
       )
 
     logger.info(
-      f"[OPTIM_STEP] model_id={model_id} | clip_grad_time={clip_time:.4f}s | "
+      f"[OPTIM_STEP] model_id={self.model_id} | clip_grad_time={clip_time:.4f}s | "
       f"optimizer_step_time={step_time:.4f}s | delta_compute_time={delta_compute_time:.4f}s | "
       f"total_optim_time={clip_time + step_time + delta_compute_time:.4f}s"
     )
