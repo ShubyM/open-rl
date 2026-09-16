@@ -51,6 +51,9 @@ class Config:
   eval_every: int = 5
   eval_max_tokens: int = 32
   plot_path: str = str(PLOT_PATH)
+  # When set, the final metrics are written here as JSON. This is the contract
+  # tests and other programs read; stdout is for people.
+  metrics_path: str = ""
   seed: int = 64
   assert_improvement: bool = True
   min_loss_drop: float = 0.8
@@ -259,18 +262,24 @@ def run_training(config: Config) -> dict[str, float]:
   print(f"Saved plot to {config.plot_path}")
   print(f"[summary] exact={before_exact:.1%}->{after_exact:.1%} similarity={before_sim:.1%}->{after_sim:.1%} loss_drop={loss_drop:.1%}")
 
-  if config.assert_improvement:
-    assert after_exact > before_exact, "Exact match did not improve"
-    assert after_sim - before_sim >= config.min_similarity_gain, "Similarity did not improve enough"
-    # assert loss_drop >= config.min_loss_drop, "Loss did not drop enough"
-
-  return {
+  metrics = {
     "before_exact": before_exact,
     "after_exact": after_exact,
     "before_sim": before_sim,
     "after_sim": after_sim,
     "loss_drop": loss_drop,
+    "min_similarity_gain": config.min_similarity_gain,
   }
+  if config.metrics_path:
+    Path(config.metrics_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(config.metrics_path).write_text(json.dumps(metrics, indent=2))
+
+  if config.assert_improvement:
+    assert after_exact > before_exact, "Exact match did not improve"
+    assert after_sim - before_sim >= config.min_similarity_gain, "Similarity did not improve enough"
+    # assert loss_drop >= config.min_loss_drop, "Loss did not drop enough"
+
+  return metrics
 
 
 @chz.blueprint._entrypoint.exit_on_entrypoint_error

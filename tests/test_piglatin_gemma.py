@@ -7,42 +7,23 @@ preset's threshold, and the final exact-match clears a 20% floor.
 
 import unittest
 
-from tests._server_fixture import REPO_ROOT, OpenRlServerCase
-from tests.test_piglatin_qwen import PIGLATIN_EVAL_EXAMPLES
-
-try:
-  from piglatin_sft import PRESETS, run_training
-except ImportError:
-  PRESETS = run_training = None
-
-CLIENT_DIR = REPO_ROOT / "examples" / "sft" / "pig-latin"
+from tests._server_fixture import OpenRlServerCase
+from tests.test_piglatin_qwen import run_e2e, run_piglatin
 
 
-@unittest.skipIf(PRESETS is None, "run from the examples project with PYTHONPATH=examples/sft/pig-latin")
+@run_e2e
 class TestPigLatinGemma(OpenRlServerCase):
   BASE_MODEL = "google/gemma-3-1b-it"
   PORT = 9011
   REQUIRE_HF_TOKEN = True
 
   def test_sft_improves(self) -> None:
-    TEST_CONFIG = {
-      "base_url": self.BASE_URL,
-      "steps": 25,
-      "assert_improvement": False,
-      "plot_path": str(CLIENT_DIR / "artifacts" / "test_gemma_metrics.png"),
-      "custom_examples": PIGLATIN_EVAL_EXAMPLES,
-    }
-
-    config = PRESETS["gemma"].clone().apply(TEST_CONFIG, layer_name="test_override").make()
-
-    m = run_training(config)
+    m = run_piglatin("gemma", base_url=self.BASE_URL, steps=25, assert_improvement=False)
     print(f"Training metrics: {m}")
 
     self.assertGreater(m["after_exact"], m["before_exact"], f"Exact match didn't improve: {m['before_exact']:.2f} -> {m['after_exact']:.2f}")
-
     sim_gain = m["after_sim"] - m["before_sim"]
-
-    self.assertGreaterEqual(sim_gain, config.min_similarity_gain, f"Similarity gain insufficient: {m['before_sim']:.2f} -> {m['after_sim']:.2f}")
+    self.assertGreaterEqual(sim_gain, m["min_similarity_gain"], f"Similarity gain insufficient: {m['before_sim']:.2f} -> {m['after_sim']:.2f}")
     self.assertGreaterEqual(m["after_exact"], 0.20, f"Expected >= 20% exact match, got {m['after_exact']:.0%}")
 
 

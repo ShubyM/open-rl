@@ -45,8 +45,9 @@ jobs:
         run: uv sync
 
       - name: Run pig-latin SFT end-to-end
-        run: PYTHONPATH=examples/sft/pig-latin uv --project examples run pytest tests/test_piglatin_qwen.py -v
+        run: uv run --frozen pytest tests/test_piglatin_qwen.py -v
         env:
+          OPEN_RL_RUN_E2E: "1"
           TINKER_API_KEY: tml-dummy-key
           TRANSFORMERS_VERBOSITY: error
           HF_HUB_DISABLE_PROGRESS_BARS: "1"

@@ -38,7 +38,8 @@ def openrl_server(
 ) -> Iterator[str]:
   port = port or unused_tcp_port()
   base_url = f"http://127.0.0.1:{port}"
-  tmp_dir = tempfile.TemporaryDirectory(prefix="open-rl-test-", dir="/dev/shm")
+  # /dev/shm keeps checkpoints in RAM on Linux; elsewhere fall back to the default temp dir.
+  tmp_dir = tempfile.TemporaryDirectory(prefix="open-rl-test-", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
   env = {
     **os.environ,
     "BASE_MODEL": base_model,
