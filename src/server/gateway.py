@@ -236,7 +236,7 @@ def new_request_id() -> str:
 
 
 async def _resolve_active_set_id(model_id: str | None) -> str | None:
-  if not model_id or not hasattr(store, "get_model_metadata"):
+  if not model_id:
     return None
   meta = await store.get_model_metadata(model_id)
   if meta and meta.get("fine_tuning_type") == "lora" and meta.get("base_model"):

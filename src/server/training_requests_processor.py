@@ -245,8 +245,6 @@ class TrainingRequestsProcessor:
       case commands.SaveWeightsForSampler():
         trainer = self.worker.trainer(command.model_id)
         published = await asyncio.to_thread(trainer.publish_sampler_weights, command)
-        if published.kind == "checkpoint":
-          await self.announce_checkpoint(command.model_id, published.path)
         return {
           "path": command.path,
           "sampling_session_id": command.sampling_session_id,
@@ -272,13 +270,6 @@ class TrainingRequestsProcessor:
       await self.store.update_job_metadata(model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
     except Exception as exc:
       print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
-
-  async def announce_checkpoint(self, model_id: str, path: str) -> None:
-    """Tell the model's vLLM sampler workers to reload a full checkpoint."""
-    if not is_primary() or not hasattr(self.store, "redis"):
-      return
-    num_subs = await self.store.redis.publish(f"open_rl:weight_update:{model_id}", json.dumps({"weights_path": path}))
-    print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {path}")
 
 
 # -- process entry point ------------------------------------------------------
