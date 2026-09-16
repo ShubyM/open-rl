@@ -29,9 +29,6 @@ from training.trainer_worker import BaseTrainerWorker, Datum, tmp_dir
 tracer = trace.get_tracer(__name__)
 
 
-TrainingWorker = BaseTrainerWorker
-
-
 def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
 
@@ -54,26 +51,21 @@ def describe_requests(batch: list[dict[str, Any]]) -> str:
 
 
 class TrainingRequestsProcessor:
-  store: RequestStore
-  worker: TrainingWorker
-  default_kind: str | None = None
+  """Drains training requests for one worker.
 
-  @property
-  def is_lora(self) -> bool:
-    if self.default_kind is not None:
-      return self.default_kind == "lora"
-    return self.worker.is_lora
+  A LoRA worker serves many adapters from the shared queue; a full-parameter
+  worker serves one model from its own queue under a GPU lease. Both run the
+  same loop, and under torchrun every rank runs it in lockstep with rank 0.
+  """
 
   def __init__(
     self,
     store: RequestStore,
     worker: BaseTrainerWorker,
     model_id: str | None = None,
-    time_slicer: TimeSlicerClient | str | None = None,
+    time_slicer: TimeSlicerClient | None = None,
     active_tenant_set_id: str | None = None,
   ):
-    if isinstance(time_slicer, str) and active_tenant_set_id is None:
-      active_tenant_set_id, time_slicer = time_slicer, None
     self.store = store
     self.worker = worker
     if not self.is_lora and not os.getenv("REDIS_URL"):
@@ -83,6 +75,10 @@ class TrainingRequestsProcessor:
     self.time_slicer = time_slicer or NoOpTimeSlicer()
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id or "shared"), claim=TRAINER_CLAIM)
     self.snapshot_registered = False
+
+  @property
+  def is_lora(self) -> bool:
+    return self.worker.is_lora
 
   async def exit_gracefully(self) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
@@ -363,14 +359,6 @@ class TrainingRequestsProcessor:
   async def save_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     await asyncio.to_thread(self.worker.save_weights, model_id, payload.get("alias"))
     return {"status": "ok", "type": "weights_saved"}
-
-
-class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
-  default_kind = "lora"
-
-
-class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
-  default_kind = "full"
 
 
 async def run_training_requests_processor(

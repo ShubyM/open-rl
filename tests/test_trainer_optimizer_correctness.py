@@ -406,7 +406,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
   async def test_lora_processor_create_model_uses_worker_create_model(self) -> None:
     worker = _RecordingLoraWorker()
     store = _FutureStoreStub()
-    processor = training_requests_processor_module.LoraTrainingRequestsProcessor(store, worker)
+    processor = training_requests_processor_module.TrainingRequestsProcessor(store, worker)
 
     await processor.process_request(
       {
@@ -454,7 +454,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     time_slicer = _TimeSlicerStub()
 
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
-      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
+      processor = training_requests_processor_module.TrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
       await processor.process_request(
         {
           "request_id": "req-a",
@@ -485,7 +485,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     time_slicer = _TimeSlicerStub()
 
     with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test", "REDIS_URL": "redis://localhost:6379"}):
-      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
+      processor = training_requests_processor_module.TrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
       await processor.process_request(
         {
           "request_id": "req-a",
@@ -599,7 +599,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     time_slicer = _TimeSlicerStub(events=events)
 
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
-      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
+      processor = training_requests_processor_module.TrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
       await processor.run_once()
 
     self.assertEqual([event[0] for event in events], ["acquire", "release", "set_future"])
@@ -901,11 +901,12 @@ class TestRankGating(unittest.TestCase):
     store = unittest.mock.AsyncMock()
     store.get_value.return_value = '{"total_steps_completed": 3}'
     worker = unittest.mock.MagicMock()
+    worker.is_lora = False
     worker.optim_step.return_value = {"metrics": {}}
     worker.save_state.return_value = {"path": "/tmp/x"}
 
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
-      proc = trp.FFTTrainingRequestsProcessor(store, worker, "m", time_slicer=None)
+      proc = trp.TrainingRequestsProcessor(store, worker, "m")
 
     for primary, expected_calls in ((False, 0), (True, 1)):
       store.reset_mock()
