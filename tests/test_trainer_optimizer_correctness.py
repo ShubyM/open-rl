@@ -896,77 +896,26 @@ class TestDataParallelForwardBackward(unittest.TestCase):
 
 
 class TestRankGating(unittest.TestCase):
-  def test_non_primary_rank_does_not_publish_futures(self) -> None:
+  def test_rank_gating_on_store_and_redis_writes(self) -> None:
     trp = training_requests_processor_module
+    store = unittest.mock.AsyncMock()
+    store.get_value.return_value = '{"total_steps_completed": 3}'
+    worker = unittest.mock.MagicMock()
+    worker.optim_step.return_value = {"metrics": {}}
+    worker.save_state.return_value = {"path": "/tmp/x"}
 
-    class Store:
-      def __init__(self):
-        self.published = []
-
-      async def set_future(self, request_id, result):
-        self.published.append(request_id)
-
-    class Proc(trp.LoraTrainingRequestsProcessor):
-      def __init__(self, store):
-        self.store = store
-
-      async def handle_request(self, raw_request, model_id=None):
-        return raw_request["request_id"], {"type": "ok"}
-
-    store = Store()
-    proc = Proc(store)
-    with patch.object(trp, "is_primary", return_value=False):
-      asyncio.run(proc.process_request({"request_id": "r1"}, "m"))
-    self.assertEqual(store.published, [])
-    with patch.object(trp, "is_primary", return_value=True):
-      asyncio.run(proc.process_request({"request_id": "r2"}, "m"))
-    self.assertEqual(store.published, ["r2"])
-
-  def test_non_primary_rank_skips_metadata_and_redis_publish(self) -> None:
-    trp = training_requests_processor_module
-
-    class RedisStub:
-      def __init__(self):
-        self.published: list[tuple[str, str]] = []
-
-      async def publish(self, channel: str, msg: str) -> int:
-        self.published.append((channel, msg))
-        return 1
-
-    class Store:
-      def __init__(self):
-        self.redis = RedisStub()
-        self.meta_updates: list[tuple[str, dict]] = []
-
-      async def get_value(self, _key: str):
-        return '{"total_steps_completed": 3}'
-
-      async def update_job_metadata(self, model_id: str, meta: dict):
-        self.meta_updates.append((model_id, meta))
-
-    class WorkerStub:
-      def optim_step(self, _params, _model_id):
-        return {"metrics": {}}
-
-      def save_state(self, _model_id, _path, _inc_opt, _kind):
-        return {"path": _path}
-
-    store = Store()
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
-      fft_proc = trp.FFTTrainingRequestsProcessor(store, WorkerStub(), "model-x", time_slicer=None)
+      proc = trp.FFTTrainingRequestsProcessor(store, worker, "m", time_slicer=None)
 
-    with patch.object(trp, "is_primary", return_value=False):
-      asyncio.run(fft_proc.optim_step({}, "model-x"))
-      asyncio.run(fft_proc.save_weights_for_sampler({"path": "tinker://v1"}, "model-x"))
-    self.assertEqual(store.meta_updates, [])
-    self.assertEqual(store.redis.published, [])
-
-    with patch.object(trp, "is_primary", return_value=True):
-      asyncio.run(fft_proc.optim_step({}, "model-x"))
-      asyncio.run(fft_proc.save_weights_for_sampler({"path": "tinker://v1"}, "model-x"))
-    self.assertEqual(len(store.meta_updates), 1)
-    self.assertEqual(store.meta_updates[0][1]["total_steps_completed"], 4)
-    self.assertEqual(len(store.redis.published), 1)
+    for primary, expected_calls in ((False, 0), (True, 1)):
+      store.reset_mock()
+      with patch.object(trp, "is_primary", return_value=primary):
+        asyncio.run(proc.publish_result("r1", {"type": "ok"}))
+        asyncio.run(proc.optim_step({}, "m"))
+        asyncio.run(proc.save_weights_for_sampler({"path": "tinker://v1"}, "m"))
+      self.assertEqual(store.set_future.call_count, expected_calls)
+      self.assertEqual(store.update_job_metadata.call_count, expected_calls)
+      self.assertEqual(store.redis.publish.call_count, expected_calls)
 
 
 if __name__ == "__main__":

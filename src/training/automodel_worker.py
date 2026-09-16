@@ -115,33 +115,16 @@ def attention_kwargs(model_type: str, cp_size: int) -> dict[str, Any]:
 
 
 def widest_head_dim(text_config: Any) -> int:
-  """The largest attention head width in the model.
-
-  transformers 5.15 makes head_dim a per-layer attribute on heterogeneous
-  models (Gemma 4: 256 on sliding layers, 512 on global ones) and raises on
-  the config-level read, so look through the per-layer views when present.
-  """
-  try:
-    layers = list(text_config.per_layer_config)
-  except Exception:
-    layers = []
-  if layers:
-    return max(int(getattr(layer, "head_dim", 0) or 0) for layer in layers)
-  try:
+  """The largest attention head width in the model (checks per-layer views first for heterogeneous models like Gemma 4)."""
+  with contextlib.suppress(Exception):
+    if layers := getattr(text_config, "per_layer_config", None):
+      return max(int(getattr(layer, "head_dim", 0) or 0) for layer in layers)
     return int(getattr(text_config, "head_dim", 0) or 0)
-  except Exception:
-    return 0
+  return 0
 
 
 def flex_kernel_options(text_config: Any) -> dict[str, Any]:
-  """Smaller FlexAttention tiles for models with heads 256 wide or wider.
-
-  Flex's default 128-wide tiles do not fit an H200's shared memory at
-  head_dim 256 (Gemma 4's sliding layers; its 512-wide global layers run on
-  FFPA). HF's flex integration reads kernel_options from the forward kwargs
-  and Automodel's FFPA route passes them through, so they travel with the
-  call. The backward needs smaller tiles than the forward.
-  """
+  """Smaller FlexAttention tiles for models with heads 256 wide or wider."""
   if widest_head_dim(text_config) < 256:
     return {}
   return {
@@ -177,30 +160,13 @@ def text_backbone(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def round_robin_permutation(cp_size: int, padded_seq_len: int, device: torch.device) -> torch.Tensor:
-  """Global position of every element of the rank-major all-gather of CP shards.
-
-  Rank r owns chunks r and 2*CP-1-r of the 2*CP equal chunks (head then tail),
-  so gathered element k sits at global position perm[k].
-  """
-  chunk = padded_seq_len // (2 * cp_size)
-  parts = []
-  for cp_rank in range(cp_size):
-    head = torch.arange(cp_rank * chunk, (cp_rank + 1) * chunk, device=device)
-    tail_start = (2 * cp_size - 1 - cp_rank) * chunk
-    tail = torch.arange(tail_start, tail_start + chunk, device=device)
-    parts.extend((head, tail))
-  return torch.cat(parts)
+  """Global position of every element of the rank-major all-gather of CP shards."""
+  chunks = torch.arange(padded_seq_len, device=device).chunk(2 * cp_size)
+  return torch.cat([part for r in range(cp_size) for part in (chunks[r], chunks[2 * cp_size - 1 - r])])
 
 
 class GatherSequenceShards(torch.autograd.Function):
-  """All-gather [batch, local_seq] shards along the sequence.
-
-  Every CP rank then holds the full sequence and computes the same loss, so the
-  gradient of the gathered tensor is identical everywhere and each rank keeps
-  its own slice. The slice is scaled by CP because FSDP2 averages gradients
-  over the dp_shard x cp mesh while the ranks hold partial gradients of one
-  loss that must sum.
-  """
+  """All-gather [batch, local_seq] shards along the sequence and scale backward by CP."""
 
   @staticmethod
   def forward(ctx, local: torch.Tensor, group: dist.ProcessGroup, cp_size: int, cp_rank: int) -> torch.Tensor:
@@ -217,29 +183,8 @@ class GatherSequenceShards(torch.autograd.Function):
     return grad[:, start : start + ctx.local_len] * ctx.cp_size, None, None, None
 
 
-class LayerGroup:
-  """Runs a run of decoder layers under one non-reentrant checkpoint."""
-
-  def __init__(self, layers: list[torch.nn.Module]):
-    self.layers = layers
-
-  def run(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-    for layer in self.layers:
-      x = layer(x, **kwargs)
-    return x
-
-  def __call__(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-    return torch.utils.checkpoint.checkpoint(self.run, x, use_reentrant=False, **kwargs)
-
-
 class GroupCheckpointedLayers(torch.nn.ModuleDict):
-  """The backbone's layer dict, iterating as checkpointed groups in training.
-
-  Automodel's native backbone runs ``for layer in self.layers.values()``; this
-  class is swapped in for that dict after the model is built and sharded, so
-  the parameters, their names and the FSDP2 units are untouched, and only the
-  iteration the forward sees changes.
-  """
+  """Iterates decoder layers as checkpointed groups during training."""
 
   group_size = 1
 
@@ -247,8 +192,16 @@ class GroupCheckpointedLayers(torch.nn.ModuleDict):
     layers = list(self._modules.values())
     if not self.training:
       return iter(layers)
-    groups = [layers[start : start + self.group_size] for start in range(0, len(layers), self.group_size)]
-    return iter([LayerGroup(group) for group in groups])
+
+    def make_group(group: list[torch.nn.Module]):
+      def run(x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        for layer in group:
+          x = layer(x, **kwargs)
+        return x
+
+      return lambda x, **kwargs: torch.utils.checkpoint.checkpoint(run, x, use_reentrant=False, **kwargs)
+
+    return (make_group(layers[i : i + self.group_size]) for i in range(0, len(layers), self.group_size))
 
 
 def install_group_checkpointing(model: torch.nn.Module, group_size: int) -> None:
@@ -644,40 +597,22 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     )
 
   def clip_gradients(self, max_grad_norm: float) -> tuple[float, float]:
-    """Clip to a global grad norm over DTensors that may live on different
-    meshes; returns the norm before clipping and the factor applied.
-
-    torch's clip_grad_norm_ stacks per-tensor norms, which fails across meshes
-    (TP-sharded projections next to replicated GDN weights). A per-tensor
-    vector_norm on a DTensor already reduces over its own placements, so every
-    rank gets the same scalar and nothing is counted twice; only the stack of
-    those scalars is local.
-    """
-    norms = []
-    for param in self.trainable_params:
-      if param.grad is None:
-        continue
-      norm = torch.linalg.vector_norm(param.grad.detach().float())
-      norms.append(norm.full_tensor() if isinstance(norm, DTensor) else norm)
-    if not norms:
+    """Clip to a global grad norm over DTensors across potentially heterogeneous meshes."""
+    grads = [p.grad for p in self.trainable_params if p.grad is not None]
+    if not grads:
       return 0.0, 1.0
+    norms = [n.full_tensor() if isinstance(n := torch.linalg.vector_norm(g.detach().float()), DTensor) else n for g in grads]
     total_norm = float(torch.linalg.vector_norm(torch.stack(norms)))
     clip_coef = min(1.0, max_grad_norm / (total_norm + 1e-6))
     if clip_coef < 1.0:
-      for param in self.trainable_params:
-        if param.grad is not None:
-          param.grad.mul_(clip_coef)
+      for g in grads:
+        g.mul_(clip_coef)
     return total_norm, clip_coef
 
   # -- checkpointing --------------------------------------------------------
 
   def get_checkpointer(self) -> Any:
-    """One Automodel Checkpointer for the process.
-
-    It knows how to gather DTensor shards, rename the native model's keys back
-    to the hub layout, and for LoRA write the PEFT adapter_config.json plus
-    adapter_model.safetensors that vLLM and PEFT load.
-    """
+    """One Automodel Checkpointer for the process."""
     if self.checkpointer is None:
       from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
@@ -698,13 +633,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     return self.checkpointer
 
   def write_weights(self, save_path: str) -> None:
-    """Write the adapter (LoRA) or the consolidated HF model (full) into save_path.
-
-    Every rank calls this: the DTensor gathers inside are collective. The
-    checkpointer nests its output under model/ (and model/consolidated/ for a
-    full model); it is lifted to save_path so the directory is a plain PEFT
-    adapter or a plain HF checkpoint.
-    """
+    """Write the adapter (LoRA) or the consolidated HF model (full) into save_path."""
     checkpointer = self.get_checkpointer()
     checkpointer.save_model(self.model, weights_path=save_path, peft_config=self.peft_config, tokenizer=self.tokenizer)
     if is_primary():
@@ -716,11 +645,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     barrier()
 
   def stage_and_swap(self, final_dir: str, write_extra: Callable[[str], None] | None = None) -> None:
-    """Write the weights into a sibling staging directory and swap it into
-    final_dir, so a save killed mid-write never leaves a directory that loads
-    as mixed old and new. write_extra runs on rank 0 against the staged dir.
-    The staging names are rank-invariant: every rank passes the same path into
-    the collective write."""
+    """Write weights into a sibling staging directory and swap it into final_dir."""
     staging_dir = f"{final_dir}.staging"
     previous_dir = f"{final_dir}.previous"
     if is_primary():
@@ -753,7 +678,6 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     assert self.model is not None, "Model must be loaded first."
     include_optimizer = include_optimizer and self.optimizer is not None
     if include_optimizer:
-      # Collective on every rank; only rank 0 gets the full state to write.
       from torch.distributed.checkpoint.state_dict import StateDictOptions, get_optimizer_state_dict
 
       optimizer_state = get_optimizer_state_dict(self.model, self.optimizer, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
@@ -775,25 +699,16 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     return self.save_state(alias, save_path, kind="weights")
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
-    metadata_path = os.path.join(state_path, "metadata.json")
-    adapter_config_path = os.path.join(state_path, "adapter_config.json")
-    if os.path.exists(metadata_path):
-      with open(metadata_path) as f:
-        metadata = json.load(f)
-      base_model = metadata.get("base_model")
-    elif os.path.exists(adapter_config_path):
-      # A sampler adapter directory: adapter only, base named by PEFT's config.
-      with open(adapter_config_path) as f:
-        metadata = {}
-        base_model = json.load(f).get("base_model_name_or_path")
-    else:
+    meta_file = next((p for f in ("metadata.json", "adapter_config.json") if os.path.exists(p := os.path.join(state_path, f))), None)
+    if not meta_file:
       raise FileNotFoundError(f"{state_path} has neither metadata.json nor adapter_config.json")
+    with open(meta_file) as f:
+      metadata = json.load(f)
+    base_model = metadata.get("base_model") or metadata.get("base_model_name_or_path")
     if not base_model:
       raise ValueError(f"{state_path} does not name its base model")
 
     if self.is_lora:
-      # The base is loaded fresh with untrained adapters, then the saved
-      # adapter tensors are read into them.
       if self.model is None:
         if self.peft_config is None:
           raise RuntimeError("A LoRA Automodel worker restores into adapters built by create_model; create the model first.")
@@ -810,7 +725,6 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       from torch.distributed.checkpoint.state_dict import StateDictOptions, set_optimizer_state_dict
 
       self.optimizer = self.build_optimizer({})
-      # Every rank reads the full state and slices its own shards; no broadcast.
       full_state = torch.load(optimizer_path, map_location="cpu", weights_only=False)
       set_optimizer_state_dict(self.model, self.optimizer, optim_state_dict=full_state, options=StateDictOptions(full_state_dict=True))
       print(f"Restored Automodel optimizer state from {optimizer_path}")
@@ -820,19 +734,18 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
   # -- sampler weights ------------------------------------------------------
 
   def save_adapter(self, adapter_id: str, alias: str | None = None) -> None:
-    """Publish the LoRA adapter where the sampler workers load it.
-
-    Same layout as the LoRA worker: peft/<adapter_id>/<adapter_id>/ holds the
-    PEFT adapter and peft/<adapter_id>/metadata.json describes it.
-    """
+    """Publish the LoRA adapter where the sampler workers load it."""
     if not self.is_lora:
       raise RuntimeError("A full-parameter Automodel worker has no adapter to publish; it saves whole checkpoints.")
     adapter_root = os.path.join(tmp_dir(), "peft", adapter_id)
     self.stage_and_swap(os.path.join(adapter_root, adapter_id))
     if is_primary():
-      metadata = {"model_id": adapter_id, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
-      if alias is not None:
-        metadata["alias"] = alias
+      metadata = {
+        "model_id": adapter_id,
+        "created_at": datetime.now().isoformat(),
+        "timestamp": time.time(),
+        **({"alias": alias} if alias is not None else {}),
+      }
       with open(os.path.join(adapter_root, "metadata.json"), "w") as f:
         json.dump(metadata, f)
       print(f"[Automodel Worker] Saved LoRA adapter to {adapter_root}/{adapter_id}.")

@@ -189,15 +189,12 @@ class BaseTrainerWorker:
           loss_fn_outputs[idx] = output
 
     mean_loss = total_loss / max(1, len(data))
-    completed_loss_fn_outputs = []
-    for output in loss_fn_outputs:
-      if output is None:
-        raise RuntimeError("forward_backward did not produce one loss_fn_output per input datum")
-      completed_loss_fn_outputs.append(output)
+    if any(output is None for output in loss_fn_outputs):
+      raise RuntimeError("forward_backward did not produce one loss_fn_output per input datum")
 
     return {
       "metrics": {"loss:mean": self.sanitize_float(mean_loss), "loss:sum": self.sanitize_float(total_loss)},
-      "loss_fn_outputs": completed_loss_fn_outputs,
+      "loss_fn_outputs": loss_fn_outputs,
       "loss_fn_output_type": "ArrayRecord",
     }
 
