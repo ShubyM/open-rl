@@ -922,6 +922,52 @@ class TestRankGating(unittest.TestCase):
       asyncio.run(proc.process_request({"request_id": "r2"}, "m"))
     self.assertEqual(store.published, ["r2"])
 
+  def test_non_primary_rank_skips_metadata_and_redis_publish(self) -> None:
+    trp = training_requests_processor_module
+
+    class RedisStub:
+      def __init__(self):
+        self.published: list[tuple[str, str]] = []
+
+      async def publish(self, channel: str, msg: str) -> int:
+        self.published.append((channel, msg))
+        return 1
+
+    class Store:
+      def __init__(self):
+        self.redis = RedisStub()
+        self.meta_updates: list[tuple[str, dict]] = []
+
+      async def get_value(self, _key: str):
+        return '{"total_steps_completed": 3}'
+
+      async def update_job_metadata(self, model_id: str, meta: dict):
+        self.meta_updates.append((model_id, meta))
+
+    class WorkerStub:
+      def optim_step(self, _params, _model_id):
+        return {"metrics": {}}
+
+      def save_state(self, _model_id, _path, _inc_opt, _kind):
+        return {"path": _path}
+
+    store = Store()
+    with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
+      fft_proc = trp.FFTTrainingRequestsProcessor(store, WorkerStub(), "model-x", time_slicer=None)
+
+    with patch.object(trp, "is_primary", return_value=False):
+      asyncio.run(fft_proc.optim_step({}, "model-x"))
+      asyncio.run(fft_proc.save_weights_for_sampler({"path": "tinker://v1"}, "model-x"))
+    self.assertEqual(store.meta_updates, [])
+    self.assertEqual(store.redis.published, [])
+
+    with patch.object(trp, "is_primary", return_value=True):
+      asyncio.run(fft_proc.optim_step({}, "model-x"))
+      asyncio.run(fft_proc.save_weights_for_sampler({"path": "tinker://v1"}, "model-x"))
+    self.assertEqual(len(store.meta_updates), 1)
+    self.assertEqual(store.meta_updates[0][1]["total_steps_completed"], 4)
+    self.assertEqual(len(store.redis.published), 1)
+
 
 if __name__ == "__main__":
   unittest.main()

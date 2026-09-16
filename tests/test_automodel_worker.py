@@ -72,6 +72,48 @@ class AutomodelWorkerHelpersTest(unittest.TestCase):
     with self.assertRaises(ValueError):
       lora_target_modules(LoraConfig(train_unembed=True))
 
+  def test_multi_rank_stage_and_swap_uses_uniform_staging_path(self):
+    import tempfile
+
+    import torch.multiprocessing as mp
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      mp.spawn(_run_multi_rank_stage_and_swap, args=(2, 29518, tmpdir), nprocs=2, join=True)
+
+
+def _run_multi_rank_stage_and_swap(rank: int, world_size: int, port: int, root_dir: str) -> None:
+  import os
+
+  import torch.distributed as dist
+
+  from training.automodel_worker import AutomodelTrainingWorker
+
+  os.environ.update({"MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(port), "RANK": str(rank), "WORLD_SIZE": str(world_size)})
+  dist.init_process_group("gloo", rank=rank, world_size=world_size)
+  try:
+    worker = AutomodelTrainingWorker(full_parameter=False)
+    worker.model = Layer(1.0)
+    seen_paths: list[str] = []
+
+    def fake_write_weights(save_path: str) -> None:
+      seen_paths.append(save_path)
+      assert os.path.isdir(save_path), f"Rank {rank} expected {save_path} to exist"
+      if rank == 0:
+        with open(os.path.join(save_path, "adapter_model.safetensors"), "w") as f:
+          f.write("weights")
+
+    worker.write_weights = fake_write_weights  # type: ignore[method-assign]
+    ckpt_target = os.path.join(root_dir, "step-1")
+    worker.save_state("test-job", ckpt_target)
+
+    all_paths = [None] * world_size
+    dist.all_gather_object(all_paths, seen_paths[0])
+    assert len(set(all_paths)) == 1, f"Staging path diverged across ranks: {all_paths}"
+    assert os.path.isfile(os.path.join(ckpt_target, "metadata.json"))
+    assert os.path.isfile(os.path.join(ckpt_target, "adapter_model.safetensors"))
+  finally:
+    dist.destroy_process_group()
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -9,7 +9,7 @@ import time
 import traceback
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any, Protocol
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -27,6 +27,9 @@ from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
 from training.trainer_worker import BaseTrainerWorker, Datum, tmp_dir
 
 tracer = trace.get_tracer(__name__)
+
+
+TrainingWorker = BaseTrainerWorker
 
 
 def is_fft_enabled() -> bool:
@@ -50,8 +53,10 @@ def describe_requests(batch: list[dict[str, Any]]) -> str:
   return ", ".join(f"{r.get('op')}:{r.get('request_id')}" for r in batch)
 
 
-class TrainingRequestsProcessor(Protocol):
+class TrainingRequestsProcessor:
   store: RequestStore
+  worker: TrainingWorker
+  default_kind: str = "full"
 
   async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
     request_id, result = await self.handle_request(raw_request, model_id)
@@ -136,17 +141,66 @@ class TrainingRequestsProcessor(Protocol):
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
 
-  async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
+  async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
+    base_model, _, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind=self.default_kind)
+    result = await asyncio.to_thread(
+      self.worker.load_from_state,
+      model_id,
+      payload["state_path"],
+      bool(payload.get("restore_optimizer", False)),
+    )
+    return {
+      "base_model": result.get("base_model") or base_model,
+      "model_id": result.get("model_id", model_id),
+      "fine_tuning_type": fine_tuning_type,
+      "type": "model_loaded_from_state",
+    }
 
-  async def forward_backward(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
+  async def forward_backward(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
+    typed_data = [parse_datum(item) for item in payload.get("data", [])]
+    result = await asyncio.to_thread(
+      self.worker.forward_backward,
+      typed_data,
+      payload.get("loss_fn", "cross_entropy"),
+      payload.get("loss_config"),
+      model_id,
+    )
+    result["type"] = "forward_backward_completed"
+    return result
 
   async def optim_step(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
 
-  async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
+  async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
+    result = await asyncio.to_thread(
+      self.worker.generate,
+      payload.get("prompt_tokens", []),
+      payload.get("max_tokens", 20),
+      payload.get("num_samples", 1),
+      payload.get("temperature", 0.0),
+      model_id,
+      bool(payload.get("prompt_logprobs", False)),
+    )
+    result["type"] = "sample_completed"
+    return result
 
-  async def save_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
+  async def save_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
+    result = await asyncio.to_thread(
+      self.worker.save_state,
+      model_id,
+      payload["state_path"],
+      bool(payload.get("include_optimizer", False)),
+      payload.get("kind", "state"),
+    )
+    return {"path": result.get("path", payload["state_path"]), "type": "state_saved"}
 
-  async def load_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
+  async def load_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
+    await asyncio.to_thread(
+      self.worker.load_from_state,
+      model_id,
+      payload["state_path"],
+      bool(payload.get("restore_optimizer", False)),
+    )
+    return {"path": payload["state_path"], "type": "weights_loaded"}
 
   async def save_weights_for_sampler(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]: ...
 
@@ -185,6 +239,8 @@ async def _fetch_model_meta(
 
 
 class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
+  default_kind = "lora"
+
   def __init__(
     self,
     store: RequestStore,
@@ -238,71 +294,12 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
       "type": "model_created",
     }
 
-  async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, _, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="lora")
-    result = await asyncio.to_thread(
-      self.worker.load_from_state,
-      model_id,
-      payload["state_path"],
-      bool(payload.get("restore_optimizer", False)),
-    )
-    return {
-      "base_model": result.get("base_model") or base_model,
-      "model_id": result.get("model_id", model_id),
-      "fine_tuning_type": fine_tuning_type,
-      "type": "model_loaded_from_state",
-    }
-
-  async def forward_backward(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    typed_data = [parse_datum(item) for item in payload.get("data", [])]
-    result = await asyncio.to_thread(
-      self.worker.forward_backward,
-      typed_data,
-      payload.get("loss_fn", "cross_entropy"),
-      payload.get("loss_config"),
-      model_id,
-    )
-    result["type"] = "forward_backward_completed"
-    return result
-
   async def optim_step(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     result = await asyncio.to_thread(self.worker.optim_step, payload.get("adam_params", {}), model_id)
     result["type"] = "optim_step_completed"
     await asyncio.to_thread(self.worker.save_adapter, model_id)
     await self.bump_step_count(model_id)
     return result
-
-  async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(
-      self.worker.generate,
-      payload.get("prompt_tokens", []),
-      payload.get("max_tokens", 20),
-      payload.get("num_samples", 1),
-      payload.get("temperature", 0.0),
-      model_id,
-      bool(payload.get("prompt_logprobs", False)),
-    )
-    result["type"] = "sample_completed"
-    return result
-
-  async def save_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(
-      self.worker.save_state,
-      model_id,
-      payload["state_path"],
-      bool(payload.get("include_optimizer", False)),
-      payload.get("kind", "state"),
-    )
-    return {"path": result.get("path", payload["state_path"]), "type": "state_saved"}
-
-  async def load_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(
-      self.worker.load_from_state,
-      model_id,
-      payload["state_path"],
-      bool(payload.get("restore_optimizer", False)),
-    )
-    return {"path": payload["state_path"], "type": "weights_loaded"}
 
   async def save_weights_for_sampler(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     await asyncio.to_thread(self.worker.save_adapter, model_id, payload.get("alias"))
@@ -444,70 +441,11 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       "type": "model_created",
     }
 
-  async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, _, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")
-    result = await asyncio.to_thread(
-      self.worker.load_from_state,
-      model_id,
-      payload["state_path"],
-      bool(payload.get("restore_optimizer", False)),
-    )
-    return {
-      "base_model": result.get("base_model") or base_model,
-      "model_id": result.get("model_id", model_id),
-      "fine_tuning_type": fine_tuning_type,
-      "type": "model_loaded_from_state",
-    }
-
-  async def forward_backward(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    typed_data = [parse_datum(item) for item in payload.get("data", [])]
-    result = await asyncio.to_thread(
-      self.worker.forward_backward,
-      typed_data,
-      payload.get("loss_fn", "cross_entropy"),
-      payload.get("loss_config"),
-      model_id,
-    )
-    result["type"] = "forward_backward_completed"
-    return result
-
   async def optim_step(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     result = await asyncio.to_thread(self.worker.optim_step, payload.get("adam_params", {}), model_id)
     result["type"] = "optim_step_completed"
     await self.bump_step_count(model_id)
     return result
-
-  async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(
-      self.worker.generate,
-      payload.get("prompt_tokens", []),
-      payload.get("max_tokens", 20),
-      payload.get("num_samples", 1),
-      payload.get("temperature", 0.0),
-      model_id,
-      bool(payload.get("prompt_logprobs", False)),
-    )
-    result["type"] = "sample_completed"
-    return result
-
-  async def save_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(
-      self.worker.save_state,
-      model_id,
-      payload["state_path"],
-      bool(payload.get("include_optimizer", False)),
-      payload.get("kind", "state"),
-    )
-    return {"path": result.get("path", payload["state_path"]), "type": "state_saved"}
-
-  async def load_weights(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(
-      self.worker.load_from_state,
-      model_id,
-      payload["state_path"],
-      bool(payload.get("restore_optimizer", False)),
-    )
-    return {"path": payload["state_path"], "type": "weights_loaded"}
 
   async def save_weights_for_sampler(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     ref = payload.get("path") or payload.get("sampling_session_id")
