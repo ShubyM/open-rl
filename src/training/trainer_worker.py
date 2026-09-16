@@ -16,6 +16,12 @@ from training.distributed import all_gather_object, all_reduce_max, all_reduce_s
 # Position marker for a filler pass, see forward_backward.
 FILLER_DATUM_INDEX = -1
 
+RATIO_STATS_ZERO = {"max_abs_log_ratio": 0.0, "tokens": 0.0, "tokens_abs_log_ratio_gt1": 0.0, "tokens_abs_log_ratio_gt5": 0.0}
+
+
+def tmp_dir() -> str:
+  return os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+
 
 def chunk_target_logprob(
   hidden_chunk: torch.Tensor,
@@ -51,13 +57,10 @@ class BaseTrainerWorker:
   # Whether samplers receive whole checkpoints (True) or LoRA adapters (False).
   # The request processor picks its loop and save routes by this.
   full_parameter = False
-  # Whether the worker parks its model on the host between GPU leases. A
-  # worker that does overrides sleep/wake_up; the default holds the GPU.
-  cpu_offload = False
 
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
-    self.ratio_stats = self.fresh_ratio_stats()
+    self.ratio_stats = dict(RATIO_STATS_ZERO)
 
     if torch.cuda.is_available():
       self.device = torch.device("cuda", local_rank())
@@ -66,11 +69,16 @@ class BaseTrainerWorker:
     else:
       self.device = torch.device("cpu")
 
+  # Hooks for the GPU lease a dedicated worker runs under. sleep and wake_up
+  # bracket the lease; save_needs_gpu says whether a save must run inside it.
   def sleep(self) -> None:
     pass
 
   def wake_up(self) -> None:
     pass
+
+  def save_needs_gpu(self) -> bool:
+    return False
 
   def data_parallel_group(self) -> dist.ProcessGroup | None:
     """The process group whose ranks split the datums of one forward_backward.
@@ -81,13 +89,20 @@ class BaseTrainerWorker:
     """
     return None
 
+  def data_parallel_loss_scale(self) -> float:
+    """Factor applied to every rank's loss before backward.
+
+    forward_backward wants the sum of the gradients over all datums. A backend
+    whose gradient reduction averages over the data-parallel group (FSDP)
+    returns the group size to undo that mean; one that sums returns 1.
+    """
+    return 1.0
+
   def forward_backward(self, model: PreTrainedModel, data: list[Datum], loss_fn: str, loss_config: dict | None = None) -> dict[str, Any]:
     """Run a forward/backward pass on model and return Tinker-shaped loss outputs.
 
-    Under data parallelism each rank owns a round-robin shard of the datums.
-    FSDP averages gradients over the group inside every backward, so each real
-    pass scales its loss by the group size to recover the sum over all datums,
-    and every rank runs the same number of passes (short ranks run zero-scaled
+    Under data parallelism each rank owns a round-robin shard of the datums and
+    every rank runs the same number of passes (short ranks run zero-scaled
     fillers) so the collectives inside backward line up.
     """
     if not data:
@@ -95,12 +110,14 @@ class BaseTrainerWorker:
 
     group = self.data_parallel_group()
     dp_rank, dp_size = group_rank(group), group_size(group)
+    loss_scale = self.data_parallel_loss_scale()
     local_indices = list(range(dp_rank, len(data), dp_size))
     local_batches = self.make_training_batches([data[idx] for idx in local_indices])
     if dp_size > 1:
-      filler_passes = all_reduce_max(len(local_batches), group) - len(local_batches)
+      filler_passes = int(all_reduce_max(len(local_batches), group)) - len(local_batches)
       if filler_passes > 0:
-        filler = data[local_indices[0]] if local_indices else data[0]
+        # Only the collectives matter, so the cheapest datum will do.
+        filler = min(data, key=lambda datum: len(datum.model_input))
         local_batches.extend([[(FILLER_DATUM_INDEX, filler)]] * filler_passes)
 
     total_loss = 0.0
@@ -154,8 +171,7 @@ class BaseTrainerWorker:
       per_datum_loss = elementwise_loss.sum(dim=1)
       loss = per_datum_loss.sum()
       if not skip_backward:
-        backward_loss = loss * (0.0 if is_filler else float(dp_size)) if dp_size > 1 else loss
-        backward_loss.backward()
+        (loss * (0.0 if is_filler else loss_scale)).backward()
       if not is_filler:
         total_loss += loss.item()
 
@@ -191,9 +207,6 @@ class BaseTrainerWorker:
     has_kl_penalty = loss_fn == "ppo" and bool(loss_config and loss_config.get("kl_coeff", 0.0) > 0)
     return not has_kl_penalty
 
-  def fresh_ratio_stats(self) -> dict[str, float]:
-    return {"max_abs_log_ratio": 0.0, "tokens": 0.0, "tokens_abs_log_ratio_gt1": 0.0, "tokens_abs_log_ratio_gt5": 0.0}
-
   def record_ratio_stats(self, target_logprobs: torch.Tensor, old_logprobs: torch.Tensor, weights: torch.Tensor, advantages: torch.Tensor) -> None:
     """Tail of the sampler/trainer log-ratio over action tokens, accumulated
     until the next optim_step reports it. The mean KL is blind to a handful of
@@ -214,8 +227,8 @@ class BaseTrainerWorker:
   def ratio_metrics(self) -> dict[str, float]:
     """Reduce the accumulated tail stats over the data-parallel group and reset them."""
     group = self.data_parallel_group()
-    stats, self.ratio_stats = self.ratio_stats, self.fresh_ratio_stats()
-    max_abs = max(all_gather_object(stats["max_abs_log_ratio"], group))
+    stats, self.ratio_stats = self.ratio_stats, dict(RATIO_STATS_ZERO)
+    max_abs = all_reduce_max(stats["max_abs_log_ratio"], group)
     tokens = all_reduce_sum(stats["tokens"], group)
     gt1 = all_reduce_sum(stats["tokens_abs_log_ratio_gt1"], group)
     gt5 = all_reduce_sum(stats["tokens_abs_log_ratio_gt5"], group)

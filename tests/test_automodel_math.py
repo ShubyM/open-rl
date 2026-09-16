@@ -16,8 +16,10 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
+from tests.test_automodel_worker import rank_shards
 from training import automodel_worker
 from training.automodel_worker import AutomodelTrainingWorker, GatherSequenceShards, round_robin_permutation
+from training.distributed import group_size
 from training.trainer_worker import BaseTrainerWorker, Datum
 
 HIDDEN, VOCAB = 8, 11
@@ -27,7 +29,8 @@ class HeadOnlyModel(torch.nn.Module):
   def __init__(self, softcap: float | None):
     super().__init__()
     self.lm_head = torch.nn.Linear(HIDDEN, VOCAB, bias=False)
-    self.config = SimpleNamespace(final_logit_softcapping=softcap)
+    text_config = SimpleNamespace(final_logit_softcapping=softcap)
+    self.config = SimpleNamespace(get_text_config=lambda: text_config)
 
   def get_output_embeddings(self):
     return self.lm_head
@@ -98,10 +101,11 @@ class ClipGradientsTest(unittest.TestCase):
     for r, p in zip(reference, params, strict=True):
       r.grad = p.grad.clone()
 
-    total = worker.clip_gradients(0.5)
+    total, clip_coef = worker.clip_gradients(0.5)
     expected_total = torch.nn.utils.clip_grad_norm_(reference, 0.5)
 
     self.assertAlmostEqual(total, expected_total.item(), places=5)
+    self.assertAlmostEqual(clip_coef, 0.5 / (total + 1e-6), places=6)
     for r, p in zip(reference, params, strict=True):
       torch.testing.assert_close(p.grad, r.grad)
 
@@ -156,6 +160,9 @@ class TableWorker(BaseTrainerWorker):
   def data_parallel_group(self):
     return self.group
 
+  def data_parallel_loss_scale(self):
+    return float(group_size(self.group))
+
   def compute_target_logprobs(self, model, input_ids, attention_mask, target_token_ids):
     return model(target_token_ids)
 
@@ -205,10 +212,7 @@ def run_fsdp_context_parallel_gather(rank: int, world_size: int, port: int) -> N
 
     mesh = init_device_mesh("cpu", (world_size,))
     model = fully_shard(TableModel(), mesh=mesh)
-    # This rank's head and tail chunk, torch's load-balanced CP layout.
-    chunk = padded // (2 * world_size)
-    chunks = tokens.split(chunk, dim=1)
-    local_tokens = torch.cat((chunks[rank], chunks[2 * world_size - 1 - rank]), dim=1)
+    local_tokens = tokens[:, rank_shards(world_size, padded)[rank]]
     local_logprobs = model(local_tokens)
     gathered = GatherSequenceShards.apply(local_logprobs, mesh.get_group(), world_size, rank)
     perm = round_robin_permutation(world_size, padded, gathered.device)

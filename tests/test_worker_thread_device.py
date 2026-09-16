@@ -11,44 +11,17 @@ which threads it reached.
 """
 
 import asyncio
-import importlib
-import os
-import sys
 import threading
-import types
 import unittest
 import unittest.mock
-from unittest.mock import patch
+
+from training import distributed
 
 # How many tasks are forced to run at once. A threading.Barrier makes the pool
 # genuinely spawn this many threads rather than reusing one warm thread.
 CONCURRENCY = 4
 BARRIER_TIMEOUT = 30.0
 RANK = 2
-
-
-def load_processor_module():
-  stubs = {
-    "peft": types.SimpleNamespace(
-      LoraConfig=object,
-      PeftModelForCausalLM=object,
-      get_peft_model=lambda *_args, **_kwargs: None,
-    ),
-    "transformers": types.SimpleNamespace(
-      AutoConfig=object,
-      AutoModelForCausalLM=object,
-      AutoTokenizer=object,
-      PreTrainedModel=object,
-      PreTrainedTokenizerBase=object,
-    ),
-  }
-  env = {"OPEN_RL_ENABLE_FFT": "true", "REDIS_URL": "redis://localhost:6379"}
-  with patch.dict(sys.modules, stubs), patch.dict(os.environ, env):
-    sys.modules.pop("server.training_requests_processor", None)
-    return importlib.import_module("server.training_requests_processor")
-
-
-processor = load_processor_module()
 
 
 class WorkerThreadDeviceTest(unittest.TestCase):
@@ -64,10 +37,10 @@ class WorkerThreadDeviceTest(unittest.TestCase):
       with self.lock:
         self.pinned[threading.current_thread().name] = index
 
-    self.enterContext(unittest.mock.patch.object(processor.torch.cuda, "is_available", return_value=True))
-    self.enterContext(unittest.mock.patch.object(processor.torch.cuda, "set_device", record_set_device))
-    self.enterContext(unittest.mock.patch.object(processor, "is_distributed", return_value=True))
-    self.enterContext(unittest.mock.patch.object(processor, "local_rank", return_value=RANK))
+    self.enterContext(unittest.mock.patch.object(distributed.torch.cuda, "is_available", return_value=True))
+    self.enterContext(unittest.mock.patch.object(distributed.torch.cuda, "set_device", record_set_device))
+    self.enterContext(unittest.mock.patch.object(distributed, "is_distributed", return_value=True))
+    self.enterContext(unittest.mock.patch.object(distributed, "local_rank", return_value=RANK))
 
   def burst(self) -> set[str]:
     """Run CONCURRENCY tasks that must overlap, and return the threads used."""
@@ -85,7 +58,7 @@ class WorkerThreadDeviceTest(unittest.TestCase):
       note_thread()
 
     async def main() -> None:
-      processor.pin_worker_threads_to_this_rank()
+      distributed.pin_executor_threads()
       # A sequential call first: the steady state that looks healthy.
       await asyncio.to_thread(note_thread)
       await asyncio.gather(*(asyncio.to_thread(task) for _ in range(CONCURRENCY)))
@@ -106,7 +79,7 @@ class WorkerThreadDeviceTest(unittest.TestCase):
     # Not everything goes through to_thread; the loop thread itself touches
     # torch, so it cannot be left on whatever device it started with.
     async def main() -> None:
-      processor.pin_worker_threads_to_this_rank()
+      distributed.pin_executor_threads()
 
     asyncio.run(main())
     self.assertEqual(self.pinned.get("MainThread"), RANK)
@@ -133,10 +106,10 @@ class WorkerThreadDeviceTest(unittest.TestCase):
   def test_a_single_process_is_left_alone(self) -> None:
     # One process, one GPU: no device to pin and no reason to replace the
     # executor. The CPU test suite itself runs in this state.
-    with unittest.mock.patch.object(processor, "is_distributed", return_value=False):
+    with unittest.mock.patch.object(distributed, "is_distributed", return_value=False):
 
       async def main() -> None:
-        processor.pin_worker_threads_to_this_rank()
+        distributed.pin_executor_threads()
         return await asyncio.to_thread(lambda: threading.current_thread().name)
 
       name = asyncio.run(main())

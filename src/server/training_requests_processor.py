@@ -7,30 +7,26 @@ import os
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, Protocol
 
-import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 
-from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
+from accel_timeslicer.time_slicer import NoOpTimeSlicer, TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.store import RequestStore, get_store
-from training.distributed import barrier, broadcast_object, is_distributed, is_primary, local_rank
+from training.distributed import barrier, broadcast_object, is_distributed, is_primary, pin_executor_threads
 from training.distributed import close as close_distributed
 from training.distributed import initialize as initialize_distributed
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
-from training.trainer_worker import BaseTrainerWorker, Datum
+from training.trainer_worker import BaseTrainerWorker, Datum, tmp_dir
 
 tracer = trace.get_tracer(__name__)
-
-
-TrainingWorker = BaseTrainerWorker
 
 
 def is_fft_enabled() -> bool:
@@ -59,8 +55,35 @@ class TrainingRequestsProcessor(Protocol):
 
   async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
     request_id, result = await self.handle_request(raw_request, model_id)
+    await self.publish_result(request_id, result)
+
+  async def publish_result(self, request_id: str | None, result: dict[str, Any]) -> None:
+    # Only rank 0 writes to the store; the other ranks computed the same result.
     if request_id is not None and is_primary():
       await self.store.set_future(request_id, result)
+
+  async def next_batch(self, fetch: Callable[[], Awaitable[list[dict[str, Any]] | None]]) -> list[dict[str, Any]] | None:
+    """The next request batch, identical on every rank.
+
+    Collectives are positional, so every rank must execute the same request
+    sequence: rank 0 owns the queue and fans each batch out.
+    """
+    batch = await fetch() if is_primary() else None
+    if is_distributed():
+      batch = await asyncio.to_thread(broadcast_object, batch)
+    if not batch and is_primary():
+      await asyncio.sleep(0.1)
+    return batch or None
+
+  async def bump_step_count(self, model_id: str) -> None:
+    if not is_primary():
+      return
+    try:
+      raw_meta = await self.store.get_value(f"open_rl:model_meta:{model_id}")
+      current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
+      await self.store.update_job_metadata(model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
+    except Exception as exc:
+      print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
 
   async def handle_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> tuple[str | None, dict[str, Any]]:
     request_id = raw_request.get("request_id")
@@ -188,14 +211,8 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
         await asyncio.sleep(1)
 
   async def run_once(self) -> None:
-    batch = await self.store.get_requests(active_set_id=self.active_tenant_set_id) if is_primary() else None
-    if is_distributed():
-      # Every rank must execute the same request sequence (collectives are
-      # positional); rank 0 owns the queue and fans the batch out.
-      batch = await asyncio.to_thread(broadcast_object, batch)
+    batch = await self.next_batch(lambda: self.store.get_requests(active_set_id=self.active_tenant_set_id))
     if not batch:
-      if is_primary():
-        await asyncio.sleep(0.1)
       return
 
     model_id = batch[0].get("model_id", "default")
@@ -252,13 +269,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     result = await asyncio.to_thread(self.worker.optim_step, payload.get("adam_params", {}), model_id)
     result["type"] = "optim_step_completed"
     await asyncio.to_thread(self.worker.save_adapter, model_id)
-    if is_primary():
-      try:
-        raw_meta = await self.store.get_value(f"open_rl:model_meta:{model_id}")
-        current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
-        await self.store.update_job_metadata(model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
-      except Exception as exc:
-        print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
+    await self.bump_step_count(model_id)
     return result
 
   async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
@@ -310,9 +321,9 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
-    worker: TrainingWorker,
+    worker: BaseTrainerWorker,
     model_id: str | None,
-    time_slicer: TimeSlicerClient | None,
+    time_slicer: TimeSlicerClient,
   ):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
@@ -325,21 +336,19 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     # the LoRA worker does and takes whatever model_id the requests carry.
     self.model_id = model_id
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id or "shared"), claim=TRAINER_CLAIM)
-    # Only rank 0 talks to the time slicer; the other ranks follow it through barriers.
     self.time_slicer = time_slicer
     self.snapshot_registered = False
 
   async def exit_gracefully(self) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if self.snapshot_registered and self.time_slicer is not None:
+    if self.snapshot_registered:
       try:
         await self.time_slicer.unregister(self.workload)
         self.snapshot_registered = False
       except Exception as exc:
         print(f"[WORKER] Failed to unregister: {exc}")
     try:
-      if self.time_slicer is not None:
-        await self.time_slicer.close()
+      await self.time_slicer.close()
     except Exception:
       pass
     os._exit(0)
@@ -348,9 +357,8 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     print("[WORKER] Full fine-tuning training requests processor started.")
 
     try:
-      if self.time_slicer is not None:
-        await self.time_slicer.register(self.workload)
-        self.snapshot_registered = True
+      await self.time_slicer.register(self.workload)
+      self.snapshot_registered = True
       while True:
         try:
           await self.run_once()
@@ -362,37 +370,26 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
           await asyncio.sleep(1)
     finally:
       try:
-        if self.snapshot_registered and self.time_slicer is not None:
+        if self.snapshot_registered:
           await self.time_slicer.unregister(self.workload)
       finally:
-        if self.time_slicer is not None:
-          await self.time_slicer.close()
+        await self.time_slicer.close()
         close_distributed()
 
   @asynccontextmanager
   async def gpu_lease(self):
-    lease = None
-    if self.time_slicer is not None:
-      lease = self.time_slicer.acquire(self.workload)
-      await lease.__aenter__()
-    await asyncio.to_thread(barrier)
-    try:
-      yield
-    finally:
+    """Rank 0 holds the lease; the other ranks enter and leave with it."""
+    async with AsyncExitStack() as stack:
+      await stack.enter_async_context(self.time_slicer.acquire(self.workload))
       await asyncio.to_thread(barrier)
-      if lease is not None:
-        await lease.__aexit__(None, None, None)
+      try:
+        yield
+      finally:
+        await asyncio.to_thread(barrier)
 
   async def run_once(self) -> None:
-    if is_primary():
-      batch = await (self.store.get_requests_for_model(self.model_id) if self.model_id else self.store.get_requests())
-    else:
-      batch = None
-    if is_distributed():
-      batch = await asyncio.to_thread(broadcast_object, batch)
+    batch = await self.next_batch(lambda: self.store.get_requests_for_model(self.model_id) if self.model_id else self.store.get_requests())
     if not batch:
-      if is_primary():
-        await asyncio.sleep(0.1)
       return
 
     # get_requests() batches one model at a time, so a batch is single-model either way.
@@ -412,9 +409,9 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       if training_reqs:
         print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {model_id}: {describe_requests(training_reqs)}")
         results = []
-        # A distributed save gathers shards over the GPUs, so it stays inside
-        # the lease; the single-process CPU-offloaded save runs outside it.
-        save_ops = set() if is_distributed() else {"save_state", "save_weights", "save_weights_for_sampler"}
+        # Saves run outside the lease when the worker can serve them from the
+        # host; a save that reads the GPU joins the leased requests.
+        save_ops = set() if self.worker.save_needs_gpu() else {"save_state", "save_weights", "save_weights_for_sampler"}
         gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
         save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
 
@@ -427,17 +424,11 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
             finally:
               await asyncio.to_thread(self.worker.sleep)
 
-        if not self.worker.cpu_offload and save_reqs:
-          async with self.gpu_lease():
-            for request in save_reqs:
-              results.append(await self.handle_request(request, model_id))
-        else:
-          for request in save_reqs:
-            results.append(await self.handle_request(request, model_id))
+        for request in save_reqs:
+          results.append(await self.handle_request(request, model_id))
 
         for request_id, result in results:
-          if request_id is not None and is_primary():
-            await self.store.set_future(request_id, result)
+          await self.publish_result(request_id, result)
 
     if has_shutdown:
       await self.exit_gracefully()
@@ -483,13 +474,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   async def optim_step(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     result = await asyncio.to_thread(self.worker.optim_step, payload.get("adam_params", {}), model_id)
     result["type"] = "optim_step_completed"
-    if is_primary():
-      try:
-        raw_meta = await self.store.get_value(f"open_rl:model_meta:{model_id}")
-        current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
-        await self.store.update_job_metadata(model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
-      except Exception as exc:
-        print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
+    await self.bump_step_count(model_id)
     return result
 
   async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
@@ -529,7 +514,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     if not ref:
       raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
     rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
-    local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
+    local_path = os.path.join(tmp_dir(), "sampler_full", rel_path)
     await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
     if is_primary() and hasattr(self.store, "redis"):
       num_subs = await self.store.redis.publish(
@@ -548,33 +533,17 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     return {"status": "ok", "type": "weights_saved"}
 
 
-def pin_worker_threads_to_this_rank() -> None:
-  """Give every executor thread this rank's CUDA device.
-
-  Torch's current device is thread-local and every worker call is handed to a
-  thread with asyncio.to_thread. Without this, a thread the pool spawns later
-  still points at cuda:0, and a device-less allocation on it lands there:
-  correct on rank 0, wrong on every other rank, surfacing as a NCCL fault.
-  """
-  if not torch.cuda.is_available() or not is_distributed():
-    return
-  device = local_rank()
-  torch.cuda.set_device(device)
-  asyncio.get_running_loop().set_default_executor(
-    ThreadPoolExecutor(thread_name_prefix="trainer-worker", initializer=torch.cuda.set_device, initargs=(device,))
-  )
-
-
 async def run_training_requests_processor(
-  worker: TrainingWorker,
+  worker: BaseTrainerWorker,
   model_id: str | None = None,
   time_slicer: TimeSlicerClient | None = None,
   active_tenant_set_id: str | None = None,
 ) -> None:
-  pin_worker_threads_to_this_rank()
+  pin_executor_threads()
   store = get_store()
   if worker.full_parameter:
-    time_slicer = (time_slicer or time_slicer_client_from_env()) if is_primary() else None
+    # Rank 0 holds the GPU lease for the whole group; the other ranks follow it through barriers.
+    time_slicer = time_slicer or (time_slicer_client_from_env() if is_primary() else NoOpTimeSlicer())
     processor = FFTTrainingRequestsProcessor(store, worker, model_id, time_slicer)
   else:
     processor = LoraTrainingRequestsProcessor(store, worker, model_id, active_tenant_set_id)
@@ -596,7 +565,7 @@ async def main_async(args: argparse.Namespace) -> None:
   is_lora = fine_tuning_type == "lora"
   print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")
 
-  worker: TrainingWorker
+  worker: BaseTrainerWorker
   if os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower() == "automodel":
     from training.automodel_worker import AutomodelTrainingWorker
 

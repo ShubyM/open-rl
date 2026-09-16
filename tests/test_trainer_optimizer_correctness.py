@@ -833,6 +833,7 @@ class TestDataParallelForwardBackward(unittest.TestCase):
     with ExitStack() as stack:
       if rank is not None:
         stack.enter_context(patch.object(worker, "data_parallel_group", return_value=object()))
+        stack.enter_context(patch.object(worker, "data_parallel_loss_scale", return_value=float(world)))
         for name, fake in fakes.items():
           stack.enter_context(patch.object(trainer_worker_module, name, fake))
       compute_calls = stack.enter_context(

@@ -1,6 +1,8 @@
 """Small torch.distributed boundary for trainer workers launched by torchrun."""
 
+import asyncio
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Any
 
@@ -34,16 +36,31 @@ def initialize() -> None:
     return
   if torch.cuda.is_available():
     torch.cuda.set_device(local_rank())
-  default_backend = "cpu:gloo,cuda:nccl" if torch.cuda.is_available() else "gloo"
-  dist.init_process_group(
-    backend=os.getenv("OPEN_RL_CONTROL_BACKEND", default_backend),
-    timeout=timedelta(seconds=int(os.getenv("OPEN_RL_DISTRIBUTED_TIMEOUT", "1800"))),
-  )
+    dist.init_process_group(backend="cpu:gloo,cuda:nccl", timeout=timedelta(minutes=30))
+  else:
+    dist.init_process_group(backend="gloo", timeout=timedelta(minutes=30))
 
 
 def close() -> None:
   if dist.is_initialized():
     dist.destroy_process_group()
+
+
+def pin_executor_threads() -> None:
+  """Give the event loop's executor threads this rank's CUDA device.
+
+  Torch's current device is thread-local and every worker call is handed to a
+  thread with asyncio.to_thread. Left alone, a thread the pool spawns later
+  still points at cuda:0, and a device-less allocation on it lands there:
+  correct on rank 0, wrong on every other rank, surfacing as a NCCL fault.
+  """
+  if not torch.cuda.is_available() or not is_distributed():
+    return
+  device = local_rank()
+  torch.cuda.set_device(device)
+  asyncio.get_running_loop().set_default_executor(
+    ThreadPoolExecutor(thread_name_prefix="trainer-worker", initializer=torch.cuda.set_device, initargs=(device,))
+  )
 
 
 def barrier() -> None:
@@ -71,24 +88,21 @@ def group_size(group: dist.ProcessGroup | None) -> int:
   return 1 if group is None else dist.get_world_size(group)
 
 
-def reduce_device() -> torch.device:
-  return torch.device("cuda", local_rank()) if torch.cuda.is_available() else torch.device("cpu")
-
-
-def all_reduce_sum(value: float, group: dist.ProcessGroup | None) -> float:
+def all_reduce(value: float, op: dist.ReduceOp, group: dist.ProcessGroup | None) -> float:
   if group is None:
     return value
-  tensor = torch.tensor([value], dtype=torch.float64, device=reduce_device())
-  dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+  device = torch.device("cuda", local_rank()) if torch.cuda.is_available() else torch.device("cpu")
+  tensor = torch.tensor([value], dtype=torch.float64, device=device)
+  dist.all_reduce(tensor, op=op, group=group)
   return float(tensor.item())
 
 
-def all_reduce_max(value: int, group: dist.ProcessGroup | None) -> int:
-  if group is None:
-    return value
-  tensor = torch.tensor([value], dtype=torch.int64, device=reduce_device())
-  dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=group)
-  return int(tensor.item())
+def all_reduce_sum(value: float, group: dist.ProcessGroup | None) -> float:
+  return all_reduce(value, dist.ReduceOp.SUM, group)
+
+
+def all_reduce_max(value: float, group: dist.ProcessGroup | None) -> float:
+  return all_reduce(value, dist.ReduceOp.MAX, group)
 
 
 def all_gather_object(value: Any, group: dist.ProcessGroup | None) -> list[Any]:

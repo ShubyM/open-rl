@@ -14,16 +14,17 @@ shards parameters over dp_shard x cp, so under CP the weights are sharded too.
 Only the DP axis shards datums: CP and TP ranks cooperate on one sequence and
 must see identical data, which is what data_parallel_group scopes to.
 
-Logprobs never materialise [seq, vocab] logits. The forward returns the final
-hidden states (logits_to_keep=1), the lm_head weight is gathered out of its
-DTensor once, and hidden states are projected in checkpointed chunks.
+Logprobs never materialise [seq, vocab] logits. The forward returns only the
+last logit row (logits_to_keep=1), the final normed hidden states are taken
+from a hook on the backbone's last norm, the lm_head weight is gathered out
+of its DTensor, and hidden states are projected in checkpointed chunks.
 
 Under CP each pass is one datum: the sequence is padded to a multiple of 2*CP,
 round-robin sharded (head and tail chunk per rank, torch's load-balanced
 context_parallel layout), forwarded under the ring-attention context, projected
 locally, and the local logprobs are all-gathered back into position order. The
 backward of that gather scales by CP to cancel FSDP2's mean over the
-dp_shard x cp mesh, matching how the base class scales by the DP size.
+dp_shard x cp mesh, matching data_parallel_loss_scale on the DP axis.
 
 A wrong CP trains on a corrupted gradient without crashing, so this one was
 checked before use on Qwen3.5-9B (LoRA r32, 4096 tokens, 2026-09-10) against a
@@ -44,23 +45,25 @@ import math
 import os
 import shutil
 import time
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
 import torch
 import torch.distributed as dist
 import torch.utils.checkpoint
+from torch.distributed.tensor import DTensor
 from transformers import AutoConfig, AutoTokenizer
 
-from training.distributed import barrier, group_rank, is_primary
-from training.fft_trainer_worker import FFTConfig
+from training.distributed import barrier, group_rank, group_size, is_primary
+from training.fft_trainer_worker import ENABLE_GRADIENT_CHECKPOINTING, FFTConfig, trainable_model_parameters
 from training.lora_trainer_worker import LoraConfig
-from training.trainer_worker import BaseTrainerWorker, Datum, chunk_target_logprob
+from training.trainer_worker import BaseTrainerWorker, Datum, chunk_target_logprob, tmp_dir
 
 # Parallel layout. DP is inferred as world / (CP * TP).
 AUTOMODEL_TP = int(os.getenv("OPEN_RL_AUTOMODEL_TP", "1"))
 AUTOMODEL_CP = int(os.getenv("OPEN_RL_AUTOMODEL_CP", "1"))
-AUTOMODEL_SEED = int(os.getenv("OPEN_RL_AUTOMODEL_SEED", "1234"))
+DEFAULT_SEED = 1234
 # Global grad-norm clip used when the client sends no grad_clip_norm. The
 # cookbook builds AdamParams without one, and Gemma's steps carry rare 20-130x
 # gradient spikes that an unclipped Adam turns into one bad step and a long
@@ -82,41 +85,33 @@ MLP_LORA_TARGETS = ("gate_proj", "up_proj", "down_proj")
 # 47k-token ceiling. Checkpointing a group of whole layers keeps one stash per
 # group; recompute cost is one extra forward regardless of the group size. 4
 # is where that trade bottomed out for this model. 0 turns it off.
-RECOMPUTE_NUM_LAYERS = int(os.getenv("OPEN_RL_AUTOMODEL_RECOMPUTE_NUM_LAYERS", "4"))
-if os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") != "1":
-  RECOMPUTE_NUM_LAYERS = 0
+RECOMPUTE_NUM_LAYERS = int(os.getenv("OPEN_RL_AUTOMODEL_RECOMPUTE_NUM_LAYERS", "4")) if ENABLE_GRADIENT_CHECKPOINTING else 0
 
-# Rows of hidden states projected through the vocab per chunk. 1024 is a 1 GiB
-# fp32 logits chunk on a 248k vocab, which an H200 does not notice.
-LOGPROB_CHUNK = int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "1024"))
-
-# Attention kernels. "auto" picks by model family: Gemma 4's global layers have
-# 512-wide heads, past what SDPA's fused kernels take, so they go through
-# Automodel's FFPA route (FFPA for the 512 heads, FlexAttention for the
-# sliding-window layers). Under CP the ring swaps SDPA itself, so the model is
-# built with sdpa and FFPA is requested for the full-attention ring chunks via
-# the text config, the way Automodel's own Gemma 4 CP recipes do. Everything
-# else is plain SDPA, which is what the CP ring-attention context patches.
-AUTOMODEL_ATTN = os.getenv("OPEN_RL_AUTOMODEL_ATTN", "auto")
+# Rows of hidden states projected through the vocab per chunk: a 1 GiB fp32
+# logits chunk on a 248k vocab, which an H200 does not notice.
+LOGPROB_CHUNK = 1024
 
 
-def tmp_dir() -> str:
-  return os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+def attention_kwargs(model_type: str, cp_size: int) -> dict[str, Any]:
+  """from_pretrained kwargs selecting the attention kernels for this model.
 
-
-def attention_kwargs(model_type: str, cp_size: int, choice: str = AUTOMODEL_ATTN) -> dict[str, Any]:
-  """from_pretrained kwargs selecting the attention kernels for this model."""
-  if choice == "auto":
-    choice = "ffpa" if model_type.startswith("gemma4") else "sdpa"
-  if choice == "ffpa" and cp_size > 1:
+  Gemma 4's global layers have 512-wide heads, past what SDPA's fused kernels
+  take, so they go through Automodel's FFPA route (FFPA for the 512 heads,
+  FlexAttention for the sliding-window layers). Under CP the ring swaps SDPA
+  itself, so the model is built with sdpa and FFPA is requested for the
+  full-attention ring chunks via the text config, the way Automodel's own
+  Gemma 4 CP recipes do. Everything else is plain SDPA, which is what the CP
+  ring-attention context patches.
+  """
+  if not model_type.startswith("gemma4"):
+    return {"attn_implementation": "sdpa"}
+  if cp_size > 1:
     return {
       "attn_implementation": "sdpa",
       "use_sdpa_patching": False,
       "text_config": {"use_cache": False, "cp_full_attn_backend": "ffpa"},
     }
-  if choice == "ffpa":
-    return {"attn_implementation": "ffpa", "use_sdpa_patching": False}
-  return {"attn_implementation": choice}
+  return {"attn_implementation": "ffpa", "use_sdpa_patching": False}
 
 
 def widest_head_dim(text_config: Any) -> int:
@@ -138,7 +133,7 @@ def widest_head_dim(text_config: Any) -> int:
     return 0
 
 
-def flex_kernel_options(text_config: Any, flex_runs_widest: bool) -> dict[str, Any]:
+def flex_kernel_options(text_config: Any) -> dict[str, Any]:
   """Smaller FlexAttention tiles for models with heads 256 wide or wider.
 
   Flex's default 128-wide tiles do not fit an H200's shared memory at
@@ -147,23 +142,20 @@ def flex_kernel_options(text_config: Any, flex_runs_widest: bool) -> dict[str, A
   and Automodel's FFPA route passes them through, so they travel with the
   call. The backward needs smaller tiles than the forward.
   """
-  widest = widest_head_dim(text_config)
-  if widest < 256:
+  if widest_head_dim(text_config) < 256:
     return {}
-  # 64/32 fits head_dim 256; when flex also has to run the widest heads
-  # (no FFPA), only 16-wide tiles fit at 512.
-  fwd, bwd = (16, 16) if flex_runs_widest and widest > 256 else (64, 32)
-  tile = {
-    "fwd_BLOCK_M": fwd,
-    "fwd_BLOCK_N": fwd,
-    "fwd_num_stages": 1,
-    "bwd_BLOCK_M1": bwd,
-    "bwd_BLOCK_N1": bwd,
-    "bwd_BLOCK_M2": bwd,
-    "bwd_BLOCK_N2": bwd,
-    "bwd_num_stages": 1,
+  return {
+    "kernel_options": {
+      "fwd_BLOCK_M": 64,
+      "fwd_BLOCK_N": 64,
+      "fwd_num_stages": 1,
+      "bwd_BLOCK_M1": 32,
+      "bwd_BLOCK_N1": 32,
+      "bwd_BLOCK_M2": 32,
+      "bwd_BLOCK_N2": 32,
+      "bwd_num_stages": 1,
+    }
   }
-  return {"kernel_options": tile}
 
 
 def require_automodel():
@@ -179,10 +171,9 @@ def require_automodel():
   return NeMoAutoModelForCausalLM
 
 
-def is_dtensor(tensor: Any) -> bool:
-  from torch.distributed.tensor import DTensor
-
-  return isinstance(tensor, DTensor)
+def text_backbone(model: torch.nn.Module) -> torch.nn.Module:
+  """The decoder stack: nested under language_model on multimodal checkpoints."""
+  return model.model.language_model if hasattr(model.model, "language_model") else model.model
 
 
 def round_robin_permutation(cp_size: int, padded_seq_len: int, device: torch.device) -> torch.Tensor:
@@ -238,8 +229,6 @@ class LayerGroup:
     return x
 
   def __call__(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-    if not torch.is_grad_enabled():
-      return self.run(x, **kwargs)
     return torch.utils.checkpoint.checkpoint(self.run, x, use_reentrant=False, **kwargs)
 
 
@@ -271,8 +260,7 @@ def install_group_checkpointing(model: torch.nn.Module, group_size: int) -> None
   computes per-layer arguments inside its own loop, so it gets HF's per-layer
   gradient checkpointing instead: one stash per layer rather than per group.
   """
-  backbone = model.model.language_model if hasattr(model.model, "language_model") else model.model
-  layers = getattr(backbone, "layers", None)
+  layers = getattr(text_backbone(model), "layers", None)
   if isinstance(layers, torch.nn.ModuleDict):
     layers.__class__ = GroupCheckpointedLayers
     layers.group_size = group_size
@@ -301,13 +289,11 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
   def __init__(self, full_parameter: bool = False):
     super().__init__()
     self.full_parameter = full_parameter
-    self.is_lora = not full_parameter
     self.model: torch.nn.Module | None = None
     self.distributed_setup: Any = None
     self.device_mesh: Any = None
     self.peft_config: Any = None
     self.checkpointer: Any = None
-    self.hf_config: Any = None
     self.forward_kwargs: dict[str, Any] = {}
     self.cp_context: contextlib.ExitStack | None = None
     self.final_norm_output: torch.Tensor | None = None
@@ -317,9 +303,17 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.tp_size = AUTOMODEL_TP
     self.cp_size = AUTOMODEL_CP
 
+  @property
+  def is_lora(self) -> bool:
+    return not self.full_parameter
+
+  def save_needs_gpu(self) -> bool:
+    # Every save gathers DTensor shards over the GPUs.
+    return True
+
   # -- distributed layout ---------------------------------------------------
 
-  def build_distributed_setup(self, base_model_name: str) -> Any:
+  def build_distributed_setup(self, config: Any) -> Any:
     """Build the FSDP2 mesh and policy once for the life of the process."""
     if not dist.is_initialized():
       raise RuntimeError("The Automodel backend runs under torchrun; torch.distributed is not initialized.")
@@ -331,7 +325,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       raise RuntimeError(f"WORLD_SIZE={world} is not divisible by OPEN_RL_AUTOMODEL_CP={self.cp_size} * OPEN_RL_AUTOMODEL_TP={self.tp_size}")
     strategy = FSDP2Config(
       activation_checkpointing=False,
-      tp_plan=self.tensor_parallel_plan(base_model_name) if self.tp_size > 1 else None,
+      tp_plan=self.tensor_parallel_plan(config) if self.tp_size > 1 else None,
     )
     mesh_context = MeshContext.build(strategy, ParallelismSizes(tp_size=self.tp_size, cp_size=self.cp_size), world_size=world)
     print(f"Automodel device mesh: DP={world // (self.cp_size * self.tp_size)} CP={self.cp_size} TP={self.tp_size}")
@@ -341,7 +335,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       activation_checkpointing=strategy.activation_checkpointing,
     )
 
-  def tensor_parallel_plan(self, base_model_name: str) -> dict[str, Any]:
+  def tensor_parallel_plan(self, config: Any) -> dict[str, Any]:
     """The HF text-model TP plan, addressed from the top of the model.
 
     Automodel's automatic plan reads _tp_plan off the language model, which its
@@ -354,7 +348,6 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     from torch.distributed.tensor import Replicate
     from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
-    config = self.load_hf_config(base_model_name)
     text_config = config.get_text_config()
     architectures = config.architectures or []
     prefix = "model.language_model" if architectures and architectures[0].endswith("ForConditionalGeneration") else "model"
@@ -373,16 +366,14 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     plan["lm_head"] = ColwiseParallel(output_layouts=Replicate())
     return plan
 
-  def load_hf_config(self, base_model_name: str) -> Any:
-    if self.hf_config is None or getattr(self.hf_config, "name_or_path", None) != base_model_name:
-      self.hf_config = AutoConfig.from_pretrained(base_model_name)
-      self.hf_config.name_or_path = base_model_name
-    return self.hf_config
-
   def data_parallel_group(self) -> dist.ProcessGroup | None:
     if self.device_mesh is None or self.device_mesh["dp_shard"].size() == 1:
       return None
     return self.device_mesh["dp_shard"].get_group()
+
+  def data_parallel_loss_scale(self) -> float:
+    # FSDP2 averages gradients over the data-parallel mesh in every backward.
+    return float(group_size(self.data_parallel_group()))
 
   # -- model construction ---------------------------------------------------
 
@@ -411,8 +402,9 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     NeMoAutoModelForCausalLM = require_automodel()
     torch.cuda.set_device(self.device)
     self.load_base_model(base_model_name)
+    config = AutoConfig.from_pretrained(base_model_name)
     if self.distributed_setup is None:
-      self.distributed_setup = self.build_distributed_setup(base_model_name)
+      self.distributed_setup = self.build_distributed_setup(config)
       self.device_mesh = self.distributed_setup.mesh_context.device_mesh
     print(f"Loading Automodel {base_model_name} (rank {os.getenv('RANK', '0')}/{os.getenv('WORLD_SIZE', '1')})...")
 
@@ -422,14 +414,10 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     # plain HF graph. Qwen3.5 checkpoints ship a multi-token-prediction head
     # that the native model would build and run over the whole sequence on
     # every training forward; the loss never reads it, so it is not built.
-    text_config = self.load_hf_config(base_model_name).get_text_config()
+    text_config = config.get_text_config()
     model_type = text_config.model_type
     extra = attention_kwargs(model_type, self.cp_size)
-    attn = extra.get("attn_implementation")
-    if attn == "flex_attention" or "ffpa" in str(extra):
-      self.forward_kwargs = flex_kernel_options(text_config, flex_runs_widest=(attn == "flex_attention"))
-    else:
-      self.forward_kwargs = {}
+    self.forward_kwargs = flex_kernel_options(text_config) if model_type.startswith("gemma4") else {}
     if model_type.startswith("qwen3_5"):
       extra["num_nextn_predict_layers"] = 0
     print(f"[Automodel Worker] {model_type}: {extra}")
@@ -443,12 +431,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     )
     if RECOMPUTE_NUM_LAYERS > 0:
       install_group_checkpointing(self.model, RECOMPUTE_NUM_LAYERS)
-    # Model-owned CP forwards (Gemma4) drop output_hidden_states on the way to
-    # the text model, so the final normed hidden states are taken from the
-    # backbone's last norm instead.
-    backbone = self.model.model.language_model if hasattr(self.model.model, "language_model") else self.model.model
-    backbone.norm.register_forward_hook(self.keep_final_norm_output)
-    self.model.train()
+    text_backbone(self.model).norm.register_forward_hook(self.keep_final_norm_output)
     if self.is_lora:
       trainable = sum(param.numel() for param in self.model.parameters() if param.requires_grad)
       total = sum(param.numel() for param in self.model.parameters())
@@ -467,8 +450,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       print(f"Automodel model {base_model_name} already loaded.")
     else:
       self.build_model(base_model_name)
-    seed = config.seed if config is not None and config.seed is not None else AUTOMODEL_SEED
-    torch.manual_seed(seed)
+    torch.manual_seed(config.seed if config is not None and config.seed is not None else DEFAULT_SEED)
     self.prepare_model_for_training()
 
   def prepare_model_for_training(self) -> None:
@@ -476,9 +458,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     if not self.is_lora:
       for param in self.model.parameters():
         param.requires_grad_(True)
-    self.trainable_params = [param for param in self.model.parameters() if param.requires_grad]
-    if not self.trainable_params:
-      raise ValueError("No trainable parameters found in the Automodel model")
+    self.trainable_params = trainable_model_parameters(self.model)
     self.model.train()
 
   # -- forward / backward ---------------------------------------------------
@@ -496,8 +476,6 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       res = super().forward_backward(self.model, data, loss_fn, loss_config)
     finally:
       self.close_cp_context()
-      # The norm hook's output keeps the last forward's graph alive otherwise.
-      self.final_norm_output = None
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
     return res
@@ -528,30 +506,27 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     # it lets SDPA pick flash attention instead of building an additive mask.
     if attention_mask is not None and bool(attention_mask.all()):
       attention_mask = None
-    outputs = model(
-      input_ids=input_ids, attention_mask=attention_mask, use_cache=False, logits_to_keep=1, output_hidden_states=True, **self.forward_kwargs
-    )
-    hidden = self.final_hidden_states(outputs)[:, :seq_len]
-    return self.project_target_logprobs(model, hidden, target_token_ids)
+    model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, logits_to_keep=1, **self.forward_kwargs)
+    return self.project_target_logprobs(model, self.final_hidden_states()[:, :seq_len], target_token_ids)
 
   def keep_final_norm_output(self, module: torch.nn.Module, args: Any, output: torch.Tensor) -> None:
     self.final_norm_output = output
 
-  def final_hidden_states(self, outputs: Any) -> torch.Tensor:
-    hidden = outputs.hidden_states
-    if isinstance(hidden, (tuple, list)):
-      hidden = hidden[-1]
+  def final_hidden_states(self) -> torch.Tensor:
+    """The last forward's final normed hidden states, taken once.
+
+    Model-owned CP forwards (Gemma4) drop output_hidden_states on the way to
+    the text model, so the norm hook is the one source that works everywhere.
+    Clearing it here keeps the previous pass's graph from outliving the pass.
+    """
+    hidden, self.final_norm_output = self.final_norm_output, None
     if hidden is None:
-      hidden = self.final_norm_output
-    if hidden is None:
-      raise RuntimeError("Automodel forward returned no hidden_states; the logprob path needs the final hidden states.")
-    if is_dtensor(hidden):
-      hidden = hidden.full_tensor()
-    return hidden
+      raise RuntimeError("The backbone norm hook saw no output; the logprob path needs the final hidden states.")
+    return hidden.full_tensor() if isinstance(hidden, DTensor) else hidden
 
   def head_weight(self, weight: torch.Tensor) -> torch.Tensor:
     """The lm_head weight as one plain [vocab, hidden] tensor on this rank."""
-    if not is_dtensor(weight):
+    if not isinstance(weight, DTensor):
       return weight
     if weight.requires_grad:
       # A trained head needs gradient-correct reduction semantics for the
@@ -563,13 +538,12 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
 
   def project_target_logprobs(self, model: torch.nn.Module, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """logit[target] - logsumexp over the vocab, in checkpointed chunks."""
-    head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else model.lm_head
+    head = model.get_output_embeddings()
     weight = self.head_weight(head.weight)
     bias = getattr(head, "bias", None)
     if bias is not None:
       bias = self.head_weight(bias)
-    text_config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
-    softcap = getattr(text_config, "final_logit_softcapping", None)
+    softcap = getattr(model.config.get_text_config(), "final_logit_softcapping", None)
 
     batch, seq_len, _ = hidden.shape
     flat_hidden = hidden.reshape(batch * seq_len, -1)
@@ -617,19 +591,9 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.close_cp_context()
     self.cp_context = contextlib.ExitStack()
     self.cp_context.enter_context(context())
-    outputs = model(
-      input_ids=batch["input_ids"],
-      position_ids=batch["position_ids"],
-      use_cache=False,
-      logits_to_keep=1,
-      output_hidden_states=True,
-      **aux,
-      **self.forward_kwargs,
-    )
-    local_targets = batch["labels"]
-    local_hidden = self.final_hidden_states(outputs)
+    model(input_ids=batch["input_ids"], position_ids=batch["position_ids"], use_cache=False, logits_to_keep=1, **aux, **self.forward_kwargs)
     # Padding slots carry an ignore index; they are cut off after the gather.
-    local_logprobs = self.project_target_logprobs(model, local_hidden, local_targets.clamp_min(0))
+    local_logprobs = self.project_target_logprobs(model, self.final_hidden_states(), batch["labels"].clamp_min(0))
 
     gathered = GatherSequenceShards.apply(local_logprobs, cp_group, self.cp_size, cp_rank)
     if owns_cp:
@@ -654,10 +618,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
         param_group["lr"] = learning_rate
 
     max_grad_norm = adam_params.get("grad_clip_norm") or GRAD_CLIP_NORM or math.inf
-    if max_grad_norm <= 0.0:
-      max_grad_norm = math.inf
-    total_norm = self.clip_gradients(max_grad_norm)
-    clip_coef = min(1.0, max_grad_norm / (total_norm + 1e-6)) if math.isfinite(max_grad_norm) else 1.0
+    total_norm, clip_coef = self.clip_gradients(max_grad_norm)
 
     self.optimizer.step()
     self.optimizer.zero_grad(set_to_none=True)
@@ -682,8 +643,9 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       foreach=False,
     )
 
-  def clip_gradients(self, max_grad_norm: float) -> float:
-    """Global grad norm over DTensors that may live on different meshes.
+  def clip_gradients(self, max_grad_norm: float) -> tuple[float, float]:
+    """Clip to a global grad norm over DTensors that may live on different
+    meshes; returns the norm before clipping and the factor applied.
 
     torch's clip_grad_norm_ stacks per-tensor norms, which fails across meshes
     (TP-sharded projections next to replicated GDN weights). A per-tensor
@@ -696,18 +658,16 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       if param.grad is None:
         continue
       norm = torch.linalg.vector_norm(param.grad.detach().float())
-      if is_dtensor(norm):
-        norm = norm.full_tensor()
-      norms.append(norm)
+      norms.append(norm.full_tensor() if isinstance(norm, DTensor) else norm)
     if not norms:
-      return 0.0
+      return 0.0, 1.0
     total_norm = float(torch.linalg.vector_norm(torch.stack(norms)))
-    clip_coef = max_grad_norm / (total_norm + 1e-6)
+    clip_coef = min(1.0, max_grad_norm / (total_norm + 1e-6))
     if clip_coef < 1.0:
       for param in self.trainable_params:
         if param.grad is not None:
           param.grad.mul_(clip_coef)
-    return total_norm
+    return total_norm, clip_coef
 
   # -- checkpointing --------------------------------------------------------
 
@@ -755,66 +715,64 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       shutil.rmtree(model_dir, ignore_errors=True)
     barrier()
 
-  def full_optimizer_state_dict(self) -> dict[str, Any]:
-    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_optimizer_state_dict
-
-    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-    return get_optimizer_state_dict(self.model, self.optimizer, options=options)
-
-  def save_checkpoint(self, path: str, metadata: dict[str, Any], include_optimizer: bool = False) -> dict[str, Any]:
-    """Write weights (and optionally optimizer state) into a staging directory
-    and swap it into place, so a save killed mid-write never leaves a
-    directory that loads as mixed old and new."""
-    assert self.model is not None, "Model must be loaded first."
-    # Rank-invariant names: every rank passes the staging path into the
-    # collective save, so it must be the same directory on every rank.
-    staging_path = f"{path}.staging"
-    previous_path = f"{path}.previous"
+  def stage_and_swap(self, final_dir: str, write_extra: Callable[[str], None] | None = None) -> None:
+    """Write the weights into a sibling staging directory and swap it into
+    final_dir, so a save killed mid-write never leaves a directory that loads
+    as mixed old and new. write_extra runs on rank 0 against the staged dir.
+    The staging names are rank-invariant: every rank passes the same path into
+    the collective write."""
+    staging_dir = f"{final_dir}.staging"
+    previous_dir = f"{final_dir}.previous"
     if is_primary():
-      shutil.rmtree(staging_path, ignore_errors=True)
-      os.makedirs(staging_path, exist_ok=True)
+      shutil.rmtree(staging_dir, ignore_errors=True)
+      os.makedirs(staging_dir, exist_ok=True)
     barrier()
-    self.write_weights(staging_path)
-    if include_optimizer and self.optimizer is not None:
-      optimizer_state = self.full_optimizer_state_dict()
-      if is_primary():
-        torch.save(optimizer_state, os.path.join(staging_path, "optimizer.pt"))
+    self.write_weights(staging_dir)
     if is_primary():
-      with open(os.path.join(staging_path, "metadata.json"), "w") as f:
-        json.dump(metadata, f)
-      shutil.rmtree(previous_path, ignore_errors=True)
-      if os.path.exists(path):
-        os.rename(path, previous_path)
-      os.rename(staging_path, path)
-      shutil.rmtree(previous_path, ignore_errors=True)
+      if write_extra is not None:
+        write_extra(staging_dir)
+      shutil.rmtree(previous_dir, ignore_errors=True)
+      if os.path.exists(final_dir):
+        os.rename(final_dir, previous_dir)
+      os.rename(staging_dir, final_dir)
+      shutil.rmtree(previous_dir, ignore_errors=True)
     barrier()
-    print(f"Saved Automodel state to {path}")
-    return {"path": path}
 
-  def save_model(self, alias: str | None = None) -> dict[str, Any]:
-    name = alias or "automodel-model"
-    save_path = name if os.path.isabs(name) else os.path.join(tmp_dir(), "automodel", name)
-    metadata = {
-      "base_model": self.base_model_name,
-      "created_at": datetime.now().isoformat(),
-      "kind": "weights",
-      "lora": self.is_lora,
-      "model_id": alias,
-      "timestamp": time.time(),
-    }
-    return self.save_checkpoint(save_path, metadata)
-
-  def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
-    metadata = {
+  def checkpoint_metadata(self, kind: str, model_id: str | None, has_optimizer: bool) -> dict[str, Any]:
+    return {
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
       "kind": kind,
       "lora": self.is_lora,
-      "has_optimizer": include_optimizer and self.optimizer is not None,
+      "has_optimizer": has_optimizer,
       "model_id": model_id,
       "timestamp": time.time(),
     }
-    return self.save_checkpoint(state_path, metadata, include_optimizer)
+
+  def save_state(self, model_id: str | None, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
+    assert self.model is not None, "Model must be loaded first."
+    include_optimizer = include_optimizer and self.optimizer is not None
+    if include_optimizer:
+      # Collective on every rank; only rank 0 gets the full state to write.
+      from torch.distributed.checkpoint.state_dict import StateDictOptions, get_optimizer_state_dict
+
+      optimizer_state = get_optimizer_state_dict(self.model, self.optimizer, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+    metadata = self.checkpoint_metadata(kind, model_id, include_optimizer)
+
+    def write_extra(staged: str) -> None:
+      if include_optimizer:
+        torch.save(optimizer_state, os.path.join(staged, "optimizer.pt"))
+      with open(os.path.join(staged, "metadata.json"), "w") as f:
+        json.dump(metadata, f)
+
+    self.stage_and_swap(state_path, write_extra)
+    print(f"Saved Automodel state to {state_path}")
+    return {"path": state_path}
+
+  def save_model(self, alias: str | None = None) -> dict[str, Any]:
+    name = alias or "automodel-model"
+    save_path = name if os.path.isabs(name) else os.path.join(tmp_dir(), "automodel", name)
+    return self.save_state(alias, save_path, kind="weights")
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
     metadata_path = os.path.join(state_path, "metadata.json")
@@ -865,34 +823,19 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     """Publish the LoRA adapter where the sampler workers load it.
 
     Same layout as the LoRA worker: peft/<adapter_id>/<adapter_id>/ holds the
-    PEFT adapter and peft/<adapter_id>/metadata.json describes it. The adapter
-    is written to a staging directory and swapped in, so a sampler never reads
-    a half-written one.
+    PEFT adapter and peft/<adapter_id>/metadata.json describes it.
     """
     if not self.is_lora:
       raise RuntimeError("A full-parameter Automodel worker has no adapter to publish; it saves whole checkpoints.")
     adapter_root = os.path.join(tmp_dir(), "peft", adapter_id)
-    final_dir = os.path.join(adapter_root, adapter_id)
-    staging_dir = os.path.join(adapter_root, ".staging")
+    self.stage_and_swap(os.path.join(adapter_root, adapter_id))
     if is_primary():
-      shutil.rmtree(staging_dir, ignore_errors=True)
-      os.makedirs(staging_dir, exist_ok=True)
-    barrier()
-    self.write_weights(staging_dir)
-    if is_primary():
-      replaced_dir = os.path.join(adapter_root, ".replaced")
-      shutil.rmtree(replaced_dir, ignore_errors=True)
-      if os.path.exists(final_dir):
-        os.rename(final_dir, replaced_dir)
-      os.rename(staging_dir, final_dir)
-      shutil.rmtree(replaced_dir, ignore_errors=True)
       metadata = {"model_id": adapter_id, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
       if alias is not None:
         metadata["alias"] = alias
       with open(os.path.join(adapter_root, "metadata.json"), "w") as f:
         json.dump(metadata, f)
-      print(f"[Automodel Worker] Saved LoRA adapter to {final_dir}.")
-    barrier()
+      print(f"[Automodel Worker] Saved LoRA adapter to {adapter_root}/{adapter_id}.")
 
   def generate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
     raise RuntimeError("Sampling from the Automodel trainer is unsupported; use the vLLM sampler worker.")

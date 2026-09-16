@@ -1,13 +1,9 @@
-import os
 import unittest
 
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from training.automodel_worker import GroupCheckpointedLayers, attention_kwargs, lora_target_modules, round_robin_permutation
 from training.lora_trainer_worker import LoraConfig
-from training.trainer_worker import BaseTrainerWorker, Datum
 
 
 def rank_shards(cp_size: int, padded: int) -> list[torch.Tensor]:
@@ -63,12 +59,11 @@ class AutomodelWorkerHelpersTest(unittest.TestCase):
     self.assertEqual(len(list(layers.values())), 6)
 
   def test_attention_kwargs_by_model_family(self):
-    self.assertEqual(attention_kwargs("qwen3_5_text", cp_size=4, choice="auto"), {"attn_implementation": "sdpa"})
-    self.assertEqual(attention_kwargs("gemma4_text", cp_size=1, choice="auto"), {"attn_implementation": "ffpa", "use_sdpa_patching": False})
-    under_cp = attention_kwargs("gemma4_text", cp_size=4, choice="auto")
+    self.assertEqual(attention_kwargs("qwen3_5_text", cp_size=4), {"attn_implementation": "sdpa"})
+    self.assertEqual(attention_kwargs("gemma4_text", cp_size=1), {"attn_implementation": "ffpa", "use_sdpa_patching": False})
+    under_cp = attention_kwargs("gemma4_text", cp_size=4)
     self.assertEqual(under_cp["attn_implementation"], "sdpa")
     self.assertEqual(under_cp["text_config"]["cp_full_attn_backend"], "ffpa")
-    self.assertEqual(attention_kwargs("gemma4_text", cp_size=1, choice="flex_attention"), {"attn_implementation": "flex_attention"})
 
   def test_lora_target_modules_follow_the_client_config(self):
     self.assertIn("model.*.layers.*.q_proj", lora_target_modules(LoraConfig()))
@@ -76,68 +71,6 @@ class AutomodelWorkerHelpersTest(unittest.TestCase):
     self.assertNotIn("model.*.layers.*.down_proj", lora_target_modules(LoraConfig(train_mlp=False)))
     with self.assertRaises(ValueError):
       lora_target_modules(LoraConfig(train_unembed=True))
-
-
-# -- data-parallel forward_backward in the base worker ------------------------
-
-
-class ToyModel(torch.nn.Module):
-  def __init__(self):
-    super().__init__()
-    self.weight = torch.nn.Parameter(torch.tensor(0.5))
-
-
-class ToyWorker(BaseTrainerWorker):
-  """Logprob of a target token is -(token * weight), so losses and gradients
-  are closed-form and identical on any layout."""
-
-  def __init__(self, group):
-    super().__init__()
-    self.group = group
-    self.forward_calls = 0
-
-  def data_parallel_group(self):
-    return self.group
-
-  def compute_target_logprobs(self, model, input_ids, attention_mask, target_token_ids):
-    self.forward_calls += 1
-    return -(target_token_ids.float() * model.weight)
-
-
-def toy_data() -> list[Datum]:
-  return [
-    Datum(model_input=[1, 2, 3], loss_fn_inputs={"target_tokens": {"data": [2, 3, 4]}}),
-    Datum(model_input=[5, 6], loss_fn_inputs={"target_tokens": {"data": [6, 7]}}),
-    Datum(model_input=[8, 9, 10, 11], loss_fn_inputs={"target_tokens": {"data": [9, 10, 11, 12]}}),
-  ]
-
-
-def run_sharded_forward_backward(rank: int, world_size: int, port: int) -> None:
-  os.environ.update({"MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(port), "RANK": str(rank), "WORLD_SIZE": str(world_size)})
-  dist.init_process_group("gloo", rank=rank, world_size=world_size)
-  try:
-    reference_model, reference_worker = ToyModel(), ToyWorker(None)
-    expected = reference_worker.forward_backward(reference_model, toy_data(), "cross_entropy")
-
-    model, worker = ToyModel(), ToyWorker(dist.group.WORLD)
-    actual = worker.forward_backward(model, toy_data(), "cross_entropy")
-
-    assert actual["metrics"] == expected["metrics"], (actual["metrics"], expected["metrics"])
-    assert actual["loss_fn_outputs"] == expected["loss_fn_outputs"]
-    # Three single-datum passes over two ranks: the short rank runs a filler.
-    assert worker.forward_calls == 2, worker.forward_calls
-    # Each rank scaled its loss by the group size, so the mean FSDP would take
-    # across ranks equals the single-process gradient.
-    grads = [None] * world_size
-    dist.all_gather_object(grads, model.weight.grad.item())
-    assert abs(sum(grads) / world_size - reference_model.weight.grad.item()) < 1e-5, (grads, reference_model.weight.grad)
-  finally:
-    dist.destroy_process_group()
-
-
-class DataParallelForwardBackwardTest(unittest.TestCase):
-  def test_two_ranks_reproduce_the_single_process_result(self):
-    mp.spawn(run_sharded_forward_backward, args=(2, 29517), nprocs=2, join=True)
 
 
 if __name__ == "__main__":
