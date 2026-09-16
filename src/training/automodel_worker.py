@@ -255,10 +255,6 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.tp_size = AUTOMODEL_TP
     self.cp_size = AUTOMODEL_CP
 
-  @property
-  def is_lora(self) -> bool:
-    return not self.full_parameter
-
   def save_needs_gpu(self) -> bool:
     # Every save gathers DTensor shards over the GPUs.
     return True
@@ -570,6 +566,8 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       adam_params,
       default_clip=GRAD_CLIP_NORM,
     )
+    if self.is_lora and model_id:
+      self.save_adapter(model_id)
     return {
       "metrics": {
         "grad_norm:mean": self.sanitize_float(total_norm),

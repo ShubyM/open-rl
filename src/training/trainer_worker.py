@@ -72,6 +72,10 @@ class BaseTrainerWorker:
     else:
       self.device = torch.device("cpu")
 
+  @property
+  def is_lora(self) -> bool:
+    return not self.full_parameter
+
   # Hooks for the GPU lease a dedicated worker runs under. sleep and wake_up
   # bracket the lease; save_needs_gpu says whether a save must run inside it.
   def sleep(self) -> None:
@@ -82,6 +86,12 @@ class BaseTrainerWorker:
 
   def save_needs_gpu(self) -> bool:
     return False
+
+  def save_weights(self, model_id: str, alias: str | None = None) -> None:
+    if self.is_lora:
+      self.save_adapter(model_id, alias)
+    else:
+      self.save_model(alias or model_id)
 
   def enable_gradient_checkpointing(self, model: torch.nn.Module) -> None:
     if not ENABLE_GRADIENT_CHECKPOINTING:
