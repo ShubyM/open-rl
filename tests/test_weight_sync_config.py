@@ -4,7 +4,7 @@ from dataclasses import asdict
 from unittest.mock import MagicMock
 
 from server.model_metadata import TrainingModelMetadata, WeightSyncConfig, extract_weight_sync_config
-from server.worker_manager import _fetch_metadata_from_store
+from server.worker_manager import metadata_for
 
 
 class TestWeightSyncConfig(unittest.TestCase):
@@ -12,13 +12,13 @@ class TestWeightSyncConfig(unittest.TestCase):
     """Test that missing headers apply single-location defaults correctly."""
     cfg = extract_weight_sync_config({})
     self.assertEqual(cfg.strategy, "delta")
-    self.assertEqual(cfg.delta_format, "vllm_fused")
+    self.assertEqual(cfg.delta_format, "native")
     self.assertEqual(cfg.delta_apply_method, "patch_in_place")
 
     # Calling with None
     cfg_none = extract_weight_sync_config(None)
     self.assertEqual(cfg_none.strategy, "delta")
-    self.assertEqual(cfg_none.delta_format, "vllm_fused")
+    self.assertEqual(cfg_none.delta_format, "native")
     self.assertEqual(cfg_none.delta_apply_method, "patch_in_place")
 
   def test_explicit_header_overrides(self):
@@ -31,7 +31,7 @@ class TestWeightSyncConfig(unittest.TestCase):
     cfg = extract_weight_sync_config(headers)
     self.assertEqual(cfg.strategy, "full")
     self.assertEqual(cfg.delta_format, "native")
-    self.assertEqual(cfg.delta_apply_method, "full_replace")
+    self.assertEqual(cfg.delta_apply_method, "patch_in_place")
 
   def test_header_case_insensitivity_and_alias_backwards_compatibility(self):
     """Test that uppercase headers and legacy alias header names parse correctly."""
@@ -54,7 +54,7 @@ class TestWeightSyncConfig(unittest.TestCase):
     }
     cfg = extract_weight_sync_config(headers)
     self.assertEqual(cfg.strategy, "delta")
-    self.assertEqual(cfg.delta_format, "vllm_fused")
+    self.assertEqual(cfg.delta_format, "native")
     self.assertEqual(cfg.delta_apply_method, "patch_in_place")
 
   def test_metadata_persistence_and_store_retrieval(self):
@@ -79,13 +79,19 @@ class TestWeightSyncConfig(unittest.TestCase):
     mock_store.get_value_sync.return_value = serialized
 
     with unittest.mock.patch("server.store.get_store", return_value=mock_store):
-      meta_res = _fetch_metadata_from_store("test-model-123")
+      meta_res = metadata_for("test-model-123")
       self.assertIsNotNone(meta_res)
       self.assertEqual(meta_res.base_model, "Qwen/Qwen3-8B")
       self.assertIsNotNone(meta_res.weight_sync_config)
       self.assertEqual(meta_res.weight_sync_config.strategy, "delta")
-      self.assertEqual(meta_res.weight_sync_config.delta_format, "vllm_fused")
+      self.assertEqual(meta_res.weight_sync_config.delta_format, "native")
       self.assertEqual(meta_res.weight_sync_config.delta_apply_method, "patch_in_place")
+
+  def test_legacy_full_replace_selects_full_checkpoint_transfer(self):
+    cfg = WeightSyncConfig(strategy="delta", delta_format="vllm_fused", delta_apply_method="full_replace")
+    self.assertEqual(cfg.strategy, "full")
+    self.assertEqual(cfg.delta_format, "native")
+    self.assertEqual(cfg.delta_apply_method, "patch_in_place")
 
   def test_from_env_reconstruction(self):
     """Test reconstructing WeightSyncConfig and TrainingModelMetadata directly from environment dictionary."""
@@ -98,13 +104,13 @@ class TestWeightSyncConfig(unittest.TestCase):
     cfg = WeightSyncConfig.from_env(env_vars)
     self.assertEqual(cfg.strategy, "full")
     self.assertEqual(cfg.delta_format, "native")
-    self.assertEqual(cfg.delta_apply_method, "full_replace")
+    self.assertEqual(cfg.delta_apply_method, "patch_in_place")
 
     meta = TrainingModelMetadata.from_env(env_vars)
     self.assertEqual(meta.base_model, "Qwen/Qwen2.5-0.5B")
     self.assertEqual(meta.weight_sync_config.strategy, "full")
     self.assertEqual(meta.weight_sync_config.delta_format, "native")
-    self.assertEqual(meta.weight_sync_config.delta_apply_method, "full_replace")
+    self.assertEqual(meta.weight_sync_config.delta_apply_method, "patch_in_place")
 
 
 if __name__ == "__main__":
