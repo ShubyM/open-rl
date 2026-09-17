@@ -11,6 +11,7 @@ from typing import Any
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
+from server.sampler_versions import version_chain
 from server.vllm_options import gpu_memory_utilization, split_stop, text_only_engine_kwargs
 
 try:
@@ -236,17 +237,20 @@ async def process_sampling_request(req: dict, store: Any) -> None:
               print("[vLLM Worker] Waking up weights...")
               await engine.wake_up(tags=["weights"])
               if WeightSyncConfig.from_env().strategy == "delta":
+                # Deltas chain, so a sampler that is behind applies every version
+                # it missed, and one starting cold begins at the last full snapshot.
+                for path in version_chain(CURRENT_LOADED_SAMPLER_WEIGHTS, weights_path):
 
-                def _trigger_wt(worker, path=weights_path):
-                  worker.start_weight_update()
-                  try:
-                    worker.update_weights({"target_weights_path": path})
-                  finally:
-                    worker.finish_weight_update()
+                  def _trigger_wt(worker, path=path):
+                    worker.start_weight_update()
+                    try:
+                      worker.update_weights({"target_weights_path": path})
+                    finally:
+                      worker.finish_weight_update()
 
-                res = await engine.collective_rpc(_trigger_wt)
-                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
-                print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
+                  res = await engine.collective_rpc(_trigger_wt)
+                  print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                  print(f"[vLLM Worker] Incremental delta weights from {path} synchronized via native WeightTransferEngine.")
               else:
                 res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
                 print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
@@ -354,6 +358,22 @@ async def run_sampling_worker(model_id: str) -> None:
       except Exception as store_exc:  # noqa: BLE001 - best effort while already failing
         print(f"[vLLM Worker] Could not fail request {request_id}: {store_exc}")
 
+  async def sample_batch(reqs: list[dict]) -> None:
+    """Runs the batch, but does not wait on an engine that dies under it.
+
+    A dead EngineCore leaves generate() hanging, so the in-flight requests
+    are failed and the caller's dead-engine path exits the worker.
+    """
+    tasks = {asyncio.create_task(process_sampling_request(req, store)): req for req in reqs}
+    pending = set(tasks)
+    while pending:
+      _, pending = await asyncio.wait(pending, timeout=5)
+      if pending and engine is not None and getattr(engine, "errored", False):
+        for task in pending:
+          task.cancel()
+        await fail_requests([tasks[task] for task in pending], RuntimeError("vLLM engine died during the batch"))
+        raise RuntimeError("vLLM engine died during the batch")
+
   def engine_is_dead(exc: BaseException) -> bool:
     if engine is not None and getattr(engine, "errored", False):
       return True
@@ -410,9 +430,8 @@ async def run_sampling_worker(model_id: str) -> None:
                 print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")
                 await engine.wake_up(tags=["weights", "kv_cache"])
                 IS_ENGINE_SLEEPING = False
-              tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
-              await asyncio.gather(*tasks)
               unanswered = []
+              await sample_batch(sampling_reqs)
               if has_shutdown:
                 await exit_gracefully()
               if engine is not None:
@@ -431,9 +450,8 @@ async def run_sampling_worker(model_id: str) -> None:
               print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")
               await engine.wake_up(tags=["weights", "kv_cache"])
               IS_ENGINE_SLEEPING = False
-            tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
-            await asyncio.gather(*tasks)
             unanswered = []
+            await sample_batch(sampling_reqs)
 
         if has_shutdown:
           print("[vLLM Worker] Shutdown sentinel popped from queue. Initiating clean exit...")

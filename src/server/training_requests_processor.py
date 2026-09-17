@@ -296,9 +296,9 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     return {"status": "ok", "type": "weights_saved"}
 
 
-# Every Nth sampler save is a full snapshot instead of a delta. The deltas
-# before it are then dead weight: the sampler has applied them and the full
-# replaces the chain. An 8B run otherwise leaves 3 GiB per step on the volume.
+# Every Nth sampler save also writes a full snapshot under <version>/full. The
+# versions before it are then dead weight: the sampler has applied them and a
+# restart replays from the full. An 8B run otherwise leaves 3 GiB per step.
 SAMPLER_FULL_EVERY = int(os.getenv("OPEN_RL_SAMPLER_FULL_EVERY", "10"))
 
 
@@ -528,7 +528,12 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     self.sampler_saves += 1
     full = SAMPLER_FULL_EVERY > 0 and self.sampler_saves % SAMPLER_FULL_EVERY == 0
     older = sibling_versions(local_path) if full else []
-    await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler", full=full)
+    await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
+    if full:
+      # The sampler keeps applying the delta. The full snapshot beside it is
+      # what a restarted sampler starts from, and what lets the versions
+      # before it go.
+      await asyncio.to_thread(self.worker.save_state, model_id, os.path.join(local_path, "full"), False, "sampler", full=True)
     if hasattr(self.store, "redis"):
       num_subs = await self.store.redis.publish(
         f"open_rl:weight_update:{model_id}",
