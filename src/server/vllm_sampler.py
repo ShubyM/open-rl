@@ -11,7 +11,6 @@ from typing import Any
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
-from server.sampler_versions import version_chain
 from server.vllm_options import gpu_memory_utilization, split_stop, text_only_engine_kwargs
 
 try:
@@ -237,20 +236,17 @@ async def process_sampling_request(req: dict, store: Any) -> None:
               print("[vLLM Worker] Waking up weights...")
               await engine.wake_up(tags=["weights"])
               if WeightSyncConfig.from_env().strategy == "delta":
-                # Deltas chain, so a sampler that is behind applies every version
-                # it missed, and one starting cold begins at the last full snapshot.
-                for path in version_chain(CURRENT_LOADED_SAMPLER_WEIGHTS, weights_path):
 
-                  def _trigger_wt(worker, path=path):
-                    worker.start_weight_update()
-                    try:
-                      worker.update_weights({"target_weights_path": path})
-                    finally:
-                      worker.finish_weight_update()
+                def _trigger_wt(worker, path=weights_path):
+                  worker.start_weight_update()
+                  try:
+                    worker.update_weights({"target_weights_path": path})
+                  finally:
+                    worker.finish_weight_update()
 
-                  res = await engine.collective_rpc(_trigger_wt)
-                  print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
-                  print(f"[vLLM Worker] Incremental delta weights from {path} synchronized via native WeightTransferEngine.")
+                res = await engine.collective_rpc(_trigger_wt)
+                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
               else:
                 res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
                 print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")

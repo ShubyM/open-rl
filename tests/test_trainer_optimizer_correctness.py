@@ -139,7 +139,7 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
   def forward_backward(self, data, loss_fn, loss_config=None, model_id=None):
     return {"model_id": model_id, "loss_fn": loss_fn, "loss_config": loss_config, "data": data}
 
-  def save_state(self, model_id, state_path, include_optimizer=False, kind="state", full=False):
+  def save_state(self, model_id, state_path, include_optimizer=False, kind="state"):
     self.saved_states.append((model_id, state_path, include_optimizer, kind))
     return {"path": state_path}
 
