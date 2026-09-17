@@ -5,10 +5,15 @@ registers the file receiver in each vLLM process. It applies sparse replacement
 values with `load_checkpoint_weight_patches`, using native checkpoint names and
 shapes so the model loader handles packing and tensor-parallel slicing.
 
-The sampler drives each update through the engine API: pause generation and
-wait for in-flight requests, start the update, load the files, finish with the
-weights path as the version, reset the encoder cache, resume. A failed update
-raises without resuming, so partially updated weights are never served.
+`vllm_sampler.py` holds one `Sampler` class for both LoRA and FFT. It consumes
+the model's queue, builds the engine inside an acquired time-slicer slot when one
+is configured, sleeps and wakes it around each batch, and updates weights between
+consecutive request groups that share a weights path. A request naming a
+`lora_id` gets that adapter attached instead. `OPEN_RL_ENABLE_FFT` selects the
+engine flags: sleep mode and the transfer plugin for FFT, LoRA support otherwise.
+There is no mock engine; running the sampler requires vLLM.
+Startup failures and cancellation shut the engine down and unregister the
+workload without an unlocked retry or a forced process exit.
 
 Sparse files use format version 2. `metadata.json` contains `format: sparse_delta`,
 `format_version: 2`, and matching `layer_names` and `layer_shapes` arrays. `delta.safetensors` contains `0.indices`, `0.values`,
