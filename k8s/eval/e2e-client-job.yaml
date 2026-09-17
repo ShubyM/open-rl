@@ -23,6 +23,12 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: open-rl-sa
+      # Accelerator pools carry this taint; without the toleration the client
+      # can only land on a general-purpose pool, which may not exist or fit it.
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
       containers:
       - name: e2e-client
         image: E2E-IMAGE

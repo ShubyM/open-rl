@@ -22,6 +22,9 @@ jobs:
             dockerfile: src/server/Dockerfile
           - image_name: client
             context: .
+            dockerfile: src/server/Dockerfile.client
+          - image_name: autoresearch
+            context: .
             dockerfile: examples/autoresearch/Dockerfile
           - image_name: scheduler
             context: scheduler/controller
