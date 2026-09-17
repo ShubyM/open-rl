@@ -143,6 +143,14 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
     self.saved_states.append((model_id, state_path, include_optimizer, kind))
     return {"path": state_path}
 
+  cpu_offload = True
+
+  def wake_up(self):
+    return None
+
+  def sleep(self):
+    return None
+
 
 class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker):
   def __init__(self):
@@ -194,6 +202,8 @@ class _TrainingRequestsStoreStub(_FutureStoreStub):
 
 
 class _TimeSlicerStub:
+  faulted = None
+
   def __init__(self, events=None):
     self.events = events if events is not None else []
 

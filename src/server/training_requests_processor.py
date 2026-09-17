@@ -382,65 +382,69 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       else:
         training_reqs.append(req)
 
+    results: list[tuple[str | None, dict[str, Any]]] = []
+    failure: Exception | None = None
     with tracer.start_as_current_span("training_requests_batch") as batch_span:
       batch_span.set_attribute("batch_size", len(training_reqs))
       batch_span.set_attribute("model_id", self.model_id)
-
       if training_reqs:
         print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}: {describe_requests(training_reqs)}")
-        results = []
-        save_ops = {"save_state", "save_weights", "save_weights_for_sampler"}
-        gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
-        save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
+        results, failure = await self.answer_batch(training_reqs)
 
-        failure: Exception | None = None
-        try:
-          if gpu_reqs:
-            async with self.time_slicer.acquire(self.workload):
-              if hasattr(self.worker, "wake_up"):
-                await asyncio.to_thread(self.worker.wake_up)
-              try:
-                for request in gpu_reqs:
-                  results.append(await self.handle_request(request, self.model_id))
-              finally:
-                if hasattr(self.worker, "sleep"):
-                  await asyncio.to_thread(self.worker.sleep)
+    for request_id, result in results:
+      if request_id is not None:
+        await self.store.set_future(request_id, result)
+    await self.store.ack_requests_for_model(self.model_id)
+    if failure is not None:
+      raise failure
 
-          if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload and save_reqs:
-            async with self.time_slicer.acquire(self.workload):
-              for request in save_reqs:
-                results.append(await self.handle_request(request, self.model_id))
-          else:
-            for request in save_reqs:
-              results.append(await self.handle_request(request, self.model_id))
-        except Exception as exc:
-          # Whatever the batch did not answer is failed now, so no client waits forever.
-          failure = exc
-          answered = {request_id for request_id, _ in results}
-          for request in training_reqs:
-            request_id = request.get("request_id")
-            if request_id and request_id not in answered:
-              results.append((request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
-
-        for request_id, result in results:
-          if request_id is not None:
-            await self.store.set_future(request_id, result)
-        await self.store.ack_requests_for_model(self.model_id)
-        if failure is not None:
-          raise failure
-      else:
-        await self.store.ack_requests_for_model(self.model_id)
-
-    faulted = getattr(self.time_slicer, "faulted", None)
-    if faulted:
+    if self.time_slicer.faulted:
       # This process still holds the accelerator. Exit without unregistering so
       # the grant moves on only once the memory is gone. Exit 0 keeps the pod
       # from restarting on fresh weights mid-run; the run fails on its next call.
-      print(f"[WORKER] Time slicer could not park this process: {faulted}. Exiting to free the accelerator.")
+      print(f"[WORKER] Time slicer could not park this process: {self.time_slicer.faulted}. Exiting to free the accelerator.")
       await self.exit_gracefully(unregister=False)
-
     if has_shutdown:
       await self.exit_gracefully()
+
+  async def answer_batch(self, requests: list[dict[str, Any]]) -> tuple[list[tuple[str | None, dict[str, Any]]], Exception | None]:
+    """Every request gets an answer: its result, or the failure that stopped the batch."""
+    results: list[tuple[str | None, dict[str, Any]]] = []
+    try:
+      await self.handle_batch(requests, results)
+    except Exception as exc:
+      answered = {request_id for request_id, _ in results}
+      for request in requests:
+        request_id = request.get("request_id")
+        if request_id and request_id not in answered:
+          results.append((request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
+      return results, exc
+    return results, None
+
+  async def handle_batch(self, requests: list[dict[str, Any]], results: list[tuple[str | None, dict[str, Any]]]) -> None:
+    """GPU work under one time-slicer turn; saves need the device only when the worker is not offloaded."""
+    save_ops = {"save_state", "save_weights", "save_weights_for_sampler"}
+    gpu_reqs = [r for r in requests if r.get("op") not in save_ops]
+    save_reqs = [r for r in requests if r.get("op") in save_ops]
+
+    if gpu_reqs:
+      async with self.time_slicer.acquire(self.workload):
+        await asyncio.to_thread(self.worker.wake_up)
+        try:
+          for request in gpu_reqs:
+            results.append(await self.handle_request(request, self.model_id))
+        finally:
+          await asyncio.to_thread(self.worker.sleep)
+
+    if not save_reqs:
+      return
+    if self.worker.cpu_offload:
+      for request in save_reqs:
+        results.append(await self.handle_request(request, self.model_id))
+    else:
+      async with self.time_slicer.acquire(self.workload):
+        for request in save_reqs:
+          results.append(await self.handle_request(request, self.model_id))
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     base_model, raw_config, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")

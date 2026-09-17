@@ -12,6 +12,9 @@ DEFAULT_TCP_PORT = 9753
 
 
 class TimeSlicerClient(Protocol):
+  # Set when a release could not park this process; it still holds the device.
+  faulted: str | None
+
   async def register(self, workload: WorkloadRef) -> dict[str, Any]: ...
 
   async def unregister(self, workload: WorkloadRef) -> dict[str, Any]: ...

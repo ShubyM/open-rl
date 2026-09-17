@@ -26,6 +26,8 @@ class SlicerStub:
 
 
 class BrokenWorker:
+  cpu_offload = True
+
   def wake_up(self):
     raise RuntimeError("CUDA out of memory")
 
@@ -67,7 +69,6 @@ class FFTBatchFailureTest(unittest.TestCase):
     store = BatchStore([{"request_id": "sv-1", "op": "save_weights"}])
     slicer = SlicerStub()
     proc = processor(store, slicer)
-    proc.worker.cpu_offload = True
     exits = []
 
     async def record_exit(unregister=True):
