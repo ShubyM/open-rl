@@ -197,7 +197,6 @@ async def main():
 
       tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
       await asyncio.gather(*tasks)
-      await store.ack_sampling_requests_for_model(model_id)
     except asyncio.CancelledError:
       break
     except Exception as exc:
