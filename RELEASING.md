@@ -18,7 +18,6 @@ verbatim:
 - `ghcr.io/gke-labs/open-rl/server:<tag>`
 - `ghcr.io/gke-labs/open-rl/gateway:<tag>`
 - `ghcr.io/gke-labs/open-rl/client:<tag>` (the e2e client, `src/server/Dockerfile.client`)
-- `ghcr.io/gke-labs/open-rl/autoresearch:<tag>`
 - `ghcr.io/gke-labs/open-rl/scheduler:<tag>`
 
 Assets, attached to the GitHub Release:
