@@ -264,7 +264,6 @@ class FFTTrainingWorker(BaseTrainerWorker):
       "created_at": datetime.now().isoformat(),
       "format": "sparse_delta",
       "format_version": SPARSE_DELTA_VERSION,
-      "delta_format": "native",
       "layer_shapes": layer_shapes,
       "kind": kind,
       "model_id": model_id,

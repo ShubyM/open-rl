@@ -330,7 +330,6 @@ def examples_env(config: RunConfig) -> dict[str, str]:
   if config.scenario.startswith("fft") or "fft" in config.scenario:
     env["OPEN_RL_FINE_TUNING_TYPE"] = "full"
     env["OPEN_RL_IN_PLACE_DELTA"] = "1"
-    env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = "patch_in_place"
   existing_path = env.get("PYTHONPATH", "")
   env["PYTHONPATH"] = f"examples:{existing_path}" if existing_path else "examples"
   return env
@@ -668,7 +667,6 @@ def run_gsm8k_rl_x4_mixed(config: RunConfig, base_url: str, watch: list[ManagedP
       else:
         env["OPEN_RL_FINE_TUNING_TYPE"] = "full"
         env["OPEN_RL_IN_PLACE_DELTA"] = "1"
-        env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = "patch_in_place"
 
       results[job] = run_command(
         ["uv", "--project", "examples", "run", "python", "-m", module_name, *args],

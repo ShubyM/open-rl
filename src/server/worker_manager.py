@@ -75,9 +75,6 @@ def worker_env(meta: TrainingModelMetadata, base_model: str, runtime: str, is_lo
   weight_sync = getattr(meta, "weight_sync_config", None)
   if weight_sync is not None:
     env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = weight_sync.strategy
-    if weight_sync.strategy == "delta":
-      env["OPEN_RL_WEIGHT_SYNC_DELTA_FORMAT"] = weight_sync.delta_format
-      env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = weight_sync.delta_apply_method
   if role == "trainer":
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
   else:

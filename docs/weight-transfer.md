@@ -11,16 +11,16 @@ weights path as the version, reset the encoder cache, resume. A failed update
 raises without resuming, so partially updated weights are never served.
 
 Sparse files use format version 2. `metadata.json` contains `format: sparse_delta`,
-`format_version: 2`, `delta_format: native`, and matching `layer_names` and
-`layer_shapes` arrays. `delta.safetensors` contains `0.indices`, `0.values`,
+`format_version: 2`, and matching `layer_names` and `layer_shapes` arrays. `delta.safetensors` contains `0.indices`, `0.values`,
 `1.indices`, `1.values`, etc. Each parameter retains its own value dtype. Indices
 must be strictly increasing and address the flattened full checkpoint tensor. An empty update has empty metadata
 arrays and an empty safetensors file.
 
 Upgrade trainer and sampler together. Old fused-coordinate files are rejected;
-regenerate them with the upgraded trainer. Legacy `vllm_fused` configuration is
-normalized to `native`. Legacy `full_replace` configuration selects full
-checkpoint transfer (`strategy=full`); the CPU snapshot fallback has been removed.
+regenerate them with the upgraded trainer. The only weight-sync setting is
+`strategy`: `delta` (default) writes sparse patches each step, `full` writes a
+full checkpoint. The former `delta_format` and `delta_apply_method` settings,
+their headers, and their env vars are gone; the sampler reads the file format.
 
 Sampling drains each consecutive group of requests for one weights path before
 updating to another. Updates pause generation and clear caches, then commit the

@@ -19,7 +19,6 @@ def write_delta(path, names=None, shapes=None, tensors=None, **metadata):
   info = {
     "format": "sparse_delta",
     "format_version": 2,
-    "delta_format": "native",
     "layer_names": names if names is not None else ["q_proj.weight"],
     "layer_shapes": shapes if shapes is not None else [[4, 2]],
   }
@@ -52,7 +51,7 @@ class PatchFileTest(unittest.TestCase):
       self.assertEqual(patches[1].indices.dtype, torch.int32)
 
   def test_rejects_legacy_and_malformed_payloads(self):
-    for change in ({"format_version": 1}, {"delta_format": "vllm_fused"}, {"layer_shapes": []}, {"layer_shapes": [[-1, 2]]}, {"layer_names": [""]}):
+    for change in ({"format_version": 1}, {"layer_shapes": []}, {"layer_shapes": [[-1, 2]]}, {"layer_names": [""]}):
       with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
         path = Path(directory)
         metadata = write_delta(path)

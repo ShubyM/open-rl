@@ -35,8 +35,8 @@ def read_sparse_patches(path: Path, metadata: dict, device: torch.device | str =
   Only indices and values move to the device. Staging on CPU would make the
   native loader copy full checkpoint tensors over PCIe, losing the sparse savings.
   """
-  if metadata.get("format_version") != SPARSE_DELTA_VERSION or metadata.get("delta_format") != "native":
-    raise ValueError("Sparse weights require format_version=2 and delta_format=native; regenerate legacy deltas with the upgraded trainer.")
+  if metadata.get("format_version") != SPARSE_DELTA_VERSION:
+    raise ValueError("Sparse weights require format_version=2 (native checkpoint coordinates); regenerate legacy deltas with the upgraded trainer.")
   names = metadata.get("layer_names")
   shapes = metadata.get("layer_shapes")
   if not isinstance(names, list) or not isinstance(shapes, list) or len(names) != len(shapes):

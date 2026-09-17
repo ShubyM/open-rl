@@ -289,8 +289,6 @@ cluster-e2e:
 	if [ -n "$(E2E_ARGS)" ]; then set -- "$$@" --args "$(E2E_ARGS)"; fi; \
 	if [ -n "$(E2E_NAMESPACE)" ]; then set -- "$$@" --namespace "$(E2E_NAMESPACE)"; fi; \
 	if [ -n "$(WEIGHT_SYNC_STRATEGY)" ]; then set -- "$$@" --weight-sync-strategy "$(WEIGHT_SYNC_STRATEGY)"; fi; \
-	if [ -n "$(WEIGHT_SYNC_DELTA_FORMAT)" ]; then set -- "$$@" --weight-sync-delta-format "$(WEIGHT_SYNC_DELTA_FORMAT)"; fi; \
-	if [ -n "$(WEIGHT_SYNC_DELTA_APPLY_METHOD)" ]; then set -- "$$@" --weight-sync-delta-apply-method "$(WEIGHT_SYNC_DELTA_APPLY_METHOD)"; fi; \
 	python3 scripts/run_cluster_e2e.py "$$@"
 
 # Local Redis (for testing distributed mode):

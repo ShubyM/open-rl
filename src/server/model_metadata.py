@@ -7,17 +7,10 @@ SPARSE_DELTA_VERSION = 2
 
 @dataclass
 class WeightSyncConfig:
-  strategy: str = "delta"
-  delta_format: str = "native"
-  delta_apply_method: str = "patch_in_place"
+  """How the trainer publishes weights each step: sparse deltas or full checkpoints.
+  The sampler reads the file format and applies either."""
 
-  def __post_init__(self) -> None:
-    # Runtime-coordinate deltas are no longer emitted. Legacy format requests
-    # use native coordinates; full_replace requests use full checkpoints.
-    self.delta_format = "native"
-    if self.delta_apply_method == "full_replace":
-      self.strategy = "full"
-      self.delta_apply_method = "patch_in_place"
+  strategy: str = "delta"
 
   @classmethod
   def from_env(cls, env: Any = None) -> "WeightSyncConfig":
@@ -27,15 +20,7 @@ class WeightSyncConfig:
     strategy = (get_val("OPEN_RL_WEIGHT_SYNC_STRATEGY") or "delta").lower()
     if strategy not in ("delta", "full"):
       strategy = "delta"
-
-    apply_method = (get_val("OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD") or "patch_in_place").lower()
-    if apply_method not in ("patch_in_place", "full_replace"):
-      apply_method = "patch_in_place"
-
-    return cls(
-      strategy=strategy,
-      delta_apply_method=apply_method,
-    )
+    return cls(strategy=strategy)
 
 
 def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
@@ -48,17 +33,7 @@ def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
   strategy = (get_header("x-open-rl-weight-sync-strategy") or "delta").lower()
   if strategy not in ("delta", "full"):
     strategy = "delta"
-
-  delta_apply_method = (
-    get_header("x-open-rl-weight-sync-delta-apply-method") or get_header("x-open-rl-weight-sync-apply-method") or "patch_in_place"
-  ).lower()
-  if delta_apply_method not in ("patch_in_place", "full_replace"):
-    delta_apply_method = "patch_in_place"
-
-  return WeightSyncConfig(
-    strategy=strategy,
-    delta_apply_method=delta_apply_method,
-  )
+  return WeightSyncConfig(strategy=strategy)
 
 
 @dataclass
@@ -80,11 +55,7 @@ class TrainingModelMetadata:
   def from_dict(cls, data: dict[str, Any]) -> "TrainingModelMetadata":
     raw_cfg = data.get("weight_sync_config")
     if isinstance(raw_cfg, dict):
-      cfg = WeightSyncConfig(
-        strategy=raw_cfg.get("strategy", "delta"),
-        delta_format=raw_cfg.get("delta_format", "native"),
-        delta_apply_method=raw_cfg.get("delta_apply_method", "patch_in_place"),
-      )
+      cfg = WeightSyncConfig(strategy=raw_cfg.get("strategy", "delta"))
     elif isinstance(raw_cfg, WeightSyncConfig):
       cfg = raw_cfg
     else:

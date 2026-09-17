@@ -49,7 +49,6 @@ class DeltaWeightSyncTest(unittest.TestCase):
       meta = json.load(f)
     self.assertEqual(meta["format"], "sparse_delta")
     self.assertEqual(meta["format_version"], 2)
-    self.assertEqual(meta["delta_format"], "native")
     self.assertEqual(meta["layer_shapes"], [[10, 10]])
     self.assertEqual(meta["changed_elements"], 2)
     self.assertEqual(meta["total_elements"], 100)
