@@ -74,7 +74,8 @@ class GetInfoTest(ApiServerTest):
     model_id = self.post("create_model", {"base_model": "my-model"}).json()["request_id"]
     queued = self.queued()
     self.assertEqual(queued[0]["model_id"], model_id)
-    self.assertEqual(queued[0]["payload"], {})
+    self.assertEqual(queued[0]["op"], "create_model")
+    self.assertEqual(queued[0]["base_model"], "my-model")
     meta = json.loads(api_server.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "my-model")
 
@@ -116,8 +117,8 @@ class SaveSeqIdZeroTest(ApiServerTest):
     self.post("save_weights_for_sampler", {"model_id": "job-a", "sampling_session_seq_id": 0})
     self.post("save_weights", {"model_id": "job-a", "seq_id": 0})
     queued = self.queued()
-    self.assertEqual(queued[0]["payload"]["sampling_session_id"], "tinker://job-a/sampler_weights/sampler-0")
-    self.assertTrue(queued[1]["payload"]["state_path"].endswith("job-a-samp-0"))
+    self.assertEqual(queued[0]["sampling_session_id"], "tinker://job-a/sampler_weights/sampler-0")
+    self.assertTrue(queued[1]["state_path"].endswith("job-a-samp-0"))
 
 
 class ApiServerPathTest(ApiServerTest):
@@ -154,8 +155,8 @@ class ApiServerPathTest(ApiServerTest):
       self.post("save_weights", {"model_id": "job-a", "path": "step-5"})
       queued = self.queued()
       self.assertEqual(queued[0]["op"], "save_state")
-      self.assertTrue(queued[0]["payload"]["include_optimizer"])
-      saved = api_server.translate_future_result({"type": "state_saved", "path": queued[0]["payload"]["state_path"]})
+      self.assertTrue(queued[0]["include_optimizer"])
+      saved = api_server.translate_future_result({"type": "state_saved", "path": queued[0]["state_path"]})
     self.assertEqual(saved, {"type": "save_weights", "path": "tinker://job-a/weights/step-5"})
 
   def test_weights_info_reads_the_checkpoint_on_disk(self) -> None:
@@ -210,9 +211,12 @@ class ProtobufWireTest(unittest.TestCase):
 
     self.assertEqual(from_proto["op"], "forward_backward")
     self.assertEqual(from_proto["model_id"], "model-abc")
-    self.assertEqual(from_proto["payload"], from_json["payload"])
-    self.assertEqual(from_proto["payload"]["loss_fn"], "importance_sampling")
-    self.assertEqual(from_proto["payload"]["loss_config"], {"clip_range": 0.2, "kl_coeff": 0.01, "mode": "token"})
+    self.assertEqual(
+      {k: v for k, v in from_proto.items() if k not in ("request_id", "trace_context")},
+      {k: v for k, v in from_json.items() if k not in ("request_id", "trace_context")},
+    )
+    self.assertEqual(from_proto["loss_fn"], "importance_sampling")
+    self.assertEqual(from_proto["loss_config"], {"clip_range": 0.2, "kl_coeff": 0.01, "mode": "token"})
 
   def test_forward_only_reaches_the_worker_from_both_routes(self) -> None:
     from server.proto import tinker_public_pb2 as pb
@@ -222,17 +226,17 @@ class ProtobufWireTest(unittest.TestCase):
     self.assertEqual(response.status_code, 200, response.text)
     queued = self._queued()[0]
     self.assertEqual(queued["op"], "forward_backward")
-    self.assertTrue(queued["payload"]["forward_only"])
+    self.assertTrue(queued["forward_only"])
 
     legacy = self.client.post("/api/v1/forward", json={"model_id": "model-abc", "forward_input": {"data": [], "loss_fn": "cross_entropy"}})
     self.assertEqual(legacy.status_code, 200, legacy.text)
-    self.assertTrue(self._queued()[0]["payload"]["forward_only"])
+    self.assertTrue(self._queued()[0]["forward_only"])
 
     train = self.client.post(
       "/api/v1/forward_backward", json={"model_id": "model-abc", "forward_backward_input": {"data": [], "loss_fn": "cross_entropy"}}
     )
     self.assertEqual(train.status_code, 200, train.text)
-    self.assertFalse(self._queued()[0]["payload"]["forward_only"])
+    self.assertFalse(self._queued()[0]["forward_only"])
 
   def test_bad_bodies_are_client_errors_not_500s(self) -> None:
     garbage = self.client.post("/api/v1/forward_backward", content=b"\xff\xfe not proto", headers={"Content-Type": "application/x-protobuf"})
