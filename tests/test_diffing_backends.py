@@ -7,7 +7,8 @@ import unittest
 import torch
 import torch.nn as nn
 
-from training.fft_trainer_worker import FFTTrainingWorker
+from server.model_metadata import WeightSyncConfig
+from training.fft_trainer_worker import FFTTrainer
 
 
 class DummyModel(nn.Module):
@@ -25,17 +26,15 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
   def tearDown(self):
     shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-  def _create_worker_and_modify(self) -> FFTTrainingWorker:
+  def build_trainer_and_modify(self) -> FFTTrainer:
     torch.manual_seed(42)
     model = DummyModel().to(self.device)
-    worker = FFTTrainingWorker()
-    worker.base_model_name = "dummy"
-    worker.model = model
-    # save_state_delta asserts the worker is offloaded when cpu_offload=True
+    params = [p for p in model.parameters() if p.requires_grad]
+    # save_state_delta asserts the trainer is offloaded when cpu_offload=True
     # (the default since the time-slicing campaigns); this test exercises the
     # diffing math, not the offload lifecycle.
-    worker.cpu_offload = False
-    worker.prepare_model_for_training()
+    trainer = FFTTrainer("dummy", model, params, None, "dummy", cpu_offload=False, weight_sync_cfg=WeightSyncConfig(strategy="delta"))
+    trainer.prepare_model_for_training()
 
     # Modify specific elements
     with torch.no_grad():
@@ -43,9 +42,9 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
       model.fc1.weight[3, 5] -= 0.75
       model.fc2.weight[2, 2] += 2.0
 
-    return worker
+    return trainer
 
-  def _read_metadata(self, save_dir: str) -> dict:
+  def read_metadata(self, save_dir: str) -> dict:
     # save_state_delta returns only {path, density_pct}; the full accounting
     # (changed_elements, layer_names, ...) is persisted in metadata.json.
     with open(os.path.join(save_dir, "metadata.json")) as f:
@@ -53,17 +52,16 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
 
   def test_streamed_diffing_optim_step_and_multi_save_idempotency(self):
     """Verifies optim_step streams diff to _latest_delta_tensors and multiple saves read it non-destructively."""
-    worker = self._create_worker_and_modify()
-    worker.weight_sync_strategy = "delta"
-    worker.optim_step({})
+    trainer = self.build_trainer_and_modify()
+    trainer.optim_step({})
 
     save_dir_1 = os.path.join(self.temp_dir, "save_optim_1")
-    worker.save_state_delta("dummy", save_dir_1, kind="sampler")
-    meta_1 = self._read_metadata(save_dir_1)
+    trainer.save_state_delta("dummy", save_dir_1, kind="sampler")
+    meta_1 = self.read_metadata(save_dir_1)
 
     save_dir_2 = os.path.join(self.temp_dir, "save_optim_2")
-    worker.save_state_delta("dummy", save_dir_2, kind="state")
-    meta_2 = self._read_metadata(save_dir_2)
+    trainer.save_state_delta("dummy", save_dir_2, kind="state")
+    meta_2 = self.read_metadata(save_dir_2)
 
     self.assertEqual(meta_1["changed_elements"], 3)
     self.assertEqual(meta_1["changed_elements"], meta_2["changed_elements"])
@@ -71,14 +69,14 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
 
   def test_streamed_diffing_empty_delta_fallback(self):
     """Verifies save_state_delta before optim_step emits an exact O(1) empty delta."""
-    worker = self._create_worker_and_modify()
+    trainer = self.build_trainer_and_modify()
     save_dir = os.path.join(self.temp_dir, "save_empty")
-    worker.save_state_delta("dummy", save_dir, kind="sampler")
-    meta = self._read_metadata(save_dir)
+    trainer.save_state_delta("dummy", save_dir, kind="sampler")
+    meta = self.read_metadata(save_dir)
 
     self.assertEqual(meta["changed_elements"], 0)
-    self.assertEqual(meta["total_elements"], worker.total_model_elements)
-    self.assertEqual(meta["layer_names"], worker.model_layer_names)
+    self.assertEqual(meta["total_elements"], trainer.total_model_elements)
+    self.assertEqual(meta["layer_names"], trainer.model_layer_names)
 
 
 if __name__ == "__main__":

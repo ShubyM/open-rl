@@ -85,6 +85,10 @@ class SaveWeights(Command):
   alias: str | None = None
 
 
+class DeleteModel(Command):
+  op: Literal["delete_model"] = "delete_model"
+
+
 class Shutdown(Command):
   op: Literal["shutdown_workers"] = "shutdown_workers"
   request_id: str = SHUTDOWN_REQUEST_ID
@@ -100,9 +104,14 @@ TrainingCommand = Annotated[
   | LoadWeights
   | SaveWeightsForSampler
   | SaveWeights
+  | DeleteModel
   | Shutdown,
   Field(discriminator="op"),
 ]
+
+# Commands whose work touches the model on the GPU. The rest are saves that a
+# worker may serve from the host; see TrainingWorker.save_needs_gpu.
+GPU_COMMANDS = (CreateModel, CreateModelFromState, ForwardBackward, OptimStep, Sample, LoadWeights)
 
 command_adapter: TypeAdapter[TrainingCommand] = TypeAdapter(TrainingCommand)
 

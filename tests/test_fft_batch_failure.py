@@ -1,3 +1,7 @@
+"""A dedicated worker's batch either answers every request or fails every
+request it did not answer, and a worker the time slicer could not park exits
+without giving its grant back."""
+
 import asyncio
 import contextlib
 import os
@@ -5,7 +9,9 @@ import unittest
 from unittest.mock import patch
 
 from server.store import InMemoryStore
-from server.training_requests_processor import FFTTrainingRequestsProcessor
+from server.training_requests_processor import Deployment, TrainingRequestsProcessor
+from training import commands
+from training.trainer_worker import TrainingWorker
 
 
 class SlicerStub:
@@ -25,14 +31,15 @@ class SlicerStub:
     pass
 
 
-class BrokenWorker:
-  cpu_offload = True
+class BrokenWorker(TrainingWorker):
+  single_model = True
+  full_parameter = True
 
-  def wake_up(self):
+  def wake_up(self) -> None:
     raise RuntimeError("CUDA out of memory")
 
-  def sleep(self):
-    pass
+  def save_needs_gpu(self) -> bool:
+    return False
 
 
 class BatchStore(InMemoryStore):
@@ -51,12 +58,16 @@ class BatchStore(InMemoryStore):
 
 def processor(store, slicer):
   with patch.dict(os.environ, {"REDIS_URL": "redis://test"}):
-    return FFTTrainingRequestsProcessor(store, BrokenWorker(), "run-a", slicer)
+    return TrainingRequestsProcessor(store, BrokenWorker(), Deployment(model_id="run-a"), slicer)
 
 
 class FFTBatchFailureTest(unittest.TestCase):
   def test_a_batch_that_fails_before_answering_fails_every_request(self) -> None:
-    store = BatchStore([{"request_id": "fb-1", "op": "forward_backward"}, {"request_id": "os-1", "op": "optim_step"}])
+    batch = [
+      commands.wire(commands.ForwardBackward(request_id="fb-1", model_id="run-a", data=[])),
+      commands.wire(commands.OptimStep(request_id="os-1", model_id="run-a")),
+    ]
+    store = BatchStore(batch)
     proc = processor(store, SlicerStub())
     with self.assertRaises(RuntimeError):
       asyncio.run(proc.run_once())
@@ -66,7 +77,7 @@ class FFTBatchFailureTest(unittest.TestCase):
       self.assertIn("CUDA out of memory", result["error_message"])
 
   def test_a_worker_the_slicer_could_not_park_exits_without_unregistering(self) -> None:
-    store = BatchStore([{"request_id": "sv-1", "op": "save_weights"}])
+    store = BatchStore([commands.wire(commands.SaveWeights(request_id="sv-1", model_id="run-a"))])
     slicer = SlicerStub()
     proc = processor(store, slicer)
     exits = []
@@ -74,11 +85,11 @@ class FFTBatchFailureTest(unittest.TestCase):
     async def record_exit(unregister=True):
       exits.append(unregister)
 
-    async def handled(request, model_id):
+    async def handled(command):
       slicer.faulted = "checkpoint failed for workload run-a; it still holds the accelerator and must exit"
-      return request["request_id"], {"type": "SaveWeightsResponse"}
+      return command.request_id, {"type": "SaveWeightsResponse"}
 
-    proc.handle_request = handled
+    proc.handle = handled
     proc.exit_gracefully = record_exit
     asyncio.run(proc.run_once())
     self.assertEqual(store.futures["sv-1"]["type"], "SaveWeightsResponse")

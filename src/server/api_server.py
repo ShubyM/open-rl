@@ -513,8 +513,7 @@ async def lifespan(_: FastAPI):
       from server import training_requests_processor
 
       worker = training_requests_processor.LoraTrainingWorker()
-      if base_model:
-        await asyncio.to_thread(worker.load_base_model, base_model)
+      await asyncio.to_thread(worker.initialize, base_model)
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
   reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
   try:
@@ -647,6 +646,12 @@ async def delete_model(req: ModelRequest):
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
     if worker_manager is not None:
       await asyncio.to_thread(worker_manager.release, model_id)
+  elif is_lora:
+    # A shared LoRA worker keeps hosting the adapter until told to drop it; a
+    # dedicated FFT worker owns its process and is shut down above instead.
+    # enqueue resolves the base-model tenant set the shared worker drains.
+    print(f"[API_SERVER] Requesting deletion of adapter {model_id}...")
+    await enqueue(commands.DeleteModel(request_id=f"delete-{model_id}", model_id=model_id))
   now = time.time()
   await store.update_job_metadata(model_id, {"status": "completed", "completed_at": now, "updated_at": now})
   return {"status": "ok"}
