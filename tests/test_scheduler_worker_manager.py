@@ -4,7 +4,7 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
-from server import gateway
+from server import api_server
 from server.estimator import footprint
 from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager
 from server.store import InMemoryStore
@@ -172,9 +172,9 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(list(self.api.existing), ["lora-qwen-qwen3-0-6b-0-trainer"])
 
   def test_release_owner_finds_workloads_by_their_spec_not_their_labels(self) -> None:
-    # A workload from before this gateway carries only the managed-by label.
+    # A workload from before this API server carries only the managed-by label.
     self.api.existing["fft-old-trainer"] = {
-      "metadata": {"name": "fft-old-trainer", "labels": {"app.kubernetes.io/managed-by": "open-rl-gateway"}},
+      "metadata": {"name": "fft-old-trainer", "labels": {"app.kubernetes.io/managed-by": "open-rl-api-server"}},
       "spec": {"ownerID": "old", "modelID": "old"},
     }
     self.assertEqual(self.manager.release_owner("old"), {"old"})
@@ -217,12 +217,12 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
     with (
       patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}),
       patch("server.store.get_store", return_value=store),
-      patch.object(gateway, "store", store),
-      patch.object(gateway, "get_store", return_value=store),
-      patch.object(gateway, "worker_manager", SchedulerWorkerManager(custom_api=api)),
+      patch.object(api_server, "store", store),
+      patch.object(api_server, "get_store", return_value=store),
+      patch.object(api_server, "worker_manager", SchedulerWorkerManager(custom_api=api)),
     ):
       for model_id in ("lora-a", "fft-a", "lora-b"):
-        await gateway.create_sampling_session({"model_path": f"tinker://{model_id}/sampler_weights/checkpoint"})
+        await api_server.create_sampling_session({"model_path": f"tinker://{model_id}/sampler_weights/checkpoint"})
 
     self.assertEqual(len(api.created), 2, "LoRA sessions should reuse one sampler while FFT gets its own")
     lora, fft = api.created

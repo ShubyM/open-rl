@@ -50,7 +50,7 @@ the loop.
 We expect frontier AI research to become increasingly automated, and abstracting away the
 infrastructure is groundwork for that. The [autoresearch recipes](examples/autoresearch/README.md),
 adapted from [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), run parallel
-experiments for parameter sweeps and reward-signal improvement against a shared OpenRL gateway.
+experiments for parameter sweeps and reward-signal improvement against a shared OpenRL API server.
 
 ## What OpenRL is not
 

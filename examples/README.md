@@ -49,7 +49,7 @@ See [Harvey LAB RL](harvey_labs) for setup and recipe options.
 * **[Text-to-SQL RL](rl/text-to-sql):** Runs the Gemma 4 SFT+RL recipe with SQL execution rewards and curve plotting.
 
 ### Autoresearch
-* **[Autoresearch Demo](autoresearch):** Runs code-RL researchers against the same OpenRL gateway using cookbook DeepCoder rewards, Sandbox Fusion, and optional Agent Sandbox CRDs.
+* **[Autoresearch Demo](autoresearch):** Runs code-RL researchers against the same OpenRL API server using cookbook DeepCoder rewards, Sandbox Fusion, and optional Agent Sandbox CRDs.
 
 ### Tinker Cookbook
 * **[Tinker Cookbook Recipes](tinker-cookbook):** Examples showing how to run [Tinker Cookbook](https://github.com/thinking-machines-lab/tinker-cookbook) recipes with OpenRL.

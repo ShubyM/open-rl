@@ -2,7 +2,7 @@
 
 **Author:** Open-RL Engineering Team  
 **Status:** Approved / Implemented (`v0.3.7` – `v0.3.11`)  
-**Target Component:** Gateway Server, vLLM Sampler, Trainer Engine, Delta Weight Transfer Engine  
+**Target Component:** API server Server, vLLM Sampler, Trainer Engine, Delta Weight Transfer Engine  
 
 ---
 

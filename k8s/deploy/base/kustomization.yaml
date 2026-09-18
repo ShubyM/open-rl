@@ -8,7 +8,7 @@ resources:
   - ../../../scheduler/deploy/base
   - rbac.yaml
   - redis.yaml
-  - gateway.yaml
+  - api-server.yaml
 
 generatorOptions:
   disableNameSuffixHash: true

@@ -6,11 +6,11 @@ Tinker SDK 0.25.0 and later send ``POST /api/v1/forward_backward`` as
 Everything else on the API stays JSON.
 
 This module converts between those messages and the JSON-shaped dicts the
-gateway already queues and the workers already produce, so nothing past the
-gateway edge changes. The schema is vendored in ``server.proto``; see
+API server already queues and the workers already produce, so nothing past the
+API server edge changes. The schema is vendored in ``server.proto``; see
 ``scripts/sync_tinker_proto.sh``.
 
-Only the stdlib ``array`` module is used for byte packing. The gateway image
+Only the stdlib ``array`` module is used for byte packing. The API server image
 does not ship numpy.
 """
 
@@ -115,7 +115,7 @@ def _decode_loss_config(msg: pb.ForwardBackwardRequest) -> dict[str, Any]:
 def decode_forward_backward(body: bytes) -> dict[str, Any]:
   """Decode a protobuf ``ForwardBackwardRequest`` into the JSON request shape.
 
-  The result matches what the SDK sends on the JSON path, so the gateway
+  The result matches what the SDK sends on the JSON path, so the API server
   handlers treat both encodings the same way.
   """
   msg = pb.ForwardBackwardRequest()

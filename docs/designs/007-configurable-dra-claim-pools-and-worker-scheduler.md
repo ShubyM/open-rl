@@ -2,7 +2,7 @@
 
 **Author:** Open-RL Engineering Team  
 **Status:** Proposed Design (`v1.0.0`)  
-**Target Component:** Multi-Tenant Gateway, `KubernetesFFTWorkerManager` (`k8s_worker_manager.py`), K8s CRD Controller (`OpenRLWorkerPool`, `OpenRLWorker`)  
+**Target Component:** Multi-Tenant API server, `KubernetesFFTWorkerManager` (`k8s_worker_manager.py`), K8s CRD Controller (`OpenRLWorkerPool`, `OpenRLWorker`)  
 **Target Manifests:** `k8s/deploy/distributed-fft-timeslice/`, `k8s/crd/`  
 
 ---
@@ -34,7 +34,7 @@ This design document specifies a **Configurable DRA Claim Pool and Worker Placem
 - **Decouple Hardware from Templates**: Move away from hardcoded claim names in pod templates.
 - **Support Existing & Managed Claims**: Allow cluster operators to either register existing pre-created K8s `ResourceClaim`s or let Open-RL auto-provision claims from K8s `ResourceClaimTemplate` specs.
 - **Strict Worker Packing & Capping**: Enforce configurable worker limits per claim with `binpack` or `spread` allocation policies.
-- **Declarative Scheduling**: Provide CRD-based scheduling (`OpenRLWorkerPool` and `OpenRLWorker`) to prevent scheduling race conditions across replicated Gateway instances.
+- **Declarative Scheduling**: Provide CRD-based scheduling (`OpenRLWorkerPool` and `OpenRLWorker`) to prevent scheduling race conditions across replicated API server instances.
 
 ---
 
@@ -42,7 +42,7 @@ This design document specifies a **Configurable DRA Claim Pool and Worker Placem
 
 ```text
                                   ┌───────────────────────────────────────────────┐
-                                  │              Open-RL Gateway                  │
+                                  │              Open-RL API server                  │
                                   │           (Job API / Metadata)                │
                                   └──────────────────────┬────────────────────────┘
                                                          │
@@ -252,8 +252,8 @@ Before deploying full K8s CRD Controllers, upgrade `k8s_worker_manager.py` with 
 
 ### Phase 2: Full Kubernetes CRD Controller Architecture
 1. **Define CRD Manifests**: Add `OpenRLWorkerPool` and `OpenRLWorker` OpenAPI v3 schemas under `k8s/crd/`.
-2. **Build Controller Loop**: Implement controller reconciliation loop (using Go `controller-runtime` or Python `kopf`) running alongside the Gateway.
-3. **Stateless Gateway Integration**: Update Gateway worker launch routes to create/watch `OpenRLWorker` custom resources instead of calling `CoreV1Api` directly.
+2. **Build Controller Loop**: Implement controller reconciliation loop (using Go `controller-runtime` or Python `kopf`) running alongside the API server.
+3. **Stateless API server Integration**: Update API server worker launch routes to create/watch `OpenRLWorker` custom resources instead of calling `CoreV1Api` directly.
 
 ---
 

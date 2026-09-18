@@ -45,7 +45,7 @@ def parse_datum(raw: dict[str, Any]) -> Datum:
 
 
 def describe_requests(batch: list[dict[str, Any]]) -> str:
-  """`op:request_id` per request, matching the gateway's enqueue log line."""
+  """`op:request_id` per request, matching the API server's enqueue log line."""
   return ", ".join(f"{r.get('op')}:{r.get('request_id')}" for r in batch)
 
 
@@ -321,7 +321,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     time_slicer: TimeSlicerClient,
   ):
     if not os.getenv("REDIS_URL"):
-      raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the gateway")
+      raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the API server")
     if not model_id:
       raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
 

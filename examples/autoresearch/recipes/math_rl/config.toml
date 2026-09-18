@@ -1,5 +1,5 @@
 # Editable Open-RL math RL, inspired by vivekvkashyap/autoresearch-rl.
-# Researchers tune only this file. The shared Open-RL gateway/trainer stack owns GPU placement.
+# Researchers tune only this file. The shared Open-RL API server/trainer stack owns GPU placement.
 
 model = "Qwen/Qwen2.5-0.5B-Instruct"
 renderer = "qwen3_instruct"

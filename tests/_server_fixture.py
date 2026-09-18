@@ -1,4 +1,4 @@
-"""Shared helpers for tests that need a local Open-RL gateway."""
+"""Shared helpers for tests that need a local Open-RL API server."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def openrl_server(
     "python",
     "-m",
     "uvicorn",
-    "server.gateway:app",
+    "server.api_server:app",
     "--host",
     "127.0.0.1",
     "--port",

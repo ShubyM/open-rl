@@ -14,7 +14,7 @@ Many Makefile targets that need to interact with the remote machine accept a `RE
 
 Open-RL uses `uv` for environment isolation. There are two primary environments:
 
-- **Server-Side Environment (`src/server`)**: Contains the gateway server and worker controllers.
+- **Server-Side Environment (`src/server`)**: Contains the API server server and worker controllers.
 - **Client/Examples Environment (`examples`)**: Contains recipes, client-side SDK compatibility checks, and E2E integration test scripts.
 
 Always run tasks using the appropriate Makefile targets (such as `make server`, `make vllm`, or `make test`). If you must execute custom scripts, make sure to target the correct environment using the appropriate project flag (e.g., `uv --project examples ...` or `uv --project src/server ...`).
@@ -59,7 +59,7 @@ make test
 E2E tests boot up a client harness and run actual SFT/RL training workflows against the Open-RL backend.
 
 ### Option A: Running In-Cluster via Kubernetes (`Preferred`)
-When testing against a Kubernetes GPU cluster (e.g., GKE), the preferred and most reliable way to execute E2E integration benchmarks is using the `make cluster-e2e` target. This deploys an in-cluster client job (`open-rl-e2e-client`) that communicates directly with `open-rl-gateway-service:8000`:
+When testing against a Kubernetes GPU cluster (e.g., GKE), the preferred and most reliable way to execute E2E integration benchmarks is using the `make cluster-e2e` target. This deploys an in-cluster client job (`open-rl-e2e-client`) that communicates directly with `open-rl-api-server-service:8000`:
 
 ```bash
 make cluster-e2e IMAGE_TAG=$(cat VERSION 2>/dev/null || echo latest) \
@@ -87,7 +87,7 @@ kubectl delete pods -l timeslice.io/group=samplers --ignore-not-found
 ### Option B: Local Port-Forward Execution (`Alternative / Local Dev`)
 If running a client script on a local machine against a remote Kubernetes cluster, use port-forwarding:
 ```bash
-pkill -9 -f port-forward 2>/dev/null; nohup sh -c 'while true; do kubectl port-forward svc/open-rl-gateway-service 8000:8000 >/dev/null 2>&1; sleep 1; done' >/dev/null 2>&1 &
+pkill -9 -f port-forward 2>/dev/null; nohup sh -c 'while true; do kubectl port-forward svc/open-rl-api-server-service 8000:8000 >/dev/null 2>&1; sleep 1; done' >/dev/null 2>&1 &
 make test e2e <scenario_name> BASE_URL=http://127.0.0.1:8000
 ```
 
@@ -167,16 +167,16 @@ kubectl delete pods -l timeslice.io/group=samplers --ignore-not-found
 ### Kustomize Deployment & Base Manifest Best Practices (`Tip`)
 To prevent noisy container image tag diffs inside pull requests while ensuring clean deployments across Kubernetes environments, always follow this Kustomize pattern:
 1. **Deploy via Kustomize (`-k`)**: Always apply directory manifests via `kubectl apply -k <directory>` rather than `kubectl apply -f <directory>`.
-2. **Keep Base YAMLs at `:latest` or Placeholder**: In all base/rendered YAML template files (`04-gateway.yaml`, `05-worker-pod-template.yaml`, `07-accel-timeslicer-daemonset.yaml`, `09-sampler-pod-template.yaml`, `04-deployment.yaml`, etc.), keep container image tags permanently set to a static placeholder (`e.g. image: ghcr.io/gke-labs/open-rl/server:latest` or `/gateway:latest`). **Never bump image tags inside these base template files.**
+2. **Keep Base YAMLs at `:latest` or Placeholder**: In all base/rendered YAML template files (`04-api-server.yaml`, `05-worker-pod-template.yaml`, `07-accel-timeslicer-daemonset.yaml`, `09-sampler-pod-template.yaml`, `04-deployment.yaml`, etc.), keep container image tags permanently set to a static placeholder (`e.g. image: ghcr.io/gke-labs/open-rl/server:latest` or `/API server:latest`). **Never bump image tags inside these base template files.**
 3. **Single Source of Truth for Version Bumps**: When releasing or bumping image versions (`e.g. 0.1.75 -> 0.1.76`), modify **only**:
    - `VERSION` (`at repository root`)
    - The `newTag:` field inside the target environment's `kustomization.yaml` (`e.g. k8s/deploy/distributed-fft-timeslice/kustomization.yaml`)
 
-### Applying Manifest Edits & Restarting the Gateway (Dev Mode)
-Since this is a development-only mode, formal rolling updates (which include waiting for rollout status) are not necessary. Simply apply the manifests via Kustomize and delete the active gateway pod to trigger an immediate, fast recreation:
+### Applying Manifest Edits & Restarting the API server (Dev Mode)
+Since this is a development-only mode, formal rolling updates (which include waiting for rollout status) are not necessary. Simply apply the manifests via Kustomize and delete the active API server pod to trigger an immediate, fast recreation:
 ```bash
 kubectl apply -k k8s/deploy/distributed-fft-timeslice/
-kubectl delete pods -l app=open-rl-gateway
+kubectl delete pods -l app=open-rl-api-server
 ```
 
 ### Resetting the Time-Slicer DaemonSet (Dev Mode)
@@ -185,10 +185,10 @@ If worker pods crash or lose their TCP connection (`9753`) to the time-slicer da
 kubectl delete pods -l app=open-rl-accel-timeslicer --grace-period=0 --force
 ```
 
-### Monitoring Live Training Progression inside Gateway Pod
-When a cluster benchmark job (`make cluster-e2e ...`) is running, live step-by-step metrics (`metrics.jsonl`) are written to shared NFS storage (`/mnt/shared/open-rl/runs/fft-gsm8k-rl/open-rl-tmp/...`). To inspect a clean progression table of live metrics (`Step | Accuracy | Reward | Sampling | Train Step | Save Delta | Total Step Time`) directly inside the Gateway pod:
+### Monitoring Live Training Progression inside API server Pod
+When a cluster benchmark job (`make cluster-e2e ...`) is running, live step-by-step metrics (`metrics.jsonl`) are written to shared NFS storage (`/mnt/shared/open-rl/runs/fft-gsm8k-rl/open-rl-tmp/...`). To inspect a clean progression table of live metrics (`Step | Accuracy | Reward | Sampling | Train Step | Save Delta | Total Step Time`) directly inside the API server pod:
 ```bash
-kubectl exec deployment/open-rl-gateway -- python3 -c '
+kubectl exec deployment/open-rl-api-server -- python3 -c '
 import json, os
 metrics_path = "/mnt/shared/open-rl/runs/fft-gsm8k-rl/open-rl-tmp/fft_gsm8k_rl/metrics.jsonl"
 if os.path.exists(metrics_path):
@@ -212,9 +212,9 @@ if os.path.exists(metrics_path):
 
 ### Standard Benchmark Run Archive Convention (`runs/` Directory)
 When an end-to-end benchmark campaign completes, always archive the results into the repository's `runs/` directory using standard `<date>_<scenario>_<details>` naming (`e.g. runs/2026-07-11_qwen8b_fft_rl_x2_192batch_30steps/`):
-1. Save raw telemetry logs (`metrics.jsonl`) from the Gateway pod:
+1. Save raw telemetry logs (`metrics.jsonl`) from the API server pod:
    ```bash
-   kubectl exec deployment/open-rl-gateway -- cat /mnt/shared/open-rl/runs/fft-gsm8k-rl/open-rl-tmp/fft_gsm8k_rl/metrics.jsonl > runs/<run_dir>/metrics.jsonl
+   kubectl exec deployment/open-rl-api-server -- cat /mnt/shared/open-rl/runs/fft-gsm8k-rl/open-rl-tmp/fft_gsm8k_rl/metrics.jsonl > runs/<run_dir>/metrics.jsonl
    ```
 2. Write a comprehensive markdown benchmark report (`benchmark_report.md`) inside `runs/<run_dir>/` documenting executive findings, full step-by-step progression tables, timing breakdown, and hardware/concurrency performance.
 
