@@ -2,22 +2,38 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
+
+from fastapi.testclient import TestClient
 
 from server import api_server
 from server.store import InMemoryStore
 
 
-class GetInfoTest(unittest.TestCase):
-  def setUp(self) -> None:
-    patcher = patch.object(api_server, "store", InMemoryStore())
-    patcher.start()
-    self.addCleanup(patcher.stop)
+class ApiServerTest(unittest.TestCase):
+  """Requests go through the ASGI app, so routing, body validation and the
+  error handlers are the ones the tinker client sees."""
 
+  def setUp(self) -> None:
+    self.enterContext(patch.object(api_server, "store", InMemoryStore()))
+    self.client = TestClient(api_server.app)
+
+  def post(self, path: str, body: dict, **kwargs):
+    return self.client.post(f"/api/v1/{path}", json=body, **kwargs)
+
+  def post_bytes(self, path: str, body: bytes, media_type: str):
+    return self.client.post(f"/api/v1/{path}", content=body, headers={"Content-Type": media_type})
+
+  def queued(self) -> list[dict]:
+    return asyncio.run(api_server.store.get_requests())
+
+
+class GetInfoTest(ApiServerTest):
   def test_get_info_uses_base_model_env(self) -> None:
     with patch.dict(os.environ, {"BASE_MODEL": "env-model"}, clear=True):
-      info = asyncio.run(api_server.get_info({"model_id": "model-a"}))
+      info = self.post("get_info", {"model_id": "model-a"}).json()
 
     self.assertEqual(info["model_name"], "env-model")
     self.assertEqual(info["model_data"]["tokenizer_id"], "env-model")
@@ -27,9 +43,9 @@ class GetInfoTest(unittest.TestCase):
     meta = json.dumps({"base_model": "google/gemma-4-e2b", "fine_tuning_type": "full"})
     asyncio.run(api_server.store.set_value("open_rl:model_meta:model-g", meta))
     with patch.dict(os.environ, {"BASE_MODEL": "Qwen/Qwen2.5-0.5B"}, clear=True):
-      info = asyncio.run(api_server.get_info({"model_id": "model-g"}))
-      via_sampler_ref = asyncio.run(api_server.get_info({"model_id": "tinker://model-g/sampler_weights/sampler-1"}))
-      unknown = asyncio.run(api_server.get_info({"model_id": "model-unknown"}))
+      info = self.post("get_info", {"model_id": "model-g"}).json()
+      via_sampler_ref = self.post("get_info", {"model_id": "tinker://model-g/sampler_weights/sampler-1"}).json()
+      unknown = self.post("get_info", {"model_id": "model-unknown"}).json()
 
     # The client loads its tokenizer from this name, so it must be the job's model.
     self.assertEqual(info["model_name"], "google/gemma-4-e2b")
@@ -39,39 +55,66 @@ class GetInfoTest(unittest.TestCase):
 
   def test_get_info_404s_without_base_model_env(self) -> None:
     with patch.dict(os.environ, {}, clear=True):
-      response = asyncio.run(api_server.get_info({"model_id": "model-a"}))
+      response = self.post("get_info", {"model_id": "model-a"})
     self.assertEqual(response.status_code, 404)
+    self.assertEqual(response.json(), {"error": "No base model is configured"})
 
   def test_create_model_requires_base_model_payload(self) -> None:
-    response = asyncio.run(api_server.create_model({}))
+    response = self.post("create_model", {})
     self.assertEqual(response.status_code, 400)
+    self.assertEqual(response.json(), {"error": "base_model is required in request payload"})
 
   def test_create_model_accepts_base_model_payload(self) -> None:
-    created = asyncio.run(api_server.create_model({"base_model": "my-model"}))
-    model_id = created["request_id"]
-    queued = asyncio.run(api_server.store.get_requests())
+    model_id = self.post("create_model", {"base_model": "my-model"}).json()["request_id"]
+    queued = self.queued()
     self.assertEqual(queued[0]["model_id"], model_id)
     self.assertEqual(queued[0]["payload"], {})
     meta = json.loads(api_server.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "my-model")
 
 
-class SaveSeqIdZeroTest(unittest.TestCase):
-  def setUp(self) -> None:
-    patcher = patch.object(api_server, "store", InMemoryStore())
-    patcher.start()
-    self.addCleanup(patcher.stop)
+class ErrorShapeTest(ApiServerTest):
+  """Every refused request answers {"error": ...}, whichever layer refused it."""
 
+  def test_an_unknown_route_answers_the_shared_error_shape(self) -> None:
+    response = self.client.get("/api/v1/no_such_endpoint")
+    self.assertEqual(response.status_code, 404)
+    self.assertEqual(response.json(), {"error": "Not Found"})
+
+  def test_a_body_of_the_wrong_shape_is_a_422_that_names_the_field(self) -> None:
+    response = self.post("get_info", {"model_id": ["not", "a", "string"]})
+    self.assertEqual(response.status_code, 422)
+    body = response.json()
+    self.assertEqual(body["error"], "invalid request")
+    self.assertEqual(body["detail"][0]["loc"], ["body", "model_id"])
+    self.assertEqual(body["detail"][0]["input"], ["not", "a", "string"])
+
+  def test_a_binary_body_on_a_json_route_is_a_422_not_a_500(self) -> None:
+    response = self.post_bytes("optim_step", b"\x8a\xff", "application/x-protobuf")
+    self.assertEqual(response.status_code, 422)
+    self.assertEqual(response.json()["detail"][0]["input"], "<2 bytes>")
+
+  def test_http_errors_keep_their_headers_and_body_rules(self) -> None:
+    from fastapi import HTTPException
+
+    throttled = asyncio.run(api_server.http_error(None, HTTPException(status_code=429, detail="slow down", headers={"Retry-After": "3"})))
+    self.assertEqual((throttled.status_code, throttled.headers["retry-after"]), (429, "3"))
+    self.assertEqual(json.loads(throttled.body), {"error": "slow down"})
+    unchanged = asyncio.run(api_server.http_error(None, HTTPException(status_code=304)))
+    self.assertEqual((unchanged.status_code, unchanged.body), (304, b""))
+
+
+class SaveSeqIdZeroTest(ApiServerTest):
   def test_the_first_saves_zero_seq_id_is_kept(self) -> None:
     # The client's counter is 0-based; 0 must not fall back to a timestamp id.
-    asyncio.run(api_server.save_weights_for_sampler({"model_id": "job-a", "sampling_session_seq_id": 0}))
-    asyncio.run(api_server.save_weights({"model_id": "job-a", "seq_id": 0}))
-    queued = asyncio.run(api_server.store.get_requests())
+    self.post("save_weights_for_sampler", {"model_id": "job-a", "sampling_session_seq_id": 0})
+    self.post("save_weights", {"model_id": "job-a", "seq_id": 0})
+    queued = self.queued()
     self.assertEqual(queued[0]["payload"]["sampling_session_id"], "tinker://job-a/sampler_weights/sampler-0")
     self.assertTrue(queued[1]["payload"]["state_path"].endswith("job-a-samp-0"))
 
 
-class ApiServerPathTest(unittest.TestCase):
+class ApiServerPathTest(ApiServerTest):
   def test_checkpoint_state_paths_are_model_scoped(self) -> None:
     old_tmp_dir = api_server.TMP_DIR
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -96,13 +139,14 @@ class ApiServerPathTest(unittest.TestCase):
       self.assertEqual(api_server.tinker_state_path("/elsewhere/final"), "/elsewhere/final")
       # Only weights paths are checkpoints. A sampler path is refused, not resolved under the caller.
       self.assertIsNone(api_server.tinker_checkpoint_dir("tinker://job-a/sampler_weights/sampler-3"))
-      refused = asyncio.run(api_server.load_weights({"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"}))
+      refused = self.post("load_weights", {"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"})
       self.assertEqual(refused.status_code, 400)
+      self.assertIn("is not a tinker://<model>/weights/<name> path", refused.json()["error"])
 
   def test_save_state_keeps_the_optimizer_and_answers_with_a_tinker_path(self) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
-      asyncio.run(api_server.save_weights({"model_id": "job-a", "path": "step-5"}))
-      queued = asyncio.run(api_server.store.get_requests())
+      self.post("save_weights", {"model_id": "job-a", "path": "step-5"})
+      queued = self.queued()
       self.assertEqual(queued[0]["op"], "save_state")
       self.assertTrue(queued[0]["payload"]["include_optimizer"])
       saved = api_server.translate_future_result({"type": "state_saved", "path": queued[0]["payload"]["state_path"]})
@@ -116,19 +160,16 @@ class ApiServerPathTest(unittest.TestCase):
         json.dump({"base_model": "google/gemma-4-e2b", "model_id": "job-a", "has_optimizer": True}, f)
       with open(os.path.join(state_dir, "job-a", "adapter_config.json"), "w") as f:
         json.dump({"r": 8}, f)
-      info = asyncio.run(api_server.weights_info({"tinker_path": "tinker://job-a/weights/step-5"}))
-      missing = asyncio.run(api_server.weights_info({"tinker_path": "tinker://job-a/weights/never"}))
+      info = self.post("weights_info", {"tinker_path": "tinker://job-a/weights/step-5"}).json()
+      missing = self.post("weights_info", {"tinker_path": "tinker://job-a/weights/never"})
     self.assertEqual(info["base_model"], "google/gemma-4-e2b")
     self.assertTrue(info["is_lora"])
     self.assertEqual(info["lora_rank"], 8)
     self.assertEqual(missing.status_code, 404)
+    self.assertEqual(missing.json(), {"error": "No checkpoint at tinker://job-a/weights/never"})
 
   def test_checkpoint_state_paths_accept_explicit_output_directories(self) -> None:
     self.assertEqual(api_server.checkpoint_state_path("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
-
-
-if __name__ == "__main__":
-  unittest.main()
 
 
 class ProtobufWireTest(unittest.TestCase):
@@ -166,6 +207,31 @@ class ProtobufWireTest(unittest.TestCase):
     self.assertEqual(from_proto["payload"], from_json["payload"])
     self.assertEqual(from_proto["payload"]["loss_fn"], "importance_sampling")
     self.assertEqual(from_proto["payload"]["loss_config"], {"clip_range": 0.2, "kl_coeff": 0.01, "mode": "token"})
+
+  def test_large_bodies_decode_and_validate_outside_the_request_thread(self) -> None:
+    from fastapi import Request
+
+    async def check(body: bytes, media: str) -> None:
+      request_thread = threading.get_ident()
+      decode = api_server.decode_forward_backward_body
+
+      def checked_decode(raw: bytes, content_type: str):
+        self.assertNotEqual(threading.get_ident(), request_thread)
+        return decode(raw, content_type)
+
+      async def receive():
+        return {"type": "http.request", "body": body}
+
+      request = Request({"type": "http", "headers": [(b"content-type", media.encode())]}, receive)
+      with patch.object(api_server, "_INLINE_BODY_BYTES", 1), patch.object(api_server, "decode_forward_backward_body", side_effect=checked_decode):
+        parsed = await api_server.forward_backward_body(request)
+      self.assertEqual(parsed.model_id, "model-abc")
+      self.assertEqual(parsed.forward_backward_input.loss_fn, "importance_sampling")
+
+    with open(self.FIXTURE, "rb") as fh:
+      asyncio.run(check(fh.read(), "application/x-protobuf"))
+    with open(self.FIXTURE[:-3] + ".json", "rb") as fh:
+      asyncio.run(check(fh.read(), "application/json"))
 
   def test_forward_only_reaches_the_worker_from_both_routes(self) -> None:
     from server.proto import tinker_public_pb2 as pb
@@ -229,23 +295,22 @@ class ProtobufWireTest(unittest.TestCase):
     self.assertEqual(optim.json()["type"], "optim_step")
 
 
-class SampleSequenceIdsTest(unittest.TestCase):
+class SampleSequenceIdsTest(ApiServerTest):
   """Tinker SDK >= 0.25 asserts that every asample promise carries one
   sequence id per requested sample."""
 
-  def setUp(self) -> None:
-    patcher = patch.object(api_server, "store", InMemoryStore())
-    patcher.start()
-    self.addCleanup(patcher.stop)
-
   def test_asample_promise_carries_one_id_per_sample(self) -> None:
     with patch.object(api_server, "get_sampler_backend", return_value="torch"):
-      promise = asyncio.run(api_server.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}))
+      promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}).json()
     self.assertEqual(len(promise["sample_sequence_ids"]), 3)
     self.assertEqual(len(set(promise["sample_sequence_ids"])), 3)
     self.assertTrue(all(sid.startswith(promise["request_id"]) for sid in promise["sample_sequence_ids"]))
 
   def test_asample_defaults_to_a_single_sample(self) -> None:
     with patch.object(api_server, "get_sampler_backend", return_value="torch"):
-      promise = asyncio.run(api_server.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}))
+      promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)
+
+
+if __name__ == "__main__":
+  unittest.main()

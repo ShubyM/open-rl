@@ -16,10 +16,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from fastapi.utils import is_body_allowed_for_status_code
 from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from pydantic import AliasChoices, BaseModel, Field, ValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import proto_codec
 from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config
@@ -81,6 +84,99 @@ logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
+
+
+# *** Request bodies ***
+# Only the fields a handler reads. Unknown fields the SDK sends are ignored.
+# Fields the tinker API requires are still checked by hand in the handler so a
+# missing one answers 400 with the same body as before, not FastAPI's 422.
+
+
+class SessionHeartbeatRequest(BaseModel):
+  session_id: str | None = None
+
+
+class CreateModelRequest(BaseModel):
+  base_model: str | None = None
+  session_id: str | None = None
+  lora_config: dict[str, Any] | None = None
+  full_config: dict[str, Any] | None = None
+
+
+class CreateModelFromStateRequest(CreateModelRequest):
+  state_path: str | None = None
+  restore_optimizer: bool = False
+
+
+class ModelRequest(BaseModel):
+  model_id: str | None = None
+
+
+class ForwardBackwardInput(BaseModel):
+  data: list[dict[str, Any]] = []
+  loss_fn: str = "cross_entropy"
+  loss_fn_config: dict[str, Any] | None = None
+
+
+class ForwardBackwardRequest(ModelRequest):
+  forward_backward_input: ForwardBackwardInput | None = None
+  # The pre-0.25 forward route sent the batch as forward_input.
+  forward_input: ForwardBackwardInput | None = None
+  forward_only: bool = False
+
+
+class RetrieveFutureRequest(BaseModel):
+  request_id: str | None = None
+
+
+class OptimStepRequest(ModelRequest):
+  adam_params: dict[str, Any] = {}
+
+
+class SaveWeightsForSamplerRequest(ModelRequest):
+  sampling_session_seq_id: int | str | None = None
+  name: str | None = None
+  alias: str | None = None
+  path: str | None = None
+
+
+class SaveWeightsRequest(ModelRequest):
+  seq_id: int | str | None = None
+  path: str | None = None
+
+
+class LoadWeightsRequest(ModelRequest):
+  path: str | None = None
+  optimizer: bool = False
+
+
+class WeightsInfoRequest(BaseModel):
+  tinker_path: str = ""
+
+
+class CreateSamplingSessionRequest(BaseModel):
+  model_path: str | None = None
+  base_model: str | None = None
+  model_id: str | None = None
+  session_id: str | None = None
+
+
+class SamplingParams(BaseModel):
+  max_tokens: int | None = 20
+  temperature: float | None = 1.0
+  stop: Any = None
+  top_p: float | None = 1.0
+  top_k: int | None = -1
+
+
+class AsampleRequest(BaseModel):
+  prompt: dict[str, Any] = {}
+  sampling_params: SamplingParams = SamplingParams()
+  num_samples: int = 1
+  # The SDK has sent this under both names.
+  prompt_logprobs: bool = Field(default=False, validation_alias=AliasChoices("prompt_logprobs", "include_prompt_logprobs"))
+  model_id: str | None = None
+  sampling_session_id: str | None = None
 
 
 # *** Helpers ***
@@ -187,28 +283,27 @@ def is_sampler_weights_ref(model_id: str | None) -> bool:
 
 
 async def _extract_and_persist_model_metadata(
-  req: dict[str, Any],
+  req: CreateModelRequest,
   request: Request | None = None,
   default_fine_tuning_type: str = "lora",
 ) -> str:
   """Extract and normalize model configuration from headers and payload, persisting TrainingModelMetadata exactly once."""
-  base_model = req.get("base_model")
+  base_model = req.base_model
   if not base_model and default_fine_tuning_type != "restored":
     raise ValueError("base_model is required in request payload")
 
-  full_config = dict(req.get("full_config") or {})
-  lora_config = dict(req.get("lora_config") or {})
+  full_config = dict(req.full_config or {})
+  lora_config = dict(req.lora_config or {})
 
-  headers = request.headers if (request and hasattr(request, "headers")) else {}
+  headers = request.headers if request is not None else {}
   weight_sync_cfg = extract_weight_sync_config(headers)
 
   fine_tuning_type = default_fine_tuning_type
-  if request and hasattr(request, "headers") and "x-open-rl-fine-tuning-type" in request.headers:
-    h_val = (request.headers.get("x-open-rl-fine-tuning-type") or "").lower()
-    if h_val == "full":
-      fine_tuning_type = "full"
-    elif h_val == "lora":
-      fine_tuning_type = "lora"
+  h_val = (headers.get("x-open-rl-fine-tuning-type") or "").lower()
+  if h_val == "full":
+    fine_tuning_type = "full"
+  elif h_val == "lora":
+    fine_tuning_type = "lora"
 
   if fine_tuning_type == "full" and not is_fft_enabled():
     raise ValueError("Full Fine-Tuning (FFT) is disabled on this Open-RL API server instance")
@@ -249,7 +344,7 @@ def make_training_request(
 
 
 async def _resolve_active_set_id(model_id: str | None) -> str | None:
-  if not model_id or not hasattr(store, "get_model_metadata"):
+  if not model_id:
     return None
   meta = await store.get_model_metadata(model_id)
   if meta and meta.get("fine_tuning_type") == "lora" and meta.get("base_model"):
@@ -257,12 +352,18 @@ async def _resolve_active_set_id(model_id: str | None) -> str | None:
   return None
 
 
+async def open_future(request_id: str) -> dict[str, str]:
+  """Register a pending future and return the trace carrier to send with its request."""
+  carrier: dict[str, str] = {}
+  propagate.inject(carrier)
+  await store.set_future(request_id, {"status": "pending"})
+  return carrier
+
+
 async def enqueue(request: dict) -> str:
   """Create a pending future, inject trace context, push to store. Returns req_id."""
   request_id = request["request_id"]
-  carrier: dict = {}
-  propagate.inject(carrier)
-  await store.set_future(request_id, {"status": "pending"})
+  carrier = await open_future(request_id)
 
   active_set_id = await _resolve_active_set_id(request.get("model_id"))
   await store.put_request({**request, "trace_context": carrier}, active_set_id=active_set_id)
@@ -415,52 +516,52 @@ FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-  """Answer malformed requests with a 422 that never echoes the raw body.
-
-  FastAPI's default handler runs the offending input through the JSON encoder,
-  which raises on binary bodies and turns a client mistake into a 500.
-  """
-  errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
-  return JSONResponse(status_code=422, content={"error": "invalid request", "detail": jsonable_encoder(errors)})
+  # FastAPI's default handler 500s when the offending input is bytes, e.g. a protobuf body on a JSON route.
+  errors = jsonable_encoder(exc.errors(), custom_encoder={bytes: lambda b: f"<{len(b)} bytes>"})
+  return JSONResponse(status_code=422, content={"error": "invalid request", "detail": errors})
 
 
-# Bodies above this size are parsed off the event loop so one large batch does
-# not stall heartbeats and other clients.
+@app.exception_handler(StarletteHTTPException)
+async def http_error(_: Request, exc: StarletteHTTPException) -> Response:
+  """Every refused request answers {"error": ...}; handlers raise instead of building responses."""
+  if not is_body_allowed_for_status_code(exc.status_code):
+    return Response(status_code=exc.status_code, headers=exc.headers)
+  return JSONResponse(status_code=exc.status_code, content={"error": exc.detail}, headers=exc.headers)
+
+
+def content_type(request: Request) -> str:
+  return request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
+
 _INLINE_BODY_BYTES = 256 * 1024
 
 
-async def training_body(request: Request) -> dict:
-  """Body of a training request in the JSON request shape.
-
-  Tinker SDK 0.25.0 and later send forward_backward as protobuf; older SDKs
-  send JSON. Both decode to the same dict here so the handlers stay shared.
-  """
-  content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+async def forward_backward_body(request: Request) -> ForwardBackwardRequest:
+  """Tinker SDK 0.25.0 and later send forward_backward as protobuf; older SDKs
+  send JSON. Both validate into the same request model."""
   encoding = request.headers.get("content-encoding", "identity").strip().lower()
   if encoding not in ("", "identity"):
     raise HTTPException(status_code=415, detail=f"Content-Encoding {encoding!r} is not supported; this server does not enable request compression")
   body = await request.body()
-  if content_type == proto_codec.PROTO_CONTENT_TYPE:
+  media = content_type(request)
+  if len(body) > _INLINE_BODY_BYTES:
+    return await asyncio.to_thread(decode_forward_backward_body, body, media)
+  return decode_forward_backward_body(body, media)
+
+
+def decode_forward_backward_body(body: bytes, media: str) -> ForwardBackwardRequest:
+  """Decode and validate together, off the event loop for large batches."""
+  if media == proto_codec.PROTO_CONTENT_TYPE:
     try:
-      if len(body) > _INLINE_BODY_BYTES:
-        return await asyncio.to_thread(proto_codec.decode_forward_backward, body)
-      return proto_codec.decode_forward_backward(body)
+      return ForwardBackwardRequest.model_validate(proto_codec.decode_forward_backward(body))
     except proto_codec.ProtoDecodeError as exc:
       raise HTTPException(status_code=400, detail=str(exc)) from exc
-  if content_type in ("application/json", ""):
-    if not body:
-      return {}
-    try:
-      if len(body) > _INLINE_BODY_BYTES:
-        parsed = await asyncio.to_thread(json.loads, body)
-      else:
-        parsed = json.loads(body)
-    except ValueError as exc:
-      raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}") from exc
-    if not isinstance(parsed, dict):
-      raise HTTPException(status_code=400, detail="request body must be a JSON object")
-    return parsed
-  raise HTTPException(status_code=415, detail=f"unsupported Content-Type {content_type!r}; send application/json or {proto_codec.PROTO_CONTENT_TYPE}")
+  if media not in ("application/json", ""):
+    raise HTTPException(status_code=415, detail=f"unsupported Content-Type {media!r}; send application/json or {proto_codec.PROTO_CONTENT_TYPE}")
+  try:
+    return ForwardBackwardRequest.model_validate_json(body or b"{}")
+  except ValidationError as exc:
+    raise RequestValidationError(exc.errors()) from exc
 
 
 # *** ServiceClient endpoints ***
@@ -497,28 +598,21 @@ async def create_session(_: dict):
 
 
 @app.post("/api/v1/session_heartbeat")
-async def session_heartbeat(req: dict):
-  if session_id := req.get("session_id"):
-    await session_registry.heartbeat(session_id)
+async def session_heartbeat(req: SessionHeartbeatRequest):
+  if req.session_id:
+    await session_registry.heartbeat(req.session_id)
   return {"type": "session_heartbeat"}
 
 
-def _get_request(request: Request) -> Request:
-  return request
-
-
 @app.post("/api/v1/create_model")
-async def create_model(
-  req: dict[str, Any],
-  request: Request | None = Depends(_get_request),  # noqa: B008
-) -> dict[str, Any]:
+async def create_model(req: CreateModelRequest, request: Request) -> dict[str, Any]:
   """ServiceClient.create_lora_training_client_async()"""
   try:
     model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="lora")
   except ValueError as exc:
-    return JSONResponse(status_code=400, content={"error": str(exc)})
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-  await bind_session(req.get("session_id"), model_id)
+  await bind_session(req.session_id, model_id)
   command = make_training_request(
     "create_model",
     model_id,
@@ -530,18 +624,12 @@ async def create_model(
 
 
 @app.post("/api/v1/delete_model")
-async def delete_model(req: dict):
-  model_id = req.get("model_id")
+async def delete_model(req: ModelRequest):
+  model_id = req.model_id
   if not model_id:
-    return JSONResponse(status_code=400, content={"error": "model_id is required"})
-  meta_dict = None
-  try:
-    raw_meta = await store.get_value(f"open_rl:model_meta:{model_id}")
-    if raw_meta:
-      meta_dict = json.loads(raw_meta)
-  except Exception:
-    pass
-  is_lora = meta_dict and meta_dict.get("fine_tuning_type") == "lora"
+    raise HTTPException(status_code=400, detail="model_id is required")
+  meta = await store.get_model_metadata(model_id)
+  is_lora = bool(meta and meta.get("fine_tuning_type") == "lora")
   if is_fft_enabled() and not is_lora:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
     await store.put_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
@@ -554,14 +642,11 @@ async def delete_model(req: dict):
 
 
 @app.post("/api/v1/create_model_from_state")
-async def create_model_from_state(
-  req: dict[str, Any],
-  request: Request | None = Depends(_get_request),  # noqa: B008
-) -> dict[str, Any]:
+async def create_model_from_state(req: CreateModelFromStateRequest, request: Request) -> dict[str, Any]:
   """ServiceClient.create_training_client_from_state_async()"""
-  state_path = req.get("state_path")
+  state_path = req.state_path
   if not state_path:
-    return JSONResponse(status_code=400, content={"error": "state_path is required"})
+    raise HTTPException(status_code=400, detail="state_path is required")
   # Resolve relative names under TMP_DIR/checkpoints, leave absolute paths alone.
   resolved_path = tinker_checkpoint_dir(state_path)
   if resolved_path is None:
@@ -569,15 +654,15 @@ async def create_model_from_state(
   try:
     model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="restored")
   except ValueError as exc:
-    return JSONResponse(status_code=400, content={"error": str(exc)})
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-  await bind_session(req.get("session_id"), model_id)
+  await bind_session(req.session_id, model_id)
   command = make_training_request(
     "create_model_from_state",
     model_id,
     {
       "state_path": resolved_path,
-      "restore_optimizer": bool(req.get("restore_optimizer", False)),
+      "restore_optimizer": req.restore_optimizer,
     },
     request_id=model_id,
   )
@@ -586,7 +671,7 @@ async def create_model_from_state(
 
 
 @app.post("/api/v1/get_info")
-async def get_info(req: dict):
+async def get_info(req: ModelRequest):
   """ServiceClient — model metadata for the training client.
 
   TrainingClient.get_tokenizer() loads whatever tokenizer this names, so it
@@ -594,11 +679,11 @@ async def get_info(req: dict):
   an id we have no metadata for. Answering with the API server default sent a
   Gemma job Qwen's tokenizer and every sample came back as token soup.
   """
-  model_id = req.get("model_id")
+  model_id = req.model_id
   meta = await store.get_model_metadata(base_model_id_from_sampling_ref(model_id) or model_id) if model_id else None
   model_name = (meta or {}).get("base_model") or get_default_model_name()
   if not model_name:
-    return JSONResponse(status_code=404, content={"error": "No base model is configured"})
+    raise HTTPException(status_code=404, detail="No base model is configured")
   # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
   # even when this process is running a full fine-tuning worker.
   result = {
@@ -613,16 +698,16 @@ async def get_info(req: dict):
 
 
 @app.post("/api/v1/retrieve_future")
-async def retrieve_future(req: dict, accept: str = Header(default="")):
+async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(default="")):
   """ServiceClient — poll for async request results.
 
   Clients that send ``Accept: application/x-protobuf`` get protobuf for the
   result types the SDK only reads as protobuf (forward_backward and sample);
   pending, failed, and every other result stay JSON.
   """
-  request_id = req.get("request_id")
+  request_id = req.request_id
   if not request_id:
-    return JSONResponse(status_code=400, content={"error": "request_id is required"})
+    raise HTTPException(status_code=400, detail="request_id is required")
 
   result = await store.get_future(request_id, timeout=60.0)
   if result is None:
@@ -639,78 +724,58 @@ async def retrieve_future(req: dict, accept: str = Header(default="")):
 
 
 # *** TrainingClient endpoints ***
-@app.post("/api/v1/forward")
-async def forward(req: Annotated[dict, Depends(training_body)]):
-  """TrainingClient.forward_async() on SDKs before 0.25; newer SDKs send
-  forward() to /api/v1/forward_backward with forward_only=true."""
-  fwd_input = req.get("forward_input") or req.get("forward_backward_input") or {}
+async def enqueue_forward_backward(req: ForwardBackwardRequest, forward_only: bool) -> dict[str, str]:
+  fwd_input = req.forward_backward_input or req.forward_input or ForwardBackwardInput()
   req_id = await enqueue(
     make_training_request(
       "forward_backward",
-      req.get("model_id"),
-      {
-        "data": fwd_input.get("data", []),
-        "loss_fn": fwd_input.get("loss_fn", "cross_entropy"),
-        "loss_config": fwd_input.get("loss_fn_config", {}),
-        "forward_only": True,
-      },
+      req.model_id,
+      {"data": fwd_input.data, "loss_fn": fwd_input.loss_fn, "loss_config": fwd_input.loss_fn_config or {}, "forward_only": forward_only},
     )
   )
   return {"request_id": req_id}
+
+
+@app.post("/api/v1/forward")
+async def forward(req: Annotated[ForwardBackwardRequest, Depends(forward_backward_body)]):
+  """TrainingClient.forward_async() on SDKs before 0.25; newer SDKs send
+  forward() to /api/v1/forward_backward with forward_only=true."""
+  return await enqueue_forward_backward(req, forward_only=True)
 
 
 @app.post("/api/v1/forward_backward")
-async def forward_backward(req: Annotated[dict, Depends(training_body)]):
+async def forward_backward(req: Annotated[ForwardBackwardRequest, Depends(forward_backward_body)]):
   """TrainingClient.forward_backward_async(), and forward_async() when the
   body carries forward_only=true (no gradient is accumulated)."""
-  fwd_input = req.get("forward_backward_input", {})
-  req_id = await enqueue(
-    make_training_request(
-      "forward_backward",
-      req.get("model_id"),
-      {
-        "data": fwd_input.get("data", []),
-        "loss_fn": fwd_input.get("loss_fn", "cross_entropy"),
-        "loss_config": fwd_input.get("loss_fn_config", {}),
-        "forward_only": bool(req.get("forward_only", False)),
-      },
-    )
-  )
-  return {"request_id": req_id}
+  return await enqueue_forward_backward(req, forward_only=req.forward_only)
 
 
 @app.post("/api/v1/optim_step")
-async def optim_step(req: dict):
+async def optim_step(req: OptimStepRequest):
   """TrainingClient.optim_step_async()"""
-  req_id = await enqueue(
-    make_training_request(
-      "optim_step",
-      req.get("model_id"),
-      {"adam_params": req.get("adam_params", {})},
-    )
-  )
+  req_id = await enqueue(make_training_request("optim_step", req.model_id, {"adam_params": req.adam_params}))
   return {"request_id": req_id}
 
 
 @app.post("/api/v1/save_weights_for_sampler")
-async def save_weights_for_sampler(req: dict):
+async def save_weights_for_sampler(req: SaveWeightsForSamplerRequest):
   """TrainingClient.save_weights_for_sampler().
 
   The SDK uses this for both named sampler checkpoints and ephemeral
   save_weights_and_get_sampling_client() snapshots. Route it through the training
   queue so the sampler always sees weights saved after prior training requests.
   """
-  model_id = req.get("model_id")
+  model_id = req.model_id
   if not model_id:
-    return JSONResponse(status_code=400, content={"error": "model_id is required"})
+    raise HTTPException(status_code=400, detail="model_id is required")
 
   await ensure_sampler_launched(model_id)
   # The client's counter is 0-based; `or` would treat the first save's seq_id
   # of 0 as missing and mint a timestamp id instead.
-  seq_id = req.get("sampling_session_seq_id")
+  seq_id = req.sampling_session_seq_id
   if seq_id is None:
     seq_id = int(time.time() * 1000)
-  alias = req.get("name") or req.get("alias") or req.get("path")
+  alias = req.name or req.alias or req.path
 
   session_id = sampler_session_id(model_id, seq_id)
   req_id = await enqueue(
@@ -728,7 +793,7 @@ async def save_weights_for_sampler(req: dict):
 
 
 @app.post("/api/v1/save_weights")
-async def save_weights(req: dict):
+async def save_weights(req: SaveWeightsRequest):
   """TrainingClient.save_weights() / save_state().
 
   This is the endpoint the tinker SDK hits for both save_weights() and save_state().
@@ -736,72 +801,51 @@ async def save_weights(req: dict):
   TMP_DIR/checkpoints/<model_id>/weights/<path> so separate training jobs do not
   overwrite each other's named checkpoints.
   """
-  model_id = req.get("model_id")
+  model_id = req.model_id
   if not model_id:
-    return JSONResponse(status_code=400, content={"error": "model_id is required"})
+    raise HTTPException(status_code=400, detail="model_id is required")
 
   # 0 is a valid seq_id; only fall back when the field is absent.
-  seq_id = req.get("seq_id")
+  seq_id = req.seq_id
   if seq_id is None:
     seq_id = int(time.time() * 1000)
-  alias = req.get("path") or f"{model_id}-samp-{seq_id}"
+  alias = req.path or f"{model_id}-samp-{seq_id}"
   state_path = checkpoint_state_path(model_id, alias)
 
-  req_id = str(uuid.uuid4())
-  await enqueue(
-    make_training_request(
-      "save_state",
-      model_id,
-      {
-        "state_path": state_path,
-        # save_state is the whole training state in tinker's API. The client
-        # chooses on load whether the optimizer comes back.
-        "include_optimizer": True,
-        "kind": "weights",
-      },
-      request_id=req_id,
-    )
-  )
+  # save_state is the whole training state in tinker's API. The client
+  # chooses on load whether the optimizer comes back.
+  req_id = await enqueue(make_training_request("save_state", model_id, {"state_path": state_path, "include_optimizer": True, "kind": "weights"}))
   return {"request_id": req_id}
 
 
 @app.post("/api/v1/load_weights")
-async def load_weights(req: dict):
+async def load_weights(req: LoadWeightsRequest):
   """TrainingClient.load_state() / load_state_with_optimizer()."""
-  model_id = req.get("model_id")
-  state_path = req.get("path")
+  model_id = req.model_id
+  state_path = req.path
   if not model_id:
-    return JSONResponse(status_code=400, content={"error": "model_id is required"})
+    raise HTTPException(status_code=400, detail="model_id is required")
   if not state_path:
-    return JSONResponse(status_code=400, content={"error": "path is required"})
+    raise HTTPException(status_code=400, detail="path is required")
   if state_path.startswith("tinker://") and tinker_checkpoint_dir(state_path) is None:
-    return JSONResponse(status_code=400, content={"error": f"{state_path} is not a tinker://<model>/weights/<name> path"})
+    raise HTTPException(status_code=400, detail=f"{state_path} is not a tinker://<model>/weights/<name> path")
 
   resolved_path = checkpoint_state_path(model_id, state_path)
-  req_id = await enqueue(
-    make_training_request(
-      "load_weights",
-      model_id,
-      {
-        "state_path": resolved_path,
-        "restore_optimizer": bool(req.get("optimizer", False)),
-      },
-    )
-  )
+  req_id = await enqueue(make_training_request("load_weights", model_id, {"state_path": resolved_path, "restore_optimizer": req.optimizer}))
   return {"request_id": req_id}
 
 
 @app.post("/api/v1/weights_info")
-async def weights_info(req: dict):
+async def weights_info(req: WeightsInfoRequest):
   """RestClient.get_weights_info_by_tinker_path(). What a checkpoint was
   trained from, so create_training_client_from_state can open a matching
   client and load_state into it. Answered from the checkpoint directory, so
   it survives an API server or Redis restart."""
-  path = req.get("tinker_path") or ""
+  path = req.tinker_path
   state_dir = tinker_checkpoint_dir(path)
   metadata_path = os.path.join(state_dir, "metadata.json") if state_dir else None
   if not metadata_path or not os.path.exists(metadata_path):
-    return JSONResponse(status_code=404, content={"error": f"No checkpoint at {path}"})
+    raise HTTPException(status_code=404, detail=f"No checkpoint at {path}")
   with open(metadata_path) as f:
     saved = json.load(f)
   adapter_config_path = os.path.join(state_dir, saved.get("model_id", ""), "adapter_config.json")
@@ -815,29 +859,23 @@ async def weights_info(req: dict):
 
 # *** SamplingClient endpoints ***
 @app.post("/api/v1/create_sampling_session")
-async def create_sampling_session(req: dict):
+async def create_sampling_session(req: CreateSamplingSessionRequest):
   """ServiceClient.create_sampling_client()"""
-  model_path = req.get("model_path")
-  base_model = req.get("base_model")
-  model_id = req.get("model_id")
-
-  if model_path and model_path.startswith("tinker://"):
-    sess_id = model_path
-    path = model_path[len("tinker://") :]
-    parts = path.split("/")
-    target_model_id = parts[0]
-  elif base_model:
-    sess_id = base_model
-    target_model_id = base_model
+  if req.model_path and req.model_path.startswith("tinker://"):
+    sess_id = req.model_path
+    target_model_id = req.model_path[len("tinker://") :].split("/")[0]
+  elif req.base_model:
+    sess_id = req.base_model
+    target_model_id = req.base_model
   else:
-    sess_id = model_id or "samp-session-live-123"
+    sess_id = req.model_id or "samp-session-live-123"
     target_model_id = sess_id
 
   model_meta = await store.get_model_metadata(target_model_id) if target_model_id else None
   fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
   ready_check_id = (model_meta.get("base_model") or target_model_id) if (fine_tuning_type == "lora" and model_meta) else target_model_id
 
-  await bind_session(req.get("session_id"), target_model_id)
+  await bind_session(req.session_id, target_model_id)
 
   if get_sampler_backend() == "vllm" and ready_check_id:
     # Launch by model ID so the worker manager retains the training kind.
@@ -873,7 +911,7 @@ async def get_sampler(sampler_id: str):
   model_meta = await store.get_model_metadata(base_model_id) if base_model_id else None
   base_model = (model_meta or {}).get("base_model") or base_model_id or get_default_model_name()
   if not base_model:
-    return JSONResponse(status_code=404, content={"error": f"Unknown sampler {sampler_id}"})
+    raise HTTPException(status_code=404, detail=f"Unknown sampler {sampler_id}")
   return {
     "sampler_id": sampler_id,
     "base_model": base_model,
@@ -891,22 +929,13 @@ def sample_sequence_ids(request_id: str, num_samples: int) -> list[str]:
 
 
 @app.post("/api/v1/asample")
-async def asample(req: dict):
+async def asample(req: AsampleRequest):
   """SamplingClient.sample_async()"""
-  chunks = req.get("prompt", {}).get("chunks", [])
-  prompt = []
-  for chunk in chunks:
-    prompt.extend(chunk.get("tokens", []))
-  params = req.get("sampling_params", {})
-  max_tokens = params.get("max_tokens", 20)
-  temperature = params.get("temperature", 1.0)
-  stop = params.get("stop")
-  top_p = params.get("top_p", 1.0)
-  top_k = params.get("top_k", -1)
-  num_samples = req.get("num_samples", 1)
-  include_prompt_logprobs = req.get("prompt_logprobs", req.get("include_prompt_logprobs", False))
+  prompt = [token for chunk in req.prompt.get("chunks", []) for token in chunk.get("tokens", [])]
+  params = req.sampling_params
+  num_samples = req.num_samples
 
-  model_id = req.get("model_id") or req.get("sampling_session_id")
+  model_id = req.model_id or req.sampling_session_id
   base_model_id = base_model_id_from_sampling_ref(model_id)
   lookup_id = base_model_id or model_id
 
@@ -917,10 +946,10 @@ async def asample(req: dict):
         lookup_id,
         {
           "prompt_tokens": prompt,
-          "max_tokens": max_tokens,
-          "temperature": temperature,
+          "max_tokens": params.max_tokens,
+          "temperature": params.temperature,
           "num_samples": num_samples,
-          "prompt_logprobs": bool(include_prompt_logprobs),
+          "prompt_logprobs": req.prompt_logprobs,
         },
       )
     )
@@ -928,9 +957,7 @@ async def asample(req: dict):
 
   # vLLM backend
   req_id = str(uuid.uuid4())
-  carrier: dict = {}
-  propagate.inject(carrier)
-  await store.set_future(req_id, {"status": "pending"})
+  carrier = await open_future(req_id)
 
   model_meta = await store.get_model_metadata(lookup_id)
   fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
@@ -951,16 +978,16 @@ async def asample(req: dict):
   sampling_req = {
     "request_id": req_id,
     "prompt_token_ids": prompt,
-    "max_tokens": max_tokens,
-    "temperature": temperature,
-    "stop": stop,
-    "top_p": top_p,
-    "top_k": top_k,
+    "max_tokens": params.max_tokens,
+    "temperature": params.temperature,
+    "stop": params.stop,
+    "top_p": params.top_p,
+    "top_k": params.top_k,
     "num_samples": num_samples,
     "lora_id": lora_id,
     "lora_path": lora_path,
     "weights_path": weights_path,
-    "include_prompt_logprobs": include_prompt_logprobs,
+    "include_prompt_logprobs": req.prompt_logprobs,
     "model_id": queue_id,
     "trace_context": carrier,
   }
@@ -975,8 +1002,6 @@ async def asample(req: dict):
 @app.get("/api/v1/list_adapters")
 async def list_adapters():
   """CLI `list` — scan the peft directory for saved adapters."""
-  import json
-
   peft_dir = os.path.join(TMP_DIR, "peft")
   adapters = []
 
