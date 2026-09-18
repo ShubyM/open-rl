@@ -136,7 +136,7 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
   def create_model(self, base_model_name, model_id, config):
     self.created_models.append((base_model_name, model_id, config))
 
-  def forward_backward(self, data, loss_fn, loss_config=None, model_id=None):
+  def forward_backward(self, data, loss_fn, loss_config=None, model_id=None, forward_only=False):
     return {"model_id": model_id, "loss_fn": loss_fn, "loss_config": loss_config, "data": data}
 
   def save_state(self, model_id, state_path, include_optimizer=False, kind="state"):

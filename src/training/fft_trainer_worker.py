@@ -337,9 +337,11 @@ class FFTTrainingWorker(BaseTrainerWorker):
     print(f"Loaded full fine-tuning state from {state_path}")
     return {"model_id": model_id, "base_model": base_model}
 
-  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
+  def forward_backward(
+    self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
+  ) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
-    res = super().forward_backward(self.model, data, loss_fn, loss_config)
+    res = super().forward_backward(self.model, data, loss_fn, loss_config, forward_only=forward_only)
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
     return res

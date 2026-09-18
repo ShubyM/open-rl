@@ -652,6 +652,7 @@ async def forward(req: Annotated[dict, Depends(training_body)]):
         "data": fwd_input.get("data", []),
         "loss_fn": fwd_input.get("loss_fn", "cross_entropy"),
         "loss_config": fwd_input.get("loss_fn_config", {}),
+        "forward_only": True,
       },
     )
   )
@@ -661,7 +662,7 @@ async def forward(req: Annotated[dict, Depends(training_body)]):
 @app.post("/api/v1/forward_backward")
 async def forward_backward(req: Annotated[dict, Depends(training_body)]):
   """TrainingClient.forward_backward_async(), and forward_async() when the
-  body carries forward_only=true. Both run the same worker op today."""
+  body carries forward_only=true (no gradient is accumulated)."""
   fwd_input = req.get("forward_backward_input", {})
   req_id = await enqueue(
     make_training_request(
@@ -671,6 +672,7 @@ async def forward_backward(req: Annotated[dict, Depends(training_body)]):
         "data": fwd_input.get("data", []),
         "loss_fn": fwd_input.get("loss_fn", "cross_entropy"),
         "loss_config": fwd_input.get("loss_fn_config", {}),
+        "forward_only": bool(req.get("forward_only", False)),
       },
     )
   )

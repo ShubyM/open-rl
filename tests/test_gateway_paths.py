@@ -167,13 +167,25 @@ class ProtobufWireTest(unittest.TestCase):
     self.assertEqual(from_proto["payload"]["loss_fn"], "importance_sampling")
     self.assertEqual(from_proto["payload"]["loss_config"], {"clip_range": 0.2, "kl_coeff": 0.01, "mode": "token"})
 
-  def test_forward_only_protobuf_goes_to_the_same_op_as_the_json_forward_route(self) -> None:
+  def test_forward_only_reaches_the_worker_from_both_routes(self) -> None:
     from server.proto import tinker_public_pb2 as pb
 
     msg = pb.ForwardBackwardRequest(model_id="model-abc", seq_id=1, loss_fn="cross_entropy", forward_only=True)
     response = self.client.post("/api/v1/forward_backward", content=msg.SerializeToString(), headers={"Content-Type": "application/x-protobuf"})
     self.assertEqual(response.status_code, 200, response.text)
-    self.assertEqual(self._queued()[0]["op"], "forward_backward")
+    queued = self._queued()[0]
+    self.assertEqual(queued["op"], "forward_backward")
+    self.assertTrue(queued["payload"]["forward_only"])
+
+    legacy = self.client.post("/api/v1/forward", json={"model_id": "model-abc", "forward_input": {"data": [], "loss_fn": "cross_entropy"}})
+    self.assertEqual(legacy.status_code, 200, legacy.text)
+    self.assertTrue(self._queued()[0]["payload"]["forward_only"])
+
+    train = self.client.post(
+      "/api/v1/forward_backward", json={"model_id": "model-abc", "forward_backward_input": {"data": [], "loss_fn": "cross_entropy"}}
+    )
+    self.assertEqual(train.status_code, 200, train.text)
+    self.assertFalse(self._queued()[0]["payload"]["forward_only"])
 
   def test_bad_bodies_are_client_errors_not_500s(self) -> None:
     garbage = self.client.post("/api/v1/forward_backward", content=b"\xff\xfe not proto", headers={"Content-Type": "application/x-protobuf"})
