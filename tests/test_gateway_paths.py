@@ -129,3 +129,123 @@ class GatewayPathTest(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class ProtobufWireTest(unittest.TestCase):
+  """Tinker SDK >= 0.25 sends forward_backward as protobuf and only reads
+  forward_backward and sample results as protobuf."""
+
+  FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "fwdbwd_request_tinker_0.29.0.pb")
+
+  def setUp(self) -> None:
+    from fastapi.testclient import TestClient
+
+    patcher = patch.object(gateway, "store", InMemoryStore())
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    self.client = TestClient(gateway.app)
+
+  def _queued(self) -> list[dict]:
+    return asyncio.run(gateway.store.get_requests())
+
+  def test_protobuf_and_json_forward_backward_queue_the_same_request(self) -> None:
+    with open(self.FIXTURE, "rb") as fh:
+      body = fh.read()
+    proto = self.client.post("/api/v1/forward_backward", content=body, headers={"Content-Type": "application/x-protobuf"})
+    self.assertEqual(proto.status_code, 200, proto.text)
+    from_proto = self._queued()[0]
+
+    with open(self.FIXTURE[:-3] + ".json") as fh:
+      json_body = json.load(fh)
+    as_json = self.client.post("/api/v1/forward_backward", json=json_body)
+    self.assertEqual(as_json.status_code, 200, as_json.text)
+    from_json = self._queued()[0]
+
+    self.assertEqual(from_proto["op"], "forward_backward")
+    self.assertEqual(from_proto["model_id"], "model-abc")
+    self.assertEqual(from_proto["payload"], from_json["payload"])
+    self.assertEqual(from_proto["payload"]["loss_fn"], "importance_sampling")
+    self.assertEqual(from_proto["payload"]["loss_config"], {"clip_range": 0.2, "kl_coeff": 0.01, "mode": "token"})
+
+  def test_forward_only_reaches_the_worker_from_both_routes(self) -> None:
+    from server.proto import tinker_public_pb2 as pb
+
+    msg = pb.ForwardBackwardRequest(model_id="model-abc", seq_id=1, loss_fn="cross_entropy", forward_only=True)
+    response = self.client.post("/api/v1/forward_backward", content=msg.SerializeToString(), headers={"Content-Type": "application/x-protobuf"})
+    self.assertEqual(response.status_code, 200, response.text)
+    queued = self._queued()[0]
+    self.assertEqual(queued["op"], "forward_backward")
+    self.assertTrue(queued["payload"]["forward_only"])
+
+    legacy = self.client.post("/api/v1/forward", json={"model_id": "model-abc", "forward_input": {"data": [], "loss_fn": "cross_entropy"}})
+    self.assertEqual(legacy.status_code, 200, legacy.text)
+    self.assertTrue(self._queued()[0]["payload"]["forward_only"])
+
+    train = self.client.post(
+      "/api/v1/forward_backward", json={"model_id": "model-abc", "forward_backward_input": {"data": [], "loss_fn": "cross_entropy"}}
+    )
+    self.assertEqual(train.status_code, 200, train.text)
+    self.assertFalse(self._queued()[0]["payload"]["forward_only"])
+
+  def test_bad_bodies_are_client_errors_not_500s(self) -> None:
+    garbage = self.client.post("/api/v1/forward_backward", content=b"\xff\xfe not proto", headers={"Content-Type": "application/x-protobuf"})
+    self.assertEqual(garbage.status_code, 400, garbage.text)
+    compressed = self.client.post(
+      "/api/v1/forward_backward", content=b"x", headers={"Content-Type": "application/x-protobuf", "Content-Encoding": "zstd"}
+    )
+    self.assertEqual(compressed.status_code, 415, compressed.text)
+    other = self.client.post("/api/v1/forward_backward", content=b"x", headers={"Content-Type": "text/plain"})
+    self.assertEqual(other.status_code, 415, other.text)
+    # A non-JSON body on a plain `req: dict` route used to crash FastAPI's 422
+    # handler while it JSON-encoded the raw bytes, turning it into a 500.
+    binary_to_dict_route = self.client.post("/api/v1/optim_step", content=b"\x8a\xff", headers={"Content-Type": "application/x-protobuf"})
+    self.assertEqual(binary_to_dict_route.status_code, 422, binary_to_dict_route.text)
+    self.assertNotIn("\x8a", binary_to_dict_route.text)
+
+  def test_retrieve_future_answers_protobuf_only_when_asked_and_only_for_proto_types(self) -> None:
+    from server.proto import tinker_public_pb2 as pb
+
+    asyncio.run(
+      gateway.store.set_future(
+        "samp-1", {"type": "sample_completed", "sequences": [{"tokens": [1, 2], "logprobs": [-0.5, -1.0], "stop_reason": "stop"}]}
+      )
+    )
+    asyncio.run(gateway.store.set_future("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
+
+    as_json = self.client.post("/api/v1/retrieve_future", json={"request_id": "samp-1"})
+    self.assertEqual(as_json.status_code, 200)
+    self.assertTrue(as_json.headers["content-type"].startswith("application/json"))
+    self.assertEqual(as_json.json()["type"], "sample")
+
+    as_proto = self.client.post("/api/v1/retrieve_future", json={"request_id": "samp-1"}, headers={"Accept": "application/x-protobuf"})
+    self.assertEqual(as_proto.status_code, 200)
+    self.assertEqual(as_proto.headers["content-type"], "application/x-protobuf")
+    msg = pb.SampleResponse()
+    msg.ParseFromString(as_proto.content)
+    self.assertEqual(msg.sequences[0].stop_reason, pb.STOP_REASON_STOP)
+
+    optim = self.client.post("/api/v1/retrieve_future", json={"request_id": "optim-1"}, headers={"Accept": "application/x-protobuf"})
+    self.assertTrue(optim.headers["content-type"].startswith("application/json"))
+    self.assertEqual(optim.json()["type"], "optim_step")
+
+
+class SampleSequenceIdsTest(unittest.TestCase):
+  """Tinker SDK >= 0.25 asserts that every asample promise carries one
+  sequence id per requested sample."""
+
+  def setUp(self) -> None:
+    patcher = patch.object(gateway, "store", InMemoryStore())
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def test_asample_promise_carries_one_id_per_sample(self) -> None:
+    with patch.object(gateway, "get_sampler_backend", return_value="torch"):
+      promise = asyncio.run(gateway.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}))
+    self.assertEqual(len(promise["sample_sequence_ids"]), 3)
+    self.assertEqual(len(set(promise["sample_sequence_ids"])), 3)
+    self.assertTrue(all(sid.startswith(promise["request_id"]) for sid in promise["sample_sequence_ids"]))
+
+  def test_asample_defaults_to_a_single_sample(self) -> None:
+    with patch.object(gateway, "get_sampler_backend", return_value="torch"):
+      promise = asyncio.run(gateway.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}))
+    self.assertEqual(len(promise["sample_sequence_ids"]), 1)

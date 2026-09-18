@@ -98,6 +98,10 @@ kubectl --context my-cluster -n openrl-system port-forward svc/open-rl-gateway-s
 The default model is public `Qwen/Qwen2.5-0.5B`. Workers download model weights
 on first use; gateway readiness does not imply model loading has completed.
 
+Any Tinker SDK from 0.23 onward can talk to the gateway. SDKs from 0.25 send
+training requests and read training and sampling results as protobuf; the
+gateway serves both that and the older JSON encoding.
+
 ## Verify and upgrade
 
 With the port-forward running, the existing tiny SFT example can also save and

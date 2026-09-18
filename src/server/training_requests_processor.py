@@ -234,6 +234,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
       payload.get("loss_fn", "cross_entropy"),
       payload.get("loss_config"),
       model_id,
+      forward_only=bool(payload.get("forward_only", False)),
     )
     result["type"] = "forward_backward_completed"
     return result
@@ -478,6 +479,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       payload.get("loss_fn", "cross_entropy"),
       payload.get("loss_config"),
       model_id,
+      forward_only=bool(payload.get("forward_only", False)),
     )
     result["type"] = "forward_backward_completed"
     return result

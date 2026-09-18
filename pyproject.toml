@@ -15,6 +15,7 @@ dependencies = [
     "opentelemetry-sdk",
     "opentelemetry-instrumentation-fastapi",
     "opentelemetry-exporter-gcp-trace",
+    "protobuf>=5",
     "pydantic",
     "redis>=5.0.0",
     "uvicorn",

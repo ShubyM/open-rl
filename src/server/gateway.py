@@ -9,16 +9,19 @@ import traceback
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
-from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
 from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from server import proto_codec
 from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config
 from server.session_registry import SessionRegistry
 from server.store import get_store
@@ -410,6 +413,56 @@ app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
 FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+  """Answer malformed requests with a 422 that never echoes the raw body.
+
+  FastAPI's default handler runs the offending input through the JSON encoder,
+  which raises on binary bodies and turns a client mistake into a 500.
+  """
+  errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
+  return JSONResponse(status_code=422, content={"error": "invalid request", "detail": jsonable_encoder(errors)})
+
+
+# Bodies above this size are parsed off the event loop so one large batch does
+# not stall heartbeats and other clients.
+_INLINE_BODY_BYTES = 256 * 1024
+
+
+async def training_body(request: Request) -> dict:
+  """Body of a training request in the JSON request shape.
+
+  Tinker SDK 0.25.0 and later send forward_backward as protobuf; older SDKs
+  send JSON. Both decode to the same dict here so the handlers stay shared.
+  """
+  content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+  encoding = request.headers.get("content-encoding", "identity").strip().lower()
+  if encoding not in ("", "identity"):
+    raise HTTPException(status_code=415, detail=f"Content-Encoding {encoding!r} is not supported; this server does not enable request compression")
+  body = await request.body()
+  if content_type == proto_codec.PROTO_CONTENT_TYPE:
+    try:
+      if len(body) > _INLINE_BODY_BYTES:
+        return await asyncio.to_thread(proto_codec.decode_forward_backward, body)
+      return proto_codec.decode_forward_backward(body)
+    except proto_codec.ProtoDecodeError as exc:
+      raise HTTPException(status_code=400, detail=str(exc)) from exc
+  if content_type in ("application/json", ""):
+    if not body:
+      return {}
+    try:
+      if len(body) > _INLINE_BODY_BYTES:
+        parsed = await asyncio.to_thread(json.loads, body)
+      else:
+        parsed = json.loads(body)
+    except ValueError as exc:
+      raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}") from exc
+    if not isinstance(parsed, dict):
+      raise HTTPException(status_code=400, detail="request body must be a JSON object")
+    return parsed
+  raise HTTPException(status_code=415, detail=f"unsupported Content-Type {content_type!r}; send application/json or {proto_codec.PROTO_CONTENT_TYPE}")
+
+
 # *** ServiceClient endpoints ***
 @app.get("/api/v1/healthz")
 async def health_check():
@@ -560,8 +613,13 @@ async def get_info(req: dict):
 
 
 @app.post("/api/v1/retrieve_future")
-async def retrieve_future(req: dict):
-  """ServiceClient — poll for async request results."""
+async def retrieve_future(req: dict, accept: str = Header(default="")):
+  """ServiceClient — poll for async request results.
+
+  Clients that send ``Accept: application/x-protobuf`` get protobuf for the
+  result types the SDK only reads as protobuf (forward_backward and sample);
+  pending, failed, and every other result stay JSON.
+  """
   request_id = req.get("request_id")
   if not request_id:
     return JSONResponse(status_code=400, content={"error": "request_id is required"})
@@ -572,14 +630,19 @@ async def retrieve_future(req: dict):
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
     return JSONResponse(status_code=400, content=result)
   if isinstance(result, dict):
+    if proto_codec.PROTO_CONTENT_TYPE in accept:
+      encoded = proto_codec.encode_future_result(result)
+      if encoded is not None:
+        return Response(content=encoded, media_type=proto_codec.PROTO_CONTENT_TYPE)
     return translate_future_result(result)
   return result
 
 
 # *** TrainingClient endpoints ***
 @app.post("/api/v1/forward")
-async def forward(req: dict):
-  """TrainingClient.forward_async()"""
+async def forward(req: Annotated[dict, Depends(training_body)]):
+  """TrainingClient.forward_async() on SDKs before 0.25; newer SDKs send
+  forward() to /api/v1/forward_backward with forward_only=true."""
   fwd_input = req.get("forward_input") or req.get("forward_backward_input") or {}
   req_id = await enqueue(
     make_training_request(
@@ -589,6 +652,7 @@ async def forward(req: dict):
         "data": fwd_input.get("data", []),
         "loss_fn": fwd_input.get("loss_fn", "cross_entropy"),
         "loss_config": fwd_input.get("loss_fn_config", {}),
+        "forward_only": True,
       },
     )
   )
@@ -596,8 +660,9 @@ async def forward(req: dict):
 
 
 @app.post("/api/v1/forward_backward")
-async def forward_backward(req: dict):
-  """TrainingClient.forward_backward_async()"""
+async def forward_backward(req: Annotated[dict, Depends(training_body)]):
+  """TrainingClient.forward_backward_async(), and forward_async() when the
+  body carries forward_only=true (no gradient is accumulated)."""
   fwd_input = req.get("forward_backward_input", {})
   req_id = await enqueue(
     make_training_request(
@@ -607,6 +672,7 @@ async def forward_backward(req: dict):
         "data": fwd_input.get("data", []),
         "loss_fn": fwd_input.get("loss_fn", "cross_entropy"),
         "loss_config": fwd_input.get("loss_fn_config", {}),
+        "forward_only": bool(req.get("forward_only", False)),
       },
     )
   )
@@ -815,6 +881,15 @@ async def get_sampler(sampler_id: str):
   }
 
 
+def sample_sequence_ids(request_id: str, num_samples: int) -> list[str]:
+  """One id per requested sample, in response order.
+
+  Tinker SDK 0.25+ requires them on the asample promise and stamps each onto
+  the matching returned sequence; the final SampleResponse does not repeat them.
+  """
+  return [f"{request_id}:{index}" for index in range(max(1, int(num_samples)))]
+
+
 @app.post("/api/v1/asample")
 async def asample(req: dict):
   """SamplingClient.sample_async()"""
@@ -849,7 +924,7 @@ async def asample(req: dict):
         },
       )
     )
-    return {"request_id": req_id}
+    return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
   # vLLM backend
   req_id = str(uuid.uuid4())
@@ -891,7 +966,7 @@ async def asample(req: dict):
   }
 
   await store.put_sampling_request(sampling_req)
-  return {"request_id": req_id}
+  return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
 
 # *** CLI endpoints ***
