@@ -215,3 +215,25 @@ class ProtobufWireTest(unittest.TestCase):
     optim = self.client.post("/api/v1/retrieve_future", json={"request_id": "optim-1"}, headers={"Accept": "application/x-protobuf"})
     self.assertTrue(optim.headers["content-type"].startswith("application/json"))
     self.assertEqual(optim.json()["type"], "optim_step")
+
+
+class SampleSequenceIdsTest(unittest.TestCase):
+  """Tinker SDK >= 0.25 asserts that every asample promise carries one
+  sequence id per requested sample."""
+
+  def setUp(self) -> None:
+    patcher = patch.object(gateway, "store", InMemoryStore())
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def test_asample_promise_carries_one_id_per_sample(self) -> None:
+    with patch.object(gateway, "get_sampler_backend", return_value="torch"):
+      promise = asyncio.run(gateway.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}))
+    self.assertEqual(len(promise["sample_sequence_ids"]), 3)
+    self.assertEqual(len(set(promise["sample_sequence_ids"])), 3)
+    self.assertTrue(all(sid.startswith(promise["request_id"]) for sid in promise["sample_sequence_ids"]))
+
+  def test_asample_defaults_to_a_single_sample(self) -> None:
+    with patch.object(gateway, "get_sampler_backend", return_value="torch"):
+      promise = asyncio.run(gateway.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}))
+    self.assertEqual(len(promise["sample_sequence_ids"]), 1)

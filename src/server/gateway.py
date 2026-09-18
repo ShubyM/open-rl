@@ -879,6 +879,15 @@ async def get_sampler(sampler_id: str):
   }
 
 
+def sample_sequence_ids(request_id: str, num_samples: int) -> list[str]:
+  """One id per requested sample, in response order.
+
+  Tinker SDK 0.25+ requires them on the asample promise and stamps each onto
+  the matching returned sequence; the final SampleResponse does not repeat them.
+  """
+  return [f"{request_id}:{index}" for index in range(max(1, int(num_samples)))]
+
+
 @app.post("/api/v1/asample")
 async def asample(req: dict):
   """SamplingClient.sample_async()"""
@@ -913,7 +922,7 @@ async def asample(req: dict):
         },
       )
     )
-    return {"request_id": req_id}
+    return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
   # vLLM backend
   req_id = str(uuid.uuid4())
@@ -955,7 +964,7 @@ async def asample(req: dict):
   }
 
   await store.put_sampling_request(sampling_req)
-  return {"request_id": req_id}
+  return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
 
 # *** CLI endpoints ***
