@@ -29,6 +29,8 @@ from server.model_metadata import TrainingModelMetadata, extract_weight_sync_con
 from server.session_registry import SessionRegistry
 from server.store import get_store
 from server.worker_manager import WorkerManager, create_worker_manager, owner_of
+from training import commands
+from training.commands import Command
 
 store = get_store()
 worker_manager: WorkerManager | None = None
@@ -286,7 +288,7 @@ async def _extract_and_persist_model_metadata(
   req: CreateModelRequest,
   request: Request | None = None,
   default_fine_tuning_type: str = "lora",
-) -> str:
+) -> tuple[str, TrainingModelMetadata]:
   """Extract and normalize model configuration from headers and payload, persisting TrainingModelMetadata exactly once."""
   base_model = req.base_model
   if not base_model and default_fine_tuning_type != "restored":
@@ -324,23 +326,11 @@ async def _extract_and_persist_model_metadata(
   )
   await store.set_value(f"open_rl:model_meta:{model_id}", json.dumps(meta_obj.to_dict()))
 
-  return model_id
+  return model_id, meta_obj
 
 
-def make_training_request(
-  op: str,
-  model_id: str | None,
-  payload: dict,
-  request_id: str | None = None,
-) -> dict:
-  request = {
-    "request_id": request_id or str(uuid.uuid4()),
-    "op": op,
-    "payload": payload,
-  }
-  if model_id is not None:
-    request["model_id"] = model_id
-  return request
+def new_request_id() -> str:
+  return str(uuid.uuid4())
 
 
 async def _resolve_active_set_id(model_id: str | None) -> str | None:
@@ -360,20 +350,19 @@ async def open_future(request_id: str) -> dict[str, str]:
   return carrier
 
 
-async def enqueue(request: dict) -> str:
-  """Create a pending future, inject trace context, push to store. Returns req_id."""
-  request_id = request["request_id"]
-  carrier = await open_future(request_id)
+async def enqueue(command: Command) -> str:
+  """Create a pending future, inject trace context, push the command to the store. Returns its request_id."""
+  carrier = await open_future(command.request_id)
 
-  active_set_id = await _resolve_active_set_id(request.get("model_id"))
-  await store.put_request({**request, "trace_context": carrier}, active_set_id=active_set_id)
+  active_set_id = await _resolve_active_set_id(command.model_id)
+  await store.put_request(commands.wire(command.model_copy(update={"trace_context": carrier})), active_set_id=active_set_id)
   # One line per training request so a request that never reaches a worker can
   # be traced end to end (the workers log the same id when they pop it).
-  print(f"[API_SERVER] enqueued op={request.get('op')} request_id={request_id} model_id={request.get('model_id')} active_set={active_set_id}")
-  return request_id
+  print(f"[API_SERVER] enqueued op={command.op} request_id={command.request_id} model_id={command.model_id} active_set={active_set_id}")
+  return command.request_id
 
 
-async def launch_worker_and_enqueue(request: dict) -> str:
+async def launch_worker_and_enqueue(command: Command) -> str:
   """Ensure the model's dedicated trainer worker exists, then enqueue onto its queue.
 
   The launcher is idempotent per model_id, and Kubernetes (or the local process
@@ -382,15 +371,15 @@ async def launch_worker_and_enqueue(request: dict) -> str:
   a request that can never be served.
   """
   assert worker_manager is not None, "Worker manager is initialized by the app lifespan"
-  request_id = request["request_id"]
+  request_id = command.request_id
   await store.set_future(request_id, {"status": "pending"})
   try:
-    await asyncio.to_thread(worker_manager.ensure, request["model_id"], "trainer")
+    await asyncio.to_thread(worker_manager.ensure, command.model_id, "trainer")
   except Exception as exc:
     traceback.print_exc()
     await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
     return request_id
-  return await enqueue(request)
+  return await enqueue(command)
 
 
 async def ensure_sampler_launched(model_id: str) -> None:
@@ -608,16 +597,18 @@ async def session_heartbeat(req: SessionHeartbeatRequest):
 async def create_model(req: CreateModelRequest, request: Request) -> dict[str, Any]:
   """ServiceClient.create_lora_training_client_async()"""
   try:
-    model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="lora")
+    model_id, meta = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="lora")
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
   await bind_session(req.session_id, model_id)
-  command = make_training_request(
-    "create_model",
-    model_id,
-    {},
+  command = commands.CreateModel(
     request_id=model_id,
+    model_id=model_id,
+    base_model=meta.base_model,
+    fine_tuning_type=meta.fine_tuning_type,
+    lora_config=meta.lora_config or {},
+    full_config=meta.full_config or {},
   )
   req_id = await launch_worker_and_enqueue(command) if worker_manager is not None else await enqueue(command)
   return {"request_id": req_id}
@@ -632,7 +623,7 @@ async def delete_model(req: ModelRequest):
   is_lora = bool(meta and meta.get("fine_tuning_type") == "lora")
   if is_fft_enabled() and not is_lora:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
-    await store.put_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
+    await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)))
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
     if worker_manager is not None:
       await asyncio.to_thread(worker_manager.release, model_id)
@@ -652,19 +643,17 @@ async def create_model_from_state(req: CreateModelFromStateRequest, request: Req
   if resolved_path is None:
     resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   try:
-    model_id = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="restored")
+    model_id, meta = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="restored")
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
   await bind_session(req.session_id, model_id)
-  command = make_training_request(
-    "create_model_from_state",
-    model_id,
-    {
-      "state_path": resolved_path,
-      "restore_optimizer": req.restore_optimizer,
-    },
+  command = commands.CreateModelFromState(
     request_id=model_id,
+    model_id=model_id,
+    state_path=resolved_path,
+    restore_optimizer=req.restore_optimizer,
+    fine_tuning_type="full" if meta.fine_tuning_type == "full" else "lora",
   )
   req_id = await launch_worker_and_enqueue(command) if worker_manager is not None else await enqueue(command)
   return {"request_id": req_id}
@@ -725,12 +714,17 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
 
 # *** TrainingClient endpoints ***
 async def enqueue_forward_backward(req: ForwardBackwardRequest, forward_only: bool) -> dict[str, str]:
+  if not req.model_id:
+    raise HTTPException(status_code=400, detail="model_id is required")
   fwd_input = req.forward_backward_input or req.forward_input or ForwardBackwardInput()
   req_id = await enqueue(
-    make_training_request(
-      "forward_backward",
-      req.model_id,
-      {"data": fwd_input.data, "loss_fn": fwd_input.loss_fn, "loss_config": fwd_input.loss_fn_config or {}, "forward_only": forward_only},
+    commands.ForwardBackward(
+      request_id=new_request_id(),
+      model_id=req.model_id,
+      data=fwd_input.data,
+      loss_fn=fwd_input.loss_fn,
+      loss_config=fwd_input.loss_fn_config or {},
+      forward_only=forward_only,
     )
   )
   return {"request_id": req_id}
@@ -753,7 +747,9 @@ async def forward_backward(req: Annotated[ForwardBackwardRequest, Depends(forwar
 @app.post("/api/v1/optim_step")
 async def optim_step(req: OptimStepRequest):
   """TrainingClient.optim_step_async()"""
-  req_id = await enqueue(make_training_request("optim_step", req.model_id, {"adam_params": req.adam_params}))
+  if not req.model_id:
+    raise HTTPException(status_code=400, detail="model_id is required")
+  req_id = await enqueue(commands.OptimStep(request_id=new_request_id(), model_id=req.model_id, adam_params=req.adam_params))
   return {"request_id": req_id}
 
 
@@ -779,14 +775,12 @@ async def save_weights_for_sampler(req: SaveWeightsForSamplerRequest):
 
   session_id = sampler_session_id(model_id, seq_id)
   req_id = await enqueue(
-    make_training_request(
-      "save_weights_for_sampler",
-      model_id,
-      {
-        "alias": alias,
-        "path": sampler_weights_path(model_id, alias) if alias else None,
-        "sampling_session_id": session_id,
-      },
+    commands.SaveWeightsForSampler(
+      request_id=new_request_id(),
+      model_id=model_id,
+      alias=alias,
+      path=sampler_weights_path(model_id, alias) if alias else None,
+      sampling_session_id=session_id,
     )
   )
   return {"request_id": req_id}
@@ -814,7 +808,9 @@ async def save_weights(req: SaveWeightsRequest):
 
   # save_state is the whole training state in tinker's API. The client
   # chooses on load whether the optimizer comes back.
-  req_id = await enqueue(make_training_request("save_state", model_id, {"state_path": state_path, "include_optimizer": True, "kind": "weights"}))
+  req_id = await enqueue(
+    commands.SaveState(request_id=new_request_id(), model_id=model_id, state_path=state_path, include_optimizer=True, kind="weights")
+  )
   return {"request_id": req_id}
 
 
@@ -831,7 +827,9 @@ async def load_weights(req: LoadWeightsRequest):
     raise HTTPException(status_code=400, detail=f"{state_path} is not a tinker://<model>/weights/<name> path")
 
   resolved_path = checkpoint_state_path(model_id, state_path)
-  req_id = await enqueue(make_training_request("load_weights", model_id, {"state_path": resolved_path, "restore_optimizer": req.optimizer}))
+  req_id = await enqueue(
+    commands.LoadWeights(request_id=new_request_id(), model_id=model_id, state_path=resolved_path, restore_optimizer=req.optimizer)
+  )
   return {"request_id": req_id}
 
 
@@ -941,16 +939,14 @@ async def asample(req: AsampleRequest):
 
   if get_sampler_backend() == "torch":
     req_id = await enqueue(
-      make_training_request(
-        "sample",
-        lookup_id,
-        {
-          "prompt_tokens": prompt,
-          "max_tokens": params.max_tokens,
-          "temperature": params.temperature,
-          "num_samples": num_samples,
-          "prompt_logprobs": req.prompt_logprobs,
-        },
+      commands.Sample(
+        request_id=new_request_id(),
+        model_id=lookup_id,
+        prompt_tokens=prompt,
+        max_tokens=params.max_tokens,
+        temperature=params.temperature,
+        num_samples=num_samples,
+        prompt_logprobs=req.prompt_logprobs,
       )
     )
     return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}

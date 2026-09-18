@@ -94,7 +94,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     request = self.store.forwarded_requests[0]
     self.assertEqual(request["op"], "create_model")
     self.assertEqual(request["model_id"], model_id)
-    self.assertEqual(request["payload"], {})
+    self.assertEqual(request["base_model"], "base-model")
     meta = json.loads(self.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "base-model")
 
@@ -129,8 +129,8 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(len(self.store.forwarded_requests), 1)
     req_forwarded = self.store.forwarded_requests[0]
     self.assertEqual(req_forwarded["op"], "create_model_from_state")
-    self.assertEqual(req_forwarded["payload"]["state_path"], "/tmp/checkpoint")
-    self.assertTrue(req_forwarded["payload"]["restore_optimizer"])
+    self.assertEqual(req_forwarded["state_path"], "/tmp/checkpoint")
+    self.assertTrue(req_forwarded["restore_optimizer"])
 
     # Assert canonical metadata persistence:
     meta = json.loads(self.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
@@ -264,7 +264,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
       ],
     }
     request = Request(scope)
-    model_id = await api_server._extract_and_persist_model_metadata(
+    model_id, _meta = await api_server._extract_and_persist_model_metadata(
       api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"),
       request,
       default_fine_tuning_type="full",
