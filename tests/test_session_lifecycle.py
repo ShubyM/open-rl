@@ -4,11 +4,10 @@ import unittest
 from collections import defaultdict
 from unittest.mock import patch
 
-from fastapi import Request
-
 from server import api_server
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStore
+from tests.api_client import asgi_client, post_json
 
 
 class RuntimeManager:
@@ -37,6 +36,12 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}))
     self.enterContext(patch.object(api_server, "owner_locks", defaultdict(asyncio.Lock)))
 
+  async def asyncSetUp(self):
+    self.client = await self.enterAsyncContext(asgi_client())
+
+  async def post(self, path, body, **kwargs):
+    return await post_json(self.client, path, body, **kwargs)
+
   async def expire(self, session_id):
     # What the store does on its own once the heartbeats stop.
     await self.store.delete_values(f"open_rl:session:{session_id}")
@@ -46,13 +51,13 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
       await api_server.reap_owner(owner)
 
   async def test_shared_lora_owner_outlives_the_session_that_created_it(self):
-    training = (await api_server.create_session({}))["session_id"]
-    adapter = (await api_server.create_model({"base_model": "test-base", "session_id": training}))["request_id"]
-    fft_request = Request({"type": "http", "headers": [(b"x-open-rl-fine-tuning-type", b"full")]})
-    fft_model = (await api_server.create_model({"base_model": "fft-base", "session_id": training}, request=fft_request))["request_id"]
+    training = (await self.post("create_session", {}))["session_id"]
+    adapter = (await self.post("create_model", {"base_model": "test-base", "session_id": training}))["request_id"]
+    fft_headers = {"x-open-rl-fine-tuning-type": "full"}
+    fft_model = (await self.post("create_model", {"base_model": "fft-base", "session_id": training}, headers=fft_headers))["request_id"]
     await self.store.set_value("open_rl:sampler_ready:test-base", "1")
-    sampling = (await api_server.create_session({}))["session_id"]
-    await api_server.create_sampling_session({"model_path": f"tinker://{adapter}/sampler_weights/test", "session_id": sampling})
+    sampling = (await self.post("create_session", {}))["session_id"]
+    await self.post("create_sampling_session", {"model_path": f"tinker://{adapter}/sampler_weights/test", "session_id": sampling})
     self.assertEqual(self.manager.ensured, [(adapter, "trainer"), (fft_model, "trainer"), (adapter, "sampler")])
 
     await self.expire(training)
