@@ -10,7 +10,7 @@
 
 ## 1. Executive Summary
 
-This design document outlines key architectural improvements to sampling and training request dispatch, queue contracts, worker selection, and resource sharing across `src/server/gateway.py`, `src/server/worker_manager.py`, `src/server/training_requests_processor.py`, `src/server/k8s_worker_manager.py`, and `src/server/store.py`.
+This design document outlines key architectural improvements to sampling and training request dispatch, queue contracts, worker selection, and resource sharing across `src/server/api_server.py`, `src/server/worker_manager.py`, `src/server/training_requests_processor.py`, `src/server/k8s_worker_manager.py`, and `src/server/store.py`.
 
 Previously, sampling and training request handling exhibited four primary operational issues:
 
@@ -25,7 +25,7 @@ Previously, sampling and training request handling exhibited four primary operat
 
 ### 1. `model_meta` as the Strict Single Source of Truth for `base_model`
 - **Zero Environment Variable Fallbacks**: `open_rl:model_meta:<model_id>` (persisted during model creation in `store`) is the canonical source of truth for `base_model` and `fine_tuning_type`.
-- Components (Gateway, Worker Managers, Sampler Workers) must retrieve `meta = store.get_model_metadata(model_id)` and read `meta.base_model`.
+- Components (API server, Worker Managers, Sampler Workers) must retrieve `meta = store.get_model_metadata(model_id)` and read `meta.base_model`.
 - There will be **no fallback on environment variables** (`BASE_MODEL`, `OPEN_RL_BASE_MODEL`, `VLLM_MODEL`) when resolving a model's base model. If `base_model` is missing in `model_meta`, an explicit exception is raised rather than falling back to global environment variables.
 
 ### 2. Base-Model Shared LoRA Sampler Workers & Queues
@@ -43,8 +43,8 @@ Previously, sampling and training request handling exhibited four primary operat
 - If `fine_tuning_type == "lora"`: Launches `server.lora_sampler` keying by `base_model`.
 - If `fine_tuning_type == "full"`: Launches `server.vllm_sampler` keying by `model_id`.
 
-### 4. Metadata-Driven Gateway Dispatch (`src/server/gateway.py`)
-`gateway.py` (`asample` and `create_sampling_session`) will eliminate `os.path.exists(...)` disk checks and environment variable fallbacks. The gateway strictly respects `fine_tuning_type` and `base_model` from `store.get_model_metadata(model_id)`:
+### 4. Metadata-Driven API server Dispatch (`src/server/api_server.py`)
+`api_server.py` (`asample` and `create_sampling_session`) will eliminate `os.path.exists(...)` disk checks and environment variable fallbacks. The API server strictly respects `fine_tuning_type` and `base_model` from `store.get_model_metadata(model_id)`:
 - If `fine_tuning_type == "lora"`: Set `queue_id = meta["base_model"]`, `weights_path = None`, `lora_id = model_id`, `lora_path = peft_dir`. Enqueue to `open_rl:sampler_queue:<queue_id>`.
 - If `fine_tuning_type == "full"`: Set `queue_id = model_id`, `weights_path = resolve_sampler_weights_path(model_id)`, `lora_id = None`, `lora_path = None`. Enqueue to `open_rl:sampler_queue:<queue_id>`.
 
@@ -54,7 +54,7 @@ Previously, sampling and training request handling exhibited four primary operat
 ### 6. LoRA Active Tenant Set Indexing & 1:1 Worker Mapping (`open_rl:active_tenants_set:<base_model>-<idx>`)
 - **Worker-Scoped Rotation Sets**: To prevent cross-model queue stealing and support horizontal worker scaling, LoRA active tenant rotation sets in Redis are indexed by `base_model` and replica index (`idx`), e.g., `open_rl:active_tenants_set:Qwen/Qwen3-0.6B-1`.
 - **1:1 Worker Mapping**: Each LoRA worker pod (e.g., `open-rl-trainer-qwen-qwen3-0-6b-1`) maps 1:1 to its indexed active tenant rotation set (`Qwen/Qwen3-0.6B-1`). A worker only polls and round-robins tenant sessions assigned to its specific `active_tenants_set` index.
-- **Gateway Tenant Assignment**: When a LoRA model is created (`create_model`), the Gateway assigns the tenant UUID to the active tenant set for that base model. Initially, there is one active set per base model (`idx=1`); as workloads scale out to multiple replicas (`idx=1, 2, ...`), the Gateway balances tenant session assignments across the indexed active sets.
+- **API server Tenant Assignment**: When a LoRA model is created (`create_model`), the API server assigns the tenant UUID to the active tenant set for that base model. Initially, there is one active set per base model (`idx=1`); as workloads scale out to multiple replicas (`idx=1, 2, ...`), the API server balances tenant session assignments across the indexed active sets.
 
 ### 7. Multi-Tenant LoRA Queue Draining Before Cycling (`v0.6.4`)
 - **Queue Draining Contract**: In `RedisStore.get_requests()` and `InMemoryStore.get_requests()`, when a LoRA trainer worker inspects the head tenant in the active rotation list (`lindex active_list 0`), it drains all pending requests from that tenant's queue (`open_rl:queue:{model_id}`) without rotating the tenant to the tail of the active list until the queue is empty (`llen == 0`).
@@ -64,7 +64,7 @@ Previously, sampling and training request handling exhibited four primary operat
 
 ## 3. Detailed Specification & Implementation Flow
 
-### 3.1 Gateway Dispatch and Session Creation (`src/server/gateway.py`)
+### 3.1 API server Dispatch and Session Creation (`src/server/api_server.py`)
 
 #### `create_sampling_session()`
 ```python
@@ -215,8 +215,8 @@ class InMemoryStore(RequestStore):
 ### 3.5 LoRA Worker Launch Contract & Active Set Routing (`--active-tenant-set-id`)
 
 - **Worker Command Line Invocation**: When `KubernetesWorkerManager` launches a LoRA trainer pod (`open-rl-trainer-<sanitized_base_model>-<idx>`), it passes `--active-tenant-set-id "open_rl:active_tenants:Qwen/Qwen3-0.6B-1"` (or derives the active set key directly from the worker's assigned base model index).
-- **Tenant Assignment on Gateway (`create_model`)**:
-  - The Gateway maps each newly created LoRA tenant (`model_id`) to the active tenant rotation set for its `base_model` index:
+- **Tenant Assignment on API server (`create_model`)**:
+  - The API server maps each newly created LoRA tenant (`model_id`) to the active tenant rotation set for its `base_model` index:
     ```python
     active_set_id = f"{base_model}-1"  # Initial deployment: 1 active set per base model
     await redis.sadd(f"open_rl:active_tenants_set:{active_set_id}", model_id)
@@ -231,7 +231,7 @@ class InMemoryStore(RequestStore):
 
 ## 4. Streamlined 3-Phase Execution Strategy
 
-Merging Gateway dispatch changes with Local Worker Manager updates ensures that queue keys (`open_rl:sampler_queue:<queue_id>`) match between queue producers (Gateway) and queue consumers (Sampler Workers) in a single coherent step.
+Merging API server dispatch changes with Local Worker Manager updates ensures that queue keys (`open_rl:sampler_queue:<queue_id>`) match between queue producers (API server) and queue consumers (Sampler Workers) in a single coherent step.
 
 Furthermore, local/dev host (`l4`) testing focuses on LoRA fine-tuning workflows, while Full Fine-Tuning (FFT) validation (which relies on `accel-timeslicer` daemonset and snapshot synchronization) is deferred to the final Kubernetes phase.
 
@@ -246,12 +246,12 @@ Furthermore, local/dev host (`l4`) testing focuses on LoRA fine-tuning workflows
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │ Phase 2: Local Sampler Selection, Shared LoRA Worker   │
-│ Launching & Gateway Metadata Dispatch                  │
+│ Launching & API server Metadata Dispatch                  │
 │ Files: src/server/worker_manager.py                   │
-│        src/server/gateway.py                           │
+│        src/server/api_server.py                           │
 │ Goal:  1. Worker manager launches lora_sampler         │
 │           keyed by base_model for LoRA jobs.           │
-│        2. Gateway routes requests to base_model        │
+│        2. API server routes requests to base_model        │
 │           queue using model_meta, removing disk/env    │
 │           checks.                                      │
 │ Test: Local unit tests + LoRA dev host `l4` testing    │
@@ -272,8 +272,8 @@ Furthermore, local/dev host (`l4`) testing focuses on LoRA fine-tuning workflows
 - **Status**: **Completed & Verified** (unit tests passing).
 - **Validation**: Added `sampling_queues` in `InMemoryStore` to support `put_sampling_request` and `get_sampling_requests_for_model` without requiring Redis.
 
-### **Phase 2: Local Sampler & Trainer Selection, Shared Base-Model Workers & Gateway Metadata Dispatch [COMPLETED & VERIFIED]**
-- **Target Files**: `src/server/worker_manager.py`, `src/server/gateway.py`, `src/server/training_requests_processor.py`
+### **Phase 2: Local Sampler & Trainer Selection, Shared Base-Model Workers & API server Metadata Dispatch [COMPLETED & VERIFIED]**
+- **Target Files**: `src/server/worker_manager.py`, `src/server/api_server.py`, `src/server/training_requests_processor.py`
 - **Status**: **Completed & Verified** on remote host `l4`.
 - **Implementation**:
   - `WorkerManager.launch_sampler()` & `launch_trainer()` resolve `target_id = base_model` for LoRA mode (`Qwen/Qwen3-0.6B`).
@@ -286,7 +286,7 @@ Furthermore, local/dev host (`l4`) testing focuses on LoRA fine-tuning workflows
   - Executed dual-job RL training benchmark `lora-gsm8k-rl-x2` (`Qwen/Qwen3-0.6B`, 5 steps) on remote GPU host `l4`.
 
 ### **Phase 3: Kubernetes Worker Manager Alignment & Per-Base-Model Active Tenant Rotation Sets [COMPLETED & VERIFIED]**
-- **Target Files**: `src/server/k8s_worker_manager.py`, `src/server/gateway.py`, `src/server/store.py`
+- **Target Files**: `src/server/k8s_worker_manager.py`, `src/server/api_server.py`, `src/server/store.py`
 - **Status**: **Completed & Verified** on Kubernetes (`v0.6.3`).
 - **Implementation**:
   - Aligned `KubernetesFFTWorkerManager` so LoRA trainer and sampler pods are named `open-rl-trainer-<sanitized_base_model>-<idx>` and `open-rl-sampler-<sanitized_base_model>-<idx>` and reused across LoRA sessions sharing the same base model.
@@ -294,11 +294,11 @@ Furthermore, local/dev host (`l4`) testing focuses on LoRA fine-tuning workflows
   - Verified 10-step single-tenant LoRA RL GSM8K benchmark (`lora-gsm8k-rl`) on Kubernetes.
 
 ### **Phase 4: Multi-Tenant LoRA Queue Draining & Full Fine-Tuning (FFT) Validation on Kubernetes [COMPLETED & VERIFIED]**
-- **Target Files**: `src/server/store.py`, `k8s/deploy/distributed-fft-timeslice/04-gateway.yaml`
+- **Target Files**: `src/server/store.py`, `k8s/deploy/distributed-fft-timeslice/04-api-server.yaml`
 - **Status**: **Completed & Verified** on Kubernetes (`v0.6.4`).
 - **Implementation**:
   - Updated `RedisStore.get_requests()` and `InMemoryStore.get_requests()` so that when a LoRA trainer worker inspects the head tenant in the active rotation list (`lindex active_list 0`), it drains all pending requests from that tenant's queue without rotating the tenant to the tail of the active list until the queue is empty (`llen == 0`).
-  - Configured `OPEN_RL_ENABLE_FFT: "true"` on Gateway (`04-gateway.yaml`).
+  - Configured `OPEN_RL_ENABLE_FFT: "true"` on API server (`04-api-server.yaml`).
 - **Validation**:
   - Executed 10-step concurrent dual LoRA RL GSM8K benchmark (`lora-gsm8k-rl-x2`) on `Qwen/Qwen3-0.6B`. Both `job-a` and `job-b` completed cleanly with zero adapter thrashing and ~21.9s average step time.
   - Executed 10-step Full Fine-Tuning RL GSM8K benchmark (`fft-gsm8k-rl`) on `Qwen/Qwen3-0.6B`. Accuracy improved from **18.75%** at Step 0 to **87.50%** at Step 8 (**81.25%** at Step 9) with ~17.7s average step time.
@@ -321,14 +321,14 @@ Furthermore, local/dev host (`l4`) testing focuses on LoRA fine-tuning workflows
 
 - **Source Files**:
   - `src/server/store.py` (Phase 1 & Phase 4 - Complete)
-  - `src/server/worker_manager.py`, `src/server/gateway.py`, `src/server/training_requests_processor.py` (Phase 2 - Complete)
+  - `src/server/worker_manager.py`, `src/server/api_server.py`, `src/server/training_requests_processor.py` (Phase 2 - Complete)
   - `src/server/k8s_worker_manager.py` (Phase 3 & Phase 5 - Complete)
 - **Kubernetes Manifests**:
-  - `k8s/deploy/distributed-fft-timeslice/04-gateway.yaml`, `05-worker-pod-template.yaml`, `09-sampler-pod-template.yaml` (Phase 3 & Phase 4 - Complete)
+  - `k8s/deploy/distributed-fft-timeslice/04-api-server.yaml`, `05-worker-pod-template.yaml`, `09-sampler-pod-template.yaml` (Phase 3 & Phase 4 - Complete)
   - `k8s/deploy/distributed-fft-timeslice/06b-lora-gpu-resourceclaim.yaml`, `08b-lora-sampler-resourceclaim.yaml` (Phase 5 - Complete)
 - **Test Files**:
   - `tests/test_redis_store.py` (Phase 1 - Complete)
-  - `tests/test_worker_manager.py` & `tests/test_gateway_paths.py` (Phase 2 - Complete)
+  - `tests/test_worker_manager.py` & `tests/test_api_server_paths.py` (Phase 2 - Complete)
   - `tests/test_k8s_worker_manager.py` (Phase 3 & Phase 5 - Complete)
 
 ---

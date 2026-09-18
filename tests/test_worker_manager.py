@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from server import gateway
+from server import api_server
 from server.session_registry import SessionRegistry
 from server.worker_manager import LocalWorkerManager
 
@@ -62,26 +62,26 @@ class WorkerManagerStub:
     pass
 
 
-class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
+class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
   """create_model in FFT mode launches the model's worker directly, then
   enqueues onto its per-model queue — there is no separate launch queue."""
 
   def setUp(self) -> None:
     self.store = StoreStub()
     self.worker_manager = WorkerManagerStub()
-    self.enterContext(patch.object(gateway, "store", self.store))
-    self.enterContext(patch.object(gateway, "worker_manager", self.worker_manager))
-    self.enterContext(patch.object(gateway, "session_registry", SessionRegistry(self.store)))
+    self.enterContext(patch.object(api_server, "store", self.store))
+    self.enterContext(patch.object(api_server, "worker_manager", self.worker_manager))
+    self.enterContext(patch.object(api_server, "session_registry", SessionRegistry(self.store)))
     self.enterContext(patch("server.store.get_store", return_value=self.store))
 
   async def asyncSetUp(self) -> None:
-    self.session_id = (await gateway.create_session({}))["session_id"]
+    self.session_id = (await api_server.create_session({}))["session_id"]
 
   async def test_create_model_launches_worker_then_enqueues(self) -> None:
     import json
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
-      result = await gateway.create_model({"base_model": "base-model", "session_id": self.session_id})
+      result = await api_server.create_model({"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
@@ -96,8 +96,8 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
   async def test_create_model_failed_launch_fails_future_and_enqueues_nothing(self) -> None:
     self.worker_manager.error = RuntimeError("boom")
 
-    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}), patch("server.gateway.traceback.print_exc"):
-      result = await gateway.create_model({"base_model": "base-model", "session_id": self.session_id})
+    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}), patch("server.api_server.traceback.print_exc"):
+      result = await api_server.create_model({"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
@@ -108,7 +108,7 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     import json
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
-      result = await gateway.create_model_from_state(
+      result = await api_server.create_model_from_state(
         {
           "session_id": self.session_id,
           "state_path": "/tmp/checkpoint",
@@ -146,24 +146,24 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
           "fine_tuning_type": "full",
         }
       )
-      await gateway.bind_session(self.session_id, "model-x")
-      await gateway.ensure_sampler_launched("model-x")
+      await api_server.bind_session(self.session_id, "model-x")
+      await api_server.ensure_sampler_launched("model-x")
 
     self.assertEqual(self.worker_manager.launched_sampler_model_ids, ["model-x"])
 
   async def test_create_model_launches_trainer_when_worker_manager_present(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "false"}):
-      result = await gateway.create_model({"base_model": "base-model", "session_id": self.session_id})
+      result = await api_server.create_model({"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
     self.assertEqual(len(self.store.forwarded_requests), 1)
 
 
-class GatewayLifespanTest(unittest.IsolatedAsyncioTestCase):
+class ApiServerLifespanTest(unittest.IsolatedAsyncioTestCase):
   async def test_lifespan_full_mode_requires_redis(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
-      async with gateway.lifespan(gateway.app):
+      async with api_server.lifespan(api_server.app):
         pass
 
 
@@ -240,10 +240,10 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       self.assertEqual(kwargs_s["env"].get("OPEN_RL_WEIGHT_SYNC_STRATEGY"), "delta")
 
 
-class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
+class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
-    self.enterContext(patch.object(gateway, "store", self.store))
+    self.enterContext(patch.object(api_server, "store", self.store))
 
   async def test_extract_and_persist_metadata_from_headers(self) -> None:
     import json
@@ -258,7 +258,7 @@ class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
       ],
     }
     request = Request(scope)
-    model_id = await gateway._extract_and_persist_model_metadata(
+    model_id = await api_server._extract_and_persist_model_metadata(
       {"base_model": "Qwen/Qwen2.5-0.5B"},
       request,
       default_fine_tuning_type="full",
@@ -272,10 +272,10 @@ class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(meta_dict["weight_sync_config"]["strategy"], "delta")
 
 
-class GatewayFutureTranslationTest(unittest.TestCase):
+class ApiServerFutureTranslationTest(unittest.TestCase):
   def test_create_model_result_translates_to_tinker_shape(self) -> None:
     self.assertEqual(
-      gateway.translate_future_result(
+      api_server.translate_future_result(
         {
           "type": "model_created",
           "model_id": "model-a",
@@ -294,7 +294,7 @@ class GatewayFutureTranslationTest(unittest.TestCase):
 
   def test_create_model_from_state_result_translates_to_tinker_shape(self) -> None:
     self.assertEqual(
-      gateway.translate_future_result(
+      api_server.translate_future_result(
         {
           "type": "model_loaded_from_state",
           "model_id": "model-a",
@@ -313,7 +313,7 @@ class GatewayFutureTranslationTest(unittest.TestCase):
 
   def test_lora_create_model_result_translates_rank_to_tinker_shape(self) -> None:
     self.assertEqual(
-      gateway.translate_future_result(
+      api_server.translate_future_result(
         {
           "type": "model_created",
           "model_id": "model-a",
@@ -345,7 +345,7 @@ class GatewayFutureTranslationTest(unittest.TestCase):
     for internal_type, public_type in cases:
       with self.subTest(internal_type=internal_type):
         self.assertEqual(
-          gateway.translate_future_result({"type": internal_type, "path": "/tmp/x"}),
+          api_server.translate_future_result({"type": internal_type, "path": "/tmp/x"}),
           {"type": public_type, "path": "/tmp/x"},
         )
 

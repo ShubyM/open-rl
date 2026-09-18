@@ -16,7 +16,7 @@ Images, published to GHCR by `.github/workflows/build-and-push.yml` and tagged w
 verbatim:
 
 - `ghcr.io/gke-labs/open-rl/server:<tag>`
-- `ghcr.io/gke-labs/open-rl/gateway:<tag>`
+- `ghcr.io/gke-labs/open-rl/api-server:<tag>`
 - `ghcr.io/gke-labs/open-rl/client:<tag>` (the e2e client, `src/server/Dockerfile.client`)
 - `ghcr.io/gke-labs/open-rl/scheduler:<tag>`
 

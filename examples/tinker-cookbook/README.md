@@ -20,7 +20,7 @@ extra, which the pin above already includes.
 ### Client SDK versions
 
 Tinker SDK 0.25.0 and later send training requests as protobuf and only read
-training and sampling results as protobuf. The gateway accepts both encodings, so any
+training and sampling results as protobuf. The API server accepts both encodings, so any
 SDK from 0.23 onward works, including the one a fresh `uv sync` of the upstream
 `tinker-cookbook` repository resolves. `docs/tinker-client-compatibility.md` lists
 the supported client methods for the SDK version it was generated from.
@@ -36,7 +36,7 @@ whose default renderer is hardcoded for a different family, such as
 
 ## Start the Server
 
-From the repository root, start one vLLM sampler and one OpenRL gateway on
+From the repository root, start one vLLM sampler and one OpenRL API server on
 separate GPUs. These examples are written for two L4 GPUs or better.
 
 ```bash
@@ -51,7 +51,7 @@ BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" \
 SAMPLING_BACKEND=vllm \
 VLLM_URL=http://127.0.0.1:8001 \
 TINKER_API_KEY=tml-dummy-key \
-uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
+uv run --extra gpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
 ```
 
 CPU mode is useful for tiny model fixtures, but Qwen-sized cookbook runs should

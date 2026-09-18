@@ -5,19 +5,19 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from server import gateway
+from server import api_server
 from server.store import InMemoryStore
 
 
 class GetInfoTest(unittest.TestCase):
   def setUp(self) -> None:
-    patcher = patch.object(gateway, "store", InMemoryStore())
+    patcher = patch.object(api_server, "store", InMemoryStore())
     patcher.start()
     self.addCleanup(patcher.stop)
 
   def test_get_info_uses_base_model_env(self) -> None:
     with patch.dict(os.environ, {"BASE_MODEL": "env-model"}, clear=True):
-      info = asyncio.run(gateway.get_info({"model_id": "model-a"}))
+      info = asyncio.run(api_server.get_info({"model_id": "model-a"}))
 
     self.assertEqual(info["model_name"], "env-model")
     self.assertEqual(info["model_data"]["tokenizer_id"], "env-model")
@@ -25,11 +25,11 @@ class GetInfoTest(unittest.TestCase):
 
   def test_get_info_prefers_the_models_own_base_model(self) -> None:
     meta = json.dumps({"base_model": "google/gemma-4-e2b", "fine_tuning_type": "full"})
-    asyncio.run(gateway.store.set_value("open_rl:model_meta:model-g", meta))
+    asyncio.run(api_server.store.set_value("open_rl:model_meta:model-g", meta))
     with patch.dict(os.environ, {"BASE_MODEL": "Qwen/Qwen2.5-0.5B"}, clear=True):
-      info = asyncio.run(gateway.get_info({"model_id": "model-g"}))
-      via_sampler_ref = asyncio.run(gateway.get_info({"model_id": "tinker://model-g/sampler_weights/sampler-1"}))
-      unknown = asyncio.run(gateway.get_info({"model_id": "model-unknown"}))
+      info = asyncio.run(api_server.get_info({"model_id": "model-g"}))
+      via_sampler_ref = asyncio.run(api_server.get_info({"model_id": "tinker://model-g/sampler_weights/sampler-1"}))
+      unknown = asyncio.run(api_server.get_info({"model_id": "model-unknown"}))
 
     # The client loads its tokenizer from this name, so it must be the job's model.
     self.assertEqual(info["model_name"], "google/gemma-4-e2b")
@@ -39,92 +39,92 @@ class GetInfoTest(unittest.TestCase):
 
   def test_get_info_404s_without_base_model_env(self) -> None:
     with patch.dict(os.environ, {}, clear=True):
-      response = asyncio.run(gateway.get_info({"model_id": "model-a"}))
+      response = asyncio.run(api_server.get_info({"model_id": "model-a"}))
     self.assertEqual(response.status_code, 404)
 
   def test_create_model_requires_base_model_payload(self) -> None:
-    response = asyncio.run(gateway.create_model({}))
+    response = asyncio.run(api_server.create_model({}))
     self.assertEqual(response.status_code, 400)
 
   def test_create_model_accepts_base_model_payload(self) -> None:
-    created = asyncio.run(gateway.create_model({"base_model": "my-model"}))
+    created = asyncio.run(api_server.create_model({"base_model": "my-model"}))
     model_id = created["request_id"]
-    queued = asyncio.run(gateway.store.get_requests())
+    queued = asyncio.run(api_server.store.get_requests())
     self.assertEqual(queued[0]["model_id"], model_id)
     self.assertEqual(queued[0]["payload"], {})
-    meta = json.loads(gateway.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    meta = json.loads(api_server.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "my-model")
 
 
 class SaveSeqIdZeroTest(unittest.TestCase):
   def setUp(self) -> None:
-    patcher = patch.object(gateway, "store", InMemoryStore())
+    patcher = patch.object(api_server, "store", InMemoryStore())
     patcher.start()
     self.addCleanup(patcher.stop)
 
   def test_the_first_saves_zero_seq_id_is_kept(self) -> None:
     # The client's counter is 0-based; 0 must not fall back to a timestamp id.
-    asyncio.run(gateway.save_weights_for_sampler({"model_id": "job-a", "sampling_session_seq_id": 0}))
-    asyncio.run(gateway.save_weights({"model_id": "job-a", "seq_id": 0}))
-    queued = asyncio.run(gateway.store.get_requests())
+    asyncio.run(api_server.save_weights_for_sampler({"model_id": "job-a", "sampling_session_seq_id": 0}))
+    asyncio.run(api_server.save_weights({"model_id": "job-a", "seq_id": 0}))
+    queued = asyncio.run(api_server.store.get_requests())
     self.assertEqual(queued[0]["payload"]["sampling_session_id"], "tinker://job-a/sampler_weights/sampler-0")
     self.assertTrue(queued[1]["payload"]["state_path"].endswith("job-a-samp-0"))
 
 
-class GatewayPathTest(unittest.TestCase):
+class ApiServerPathTest(unittest.TestCase):
   def test_checkpoint_state_paths_are_model_scoped(self) -> None:
-    old_tmp_dir = gateway.TMP_DIR
+    old_tmp_dir = api_server.TMP_DIR
     with tempfile.TemporaryDirectory() as tmp_dir:
-      gateway.TMP_DIR = tmp_dir
-      self.addCleanup(setattr, gateway, "TMP_DIR", old_tmp_dir)
+      api_server.TMP_DIR = tmp_dir
+      self.addCleanup(setattr, api_server, "TMP_DIR", old_tmp_dir)
 
       self.assertEqual(
-        gateway.checkpoint_state_path("job-a", "final"),
+        api_server.checkpoint_state_path("job-a", "final"),
         os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "final"),
       )
       self.assertEqual(
-        gateway.checkpoint_state_path("job-b", "final"),
+        api_server.checkpoint_state_path("job-b", "final"),
         os.path.join(tmp_dir, "checkpoints", "job-b", "weights", "final"),
       )
 
   def test_a_tinker_path_names_the_model_that_saved_it(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(gateway, "TMP_DIR", tmp_dir):
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
       state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
-      self.assertEqual(gateway.tinker_state_path(state_dir), "tinker://job-a/weights/step-5")
+      self.assertEqual(api_server.tinker_state_path(state_dir), "tinker://job-a/weights/step-5")
       # A resuming job passes the dead job's path under its own model id.
-      self.assertEqual(gateway.checkpoint_state_path("job-b", "tinker://job-a/weights/step-5"), state_dir)
-      self.assertEqual(gateway.tinker_state_path("/elsewhere/final"), "/elsewhere/final")
+      self.assertEqual(api_server.checkpoint_state_path("job-b", "tinker://job-a/weights/step-5"), state_dir)
+      self.assertEqual(api_server.tinker_state_path("/elsewhere/final"), "/elsewhere/final")
       # Only weights paths are checkpoints. A sampler path is refused, not resolved under the caller.
-      self.assertIsNone(gateway.tinker_checkpoint_dir("tinker://job-a/sampler_weights/sampler-3"))
-      refused = asyncio.run(gateway.load_weights({"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"}))
+      self.assertIsNone(api_server.tinker_checkpoint_dir("tinker://job-a/sampler_weights/sampler-3"))
+      refused = asyncio.run(api_server.load_weights({"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"}))
       self.assertEqual(refused.status_code, 400)
 
   def test_save_state_keeps_the_optimizer_and_answers_with_a_tinker_path(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(gateway, "TMP_DIR", tmp_dir):
-      asyncio.run(gateway.save_weights({"model_id": "job-a", "path": "step-5"}))
-      queued = asyncio.run(gateway.store.get_requests())
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
+      asyncio.run(api_server.save_weights({"model_id": "job-a", "path": "step-5"}))
+      queued = asyncio.run(api_server.store.get_requests())
       self.assertEqual(queued[0]["op"], "save_state")
       self.assertTrue(queued[0]["payload"]["include_optimizer"])
-      saved = gateway.translate_future_result({"type": "state_saved", "path": queued[0]["payload"]["state_path"]})
+      saved = api_server.translate_future_result({"type": "state_saved", "path": queued[0]["payload"]["state_path"]})
     self.assertEqual(saved, {"type": "save_weights", "path": "tinker://job-a/weights/step-5"})
 
   def test_weights_info_reads_the_checkpoint_on_disk(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(gateway, "TMP_DIR", tmp_dir):
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
       state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
       os.makedirs(os.path.join(state_dir, "job-a"))
       with open(os.path.join(state_dir, "metadata.json"), "w") as f:
         json.dump({"base_model": "google/gemma-4-e2b", "model_id": "job-a", "has_optimizer": True}, f)
       with open(os.path.join(state_dir, "job-a", "adapter_config.json"), "w") as f:
         json.dump({"r": 8}, f)
-      info = asyncio.run(gateway.weights_info({"tinker_path": "tinker://job-a/weights/step-5"}))
-      missing = asyncio.run(gateway.weights_info({"tinker_path": "tinker://job-a/weights/never"}))
+      info = asyncio.run(api_server.weights_info({"tinker_path": "tinker://job-a/weights/step-5"}))
+      missing = asyncio.run(api_server.weights_info({"tinker_path": "tinker://job-a/weights/never"}))
     self.assertEqual(info["base_model"], "google/gemma-4-e2b")
     self.assertTrue(info["is_lora"])
     self.assertEqual(info["lora_rank"], 8)
     self.assertEqual(missing.status_code, 404)
 
   def test_checkpoint_state_paths_accept_explicit_output_directories(self) -> None:
-    self.assertEqual(gateway.checkpoint_state_path("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
+    self.assertEqual(api_server.checkpoint_state_path("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
 
 
 if __name__ == "__main__":
@@ -140,13 +140,13 @@ class ProtobufWireTest(unittest.TestCase):
   def setUp(self) -> None:
     from fastapi.testclient import TestClient
 
-    patcher = patch.object(gateway, "store", InMemoryStore())
+    patcher = patch.object(api_server, "store", InMemoryStore())
     patcher.start()
     self.addCleanup(patcher.stop)
-    self.client = TestClient(gateway.app)
+    self.client = TestClient(api_server.app)
 
   def _queued(self) -> list[dict]:
-    return asyncio.run(gateway.store.get_requests())
+    return asyncio.run(api_server.store.get_requests())
 
   def test_protobuf_and_json_forward_backward_queue_the_same_request(self) -> None:
     with open(self.FIXTURE, "rb") as fh:
@@ -206,11 +206,11 @@ class ProtobufWireTest(unittest.TestCase):
     from server.proto import tinker_public_pb2 as pb
 
     asyncio.run(
-      gateway.store.set_future(
+      api_server.store.set_future(
         "samp-1", {"type": "sample_completed", "sequences": [{"tokens": [1, 2], "logprobs": [-0.5, -1.0], "stop_reason": "stop"}]}
       )
     )
-    asyncio.run(gateway.store.set_future("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
+    asyncio.run(api_server.store.set_future("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
 
     as_json = self.client.post("/api/v1/retrieve_future", json={"request_id": "samp-1"})
     self.assertEqual(as_json.status_code, 200)
@@ -234,18 +234,18 @@ class SampleSequenceIdsTest(unittest.TestCase):
   sequence id per requested sample."""
 
   def setUp(self) -> None:
-    patcher = patch.object(gateway, "store", InMemoryStore())
+    patcher = patch.object(api_server, "store", InMemoryStore())
     patcher.start()
     self.addCleanup(patcher.stop)
 
   def test_asample_promise_carries_one_id_per_sample(self) -> None:
-    with patch.object(gateway, "get_sampler_backend", return_value="torch"):
-      promise = asyncio.run(gateway.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}))
+    with patch.object(api_server, "get_sampler_backend", return_value="torch"):
+      promise = asyncio.run(api_server.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}))
     self.assertEqual(len(promise["sample_sequence_ids"]), 3)
     self.assertEqual(len(set(promise["sample_sequence_ids"])), 3)
     self.assertTrue(all(sid.startswith(promise["request_id"]) for sid in promise["sample_sequence_ids"]))
 
   def test_asample_defaults_to_a_single_sample(self) -> None:
-    with patch.object(gateway, "get_sampler_backend", return_value="torch"):
-      promise = asyncio.run(gateway.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}))
+    with patch.object(api_server, "get_sampler_backend", return_value="torch"):
+      promise = asyncio.run(api_server.asample({"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}))
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)

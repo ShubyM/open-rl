@@ -1,4 +1,4 @@
-"""Worker managers. The gateway asks one to make sure a model's trainer or
+"""Worker managers. The API server asks one to make sure a model's trainer or
 sampler exists before it enqueues work. Local mode spawns subprocesses; the
 scheduler mode (scheduler_worker_manager.py) creates Workloads."""
 
@@ -138,12 +138,12 @@ class WorkerManager(Protocol):
     ...
 
   def close(self) -> None:
-    """The gateway is exiting."""
+    """The API server is exiting."""
     ...
 
 
 class LocalWorkerManager:
-  """Runs each runtime as a subprocess of the gateway, for development."""
+  """Runs each runtime as a subprocess of the API server, for development."""
 
   def __init__(self, project_dir: Path = PROJECT_DIR):
     if not os.getenv("REDIS_URL"):

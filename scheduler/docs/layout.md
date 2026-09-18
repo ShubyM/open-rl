@@ -84,5 +84,5 @@ it touches Kubernetes). Everything else is in service of those.
 
 Not in this module: the node-local time-slicer (who is *resident* right now)
 is Python, in `src/accel_timeslicer/`, and ships with the FFT line along with
-the gateway's `src/server/scheduler_worker_manager.py`, which turns API
+the API server's `src/server/scheduler_worker_manager.py`, which turns API
 requests into Workload objects using the estimator's footprint.

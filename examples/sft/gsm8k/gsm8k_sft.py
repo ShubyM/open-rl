@@ -99,7 +99,7 @@ def main(config: Config) -> None:
 
 
 if __name__ == "__main__":
-  # Turns OPEN_RL_FINE_TUNING_TYPE into the header the gateway reads. Without
+  # Turns OPEN_RL_FINE_TUNING_TYPE into the header the API server reads. Without
   # it the fft-gsm8k scenario silently trains a LoRA adapter.
   patch_tinker_default_headers()
   chz.nested_entrypoint(main, allow_hyphens=True)

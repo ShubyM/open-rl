@@ -34,7 +34,7 @@ session_registry = SessionRegistry(store)
 SESSION_REAP_INTERVAL_SEC = 30
 # Attaching a session to an owner and reaping that owner take turns, so a
 # session cannot attach between the reaper deciding an owner is unused and
-# deleting its workers. In-process, which is why there is one gateway replica.
+# deleting its workers. In-process, which is why there is one API server replica.
 owner_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
@@ -49,7 +49,7 @@ async def reap_owner(owner: str) -> None:
   async with owner_locks[owner]:
     if await session_registry.in_use(owner):
       return
-    print(f"[GATEWAY] No live session uses {owner}; tearing its workers down")
+    print(f"[API_SERVER] No live session uses {owner}; tearing its workers down")
     for model in await asyncio.to_thread(worker_manager.release_owner, owner):
       await store.delete_values(f"open_rl:sampler_ready:{model}")
     await session_registry.forget(owner)
@@ -125,7 +125,7 @@ def resolve_sampler_weights_path(model_id: str) -> str:
         if steps:
           weights_path = os.path.join(sampler_weights_dir, f"sampler-{max(steps)}")
       except Exception as e:
-        print(f"[GATEWAY] Warning: Failed parsing step subdirectories in {sampler_weights_dir}: {e}")
+        print(f"[API_SERVER] Warning: Failed parsing step subdirectories in {sampler_weights_dir}: {e}")
   return weights_path
 
 
@@ -211,7 +211,7 @@ async def _extract_and_persist_model_metadata(
       fine_tuning_type = "lora"
 
   if fine_tuning_type == "full" and not is_fft_enabled():
-    raise ValueError("Full Fine-Tuning (FFT) is disabled on this Open-RL Gateway instance")
+    raise ValueError("Full Fine-Tuning (FFT) is disabled on this Open-RL API server instance")
 
   if fine_tuning_type != "full" and default_fine_tuning_type != "restored":
     fine_tuning_type = "lora"
@@ -268,7 +268,7 @@ async def enqueue(request: dict) -> str:
   await store.put_request({**request, "trace_context": carrier}, active_set_id=active_set_id)
   # One line per training request so a request that never reaches a worker can
   # be traced end to end (the workers log the same id when they pop it).
-  print(f"[GATEWAY] enqueued op={request.get('op')} request_id={request_id} model_id={request.get('model_id')} active_set={active_set_id}")
+  print(f"[API_SERVER] enqueued op={request.get('op')} request_id={request_id} model_id={request.get('model_id')} active_set={active_set_id}")
   return request_id
 
 
@@ -543,7 +543,7 @@ async def delete_model(req: dict):
     pass
   is_lora = meta_dict and meta_dict.get("fine_tuning_type") == "lora"
   if is_fft_enabled() and not is_lora:
-    print(f"[GATEWAY] Requesting shutdown of workers for model {model_id}...")
+    print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
     await store.put_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id, "op": "shutdown_workers"})
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
     if worker_manager is not None:
@@ -591,7 +591,7 @@ async def get_info(req: dict):
 
   TrainingClient.get_tokenizer() loads whatever tokenizer this names, so it
   has to be the model's own base model; BASE_MODEL is only the fallback for
-  an id we have no metadata for. Answering with the gateway default sent a
+  an id we have no metadata for. Answering with the API server default sent a
   Gemma job Qwen's tokenizer and every sample came back as token soup.
   """
   model_id = req.get("model_id")
@@ -796,7 +796,7 @@ async def weights_info(req: dict):
   """RestClient.get_weights_info_by_tinker_path(). What a checkpoint was
   trained from, so create_training_client_from_state can open a matching
   client and load_state into it. Answered from the checkpoint directory, so
-  it survives a gateway or Redis restart."""
+  it survives an API server or Redis restart."""
   path = req.get("tinker_path") or ""
   state_dir = tinker_checkpoint_dir(path)
   metadata_path = os.path.join(state_dir, "metadata.json") if state_dir else None
@@ -845,12 +845,12 @@ async def create_sampling_session(req: dict):
     await ensure_sampler_launched(target_model_id)
     s = get_store()
     if hasattr(s, "redis"):
-      print(f"[GATEWAY] Waiting for dynamic vLLM sampler worker to be ready for model {ready_check_id}...")
+      print(f"[API_SERVER] Waiting for dynamic vLLM sampler worker to be ready for model {ready_check_id}...")
       start_time = time.monotonic()
       while True:
         is_ready = await s.redis.get(f"open_rl:sampler_ready:{ready_check_id}")
         if is_ready == "1" or is_ready == b"1":
-          print(f"[GATEWAY] Dynamic vLLM sampler worker is ready! (took {time.monotonic() - start_time:.2f}s)")
+          print(f"[API_SERVER] Dynamic vLLM sampler worker is ready! (took {time.monotonic() - start_time:.2f}s)")
           break
         if time.monotonic() - start_time > 300:
           raise TimeoutError("Timed out waiting for dynamic vLLM sampler worker to be ready")

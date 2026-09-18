@@ -1,8 +1,8 @@
 .PHONY: server vllm test lint fmt help render release-bundle push-vm pull-vm cluster-eval \
-	cloud-build-gateway cloud-build-server cloud-build-client \
-	cloud-deploy-gateway cloud-deploy-server \
-	cloud-rollout-gateway cloud-rollout-server cloud-rollout \
-	kind-host-setup kind-create kind-gateway kind-deploy \
+	cloud-build-api-server cloud-build-server cloud-build-client \
+	cloud-deploy-api-server cloud-deploy-server \
+	cloud-rollout-api-server cloud-rollout-server cloud-rollout \
+	kind-host-setup kind-create kind-api-server kind-deploy \
 	kind-client kind-e2e kind-status kind-logs kind-prune kind-delete
 
 # ---------------------------------------------------------------------------
@@ -18,7 +18,7 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_gateway_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends tests.test_sampler_weight_rotation
+UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_api_server_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends tests.test_sampler_weight_rotation
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -66,7 +66,7 @@ server:
 	@-kill -9 $$(lsof -ti:$(PORT)) 2>/dev/null || true
 	BASE_MODEL="$(BASE_MODEL)" SAMPLING_BACKEND="$(SAMPLING_BACKEND)" \
 	  uv run --extra $(if $(filter vllm,$(SAMPLING_BACKEND)),gpu,cpu) \
-	  python -m uvicorn server.gateway:app --host $(HOST) --port $(PORT)
+	  python -m uvicorn server.api_server:app --host $(HOST) --port $(PORT)
 
 vllm:
 	BASE_MODEL="$(BASE_MODEL)" \
@@ -137,16 +137,16 @@ require-gcp-project:
 
 build-images: require-gcp-project
 	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG) -f src/server/Dockerfile .
-	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-gateway:$(IMAGE_TAG) -f src/server/Dockerfile.gateway .
+	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-api-server:$(IMAGE_TAG) -f src/server/Dockerfile.api_server .
 	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-client:$(IMAGE_TAG) -f src/server/Dockerfile.client .
 
 push-images: require-gcp-project
 	docker push $(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG)
-	docker push $(CLOUD_REGISTRY)/open-rl-gateway:$(IMAGE_TAG)
+	docker push $(CLOUD_REGISTRY)/open-rl-api-server:$(IMAGE_TAG)
 	docker push $(CLOUD_REGISTRY)/open-rl-client:$(IMAGE_TAG)
-	kubectl set image deployment/open-rl-gateway gateway=$(CLOUD_REGISTRY)/open-rl-gateway:$(IMAGE_TAG) 2>/dev/null || true
+	kubectl set image deployment/open-rl-api-server api-server=$(CLOUD_REGISTRY)/open-rl-api-server:$(IMAGE_TAG) 2>/dev/null || true
 	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=$(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
-	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=$(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
+	kubectl set env deployment/open-rl-api-server OPEN_RL_WORKER_IMAGE=$(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG) 2>/dev/null || true
 
 # --- Cloud Build ------------------------------------------------------------
 # Builds in GCP instead of locally: `gcloud builds submit` uploads only the
@@ -154,7 +154,7 @@ push-images: require-gcp-project
 # inside Google's network. Useful when the workstation is far from the cluster
 # or has no Docker daemon.
 #
-#   make cloud-rollout-gateway   # slim gateway image, ~2 min -- covers gateway.py,
+#   make cloud-rollout-api-server   # slim API server image, ~2 min -- covers api_server.py,
 #                                #   k8s_worker_manager.py, store.py
 #   make cloud-rollout-server    # CUDA worker image, ~20-40 min
 #   make cloud-rollout           # both, plus the client image
@@ -175,8 +175,8 @@ CLOUD_REGISTRY ?= gcr.io/$(GCP_PROJECT)
 
 CLOUD_BUILD = gcloud builds submit --project=$(GCP_PROJECT) --config=cloudbuild.yaml
 
-cloud-build-gateway: require-gcp-project
-	$(CLOUD_BUILD) --substitutions=_IMAGE=$(CLOUD_REGISTRY)/open-rl-gateway,_DOCKERFILE=src/server/Dockerfile.gateway,_TAG=$(CLOUD_IMAGE_TAG) .
+cloud-build-api-server: require-gcp-project
+	$(CLOUD_BUILD) --substitutions=_IMAGE=$(CLOUD_REGISTRY)/open-rl-api-server,_DOCKERFILE=src/server/Dockerfile.api_server,_TAG=$(CLOUD_IMAGE_TAG) .
 
 cloud-build-server: require-gcp-project
 	$(CLOUD_BUILD) --substitutions=_IMAGE=$(CLOUD_REGISTRY)/open-rl-server,_DOCKERFILE=src/server/Dockerfile,_TAG=$(CLOUD_IMAGE_TAG) .
@@ -186,19 +186,19 @@ cloud-build-client: require-gcp-project
 
 # Point the running workloads at the freshly built tag. Split from the build
 # steps so a tag built earlier can be re-deployed with
-# `make cloud-deploy-gateway CLOUD_IMAGE_TAG=<tag>`.
-cloud-deploy-gateway: require-gcp-project
-	kubectl set image deployment/open-rl-gateway gateway=$(CLOUD_REGISTRY)/open-rl-gateway:$(CLOUD_IMAGE_TAG)
-	@echo "gateway -> $(CLOUD_REGISTRY)/open-rl-gateway:$(CLOUD_IMAGE_TAG)"
+# `make cloud-deploy-api-server CLOUD_IMAGE_TAG=<tag>`.
+cloud-deploy-api-server: require-gcp-project
+	kubectl set image deployment/open-rl-api-server api-server=$(CLOUD_REGISTRY)/open-rl-api-server:$(CLOUD_IMAGE_TAG)
+	@echo "API server -> $(CLOUD_REGISTRY)/open-rl-api-server:$(CLOUD_IMAGE_TAG)"
 
 cloud-deploy-server: require-gcp-project
 	kubectl set image daemonset/open-rl-accel-timeslicer accel-timeslicer=$(CLOUD_REGISTRY)/open-rl-server:$(CLOUD_IMAGE_TAG) 2>/dev/null || true
-	kubectl set env deployment/open-rl-gateway OPEN_RL_WORKER_IMAGE=$(CLOUD_REGISTRY)/open-rl-server:$(CLOUD_IMAGE_TAG)
+	kubectl set env deployment/open-rl-api-server OPEN_RL_WORKER_IMAGE=$(CLOUD_REGISTRY)/open-rl-server:$(CLOUD_IMAGE_TAG)
 	@echo "workers -> $(CLOUD_REGISTRY)/open-rl-server:$(CLOUD_IMAGE_TAG)"
 
-cloud-rollout-gateway: cloud-build-gateway cloud-deploy-gateway
+cloud-rollout-api-server: cloud-build-api-server cloud-deploy-api-server
 cloud-rollout-server: cloud-build-server cloud-deploy-server
-cloud-rollout: cloud-build-gateway cloud-build-server cloud-build-client cloud-deploy-gateway cloud-deploy-server
+cloud-rollout: cloud-build-api-server cloud-build-server cloud-build-client cloud-deploy-api-server cloud-deploy-server
 
 # --- kind on a GPU VM -------------------------------------------------------
 # These run against the local docker daemon and kube context, so run them on the
@@ -213,10 +213,10 @@ kind-host-setup:
 kind-create:
 	./dev/kind/create-cluster.sh
 
-# Rebuild and republish only the slim gateway image -- the fast inner loop.
-kind-gateway:
-	./dev/kind/load-images.sh gateway
-	kubectl -n openrl-system rollout restart deployment/open-rl-gateway
+# Rebuild and republish only the slim API server image -- the fast inner loop.
+kind-api-server:
+	./dev/kind/load-images.sh api-server
+	kubectl -n openrl-system rollout restart deployment/open-rl-api-server
 
 kind-deploy:
 	./dev/kind/load-images.sh
@@ -238,7 +238,7 @@ kind-status:
 	kubectl get pods,resourceclaims,resourceslices
 
 kind-logs:
-	kubectl logs deployment/open-rl-gateway --tail=100
+	kubectl logs deployment/open-rl-api-server --tail=100
 
 # Reclaim what republishing a mutable tag leaves behind: superseded registry
 # blobs and untagged node images. Leaves the BuildKit cache alone -- see the
@@ -252,14 +252,14 @@ kind-delete:
 deploy:
 	kubectl apply -k k8s/deploy/distributed-lustre/
 
-# FFT DRA variant: the gateway launches one worker pod per FFT model, all pinned
+# FFT DRA variant: the API server launches one worker pod per FFT model, all pinned
 # to one physical GPU allocation via a shared DRA ResourceClaim.
 # See docs/setup/gke-fft-timeslice.md.
 deploy-fft-timeslice:
 	kubectl apply --server-side -k k8s/deploy/distributed-fft-timeslice/
 
 rollout:
-	kubectl rollout restart deployment redis-store open-rl-gateway open-rl-trainer-worker vllm-worker
+	kubectl rollout restart deployment redis-store open-rl-api-server open-rl-trainer-worker vllm-worker
 
 # One-off vLLM eval of a checkpoint on the shared PVC:
 cluster-eval:
@@ -309,7 +309,7 @@ dashboard-apply:
 # Images published by .github/workflows/build-and-push.yml. The names must match
 # the manifests exactly or the pin silently does nothing.
 IMAGE_REPO     ?= ghcr.io/gke-labs/open-rl
-RELEASE_IMAGES ?= server gateway client scheduler
+RELEASE_IMAGES ?= server api-server client scheduler
 # Gitignored; the release job uploads everything in here.
 DIST_DIR       ?= dist
 

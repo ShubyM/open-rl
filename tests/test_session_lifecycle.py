@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from fastapi import Request
 
-from server import gateway
+from server import api_server
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStore
 
@@ -29,13 +29,13 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.store = InMemoryStore()
     self.manager = RuntimeManager()
     self.registry = SessionRegistry(self.store)
-    self.enterContext(patch.object(gateway, "store", self.store))
-    self.enterContext(patch.object(gateway, "get_store", return_value=self.store))
+    self.enterContext(patch.object(api_server, "store", self.store))
+    self.enterContext(patch.object(api_server, "get_store", return_value=self.store))
     self.enterContext(patch("server.store.get_store", return_value=self.store))
-    self.enterContext(patch.object(gateway, "session_registry", self.registry))
-    self.enterContext(patch.object(gateway, "worker_manager", self.manager))
+    self.enterContext(patch.object(api_server, "session_registry", self.registry))
+    self.enterContext(patch.object(api_server, "worker_manager", self.manager))
     self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}))
-    self.enterContext(patch.object(gateway, "owner_locks", defaultdict(asyncio.Lock)))
+    self.enterContext(patch.object(api_server, "owner_locks", defaultdict(asyncio.Lock)))
 
   async def expire(self, session_id):
     # What the store does on its own once the heartbeats stop.
@@ -43,16 +43,16 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
   async def reap(self):
     for owner in await self.registry.owners():
-      await gateway.reap_owner(owner)
+      await api_server.reap_owner(owner)
 
   async def test_shared_lora_owner_outlives_the_session_that_created_it(self):
-    training = (await gateway.create_session({}))["session_id"]
-    adapter = (await gateway.create_model({"base_model": "test-base", "session_id": training}))["request_id"]
+    training = (await api_server.create_session({}))["session_id"]
+    adapter = (await api_server.create_model({"base_model": "test-base", "session_id": training}))["request_id"]
     fft_request = Request({"type": "http", "headers": [(b"x-open-rl-fine-tuning-type", b"full")]})
-    fft_model = (await gateway.create_model({"base_model": "fft-base", "session_id": training}, request=fft_request))["request_id"]
+    fft_model = (await api_server.create_model({"base_model": "fft-base", "session_id": training}, request=fft_request))["request_id"]
     await self.store.set_value("open_rl:sampler_ready:test-base", "1")
-    sampling = (await gateway.create_session({}))["session_id"]
-    await gateway.create_sampling_session({"model_path": f"tinker://{adapter}/sampler_weights/test", "session_id": sampling})
+    sampling = (await api_server.create_session({}))["session_id"]
+    await api_server.create_sampling_session({"model_path": f"tinker://{adapter}/sampler_weights/test", "session_id": sampling})
     self.assertEqual(self.manager.ensured, [(adapter, "trainer"), (fft_model, "trainer"), (adapter, "sampler")])
 
     await self.expire(training)
@@ -86,9 +86,9 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
       return {"test-base"}
 
     self.manager.release_owner = release_owner
-    reap = asyncio.create_task(gateway.reap_owner("test-base"))
+    reap = asyncio.create_task(api_server.reap_owner("test-base"))
     await slow.wait()  # the reaper has decided and is mid-delete
-    await gateway.bind_session("b", "test-base")
+    await api_server.bind_session("b", "test-base")
     await reap
     self.assertEqual(self.manager.released, ["test-base"])
     self.assertTrue(await self.registry.in_use("test-base"))
