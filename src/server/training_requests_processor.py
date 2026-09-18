@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import threading
 import time
 import traceback
@@ -295,6 +296,21 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     return {"status": "ok", "type": "weights_saved"}
 
 
+# Sampler weight versions kept on the volume. The sampler applies each delta
+# as it lands, so older versions are dead weight; an 8B run otherwise leaves
+# 3 GiB per step behind.
+SAMPLER_VERSIONS_KEPT = int(os.getenv("OPEN_RL_SAMPLER_VERSIONS_KEPT", "3"))
+
+
+def older_versions(path: str, keep: int) -> list[str]:
+  """Sibling version directories of `path` beyond the newest `keep`, oldest first."""
+  parent = os.path.dirname(path)
+  if not os.path.isdir(parent):
+    return []
+  versions = sorted((p for p in (os.path.join(parent, name) for name in os.listdir(parent)) if os.path.isdir(p)), key=os.path.getmtime)
+  return versions[: max(0, len(versions) - keep)]
+
+
 class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
@@ -315,9 +331,9 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     self.time_slicer = time_slicer
     self.snapshot_registered = False
 
-  async def exit_gracefully(self) -> None:
+  async def exit_gracefully(self, unregister: bool = True) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if self.snapshot_registered:
+    if unregister and self.snapshot_registered:
       try:
         await self.time_slicer.unregister(self.workload)
         self.snapshot_registered = False
@@ -365,42 +381,68 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       else:
         training_reqs.append(req)
 
+    results: list[tuple[str | None, dict[str, Any]]] = []
+    failure: Exception | None = None
     with tracer.start_as_current_span("training_requests_batch") as batch_span:
       batch_span.set_attribute("batch_size", len(training_reqs))
       batch_span.set_attribute("model_id", self.model_id)
-
       if training_reqs:
         print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}: {describe_requests(training_reqs)}")
-        results = []
-        save_ops = {"save_state", "save_weights", "save_weights_for_sampler"}
-        gpu_reqs = [r for r in training_reqs if r.get("op") not in save_ops]
-        save_reqs = [r for r in training_reqs if r.get("op") in save_ops]
+        results, failure = await self.answer_batch(training_reqs)
 
-        if gpu_reqs:
-          async with self.time_slicer.acquire(self.workload):
-            if hasattr(self.worker, "wake_up"):
-              await asyncio.to_thread(self.worker.wake_up)
-            try:
-              for request in gpu_reqs:
-                results.append(await self.handle_request(request, self.model_id))
-            finally:
-              if hasattr(self.worker, "sleep"):
-                await asyncio.to_thread(self.worker.sleep)
+    for request_id, result in results:
+      if request_id is not None:
+        await self.store.set_future(request_id, result)
+    if failure is not None:
+      raise failure
 
-        if hasattr(self.worker, "cpu_offload") and not self.worker.cpu_offload and save_reqs:
-          async with self.time_slicer.acquire(self.workload):
-            for request in save_reqs:
-              results.append(await self.handle_request(request, self.model_id))
-        else:
-          for request in save_reqs:
-            results.append(await self.handle_request(request, self.model_id))
-
-        for request_id, result in results:
-          if request_id is not None:
-            await self.store.set_future(request_id, result)
-
+    if self.time_slicer.faulted:
+      # This process still holds the accelerator. Exit without unregistering so
+      # the grant moves on only once the memory is gone. Exit 0 keeps the pod
+      # from restarting on fresh weights mid-run; the run fails on its next call.
+      print(f"[WORKER] Time slicer could not park this process: {self.time_slicer.faulted}. Exiting to free the accelerator.")
+      await self.exit_gracefully(unregister=False)
     if has_shutdown:
       await self.exit_gracefully()
+
+  async def answer_batch(self, requests: list[dict[str, Any]]) -> tuple[list[tuple[str | None, dict[str, Any]]], Exception | None]:
+    """Every request gets an answer: its result, or the failure that stopped the batch."""
+    results: list[tuple[str | None, dict[str, Any]]] = []
+    try:
+      await self.handle_batch(requests, results)
+    except Exception as exc:
+      answered = {request_id for request_id, _ in results}
+      for request in requests:
+        request_id = request.get("request_id")
+        if request_id and request_id not in answered:
+          results.append((request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
+      return results, exc
+    return results, None
+
+  async def handle_batch(self, requests: list[dict[str, Any]], results: list[tuple[str | None, dict[str, Any]]]) -> None:
+    """GPU work under one time-slicer turn; saves need the device only when the worker is not offloaded."""
+    save_ops = {"save_state", "save_weights", "save_weights_for_sampler"}
+    gpu_reqs = [r for r in requests if r.get("op") not in save_ops]
+    save_reqs = [r for r in requests if r.get("op") in save_ops]
+
+    if gpu_reqs:
+      async with self.time_slicer.acquire(self.workload):
+        await asyncio.to_thread(self.worker.wake_up)
+        try:
+          for request in gpu_reqs:
+            results.append(await self.handle_request(request, self.model_id))
+        finally:
+          await asyncio.to_thread(self.worker.sleep)
+
+    if not save_reqs:
+      return
+    if self.worker.cpu_offload:
+      for request in save_reqs:
+        results.append(await self.handle_request(request, self.model_id))
+    else:
+      async with self.time_slicer.acquire(self.workload):
+        for request in save_reqs:
+          results.append(await self.handle_request(request, self.model_id))
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     base_model, raw_config, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")
@@ -497,6 +539,11 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         json.dumps({"weights_path": local_path}),
       )
       print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")
+    older = older_versions(local_path, SAMPLER_VERSIONS_KEPT)
+    for path in older:
+      shutil.rmtree(path, ignore_errors=True)
+    if older:
+      print(f"[Trainer] Removed {len(older)} sampler weight versions older than the newest {SAMPLER_VERSIONS_KEPT}")
     return {
       "path": payload.get("path"),
       "sampling_session_id": payload.get("sampling_session_id"),

@@ -425,6 +425,12 @@ class DeltaSnapshotWeightTransferEngine(WeightTransferEngine):
 
       if torch.cuda.is_available() and target_device.type == "cuda":
         torch.cuda.synchronize(target_device)
+        # Hand the bulk tensors back to the driver. vLLM re-creates the KV
+        # cache with cuMemCreate right after this, which cannot use memory
+        # torch still holds in its cache; for an 8B FFT delta that is ~10 GiB.
+        patch = idx_slice = val_slice = None
+        del bulk_indices_gpu, bulk_values_gpu
+        torch.cuda.empty_cache()
 
     t_copy_ms = (time.perf_counter() - t0_copy) * 1000.0
     t_total_ms = (time.perf_counter() - t0_start) * 1000.0

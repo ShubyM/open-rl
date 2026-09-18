@@ -31,7 +31,7 @@ spec:
       serviceAccountName: open-rl-sa
       containers:
       - name: ui
-        image: ghcr.io/gke-labs/open-rl/client:latest
+        image: ghcr.io/gke-labs/open-rl/autoresearch:latest
         imagePullPolicy: Always
         command: ["sh", "-c"]
         args:
@@ -98,7 +98,7 @@ spec:
       activeDeadlineSeconds: 21600
       containers:
       - name: researcher
-        image: ghcr.io/gke-labs/open-rl/client:latest
+        image: ghcr.io/gke-labs/open-rl/autoresearch:latest
         imagePullPolicy: Always
         resources:
           requests:

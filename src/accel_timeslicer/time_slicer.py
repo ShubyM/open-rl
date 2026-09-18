@@ -12,6 +12,9 @@ DEFAULT_TCP_PORT = 9753
 
 
 class TimeSlicerClient(Protocol):
+  # Set when a release could not park this process; it still holds the device.
+  faulted: str | None
+
   async def register(self, workload: WorkloadRef) -> dict[str, Any]: ...
 
   async def unregister(self, workload: WorkloadRef) -> dict[str, Any]: ...
@@ -31,6 +34,10 @@ class TimeSlicer(Protocol):
   async def unregister(self, workload: WorkloadRef) -> dict[str, Any]: ...
 
 
+class TimeSlicerFault(RuntimeError):
+  """The slicer could not park this process, so it still holds the accelerator and has to exit."""
+
+
 class SocketTimeSlicerClient:
   def __init__(
     self,
@@ -43,6 +50,9 @@ class SocketTimeSlicerClient:
     self.port = port
     self.reader: asyncio.StreamReader | None = None
     self.writer: asyncio.StreamWriter | None = None
+    # Set when a release could not park this process. The caller finishes
+    # publishing its results and exits; the grant moves on once it is gone.
+    self.faulted: str | None = None
 
   async def connect(self, retries: int = 10, backoff: float = 0.5) -> None:
     if self.writer is not None and not self.writer.is_closing():
@@ -80,7 +90,10 @@ class SocketTimeSlicerClient:
     try:
       yield
     finally:
-      await self.request({"command": "RELEASE", **payload})
+      try:
+        await self.request({"command": "RELEASE", **payload})
+      except TimeSlicerFault as exc:
+        self.faulted = str(exc)
 
   async def request(self, payload: dict[str, Any]) -> dict[str, Any]:
     await self.connect()
@@ -97,8 +110,14 @@ class SocketTimeSlicerClient:
 
       response = json.loads(line.decode("utf-8"))
       if not response.get("ok"):
+        if response.get("faulted"):
+          # The connection stays open: closing it would hand the grant to the
+          # next waiter while this process still holds the accelerator.
+          raise TimeSlicerFault(response.get("error", "time slicer could not park this process"))
         raise RuntimeError(response.get("error", "time slicer command failed"))
       return response
+    except TimeSlicerFault:
+      raise
     except Exception:
       await self.close()
       raise

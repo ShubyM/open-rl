@@ -79,11 +79,14 @@ SAMPLER_LORA_SLOT_BYTES = GIB
 SAMPLER_LORA_SLOT_BYTES_PER_PARAM = 0.25
 SAMPLER_KV_TOKENS = 8 * 8192  # eight max-length requests in flight
 # Parked in host memory: fft trainer 12 B/param + a weight copy in flight;
-# plus process overhead. Measured: 0.5B trainer 28Gi, sampler 20Gi; 7B FFT
-# trainer OOM-killed at 110Gi.
+# plus process overhead. Measured: 0.5B trainer 28Gi, sampler 20Gi; 8B FFT
+# sampler 39Gi steady; 7B FFT trainer OOM-killed at 110Gi.
 HOST_BYTES_PER_PARAM = {("full", "trainer"): 14, ("lora", "trainer"): 2, ("full", "sampler"): 2, ("lora", "sampler"): 2}
-HOST_OVERHEAD_BYTES = {"trainer": 20 * GIB, "sampler": 18 * GIB}
-HOST_LIMIT_FACTOR = 1.5
+HOST_OVERHEAD_BYTES = {"trainer": 20 * GIB, "sampler": 24 * GIB}
+# Limits equal requests. Placement admits pods by request, so a pod that
+# could burst past it can push a co-seated neighbour into the kernel's OOM
+# killer; an 8B FFT sampler ran at 39Gi against a 34Gi request.
+HOST_LIMIT_FACTOR = 1.0
 
 
 def gib(n: int) -> str:
