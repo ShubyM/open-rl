@@ -12,12 +12,13 @@ from typing import Any, Protocol
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from opentelemetry import context as otel_context
-from opentelemetry import propagate, trace
+from opentelemetry import context, propagate, trace
+from opentelemetry.trace import SpanKind
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.store import RequestStore, get_store
+from server.telemetry import initialize_tracing, shutdown_tracing
 from training.commands import parse_command
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
@@ -48,28 +49,27 @@ class TrainingRequestsProcessor(Protocol):
 
   async def handle_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> tuple[str | None, dict[str, Any]]:
     request_id = raw_request.get("request_id")
-    token = None
 
     try:
       command = parse_command(raw_request)
       request_id = command.request_id
       resolved_model_id = model_id or command.model_id or "default"
 
-      ctx = propagate.extract(command.trace_context) if command.trace_context else None
-      token = otel_context.attach(ctx) if ctx else None
-
-      # The handlers read the command's fields as the payload they always took.
-      payload = command.model_dump(mode="json", exclude={"op", "request_id", "model_id", "trace_context"})
-      result = await self.dispatch_operation(command.op, payload, resolved_model_id)
+      parent = propagate.extract(command.trace_context or {}, context=context.Context())
+      with tracer.start_as_current_span(
+        f"training.{command.op}",
+        context=parent,
+        kind=SpanKind.CONSUMER,
+        attributes={"request_id": request_id, "model_id": resolved_model_id},
+      ):
+        payload = command.model_dump(mode="json", exclude={"op", "request_id", "model_id", "trace_context"})
+        result = await self.dispatch_operation(command.op, payload, resolved_model_id)
       return request_id, result
     except Exception as exc:
       traceback.print_exc()
       if request_id is None:
         raise
       return request_id, {"type": "RequestFailedResponse", "error_message": str(exc)}
-    finally:
-      if token:
-        otel_context.detach(token)
 
   async def dispatch_operation(self, op: str, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     match op:
@@ -180,14 +180,10 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
 
     model_id = batch[0].get("model_id", "default")
 
-    with tracer.start_as_current_span("training_requests_batch") as batch_span:
-      batch_span.set_attribute("batch_size", len(batch))
-      batch_span.set_attribute("model_id", model_id)
-
-      print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {model_id}: {describe_requests(batch)}")
-      for request in batch:
-        target_model_id = request.get("adapter_id") or request.get("model_id") or model_id
-        await self.process_request(request, target_model_id)
+    print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {model_id}: {describe_requests(batch)}")
+    for request in batch:
+      target_model_id = request.get("adapter_id") or request.get("model_id") or model_id
+      await self.process_request(request, target_model_id)
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     base_model, _, raw_config, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="lora")
@@ -334,6 +330,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       await self.time_slicer.close()
     except Exception:
       pass
+    shutdown_tracing()
     os._exit(0)
 
   async def run(self) -> None:
@@ -374,12 +371,9 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
     results: list[tuple[str | None, dict[str, Any]]] = []
     failure: Exception | None = None
-    with tracer.start_as_current_span("training_requests_batch") as batch_span:
-      batch_span.set_attribute("batch_size", len(training_reqs))
-      batch_span.set_attribute("model_id", self.model_id)
-      if training_reqs:
-        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}: {describe_requests(training_reqs)}")
-        results, failure = await self.answer_batch(training_reqs)
+    if training_reqs:
+      print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}: {describe_requests(training_reqs)}")
+      results, failure = await self.answer_batch(training_reqs)
 
     for request_id, result in results:
       if request_id is not None:
@@ -626,7 +620,11 @@ def start_request_processing_loop() -> None:
   cuda_devs = os.getenv("CUDA_VISIBLE_DEVICES", "ALL")
   print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
 
-  asyncio.run(main_async(args))
+  initialize_tracing("open-rl-trainer")
+  try:
+    asyncio.run(main_async(args))
+  finally:
+    shutdown_tracing()
 
 
 if __name__ == "__main__":

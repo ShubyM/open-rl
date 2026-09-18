@@ -8,6 +8,7 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
+from training.telemetry import TrainingTimings
 from training.types import Datum
 
 
@@ -44,9 +45,12 @@ class BaseTrainerWorker:
     else:
       model.train()
 
+    timings = TrainingTimings(self.device)
     with torch.set_grad_enabled(not forward_only):
-      total_loss = self._run_batches(model, data, loss_fn, loss_config, forward_only, loss_fn_outputs)
-    return self._finish(data, loss_fn_outputs, total_loss)
+      total_loss = self._run_batches(model, data, loss_fn, loss_config, forward_only, loss_fn_outputs, timings)
+    result = self._finish(data, loss_fn_outputs, total_loss)
+    result["metrics"].update(timings.metrics)
+    return result
 
   def _run_batches(
     self,
@@ -56,6 +60,7 @@ class BaseTrainerWorker:
     loss_config: dict | None,
     forward_only: bool,
     loss_fn_outputs: list[dict[str, Any] | None],
+    timings: TrainingTimings,
   ) -> float:
     """Run every batch, fill ``loss_fn_outputs`` in place, and return the summed loss."""
     total_loss = 0.0
@@ -63,40 +68,45 @@ class BaseTrainerWorker:
       batch_indices = [idx for idx, _ in batch]
       batch_data = [datum for _, datum in batch]
 
-      input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
-      target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
-      target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+      with timings.phase("prepare_batch"):
+        input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
+        target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
+      with timings.phase("forward"):
+        target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
 
-      match loss_fn:
-        case "cross_entropy":
-          elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
-        case "importance_sampling":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
-          elementwise_loss = losses.importance_sampling_loss(
-            target_logprobs,
-            weights,
-            old_logprobs,
-            advantages,
-          )
-        case "ppo":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
-          elementwise_loss = losses.ppo_loss(
-            target_logprobs,
-            weights,
-            old_logprobs,
-            advantages,
-            loss_config,
-          )
-        case _:
-          raise NotImplementedError(f"Loss {loss_fn} not supported")
+      with timings.phase("loss"):
+        match loss_fn:
+          case "cross_entropy":
+            elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
+          case "importance_sampling":
+            old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
+            advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
+            elementwise_loss = losses.importance_sampling_loss(
+              target_logprobs,
+              weights,
+              old_logprobs,
+              advantages,
+            )
+          case "ppo":
+            old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
+            advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
+            elementwise_loss = losses.ppo_loss(
+              target_logprobs,
+              weights,
+              old_logprobs,
+              advantages,
+              loss_config,
+            )
+          case _:
+            raise NotImplementedError(f"Loss {loss_fn} not supported")
 
-      per_datum_loss = elementwise_loss.sum(dim=1)
-      loss = per_datum_loss.sum()
+        per_datum_loss = elementwise_loss.sum(dim=1)
+        loss = per_datum_loss.sum()
       if not forward_only:
-        loss.backward()
+        with timings.phase("backward"):
+          loss.backward()
       total_loss += loss.item()
+      timings.collect_gpu()
 
       detached_logprobs = target_logprobs.detach().cpu()
       for row, original_idx in enumerate(batch_indices):

@@ -17,10 +17,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.utils import is_body_allowed_for_status_code
-from opentelemetry import propagate, trace
+from opentelemetry import propagate
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import AliasChoices, BaseModel, Field, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -28,6 +26,7 @@ from server import proto_codec
 from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config
 from server.session_registry import SessionRegistry
 from server.store import get_store
+from server.telemetry import initialize_tracing, shutdown_tracing
 from server.worker_manager import WorkerManager, create_worker_manager, owner_of
 from training import commands
 from training.commands import Command
@@ -58,22 +57,6 @@ async def reap_owner(owner: str) -> None:
     for model in await asyncio.to_thread(worker_manager.release_owner, owner):
       await store.delete_values(f"open_rl:sampler_ready:{model}")
     await session_registry.forget(owner)
-
-
-provider = TracerProvider()
-trace.set_tracer_provider(provider)
-
-if os.getenv("ENABLE_GCP_TRACE", "0") == "1":
-  try:
-    from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
-
-    exporter = CloudTraceSpanExporter()
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    print("OpenTelemetry: Configured GCP CloudTraceSpanExporter")
-  except ImportError:
-    print("OpenTelemetry: opentelemetry-exporter-gcp-trace is not installed")
-else:
-  print("OpenTelemetry: No exporter configured (ENABLE_GCP_TRACE=0)")
 
 
 class FilterNoisyEndpoints(logging.Filter):
@@ -342,17 +325,11 @@ async def _resolve_active_set_id(model_id: str | None) -> str | None:
   return None
 
 
-async def open_future(request_id: str) -> dict[str, str]:
-  """Register a pending future and return the trace carrier to send with its request."""
-  carrier: dict[str, str] = {}
-  propagate.inject(carrier)
-  await store.set_future(request_id, {"status": "pending"})
-  return carrier
-
-
 async def enqueue(command: Command) -> str:
   """Create a pending future, inject trace context, push the command to the store. Returns its request_id."""
-  carrier = await open_future(command.request_id)
+  await store.set_future(command.request_id, {"status": "pending"})
+  carrier: dict[str, str] = {}
+  propagate.inject(carrier)
 
   active_set_id = await _resolve_active_set_id(command.model_id)
   await store.put_request(commands.wire(command.model_copy(update={"trace_context": carrier})), active_set_id=active_set_id)
@@ -360,6 +337,16 @@ async def enqueue(command: Command) -> str:
   # be traced end to end (the workers log the same id when they pop it).
   print(f"[API_SERVER] enqueued op={command.op} request_id={command.request_id} model_id={command.model_id} active_set={active_set_id}")
   return command.request_id
+
+
+async def enqueue_sampling(request: dict[str, Any]) -> str:
+  """Register the result and carry the current trace across the sampling queue."""
+  request_id = request["request_id"]
+  await store.set_future(request_id, {"status": "pending"})
+  carrier: dict[str, str] = {}
+  propagate.inject(carrier)
+  await store.put_sampling_request({**request, "trace_context": carrier})
+  return request_id
 
 
 async def launch_worker_and_enqueue(command: Command) -> str:
@@ -466,6 +453,7 @@ async def reap_dead_sessions():
 @asynccontextmanager
 async def lifespan(_: FastAPI):
   global worker_manager
+  initialize_tracing("open-rl-api-server")
   task = None
   if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER"):
     worker_manager = create_worker_manager()
@@ -494,9 +482,11 @@ async def lifespan(_: FastAPI):
       reap_task.cancel()
     if task is not None:
       task.cancel()
+    await asyncio.gather(*(t for t in (reap_task, task) if t is not None), return_exceptions=True)
     if worker_manager is not None:
       worker_manager.close()
       worker_manager = None
+    shutdown_tracing()
 
 
 app = FastAPI(title="Open-RL Server MVP", lifespan=lifespan)
@@ -953,7 +943,6 @@ async def asample(req: AsampleRequest):
 
   # vLLM backend
   req_id = str(uuid.uuid4())
-  carrier = await open_future(req_id)
 
   model_meta = await store.get_model_metadata(lookup_id)
   fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
@@ -985,10 +974,9 @@ async def asample(req: AsampleRequest):
     "weights_path": weights_path,
     "include_prompt_logprobs": req.prompt_logprobs,
     "model_id": queue_id,
-    "trace_context": carrier,
   }
 
-  await store.put_sampling_request(sampling_req)
+  await enqueue_sampling(sampling_req)
   return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
 

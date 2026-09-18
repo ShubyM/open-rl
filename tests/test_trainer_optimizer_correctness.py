@@ -100,6 +100,9 @@ class _LogitModelStub:
   def train(self):
     return None
 
+  def eval(self):
+    return None
+
   def __call__(self, input_tensor, attention_mask=None, **_kwargs):
     if attention_mask is not None:
       self.calls.append((input_tensor.detach().clone(), attention_mask.detach().clone()))
@@ -719,9 +722,19 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     self.assertEqual(len(result["loss_fn_outputs"]), len(data))
     self.assertGreater(len(model.calls), 0)
     self.assertTrue(any(call[0].shape[0] > 1 for call in model.calls))
+    for phase in ("prepare_batch", "forward", "loss", "backward"):
+      self.assertGreater(result["metrics"][f"time/{phase}_host:sum"], 0)
+      self.assertNotIn(f"time/{phase}_gpu:sum", result["metrics"])
     for datum, output in zip(data, result["loss_fn_outputs"], strict=True):
       logprobs = output["logprobs"]
       self.assertEqual(logprobs["shape"], [min(len(datum.model_input), len(datum.loss_fn_inputs["target_tokens"].data))])
+
+  def test_forward_only_has_no_backward_timing(self) -> None:
+    worker = self._worker()
+    model = _LogitModelStub()
+    result = worker.forward_backward(model, self._data(), "cross_entropy", forward_only=True)
+    self.assertGreater(result["metrics"]["time/forward_host:sum"], 0)
+    self.assertNotIn("time/backward_host:sum", result["metrics"])
 
   def test_fft_forward_backward_uses_single_process_model(self) -> None:
     worker = FFTTrainingWorker()

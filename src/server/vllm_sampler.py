@@ -34,22 +34,10 @@ try:
 except ImportError:
   pass
 
-from opentelemetry import propagate, trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry import context, propagate, trace
+from opentelemetry.trace import SpanKind, StatusCode
 
-provider = TracerProvider()
-trace.set_tracer_provider(provider)
-
-if os.getenv("ENABLE_GCP_TRACE", "0") == "1":
-  try:
-    from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
-
-    exporter = CloudTraceSpanExporter()
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    print("OpenTelemetry: Configured GCP CloudTraceSpanExporter for vLLM Worker")
-  except ImportError:
-    print("OpenTelemetry: opentelemetry-exporter-gcp-trace is not installed")
+from server.telemetry import initialize_tracing, shutdown_tracing
 
 tracer = trace.get_tracer("vllm.inference.worker")
 
@@ -174,6 +162,7 @@ async def run_generation_backend(
         span.set_attribute("vllm.lora_id", lora_id)
       async for request_output in results_generator:
         final_output = request_output
+      span.set_attribute("sampling.output_tokens", sum(len(output.token_ids) for output in final_output.outputs) if final_output else 0)
 
     outputs = final_output.outputs if final_output else []
     sequences_out = []
@@ -209,6 +198,8 @@ async def run_generation_backend(
       res["prompt_logprobs"] = prompt_logprobs_out
     return res
   except Exception as e:
+    trace.get_current_span().record_exception(e)
+    trace.get_current_span().set_status(StatusCode.ERROR, str(e))
     traceback.print_exc()
     return {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(e)}"}
 
@@ -221,42 +212,47 @@ async def process_sampling_request(req: dict, store: Any) -> None:
   request_id = req["request_id"]
   trace_context = req.get("trace_context", {})
 
-  parent_span = propagate.extract(trace_context)
-  with tracer.start_as_current_span("process_sampling_request", context=parent_span):
+  parent_span = propagate.extract(trace_context or {}, context=context.Context())
+  with tracer.start_as_current_span(
+    "sampling.request",
+    context=parent_span,
+    kind=SpanKind.CONSUMER,
+    attributes={"request_id": request_id, "model_id": req.get("model_id") or "default"},
+  ) as span:
     try:
       # 1. Manage weights reloading
       weights_path = req.get("weights_path")
       if is_fft_enabled() and weights_path:
-        async with reload_lock:
-          if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
-            print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
-            if engine is not None:
-              print("[vLLM Worker] Triggering sleep level 1 (CPU offload weights)...")
-              await engine.sleep(level=1)
-              print("[vLLM Worker] Waking up weights...")
-              await engine.wake_up(tags=["weights"])
-              if WeightSyncConfig.from_env().strategy == "delta":
+        with tracer.start_as_current_span("sampling.reload_weights"):
+          async with reload_lock:
+            if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
+              print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
+              if engine is not None:
+                print("[vLLM Worker] Triggering sleep level 1 (CPU offload weights)...")
+                await engine.sleep(level=1)
+                print("[vLLM Worker] Waking up weights...")
+                await engine.wake_up(tags=["weights"])
+                if WeightSyncConfig.from_env().strategy == "delta":
 
-                def _trigger_wt(worker, path=weights_path):
-                  worker.start_weight_update()
-                  try:
-                    worker.update_weights({"target_weights_path": path})
-                  finally:
-                    worker.finish_weight_update()
+                  def _trigger_wt(worker, path=weights_path):
+                    worker.start_weight_update()
+                    try:
+                      worker.update_weights({"target_weights_path": path})
+                    finally:
+                      worker.finish_weight_update()
 
-                res = await engine.collective_rpc(_trigger_wt)
-                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
-                print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
-              else:
-                res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
-                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
-                print(f"[vLLM Worker] Full weights reloaded from {weights_path} in-place.")
-              print("[vLLM Worker] Waking up KV cache...")
-              await engine.wake_up(tags=["kv_cache"])
-              IS_ENGINE_SLEEPING = False
-            CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
-            print("[vLLM Worker] Weights reload completed successfully!")
-
+                  res = await engine.collective_rpc(_trigger_wt)
+                  print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                  print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
+                else:
+                  res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+                  print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                  print(f"[vLLM Worker] Full weights reloaded from {weights_path} in-place.")
+                print("[vLLM Worker] Waking up KV cache...")
+                await engine.wake_up(tags=["kv_cache"])
+                IS_ENGINE_SLEEPING = False
+              CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
+              print("[vLLM Worker] Weights reload completed successfully!")
       # 2. Run inference
       prompt_token_ids = req.get("prompt_token_ids", [])
       max_tokens = req.get("max_tokens", 20)
@@ -283,11 +279,15 @@ async def process_sampling_request(req: dict, store: Any) -> None:
         include_prompt_logprobs=include_prompt_logprobs,
       )
 
-      if result.get("type") != "RequestFailedResponse":
+      if result.get("type") == "RequestFailedResponse":
+        span.set_status(StatusCode.ERROR, result.get("error_message", "sampling failed"))
+      else:
         result["type"] = "sample"
 
       await store.set_future(request_id, result)
     except Exception as exc:
+      span.record_exception(exc)
+      span.set_status(StatusCode.ERROR, str(exc))
       traceback.print_exc()
       await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(exc)}"})
 
@@ -341,6 +341,7 @@ async def run_sampling_worker(model_id: str) -> None:
         await time_slicer.close()
       except Exception:
         pass
+    shutdown_tracing()
     os._exit(code)
 
   async def fail_requests(reqs: list[dict], exc: BaseException) -> None:
@@ -473,6 +474,7 @@ async def run_sampling_worker(model_id: str) -> None:
           await time_slicer.unregister(workload)
       finally:
         await time_slicer.close()
+        shutdown_tracing()
         os._exit(0)
 
 
@@ -481,10 +483,13 @@ def main() -> None:
   parser.add_argument("--model-id", type=str, required=True, help="The model ID of the RL job to process requests for")
   args = parser.parse_args()
 
+  initialize_tracing("open-rl-sampler")
   try:
     asyncio.run(run_sampling_worker(args.model_id))
   except KeyboardInterrupt:
     print("[vLLM Worker] Exiting via KeyboardInterrupt.")
+  finally:
+    shutdown_tracing()
 
 
 if __name__ == "__main__":
