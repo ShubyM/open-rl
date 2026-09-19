@@ -10,7 +10,6 @@ from opentelemetry import propagate, trace
 from opentelemetry.sdk.trace import TracerProvider
 
 from server import api_server
-from server.checkpoints import CheckpointStore
 from server.store import InMemoryStore
 from tests.api_client import runtime_context
 from training import commands
@@ -129,26 +128,26 @@ class SaveSeqIdZeroTest(ApiServerTest):
 class ApiServerPathTest(ApiServerTest):
   def test_checkpoint_state_paths_are_model_scoped(self) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
-      self.runtime.checkpoints = CheckpointStore(tmp_dir)
+      self.runtime.checkpoint_root = os.path.join(tmp_dir, "checkpoints")
 
       self.assertEqual(
-        self.runtime.checkpoints.resolve("job-a", "final"),
+        api_server.checkpoint_path(self.runtime.checkpoint_root, "job-a", "final"),
         os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "final"),
       )
       self.assertEqual(
-        self.runtime.checkpoints.resolve("job-b", "final"),
+        api_server.checkpoint_path(self.runtime.checkpoint_root, "job-b", "final"),
         os.path.join(tmp_dir, "checkpoints", "job-b", "weights", "final"),
       )
 
   def test_a_tinker_path_names_the_model_that_saved_it(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(self.runtime, "checkpoints", CheckpointStore(tmp_dir)):
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(self.runtime, "checkpoint_root", os.path.join(tmp_dir, "checkpoints")):
       state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
-      self.assertEqual(self.runtime.checkpoints.to_uri(state_dir), "tinker://job-a/weights/step-5")
+      self.assertEqual(api_server.checkpoint_uri(self.runtime.checkpoint_root, state_dir), "tinker://job-a/weights/step-5")
       # A resuming job passes the dead job's path under its own model id.
-      self.assertEqual(self.runtime.checkpoints.resolve("job-b", "tinker://job-a/weights/step-5"), state_dir)
-      self.assertEqual(self.runtime.checkpoints.to_uri("/elsewhere/final"), "/elsewhere/final")
+      self.assertEqual(api_server.checkpoint_path(self.runtime.checkpoint_root, "job-b", "tinker://job-a/weights/step-5"), state_dir)
+      self.assertEqual(api_server.checkpoint_uri(self.runtime.checkpoint_root, "/elsewhere/final"), "/elsewhere/final")
       # Only weights paths are checkpoints. A sampler path is refused, not resolved under the caller.
-      self.assertIsNone(self.runtime.checkpoints.from_uri("tinker://job-a/sampler_weights/sampler-3"))
+      self.assertIsNone(api_server.checkpoint_from_uri(self.runtime.checkpoint_root, "tinker://job-a/sampler_weights/sampler-3"))
       refused = self.post("load_weights", {"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"})
       self.assertEqual(refused.status_code, 400)
       self.assertIn("is not a tinker://<model>/weights/<name> path", refused.json()["error"])
@@ -156,16 +155,16 @@ class ApiServerPathTest(ApiServerTest):
       self.assertEqual(refused_save.status_code, 400)
 
   def test_save_state_keeps_the_optimizer_and_answers_with_a_tinker_path(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(self.runtime, "checkpoints", CheckpointStore(tmp_dir)):
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(self.runtime, "checkpoint_root", os.path.join(tmp_dir, "checkpoints")):
       self.post("save_weights", {"model_id": "job-a", "path": "step-5"})
       queued = self.queued()
       self.assertEqual(queued[0]["op"], "save_state")
       self.assertTrue(queued[0]["include_optimizer"])
-      saved = api_server.translate_future_result({"type": "state_saved", "path": queued[0]["state_path"]}, self.runtime.checkpoints)
+      saved = api_server.translate_future_result({"type": "state_saved", "path": queued[0]["state_path"]}, self.runtime.checkpoint_root)
     self.assertEqual(saved, {"type": "save_weights", "path": "tinker://job-a/weights/step-5"})
 
   def test_weights_info_reads_the_checkpoint_on_disk(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(self.runtime, "checkpoints", CheckpointStore(tmp_dir)):
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(self.runtime, "checkpoint_root", os.path.join(tmp_dir, "checkpoints")):
       state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
       os.makedirs(os.path.join(state_dir, "job-a"))
       with open(os.path.join(state_dir, "metadata.json"), "w") as f:
@@ -181,7 +180,7 @@ class ApiServerPathTest(ApiServerTest):
     self.assertEqual(missing.json(), {"error": "No checkpoint at tinker://job-a/weights/never"})
 
   def test_checkpoint_state_paths_accept_explicit_output_directories(self) -> None:
-    self.assertEqual(self.runtime.checkpoints.resolve("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
+    self.assertEqual(api_server.checkpoint_path(self.runtime.checkpoint_root, "job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
 
 
 class ProtobufWireTest(unittest.TestCase):

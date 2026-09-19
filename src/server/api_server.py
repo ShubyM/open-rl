@@ -26,7 +26,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import proto_codec
 from server.api_runtime import ApiRuntime
-from server.checkpoints import CheckpointStore
 from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config
 from server.store import get_store
 from server.worker_manager import create_worker_manager
@@ -307,7 +306,53 @@ async def preflight_vllm() -> None:
     ) from exc
 
 
-def translate_future_result(result: dict, checkpoints: CheckpointStore) -> dict:
+def checkpoint_from_uri(root: str, path: str) -> str | None:
+  if not path.startswith("tinker://"):
+    return None
+  owner, sep, rest = path[len("tinker://") :].partition("/weights/")
+  if not (owner and sep):
+    return None
+  return os.path.join(root, owner, "weights", rest)
+
+
+def checkpoint_path(root: str, model_id: str, name: str) -> str:
+  """A tinker reference retains its original owner when another model loads it."""
+  if name.startswith("tinker://"):
+    path = checkpoint_from_uri(root, name)
+    if path is None:
+      raise ValueError(f"{name} is not a tinker://<model>/weights/<name> path")
+    return path
+  if os.path.isabs(name):
+    return name
+  return os.path.join(root, model_id, "weights", name)
+
+
+def checkpoint_uri(root: str, state_path: str) -> str:
+  prefix = root + os.sep
+  if state_path.startswith(prefix):
+    model_id, sep, rest = state_path[len(prefix) :].partition("/weights/")
+    if model_id and sep:
+      return f"tinker://{model_id}/weights/{rest}"
+  return state_path
+
+
+def checkpoint_info(root: str, path: str) -> dict[str, Any] | None:
+  state_dir = checkpoint_from_uri(root, path)
+  metadata_path = os.path.join(state_dir, "metadata.json") if state_dir else None
+  if not metadata_path or not os.path.exists(metadata_path):
+    return None
+  with open(metadata_path) as f:
+    saved = json.load(f)
+  adapter_config_path = os.path.join(state_dir, saved.get("model_id", ""), "adapter_config.json")
+  is_lora = os.path.exists(adapter_config_path)
+  rank = None
+  if is_lora:
+    with open(adapter_config_path) as f:
+      rank = json.load(f).get("r")
+  return {"base_model": saved["base_model"], "is_lora": is_lora, "lora_rank": rank, "type": "weights_info"}
+
+
+def translate_future_result(result: dict, checkpoint_root: str) -> dict:
   result_type = result.get("type")
   if result_type in {"model_created", "model_loaded_from_state"}:
     # SDK compatibility: the public client currently expects LoRA-shaped training metadata,
@@ -338,7 +383,7 @@ def translate_future_result(result: dict, checkpoints: CheckpointStore) -> dict:
     response = dict(result)
     response["type"] = public_type_by_internal_type[result_type]
     if result_type == "state_saved" and isinstance(response.get("path"), str):
-      response["path"] = checkpoints.to_uri(response["path"])
+      response["path"] = checkpoint_uri(checkpoint_root, response["path"])
     return response
 
   return result
@@ -492,7 +537,8 @@ async def delete_model(runtime: Runtime, req: ModelRequest):
 async def create_model_from_state(runtime: Runtime, req: CreateModelFromStateRequest, request: Request) -> dict[str, Any]:
   """ServiceClient.create_training_client_from_state_async()"""
   state_path = req.state_path
-  resolved_path = runtime.checkpoints.restore_path(state_path)
+  # Legacy restore names are relative to the checkpoint root, not a new model.
+  resolved_path = checkpoint_from_uri(runtime.checkpoint_root, state_path) or os.path.join(runtime.checkpoint_root, state_path)
   try:
     meta = build_model_metadata(req, request.headers)
     model_id = await runtime.persist_model_metadata(meta)
@@ -557,7 +603,7 @@ async def retrieve_future(runtime: Runtime, req: RetrieveFutureRequest, accept: 
       encoded = proto_codec.encode_future_result(result)
       if encoded is not None:
         return Response(content=encoded, media_type=proto_codec.PROTO_CONTENT_TYPE)
-    return translate_future_result(result, runtime.checkpoints)
+    return translate_future_result(result, runtime.checkpoint_root)
   return result
 
 
@@ -644,7 +690,7 @@ async def save_weights(runtime: Runtime, req: SaveWeightsRequest):
     seq_id = int(time.time() * 1000)
   alias = req.path or f"{model_id}-samp-{seq_id}"
   try:
-    state_path = runtime.checkpoints.resolve(model_id, alias)
+    state_path = checkpoint_path(runtime.checkpoint_root, model_id, alias)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -662,7 +708,7 @@ async def load_weights(runtime: Runtime, req: LoadWeightsRequest):
   model_id = req.model_id
   state_path = req.path
   try:
-    resolved_path = runtime.checkpoints.resolve(model_id, state_path)
+    resolved_path = checkpoint_path(runtime.checkpoint_root, model_id, state_path)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
   req_id = await runtime.submit(
@@ -677,7 +723,7 @@ async def weights_info(runtime: Runtime, req: WeightsInfoRequest):
   trained from, so create_training_client_from_state can open a matching
   client and load_state into it. Answered from the checkpoint directory, so
   it survives an API server or Redis restart."""
-  info = await asyncio.to_thread(runtime.checkpoints.info, req.tinker_path)
+  info = await asyncio.to_thread(checkpoint_info, runtime.checkpoint_root, req.tinker_path)
   if info is None:
     raise HTTPException(status_code=404, detail=f"No checkpoint at {req.tinker_path}")
   return info

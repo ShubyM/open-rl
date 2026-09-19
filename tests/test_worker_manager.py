@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi import FastAPI
 
 from server import api_server
-from server.checkpoints import CheckpointStore
 from server.worker_manager import LocalWorkerManager
 from tests.api_client import asgi_client, post_json, runtime_context
 
@@ -395,7 +394,7 @@ class ApiServerFutureTranslationTest(unittest.TestCase):
           "base_model": "base-model",
           "fine_tuning_type": "full",
         },
-        CheckpointStore("/tmp/open-rl"),
+        "/tmp/open-rl/checkpoints",
       ),
       {
         "type": "create_model",
@@ -415,7 +414,7 @@ class ApiServerFutureTranslationTest(unittest.TestCase):
           "base_model": "base-model",
           "fine_tuning_type": "full",
         },
-        CheckpointStore("/tmp/open-rl"),
+        "/tmp/open-rl/checkpoints",
       ),
       {
         "type": "create_model_from_state",
@@ -436,7 +435,7 @@ class ApiServerFutureTranslationTest(unittest.TestCase):
           "rank": 4,
           "fine_tuning_type": "lora",
         },
-        CheckpointStore("/tmp/open-rl"),
+        "/tmp/open-rl/checkpoints",
       ),
       {
         "type": "create_model",
@@ -461,7 +460,7 @@ class ApiServerFutureTranslationTest(unittest.TestCase):
     for internal_type, public_type in cases:
       with self.subTest(internal_type=internal_type):
         self.assertEqual(
-          api_server.translate_future_result({"type": internal_type, "path": "/tmp/x"}, CheckpointStore("/tmp/open-rl")),
+          api_server.translate_future_result({"type": internal_type, "path": "/tmp/x"}, "/tmp/open-rl/checkpoints"),
           {"type": public_type, "path": "/tmp/x"},
         )
 

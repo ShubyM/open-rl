@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import traceback
 import uuid
 from collections import defaultdict
@@ -9,7 +10,6 @@ from typing import Any
 
 from opentelemetry import propagate
 
-from server.checkpoints import CheckpointStore
 from server.model_metadata import TrainingModelMetadata
 from server.session_registry import SessionRegistry
 from server.store import RequestStore
@@ -22,7 +22,7 @@ class ApiRuntime:
     self.store = store
     self.worker_manager = worker_manager
     self.sessions = SessionRegistry(store)
-    self.checkpoints = CheckpointStore(tmp_dir)
+    self.checkpoint_root = os.path.join(tmp_dir, "checkpoints")
     # Serialize attachment and teardown of an owner within this API process.
     self.owner_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
     self.tasks: list[asyncio.Task[Any]] = []
