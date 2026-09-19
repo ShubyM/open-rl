@@ -1,17 +1,21 @@
-# This file contains the state management and request queue implementation for the Open-RL server, supporting both in-memory and Redis backends.
+"""Request transport and generic state backends, sharing Redis connections."""
 
 import asyncio
 import json
 import os
 import time
 from abc import ABC, abstractmethod
+from functools import cache
 from typing import Any
 
+import redis as sync_redis
 import redis.asyncio as redis
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 
 class RequestStore(ABC):
+  """Request queues and results, keyed by request ID."""
+
   @abstractmethod
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     """Push a request into the tenant queue and assign to an active set."""
@@ -47,63 +51,6 @@ class RequestStore(ABC):
     """Block until the future resolves or the timeout is reached."""
     pass
 
-  @abstractmethod
-  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
-    """Store a simple string value by key, gone after ttl_seconds if given."""
-    pass
-
-  @abstractmethod
-  async def get_value(self, key: str) -> str | None:
-    """Fetch a string value by key."""
-    pass
-
-  @abstractmethod
-  def get_value_sync(self, key: str) -> str | None:
-    """Synchronously fetch a string value by key."""
-    pass
-
-  @abstractmethod
-  async def delete_values(self, *keys: str) -> None:
-    """Delete one or more keys."""
-    pass
-
-  @abstractmethod
-  async def add_to_set(self, key: str, member: str) -> None:
-    pass
-
-  @abstractmethod
-  async def remove_from_set(self, key: str, member: str) -> None:
-    pass
-
-  @abstractmethod
-  async def set_members(self, key: str) -> set[str]:
-    pass
-
-  async def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
-    """Retrieve metadata for a specific model_id."""
-    raw_val = await self.get_value(f"open_rl:model_meta:{model_id}")
-    if raw_val:
-      try:
-        data = json.loads(raw_val)
-        data["model_id"] = model_id
-        return data
-      except Exception:
-        pass
-    return None
-
-  async def update_job_metadata(self, model_id: str, updates: dict[str, Any]) -> None:
-    key = f"open_rl:model_meta:{model_id}"
-    raw_val = await self.get_value(key)
-    data = {}
-    if raw_val:
-      try:
-        data = json.loads(raw_val)
-      except Exception:
-        data = {}
-    data.update(updates)
-    data["updated_at"] = time.time()
-    await self.set_value(key, json.dumps(data))
-
 
 class InMemoryStore(RequestStore):
   def __init__(self):
@@ -114,9 +61,6 @@ class InMemoryStore(RequestStore):
     self.active_tenants_cv = asyncio.Condition()
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_events: dict[str, set[asyncio.Event]] = {}
-    self.kv_store: dict[str, str] = {}
-    self.expiries: dict[str, float] = {}
-    self.sets: dict[str, set[str]] = {}
     self.sampling_queues: dict[str, asyncio.Queue] = {}
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
@@ -209,43 +153,10 @@ class InMemoryStore(RequestStore):
       if not waiters:
         del self.futures_events[req_id]
 
-  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
-    self.kv_store[key] = value
-    self.expiries.pop(key, None)
-    if ttl_seconds is not None:
-      self.expiries[key] = time.monotonic() + ttl_seconds
-
-  async def get_value(self, key: str) -> str | None:
-    return self.get_value_sync(key)
-
-  def get_value_sync(self, key: str) -> str | None:
-    if key in self.expiries and time.monotonic() >= self.expiries[key]:
-      self.kv_store.pop(key, None)
-      self.expiries.pop(key, None)
-    return self.kv_store.get(key)
-
-  async def delete_values(self, *keys: str) -> None:
-    for k in keys:
-      self.kv_store.pop(k, None)
-      self.expiries.pop(k, None)
-      self.sets.pop(k, None)
-
-  async def add_to_set(self, key: str, member: str) -> None:
-    self.sets.setdefault(key, set()).add(member)
-
-  async def remove_from_set(self, key: str, member: str) -> None:
-    self.sets.get(key, set()).discard(member)
-
-  async def set_members(self, key: str) -> set[str]:
-    return set(self.sets.get(key, set()))
-
 
 class RedisStore(RequestStore):
-  def __init__(self, redis_url: str):
-    self.redis = redis.from_url(redis_url, decode_responses=True, health_check_interval=2, max_connections=10000)
-    import redis as sync_redis_mod
-
-    self.sync_redis = sync_redis_mod.Redis.from_url(redis_url, decode_responses=True)
+  def __init__(self, client: redis.Redis):
+    self.redis = client
     self.active_list = "open_rl:active_tenants"
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
@@ -385,6 +296,85 @@ class RedisStore(RequestStore):
 
       await asyncio.sleep(0.1)
 
+
+class StateStore(ABC):
+  """Application state stored as values with expiry and sets of members."""
+
+  @abstractmethod
+  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
+    """Store a simple string value by key, gone after ttl_seconds if given."""
+    pass
+
+  @abstractmethod
+  async def get_value(self, key: str) -> str | None:
+    """Fetch a string value by key."""
+    pass
+
+  @abstractmethod
+  def get_value_sync(self, key: str) -> str | None:
+    """Synchronously fetch a string value by key."""
+    pass
+
+  @abstractmethod
+  async def delete_values(self, *keys: str) -> None:
+    """Delete one or more keys."""
+    pass
+
+  @abstractmethod
+  async def add_to_set(self, key: str, member: str) -> None:
+    pass
+
+  @abstractmethod
+  async def remove_from_set(self, key: str, member: str) -> None:
+    pass
+
+  @abstractmethod
+  async def set_members(self, key: str) -> set[str]:
+    pass
+
+
+class InMemoryStateStore(StateStore):
+  def __init__(self):
+    self.kv_store: dict[str, str] = {}
+    self.expiries: dict[str, float] = {}
+    self.sets: dict[str, set[str]] = {}
+
+  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
+    self.kv_store[key] = value
+    self.expiries.pop(key, None)
+    if ttl_seconds is not None:
+      self.expiries[key] = time.monotonic() + ttl_seconds
+
+  async def get_value(self, key: str) -> str | None:
+    return self.get_value_sync(key)
+
+  def get_value_sync(self, key: str) -> str | None:
+    if key in self.expiries and time.monotonic() >= self.expiries[key]:
+      self.kv_store.pop(key, None)
+      self.expiries.pop(key, None)
+    return self.kv_store.get(key)
+
+  async def delete_values(self, *keys: str) -> None:
+    for k in keys:
+      self.kv_store.pop(k, None)
+      self.expiries.pop(k, None)
+      self.sets.pop(k, None)
+
+  async def add_to_set(self, key: str, member: str) -> None:
+    self.sets.setdefault(key, set()).add(member)
+
+  async def remove_from_set(self, key: str, member: str) -> None:
+    self.sets.get(key, set()).discard(member)
+
+  async def set_members(self, key: str) -> set[str]:
+    return set(self.sets.get(key, set()))
+
+
+class RedisStateStore(StateStore):
+  def __init__(self, client: redis.Redis, sync_client: sync_redis.Redis):
+    self.redis = client
+    self.sync_redis = sync_client
+
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     await self.redis.set(key, value, px=None if ttl_seconds is None else int(ttl_seconds * 1000))
 
@@ -411,18 +401,20 @@ class RedisStore(RequestStore):
     return set(await self.redis.smembers(key))
 
 
-# Global singleton factory
-_store_instance = None
+@cache
+def _redis_client(redis_url: str) -> redis.Redis:
+  return redis.from_url(redis_url, decode_responses=True, health_check_interval=2, max_connections=10000)
 
 
+@cache
 def get_store() -> RequestStore:
-  global _store_instance
-  if _store_instance is None:
-    redis_url = os.environ.get("REDIS_URL")
-    if redis_url:
-      print(f"[RequestStore] Initializing Redis backend at {redis_url} with RR Tenant Queues")
-      _store_instance = RedisStore(redis_url)
-    else:
-      print("[RequestStore] Initializing In-Memory backend with RR Tenant Queues")
-      _store_instance = InMemoryStore()
-  return _store_instance
+  redis_url = os.environ.get("REDIS_URL")
+  return RedisStore(_redis_client(redis_url)) if redis_url else InMemoryStore()
+
+
+@cache
+def get_state_store() -> StateStore:
+  redis_url = os.environ.get("REDIS_URL")
+  if redis_url:
+    return RedisStateStore(_redis_client(redis_url), sync_redis.Redis.from_url(redis_url, decode_responses=True))
+  return InMemoryStateStore()

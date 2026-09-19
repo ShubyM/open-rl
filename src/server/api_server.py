@@ -26,8 +26,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import proto_codec
 from server.api_runtime import ApiRuntime
-from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config
-from server.store import get_store
+from server.model_metadata import (
+  TrainingModelMetadata,
+  extract_weight_sync_config,
+  get_model_metadata,
+  persist_model_metadata,
+  update_model_metadata,
+)
+from server.store import RedisStateStore, get_state_store, get_store
 from server.worker_manager import create_worker_manager
 from training import commands
 
@@ -391,8 +397,9 @@ def translate_future_result(result: dict, checkpoint_root: str) -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
   store = get_store()
+  state = get_state_store()
   manager = create_worker_manager() if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER") else None
-  runtime = ApiRuntime(store, manager, TMP_DIR)
+  runtime = ApiRuntime(store, state, manager, TMP_DIR)
   app.state.runtime = runtime
   try:
     if is_single_process_mode():
@@ -499,7 +506,7 @@ async def create_model(runtime: Runtime, req: CreateModelRequest, request: Reque
   """ServiceClient.create_lora_training_client_async()"""
   try:
     meta = build_model_metadata(req, request.headers)
-    model_id = await runtime.persist_model_metadata(meta)
+    model_id = await persist_model_metadata(runtime.state, meta)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -519,7 +526,7 @@ async def create_model(runtime: Runtime, req: CreateModelRequest, request: Reque
 @app.post("/api/v1/delete_model")
 async def delete_model(runtime: Runtime, req: ModelRequest):
   model_id = req.model_id
-  meta = await runtime.store.get_model_metadata(model_id)
+  meta = await get_model_metadata(runtime.state, model_id)
   is_lora = bool(meta and meta.get("fine_tuning_type") == "lora")
   if is_fft_enabled() and not is_lora:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
@@ -528,7 +535,7 @@ async def delete_model(runtime: Runtime, req: ModelRequest):
     if runtime.worker_manager is not None:
       await asyncio.to_thread(runtime.worker_manager.release, model_id)
   now = time.time()
-  await runtime.store.update_job_metadata(model_id, {"status": "completed", "completed_at": now, "updated_at": now})
+  await update_model_metadata(runtime.state, model_id, {"status": "completed", "completed_at": now, "updated_at": now})
   return {"status": "ok"}
 
 
@@ -540,7 +547,7 @@ async def create_model_from_state(runtime: Runtime, req: CreateModelFromStateReq
   resolved_path = checkpoint_from_uri(runtime.checkpoint_root, state_path) or os.path.join(runtime.checkpoint_root, state_path)
   try:
     meta = build_model_metadata(req, request.headers)
-    model_id = await runtime.persist_model_metadata(meta)
+    model_id = await persist_model_metadata(runtime.state, meta)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -566,7 +573,7 @@ async def get_info(runtime: Runtime, req: GetInfoRequest):
   Gemma job Qwen's tokenizer and every sample came back as token soup.
   """
   model_id = req.model_id
-  meta = await runtime.store.get_model_metadata(base_model_id_from_sampling_ref(model_id) or model_id) if model_id else None
+  meta = await get_model_metadata(runtime.state, base_model_id_from_sampling_ref(model_id) or model_id) if model_id else None
   model_name = (meta or {}).get("base_model") or get_default_model_name()
   if not model_name:
     raise HTTPException(status_code=404, detail="No base model is configured")
@@ -742,7 +749,7 @@ async def create_sampling_session(runtime: Runtime, req: CreateSamplingSessionRe
     sess_id = req.model_id or "samp-session-live-123"
     target_model_id = sess_id
 
-  model_meta = await runtime.store.get_model_metadata(target_model_id) if target_model_id else None
+  model_meta = await get_model_metadata(runtime.state, target_model_id) if target_model_id else None
   fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
   ready_check_id = (model_meta.get("base_model") or target_model_id) if (fine_tuning_type == "lora" and model_meta) else target_model_id
 
@@ -752,12 +759,12 @@ async def create_sampling_session(runtime: Runtime, req: CreateSamplingSessionRe
     # Launch by model ID so the worker manager retains the training kind.
     # LoRA readiness is still reported under the shared base-model runtime.
     await ensure_sampler_launched(runtime, target_model_id)
-    s = runtime.store
-    if hasattr(s, "redis"):
+    state = runtime.state
+    if isinstance(state, RedisStateStore):
       print(f"[API_SERVER] Waiting for dynamic vLLM sampler worker to be ready for model {ready_check_id}...")
       start_time = time.monotonic()
       while True:
-        is_ready = await s.redis.get(f"open_rl:sampler_ready:{ready_check_id}")
+        is_ready = await state.get_value(f"open_rl:sampler_ready:{ready_check_id}")
         if is_ready == "1" or is_ready == b"1":
           print(f"[API_SERVER] Dynamic vLLM sampler worker is ready! (took {time.monotonic() - start_time:.2f}s)")
           break
@@ -779,7 +786,7 @@ async def get_sampler(runtime: Runtime, sampler_id: str):
   tokenizer from the Hub itself.
   """
   base_model_id = base_model_id_from_sampling_ref(sampler_id)
-  model_meta = await runtime.store.get_model_metadata(base_model_id) if base_model_id else None
+  model_meta = await get_model_metadata(runtime.state, base_model_id) if base_model_id else None
   base_model = (model_meta or {}).get("base_model") or base_model_id or get_default_model_name()
   if not base_model:
     raise HTTPException(status_code=404, detail=f"Unknown sampler {sampler_id}")
@@ -827,7 +834,7 @@ async def asample(runtime: Runtime, req: AsampleRequest):
   # vLLM backend
   req_id = str(uuid.uuid4())
 
-  model_meta = await runtime.store.get_model_metadata(lookup_id)
+  model_meta = await get_model_metadata(runtime.state, lookup_id)
   fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
 
   if fine_tuning_type == "lora":

@@ -17,7 +17,8 @@ from opentelemetry import propagate, trace
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
-from server.store import RequestStore, get_store
+from server.model_metadata import get_model_metadata, update_model_metadata
+from server.store import RequestStore, StateStore, get_state_store, get_store
 from training.commands import parse_command
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
@@ -116,28 +117,21 @@ class TrainingRequestsProcessor(Protocol):
 
 
 async def _fetch_model_meta(
-  store: RequestStore,
+  state: StateStore,
   model_id: str,
   payload: dict[str, Any],
   default_kind: str = "full",
 ) -> tuple[str, dict[str, Any], dict[str, Any], str]:
-  val = None
-  if hasattr(store, "get_value"):
-    try:
-      val = await store.get_value(f"open_rl:model_meta:{model_id}")
-    except Exception:
-      pass
-  if val:
-    try:
-      meta = json.loads(val) if isinstance(val, str) else val
-      if isinstance(meta, dict):
-        base_model = meta.get("base_model") or payload.get("base_model") or ""
-        full_config = meta.get("full_config") or payload.get("full_config") or {}
-        lora_config = meta.get("lora_config") or payload.get("lora_config") or {}
-        fine_tuning_type = meta.get("fine_tuning_type") or payload.get("fine_tuning_type") or ("lora" if "lora_config" in meta else default_kind)
-        return base_model, full_config, lora_config, fine_tuning_type
-    except Exception:
-      pass
+  try:
+    meta = await get_model_metadata(state, model_id)
+  except Exception:
+    meta = None
+  if meta:
+    base_model = meta.get("base_model") or payload.get("base_model") or ""
+    full_config = meta.get("full_config") or payload.get("full_config") or {}
+    lora_config = meta.get("lora_config") or payload.get("lora_config") or {}
+    fine_tuning_type = meta.get("fine_tuning_type") or payload.get("fine_tuning_type") or ("lora" if "lora_config" in meta else default_kind)
+    return base_model, full_config, lora_config, fine_tuning_type
   return (
     payload.get("base_model", ""),
     payload.get("full_config") or {},
@@ -150,11 +144,13 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
+    state: StateStore,
     worker: LoraTrainingWorker,
     model_id: str | None = None,
     active_tenant_set_id: str | None = None,
   ):
     self.store = store
+    self.state = state
     self.worker = worker
     self.model_id = model_id
     self.active_tenant_set_id = active_tenant_set_id or (f"{model_id}-1" if model_id else None)
@@ -190,7 +186,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
         await self.process_request(request, target_model_id)
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, _, raw_config, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="lora")
+    base_model, _, raw_config, fine_tuning_type = await _fetch_model_meta(self.state, model_id, payload, default_kind="lora")
     lora_config = LoraConfig(**{k: v for k, v in raw_config.items() if k in LoraConfig.model_fields})
     await asyncio.to_thread(self.worker.create_model, base_model, model_id, lora_config)
     return {
@@ -202,7 +198,7 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     }
 
   async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, _, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="lora")
+    base_model, _, _, fine_tuning_type = await _fetch_model_meta(self.state, model_id, payload, default_kind="lora")
     result = await asyncio.to_thread(
       self.worker.load_from_state,
       model_id,
@@ -233,13 +229,12 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     result = await asyncio.to_thread(self.worker.optim_step, payload.get("adam_params", {}), model_id)
     result["type"] = "optim_step_completed"
     await asyncio.to_thread(self.worker.save_adapter, model_id)
-    if hasattr(self, "store") and self.store:
-      try:
-        raw_meta = await self.store.get_value(f"open_rl:model_meta:{model_id}")
-        current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
-        await self.store.update_job_metadata(model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
-      except Exception as exc:
-        print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
+    try:
+      metadata = await get_model_metadata(self.state, model_id)
+      current_step = metadata.get("total_steps_completed", 0) if metadata else 0
+      await update_model_metadata(self.state, model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
+    except Exception as exc:
+      print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
     return result
 
   async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
@@ -306,6 +301,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
+    state: StateStore,
     worker: FFTTrainingWorker,
     model_id: str | None,
     time_slicer: TimeSlicerClient,
@@ -316,6 +312,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
 
     self.store = store
+    self.state = state
     self.worker = worker
     self.model_id = model_id
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM)
@@ -436,7 +433,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
           results.append(await self.handle_request(request, self.model_id))
 
   async def create_model(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, raw_config, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")
+    base_model, raw_config, _, fine_tuning_type = await _fetch_model_meta(self.state, model_id, payload, default_kind="full")
     full_config = FFTConfig(**{k: v for k, v in raw_config.items() if k in FFTConfig.model_fields})
     await asyncio.to_thread(self.worker.create_model, base_model, model_id, full_config)
     return {
@@ -447,7 +444,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     }
 
   async def create_model_from_state(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
-    base_model, _, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, payload, default_kind="full")
+    base_model, _, _, fine_tuning_type = await _fetch_model_meta(self.state, model_id, payload, default_kind="full")
     result = await asyncio.to_thread(
       self.worker.load_from_state,
       model_id,
@@ -477,13 +474,12 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   async def optim_step(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
     result = await asyncio.to_thread(self.worker.optim_step, payload.get("adam_params", {}), model_id)
     result["type"] = "optim_step_completed"
-    if hasattr(self, "store") and self.store:
-      try:
-        raw_meta = await self.store.get_value(f"open_rl:model_meta:{model_id}")
-        current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
-        await self.store.update_job_metadata(model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
-      except Exception as exc:
-        print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
+    try:
+      metadata = await get_model_metadata(self.state, model_id)
+      current_step = metadata.get("total_steps_completed", 0) if metadata else 0
+      await update_model_metadata(self.state, model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
+    except Exception as exc:
+      print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
     return result
 
   async def sample(self, payload: dict[str, Any], model_id: str) -> dict[str, Any]:
@@ -552,13 +548,17 @@ async def run_training_requests_processor(
   model_id: str | None = None,
   time_slicer: TimeSlicerClient | None = None,
   active_tenant_set_id: str | None = None,
+  *,
+  store: RequestStore | None = None,
+  state: StateStore | None = None,
 ) -> None:
-  store = get_store()
+  store = get_store() if store is None else store
+  state = get_state_store() if state is None else state
   if isinstance(worker, FFTTrainingWorker):
     time_slicer = time_slicer or time_slicer_client_from_env()
-    processor = FFTTrainingRequestsProcessor(store, worker, model_id, time_slicer)
+    processor = FFTTrainingRequestsProcessor(store, state, worker, model_id, time_slicer)
   else:
-    processor = LoraTrainingRequestsProcessor(store, worker, model_id, active_tenant_set_id)
+    processor = LoraTrainingRequestsProcessor(store, state, worker, model_id, active_tenant_set_id)
   await processor.run()
 
 
@@ -566,11 +566,9 @@ async def main_async(args: argparse.Namespace) -> None:
   fine_tuning_type = os.getenv("OPEN_RL_FINE_TUNING_TYPE") or ("full" if is_fft_enabled() else "lora")
   if args.model_id:
     try:
-      store = get_store()
-      raw_meta = await store.get_value(f"open_rl:model_meta:{args.model_id}")
-      if raw_meta:
-        meta_dict = json.loads(raw_meta)
-        fine_tuning_type = meta_dict.get("fine_tuning_type", fine_tuning_type)
+      metadata = await get_model_metadata(get_state_store(), args.model_id)
+      if metadata:
+        fine_tuning_type = metadata.get("fine_tuning_type", fine_tuning_type)
     except Exception as exc:
       print(f"[WORKER] Failed to fetch model metadata for {args.model_id}: {exc}")
 

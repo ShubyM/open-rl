@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi import FastAPI
 
 from server import api_server
+from server.model_metadata import persist_model_metadata
+from server.store import InMemoryStateStore
 from server.worker_manager import LocalWorkerManager
 from tests.api_client import asgi_client, post_json, runtime_context
 
@@ -17,7 +19,6 @@ class StoreStub:
     self.futures = {}
     self.future_updates = []
     self.active_sets = []
-    self.kv_store = {}
 
   async def put_request(self, req_data: dict, active_set_id: str | None = None) -> None:
     self.forwarded_requests.append(req_data)
@@ -26,27 +27,6 @@ class StoreStub:
   async def set_future(self, req_id: str, result: dict) -> None:
     self.futures[req_id] = result
     self.future_updates.append((req_id, result))
-
-  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
-    self.kv_store[key] = value
-
-  async def add_to_set(self, key: str, member: str) -> None:
-    pass
-
-  async def get_value(self, key: str) -> str | None:
-    return self.kv_store.get(key)
-
-  def get_value_sync(self, key: str) -> str | None:
-    return self.kv_store.get(key)
-
-  async def get_model_metadata(self, model_id: str) -> dict | None:
-    val = self.kv_store.get(f"open_rl:model_meta:{model_id}")
-    if val:
-      try:
-        return json.loads(val)
-      except Exception:
-        return None
-    return None
 
 
 class WorkerManagerStub:
@@ -78,7 +58,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.store = StoreStub()
     self.worker_manager = WorkerManagerStub()
     self.runtime = self.enterContext(runtime_context(self.store, self.worker_manager))
-    self.enterContext(patch("server.store.get_store", return_value=self.store))
+    self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.runtime.state))
 
   async def asyncSetUp(self) -> None:
     self.client = await self.enterAsyncContext(asgi_client())
@@ -101,7 +81,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(request["op"], "create_model")
     self.assertEqual(request["model_id"], model_id)
     self.assertEqual(request["base_model"], "base-model")
-    meta = json.loads(self.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    meta = json.loads(self.runtime.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "base-model")
 
   async def test_create_model_failed_launch_fails_future_and_enqueues_nothing(self) -> None:
@@ -139,19 +119,19 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(req_forwarded["restore_optimizer"])
 
     # Assert canonical metadata persistence:
-    meta = json.loads(self.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    meta = json.loads(self.runtime.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "restored-base")
     self.assertEqual(meta["fine_tuning_type"], "restored")
     self.assertEqual(meta["full_config"]["weight_sync_strategy"], "delta")
 
     # Assert no dual-key writing:
-    self.assertIsNone(self.store.get_value_sync(f"open_rl:model_base:{model_id}"))
+    self.assertIsNone(self.runtime.state.get_value_sync(f"open_rl:model_base:{model_id}"))
 
   async def test_ensure_sampler_launched_delegates_to_worker_manager_with_model_id(self) -> None:
     import json
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}):
-      self.store.kv_store["open_rl:model_meta:model-x"] = json.dumps(
+      self.runtime.state.kv_store["open_rl:model_meta:model-x"] = json.dumps(
         {
           "base_model": "base-vllm",
           "weight_sync_strategy": "delta",
@@ -172,7 +152,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(len(self.store.forwarded_requests), 1)
 
   async def test_existing_model_commands_route_without_launching_again(self) -> None:
-    await self.store.set_value("open_rl:model_meta:adapter", json.dumps({"fine_tuning_type": "lora", "base_model": "shared-base"}))
+    await self.runtime.state.set_value("open_rl:model_meta:adapter", json.dumps({"fine_tuning_type": "lora", "base_model": "shared-base"}))
     request_id = await self.runtime.submit(api_server.commands.OptimStep(request_id="step", model_id="adapter"))
     self.assertEqual(request_id, "step")
     self.assertEqual(self.worker_manager.launched_model_ids, [])
@@ -207,6 +187,7 @@ class ApiServerLifespanTest(unittest.IsolatedAsyncioTestCase):
     with (
       patch.dict(os.environ, {"OPEN_RL_WORKER_MANAGER": "local"}, clear=True),
       patch.object(api_server, "get_store", return_value=StoreStub()),
+      patch.object(api_server, "get_state_store", return_value=InMemoryStateStore()),
       patch.object(api_server, "create_worker_manager", return_value=manager),
     ):
       async with api_server.lifespan(app):
@@ -225,6 +206,7 @@ class ApiServerLifespanTest(unittest.IsolatedAsyncioTestCase):
     with (
       patch.dict(os.environ, {"BASE_MODEL": "base", "OPEN_RL_WORKER_MANAGER": "local"}, clear=True),
       patch.object(api_server, "get_store", return_value=StoreStub()),
+      patch.object(api_server, "get_state_store", return_value=InMemoryStateStore()),
       patch.object(api_server, "create_worker_manager", return_value=manager),
       patch.object(api_server, "preflight_vllm", new=AsyncMock(side_effect=RuntimeError("unavailable"))),
       self.assertRaisesRegex(RuntimeError, "unavailable"),
@@ -236,9 +218,14 @@ class ApiServerLifespanTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_apps_do_not_share_runtime_state(self) -> None:
     first, second = FastAPI(), FastAPI()
-    with patch.dict(os.environ, {}, clear=True), patch.object(api_server, "get_store", side_effect=[StoreStub(), StoreStub()]):
+    with (
+      patch.dict(os.environ, {}, clear=True),
+      patch.object(api_server, "get_store", side_effect=[StoreStub(), StoreStub()]),
+      patch.object(api_server, "get_state_store", side_effect=[InMemoryStateStore(), InMemoryStateStore()]),
+    ):
       async with api_server.lifespan(first), api_server.lifespan(second):
         self.assertIsNot(first.state.runtime.store, second.state.runtime.store)
+        self.assertIsNot(first.state.runtime.state, second.state.runtime.state)
         self.assertIsNot(first.state.runtime.sessions, second.state.runtime.sessions)
         self.assertIsNot(first.state.runtime.owner_locks, second.state.runtime.owner_locks)
 
@@ -293,9 +280,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
   async def test_launch_fetches_metadata_from_store(self) -> None:
     import json
 
-    from server.store import InMemoryStore
-
-    s = InMemoryStore()
+    s = InMemoryStateStore()
     s.kv_store["open_rl:model_meta:Model_A.1"] = json.dumps(
       {
         "base_model": "base-model-a",
@@ -306,7 +291,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
 
     with (
       patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm"}, clear=True),
-      patch("server.store.get_store", return_value=s),
+      patch("server.worker_manager.get_state_store", return_value=s),
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
@@ -340,10 +325,10 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     }
     request = Request(scope)
     metadata = api_server.build_model_metadata(api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"), request.headers)
-    self.assertEqual(self.store.kv_store, {})
-    model_id = await self.runtime.persist_model_metadata(metadata)
+    self.assertEqual(self.runtime.state.kv_store, {})
+    model_id = await persist_model_metadata(self.runtime.state, metadata)
 
-    meta_val = self.store.kv_store.get(f"open_rl:model_meta:{model_id}")
+    meta_val = self.runtime.state.kv_store.get(f"open_rl:model_meta:{model_id}")
     self.assertIsNotNone(meta_val)
     meta_dict = json.loads(meta_val)
     self.assertEqual(meta_dict["base_model"], "Qwen/Qwen2.5-0.5B")
@@ -358,7 +343,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created.fine_tuning_type, "lora")
         self.assertEqual(restored.fine_tuning_type, "restored")
         self.assertIsNone(restored.base_model)
-    self.assertEqual(self.store.kv_store, {})
+    self.assertEqual(self.runtime.state.kv_store, {})
 
   def test_headers_override_config_without_mutating_request(self) -> None:
     req = api_server.CreateModelRequest(
@@ -381,7 +366,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
       ):
         with self.subTest(request=type(req).__name__), self.assertRaisesRegex(ValueError, "FFT.*disabled"):
           api_server.build_model_metadata(req, {"x-open-rl-fine-tuning-type": "full"})
-    self.assertEqual(self.store.kv_store, {})
+    self.assertEqual(self.runtime.state.kv_store, {})
 
 
 class ApiServerFutureTranslationTest(unittest.TestCase):
