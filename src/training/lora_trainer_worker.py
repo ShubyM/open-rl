@@ -145,6 +145,9 @@ class LoraTrainingWorker(BaseTrainerWorker):
         print(f"Failed to enable gradient checkpointing: {e}")
 
     self.peft_model.train()
+    self.configure_token_budget(
+      self.peft_model, self.adapter_states[adapter_id]["trainable_params"], gradient_checkpointing=ENABLE_GRADIENT_CHECKPOINTING
+    )
     print(f"LoRA adapter '{adapter_id}' created and set to active.")
 
     self.save_adapter(adapter_id)
