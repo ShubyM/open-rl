@@ -8,17 +8,19 @@ from typing import Any
 
 from opentelemetry import propagate
 
+from server.model_metadata import get_model_metadata
 from server.session_registry import SessionRegistry
-from server.store import RequestStore
+from server.store import RequestStore, StateStore
 from server.worker_manager import WorkerManager, owner_of
 from training import commands
 
 
 class ApiRuntime:
-  def __init__(self, store: RequestStore, worker_manager: WorkerManager | None, tmp_dir: str):
+  def __init__(self, store: RequestStore, state: StateStore, worker_manager: WorkerManager | None, tmp_dir: str):
     self.store = store
+    self.state = state
     self.worker_manager = worker_manager
-    self.sessions = SessionRegistry(store)
+    self.sessions = SessionRegistry(state)
     self.checkpoint_root = os.path.join(tmp_dir, "checkpoints")
     # Serialize attachment and teardown of an owner within this API process.
     self.owner_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -36,7 +38,7 @@ class ApiRuntime:
         return request_id
     # Store errors raise so the client sees a 500 and retries, instead of a
     # terminal failed future.
-    meta = await self.store.get_model_metadata(command.model_id)
+    meta = await get_model_metadata(self.state, command.model_id)
     active_set_id = f"{meta['base_model']}-1" if meta and meta.get("fine_tuning_type") == "lora" and meta.get("base_model") else None
     carrier: dict[str, str] = {}
     propagate.inject(carrier)
@@ -58,7 +60,7 @@ class ApiRuntime:
         return
       print(f"[API_SERVER] No live session uses {owner}; tearing its workers down")
       for model in await asyncio.to_thread(self.worker_manager.release_owner, owner):
-        await self.store.delete_values(f"open_rl:sampler_ready:{model}")
+        await self.state.delete_values(f"open_rl:sampler_ready:{model}")
       await self.sessions.forget(owner)
 
   async def reap_dead_sessions(self) -> None:
@@ -85,7 +87,7 @@ class ApiRuntime:
     worker = training_requests_processor.LoraTrainingWorker()
     if base_model:
       await asyncio.to_thread(worker.load_base_model, base_model)
-    self.tasks.append(asyncio.create_task(training_requests_processor.run_training_requests_processor(worker)))
+    self.tasks.append(asyncio.create_task(training_requests_processor.run_training_requests_processor(worker, store=self.store, state=self.state)))
 
   async def close(self) -> None:
     for task in self.tasks:

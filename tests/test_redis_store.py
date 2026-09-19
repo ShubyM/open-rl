@@ -12,9 +12,19 @@ import time
 import unittest
 from unittest.mock import patch
 
+import redis as sync_redis
+import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from server.store import RedisStore
+from server import store as stores
+from server.model_metadata import (
+  TrainingModelMetadata,
+  get_model_metadata,
+  get_model_metadata_sync,
+  persist_model_metadata,
+  update_model_metadata,
+)
+from server.store import InMemoryStateStore, InMemoryStore, RedisStateStore, RedisStore
 
 TEST_REDIS_URL = os.getenv("OPEN_RL_TEST_REDIS_URL")
 REDIS_SERVER = shutil.which("redis-server")
@@ -60,14 +70,16 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
       cls.server.wait(timeout=10)
 
   def setUp(self) -> None:
-    self.store = RedisStore(self.redis_url)
+    client = redis.from_url(self.redis_url, decode_responses=True)
+    self.store = RedisStore(client)
+    self.state = RedisStateStore(client, sync_redis.Redis.from_url(self.redis_url, decode_responses=True))
 
   async def asyncSetUp(self) -> None:
     await self.store.redis.flushdb()
 
   async def asyncTearDown(self) -> None:
     await self.store.redis.aclose()
-    self.store.sync_redis.close()
+    self.state.sync_redis.close()
 
   async def test_get_future_returns_already_resolved_result(self) -> None:
     await self.store.set_future("req-1", {"type": "sample", "ok": True})
@@ -188,23 +200,21 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual([r["request_id"] for r in batch], ["a0", "a1"])
 
   async def test_values_expire_and_sets_hold_members(self) -> None:
-    await self.store.set_value("k", "v", ttl_seconds=60)
-    self.assertEqual(await self.store.get_value("k"), "v")
-    await self.store.set_value("k", "v", ttl_seconds=0.2)
+    await self.state.set_value("k", "v", ttl_seconds=60)
+    self.assertEqual(await self.state.get_value("k"), "v")
+    await self.state.set_value("k", "v", ttl_seconds=0.2)
     await asyncio.sleep(0.5)
-    self.assertIsNone(await self.store.get_value("k"))
+    self.assertIsNone(await self.state.get_value("k"))
 
-    await self.store.add_to_set("s", "a")
-    await self.store.add_to_set("s", "b")
-    await self.store.remove_from_set("s", "a")
-    self.assertEqual(await self.store.set_members("s"), {"b"})
-    self.assertEqual(await self.store.set_members("missing"), set())
+    await self.state.add_to_set("s", "a")
+    await self.state.add_to_set("s", "b")
+    await self.state.remove_from_set("s", "a")
+    self.assertEqual(await self.state.set_members("s"), {"b"})
+    self.assertEqual(await self.state.set_members("missing"), set())
 
 
 class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
-    from server.store import InMemoryStore
-
     self.store = InMemoryStore()
 
   async def test_future_wakes_all_waiters_without_registration(self) -> None:
@@ -253,28 +263,6 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
     for _ in range(2):
       self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "replacement"})
 
-  async def test_metadata_updates_preserve_existing_fields(self) -> None:
-    await self.store.set_value("open_rl:model_meta:model-1", '{"base_model": "base", "total_steps_completed": 1}')
-    with patch("server.store.time.time", return_value=123.0):
-      await self.store.update_job_metadata("model-1", {"total_steps_completed": 2})
-    self.assertEqual(
-      await self.store.get_model_metadata("model-1"),
-      {"model_id": "model-1", "base_model": "base", "total_steps_completed": 2, "updated_at": 123.0},
-    )
-
-  async def test_metadata_missing_or_invalid_can_be_updated(self) -> None:
-    for raw in (None, "invalid JSON"):
-      with self.subTest(raw=raw):
-        if raw is not None:
-          await self.store.set_value("open_rl:model_meta:model-1", raw)
-        self.assertIsNone(await self.store.get_model_metadata("model-1"))
-        with patch("server.store.time.time", return_value=123.0):
-          await self.store.update_job_metadata("model-1", {"status": "completed"})
-        self.assertEqual(
-          await self.store.get_model_metadata("model-1"),
-          {"model_id": "model-1", "status": "completed", "updated_at": 123.0},
-        )
-
   async def test_sampling_queue_put_and_get(self) -> None:
     req1 = {"model_id": "base-m1", "request_id": "r1"}
     req2 = {"model_id": "base-m1", "request_id": "r2"}
@@ -320,18 +308,87 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
     batch = await self.store.get_requests(active_set_id="base-1")
     self.assertEqual([r["request_id"] for r in batch], ["a0", "a1"])
 
-  async def test_values_expire_and_sets_hold_members(self) -> None:
-    await self.store.set_value("k", "v", ttl_seconds=60)
-    self.assertEqual(await self.store.get_value("k"), "v")
-    await self.store.set_value("k", "v", ttl_seconds=0.2)
-    await asyncio.sleep(0.5)
-    self.assertIsNone(await self.store.get_value("k"))
 
-    await self.store.add_to_set("s", "a")
-    await self.store.add_to_set("s", "b")
-    await self.store.remove_from_set("s", "a")
-    self.assertEqual(await self.store.set_members("s"), {"b"})
-    self.assertEqual(await self.store.set_members("missing"), set())
+class InMemoryStateStoreTest(unittest.IsolatedAsyncioTestCase):
+  def setUp(self) -> None:
+    self.state = InMemoryStateStore()
+
+  async def test_metadata_updates_preserve_existing_fields(self) -> None:
+    await self.state.set_value("open_rl:model_meta:model-1", '{"base_model": "base", "total_steps_completed": 1}')
+    with patch("server.model_metadata.time.time", return_value=123.0):
+      await update_model_metadata(self.state, "model-1", {"total_steps_completed": 2})
+    self.assertEqual(
+      await get_model_metadata(self.state, "model-1"),
+      {"model_id": "model-1", "base_model": "base", "total_steps_completed": 2, "updated_at": 123.0},
+    )
+
+  async def test_metadata_missing_or_invalid_can_be_updated(self) -> None:
+    for raw in (None, "invalid JSON", "[]", "null"):
+      with self.subTest(raw=raw):
+        if raw is not None:
+          await self.state.set_value("open_rl:model_meta:model-1", raw)
+        self.assertIsNone(await get_model_metadata(self.state, "model-1"))
+        with patch("server.model_metadata.time.time", return_value=123.0):
+          await update_model_metadata(self.state, "model-1", {"status": "completed"})
+        self.assertEqual(
+          await get_model_metadata(self.state, "model-1"),
+          {"model_id": "model-1", "status": "completed", "updated_at": 123.0},
+        )
+
+  async def test_persisted_model_is_readable_by_sync_worker_lookup(self) -> None:
+    metadata = TrainingModelMetadata(base_model="base", created_at=123.0)
+    model_id = "model-1"
+    await persist_model_metadata(self.state, model_id, metadata)
+    self.assertEqual(await get_model_metadata(self.state, model_id), {**metadata.to_dict(), "model_id": model_id})
+    self.assertEqual(get_model_metadata_sync(self.state, model_id), await get_model_metadata(self.state, model_id))
+
+  async def test_values_expire_and_sets_hold_members(self) -> None:
+    await self.state.set_value("k", "v", ttl_seconds=60)
+    self.assertEqual(await self.state.get_value("k"), "v")
+    await self.state.set_value("k", "v", ttl_seconds=0.2)
+    await asyncio.sleep(0.5)
+    self.assertIsNone(await self.state.get_value("k"))
+
+    await self.state.add_to_set("s", "a")
+    await self.state.add_to_set("s", "b")
+    await self.state.remove_from_set("s", "a")
+    self.assertEqual(await self.state.set_members("s"), {"b"})
+    self.assertEqual(await self.state.set_members("missing"), set())
+
+
+class StoreFactoryTest(unittest.TestCase):
+  def setUp(self) -> None:
+    self.clear_factories()
+    self.addCleanup(self.clear_factories)
+
+  def clear_factories(self) -> None:
+    stores.get_store.cache_clear()
+    stores.get_state_store.cache_clear()
+    stores._redis_client.cache_clear()
+
+  def test_redis_backends_share_one_async_client(self) -> None:
+    with (
+      patch.dict(os.environ, {"REDIS_URL": "redis://shared"}),
+      patch("server.store.redis.from_url") as async_client,
+      patch("server.store.sync_redis.Redis.from_url") as sync_client,
+    ):
+      transport = stores.get_store()
+      state = stores.get_state_store()
+      self.assertIs(transport.redis, state.redis)
+      self.assertIs(state.sync_redis, sync_client.return_value)
+      self.assertIs(stores.get_store(), transport)
+      self.assertIs(stores.get_state_store(), state)
+      async_client.assert_called_once()
+      sync_client.assert_called_once()
+
+  def test_memory_backends_are_independent_singletons(self) -> None:
+    with patch.dict(os.environ, {"REDIS_URL": ""}):
+      transport = stores.get_store()
+      state = stores.get_state_store()
+      self.assertIsInstance(transport, InMemoryStore)
+      self.assertIsInstance(state, InMemoryStateStore)
+      self.assertIs(stores.get_store(), transport)
+      self.assertIs(stores.get_state_store(), state)
 
 
 if __name__ == "__main__":

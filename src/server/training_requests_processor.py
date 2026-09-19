@@ -17,7 +17,8 @@ from opentelemetry import propagate, trace
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
-from server.store import RequestStore, get_store
+from server.model_metadata import get_model_metadata, update_model_metadata
+from server.store import RequestStore, StateStore, get_state_store, get_store
 from training import commands
 from training.commands import parse_command
 from training.fft_trainer_worker import FFTTrainingWorker
@@ -112,11 +113,13 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
+    state: StateStore,
     worker: LoraTrainingWorker,
     model_id: str | None = None,
     active_tenant_set_id: str | None = None,
   ):
     self.store = store
+    self.state = state
     self.worker = worker
     self.model_id = model_id
     self.active_tenant_set_id = active_tenant_set_id or (f"{model_id}-1" if model_id else None)
@@ -185,13 +188,12 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
     result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, command.model_id)
     result["type"] = "optim_step_completed"
     await asyncio.to_thread(self.worker.save_adapter, command.model_id)
-    if hasattr(self, "store") and self.store:
-      try:
-        raw_meta = await self.store.get_value(f"open_rl:model_meta:{command.model_id}")
-        current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
-        await self.store.update_job_metadata(command.model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
-      except Exception as exc:
-        print(f"[PROCESSOR] Failed to update step metadata for model {command.model_id}: {exc}")
+    try:
+      metadata = await get_model_metadata(self.state, command.model_id)
+      current_step = metadata.get("total_steps_completed", 0) if metadata else 0
+      await update_model_metadata(self.state, command.model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
+    except Exception as exc:
+      print(f"[PROCESSOR] Failed to update step metadata for model {command.model_id}: {exc}")
     return result
 
   async def sample(self, command: commands.Sample) -> dict[str, Any]:
@@ -239,6 +241,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
     store: RequestStore,
+    state: StateStore,
     worker: FFTTrainingWorker,
     model_id: str | None,
     time_slicer: TimeSlicerClient,
@@ -249,6 +252,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
 
     self.store = store
+    self.state = state
     self.worker = worker
     self.model_id = model_id
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM)
@@ -401,13 +405,12 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
   async def optim_step(self, command: commands.OptimStep) -> dict[str, Any]:
     result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, command.model_id)
     result["type"] = "optim_step_completed"
-    if hasattr(self, "store") and self.store:
-      try:
-        raw_meta = await self.store.get_value(f"open_rl:model_meta:{command.model_id}")
-        current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
-        await self.store.update_job_metadata(command.model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
-      except Exception as exc:
-        print(f"[PROCESSOR] Failed to update step metadata for model {command.model_id}: {exc}")
+    try:
+      metadata = await get_model_metadata(self.state, command.model_id)
+      current_step = metadata.get("total_steps_completed", 0) if metadata else 0
+      await update_model_metadata(self.state, command.model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
+    except Exception as exc:
+      print(f"[PROCESSOR] Failed to update step metadata for model {command.model_id}: {exc}")
     return result
 
   async def sample(self, command: commands.Sample) -> dict[str, Any]:
@@ -457,13 +460,17 @@ async def run_training_requests_processor(
   model_id: str | None = None,
   time_slicer: TimeSlicerClient | None = None,
   active_tenant_set_id: str | None = None,
+  *,
+  store: RequestStore | None = None,
+  state: StateStore | None = None,
 ) -> None:
-  store = get_store()
+  store = get_store() if store is None else store
+  state = get_state_store() if state is None else state
   if isinstance(worker, FFTTrainingWorker):
     time_slicer = time_slicer or time_slicer_client_from_env()
-    processor = FFTTrainingRequestsProcessor(store, worker, model_id, time_slicer)
+    processor = FFTTrainingRequestsProcessor(store, state, worker, model_id, time_slicer)
   else:
-    processor = LoraTrainingRequestsProcessor(store, worker, model_id, active_tenant_set_id)
+    processor = LoraTrainingRequestsProcessor(store, state, worker, model_id, active_tenant_set_id)
   await processor.run()
 
 
@@ -471,11 +478,9 @@ async def main_async(args: argparse.Namespace) -> None:
   fine_tuning_type = os.getenv("OPEN_RL_FINE_TUNING_TYPE") or ("full" if is_fft_enabled() else "lora")
   if args.model_id:
     try:
-      store = get_store()
-      raw_meta = await store.get_value(f"open_rl:model_meta:{args.model_id}")
-      if raw_meta:
-        meta_dict = json.loads(raw_meta)
-        fine_tuning_type = meta_dict.get("fine_tuning_type", fine_tuning_type)
+      metadata = await get_model_metadata(get_state_store(), args.model_id)
+      if metadata:
+        fine_tuning_type = metadata.get("fine_tuning_type", fine_tuning_type)
     except Exception as exc:
       print(f"[WORKER] Failed to fetch model metadata for {args.model_id}: {exc}")
 

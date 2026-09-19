@@ -44,7 +44,7 @@ class GetInfoTest(ApiServerTest):
 
   def test_get_info_prefers_the_models_own_base_model(self) -> None:
     meta = json.dumps({"base_model": "google/gemma-4-e2b", "fine_tuning_type": "full"})
-    asyncio.run(self.runtime.store.set_value("open_rl:model_meta:model-g", meta))
+    asyncio.run(self.runtime.state.set_value("open_rl:model_meta:model-g", meta))
     with patch.dict(os.environ, {"BASE_MODEL": "Qwen/Qwen2.5-0.5B"}, clear=True):
       info = self.post("get_info", {"model_id": "model-g"}).json()
       via_sampler_ref = self.post("get_info", {"model_id": "tinker://model-g/sampler_weights/sampler-1"}).json()
@@ -80,7 +80,7 @@ class GetInfoTest(ApiServerTest):
     self.assertEqual(queued[0]["model_id"], model_id)
     self.assertEqual(queued[0]["op"], "create_model")
     self.assertEqual(queued[0]["base_model"], "my-model")
-    meta = json.loads(self.runtime.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    meta = json.loads(self.runtime.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "my-model")
 
   def test_an_invalid_config_is_a_400_and_persists_nothing(self) -> None:

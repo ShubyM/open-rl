@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from server import training_requests_processor as trp
-from server.store import InMemoryStore
+from server.store import InMemoryStateStore, InMemoryStore
 from tests.test_fft_batch_failure import SlicerStub
 from training import commands
 
@@ -30,7 +30,7 @@ class SamplerWeightRotationTest(unittest.TestCase):
       patch.object(trp, "SAMPLER_VERSIONS_KEPT", 3),
     ):
       worker = RecordingWorker()
-      proc = trp.FFTTrainingRequestsProcessor(InMemoryStore(), worker, "run-a", SlicerStub())
+      proc = trp.FFTTrainingRequestsProcessor(InMemoryStore(), InMemoryStateStore(), worker, "run-a", SlicerStub())
       versions = os.path.join(tmp, "sampler_full", "run-a", "sampler_weights")
       for step in range(1, 6):
         command = commands.SaveWeightsForSampler(request_id=f"r{step}", model_id="run-a", path=f"tinker://run-a/sampler_weights/sampler-{step}")

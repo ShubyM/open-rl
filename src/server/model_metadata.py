@@ -1,6 +1,10 @@
+import json
 import os
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, field
 from typing import Any
+
+from server.store import StateStore
 
 
 @dataclass
@@ -59,9 +63,6 @@ def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
     delta_format=delta_fmt,
     delta_apply_method=delta_apply_method,
   )
-
-
-from dataclasses import dataclass, field
 
 
 @dataclass
@@ -134,3 +135,39 @@ class TrainingModelMetadata:
     if isinstance(self.weight_sync_config, WeightSyncConfig):
       res["weight_sync_config"] = asdict(self.weight_sync_config)
     return res
+
+
+def _decode_metadata(raw: str | None) -> dict[str, Any] | None:
+  if not raw:
+    return None
+  try:
+    data = json.loads(raw)
+  except (TypeError, ValueError):
+    return None
+  return data if isinstance(data, dict) else None
+
+
+async def get_model_metadata(state: StateStore, model_id: str) -> dict[str, Any] | None:
+  data = _decode_metadata(await state.get_value(f"open_rl:model_meta:{model_id}"))
+  if data is not None:
+    data["model_id"] = model_id
+  return data
+
+
+def get_model_metadata_sync(state: StateStore, model_id: str) -> dict[str, Any] | None:
+  data = _decode_metadata(state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+  if data is not None:
+    data["model_id"] = model_id
+  return data
+
+
+async def update_model_metadata(state: StateStore, model_id: str, updates: dict[str, Any]) -> None:
+  key = f"open_rl:model_meta:{model_id}"
+  data = _decode_metadata(await state.get_value(key)) or {}
+  data.update(updates)
+  data["updated_at"] = time.time()
+  await state.set_value(key, json.dumps(data))
+
+
+async def persist_model_metadata(state: StateStore, model_id: str, metadata: TrainingModelMetadata) -> None:
+  await state.set_value(f"open_rl:model_meta:{model_id}", json.dumps(metadata.to_dict()))

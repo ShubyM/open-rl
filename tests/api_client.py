@@ -12,12 +12,17 @@ import httpx
 
 from server import api_server
 from server.api_runtime import ApiRuntime
-from server.store import InMemoryStore
+from server.store import InMemoryStateStore, InMemoryStore
 
 
 @contextmanager
-def runtime_context(store=None, worker_manager=None):
-  runtime = ApiRuntime(store if store is not None else InMemoryStore(), worker_manager, api_server.TMP_DIR)
+def runtime_context(store=None, worker_manager=None, *, state=None):
+  runtime = ApiRuntime(
+    store if store is not None else InMemoryStore(),
+    state if state is not None else InMemoryStateStore(),
+    worker_manager,
+    api_server.TMP_DIR,
+  )
   with patch.object(api_server.app.state, "runtime", runtime, create=True):
     yield runtime
 
