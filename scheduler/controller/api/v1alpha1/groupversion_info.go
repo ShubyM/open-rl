@@ -1,5 +1,5 @@
 // Package v1alpha1 contains the Workload API, the placement request the
-// gateway writes for every worker process it wants running.
+// API server writes for every worker process it wants running.
 //
 // See scheduler/docs/design.md.
 // +kubebuilder:object:generate=true

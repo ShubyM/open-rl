@@ -13,7 +13,7 @@ kind: Kustomization
 #   - images point at locally built tags in the cluster-local registry
 #
 # Container patches select local development images and their pull policies.
-# The base uses upstream GHCR images; the gateway worker-image env is patched
+# The base uses upstream GHCR images; the API server worker-image env is patched
 # separately because it is not a container image field.
 #
 # dev/kind/kind-cluster.yaml labels the single node as both a trainer and a
@@ -123,27 +123,27 @@ patches:
 
   - target:
       kind: Deployment
-      name: open-rl-gateway
+      name: open-rl-api-server
     patch: |
       apiVersion: apps/v1
       kind: Deployment
       metadata:
-        name: open-rl-gateway
+        name: open-rl-api-server
       spec:
         template:
           spec:
             containers:
-              - name: gateway
-                image: localhost:5001/open-rl-gateway:kind-dev
+              - name: api-server
+                image: localhost:5001/open-rl-api-server:kind-dev
                 imagePullPolicy: Always
                 env:
                   # The worker image is a plain string in the Workload template
-                  # the gateway renders, out of reach of any image transformer,
+                  # the API server renders, out of reach of any image transformer,
                   # so this var is what decides the image every worker runs.
                   - name: OPEN_RL_WORKER_IMAGE
                     valueFrom: null
                     value: localhost:5001/open-rl-server:kind-dev
-                  # The gateway also stamps the pull policy into each Workload.
+                  # The API server also stamps the pull policy into each Workload.
                   - name: OPEN_RL_WORKER_IMAGE_PULL_POLICY
                     value: Always
 

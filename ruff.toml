@@ -1,6 +1,7 @@
 line-length = 150
 indent-width = 2
-extend-exclude = ["*.ipynb"]
+# Generated protobuf code vendored from the tinker SDK; regenerated, never edited.
+extend-exclude = ["*.ipynb", "src/server/proto/tinker_public_pb2.py", "src/server/proto/tinker_public_pb2.pyi"]
 
 [lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]

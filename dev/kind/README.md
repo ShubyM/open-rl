@@ -55,13 +55,13 @@ ssh <host> 'cd ~/open-rl && make kind-deploy'
 
 ```bash
 make push-vm REMOTE_HOST=<host>                  # from the workstation
-make kind-gateway                                # on the VM: ~1 min; covers
-                                                 # gateway.py, scheduler_worker_manager.py,
+make kind-api-server                                # on the VM: ~1 min; covers
+                                                 # api_server.py, scheduler_worker_manager.py,
                                                  # store.py — then rolls out
 ```
 
 Rebuild the `server` image only when the trainer or sampler code changes — it is
-the expensive one. `make kind-deploy` builds gateway, server, and scheduler
+the expensive one. `make kind-deploy` builds API server, server, and scheduler
 from the same checkout.
 
 ## The cluster-local registry
@@ -83,7 +83,7 @@ Two consequences worth knowing:
 - **`imagePullPolicy: Always` everywhere in the kind overlay.** The `:kind-dev`
   tag is mutable and republished every iteration, so the base manifests'
   `IfNotPresent` would leave the kubelet on the build it already cached and
-  silently test the previous code. The gateway creates worker templates dynamically
+  silently test the previous code. The API server creates worker templates dynamically
   inside Workloads, so it stamps their image and pull policy at render time from
   `OPEN_RL_WORKER_IMAGE` / `OPEN_RL_WORKER_IMAGE_PULL_POLICY`.
 
@@ -103,7 +103,7 @@ pushes. Collecting deletes the child manifests under the tagged index and
 leaves a registry that answers 200 on `:kind-dev` and 404 on every layer it
 points at, breaking images that were never stale. Re-pushing from the host's
 local images is the repair, so `prune.sh` refuses to touch the registry unless
-the gateway, server, client, and scheduler images are present to put back.
+the API server, server, client, and scheduler images are present to put back.
 
 ## How GPUs reach the pods
 
@@ -134,7 +134,7 @@ have. Pass `KEEP_COMPUTE_DOMAINS=1` on NVLink hardware.
 
 ## Sizing
 
-The gateway sizes each Workload from the model's parameter count
+The API server sizes each Workload from the model's parameter count
 (`footprint` in `src/server/estimator.py`): bytes per parameter on the
 device and in host memory, plus a fixed reserve per role. There are no GPU
 tiers; the scheduler picks whichever device the figure fits. An L4 holds

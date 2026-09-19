@@ -136,12 +136,20 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
   def create_model(self, base_model_name, model_id, config):
     self.created_models.append((base_model_name, model_id, config))
 
-  def forward_backward(self, data, loss_fn, loss_config=None, model_id=None):
+  def forward_backward(self, data, loss_fn, loss_config=None, model_id=None, forward_only=False):
     return {"model_id": model_id, "loss_fn": loss_fn, "loss_config": loss_config, "data": data}
 
   def save_state(self, model_id, state_path, include_optimizer=False, kind="state", full=False):
     self.saved_states.append((model_id, state_path, include_optimizer, kind))
     return {"path": state_path}
+
+  cpu_offload = True
+
+  def wake_up(self):
+    return None
+
+  def sleep(self):
+    return None
 
 
 class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker):
@@ -191,6 +199,8 @@ class _TrainingRequestsStoreStub(_FutureStoreStub):
 
 
 class _TimeSlicerStub:
+  faulted = None
+
   def __init__(self, events=None):
     self.events = events if events is not None else []
 

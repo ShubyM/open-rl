@@ -34,17 +34,17 @@ patches:
             storage: 100Gi
   - target:
       kind: Deployment
-      name: open-rl-gateway
+      name: open-rl-api-server
     patch: |-
       apiVersion: apps/v1
       kind: Deployment
       metadata:
-        name: open-rl-gateway
+        name: open-rl-api-server
       spec:
         template:
           spec:
             containers:
-              - name: gateway
+              - name: api-server
                 env:
                   - name: PYTHONPATH
                     value: "/app/src"

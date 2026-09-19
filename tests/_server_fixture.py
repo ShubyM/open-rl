@@ -1,4 +1,4 @@
-"""Shared helpers for tests that need a local Open-RL gateway."""
+"""Shared helpers for tests that need a local Open-RL API server."""
 
 from __future__ import annotations
 
@@ -38,7 +38,8 @@ def openrl_server(
 ) -> Iterator[str]:
   port = port or unused_tcp_port()
   base_url = f"http://127.0.0.1:{port}"
-  tmp_dir = tempfile.TemporaryDirectory(prefix="open-rl-test-", dir="/dev/shm")
+  # /dev/shm keeps the fixture off disk on Linux; macOS has no such mount.
+  tmp_dir = tempfile.TemporaryDirectory(prefix="open-rl-test-", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
   env = {
     **os.environ,
     "BASE_MODEL": base_model,
@@ -60,7 +61,7 @@ def openrl_server(
     "python",
     "-m",
     "uvicorn",
-    "server.gateway:app",
+    "server.api_server:app",
     "--host",
     "127.0.0.1",
     "--port",

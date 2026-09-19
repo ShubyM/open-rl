@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bring up the Harvey-LAB RL stack in one tmux session: vLLM sampler on the
-# non-trainer GPUs, gateway (+ trainer), and typed train/eval commands.
+# non-trainer GPUs, API server (+ trainer), and typed train/eval commands.
 #
 #   MODEL=9b  ./scripts/launch_work.sh                # Qwen3.5-9B (default)
 #   TRAIN_GPUS=4 MODEL=27b ./scripts/launch_work.sh   # data-parallel LoRA trainer on 4 GPUs
@@ -153,7 +153,7 @@ if [ "$TRAIN_GPUS" -gt 1 ]; then
   # Ephemeral queue: no RDB snapshots or AOF — background persistence of
   # multi-MB training payloads is pure stall risk for zero value. Raise the
   # fd limit before daemonizing: redis derives maxclients from it, and every
-  # pending gateway request holds one BLPOP connection.
+  # pending API server request holds one BLPOP connection.
   ulimit -n 65535 2>/dev/null || true
   pgrep -x redis-server >/dev/null || redis-server --daemonize yes --save '' --appendonly no --maxclients 8192
   QUEUE_ENV="REDIS_URL=redis://127.0.0.1:6379 OPEN_RL_EXTERNAL_TRAINER=1"
@@ -192,14 +192,14 @@ uv run --extra gpu --extra vllm --extra fastpath vllm serve $MODEL_NAME \
 --language-model-only |& tee -a $LOGS/sampler.log"
 fi
 
-GATEWAY_DEV=0
-[ "$TRAIN_GPUS" -gt 1 ] && GATEWAY_DEV=""
-GATEWAY_CMD="$SAMPLER_WAIT; \
-CUDA_VISIBLE_DEVICES=$GATEWAY_DEV $QUEUE_ENV FLA_TILELANG=$FLA_TILELANG BASE_MODEL=$MODEL_NAME $SAMPLER_ENV \
+API_SERVER_DEV=0
+[ "$TRAIN_GPUS" -gt 1 ] && API_SERVER_DEV=""
+API_SERVER_CMD="$SAMPLER_WAIT; \
+CUDA_VISIBLE_DEVICES=$API_SERVER_DEV $QUEUE_ENV FLA_TILELANG=$FLA_TILELANG BASE_MODEL=$MODEL_NAME $SAMPLER_ENV \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 OPEN_RL_TRAIN_TOKEN_BUDGET=$CONTEXT OPEN_RL_ACTIVATION_CPU_OFFLOAD=1 \
 OPEN_RL_LOG_CUDA_MEMORY=1 \
-uv run --extra gpu --extra vllm --extra fastpath python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003 |& tee -a $LOGS/gateway.log"
+uv run --extra gpu --extra vllm --extra fastpath python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003 |& tee -a $LOGS/api-server.log"
 
 TRAIN_CMD="TINKER_API_KEY=tml-dummy $JUDGE_ENV uv --project examples run python examples/harvey_labs/train.py \
 model_name=$MODEL_NAME renderer_name=qwen3_5 base_url=http://127.0.0.1:9003 \
@@ -219,8 +219,8 @@ tmux new-session -d -s "$SESSION" -n sampler -c "$REPO"
 tmux set-option -t "$SESSION" history-limit 100000
 tmux send-keys -t "$SESSION:sampler" "$SAMPLER_CMD" C-m
 
-tmux new-window -t "$SESSION" -n gateway -c "$REPO"
-tmux send-keys -t "$SESSION:gateway" "$GATEWAY_CMD" C-m
+tmux new-window -t "$SESSION" -n api-server -c "$REPO"
+tmux send-keys -t "$SESSION:api-server" "$API_SERVER_CMD" C-m
 
 if [ "$TRAIN_GPUS" -gt 1 ]; then
   TRAINER_CMD="CUDA_VISIBLE_DEVICES=$TRAIN_DEV FLA_TILELANG=$FLA_TILELANG REDIS_URL=redis://127.0.0.1:6379 \
@@ -243,7 +243,7 @@ tmux new-window -t "$SESSION" -n gpu -c "$REPO"
 tmux send-keys -t "$SESSION:gpu" "watch -n 5 nvidia-smi" C-m
 
 tmux select-window -t "$SESSION:train"
-echo "[work] up. sampler+gateway starting; train/eval commands are typed and waiting."
+echo "[work] up. sampler+API server starting; train/eval commands are typed and waiting."
 if [ -t 1 ]; then
   exec tmux attach -t "$SESSION"
 fi

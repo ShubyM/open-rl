@@ -2,7 +2,7 @@
 
 **Author:** Open-RL Engineering Team  
 **Status:** Proposed Design (`v0.5.0`)  
-**Target Component:** Gateway Server, Worker Managers (Local & K8s), Trainer Engine, Sampler Engine, Client HTTP API  
+**Target Component:** API server Server, Worker Managers (Local & K8s), Trainer Engine, Sampler Engine, Client HTTP API  
 
 ---
 
@@ -15,7 +15,7 @@ This document specifies a **unified, hierarchical Weight Synchronization Configu
 Key highlights of this design:
 1. **Hierarchical Schema**: A clean separation between the top-level sync strategy (`strategy`) and delta-specific execution sub-knobs (`format`, `apply_method`, `enable_prefetching`).
 2. **Client-Side HTTP Header Control**: Full control exposed to clients via `x-open-rl-weight-sync-*` HTTP headers.
-3. **Gateway Extraction & Defaulting**: Robust HTTP header parsing and automatic defaulting in the Gateway server, storing `weight_sync_cfg` in canonical Redis model metadata.
+3. **API server Extraction & Defaulting**: Robust HTTP header parsing and automatic defaulting in the API server server, storing `weight_sync_cfg` in canonical Redis model metadata.
 4. **Explicit Worker Pod Template Injection**: Worker Managers (`worker_manager.py` and `k8s_worker_manager.py`) dynamically read model metadata and set explicit environment variables on Trainer and Sampler pod templates.
 5. **Comprehensive Unit Test Suite**: Dedicated test coverage verifying HTTP header extraction, case-insensitivity, invalid fallbacks, and Redis metadata persistence.
 
@@ -26,11 +26,11 @@ Key highlights of this design:
 ### 2.1 Current Friction
 Currently, configuring weight synchronization suffers from three friction points:
 1. **Scattered Environment Variables**: Flags like `OPEN_RL_IN_PLACE_DELTA` and `OPEN_RL_EMIT_VLLM_FUSED_DELTAS` are parsed in separate files without a centralized configuration dataclass.
-2. **Dual-Location Defaulting (Anti-Pattern)**: Default values (such as `"vllm_fused"` or `"patch_in_place"`) were evaluated in multiple locations (both Gateway and downstream Worker processes), risking default drift bugs.
+2. **Dual-Location Defaulting (Anti-Pattern)**: Default values (such as `"vllm_fused"` or `"patch_in_place"`) were evaluated in multiple locations (both API server and downstream Worker processes), risking default drift bugs.
 3. **Overloaded Terminology**: Terms like `sync_cfg` are overloaded across multiple system boundaries. Replacing them with `weight_sync_cfg` establishes explicit domain boundaries.
 
 ### 2.2 Objective
-Establish a single, canonical hierarchy that enforces **Single-Location Defaulting** at the Gateway entry point. The Gateway extracts HTTP headers, applies default values ONCE, and persists a fully-resolved `weight_sync_cfg` into Redis model metadata. Downstream Worker Managers and engines consume these fully-resolved values directly without duplicating default fallbacks.
+Establish a single, canonical hierarchy that enforces **Single-Location Defaulting** at the API server entry point. The API server extracts HTTP headers, applies default values ONCE, and persists a fully-resolved `weight_sync_cfg` into Redis model metadata. Downstream Worker Managers and engines consume these fully-resolved values directly without duplicating default fallbacks.
 
 ---
 
@@ -68,7 +68,7 @@ class WeightSyncConfig:
 
 ### 3.2 Field Specification & Defaulting Rules
 
-| Field | Type | Allowed Values | Default (Gateway Entry Point Only) | Description / Behavior |
+| Field | Type | Allowed Values | Default (API server Entry Point Only) | Description / Behavior |
 | :--- | :--- | :--- | :--- | :--- |
 | **`strategy`** | `str` | `"delta"`, `"full"` | `"delta"` | Top-level weight transfer strategy. |
 | **`delta_format`** | `str` | `"vllm_fused"`, `"native"` | `"vllm_fused"` | Delta layer encoding format. `"vllm_fused"` remaps split HF attention/MLP layers (`q/k/v_proj`) to vLLM fused representations (`qkv_proj`). Active when `strategy == "delta"`. |
@@ -83,7 +83,7 @@ Clients (SDKs, CLI tools, or curl scripts) pass optional HTTP headers using the 
 
 ```http
 POST /v1/fine_tuning/jobs HTTP/1.1
-Host: open-rl-gateway:8000
+Host: open-rl-api-server:8000
 Content-Type: application/json
 x-open-rl-weight-sync-strategy: delta
 x-open-rl-weight-sync-delta-format: vllm_fused
@@ -93,9 +93,9 @@ x-open-rl-weight-sync-enable-prefetching: true
 
 ---
 
-## 5. Gateway Header Extraction & Metadata Store
+## 5. API server Header Extraction & Metadata Store
 
-Inside `src/server/gateway.py`, the Gateway server parses incoming HTTP headers, applies defaults for missing fields **once**, and persists `weight_sync_cfg` to Redis.
+Inside `src/server/api_server.py`, the API server server parses incoming HTTP headers, applies defaults for missing fields **once**, and persists `weight_sync_cfg` to Redis.
 
 ```python
 def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
@@ -190,7 +190,7 @@ def _fetch_metadata_from_store(model_id: str) -> TrainingModelMetadata | None:
 # Pod Template Environment Setup in k8s_worker_manager.py:
 meta = _fetch_metadata_from_store(model_id)
 
-# Fully-resolved by Gateway — no duplicate fallback defaults needed:
+# Fully-resolved by API server — no duplicate fallback defaults needed:
 if meta and meta.weight_sync_config:
   cfg = meta.weight_sync_config
   set_env(container, "OPEN_RL_WEIGHT_SYNC_STRATEGY", cfg["strategy"])
@@ -227,7 +227,7 @@ make cluster-e2e E2E_SCENARIO=fft-gsm8k-rl \
   WEIGHT_SYNC_ENABLE_PREFETCHING=true
 ```
 
-`scripts/run_cluster_e2e.py` parses these overrides via canonical CLI flags (`--weight-sync-strategy`, `--weight-sync-delta-format`, `--weight-sync-delta-apply-method`, `--weight-sync-enable-prefetching`) and dynamically injects `OPEN_RL_WEIGHT_SYNC_*` environment variables onto the `e2e-client` job container, where `patch_tinker_default_headers()` (`examples/common/tinker_utils.py`) automatically propagates them as HTTP headers to the Gateway.
+`scripts/run_cluster_e2e.py` parses these overrides via canonical CLI flags (`--weight-sync-strategy`, `--weight-sync-delta-format`, `--weight-sync-delta-apply-method`, `--weight-sync-enable-prefetching`) and dynamically injects `OPEN_RL_WEIGHT_SYNC_*` environment variables onto the `e2e-client` job container, where `patch_tinker_default_headers()` (`examples/common/tinker_utils.py`) automatically propagates them as HTTP headers to the API server.
 
 ### 7.2 Kubernetes Manifest Standardisation
 Base Kubernetes pod templates (`05-worker-pod-template.yaml` and `09-sampler-pod-template.yaml`) are updated to specify canonical `OPEN_RL_WEIGHT_SYNC_*` environment keys:

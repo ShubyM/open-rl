@@ -6,7 +6,7 @@ session every ten seconds for as long as it runs. A session that stops is
 dead, and an owner whose sessions are all dead is abandoned, so a job that
 exits without calling delete_model still gives its GPUs back.
 
-Everything lives in the store, so a gateway restart keeps it:
+Everything lives in the store, so an API server restart keeps it:
 
   open_rl:session:<id>    present while the session is live. Each heartbeat
                           resets its expiry, so a silent session vanishes
@@ -14,7 +14,7 @@ Everything lives in the store, so a gateway restart keeps it:
   open_rl:owner:<owner>   the sessions using this owner's workers.
   open_rl:owners          every owner that has workers.
 
-Nothing here is atomic. The gateway holds a lock per owner around attach and
+Nothing here is atomic. The API server holds a lock per owner around attach and
 around the in_use check and the teardown that follows it, so a session cannot
 attach to an owner between the check and the delete.
 """

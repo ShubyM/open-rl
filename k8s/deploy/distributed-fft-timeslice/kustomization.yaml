@@ -1,10 +1,10 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# FFT deployment: the gateway creates one Workload per worker process and the
+# FFT deployment: the API server creates one Workload per worker process and the
 # scheduler turns each into a DRA ResourceClaim and a pod. There is no static
 # trainer worker in this variant.
-# One namespace for the whole stack. The gateway creates Workloads in its own
+# One namespace for the whole stack. The API server creates Workloads in its own
 # namespace and the scheduler watches its own, and the scheduler runs as the
 # open-rl-sa this stack creates, so all three must agree. The scheduler base
 # pins openrl-system on its own; this makes the rest of the stack match it.
@@ -32,7 +32,7 @@ configMapGenerator:
 images:
   - name: ghcr.io/gke-labs/open-rl/server
     newTag: latest
-  - name: ghcr.io/gke-labs/open-rl/gateway
+  - name: ghcr.io/gke-labs/open-rl/api-server
     newTag: latest
 
 # FFT remains an optional deployment with cooperative GPU sharing.
@@ -41,12 +41,12 @@ patches:
       apiVersion: apps/v1
       kind: Deployment
       metadata:
-        name: open-rl-gateway
+        name: open-rl-api-server
       spec:
         template:
           spec:
             containers:
-              - name: gateway
+              - name: api-server
                 env:
                   - name: OPEN_RL_ENABLE_FFT
                     value: "true"

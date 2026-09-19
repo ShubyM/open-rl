@@ -8,7 +8,7 @@
 # CAS-arbitrated, so reconciles run concurrently; the leader lease keeps a
 # rolling update from running two processes at once.
 # The scheduler runs as the shared OpenRL control-plane account, open-rl-sa,
-# declared by this base. The gateway adds its Workload permissions separately.
+# declared by this base. The API server adds its Workload permissions separately.
 # Cluster-scoped only for reading nodes: the scheduler must see the capacity
 # labels (openrl.io/enabled, /trainer, /sampler) to know which nodes accept
 # which role, and the node's allocatable memory, which is what bounds how many
@@ -20,6 +20,12 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+# Pods on every node count against its allocatable memory, whichever
+# namespace they live in. Reading them is what keeps the host-memory fit
+# in step with kube-scheduler's.
+- apiGroups: [""]
+  resources: ["pods"]
   verbs: ["get", "list", "watch"]
 # ResourceSlices are cluster-scoped and are how the scheduler learns what
 # accelerators each node actually has.

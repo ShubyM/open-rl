@@ -1792,7 +1792,7 @@ requires-dist = [
     { name = "opentelemetry-sdk", specifier = ">=1.40.0" },
     { name = "orjson", specifier = ">=3.11.8" },
     { name = "requests", specifier = ">=2.32.5" },
-    { name = "tinker", specifier = "==0.23.0" },
+    { name = "tinker", specifier = "==0.29.0" },
     { name = "tinker-cookbook", extras = ["math-rl"], specifier = "==0.5.7" },
     { name = "transformers", specifier = ">=5.16.1" },
 ]
@@ -3003,7 +3003,7 @@ wheels = [
 
 [[package]]
 name = "tinker"
-version = "0.23.0"
+version = "0.29.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -3021,9 +3021,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/33/ce/0d30f80d7234ea88e8310b91d4ef58e9d27a96be5c579553407f831bba6b/tinker-0.23.0.tar.gz", hash = "sha256:b48f3e74128e56ad34bee18124f9b3a109a502bfa602853e999679eaf128aa49", size = 247551, upload-time = "2026-07-15T17:16:40.621Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/59/ec/5dea13ab5468aaf571c20335926e21fdbefab81f64540802f894f0be512f/tinker-0.29.0.tar.gz", hash = "sha256:615ed096ff647addafd1637096e8c688ce1581b8132bb937426492d2c5c0d619", size = 281006, upload-time = "2026-09-14T15:19:15.065Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bb/a6/17932357c145c6dbe988832613b36bc7630a661148e17db1f6017ddca01a/tinker-0.23.0-py3-none-any.whl", hash = "sha256:416a20f2cc62fc83cc92c5b69de7f6aa8736bceee0156fda07fbe2fef1b00936", size = 237099, upload-time = "2026-07-15T17:16:39.183Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/15/ce80b7ad9fa9b3799aaf340f47f12df06b831b30ff4a156f32c285525c34/tinker-0.29.0-py3-none-any.whl", hash = "sha256:d3a9edd08718edaa8d8f72fe4ffa2a7f1ae8da2967f35e1ab206988b86a1b1fb", size = 270325, upload-time = "2026-09-14T15:19:13.674Z" },
 ]
 
 [[package]]

@@ -67,7 +67,7 @@ for _ in $(seq 1 60); do
 done
 
 # Fail loudly. A cluster with zero slices looks healthy -- the DeviceClasses are
-# registered and the pods, if any, are Running -- but every claim the gateway
+# registered and the pods, if any, are Running -- but every claim the API server
 # creates will sit Pending with nothing in its logs to say why.
 if [[ -z "$slices_ready" ]]; then
   echo "No ResourceSlices published after 5m." >&2

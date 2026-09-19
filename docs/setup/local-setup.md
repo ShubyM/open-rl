@@ -84,7 +84,7 @@ uv run --extra vllm python src/server/scripts/patch_vllm_lora_dedup.py
 
 ### 2. Start the OpenRL Server
 
-The gateway now launches a dedicated trainer and vLLM sampler process per model
+The API server now launches a dedicated trainer and vLLM sampler process per model
 on demand (they share request queues and futures through Redis), so a single
 terminal starts everything:
 

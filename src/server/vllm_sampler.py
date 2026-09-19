@@ -12,7 +12,6 @@ os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
 from server.observability import gpu_turn, observe_operation
-from server.sampler_versions import version_chain
 from server.vllm_options import gpu_memory_utilization, split_stop, text_only_engine_kwargs
 
 try:
@@ -36,7 +35,7 @@ try:
 except ImportError:
   pass
 
-from opentelemetry import trace
+from opentelemetry import propagate, trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
@@ -215,87 +214,89 @@ async def run_generation_backend(
     return {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(e)}"}
 
 
-async def _sample_request(req: dict) -> dict:
+async def process_sampling_request(req: dict, store: Any) -> None:
   global engine
   global CURRENT_LOADED_SAMPLER_WEIGHTS
   global IS_ENGINE_SLEEPING
 
   request_id = req["request_id"]
-  # 1. Manage weights reloading
-  weights_path = req.get("weights_path")
-  if is_fft_enabled() and weights_path:
-    async with reload_lock:
-      if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
-        print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
-        if engine is not None:
-          print("[vLLM Worker] Triggering sleep level 1 (CPU offload weights)...")
-          await engine.sleep(level=1)
-          print("[vLLM Worker] Waking up weights...")
-          await engine.wake_up(tags=["weights"])
-          if WeightSyncConfig.from_env().strategy == "delta":
-            # Deltas chain, so a sampler that is behind applies every version
-            # it missed, and one starting cold begins at the last full snapshot.
-            for path in version_chain(CURRENT_LOADED_SAMPLER_WEIGHTS, weights_path):
+  trace_context = req.get("trace_context", {})
 
-              def _trigger_wt(worker, path=path):
-                worker.start_weight_update()
-                try:
-                  worker.update_weights({"target_weights_path": path})
-                finally:
-                  worker.finish_weight_update()
+  parent_span = propagate.extract(trace_context)
+  with tracer.start_as_current_span("process_sampling_request", context=parent_span):
+    try:
+      # 1. Manage weights reloading
+      weights_path = req.get("weights_path")
+      if is_fft_enabled() and weights_path:
+        async with reload_lock:
+          if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
+            print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
+            if engine is not None:
+              print("[vLLM Worker] Triggering sleep level 1 (CPU offload weights)...")
+              await engine.sleep(level=1)
+              print("[vLLM Worker] Waking up weights...")
+              await engine.wake_up(tags=["weights"])
+              if WeightSyncConfig.from_env().strategy == "delta":
 
-              res = await engine.collective_rpc(_trigger_wt)
-              print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
-              print(f"[vLLM Worker] Incremental delta weights from {path} synchronized via native WeightTransferEngine.")
-          else:
-            res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
-            print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
-            print(f"[vLLM Worker] Full weights reloaded from {weights_path} in-place.")
-          print("[vLLM Worker] Waking up KV cache...")
-          await engine.wake_up(tags=["kv_cache"])
-          IS_ENGINE_SLEEPING = False
-        CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
-        print("[vLLM Worker] Weights reload completed successfully!")
+                def _trigger_wt(worker, path=weights_path):
+                  worker.start_weight_update()
+                  try:
+                    worker.update_weights({"target_weights_path": path})
+                  finally:
+                    worker.finish_weight_update()
 
-  # 2. Run inference
-  prompt_token_ids = req.get("prompt_token_ids", [])
-  max_tokens = req.get("max_tokens", 20)
-  temperature = req.get("temperature", 1.0)
-  stop = req.get("stop")
-  top_p = req.get("top_p", 1.0)
-  top_k = req.get("top_k", -1)
-  num_samples = req.get("num_samples", 1)
-  lora_id = req.get("lora_id")
-  lora_path = req.get("lora_path")
-  include_prompt_logprobs = req.get("include_prompt_logprobs", False)
+                res = await engine.collective_rpc(_trigger_wt)
+                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
+              else:
+                res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                print(f"[vLLM Worker] Full weights reloaded from {weights_path} in-place.")
+              print("[vLLM Worker] Waking up KV cache...")
+              await engine.wake_up(tags=["kv_cache"])
+              IS_ENGINE_SLEEPING = False
+            CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
+            print("[vLLM Worker] Weights reload completed successfully!")
 
-  result = await run_generation_backend(
-    request_id=request_id,
-    prompt_token_ids=prompt_token_ids,
-    max_tokens=max_tokens,
-    temperature=temperature,
-    stop=stop,
-    top_p=top_p,
-    top_k=top_k,
-    num_samples=num_samples,
-    lora_id=lora_id,
-    lora_path=lora_path,
-    include_prompt_logprobs=include_prompt_logprobs,
-  )
+      # 2. Run inference
+      prompt_token_ids = req.get("prompt_token_ids", [])
+      max_tokens = req.get("max_tokens", 20)
+      temperature = req.get("temperature", 1.0)
+      stop = req.get("stop")
+      top_p = req.get("top_p", 1.0)
+      top_k = req.get("top_k", -1)
+      num_samples = req.get("num_samples", 1)
+      lora_id = req.get("lora_id")
+      lora_path = req.get("lora_path")
+      include_prompt_logprobs = req.get("include_prompt_logprobs", False)
 
-  if result.get("type") != "RequestFailedResponse":
-    result["type"] = "sample"
-  return result
+      result = await observe_operation(
+        store,
+        req,
+        "sampler",
+        req.get("model_id"),
+        lambda: run_generation_backend(
+          request_id=request_id,
+          prompt_token_ids=prompt_token_ids,
+          max_tokens=max_tokens,
+          temperature=temperature,
+          stop=stop,
+          top_p=top_p,
+          top_k=top_k,
+          num_samples=num_samples,
+          lora_id=lora_id,
+          lora_path=lora_path,
+          include_prompt_logprobs=include_prompt_logprobs,
+        ),
+      )
 
+      if result.get("type") != "RequestFailedResponse":
+        result["type"] = "sample"
 
-async def process_sampling_request(req: dict, store: Any) -> None:
-  request_id = req["request_id"]
-  try:
-    result = await observe_operation(store, req, "sampler", req.get("model_id"), lambda: _sample_request(req))
-    await store.set_future(request_id, result)
-  except Exception as exc:
-    traceback.print_exc()
-    await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(exc)}"})
+      await store.set_future(request_id, result)
+    except Exception as exc:
+      traceback.print_exc()
+      await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {str(exc)}"})
 
 
 async def run_sampling_worker(model_id: str) -> None:
@@ -434,7 +435,6 @@ async def run_sampling_worker(model_id: str) -> None:
                 IS_ENGINE_SLEEPING = False
               unanswered = []
               await sample_batch(sampling_reqs)
-              await store.ack_sampling_requests_for_model(model_id)
               if has_shutdown:
                 await exit_gracefully()
               if engine is not None:
@@ -455,11 +455,9 @@ async def run_sampling_worker(model_id: str) -> None:
               IS_ENGINE_SLEEPING = False
             unanswered = []
             await sample_batch(sampling_reqs)
-            await store.ack_sampling_requests_for_model(model_id)
 
         if has_shutdown:
           print("[vLLM Worker] Shutdown sentinel popped from queue. Initiating clean exit...")
-          await store.ack_sampling_requests_for_model(model_id)
           await exit_gracefully()
       except asyncio.CancelledError:
         break
@@ -467,7 +465,6 @@ async def run_sampling_worker(model_id: str) -> None:
         print(f"Error in sampling worker loop: {exc}")
         traceback.print_exc()
         await fail_requests(unanswered, exc)
-        await store.ack_sampling_requests_for_model(model_id)
         if engine_is_dead(exc):
           # A dead EngineCore (e.g. a CUDA assert during a weight patch) never
           # recovers in-process; exit non-zero so the pod restarts instead of

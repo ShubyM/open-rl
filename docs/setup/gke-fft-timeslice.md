@@ -3,7 +3,7 @@
 This guide describes the cluster shape for FFT on shared GPUs. It separates
 three ideas that build on each other:
 
-1. **Workload placement:** the gateway creates one `Workload` per worker
+1. **Workload placement:** the API server creates one `Workload` per worker
    process, and the OpenRL scheduler turns each into a DRA `ResourceClaim` and
    a pod, sharing a claim between workers when the cluster is full.
 2. **DRA pinning:** every pod that references a claim is scheduled onto the
@@ -17,7 +17,7 @@ three ideas that build on each other:
 
 There are three separate responsibilities.
 
-First, the gateway is the launcher, and it launches by asking. When it receives
+First, the API server is the launcher, and it launches by asking. When it receives
 `create_model` in FFT mode it creates a `Workload` for that job's trainer; when
 it receives `create_sampling_client` it creates one for the sampler. Each
 Workload carries the complete pod template and the estimator's accelerator
@@ -45,11 +45,11 @@ checkpoint/restore.
 The request flow is:
 
 1. A client calls `create_model`.
-2. The gateway creates a unique `model_id`.
-3. The gateway ensures a trainer `Workload` exists for that job.
+2. The API server creates a unique `model_id`.
+3. The API server ensures a trainer `Workload` exists for that job.
 4. The scheduler cuts or selects a `ResourceClaim` and creates the worker pod
    against it, so Kubernetes places it on the node holding that device.
-5. The gateway enqueues the create request on the model's Redis queue.
+5. The API server enqueues the create request on the model's Redis queue.
 6. The trainer worker drains that queue and uses the node-local time slicer
    before entering CUDA sections.
 
@@ -61,7 +61,7 @@ coordinates which colocated trainer worker may enter CUDA.
 flowchart TD
     subgraph launch["Layer 1: launch and placement"]
         client["Client"]
-        gateway["OpenRL gateway\nworker manager lives here"]
+        api_server["OpenRL API server\nworker manager lives here"]
         kube["Kubernetes API"]
         redis["Redis\nper-model queue + future"]
         scheduler["OpenRL scheduler\none Workload -> claim + pod"]
@@ -75,11 +75,11 @@ flowchart TD
         gpu["Physical GPU"]
     end
 
-    client -->|"create_model / retrieve_future"| gateway
-    gateway -->|"create or reuse Workload"| kube
+    client -->|"create_model / retrieve_future"| api_server
+    api_server -->|"create or reuse Workload"| kube
     kube -->|"Workload"| scheduler
     scheduler -->|"ResourceClaim + pod"| kube
-    gateway -->|"enqueue request / read future"| redis
+    api_server -->|"enqueue request / read future"| redis
     kube -->|"schedule pods that reference claim"| workerA
     kube -->|"schedule pods that reference claim"| workerB
     scheduler -.->|"claim pins each pod to one device"| workerA
@@ -99,11 +99,11 @@ The orchestration is currently cooperative: worker code calls acquire/release,
 and the OpenRL time slicer serializes those calls with a FIFO lock. The
 scheduler only places pods; it is not the runtime time-slice scheduler.
 
-## 1. The gateway creates one Workload per worker process
+## 1. The API server creates one Workload per worker process
 
 The per-model Redis queues and future protocol are unchanged. What differs is
 how workers are launched: with `OPEN_RL_WORKER_MANAGER=scheduler`, the
-gateway's `server/scheduler_worker_manager.py` creates one `Workload` object
+API server's `server/scheduler_worker_manager.py` creates one `Workload` object
 per runtime process and stops. FFT jobs own their processes
 (`fft-<job>-trainer`, `fft-<job>-sampler`); LoRA jobs on one base model share
 them (`lora-<base>-0-<role>`), so a second compatible request hits
@@ -112,7 +112,7 @@ them (`lora-<base>-0-<role>`), so a second compatible request hits
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant G as Gateway
+    participant G as API server
     participant K as Kubernetes API
     participant S as Scheduler
     participant R as Redis
@@ -262,13 +262,13 @@ make deploy-fft-timeslice
 
 `k8s/deploy/distributed-fft-timeslice/` deploys Redis, the shared PVC, the
 shared GPU `ResourceClaim`, the llm-d Snapshot Agent DaemonSet, the node-local
-OpenRL time-slicer DaemonSet, and the gateway with `OPEN_RL_ENABLE_FFT=true`
+OpenRL time-slicer DaemonSet, and the API server with `OPEN_RL_ENABLE_FFT=true`
 and `OPEN_RL_WORKER_MANAGER=scheduler`.
 The deployment assumes one base model per rollout: set `BASE_MODEL` in
-`kustomization.yaml`, and the gateway uses that value for `get_info` and
+`kustomization.yaml`, and the API server uses that value for `get_info` and
 `create_model` requests that do not explicitly pass a base model.
 
-There are no static worker deployments. Every `create_model` call makes the gateway create a trainer `Workload` (`fft-<job>-trainer`), and every `create_sampling_client` call makes it create a sampler one (`fft-<job>-sampler`); the scheduler creates the pod for each as `orw-<workload name>`. Both pods are labeled:
+There are no static worker deployments. Every `create_model` call makes the API server create a trainer `Workload` (`fft-<job>-trainer`), and every `create_sampling_client` call makes it create a sampler one (`fft-<job>-sampler`); the scheduler creates the pod for each as `orw-<workload name>`. Both pods are labeled:
 
 ```yaml
 accel-timeslicer: "true"            # OpenRL time-slicer marker
@@ -276,10 +276,10 @@ timeslice.io/group: <claim name>    # the ResourceClaim the pod shares
 timeslice.io/job-id: <workload name>
 ```
 
-The gateway's `open-rl-sa` service account has a Role allowing Workload CRUD in the workload namespace (`03-rbac.yaml`); the scheduler runs as the same account with the roles its own manifests add. When weight updates occur during FFT training, Trainers write checkpoints to NFS `/mnt/shared`, and Samplers dynamically reload those checkpoint safetensors in-place in ~1.1 seconds while yielding GPU VRAM via cooperative sleep.
+The API server's `open-rl-sa` service account has a Role allowing Workload CRUD in the workload namespace (`03-rbac.yaml`); the scheduler runs as the same account with the roles its own manifests add. When weight updates occur during FFT training, Trainers write checkpoints to NFS `/mnt/shared`, and Samplers dynamically reload those checkpoint safetensors in-place in ~1.1 seconds while yielding GPU VRAM via cooperative sleep.
 
 ### Structured Model Serialization in Redis
-To ensure reliable metadata persistence across gateway restarts and worker spawns, model configuration is serialized in Redis using the `TrainingModelMetadata` dataclass:
+To ensure reliable metadata persistence across API server restarts and worker spawns, model configuration is serialized in Redis using the `TrainingModelMetadata` dataclass:
 - **Generic KV Store:** The `RequestStore` interface provides generic `set_value`, `get_value`, and `delete_values` operations for storing structured objects alongside tenant request queues.
 - **Mandatory Architecture Specification:** The `/api/v1/create_model` endpoint strictly requires a valid `base_model` in the request payload, guaranteeing deterministic worker pod configuration.
 
@@ -297,7 +297,7 @@ The Kustomize rollout includes `10-dcgm-monitoring.yaml`, deploying the NVIDIA D
 ## Setup 3: Run training on the cluster
 
 ```bash
-kubectl port-forward svc/open-rl-gateway-service 8000:8000 &
+kubectl port-forward svc/open-rl-api-server-service 8000:8000 &
 make test e2e fft-gsm8k BASE_URL=http://127.0.0.1:8000
 ```
 
@@ -324,7 +324,7 @@ make test e2e fft-gsm8k BASE_URL=http://127.0.0.1:8000
   DaemonSet should reach llm-d at `127.0.0.1:9001`, and the worker pod should
   carry a `timeslice.io/job-id` equal to its Workload name and a
   `timeslice.io/group` equal to its ResourceClaim.
-- **`create_model` future fails with a pod-create error**: check gateway logs and
+- **`create_model` future fails with a pod-create error**: check API server logs and
   RBAC; the error message is propagated into the `RequestFailedResponse`.
 - **First request after `create_model` is slow**: pod scheduling, image pull, and
   model load all happen before the worker drains its queue; pre-pull the server

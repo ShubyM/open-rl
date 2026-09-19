@@ -2,7 +2,7 @@
 
 **Author:** Open-RL Engineering Team  
 **Status:** Proposed Design (`v1.0.0`)  
-**Target Component:** Gateway Server, `FFTTrainingWorker`, `vLLMInferenceEngine`, `SingleNodeTimeSlicer` (`accel_timeslicer`), K8s Dev Manifests  
+**Target Component:** API server Server, `FFTTrainingWorker`, `vLLMInferenceEngine`, `SingleNodeTimeSlicer` (`accel_timeslicer`), K8s Dev Manifests  
 **Target Manifests:** `k8s/deploy/single-node-dev/`, `src/accel_timeslicer/`, `src/server/`  
 
 ---
@@ -38,7 +38,7 @@ The single-node architecture uses the **Accelerator Time-Slicer** (`accel_timesl
 
 ```text
                                ┌───────────────────────────────────────────────┐
-                               │               Open-RL Gateway                 │
+                               │               Open-RL API server                 │
                                │        (Job Store / Queue Manager)            │
                                └──────────────────────┬────────────────────────┘
                                                       │
@@ -84,7 +84,7 @@ The single-node architecture uses the **Accelerator Time-Slicer** (`accel_timesl
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Gateway as Gateway / Store
+    participant APIServer as API server / Store
     participant TS as Accelerator Time-Slicer (Daemon)
     participant Sampler as vLLM Sampler Worker
     participant Trainer as FFT Trainer Worker
@@ -93,21 +93,21 @@ sequenceDiagram
     Note over Sampler,Trainer: Both workers initialized in SLEEP mode (VRAM ~0 MB, Tensors in Pinned Host CPU RAM)
 
     rect rgb(240, 248, 255)
-    Note over Gateway,Sampler: Phase 1: Generation / Sampling Turn
-    Gateway->>Sampler: Sampling Request (Batch)
+    Note over APIServer,Sampler: Phase 1: Generation / Sampling Turn
+    APIServer->>Sampler: Sampling Request (Batch)
     Sampler->>TS: ACQUIRE (group: sampler, job: model-1)
     TS-->>Sampler: Granted (Exclusive GPU Lock)
     Sampler->>GPU: wake_up() -> Load vLLM weights & allocate KV cache
     Sampler->>GPU: Execute vLLM generation
-    Sampler->>Gateway: Return Token Sequences & Logprobs
+    Sampler->>APIServer: Return Token Sequences & Logprobs
     Sampler->>GPU: sleep(level=1) -> Offload weights & free KV cache
     Sampler->>GPU: torch.cuda.empty_cache()
     Sampler->>TS: RELEASE
     end
 
     rect rgb(255, 245, 238)
-    Note over Gateway,Trainer: Phase 2: Policy Update / Training Turn
-    Gateway->>Trainer: Forward/Backward & Optim Request
+    Note over APIServer,Trainer: Phase 2: Policy Update / Training Turn
+    APIServer->>Trainer: Forward/Backward & Optim Request
     Trainer->>TS: ACQUIRE (group: trainer, job: model-1)
     TS-->>Trainer: Granted (Exclusive GPU Lock)
     Trainer->>GPU: wake_up() -> Load model & AdamW states from pinned CPU RAM
@@ -116,12 +116,12 @@ sequenceDiagram
     Trainer->>GPU: sleep() -> Offload model, grads & AdamW state to CPU RAM
     Trainer->>GPU: torch.cuda.empty_cache()
     Trainer->>TS: RELEASE
-    Trainer->>Gateway: Return Training Metrics & Save Delta Safetensors
+    Trainer->>APIServer: Return Training Metrics & Save Delta Safetensors
     end
 
     rect rgb(240, 248, 255)
-    Note over Gateway,Sampler: Phase 3: Weight Synchronization & Next Rollout
-    Gateway->>Sampler: Sampling Request (Next Step)
+    Note over APIServer,Sampler: Phase 3: Weight Synchronization & Next Rollout
+    APIServer->>Sampler: Sampling Request (Next Step)
     Sampler->>TS: ACQUIRE
     TS-->>Sampler: Granted
     Sampler->>GPU: wake_up() weights
@@ -261,7 +261,7 @@ For local dev without Kubernetes (`OPEN_RL_WORKER_MANAGER=subprocess`), the setu
      --scheduling-policy lrs &
    ```
 
-3. **Gateway Launch**:
+3. **API server Launch**:
    ```bash
    export OPEN_RL_WORKER_MANAGER="subprocess"
    export OPEN_RL_ENABLE_FFT="true"
@@ -270,7 +270,7 @@ For local dev without Kubernetes (`OPEN_RL_WORKER_MANAGER=subprocess`), the setu
    export OPEN_RL_ACCEL_TIMESLICER_PORT="9753"
    export CUDA_VISIBLE_DEVICES="0"
 
-   uv run uvicorn server.gateway:app --host 0.0.0.0 --port 8000
+   uv run uvicorn server.api_server:app --host 0.0.0.0 --port 8000
    ```
 
 ---
@@ -282,20 +282,20 @@ Add a streamlined Makefile target to launch single-node dev runs:
 
 ```makefile
 .PHONY: dev-single-node
-dev-single-node: ## Run local single-node time-slicer & gateway in dev mode
+dev-single-node: ## Run local single-node time-slicer & API server in dev mode
 	@echo "==> Starting local Redis..."
 	@redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes
 	@echo "==> Starting Accelerator Time-Slicer daemon..."
 	@pkill -f "accel_timeslicer.serve" 2>/dev/null || true
 	@uv run python -m accel_timeslicer.serve --listen-host 127.0.0.1 --port 9753 --backend llmd &
-	@echo "==> Starting Gateway (Subprocess Mode)..."
+	@echo "==> Starting API server (Subprocess Mode)..."
 	@OPEN_RL_WORKER_MANAGER=subprocess \
 	 OPEN_RL_ENABLE_FFT=true \
 	 REDIS_URL="redis://127.0.0.1:6379" \
 	 OPEN_RL_ACCEL_TIMESLICER_HOST="127.0.0.1" \
 	 OPEN_RL_ACCEL_TIMESLICER_PORT="9753" \
 	 CUDA_VISIBLE_DEVICES=0 \
-	 uv run uvicorn server.gateway:app --host 0.0.0.0 --port 8000
+	 uv run uvicorn server.api_server:app --host 0.0.0.0 --port 8000
 ```
 
 ### 7.2 Validation Checklist

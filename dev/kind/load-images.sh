@@ -17,8 +17,8 @@
 # kubelet pulls only that. Same iteration is now seconds.
 #
 # Usage:
-#   ./dev/kind/load-images.sh                # gateway + server + scheduler
-#   ./dev/kind/load-images.sh gateway        # just the fast one
+#   ./dev/kind/load-images.sh                # API server + server + scheduler
+#   ./dev/kind/load-images.sh api-server        # just the fast one
 #   IMAGE_TAG=wip ./dev/kind/load-images.sh
 set -euo pipefail
 
@@ -32,7 +32,7 @@ REGISTRY="${REGISTRY:-localhost:5001}"
 
 TARGETS=("$@")
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-  TARGETS=(gateway server scheduler)
+  TARGETS=(api-server server scheduler)
 fi
 
 log() { echo "[load-images] $*"; }
@@ -47,12 +47,12 @@ fi
 for target in "${TARGETS[@]}"; do
   context="$REPO_ROOT"
   case "$target" in
-    gateway) dockerfile="src/server/Dockerfile.gateway" ;;
+    api-server) dockerfile="src/server/Dockerfile.api_server" ;;
     server) dockerfile="src/server/Dockerfile" ;;
     client) dockerfile="src/server/Dockerfile.client" ;;
     scheduler) dockerfile="scheduler/controller/Dockerfile"; context="$REPO_ROOT/scheduler/controller" ;;
     *)
-      echo "Unknown target '$target'. Expected gateway, server, client, or scheduler." >&2
+      echo "Unknown target '$target'. Expected api-server, server, client, or scheduler." >&2
       exit 2
       ;;
   esac

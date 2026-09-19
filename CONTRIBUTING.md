@@ -66,7 +66,7 @@ request. If there isn't one yet, open a new issue.
 OpenRL uses [`uv`](https://docs.astral.sh/uv/) for environment isolation. There are two
 primary environments:
 
-* **Server** (`src/server`) — the gateway server and worker controllers.
+* **Server** (`src/server`) — the API server server and worker controllers.
 * **Client / examples** (`examples`) — recipes, client SDK compatibility checks, and
   end-to-end integration test scripts.
 

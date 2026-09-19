@@ -61,7 +61,7 @@ COPY uv.lock .
 # UV_COMPILE_BYTECODE: without it the venv ships 24k .py files and no .pyc, so
 # every worker start recompiles the whole import graph and throws it away --
 # `import vllm` measured 12.9s cold against 5.6s with bytecode present, on every
-# trainer and sampler launch, for ~0.4GB of image. The gateway and client images
+# trainer and sampler launch, for ~0.4GB of image. The API server and client images
 # already set this.
 #
 # UV_NO_SYNC: the source is exposed through PYTHONPATH below rather than
@@ -122,9 +122,9 @@ ENV PATH="/usr/local/cuda/bin:$PATH" \
     # LD_LIBRARY_PATH, silently leaving torch/vLLM CPU-only on GKE.
     LD_LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib:$LD_LIBRARY_PATH"
 
-# Expose ports (Gateway: 8000, vLLM Worker: 8001)
+# Expose ports (API server: 8000, vLLM Worker: 8001)
 EXPOSE 8000
 EXPOSE 8001
 
-# Start the Gateway using uv run to ensure the venv is active
-CMD ["uv", "run", "uvicorn", "server.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+# Start the API server using uv run to ensure the venv is active
+CMD ["uv", "run", "uvicorn", "server.api_server:app", "--host", "0.0.0.0", "--port", "8000"]

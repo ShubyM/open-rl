@@ -1,6 +1,6 @@
 # GKE Setup Guide
 
-This guide describes how to create a minimal GKE Standard cluster to run OpenRL workloads. It sets up the OpenRL gateway, one vLLM worker, one trainer worker, Redis, and a shared Filestore PVC.
+This guide describes how to create a minimal GKE Standard cluster to run OpenRL workloads. It sets up the OpenRL API server, one vLLM worker, one trainer worker, Redis, and a shared Filestore PVC.
 
 This guide is based on the [Text-to-SQL recipe](../../examples/text-to-sql/README.md) requirements.
 
@@ -8,11 +8,11 @@ This guide is based on the [Text-to-SQL recipe](../../examples/text-to-sql/READM
 
 | Component | Minimum used here | Why |
 | --- | --- | --- |
-| CPU node pool | `1 x e2-standard-4` | Gateway, Redis, system pods. |
+| CPU node pool | `1 x e2-standard-4` | API server, Redis, system pods. |
 | GPU node pool | `1 x g2-standard-24` | Two NVIDIA L4 GPUs, one for vLLM and one for the trainer. |
 | GPU VRAM | `2 x 24 GB` | Expected separate 24 GB-class GPUs. |
 | Shared storage | `100Gi standard-rwx` Filestore PVC | Shared adapter snapshots, checkpoints, and Hugging Face cache. |
-| Server images | one gateway image, one worker image | vLLM and trainer share the worker image. |
+| Server images | one API server image, one worker image | vLLM and trainer share the worker image. |
 
 Google references:
 
@@ -127,7 +127,7 @@ Wait for the deployments to become ready:
 
 ```bash
 kubectl rollout status deploy/redis-store
-kubectl rollout status deploy/open-rl-gateway
+kubectl rollout status deploy/open-rl-api-server
 kubectl rollout status deploy/vllm-worker
 kubectl rollout status deploy/open-rl-trainer-worker
 ```
@@ -137,15 +137,15 @@ Useful logs:
 ```bash
 kubectl logs deploy/vllm-worker -f
 kubectl logs deploy/open-rl-trainer-worker -f
-kubectl logs deploy/open-rl-gateway -f
+kubectl logs deploy/open-rl-api-server -f
 ```
 
-## 4. Port-Forward the Gateway
+## 4. Port-Forward the API server
 
-To access the gateway from your local machine:
+To access the API server from your local machine:
 
 ```bash
-kubectl port-forward svc/open-rl-gateway-service 9003:8000
+kubectl port-forward svc/open-rl-api-server-service 9003:8000
 ```
 
 Smoke test:

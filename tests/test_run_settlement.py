@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 
-from server import gateway
+from server import api_server as gateway
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStore
 

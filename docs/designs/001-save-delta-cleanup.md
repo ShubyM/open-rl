@@ -32,7 +32,7 @@ self._latest_delta_tensors = {
 }
 ```
 
-Immediately following `optim_step()`, the gateway and worker controller routinely issue two consecutive save requests:
+Immediately following `optim_step()`, the API server and worker controller routinely issue two consecutive save requests:
 1. **`save_weights_for_sampler`**: Writes sparse delta weights to `/tmp/sampler_full/...` and publishes a Redis notification to trigger sampler synchronization.
 2. **`save_state`**: Writes the persistent checkpoint for the training step to shared storage / NFS (`/mnt/shared/.../step_N`).
 
@@ -228,7 +228,7 @@ def save_state_delta(
    * Verify that calling `worker.save_state_delta()` immediately after `worker.create_model(...)` without calling `optim_step()` writes a valid Safetensors file containing `0` elements with `values_flat.dtype` matching the base model parameter dtype (`bfloat16` or `float32`) and `total_elements` accurately matching `self.total_model_elements`.
 3. **E2E Integration & Cluster Regression Suite**:
    * Run the standard test suite: `make test`
-   * Run E2E distributed timeslice scenarios (`fft-gsm8k-rl` and `fft-gsm8k-rl-x2`) to verify that gateway training requests, sampler synchronization via Redis, and checkpoint recovery operate cleanly under the streamlined sync architecture.
+   * Run E2E distributed timeslice scenarios (`fft-gsm8k-rl` and `fft-gsm8k-rl-x2`) to verify that API server training requests, sampler synchronization via Redis, and checkpoint recovery operate cleanly under the streamlined sync architecture.
 
 ---
 

@@ -77,9 +77,9 @@
   <rect x="60" y="310" width="1080" height="165" rx="16" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.2"/>
   <text x="600" y="338" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="700" fill="#334155" letter-spacing="0.05em">WHAT HAPPENS ON THE SERVER</text>
 
-  <!-- Gateway -->
+  <!-- API server -->
   <rect x="100" y="360" width="160" height="55" rx="10" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
-  <text x="180" y="383" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10" font-weight="650" fill="#1e40af">Gateway</text>
+  <text x="180" y="383" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10" font-weight="650" fill="#1e40af">API server</text>
   <text x="180" y="398" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="8.5" fill="#64748b">Receives request</text>
   <text x="180" y="410" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="8.5" fill="#64748b">Returns future ID</text>
 

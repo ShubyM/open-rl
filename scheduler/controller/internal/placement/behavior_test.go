@@ -1,7 +1,7 @@
 // What we expect of placement, end to end, played the way the controller
 // plays it -- cut a tiered claim, DRA answers instantly, an unsatisfied
 // claim falls back to sharing on kube-scheduler's verdict. The memory
-// figures are the estimator's real outputs: the gateway's tier table says
+// figures are the estimator's real outputs: the API server's tier table says
 // 10Gi for the L4 tier and 60Gi for the 80Gi tier, and the hardware shapes
 // are the ones we run (2x L4 24Gi dev box, single 80Gi devices).
 //
@@ -146,7 +146,7 @@ func gpu80(name string, roles ...string) *Node {
 func TestWorkersSpreadAcrossFreeGPUs(t *testing.T) {
 	c := newCluster(t, gpu80("node-a", "trainer"), gpu80("node-b", "trainer"))
 
-	// Two 80Gi-tier estimates (the gateway's table says 60Gi) while both
+	// Two 80Gi-tier estimates (the API server's table says 60Gi) while both
 	// GPUs are free: a claim each, on different nodes.
 	a := c.arrive(trainer("w1", 60))
 	b := c.arrive(trainer("w2", 60))

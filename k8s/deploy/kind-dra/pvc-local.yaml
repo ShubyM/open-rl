@@ -1,6 +1,6 @@
 # kind ships the rancher local-path provisioner as the default StorageClass.
 # It is node-local and RWO-only, which is fine here because the cluster has a
-# single node -- every trainer, sampler, and gateway pod lands on it and shares
+# single node -- every trainer, sampler, and API server pod lands on it and shares
 # the same host directory. The GKE variant uses an RWX Filestore class because
 # there the pods really are spread across nodes.
 apiVersion: v1

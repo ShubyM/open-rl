@@ -9,7 +9,7 @@ resources:
   - rbac.yaml
   - ../dashboard
   - redis.yaml
-  - gateway.yaml
+  - api-server.yaml
 
 generatorOptions:
   disableNameSuffixHash: true

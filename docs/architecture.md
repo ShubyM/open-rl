@@ -17,7 +17,7 @@ Here is an architecture diagram:
 ```mermaid
 flowchart TB
     classDef client fill:#888,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef gateway fill:#326ce5,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef api_server fill:#326ce5,stroke:#fff,stroke-width:2px,color:#fff;
     classDef cache fill:#d82c20,stroke:#fff,stroke-width:2px,color:#fff;
     classDef compute_gpu fill:#326ce5,stroke:#fff,stroke-width:2px,color:#fff;
     classDef compute_pod fill:#fff,stroke:#326ce5,stroke-width:2px,color:#326ce5;
@@ -27,7 +27,7 @@ flowchart TB
     job2["Training Loop 2"]:::client
 
     subgraph Cluster["Compute Cluster"]
-        api["API server"]:::gateway
+        api["API server"]:::api_server
 
         subgraph Queue["Request Queue"]
             queue1[("Queue: Model 1<br/>Training and save work")]:::cache
@@ -38,7 +38,7 @@ flowchart TB
             trainer["Trainer<br/>Model state and adapter updates"]:::compute_gpu
 
             subgraph Sampling["Sampler"]
-                sampler_service["Sampler service"]:::gateway
+                sampler_service["Sampler service"]:::api_server
                 sampler_w1["Sampler Worker 1"]:::compute_pod
                 sampler_w2["Sampler Worker 2"]:::compute_pod
                 sampler_w3["Sampler Worker 3"]:::compute_pod

@@ -17,7 +17,7 @@ command declared in TOML as long as it writes the configured metric to
 `metrics.jsonl`.
 
 Unlike the original prime-rl setup, this recipe does not allocate two GPUs per
-researcher. Researcher pods call a shared OpenRL gateway via `TINKER_BASE_URL`;
+researcher. Researcher pods call a shared OpenRL API server via `TINKER_BASE_URL`;
 the cluster-side model/trainer stack owns GPU placement. The composed GKE stack
 sets the shared `BASE_MODEL` to `Qwen/Qwen2.5-0.5B-Instruct`, matching the
 `autoresearch-rl` base model.
@@ -35,7 +35,7 @@ flow.
 
 ## Local Attempt Run
 
-From `examples`, with an OpenRL gateway reachable on a port:
+From `examples`, with an OpenRL API server reachable on a port:
 
 ```bash
 export TINKER_BASE_URL=http://127.0.0.1:9003
@@ -81,18 +81,18 @@ OpenRL backend with the autoresearch add-on:
 ```bash
 kubectl apply -k examples/autoresearch/recipes/math_rl/gke
 kubectl wait --for=condition=available deployment/vllm-worker --timeout=20m
-kubectl wait --for=condition=available deployment/open-rl-gateway --timeout=5m
+kubectl wait --for=condition=available deployment/open-rl-api-server --timeout=5m
 kubectl wait --for=condition=available deployment/open-rl-trainer-worker --timeout=20m
 kubectl port-forward svc/open-rl-autoresearch-ui 8080:8080
 ```
 
 The researcher pods also wait on `READY_URLS`, so attempts do not start until
-vLLM, the trainer worker, and the gateway health endpoints are reachable.
+vLLM, the trainer worker, and the API server health endpoints are reachable.
 
-The researcher pods use the in-cluster gateway URL:
+The researcher pods use the in-cluster API server URL:
 
 ```text
-TINKER_BASE_URL=http://open-rl-gateway-service:8000
+TINKER_BASE_URL=http://open-rl-api-server-service:8000
 ```
 
 ## Overlay Settings
@@ -103,8 +103,8 @@ The math-RL overlay sets:
 - `LOG_ROOT=/mnt/shared/open-rl/autoresearch/math_rl`
 - `ATTEMPT_TIMEOUT_MINUTES=5`
 - `AGENT_TIMEOUT_MINUTES=10`
-- `READY_URLS=http://open-rl-gateway-service:8000/api/v1/healthz`
-- `TINKER_BASE_URL=http://open-rl-gateway-service:8000`
+- `READY_URLS=http://open-rl-api-server-service:8000/api/v1/healthz`
+- `TINKER_BASE_URL=http://open-rl-api-server-service:8000`
 - `BASE_MODEL=Qwen/Qwen2.5-0.5B-Instruct` in the composed GKE stack
 
 The recipe `program.md` tells each researcher sandbox to tune `config.toml`, run

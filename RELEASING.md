@@ -16,8 +16,8 @@ Images, published to GHCR by `.github/workflows/build-and-push.yml` and tagged w
 verbatim:
 
 - `ghcr.io/gke-labs/open-rl/server:<tag>`
-- `ghcr.io/gke-labs/open-rl/gateway:<tag>`
-- `ghcr.io/gke-labs/open-rl/client:<tag>`
+- `ghcr.io/gke-labs/open-rl/api-server:<tag>`
+- `ghcr.io/gke-labs/open-rl/client:<tag>` (the e2e client, `src/server/Dockerfile.client`)
 - `ghcr.io/gke-labs/open-rl/scheduler:<tag>`
 
 Assets, attached to the GitHub Release:
@@ -66,9 +66,12 @@ Every bundle has its images pinned to the release tag.
 4. **Verify on a clean cluster.**
 
    ```bash
-   kubectl apply -f https://github.com/gke-labs/open-rl/releases/download/v0.0.2/openrl-distributed-shared.yaml
+   kubectl apply --server-side -f https://github.com/gke-labs/open-rl/releases/download/v0.0.2/openrl-distributed-shared.yaml
    kubectl get pods -o jsonpath='{..image}'
    ```
+
+   Server-side apply is required: the Workload CRD is larger than the 256 KiB
+   `last-applied-configuration` annotation a client-side apply would write.
 
    Every OpenRL image should read `:v0.0.2` and none should read `:latest`.
 

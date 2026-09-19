@@ -4,7 +4,7 @@ kind: Kustomization
 # The scheduler on its own: two CRDs, a namespace, and one deployment.
 #
 # Applying this changes nothing about a running cluster. The scheduler only
-# acts on Workload objects, and nothing creates those until the gateway is
+# acts on Workload objects, and nothing creates those until the API server is
 # pointed at it.
 #
 #   kubectl apply --server-side -k scheduler/deploy/base

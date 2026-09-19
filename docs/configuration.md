@@ -17,7 +17,7 @@ Start the API server and trainer with the default torch sampling backend:
 ```bash
 BASE_MODEL=google/gemma-4-e2b \
 SAMPLING_BACKEND=torch \
-uv run --extra cpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
+uv run --extra cpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
 ```
 
 Because `REDIS_URL` is unset, this starts the API server and trainer loop in one
@@ -38,7 +38,7 @@ uv run --extra vllm python -m server.vllm_sampler
 BASE_MODEL=google/gemma-4-e2b \
 SAMPLING_BACKEND=vllm \
 CUDA_VISIBLE_DEVICES=1 \
-uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
+uv run --extra gpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
 ```
 
 The equivalent Makefile shortcuts are:
@@ -110,7 +110,7 @@ Kubernetes deployment manifests set these variables in pod specs. The important 
 REDIS_URL=redis://redis-service:6379 \
 VLLM_URL=http://vllm-service:8001 \
 BASE_MODEL=google/gemma-4-e2b \
-uv run uvicorn server.gateway:app --host 0.0.0.0 --port 8000
+uv run uvicorn server.api_server:app --host 0.0.0.0 --port 8000
 ```
 
 ```bash

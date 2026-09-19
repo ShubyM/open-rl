@@ -319,7 +319,7 @@ def start_backend(config: RunConfig, processes: list[ManagedProcess]) -> str:
   launch(
     processes,
     "backend",
-    uv_run(config.uv_extra) + ["python", "-m", "uvicorn", "server.gateway:app", "--host", config.host, "--port", str(port)],
+    uv_run(config.uv_extra) + ["python", "-m", "uvicorn", "server.api_server:app", "--host", config.host, "--port", str(port)],
     env,
     log_dir / "backend.log",
     lambda: http_ok(f"{base_url}/api/v1/healthz"),
@@ -1027,8 +1027,8 @@ def run_tiny_rl_x2_families(config: RunConfig, base_url: str, watch: list[Manage
   """Two concurrent tiny RL jobs on base models from different families
   (base_model and second_base_model), LoRA or FFT by scenario name.
 
-  One gateway, two vocabularies: anything that resolves a job's tokenizer,
-  parameter names or worker from a gateway-wide default instead of the job's
+  One API server, two vocabularies: anything that resolves a job's tokenizer,
+  parameter names or worker from a API-server-wide default instead of the job's
   own metadata hands one job the other model's tokens. That does not crash
   tiny_rl, the samples just turn into token soup and the reward stays at 0,
   so each job must also earn a reward at least once."""
@@ -1067,7 +1067,7 @@ def run_tiny_rl_x2_families(config: RunConfig, base_url: str, watch: list[Manage
     if best <= 0:
       raise RuntimeError(
         f"{job} ({model}) never earned a reward in {len(rows)} steps; its samples are most likely "
-        "token soup from the other model's tokenizer (check the gateway's per-model metadata)"
+        "token soup from the other model's tokenizer (check the API server's per-model metadata)"
       )
     print(f"[training-e2e] {job} {model}: best mean_reward={best:.2f} over {len(rows)} steps")
 

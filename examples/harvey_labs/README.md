@@ -6,7 +6,7 @@ against the full rubric. The default model is `Qwen/Qwen3.5-9B`.
 
 ## Setup
 
-Start an Open-RL gateway, then install the client and LAB environment:
+Start an Open-RL API server, then install the client and LAB environment:
 
 ```bash
 cd examples
@@ -122,5 +122,5 @@ turns using the real tokenizer, without model weights or a GPU. Gemma uses
 Google’s unmodified template and response schema at a pinned HF revision,
 with Transformers parsing tool calls; malformed arguments fail parsing. The
 first Gemma run downloads these assets into the HF cache. Keep tests focused here;
-avoid a broad recipe suite or generated fake harness packages. For gateway configuration,
+avoid a broad recipe suite or generated fake harness packages. For API server configuration,
 see [docs/configuration.md](../../docs/configuration.md).

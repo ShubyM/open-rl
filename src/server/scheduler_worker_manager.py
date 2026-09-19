@@ -42,7 +42,7 @@ def workload_name(role: str, owner: str, is_lora: bool) -> str:
 
 @dataclass(frozen=True)
 class Worker:
-  """Everything the gateway knows about one worker process before placement."""
+  """Everything the API server knows about one worker process before placement."""
 
   role: str
   runtime: str
@@ -127,7 +127,7 @@ def workload_body(worker: Worker) -> dict[str, Any]:
   return {
     "apiVersion": f"{GROUP}/{VERSION}",
     "kind": "Workload",
-    "metadata": {"name": worker.name, "labels": {"app.kubernetes.io/managed-by": "open-rl-gateway"}},
+    "metadata": {"name": worker.name, "labels": {"app.kubernetes.io/managed-by": "open-rl-api-server"}},
     "spec": {
       "role": worker.role,
       "trainingKind": "lora" if worker.is_lora else "fft",
@@ -191,7 +191,7 @@ class SchedulerWorkerManager:
 
   def release_owner(self, owner: str) -> set[str]:
     """Delete the owner's workloads. The scheduler's finalizer frees the seats."""
-    selector = "app.kubernetes.io/managed-by=open-rl-gateway"
+    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
     found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
     ours = [item for item in found["items"] if item["spec"]["ownerID"] == owner]
     for item in ours:
@@ -199,7 +199,7 @@ class SchedulerWorkerManager:
     return {item["spec"]["modelID"] for item in ours}
 
   def close(self) -> None:
-    pass  # Workloads outlive the gateway; the scheduler owns them from here
+    pass  # Workloads outlive the API server; the scheduler owns them from here
 
   def delete_workload(self, name: str) -> None:
     try:
