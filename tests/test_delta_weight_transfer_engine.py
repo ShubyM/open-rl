@@ -10,7 +10,10 @@ from unittest.mock import patch
 import torch
 from safetensors.torch import save_file
 
-from server.delta_weight_transfer_engine import DeltaSnapshotWeightTransferEngine, read_sparse_patches, read_weight_metadata
+try:
+  from server.delta_weight_transfer_engine import DeltaSnapshotWeightTransferEngine, read_sparse_patches, read_weight_metadata
+except ImportError as exc:  # the engine imports vLLM, which the CPU test environment does not install
+  raise unittest.SkipTest(f"vLLM not available: {exc}") from exc
 
 
 def write_delta(path, names=None, shapes=None, tensors=None, **metadata):
