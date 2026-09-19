@@ -1,25 +1,32 @@
+import asyncio
 import json
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
+
+from fastapi import FastAPI
 
 from server import api_server
-from server.session_registry import SessionRegistry
+from server.checkpoints import CheckpointStore
 from server.worker_manager import LocalWorkerManager
-from tests.api_client import asgi_client, post_json
+from tests.api_client import asgi_client, post_json, runtime_context
 
 
 class StoreStub:
   def __init__(self):
     self.forwarded_requests = []
     self.futures = {}
+    self.future_updates = []
+    self.active_sets = []
     self.kv_store = {}
 
   async def put_request(self, req_data: dict, active_set_id: str | None = None) -> None:
     self.forwarded_requests.append(req_data)
+    self.active_sets.append(active_set_id)
 
   async def set_future(self, req_id: str, result: dict) -> None:
     self.futures[req_id] = result
+    self.future_updates.append((req_id, result))
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
@@ -71,9 +78,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
     self.worker_manager = WorkerManagerStub()
-    self.enterContext(patch.object(api_server, "store", self.store))
-    self.enterContext(patch.object(api_server, "worker_manager", self.worker_manager))
-    self.enterContext(patch.object(api_server, "session_registry", SessionRegistry(self.store)))
+    self.runtime = self.enterContext(runtime_context(self.store, self.worker_manager))
     self.enterContext(patch("server.store.get_store", return_value=self.store))
 
   async def asyncSetUp(self) -> None:
@@ -92,6 +97,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
     self.assertEqual(len(self.store.forwarded_requests), 1)
+    self.assertEqual(self.store.future_updates, [(model_id, {"status": "pending"})])
     request = self.store.forwarded_requests[0]
     self.assertEqual(request["op"], "create_model")
     self.assertEqual(request["model_id"], model_id)
@@ -153,8 +159,8 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
           "fine_tuning_type": "full",
         }
       )
-      await api_server.bind_session(self.session_id, "model-x")
-      await api_server.ensure_sampler_launched("model-x")
+      await self.runtime.bind_session(self.session_id, "model-x")
+      await api_server.ensure_sampler_launched(self.runtime, "model-x")
 
     self.assertEqual(self.worker_manager.launched_sampler_model_ids, ["model-x"])
 
@@ -166,8 +172,77 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
     self.assertEqual(len(self.store.forwarded_requests), 1)
 
+  async def test_existing_model_commands_route_without_launching_again(self) -> None:
+    await self.store.set_value("open_rl:model_meta:adapter", json.dumps({"fine_tuning_type": "lora", "base_model": "shared-base"}))
+    request_id = await self.runtime.submit(api_server.commands.OptimStep(request_id="step", model_id="adapter"))
+    self.assertEqual(request_id, "step")
+    self.assertEqual(self.worker_manager.launched_model_ids, [])
+    self.assertEqual(self.store.active_sets, ["shared-base-1"])
+    self.assertEqual(self.store.future_updates, [("step", {"status": "pending"})])
+
+  async def test_queue_failure_resolves_pending_future(self) -> None:
+    with (
+      patch.object(self.store, "put_request", new=AsyncMock(side_effect=RuntimeError("queue unavailable"))),
+      patch("server.api_runtime.traceback.print_exc"),
+    ):
+      request_id = await self.runtime.submit(api_server.commands.OptimStep(request_id="step", model_id="adapter"))
+    self.assertEqual(request_id, "step")
+    self.assertEqual(self.store.futures["step"], {"type": "RequestFailedResponse", "error_message": "queue unavailable"})
+
 
 class ApiServerLifespanTest(unittest.IsolatedAsyncioTestCase):
+  async def test_shutdown_drains_tasks_before_closing_manager(self) -> None:
+    app = FastAPI()
+    manager = WorkerManagerStub()
+    finished = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def background():
+      try:
+        entered.set()
+        await asyncio.Event().wait()
+      finally:
+        finished.set()
+
+    manager.close = Mock(side_effect=lambda: self.assertTrue(finished.is_set()))
+    with (
+      patch.dict(os.environ, {"OPEN_RL_WORKER_MANAGER": "local"}, clear=True),
+      patch.object(api_server, "get_store", return_value=StoreStub()),
+      patch.object(api_server, "create_worker_manager", return_value=manager),
+    ):
+      async with api_server.lifespan(app):
+        runtime = app.state.runtime
+        task = asyncio.create_task(background())
+        runtime.tasks.append(task)
+        await entered.wait()
+      self.assertTrue(task.done())
+      self.assertEqual(runtime.tasks, [])
+      manager.close.assert_called_once()
+      self.assertNotIn("runtime", app.state._state)
+
+  async def test_startup_failure_closes_manager_and_removes_app_state(self) -> None:
+    app = FastAPI()
+    manager = Mock()
+    with (
+      patch.dict(os.environ, {"BASE_MODEL": "base", "OPEN_RL_WORKER_MANAGER": "local"}, clear=True),
+      patch.object(api_server, "get_store", return_value=StoreStub()),
+      patch.object(api_server, "create_worker_manager", return_value=manager),
+      patch.object(api_server, "preflight_vllm", new=AsyncMock(side_effect=RuntimeError("unavailable"))),
+      self.assertRaisesRegex(RuntimeError, "unavailable"),
+    ):
+      async with api_server.lifespan(app):
+        self.fail("startup should fail")
+    manager.close.assert_called_once()
+    self.assertNotIn("runtime", app.state._state)
+
+  async def test_apps_do_not_share_runtime_state(self) -> None:
+    first, second = FastAPI(), FastAPI()
+    with patch.dict(os.environ, {}, clear=True), patch.object(api_server, "get_store", side_effect=[StoreStub(), StoreStub()]):
+      async with api_server.lifespan(first), api_server.lifespan(second):
+        self.assertIsNot(first.state.runtime.store, second.state.runtime.store)
+        self.assertIsNot(first.state.runtime.sessions, second.state.runtime.sessions)
+        self.assertIsNot(first.state.runtime.owner_locks, second.state.runtime.owner_locks)
+
   async def test_lifespan_full_mode_requires_redis(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
       async with api_server.lifespan(api_server.app):
@@ -250,7 +325,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
 class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
-    self.enterContext(patch.object(api_server, "store", self.store))
+    self.runtime = self.enterContext(runtime_context(self.store))
 
   async def test_build_and_persist_metadata_from_headers(self) -> None:
     import json
@@ -267,7 +342,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     request = Request(scope)
     metadata = api_server.build_model_metadata(api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"), request.headers)
     self.assertEqual(self.store.kv_store, {})
-    model_id = await api_server.persist_model_metadata(metadata)
+    model_id = await self.runtime.persist_model_metadata(metadata)
 
     meta_val = self.store.kv_store.get(f"open_rl:model_meta:{model_id}")
     self.assertIsNotNone(meta_val)
@@ -319,7 +394,8 @@ class ApiServerFutureTranslationTest(unittest.TestCase):
           "model_id": "model-a",
           "base_model": "base-model",
           "fine_tuning_type": "full",
-        }
+        },
+        CheckpointStore("/tmp/open-rl"),
       ),
       {
         "type": "create_model",
@@ -338,7 +414,8 @@ class ApiServerFutureTranslationTest(unittest.TestCase):
           "model_id": "model-a",
           "base_model": "base-model",
           "fine_tuning_type": "full",
-        }
+        },
+        CheckpointStore("/tmp/open-rl"),
       ),
       {
         "type": "create_model_from_state",
@@ -358,7 +435,8 @@ class ApiServerFutureTranslationTest(unittest.TestCase):
           "base_model": "base-model",
           "rank": 4,
           "fine_tuning_type": "lora",
-        }
+        },
+        CheckpointStore("/tmp/open-rl"),
       ),
       {
         "type": "create_model",
@@ -383,7 +461,7 @@ class ApiServerFutureTranslationTest(unittest.TestCase):
     for internal_type, public_type in cases:
       with self.subTest(internal_type=internal_type):
         self.assertEqual(
-          api_server.translate_future_result({"type": internal_type, "path": "/tmp/x"}),
+          api_server.translate_future_result({"type": internal_type, "path": "/tmp/x"}, CheckpointStore("/tmp/open-rl")),
           {"type": public_type, "path": "/tmp/x"},
         )
 

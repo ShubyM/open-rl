@@ -10,7 +10,9 @@ from opentelemetry import propagate, trace
 from opentelemetry.sdk.trace import TracerProvider
 
 from server import api_server
+from server.checkpoints import CheckpointStore
 from server.store import InMemoryStore
+from tests.api_client import runtime_context
 from training import commands
 
 
@@ -19,7 +21,7 @@ class ApiServerTest(unittest.TestCase):
   error handlers are the ones the tinker client sees."""
 
   def setUp(self) -> None:
-    self.enterContext(patch.object(api_server, "store", InMemoryStore()))
+    self.runtime = self.enterContext(runtime_context())
     self.client = TestClient(api_server.app)
 
   def post(self, path: str, body: dict, **kwargs):
@@ -29,7 +31,7 @@ class ApiServerTest(unittest.TestCase):
     return self.client.post(f"/api/v1/{path}", content=body, headers={"Content-Type": media_type})
 
   def queued(self) -> list[dict]:
-    return asyncio.run(api_server.store.get_requests())
+    return asyncio.run(self.runtime.store.get_requests())
 
 
 class GetInfoTest(ApiServerTest):
@@ -43,7 +45,7 @@ class GetInfoTest(ApiServerTest):
 
   def test_get_info_prefers_the_models_own_base_model(self) -> None:
     meta = json.dumps({"base_model": "google/gemma-4-e2b", "fine_tuning_type": "full"})
-    asyncio.run(api_server.store.set_value("open_rl:model_meta:model-g", meta))
+    asyncio.run(self.runtime.store.set_value("open_rl:model_meta:model-g", meta))
     with patch.dict(os.environ, {"BASE_MODEL": "Qwen/Qwen2.5-0.5B"}, clear=True):
       info = self.post("get_info", {"model_id": "model-g"}).json()
       via_sampler_ref = self.post("get_info", {"model_id": "tinker://model-g/sampler_weights/sampler-1"}).json()
@@ -79,7 +81,7 @@ class GetInfoTest(ApiServerTest):
     self.assertEqual(queued[0]["model_id"], model_id)
     self.assertEqual(queued[0]["op"], "create_model")
     self.assertEqual(queued[0]["base_model"], "my-model")
-    meta = json.loads(api_server.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    meta = json.loads(self.runtime.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "my-model")
 
 
@@ -126,44 +128,44 @@ class SaveSeqIdZeroTest(ApiServerTest):
 
 class ApiServerPathTest(ApiServerTest):
   def test_checkpoint_state_paths_are_model_scoped(self) -> None:
-    old_tmp_dir = api_server.TMP_DIR
     with tempfile.TemporaryDirectory() as tmp_dir:
-      api_server.TMP_DIR = tmp_dir
-      self.addCleanup(setattr, api_server, "TMP_DIR", old_tmp_dir)
+      self.runtime.checkpoints = CheckpointStore(tmp_dir)
 
       self.assertEqual(
-        api_server.checkpoint_state_path("job-a", "final"),
+        self.runtime.checkpoints.resolve("job-a", "final"),
         os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "final"),
       )
       self.assertEqual(
-        api_server.checkpoint_state_path("job-b", "final"),
+        self.runtime.checkpoints.resolve("job-b", "final"),
         os.path.join(tmp_dir, "checkpoints", "job-b", "weights", "final"),
       )
 
   def test_a_tinker_path_names_the_model_that_saved_it(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(self.runtime, "checkpoints", CheckpointStore(tmp_dir)):
       state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
-      self.assertEqual(api_server.tinker_state_path(state_dir), "tinker://job-a/weights/step-5")
+      self.assertEqual(self.runtime.checkpoints.to_uri(state_dir), "tinker://job-a/weights/step-5")
       # A resuming job passes the dead job's path under its own model id.
-      self.assertEqual(api_server.checkpoint_state_path("job-b", "tinker://job-a/weights/step-5"), state_dir)
-      self.assertEqual(api_server.tinker_state_path("/elsewhere/final"), "/elsewhere/final")
+      self.assertEqual(self.runtime.checkpoints.resolve("job-b", "tinker://job-a/weights/step-5"), state_dir)
+      self.assertEqual(self.runtime.checkpoints.to_uri("/elsewhere/final"), "/elsewhere/final")
       # Only weights paths are checkpoints. A sampler path is refused, not resolved under the caller.
-      self.assertIsNone(api_server.tinker_checkpoint_dir("tinker://job-a/sampler_weights/sampler-3"))
+      self.assertIsNone(self.runtime.checkpoints.from_uri("tinker://job-a/sampler_weights/sampler-3"))
       refused = self.post("load_weights", {"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"})
       self.assertEqual(refused.status_code, 400)
       self.assertIn("is not a tinker://<model>/weights/<name> path", refused.json()["error"])
+      refused_save = self.post("save_weights", {"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"})
+      self.assertEqual(refused_save.status_code, 400)
 
   def test_save_state_keeps_the_optimizer_and_answers_with_a_tinker_path(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(self.runtime, "checkpoints", CheckpointStore(tmp_dir)):
       self.post("save_weights", {"model_id": "job-a", "path": "step-5"})
       queued = self.queued()
       self.assertEqual(queued[0]["op"], "save_state")
       self.assertTrue(queued[0]["include_optimizer"])
-      saved = api_server.translate_future_result({"type": "state_saved", "path": queued[0]["state_path"]})
+      saved = api_server.translate_future_result({"type": "state_saved", "path": queued[0]["state_path"]}, self.runtime.checkpoints)
     self.assertEqual(saved, {"type": "save_weights", "path": "tinker://job-a/weights/step-5"})
 
   def test_weights_info_reads_the_checkpoint_on_disk(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(self.runtime, "checkpoints", CheckpointStore(tmp_dir)):
       state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
       os.makedirs(os.path.join(state_dir, "job-a"))
       with open(os.path.join(state_dir, "metadata.json"), "w") as f:
@@ -179,7 +181,7 @@ class ApiServerPathTest(ApiServerTest):
     self.assertEqual(missing.json(), {"error": "No checkpoint at tinker://job-a/weights/never"})
 
   def test_checkpoint_state_paths_accept_explicit_output_directories(self) -> None:
-    self.assertEqual(api_server.checkpoint_state_path("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
+    self.assertEqual(self.runtime.checkpoints.resolve("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
 
 
 class ProtobufWireTest(unittest.TestCase):
@@ -191,13 +193,11 @@ class ProtobufWireTest(unittest.TestCase):
   def setUp(self) -> None:
     from fastapi.testclient import TestClient
 
-    patcher = patch.object(api_server, "store", InMemoryStore())
-    patcher.start()
-    self.addCleanup(patcher.stop)
+    self.runtime = self.enterContext(runtime_context())
     self.client = TestClient(api_server.app)
 
   def _queued(self) -> list[dict]:
-    return asyncio.run(api_server.store.get_requests())
+    return asyncio.run(self.runtime.store.get_requests())
 
   def test_protobuf_and_json_forward_backward_queue_the_same_request(self) -> None:
     with open(self.FIXTURE, "rb") as fh:
@@ -260,11 +260,11 @@ class ProtobufWireTest(unittest.TestCase):
     from server.proto import tinker_public_pb2 as pb
 
     asyncio.run(
-      api_server.store.set_future(
+      self.runtime.store.set_future(
         "samp-1", {"type": "sample_completed", "sequences": [{"tokens": [1, 2], "logprobs": [-0.5, -1.0], "stop_reason": "stop"}]}
       )
     )
-    asyncio.run(api_server.store.set_future("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
+    asyncio.run(self.runtime.store.set_future("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
 
     as_json = self.client.post("/api/v1/retrieve_future", json={"request_id": "samp-1"})
     self.assertEqual(as_json.status_code, 200)
@@ -309,9 +309,9 @@ class SampleSequenceIdsTest(ApiServerTest):
       )
     self.assertEqual(response.status_code, 200)
     promise = response.json()
-    queued = asyncio.run(api_server.store.get_sampling_requests_for_model("job-a"))[0]
+    queued = asyncio.run(self.runtime.store.get_sampling_requests_for_model("job-a"))[0]
     self.assertEqual(queued["request_id"], promise["request_id"])
-    self.assertEqual(api_server.store.futures_store[promise["request_id"]], {"status": "pending"})
+    self.assertEqual(self.runtime.store.futures_store[promise["request_id"]], {"status": "pending"})
     self.assertEqual(queued["prompt_token_ids"], [1, 2])
     self.assertEqual(len(promise["sample_sequence_ids"]), 2)
     context = trace.get_current_span(propagate.extract(queued["trace_context"])).get_span_context()
@@ -324,18 +324,18 @@ class QueueTraceContextTest(unittest.IsolatedAsyncioTestCase):
     self.addCleanup(provider.shutdown)
     tracer = provider.get_tracer(__name__)
     store = InMemoryStore()
-    self.enterContext(patch.object(api_server, "store", store))
+    self.runtime = self.enterContext(runtime_context(store))
 
     async def submit(queue, request_id):
       if queue == "training":
         command = commands.OptimStep(request_id=request_id, model_id="model", trace_context={"old": "context"})
-        returned_id = await api_server.enqueue(command)
+        returned_id = await self.runtime.submit(command)
         self.assertEqual(command.trace_context, {"old": "context"})
         raw = (await store.get_requests())[0]
         commands.parse_command(raw)
       else:
         request = {"request_id": request_id, "model_id": "model", "trace_context": {"old": "context"}}
-        returned_id = await api_server.enqueue_sampling(request)
+        returned_id = await api_server.enqueue_sampling(self.runtime, request)
         self.assertEqual(request["trace_context"], {"old": "context"})
         raw = (await store.get_sampling_requests_for_model("model"))[0]
       self.assertEqual(returned_id, request_id)
