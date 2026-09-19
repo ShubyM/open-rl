@@ -7,7 +7,7 @@ import tempfile
 import types
 import unittest
 from contextlib import asynccontextmanager
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import torch
 
@@ -499,6 +499,48 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       },
     )
 
+  async def test_create_and_restore_do_not_read_state(self) -> None:
+    for kind in ("lora", "full"):
+      with self.subTest(kind=kind), patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
+        store = _FutureStoreStub()
+        state = InMemoryStateStore()
+        state.get_value = AsyncMock(side_effect=AssertionError("unexpected metadata read"))
+        created = []
+        worker = types.SimpleNamespace(
+          create_model=lambda base, model, config, created=created: created.append((base, config)),
+          load_from_state=lambda *_args: {"base_model": "checkpoint-base", "model_id": "model-a"},
+        )
+        if kind == "lora":
+          processor = training_requests_processor_module.LoraTrainingRequestsProcessor(store, state, worker)
+        else:
+          processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, state, worker, "model-a", _TimeSlicerStub())
+        await processor.process_request(
+          {
+            "op": "create_model",
+            "request_id": "create",
+            "model_id": "model-a",
+            "base_model": "command-base",
+            "fine_tuning_type": kind,
+            "lora_config": {"seed": 0},
+            "full_config": {"seed": 0},
+          }
+        )
+        self.assertEqual(store.results["create"]["type"], "model_created")
+        self.assertEqual(created[0][0], "command-base")
+        self.assertEqual(created[0][1].seed, 0)
+        await processor.process_request(
+          {
+            "op": "create_model_from_state",
+            "request_id": "restore",
+            "model_id": "model-a",
+            "state_path": "/checkpoint",
+            "fine_tuning_type": kind,
+          }
+        )
+        self.assertEqual(store.results["restore"]["base_model"], "checkpoint-base")
+        self.assertEqual(store.results["restore"]["fine_tuning_type"], kind)
+        state.get_value.assert_not_called()
+
   async def test_processors_update_model_steps_in_injected_state(self) -> None:
     for kind in ("lora", "full"):
       with self.subTest(kind=kind), patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
@@ -574,8 +616,8 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       if len(event) >= 2 and event[0] != "close":
         self.assertEqual(event[1].name, "trainer-model-a")
         self.assertEqual(event[1].claim, "trainers")
-    self.assertEqual(worker.created_models[0][0], "stored-base")
-    self.assertEqual(worker.created_models[0][2].seed, 345)
+    self.assertEqual(worker.created_models[0][0], "base-model")
+    self.assertEqual(worker.created_models[0][2].seed, 123)
     self.assertEqual(store.results["req-a"]["model_id"], "model-a")
 
   async def test_full_processor_publishes_result_after_release(self) -> None:

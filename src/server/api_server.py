@@ -21,7 +21,7 @@ from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from pydantic import AliasChoices, BaseModel, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, Field, ValidationError, ValidationInfo, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import proto_codec
@@ -36,6 +36,7 @@ from server.model_metadata import (
 from server.store import RedisStateStore, get_state_store, get_store
 from server.worker_manager import create_worker_manager
 from training import commands
+from training.types import FFTConfig, LoraConfig
 
 
 def get_runtime(request: Request) -> ApiRuntime:
@@ -85,8 +86,13 @@ class SessionHeartbeatRequest(BaseModel):
 class CreateModelRequest(BaseModel):
   base_model: str
   session_id: str | None = None
-  lora_config: dict[str, Any] | None = None
-  full_config: dict[str, Any] | None = None
+  lora_config: LoraConfig = Field(default_factory=LoraConfig)
+  full_config: FFTConfig = Field(default_factory=FFTConfig)
+
+  @field_validator("lora_config", "full_config", mode="before")
+  @classmethod
+  def default_config(cls, value):
+    return {} if value is None else value
 
 
 class CreateModelFromStateRequest(BaseModel):
@@ -95,8 +101,13 @@ class CreateModelFromStateRequest(BaseModel):
   # The checkpoint's metadata names the base model when the client does not.
   base_model: str | None = None
   session_id: str | None = None
-  lora_config: dict[str, Any] | None = None
-  full_config: dict[str, Any] | None = None
+  lora_config: LoraConfig = Field(default_factory=LoraConfig)
+  full_config: FFTConfig = Field(default_factory=FFTConfig)
+
+  @field_validator("lora_config", "full_config", mode="before")
+  @classmethod
+  def default_config(cls, value):
+    return {} if value is None else value
 
 
 class ModelRequest(BaseModel):
@@ -111,7 +122,12 @@ class GetInfoRequest(BaseModel):
 class ForwardBackwardInput(BaseModel):
   data: list[dict[str, Any]] = []
   loss_fn: str = "cross_entropy"
-  loss_fn_config: dict[str, Any] | None = None
+  loss_fn_config: dict[str, Any] = Field(default_factory=dict)
+
+  @field_validator("loss_fn_config", mode="before")
+  @classmethod
+  def default_loss_config(cls, value):
+    return {} if value is None else value
 
 
 class ForwardBackwardRequest(ModelRequest):
@@ -158,11 +174,16 @@ class CreateSamplingSessionRequest(BaseModel):
 
 
 class SamplingParams(BaseModel):
-  max_tokens: int | None = 20
-  temperature: float | None = 1.0
+  max_tokens: int = 20
+  temperature: float = 1.0
   stop: Any = None
-  top_p: float | None = 1.0
-  top_k: int | None = -1
+  top_p: float = 1.0
+  top_k: int = -1
+
+  @field_validator("max_tokens", "temperature", "top_p", "top_k", mode="before")
+  @classmethod
+  def default_sampling_param(cls, value, info: ValidationInfo):
+    return cls.model_fields[info.field_name].default if value is None else value
 
 
 class AsampleRequest(BaseModel):
@@ -249,13 +270,12 @@ def build_model_metadata(
   headers: Mapping[str, str],
 ) -> TrainingModelMetadata:
   """Normalize model settings without writing to the store or changing the request."""
-  restoring = isinstance(req, CreateModelFromStateRequest)
-  if not req.base_model and not restoring:
+  if not req.base_model:
     raise ValueError("base_model is required in request payload")
 
   fine_tuning_type = (headers.get("x-open-rl-fine-tuning-type") or "").lower()
   if fine_tuning_type not in {"full", "lora"}:
-    fine_tuning_type = "restored" if restoring else "lora"
+    fine_tuning_type = "lora"
   if fine_tuning_type == "full" and not is_fft_enabled():
     raise ValueError("Full Fine-Tuning (FFT) is disabled on this Open-RL API server instance")
 
@@ -265,8 +285,8 @@ def build_model_metadata(
     created_at=time.time(),
     fine_tuning_type=fine_tuning_type,
     weight_sync_config=weight_sync_config,
-    full_config={**(req.full_config or {}), "weight_sync_strategy": weight_sync_config.strategy},
-    lora_config=dict(req.lora_config or {}),
+    full_config={**req.full_config.model_dump(), "weight_sync_strategy": weight_sync_config.strategy},
+    lora_config=req.lora_config.model_dump(),
   )
 
 
@@ -342,18 +362,28 @@ def checkpoint_uri(root: str, state_path: str) -> str:
 
 
 def checkpoint_info(root: str, path: str) -> dict[str, Any] | None:
-  state_dir = checkpoint_from_uri(root, path)
+  state_dir = checkpoint_from_uri(root, path) or (path if os.path.isabs(path) else None)
   metadata_path = os.path.join(state_dir, "metadata.json") if state_dir else None
   if not metadata_path or not os.path.exists(metadata_path):
     return None
   with open(metadata_path) as f:
     saved = json.load(f)
-  adapter_config_path = os.path.join(state_dir, saved.get("model_id", ""), "adapter_config.json")
+  if not isinstance(saved, dict) or not isinstance(saved.get("base_model"), str) or not saved["base_model"]:
+    raise ValueError("Checkpoint metadata must specify base_model")
+  saved_model_id = saved.get("model_id", "")
+  if not isinstance(saved_model_id, str):
+    raise ValueError("Checkpoint model_id must be a string")
+  adapter_config_path = os.path.join(state_dir, saved_model_id, "adapter_config.json")
+  if not os.path.exists(adapter_config_path):
+    adapter_config_path = os.path.join(state_dir, "adapter_config.json")
   is_lora = os.path.exists(adapter_config_path)
   rank = None
   if is_lora:
     with open(adapter_config_path) as f:
-      rank = json.load(f).get("r")
+      adapter_config = json.load(f)
+    if not isinstance(adapter_config, dict):
+      raise ValueError("Checkpoint adapter config must be an object")
+    rank = adapter_config.get("r")
   return {"base_model": saved["base_model"], "is_lora": is_lora, "lora_rank": rank, "type": "weights_info"}
 
 
@@ -516,8 +546,8 @@ async def create_model(runtime: Runtime, req: CreateModelRequest, request: Reque
     model_id=model_id,
     base_model=meta.base_model,
     fine_tuning_type=meta.fine_tuning_type,
-    lora_config=meta.lora_config or {},
-    full_config=meta.full_config or {},
+    lora_config=meta.lora_config,
+    full_config=meta.full_config,
   )
   req_id = await runtime.submit(command)
   return {"request_id": req_id}
@@ -527,7 +557,9 @@ async def create_model(runtime: Runtime, req: CreateModelRequest, request: Reque
 async def delete_model(runtime: Runtime, req: ModelRequest):
   model_id = req.model_id
   meta = await get_model_metadata(runtime.state, model_id)
-  is_lora = bool(meta and meta.get("fine_tuning_type") == "lora")
+  if meta is None:
+    raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+  is_lora = meta.get("fine_tuning_type", "lora") == "lora"
   if is_fft_enabled() and not is_lora:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
     await runtime.store.put_request(commands.wire(commands.Shutdown(model_id=model_id)))
@@ -546,9 +578,19 @@ async def create_model_from_state(runtime: Runtime, req: CreateModelFromStateReq
   # Legacy restore names are relative to the checkpoint root, not a new model.
   resolved_path = checkpoint_from_uri(runtime.checkpoint_root, state_path) or os.path.join(runtime.checkpoint_root, state_path)
   try:
-    meta = build_model_metadata(req, request.headers)
+    checkpoint = await asyncio.to_thread(checkpoint_info, runtime.checkpoint_root, resolved_path)
+    if checkpoint is None:
+      raise ValueError(f"No checkpoint at {state_path}")
+    kind = "lora" if checkpoint["is_lora"] else "full"
+    if req.base_model is not None and req.base_model != checkpoint["base_model"]:
+      raise ValueError("base_model does not match the checkpoint")
+    requested_kind = request.headers.get("x-open-rl-fine-tuning-type", "").lower()
+    if requested_kind in {"lora", "full"} and requested_kind != kind:
+      raise ValueError("fine-tuning type does not match the checkpoint")
+    req = req.model_copy(update={"base_model": checkpoint["base_model"]})
+    meta = build_model_metadata(req, {**request.headers, "x-open-rl-fine-tuning-type": kind})
     model_id = await persist_model_metadata(runtime.state, meta)
-  except ValueError as exc:
+  except (ValueError, OSError) as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
   await runtime.bind_session(req.session_id, model_id)
@@ -557,7 +599,7 @@ async def create_model_from_state(runtime: Runtime, req: CreateModelFromStateReq
     model_id=model_id,
     state_path=resolved_path,
     restore_optimizer=req.restore_optimizer,
-    fine_tuning_type="full" if meta.fine_tuning_type == "full" else "lora",
+    fine_tuning_type=meta.fine_tuning_type,
   )
   req_id = await runtime.submit(command)
   return {"request_id": req_id}
@@ -622,7 +664,7 @@ async def enqueue_forward_backward(runtime: ApiRuntime, req: ForwardBackwardRequ
       model_id=req.model_id,
       data=fwd_input.data,
       loss_fn=fwd_input.loss_fn,
-      loss_config=fwd_input.loss_fn_config or {},
+      loss_config=fwd_input.loss_fn_config,
       forward_only=forward_only,
     )
   )

@@ -84,6 +84,82 @@ class GetInfoTest(ApiServerTest):
     self.assertEqual(meta["base_model"], "my-model")
 
 
+class InputNormalizationTest(ApiServerTest):
+  def test_bad_configs_are_rejected_before_persistence(self) -> None:
+    for config in ({"lora_config": {"rank": "invalid"}}, {"full_config": {"seed": "invalid"}}):
+      with self.subTest(config=config):
+        response = self.post("create_model", {"base_model": "base", **config})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.runtime.state.kv_store, {})
+        self.assertEqual(self.runtime.store.queues, {})
+
+  def test_null_configs_are_normalized_once(self) -> None:
+    response = self.post("create_model", {"base_model": "base", "lora_config": None, "full_config": None})
+    self.assertEqual(response.status_code, 200)
+    command = commands.parse_command(self.queued()[0])
+    self.assertEqual(command.lora_config.rank, 16)
+    self.assertTrue(command.full_config.cpu_offload)
+
+  def test_sampling_nulls_use_defaults_and_zero_is_preserved(self) -> None:
+    for backend in ("torch", "vllm"):
+      for value in (None, 0):
+        with self.subTest(backend=backend, value=value), patch.object(api_server, "get_sampler_backend", return_value=backend):
+          response = self.post(
+            "asample",
+            {
+              "model_id": "base",
+              "prompt": {"chunks": [{"tokens": [1]}]},
+              "sampling_params": {"max_tokens": value, "temperature": value, "top_p": value, "top_k": value},
+            },
+          )
+          self.assertEqual(response.status_code, 200)
+          if backend == "torch":
+            queued = self.queued()[0]
+          else:
+            queued = asyncio.run(self.runtime.store.get_sampling_requests_for_model("base"))[0]
+            self.assertEqual(queued["top_p"], 1.0 if value is None else 0)
+            self.assertEqual(queued["top_k"], -1 if value is None else 0)
+          self.assertEqual(queued["max_tokens"], 20 if value is None else 0)
+          self.assertEqual(queued["temperature"], 1.0 if value is None else 0)
+
+  def test_restore_uses_checkpoint_metadata_for_routing_and_tokenizer(self) -> None:
+    for kind in ("lora", "full"):
+      with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
+        with open(os.path.join(directory, "metadata.json"), "w") as f:
+          json.dump({"base_model": "checkpoint-base", "model_id": "old"}, f)
+        if kind == "lora":
+          os.makedirs(os.path.join(directory, "old"))
+          with open(os.path.join(directory, "old", "adapter_config.json"), "w") as f:
+            json.dump({"r": 8}, f)
+        response = self.post("create_model_from_state", {"state_path": directory})
+        self.assertEqual(response.status_code, 200)
+        model_id = response.json()["request_id"]
+        metadata = json.loads(self.runtime.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+        self.assertEqual(metadata["base_model"], "checkpoint-base")
+        self.assertEqual(metadata["fine_tuning_type"], kind)
+        active_set = "checkpoint-base-1" if kind == "lora" else "default"
+        self.assertIn(model_id, self.runtime.store.active_tenants[active_set])
+        command = asyncio.run(self.runtime.store.get_requests(active_set))[0]
+        self.assertEqual(command["fine_tuning_type"], kind)
+        info = self.post("get_info", {"model_id": model_id}).json()
+        self.assertEqual(info["model_name"], "checkpoint-base")
+        self.assertEqual(info["model_data"]["tokenizer_id"], "checkpoint-base")
+
+  def test_bad_restore_does_not_persist_metadata(self) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+      for saved in ([], None, {}, {"base_model": None}, {"base_model": "checkpoint-base", "model_id": None}, {"base_model": "checkpoint-base"}):
+        with open(os.path.join(directory, "metadata.json"), "w") as f:
+          json.dump(saved, f)
+        response = self.post("create_model_from_state", {"state_path": directory, "base_model": "wrong-base"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.runtime.state.kv_store, {})
+        self.assertEqual(self.runtime.store.queues, {})
+
+  def test_deleting_unknown_model_does_not_create_stub_metadata(self) -> None:
+    self.assertEqual(self.post("delete_model", {"model_id": "missing"}).status_code, 404)
+    self.assertEqual(self.runtime.state.kv_store, {})
+
+
 class ErrorShapeTest(ApiServerTest):
   """Every refused request answers {"error": ...}, whichever layer refused it."""
 

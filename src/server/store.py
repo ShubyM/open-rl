@@ -382,10 +382,7 @@ class RedisStateStore(StateStore):
     return await self.redis.get(key)
 
   def get_value_sync(self, key: str) -> str | None:
-    try:
-      return self.sync_redis.get(key)
-    except Exception:
-      return None
+    return self.sync_redis.get(key)
 
   async def delete_values(self, *keys: str) -> None:
     if keys:

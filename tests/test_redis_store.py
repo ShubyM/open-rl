@@ -322,18 +322,20 @@ class InMemoryStateStoreTest(unittest.IsolatedAsyncioTestCase):
       {"model_id": "model-1", "base_model": "base", "total_steps_completed": 2, "updated_at": 123.0},
     )
 
-  async def test_metadata_missing_or_invalid_can_be_updated(self) -> None:
-    for raw in (None, "invalid JSON", "[]", "null"):
+  async def test_metadata_updates_refuse_missing_or_corrupt_records(self) -> None:
+    key = "open_rl:model_meta:model-1"
+    self.assertIsNone(await get_model_metadata(self.state, "model-1"))
+    with self.assertRaises(KeyError):
+      await update_model_metadata(self.state, "model-1", {"status": "completed"})
+    self.assertIsNone(await self.state.get_value(key))
+    for raw in ("invalid JSON", "[]", "null", "{}", '{"base_model": null}'):
       with self.subTest(raw=raw):
-        if raw is not None:
-          await self.state.set_value("open_rl:model_meta:model-1", raw)
-        self.assertIsNone(await get_model_metadata(self.state, "model-1"))
-        with patch("server.model_metadata.time.time", return_value=123.0):
+        await self.state.set_value(key, raw)
+        with self.assertRaises(ValueError):
+          await get_model_metadata(self.state, "model-1")
+        with self.assertRaises(ValueError):
           await update_model_metadata(self.state, "model-1", {"status": "completed"})
-        self.assertEqual(
-          await get_model_metadata(self.state, "model-1"),
-          {"model_id": "model-1", "status": "completed", "updated_at": 123.0},
-        )
+        self.assertEqual(await self.state.get_value(key), raw)
 
   async def test_persisted_model_is_readable_by_sync_worker_lookup(self) -> None:
     metadata = TrainingModelMetadata(base_model="base", created_at=123.0)

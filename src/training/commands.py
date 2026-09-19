@@ -53,7 +53,7 @@ class Sample(Command):
   prompt_tokens: list[int]
   max_tokens: int = 20
   num_samples: int = 1
-  temperature: float = 0.0
+  temperature: float = 1.0
   prompt_logprobs: bool = False
 
 
