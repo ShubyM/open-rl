@@ -104,6 +104,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     for param in self.model.parameters():
       param.requires_grad_(True)
     self.trainable_params = trainable_model_parameters(self.model)
+    self.configure_token_budget(self.model, self.trainable_params, gradient_checkpointing=ENABLE_GRADIENT_CHECKPOINTING)
     self.model_layer_names = [name for name, p in self.model.named_parameters() if p.requires_grad]
     self.total_model_elements = sum(p.numel() for p in self.model.parameters())
     if self.weight_sync_cfg.strategy == "delta":
@@ -410,6 +411,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       torch.cuda.empty_cache()
     if not self.trainable_params:
       self.trainable_params = trainable_model_parameters(self.model)
+      self.configure_token_budget(self.model, self.trainable_params, gradient_checkpointing=ENABLE_GRADIENT_CHECKPOINTING)
 
     if self.optimizer is None:
       lr = adam_params.get("learning_rate", 1e-4)
