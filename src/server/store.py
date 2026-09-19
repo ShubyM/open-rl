@@ -18,18 +18,8 @@ class RequestStore(ABC):
     pass
 
   @abstractmethod
-  async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
-    """Push a create-model request onto the queue that starts dedicated FFT workers."""
-    pass
-
-  @abstractmethod
   async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]:
     """Block until at least 1 request is available in the active set, then return all currently queued requests."""
-    pass
-
-  @abstractmethod
-  async def get_worker_launch_requests(self) -> list[dict[str, Any]]:
-    """Block until at least 1 worker-launch request is available, then drain that queue."""
     pass
 
   @abstractmethod
@@ -89,45 +79,8 @@ class RequestStore(ABC):
   async def set_members(self, key: str) -> set[str]:
     pass
 
-  @abstractmethod
-  async def list_jobs_metadata(self) -> list[dict[str, Any]]:
-    """Retrieve metadata for all registered models/jobs."""
-    pass
-
-  @abstractmethod
   async def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
     """Retrieve metadata for a specific model_id."""
-    pass
-
-
-class InMemoryStore(RequestStore):
-  def __init__(self):
-    # tenant_id -> queue of requests
-    self.queues: dict[str, asyncio.Queue] = {}
-    # active_set_id -> list of tenant model_ids for round-robin
-    self.active_tenants: dict[str, list[str]] = {}
-    self.active_tenants_cv = asyncio.Condition()
-    self.futures_store: dict[str, dict[str, Any]] = {}
-    self.futures_events: dict[str, asyncio.Event] = {}
-    self.kv_store: dict[str, str] = {}
-    self.expiries: dict[str, float] = {}
-    self.sets: dict[str, set[str]] = {}
-    self.sampling_queues: dict[str, asyncio.Queue] = {}
-
-  async def list_jobs_metadata(self) -> list[dict[str, Any]]:
-    jobs = []
-    for key, val in self.kv_store.items():
-      if key.startswith("open_rl:model_meta:"):
-        try:
-          data = json.loads(val)
-          m_id = key.replace("open_rl:model_meta:", "")
-          data["model_id"] = m_id
-          jobs.append(data)
-        except Exception:
-          pass
-    return jobs
-
-  async def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
     raw_val = await self.get_value(f"open_rl:model_meta:{model_id}")
     if raw_val:
       try:
@@ -151,6 +104,21 @@ class InMemoryStore(RequestStore):
     data["updated_at"] = time.time()
     await self.set_value(key, json.dumps(data))
 
+
+class InMemoryStore(RequestStore):
+  def __init__(self):
+    # tenant_id -> queue of requests
+    self.queues: dict[str, asyncio.Queue] = {}
+    # active_set_id -> list of tenant model_ids for round-robin
+    self.active_tenants: dict[str, list[str]] = {}
+    self.active_tenants_cv = asyncio.Condition()
+    self.futures_store: dict[str, dict[str, Any]] = {}
+    self.futures_events: dict[str, set[asyncio.Event]] = {}
+    self.kv_store: dict[str, str] = {}
+    self.expiries: dict[str, float] = {}
+    self.sets: dict[str, set[str]] = {}
+    self.sampling_queues: dict[str, asyncio.Queue] = {}
+
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
     set_key = active_set_id or "default"
@@ -165,9 +133,6 @@ class InMemoryStore(RequestStore):
       if model_id not in tenants_list:
         tenants_list.append(model_id)
         self.active_tenants_cv.notify_all()
-
-  async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
-    raise RuntimeError("Worker launch requests require REDIS_URL; in-memory queues cannot be shared across processes")
 
   async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]:
     async with self.active_tenants_cv:
@@ -200,9 +165,6 @@ class InMemoryStore(RequestStore):
 
         await self.active_tenants_cv.wait()
 
-  async def get_worker_launch_requests(self) -> list[dict[str, Any]]:
-    raise RuntimeError("Worker launch requests require REDIS_URL; in-memory queues cannot be shared across processes")
-
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     raise RuntimeError("Per-model full fine-tuning workers require REDIS_URL; in-memory queues cannot be shared across processes")
 
@@ -224,26 +186,28 @@ class InMemoryStore(RequestStore):
     return batch
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
+    if result.get("status") == "pending":
+      return
     self.futures_store[req_id] = result
-    if req_id in self.futures_events:
-      self.futures_events[req_id].set()
+    for event in self.futures_events.get(req_id, ()):
+      event.set()
 
   async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
-    self.futures_store.setdefault(req_id, {"status": "pending"})
-
-    if self.futures_store[req_id].get("status") != "pending":
+    if req_id in self.futures_store:
       return self.futures_store[req_id]
 
     event = asyncio.Event()
-    self.futures_events[req_id] = event
-
+    waiters = self.futures_events.setdefault(req_id, set())
+    waiters.add(event)
     try:
       await asyncio.wait_for(event.wait(), timeout=timeout)
-      return self.futures_store.get(req_id)
+      return self.futures_store[req_id]
     except TimeoutError:
       return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
     finally:
-      self.futures_events.pop(req_id, None)
+      waiters.remove(event)
+      if not waiters:
+        del self.futures_events[req_id]
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
@@ -285,7 +249,6 @@ class RedisStore(RequestStore):
     self.active_list = "open_rl:active_tenants"
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
-    self.worker_launch_queue = "open_rl:worker_launch_queue"
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
@@ -302,9 +265,6 @@ class RedisStore(RequestStore):
     is_new = await self.redis.sadd(active_set, model_id)
     if is_new == 1:
       await self.redis.rpush(active_list, model_id)
-
-  async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
-    await self.redis.rpush(self.worker_launch_queue, json.dumps(req_data))
 
   async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]:
     active_set = f"open_rl:active_tenants_set:{active_set_id}" if active_set_id else self.active_set
@@ -346,25 +306,6 @@ class RedisStore(RequestStore):
         # afterwards keeps a continuously-enqueueing tenant from starving peers.
         await self.redis.lmove(active_list, active_list, "LEFT", "RIGHT")
         return batch
-
-  async def get_worker_launch_requests(self) -> list[dict[str, Any]]:
-    try:
-      result = await self.redis.blpop(self.worker_launch_queue, timeout=5)
-    except RedisTimeoutError:
-      return []
-
-    if not result:
-      return []
-
-    batch = [json.loads(result[1])]
-
-    while True:
-      item = await self.redis.lpop(self.worker_launch_queue)
-      if not item:
-        break
-      batch.append(json.loads(item))
-
-    return batch
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     queue_key = f"open_rl:queue:{model_id}"
@@ -421,8 +362,12 @@ class RedisStore(RequestStore):
       return
 
     key = f"open_rl:future:{req_id}"
-    await self.redis.rpush(key, json.dumps(result))
-    await self.redis.expire(key, 300)
+    # Keep the list format for existing workers, with one result per request.
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.rpush(key, json.dumps(result))
+      pipeline.ltrim(key, -1, -1)
+      pipeline.expire(key, 300)
+      await pipeline.execute()
 
   async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     key = f"open_rl:future:{req_id}"
@@ -431,14 +376,10 @@ class RedisStore(RequestStore):
       remaining = deadline - time.monotonic()
       if remaining <= 0:
         return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
-      try:
-        raw_result = await self.redis.lpop(key)
-      except Exception:
-        raw_result = None
+      raw_result = await self.redis.lindex(key, -1)
 
       if raw_result:
         payload = json.loads(raw_result)
-        await self.redis.rpush(key, raw_result)
         await self.redis.expire(key, 300)
         return payload
 
@@ -468,49 +409,6 @@ class RedisStore(RequestStore):
 
   async def set_members(self, key: str) -> set[str]:
     return set(await self.redis.smembers(key))
-
-  async def list_jobs_metadata(self) -> list[dict[str, Any]]:
-    keys = await self.redis.keys("open_rl:model_meta:*")
-    jobs = []
-    for k in keys:
-      k_str = k.decode() if isinstance(k, bytes) else str(k)
-      m_id = k_str.replace("open_rl:model_meta:", "")
-      raw_val = await self.redis.get(k_str)
-      if raw_val:
-        val_str = raw_val.decode() if isinstance(raw_val, bytes) else str(raw_val)
-        try:
-          data = json.loads(val_str)
-          data["model_id"] = m_id
-          jobs.append(data)
-        except Exception:
-          pass
-    return jobs
-
-  async def get_model_metadata(self, model_id: str) -> dict[str, Any] | None:
-    raw_val = await self.redis.get(f"open_rl:model_meta:{model_id}")
-    if raw_val:
-      val_str = raw_val.decode() if isinstance(raw_val, bytes) else str(raw_val)
-      try:
-        data = json.loads(val_str)
-        data["model_id"] = model_id
-        return data
-      except Exception:
-        pass
-    return None
-
-  async def update_job_metadata(self, model_id: str, updates: dict[str, Any]) -> None:
-    key = f"open_rl:model_meta:{model_id}"
-    raw_val = await self.redis.get(key)
-    data = {}
-    if raw_val:
-      val_str = raw_val.decode() if isinstance(raw_val, bytes) else str(raw_val)
-      try:
-        data = json.loads(val_str)
-      except Exception:
-        data = {}
-    data.update(updates)
-    data["updated_at"] = time.time()
-    await self.redis.set(key, json.dumps(data))
 
 
 # Global singleton factory
