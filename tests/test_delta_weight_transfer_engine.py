@@ -12,8 +12,10 @@ from safetensors.torch import save_file
 
 try:
   from server.delta_weight_transfer_engine import DeltaSnapshotWeightTransferEngine, read_sparse_patches, read_weight_metadata
-except ImportError as exc:  # the engine imports vLLM, which the CPU test environment does not install
-  raise unittest.SkipTest(f"vLLM not available: {exc}") from exc
+
+  HAS_VLLM = True
+except ImportError:  # the engine imports vLLM, which the CPU test environment does not install
+  HAS_VLLM = False
 
 
 def write_delta(path, names=None, shapes=None, tensors=None, **metadata):
@@ -34,6 +36,7 @@ def write_delta(path, names=None, shapes=None, tensors=None, **metadata):
   return info
 
 
+@unittest.skipUnless(HAS_VLLM, "vLLM not installed")
 class PatchFileTest(unittest.TestCase):
   def test_mixed_dtypes_preserved(self):
     with tempfile.TemporaryDirectory() as directory:
@@ -100,6 +103,7 @@ class PackedModel(torch.nn.Module):
     return loaded
 
 
+@unittest.skipUnless(HAS_VLLM, "vLLM not installed")
 class WeightTransferEngineTest(unittest.TestCase):
   def make_engine(self, model):
     config = SimpleNamespace(parallel_config=SimpleNamespace(), model_config=SimpleNamespace())
