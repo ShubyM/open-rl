@@ -11,7 +11,7 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from server.store import get_store
-from server.vllm_options import gpu_memory_utilization, split_stop, text_only_engine_kwargs
+from server.vllm_options import gpu_memory_utilization, sampler_batch_limits, split_stop, text_only_engine_kwargs
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 engine: AsyncLLMEngine | None = None
@@ -158,7 +158,7 @@ async def main():
     "max_loras": int(os.getenv("VLLM_MAX_LORAS", "8")),
     "max_lora_rank": int(os.getenv("VLLM_MAX_LORA_RANK", "64")),
     "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", "8192")),
-    "max_num_seqs": int(os.getenv("VLLM_MAX_NUM_SEQS", "64")),
+    **sampler_batch_limits(),
     "gpu_memory_utilization": gpu_memory_utilization(),
     "enable_prefix_caching": False,
     "enforce_eager": os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
