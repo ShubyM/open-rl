@@ -37,14 +37,6 @@ class RequestStore(ABC):
     """Block until this model has at least 1 request, then return all queued requests for it."""
     pass
 
-  async def ack_requests_for_model(self, model_id: str) -> None:
-    """Confirm the last batch from get_requests or get_requests_for_model was answered."""
-    return None
-
-  async def ack_sampling_requests_for_model(self, model_id: str) -> None:
-    """Confirm the last batch from get_sampling_requests_for_model was answered."""
-    return None
-
   @abstractmethod
   async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
     """Push a sampling request into the queue for its model."""
@@ -73,16 +65,6 @@ class RequestStore(ABC):
   @abstractmethod
   async def get_value(self, key: str) -> str | None:
     """Fetch a string value by key."""
-    pass
-
-  @abstractmethod
-  async def append_sample(self, key: str, sample: dict[str, Any], limit: int = 120) -> None:
-    """Atomically append a sample and retain the most recent limit entries."""
-    pass
-
-  @abstractmethod
-  async def read_samples(self, key: str) -> list[dict[str, Any]]:
-    """Read retained samples in append order."""
     pass
 
   @abstractmethod
@@ -131,7 +113,6 @@ class InMemoryStore(RequestStore):
     self.expiries: dict[str, float] = {}
     self.sets: dict[str, set[str]] = {}
     self.sampling_queues: dict[str, asyncio.Queue] = {}
-    self.sample_store: dict[str, list[str]] = {}
 
   async def list_jobs_metadata(self) -> list[dict[str, Any]]:
     jobs = []
@@ -273,16 +254,6 @@ class InMemoryStore(RequestStore):
   async def get_value(self, key: str) -> str | None:
     return self.get_value_sync(key)
 
-  async def append_sample(self, key: str, sample: dict[str, Any], limit: int = 120) -> None:
-    if limit < 1:
-      raise ValueError("Sample limit must be positive")
-    samples = self.sample_store.setdefault(key, [])
-    samples.append(json.dumps(sample, allow_nan=False))
-    del samples[:-limit]
-
-  async def read_samples(self, key: str) -> list[dict[str, Any]]:
-    return [json.loads(sample) for sample in self.sample_store.get(key, [])]
-
   def get_value_sync(self, key: str) -> str | None:
     if key in self.expiries and time.monotonic() >= self.expiries[key]:
       self.kv_store.pop(key, None)
@@ -294,7 +265,6 @@ class InMemoryStore(RequestStore):
       self.kv_store.pop(k, None)
       self.expiries.pop(k, None)
       self.sets.pop(k, None)
-      self.sample_store.pop(k, None)
 
   async def add_to_set(self, key: str, member: str) -> None:
     self.sets.setdefault(key, set()).add(member)
@@ -336,34 +306,6 @@ class RedisStore(RequestStore):
   async def put_worker_launch_request(self, req_data: dict[str, Any]) -> None:
     await self.redis.rpush(self.worker_launch_queue, json.dumps(req_data))
 
-  # A popped request leaves Redis only when its result has been published.
-  # Until then it sits in <queue>:processing, and the next pass hands it out
-  # again, so a reply lost between the server and this client is a retry
-  # rather than a request that never comes back.
-  async def move_queue(self, queue_key: str, block: bool) -> list[dict[str, Any]]:
-    processing = f"{queue_key}:processing"
-    batch = [json.loads(item) for item in await self.redis.lrange(processing, 0, -1)]
-    if not batch and block:
-      try:
-        item = await self.redis.blmove(queue_key, processing, 5, "LEFT", "RIGHT")
-      except RedisTimeoutError:
-        return []
-      if not item:
-        return []
-      batch.append(json.loads(item))
-    while True:
-      item = await self.redis.lmove(queue_key, processing, "LEFT", "RIGHT")
-      if not item:
-        break
-      batch.append(json.loads(item))
-    return batch
-
-  async def ack_requests_for_model(self, model_id: str) -> None:
-    await self.redis.delete(f"open_rl:queue:{model_id}:processing")
-
-  async def ack_sampling_requests_for_model(self, model_id: str) -> None:
-    await self.redis.delete(f"open_rl:sampler_queue:{model_id}:processing")
-
   async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]:
     active_set = f"open_rl:active_tenants_set:{active_set_id}" if active_set_id else self.active_set
     active_list = f"open_rl:active_tenants:{active_set_id}" if active_set_id else self.active_list
@@ -382,19 +324,18 @@ class RedisStore(RequestStore):
         model_id = model_id_bytes.decode() if isinstance(model_id_bytes, bytes) else str(model_id_bytes)
 
       queue_key = f"open_rl:queue:{model_id}"
-      processing = f"{queue_key}:processing"
       # Snapshot the depth before draining: requests this tenant enqueues while
       # we drain belong to its next turn, otherwise a producer that outruns the
       # consumer keeps the drain loop alive and never yields the head slot.
       q_len = await self.redis.llen(queue_key)
-      batch = [json.loads(item) for item in await self.redis.lrange(processing, 0, -1)]
-      if q_len == 0 and not batch:
+      if q_len == 0:
         await self.redis.lrem(active_list, 0, model_id)
         await self.redis.srem(active_set, model_id)
         continue
 
+      batch = []
       for _ in range(q_len):
-        item = await self.redis.lmove(queue_key, processing, "LEFT", "RIGHT")
+        item = await self.redis.lpop(queue_key)
         if not item:
           break
         batch.append(json.loads(item))
@@ -427,9 +368,21 @@ class RedisStore(RequestStore):
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     queue_key = f"open_rl:queue:{model_id}"
-    batch = await self.move_queue(queue_key, block=True)
-    if not batch:
+    try:
+      result = await self.redis.blpop(queue_key, timeout=5)
+    except RedisTimeoutError:
       return []
+
+    if not result:
+      return []
+
+    batch = [json.loads(result[1])]
+
+    while True:
+      item = await self.redis.lpop(queue_key)
+      if not item:
+        break
+      batch.append(json.loads(item))
 
     q_len = await self.redis.llen(queue_key)
     if q_len == 0:
@@ -444,7 +397,24 @@ class RedisStore(RequestStore):
     await self.redis.rpush(queue_key, json.dumps(req_data))
 
   async def get_sampling_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    return await self.move_queue(f"open_rl:sampler_queue:{model_id}", block=True)
+    queue_key = f"open_rl:sampler_queue:{model_id}"
+    try:
+      result = await self.redis.blpop(queue_key, timeout=5)
+    except RedisTimeoutError:
+      return []
+
+    if not result:
+      return []
+
+    batch = [json.loads(result[1])]
+
+    while True:
+      item = await self.redis.lpop(queue_key)
+      if not item:
+        break
+      batch.append(json.loads(item))
+
+    return batch
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
@@ -479,17 +449,6 @@ class RedisStore(RequestStore):
 
   async def get_value(self, key: str) -> str | None:
     return await self.redis.get(key)
-
-  async def append_sample(self, key: str, sample: dict[str, Any], limit: int = 120) -> None:
-    if limit < 1:
-      raise ValueError("Sample limit must be positive")
-    async with self.redis.pipeline(transaction=True) as pipeline:
-      pipeline.rpush(key, json.dumps(sample, allow_nan=False))
-      pipeline.ltrim(key, -limit, -1)
-      await pipeline.execute()
-
-  async def read_samples(self, key: str) -> list[dict[str, Any]]:
-    return [json.loads(sample) for sample in await self.redis.lrange(key, 0, -1)]
 
   def get_value_sync(self, key: str) -> str | None:
     try:
