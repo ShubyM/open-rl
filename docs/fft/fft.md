@@ -140,7 +140,7 @@ To prevent dropping in-flight rollouts during de-provisioning, teardown uses the
 
 ## 4. Core Components & Deep Interaction Analysis
 
-### A. API Server (`open-rl-gateway`)
+### A. API Server (`open-rl-api-server`)
 The API Server acts as the central REST API facade and orchestration controller. It receives incoming client SDK requests (`create_model`, `create_sampling_client`, inference rollouts, and training steps), validates session payloads, and routes execution tasks into MultiTenant WorkQueues. While hosted inside the same OS process as the worker manager in the current implementation, architecturally it remains a distinct, decoupled request controller.
 
 ### B. Kubernetes Worker Manager (`KubernetesFFTWorkerManager`)
@@ -271,14 +271,14 @@ Rather than attaching rigid, static `nvidia.com/gpu` integer device requests dir
 
 ## 7. Configuration & Runtime Environment Variables
 
-The following environment variables govern multi-tenant GPU execution across Gateway and Worker processes:
+The following environment variables govern multi-tenant GPU execution across API server and Worker processes:
 
 | Environment Variable | Target Process | Description |
 | :--- | :--- | :--- |
-| `OPEN_RL_ENABLE_FFT=true` | Gateway / Workers | Enables Full Fine-Tuning execution pathways and dynamic worker provisioning. |
-| `OPEN_RL_WORKER_MANAGER=kubernetes` | Gateway | Configures API Server to provision pod workloads on cluster nodes rather than local subprocesses. |
-| `OPEN_RL_WORKER_IMAGE=<tag>` | Gateway | Runtime override injecting explicit container image digests into rendered worker pod specifications. |
-| `SAMPLING_BACKEND=vllm` | Client / Gateway | Instructs the framework to route rollout requests to vLLM dynamic sampler pods. |
+| `OPEN_RL_ENABLE_FFT=true` | API server / Workers | Enables Full Fine-Tuning execution pathways and dynamic worker provisioning. |
+| `OPEN_RL_WORKER_MANAGER=kubernetes` | API server | Configures API Server to provision pod workloads on cluster nodes rather than local subprocesses. |
+| `OPEN_RL_WORKER_IMAGE=<tag>` | API server | Runtime override injecting explicit container image digests into rendered worker pod specifications. |
+| `SAMPLING_BACKEND=vllm` | Client / API server | Instructs the framework to route rollout requests to vLLM dynamic sampler pods. |
 | `CUDA_VISIBLE_DEVICES=<ids>` | Trainer Worker | Binds PyTorch FSDP autograd engines to designated physical accelerator UUIDs or indices. |
 | `SAMPLER_CUDA_VISIBLE_DEVICES=<ids>` | Sampler Worker | Binds vLLM Dynamo engines to isolated inference accelerators. |
 | `VLLM_GPU_MEMORY_UTILIZATION=0.70` | Sampler Worker | Configures vLLM pre-allocated KV cache ceiling, leaving headroom for cooperative memory swapping. |
@@ -292,6 +292,14 @@ make test e2e tiny-fft-rl TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=
 To execute concurrent dual-job time-slicing verification:
 ```bash
 make test e2e tiny-fft-rl-x2 TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=0 sampler_gpu=1 steps=5"
+```
+To verify two concurrent jobs on different model families (each job must get its own tokenizer, names and workers):
+```bash
+make test e2e tiny-fft-rl-x2-families TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=0 sampler_gpu=1 base_model=Qwen/Qwen3-0.6B second_base_model=google/gemma-4-e2b"
+```
+To run two Text-to-SQL FFT RL experiments side by side, give each job its own overrides with `extra_a=` / `extra_b=` (layered over `extra=`); setting `model.base_model` in one of them switches that job's model and tokenizer:
+```bash
+make test e2e fft-textsql-rl-x2 TRAINING_TEST_ARGS="sampling_backend=vllm trainer_gpu=0 sampler_gpu=1 steps=40 base_model=google/gemma-4-e2b extra_a='rl.learning_rate=1e-6' extra_b='rl.learning_rate=5e-6'"
 ```
 
 ---

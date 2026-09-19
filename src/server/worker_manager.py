@@ -1,10 +1,11 @@
-"""Worker managers. The gateway asks one to make sure a model's trainer or
+"""Worker managers. The API server asks one to make sure a model's trainer or
 sampler exists before it enqueues work. Local mode spawns subprocesses; the
 scheduler mode (scheduler_worker_manager.py) creates Workloads."""
 
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,23 @@ def runtime_of(model_id: str) -> tuple[TrainingModelMetadata, str, bool]:
 
 def base_model_of(meta: TrainingModelMetadata, runtime: str) -> str:
   return meta.base_model or os.getenv("BASE_MODEL") or runtime
+
+
+# Owners double as label values and pod name stems.
+LABEL_UNSAFE = re.compile(r"[^a-z0-9-]+")
+
+
+def owner_id(runtime: str) -> str:
+  """The scheduler's ownerID for a runtime, the name its trainer and sampler share."""
+  cleaned = LABEL_UNSAFE.sub("-", runtime.lower()).strip("-")
+  if not cleaned:
+    raise ValueError(f"model_id {runtime!r} has no label-safe characters")
+  return cleaned[:63]
+
+
+def owner_of(model_id: str) -> str:
+  _, runtime, _ = runtime_of(model_id)
+  return owner_id(runtime)
 
 
 # -- the process ------------------------------------------------------------------
@@ -111,13 +129,18 @@ class WorkerManager(Protocol):
     """Tear down the runtimes an FFT job owns. A shared LoRA runtime is left alone."""
     ...
 
+  def release_owner(self, owner: str) -> set[str]:
+    """Tear down an owner's trainer and sampler, shared or not. Returns the
+    model ids they served, so the caller can clear their state."""
+    ...
+
   def close(self) -> None:
-    """The gateway is exiting."""
+    """The API server is exiting."""
     ...
 
 
 class LocalWorkerManager:
-  """Runs each runtime as a subprocess of the gateway, for development."""
+  """Runs each runtime as a subprocess of the API server, for development."""
 
   def __init__(self, project_dir: Path = PROJECT_DIR):
     if not os.getenv("REDIS_URL"):
@@ -158,6 +181,13 @@ class LocalWorkerManager:
     with self.lock:
       for key in [key for key in self.processes if key[1] in {runtime, model_id}]:
         self.terminate(key)
+
+  def release_owner(self, owner: str) -> set[str]:
+    with self.lock:
+      keys = [key for key in self.processes if owner_id(key[1]) == owner]
+      for key in keys:
+        self.terminate(key)
+    return {key[1] for key in keys}
 
   def close(self) -> None:
     with self.lock:

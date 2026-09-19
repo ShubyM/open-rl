@@ -8,7 +8,7 @@ This mirrors the `vivekvkashyap/autoresearch-rl` loop: the human owns these
 instructions, and the agent iterates on one training configuration until its
 agent timeout expires.
 
-You do not manage GPUs directly. Run against the shared OpenRL gateway exposed
+You do not manage GPUs directly. Run against the shared OpenRL API server exposed
 by `TINKER_BASE_URL`; the model/trainer service handles GPU placement.
 
 ## Setup

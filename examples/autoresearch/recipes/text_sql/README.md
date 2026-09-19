@@ -10,7 +10,7 @@ editable = ["recipes/text_sql/train.py"]
 metric = "accuracy"
 ```
 
-This recipe samples the configured base model through the shared OpenRL gateway
+This recipe samples the configured base model through the shared OpenRL API server
 for both the unmodified default-config attempt and later agent-edited attempts. `prepare.py` owns the fixed
 dataset and scoring helpers; `train.py` is the editable runnable attempt.
 
@@ -81,9 +81,9 @@ The text-SQL overlay sets:
 
 - `RECIPE=recipes/text_sql/autoresearch.toml`
 - `LOG_ROOT=/mnt/shared/open-rl/autoresearch/text_sql`
-- `TINKER_BASE_URL=http://open-rl-gateway-service:8000`
+- `TINKER_BASE_URL=http://open-rl-api-server-service:8000`
 - `BASE_MODEL=google/gemma-4-e2b`
-- `READY_URLS=http://open-rl-gateway-service:8000/api/v1/get_server_capabilities`
+- `READY_URLS=http://open-rl-api-server-service:8000/api/v1/get_server_capabilities`
 - `ATTEMPT_TIMEOUT_MINUTES=30`
 - `AGENT_TIMEOUT_MINUTES=10`
 

@@ -1,18 +1,18 @@
 # GSM8K full fine-tuning
 
-Full-parameter SFT of a small model on GSM8K, driven through the OpenRL gateway
+Full-parameter SFT of a small model on GSM8K, driven through the OpenRL API server
 with the Tinker SDK.
 
 ## Why full fine-tuning goes through dedicated workers
 
 The public Tinker SDK entrypoint is still `create_lora_training_client()`. For
 now, OpenRL routes that same client flow to a full fine-tuning worker when the
-gateway is started with `OPEN_RL_ENABLE_FFT=true`.
+API server is started with `OPEN_RL_ENABLE_FFT=true`.
 
 ## Run
 
 This branch launches one full fine-tuning worker process per created model. That
-worker shares requests and futures with the gateway through Redis.
+worker shares requests and futures with the API server through Redis.
 
 Start from the repository root in separate terminals.
 
@@ -22,14 +22,14 @@ Start from the repository root in separate terminals.
 redis-server --port 6379 --save "" --appendonly no
 ```
 
-### Terminal 2: Gateway
+### Terminal 2: API server
 
 ```bash
 REDIS_URL=redis://127.0.0.1:6379 \
 OPEN_RL_ENABLE_FFT=true \
 BASE_MODEL=Qwen/Qwen2.5-0.5B \
 SAMPLING_BACKEND=torch \
-uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
+uv run --extra gpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
 ```
 
 ### Terminal 3: SFT Job

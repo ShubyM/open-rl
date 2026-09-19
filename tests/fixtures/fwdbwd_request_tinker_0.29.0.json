@@ -1,0 +1,157 @@
+{
+ "model_id": "model-abc",
+ "seq_id": 7,
+ "forward_only": false,
+ "forward_backward_input": {
+  "loss_fn": "importance_sampling",
+  "loss_fn_config": {
+   "clip_range": 0.2,
+   "kl_coeff": 0.01,
+   "mode": "token"
+  },
+  "data": [
+   {
+    "model_input": {
+     "chunks": [
+      {
+       "type": "encoded_text",
+       "tokens": [
+        151644,
+        872,
+        198,
+        9707,
+        11,
+        1879,
+        0,
+        151645
+       ]
+      }
+     ]
+    },
+    "loss_fn_inputs": {
+     "target_tokens": {
+      "data": [
+       872,
+       198,
+       9707,
+       11,
+       1879,
+       0,
+       151645,
+       198
+      ],
+      "dtype": "int64",
+      "shape": [
+       8
+      ]
+     },
+     "weights": {
+      "data": [
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       1.0,
+       1.0,
+       1.0,
+       1.0
+      ],
+      "dtype": "float32",
+      "shape": [
+       8
+      ]
+     }
+    }
+   },
+   {
+    "model_input": {
+     "chunks": [
+      {
+       "type": "encoded_text",
+       "tokens": [
+        151644,
+        77091,
+        198,
+        785,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13
+       ]
+      }
+     ]
+    },
+    "loss_fn_inputs": {
+     "target_tokens": {
+      "data": [
+       77091,
+       198,
+       785,
+       3974,
+       13876,
+       38835,
+       34208,
+       916,
+       279,
+       15678,
+       5562,
+       13,
+       151645
+      ],
+      "dtype": "int64",
+      "shape": [
+       13
+      ]
+     },
+     "weights": {
+      "data": [
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       1.0,
+       1.0,
+       1.0,
+       1.0,
+       1.0,
+       1.0
+      ],
+      "dtype": "float32",
+      "shape": [
+       13
+      ]
+     },
+     "logprobs": {
+      "data": [
+       -0.5,
+       -1.25,
+       -2.0,
+       -0.125,
+       -3.5,
+       -0.75,
+       -1.0,
+       -0.25,
+       -0.0625,
+       -4.0,
+       -0.5,
+       -1.5,
+       -2.25
+      ],
+      "dtype": "float32",
+      "shape": [
+       13
+      ]
+     }
+    }
+   }
+  ]
+ }
+}

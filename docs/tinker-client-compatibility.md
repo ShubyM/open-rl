@@ -1,17 +1,17 @@
 # Tinker Client Compatibility
 
-Generated from `tinker==0.22.7` by
+Generated from `tinker==0.29.0` by
 `tests/tinker_client_compat.py`.
 
 The test discovers public Tinker client methods with `dir()` and `inspect`,
-starts the real OpenRL FastAPI gateway in single-process mode with a tiny
+starts the real OpenRL FastAPI API server in single-process mode with a tiny
 local model fixture, lets the SDK fetch server bootstrap config, calls each
 discovered method
 with small fixture arguments, and records whether the call succeeds before
 the probe timeout.
 
-- Supported methods: 41
-- Unsupported methods: 41
+- Supported methods: 48
+- Unsupported methods: 47
 
 ## Supported Methods
 
@@ -28,6 +28,7 @@ the probe timeout.
 - `get_base_model`
 - `get_base_model_async`
 - `get_telemetry`
+- `get_tokenizer`
 - `on_queue_state_change`
 - `sample`
 - `sample_async`
@@ -39,6 +40,11 @@ the probe timeout.
 - `create_rest_client`
 - `create_sampling_client`
 - `create_sampling_client_async`
+- `create_training_client_from_state`
+- `create_training_client_from_state_async`
+- `create_training_client_from_state_with_optimizer`
+- `create_training_client_from_state_with_optimizer_async`
+- `get_console_url`
 - `get_server_capabilities`
 - `get_server_capabilities_async`
 - `get_telemetry`
@@ -51,6 +57,7 @@ the probe timeout.
 - `forward_async`
 - `forward_backward`
 - `forward_backward_async`
+- `get_console_url`
 - `get_info`
 - `get_info_async`
 - `get_telemetry`
@@ -78,12 +85,18 @@ the probe timeout.
 - `delete_checkpoint_async`
 - `delete_checkpoint_from_tinker_path`
 - `delete_checkpoint_from_tinker_path_async`
+- `export_session_trace`
+- `export_session_trace_async`
 - `get_audit_log`
 - `get_audit_log_async`
+- `get_billing_usage`
+- `get_billing_usage_async`
 - `get_checkpoint_archive_url`
 - `get_checkpoint_archive_url_async`
 - `get_checkpoint_archive_url_from_tinker_path`
 - `get_checkpoint_archive_url_from_tinker_path_async`
+- `get_external_weights_urls`
+- `get_external_weights_urls_async`
 - `get_session`
 - `get_session_async`
 - `get_training_run`
@@ -105,20 +118,20 @@ the probe timeout.
 - `set_checkpoint_ttl_from_tinker_path_async`
 - `unpublish_checkpoint_from_tinker_path`
 - `unpublish_checkpoint_from_tinker_path_async`
+- `whoami`
 
 ### SamplingClient
 
 - `create`
-- `get_tokenizer`
 
 ### ServiceClient
 
-- `create_training_client_from_state`
-- `create_training_client_from_state_async`
-- `create_training_client_from_state_with_optimizer`
-- `create_training_client_from_state_with_optimizer_async`
+- `close`
+- `copy_weights`
 
 ### TrainingClient
 
 - `forward_backward_custom`
 - `forward_backward_custom_async`
+- `save_weights_external`
+- `save_weights_external_async`

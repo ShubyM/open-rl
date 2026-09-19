@@ -304,10 +304,10 @@ async def run_sampling_worker(model_id: str) -> None:
   else:
     init_engine()
 
-  async def exit_gracefully() -> None:
-    print(f"[vLLM Worker] Initiating immediate exit for model {model_id} sampler worker...")
+  async def exit_gracefully(code: int = 0, unregister: bool = True) -> None:
+    print(f"[vLLM Worker] Initiating immediate exit for model {model_id} sampler worker (code {code})...")
     nonlocal snapshot_registered
-    if snapshot_registered and time_slicer is not None:
+    if unregister and snapshot_registered and time_slicer is not None:
       assert workload is not None
       try:
         await time_slicer.unregister(workload)
@@ -319,7 +319,43 @@ async def run_sampling_worker(model_id: str) -> None:
         await time_slicer.close()
       except Exception:
         pass
-    os._exit(0)
+    os._exit(code)
+
+  async def fail_requests(reqs: list[dict], exc: BaseException) -> None:
+    """Answers every popped-but-unserved request so clients see the failure instead of hanging."""
+    for req in reqs:
+      request_id = req.get("request_id")
+      if not request_id:
+        continue
+      try:
+        await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": f"vLLM Worker Error: {exc}"})
+      except Exception as store_exc:  # noqa: BLE001 - best effort while already failing
+        print(f"[vLLM Worker] Could not fail request {request_id}: {store_exc}")
+
+  async def sample_batch(reqs: list[dict]) -> None:
+    """Runs the batch, but does not wait on an engine that dies under it.
+
+    A dead EngineCore leaves generate() hanging, so the in-flight requests
+    are failed and the caller's dead-engine path exits the worker.
+    """
+    tasks = {asyncio.create_task(process_sampling_request(req, store)): req for req in reqs}
+    pending = set(tasks)
+    while pending:
+      _, pending = await asyncio.wait(pending, timeout=5)
+      if pending and engine is not None and getattr(engine, "errored", False):
+        for task in pending:
+          task.cancel()
+        await fail_requests([tasks[task] for task in pending], RuntimeError("vLLM engine died during the batch"))
+        raise RuntimeError("vLLM engine died during the batch")
+
+  def engine_is_dead(exc: BaseException) -> bool:
+    if engine is not None and getattr(engine, "errored", False):
+      return True
+    try:
+      from vllm.v1.engine.exceptions import EngineDeadError
+    except ImportError:
+      return False
+    return isinstance(exc, EngineDeadError)
 
   if time_slicer is not None:
     import signal
@@ -342,6 +378,9 @@ async def run_sampling_worker(model_id: str) -> None:
   print(f"[vLLM Worker] Listening for sampling requests on queue for model: {model_id}...")
   try:
     while True:
+      # Requests popped from the queue but not yet handed to process_sampling_request;
+      # an exception before dispatch would otherwise leave their futures unset forever.
+      unanswered: list[dict] = []
       try:
         batch = await store.get_sampling_requests_for_model(model_id)
         if not batch:
@@ -357,6 +396,7 @@ async def run_sampling_worker(model_id: str) -> None:
             sampling_reqs.append(req)
 
         if sampling_reqs:
+          unanswered = list(sampling_reqs)
           if time_slicer is not None:
             assert workload is not None
             async with time_slicer.acquire(workload):
@@ -364,21 +404,28 @@ async def run_sampling_worker(model_id: str) -> None:
                 print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")
                 await engine.wake_up(tags=["weights", "kv_cache"])
                 IS_ENGINE_SLEEPING = False
-              tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
-              await asyncio.gather(*tasks)
+              unanswered = []
+              await sample_batch(sampling_reqs)
               if has_shutdown:
                 await exit_gracefully()
               if engine is not None:
                 print("[vLLM Worker] Exiting batch: sleeping engine (CPU offload weights) to yield GPU memory...")
                 await engine.sleep(level=1)
                 IS_ENGINE_SLEEPING = True
+            faulted = getattr(time_slicer, "faulted", None)
+            if faulted:
+              # This process still holds the accelerator, so it exits without
+              # unregistering and the pod restarts; the grant moves on once
+              # the memory is gone.
+              print(f"[vLLM Worker] Time slicer could not park this process: {faulted}. Exiting for a restart.")
+              await exit_gracefully(code=1, unregister=False)
           else:
             if engine is not None and IS_ENGINE_SLEEPING:
               print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")
               await engine.wake_up(tags=["weights", "kv_cache"])
               IS_ENGINE_SLEEPING = False
-            tasks = [asyncio.create_task(process_sampling_request(req, store)) for req in sampling_reqs]
-            await asyncio.gather(*tasks)
+            unanswered = []
+            await sample_batch(sampling_reqs)
 
         if has_shutdown:
           print("[vLLM Worker] Shutdown sentinel popped from queue. Initiating clean exit...")
@@ -388,6 +435,13 @@ async def run_sampling_worker(model_id: str) -> None:
       except Exception as exc:
         print(f"Error in sampling worker loop: {exc}")
         traceback.print_exc()
+        await fail_requests(unanswered, exc)
+        if engine_is_dead(exc):
+          # A dead EngineCore (e.g. a CUDA assert during a weight patch) never
+          # recovers in-process; exit non-zero so the pod restarts instead of
+          # sitting Running while every client times out.
+          print("[vLLM Worker] vLLM engine is dead; exiting so the worker can be restarted.")
+          await exit_gracefully(code=1)
         await asyncio.sleep(1)
   finally:
     if time_slicer is not None:

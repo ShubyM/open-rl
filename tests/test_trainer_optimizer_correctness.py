@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -135,12 +136,20 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
   def create_model(self, base_model_name, model_id, config):
     self.created_models.append((base_model_name, model_id, config))
 
-  def forward_backward(self, data, loss_fn, loss_config=None, model_id=None):
+  def forward_backward(self, data, loss_fn, loss_config=None, model_id=None, forward_only=False):
     return {"model_id": model_id, "loss_fn": loss_fn, "loss_config": loss_config, "data": data}
 
   def save_state(self, model_id, state_path, include_optimizer=False, kind="state"):
     self.saved_states.append((model_id, state_path, include_optimizer, kind))
     return {"path": state_path}
+
+  cpu_offload = True
+
+  def wake_up(self):
+    return None
+
+  def sleep(self):
+    return None
 
 
 class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker):
@@ -190,6 +199,8 @@ class _TrainingRequestsStoreStub(_FutureStoreStub):
 
 
 class _TimeSlicerStub:
+  faulted = None
+
   def __init__(self, events=None):
     self.events = events if events is not None else []
 
@@ -281,6 +292,45 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
       self.assertTrue(os.path.exists(os.path.join(tmp_dir, "peft", "adapter-a", "metadata.json")))
 
     self.assertEqual(worker.peft_model.active_adapter, "adapter-a")
+
+  def test_lora_save_state_writes_the_optimizer_next_to_the_adapter(self) -> None:
+    param = torch.nn.Parameter(torch.tensor([1.0]))
+    worker = LoraTrainingWorker()
+    worker.base_model_name = "base"
+    worker.peft_model = _PeftModelStub({"job-a": [param]})
+    worker.adapter_states["job-a"] = {"trainable_params": [param], "optimizer": torch.optim.AdamW([param], lr=0.1)}
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      state_dir = os.path.join(tmp_dir, "step-5")
+      worker.save_state("job-a", state_dir, include_optimizer=True)
+      self.assertTrue(os.path.exists(os.path.join(state_dir, "optimizer.pt")))
+      with open(os.path.join(state_dir, "metadata.json")) as f:
+        self.assertTrue(json.load(f)["has_optimizer"])
+
+  def test_fft_save_state_under_delta_writes_a_delta_whatever_was_asked(self) -> None:
+    worker = FFTTrainingWorker()
+    worker.model = _FullModelStub([])
+    worker.cpu_offload = False
+    worker.weight_sync_cfg.strategy = "delta"
+    with patch.object(worker, "save_state_delta", return_value={"path": "delta"}) as delta:
+      self.assertEqual(worker.save_state("job-a", "/tmp/x", include_optimizer=True), {"path": "delta"})
+    delta.assert_called_once()
+
+  def test_fft_save_state_skips_the_optimizer_until_fft_resume_exists(self) -> None:
+    param = torch.nn.Parameter(torch.tensor([1.0]))
+    worker = FFTTrainingWorker()
+    worker.model = _FullModelStub([param])
+    worker.model.save_pretrained = lambda path: None
+    worker.tokenizer = None
+    worker.optimizer = torch.optim.AdamW([param], lr=0.1)
+    worker.cpu_offload = False
+    worker.weight_sync_cfg.strategy = "full"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      state_dir = os.path.join(tmp_dir, "step-5")
+      worker.save_state("job-a", state_dir, include_optimizer=True)
+      self.assertFalse(os.path.exists(os.path.join(state_dir, "optimizer.pt")))
+      with open(os.path.join(state_dir, "metadata.json")) as f:
+        self.assertFalse(json.load(f)["has_optimizer"])
 
   def test_fft_create_model_loads_base_then_prepares_model(self) -> None:
     worker = FFTTrainingWorker()

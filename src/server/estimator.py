@@ -67,10 +67,11 @@ TRAINER_DEVICE_BYTES_PER_PARAM = {"full": 8, "lora": 2}
 TRAINER_DEVICE_RESERVE_BYTES = 4 * GIB
 # Sampler on the device: bf16 weights, vLLM's activation peak and CUDA graphs,
 # LoRA slot buffers (max_loras 8, rank 64) for a LoRA sampler, and a KV cache
-# sized for SAMPLER_KV_TOKENS. The budget is exactly what vLLM is handed, so
-# whatever the overheads do not use becomes KV cache. Overheads measured on
-# the live samplers: activation peak 0.5 GiB at 0.6B and 1.4 GiB at 8B; LoRA
-# slots 1.05 GiB at 0.6B and 2.9 GiB at 8B.
+# sized for SAMPLER_KV_TOKENS. This is a placement claim: it decides which
+# device the sampler may land on, not how much of it vLLM uses (see
+# vllm_options.gpu_memory_utilization). Overheads measured on the live
+# samplers: activation peak 0.5 GiB at 0.6B and 1.4 GiB at 8B; LoRA slots
+# 1.05 GiB at 0.6B and 2.9 GiB at 8B.
 SAMPLER_WEIGHT_BYTES_PER_PARAM = 2
 SAMPLER_OVERHEAD_BYTES = GIB // 2
 SAMPLER_OVERHEAD_BYTES_PER_PARAM = 0.125
@@ -78,11 +79,14 @@ SAMPLER_LORA_SLOT_BYTES = GIB
 SAMPLER_LORA_SLOT_BYTES_PER_PARAM = 0.25
 SAMPLER_KV_TOKENS = 8 * 8192  # eight max-length requests in flight
 # Parked in host memory: fft trainer 12 B/param + a weight copy in flight;
-# plus process overhead. Measured: 0.5B trainer 28Gi, sampler 20Gi; 7B FFT
-# trainer OOM-killed at 110Gi.
+# plus process overhead. Measured: 0.5B trainer 28Gi, sampler 20Gi; 8B FFT
+# sampler 39Gi steady; 7B FFT trainer OOM-killed at 110Gi.
 HOST_BYTES_PER_PARAM = {("full", "trainer"): 14, ("lora", "trainer"): 2, ("full", "sampler"): 2, ("lora", "sampler"): 2}
-HOST_OVERHEAD_BYTES = {"trainer": 20 * GIB, "sampler": 18 * GIB}
-HOST_LIMIT_FACTOR = 1.5
+HOST_OVERHEAD_BYTES = {"trainer": 20 * GIB, "sampler": 24 * GIB}
+# Limits equal requests. Placement admits pods by request, so a pod that
+# could burst past it can push a co-seated neighbour into the kernel's OOM
+# killer; an 8B FFT sampler ran at 39Gi against a 34Gi request.
+HOST_LIMIT_FACTOR = 1.0
 
 
 def gib(n: int) -> str:

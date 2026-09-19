@@ -7,14 +7,15 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from gemma4_renderer import register_gemma4_tool_renderer
-from reward import ARTIFACT_EXTENSIONS
-from tasks import LabTask
 from tinker_cookbook import model_info, tokenizer_utils
 from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.renderers.base import Message, Renderer
 
-OUTPUT_FILE_RE = re.compile(rf"`([^`]+\.(?:{'|'.join(ARTIFACT_EXTENSIONS)}))`", re.IGNORECASE)
+from .renderers.gemma4_renderer import register_gemma4_tool_renderer
+from .renderers.qwen35_renderer import VERBATIM_FOR, register_verbatim_qwen35_renderer
+from .tasks import LabTask
+
+OUTPUT_FILE_RE = re.compile(r"`([^`]+\.(?:docx|xlsx|pptx|pdf|md|txt))`", re.IGNORECASE)
 
 
 def default_skills(lab_root: Path) -> list[str]:
@@ -79,8 +80,12 @@ def artifact_path_prompt(task: LabTask) -> str:
 
 def lab_renderer(model_name: str, renderer_name: str | None) -> Renderer:
   register_gemma4_tool_renderer()
+  register_verbatim_qwen35_renderer()
   tokenizer = tokenizer_utils.get_tokenizer(model_name)
   resolved_name = renderer_name or model_info.get_recommended_renderer_name(model_name)
+  # The stock re-render of a tool-calling turn differs from the sampled
+  # tokens; see renderers/qwen35_renderer.py for the failure and the fix.
+  resolved_name = VERBATIM_FOR.get(resolved_name, resolved_name)
   renderer = get_renderer(resolved_name, tokenizer, model_name=model_name)
   if resolved_name.startswith("qwen3") and hasattr(renderer, "strip_thinking_from_history"):
     # Multi-turn RL needs each observation to extend the preceding one. The

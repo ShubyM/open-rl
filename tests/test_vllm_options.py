@@ -35,15 +35,14 @@ if __name__ == "__main__":
 class GpuMemoryUtilizationTest(unittest.TestCase):
   def test_explicit_fraction_wins(self) -> None:
     with patch.dict(os.environ, {"VLLM_GPU_MEMORY_UTILIZATION": "0.5", "OPEN_RL_ACCELERATOR_MEMORY": str(70 * 1024**3)}):
-      self.assertEqual(gpu_memory_utilization(device_bytes=80 * 1024**3), 0.5)
+      self.assertEqual(gpu_memory_utilization(), 0.5)
 
-  def test_budget_over_the_actual_device_capped(self) -> None:
+  def test_placement_claim_does_not_cap_the_device(self) -> None:
+    # The claim only decides where the worker lands; once placed it owns the
+    # device while it holds it, so a 7 GiB claim still gets the 0.90 default.
     with patch.dict(os.environ, {"OPEN_RL_ACCELERATOR_MEMORY": str(7 * 1024**3)}, clear=True):
-      self.assertAlmostEqual(gpu_memory_utilization(device_bytes=24 * 1024**3), 7 / 24)
-      self.assertAlmostEqual(gpu_memory_utilization(device_bytes=80 * 1024**3), 7 / 80)
-    with patch.dict(os.environ, {"OPEN_RL_ACCELERATOR_MEMORY": str(100 * 1024**3)}, clear=True):
-      self.assertEqual(gpu_memory_utilization(device_bytes=80 * 1024**3), 0.90)
+      self.assertEqual(gpu_memory_utilization(), 0.90)
 
   def test_without_a_budget_the_default_holds(self) -> None:
     with patch.dict(os.environ, {}, clear=True):
-      self.assertEqual(gpu_memory_utilization(device_bytes=80 * 1024**3), 0.90)
+      self.assertEqual(gpu_memory_utilization(), 0.90)

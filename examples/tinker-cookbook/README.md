@@ -14,25 +14,44 @@ uv sync
 ```
 
 If you want to try other recipes, you may need to install other extras or dependencies.
+The GSM8K recipe (`tinker_cookbook.recipes.rl_loop`) needs the cookbook's `math-rl`
+extra, which the pin above already includes.
+
+### Client SDK versions
+
+Tinker SDK 0.25.0 and later send training requests as protobuf and only read
+training and sampling results as protobuf. The API server accepts both encodings, so any
+SDK from 0.23 onward works, including the one a fresh `uv sync` of the upstream
+`tinker-cookbook` repository resolves. `docs/tinker-client-compatibility.md` lists
+the supported client methods for the SDK version it was generated from.
+
+### Models
+
+The upstream cookbook resolves a renderer from its own model registry and raises
+`KeyError` for models that are not in it. Small Qwen models that OpenRL runs on a
+single L4 and that the registry knows are `Qwen/Qwen3-4B-Instruct-2507` (renderer
+`qwen3_instruct`) and, on larger GPUs, `Qwen/Qwen3-8B` (renderer `qwen3`). Recipes
+whose default renderer is hardcoded for a different family, such as
+`preference.shorter.train`, need `renderer_name=qwen3_instruct` on the command line.
 
 ## Start the Server
 
-From the repository root, start one vLLM sampler and one OpenRL gateway on
+From the repository root, start one vLLM sampler and one OpenRL API server on
 separate GPUs. These examples are written for two L4 GPUs or better.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 BASE_MODEL="Qwen/Qwen3-1.7B" uv run --extra vllm python -m server.vllm_sampler
+CUDA_VISIBLE_DEVICES=0 BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" uv run --extra vllm python -m server.vllm_sampler
 ```
 
 In another shell:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
-BASE_MODEL="Qwen/Qwen3-1.7B" \
+BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" \
 SAMPLING_BACKEND=vllm \
 VLLM_URL=http://127.0.0.1:8001 \
 TINKER_API_KEY=tml-dummy-key \
-uv run --extra gpu python -m uvicorn server.gateway:app --host 127.0.0.1 --port 9003
+uv run --extra gpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
 ```
 
 CPU mode is useful for tiny model fixtures, but Qwen-sized cookbook runs should
@@ -50,7 +69,7 @@ OpenRL does not yet implement full Tinker-compatible durable checkpoint manageme
 cd examples
 TINKER_API_KEY=tml-dummy-key uv run python -m tinker_cookbook.recipes.sl_loop \
   base_url=http://127.0.0.1:9003 \
-  model_name="Qwen/Qwen3-1.7B" \
+  model_name="Qwen/Qwen3-4B-Instruct-2507" \
   log_path=artifacts/tinker-cookbook/sl_loop \
   save_every=0
 ```
@@ -64,7 +83,7 @@ TINKER_API_KEY=tml-dummy-key uv run python -m tinker_cookbook.recipes.sl_loop \
 ```bash
 cd examples
 TINKER_API_KEY=tml-dummy-key TINKER_BASE_URL=http://127.0.0.1:9003 TINKER_TELEMETRY=0 uv run python -m tinker_cookbook.recipes.preference.shorter.train \
-  model_name="Qwen/Qwen3-1.7B" \
+  model_name="Qwen/Qwen3-4B-Instruct-2507" \
   batch_size=4 \
   group_size=4 \
   max_tokens=64 \

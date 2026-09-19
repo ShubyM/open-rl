@@ -2,8 +2,10 @@ import json
 import unittest
 from unittest.mock import patch
 
-from server import gateway
+from server import api_server
+from server.session_registry import SessionRegistry
 from server.worker_manager import LocalWorkerManager
+from tests.api_client import asgi_client, post_json
 
 
 class StoreStub:
@@ -18,8 +20,11 @@ class StoreStub:
   async def set_future(self, req_id: str, result: dict) -> None:
     self.futures[req_id] = result
 
-  async def set_value(self, key: str, value: str) -> None:
+  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
+
+  async def add_to_set(self, key: str, member: str) -> None:
+    pass
 
   async def get_value(self, key: str) -> str | None:
     return self.kv_store.get(key)
@@ -58,28 +63,30 @@ class WorkerManagerStub:
     pass
 
 
-class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
+class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
   """create_model in FFT mode launches the model's worker directly, then
   enqueues onto its per-model queue — there is no separate launch queue."""
 
   def setUp(self) -> None:
     self.store = StoreStub()
     self.worker_manager = WorkerManagerStub()
-    self.old_store = gateway.store
-    self.old_manager = gateway.worker_manager
-    gateway.store = self.store
-    gateway.worker_manager = self.worker_manager
-    self.addCleanup(self._restore)
+    self.enterContext(patch.object(api_server, "store", self.store))
+    self.enterContext(patch.object(api_server, "worker_manager", self.worker_manager))
+    self.enterContext(patch.object(api_server, "session_registry", SessionRegistry(self.store)))
+    self.enterContext(patch("server.store.get_store", return_value=self.store))
 
-  def _restore(self) -> None:
-    gateway.store = self.old_store
-    gateway.worker_manager = self.old_manager
+  async def asyncSetUp(self) -> None:
+    self.client = await self.enterAsyncContext(asgi_client())
+    self.session_id = (await self.post("create_session", {}))["session_id"]
+
+  async def post(self, path: str, body: dict) -> dict:
+    return await post_json(self.client, path, body)
 
   async def test_create_model_launches_worker_then_enqueues(self) -> None:
     import json
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
-      result = await gateway.create_model({"base_model": "base-model"})
+      result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
@@ -94,8 +101,8 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
   async def test_create_model_failed_launch_fails_future_and_enqueues_nothing(self) -> None:
     self.worker_manager.error = RuntimeError("boom")
 
-    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}), patch("server.gateway.traceback.print_exc"):
-      result = await gateway.create_model({"base_model": "base-model"})
+    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}), patch("server.api_server.traceback.print_exc"):
+      result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
@@ -106,13 +113,15 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     import json
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
-      result = await gateway.create_model_from_state(
+      result = await self.post(
+        "create_model_from_state",
         {
+          "session_id": self.session_id,
           "state_path": "/tmp/checkpoint",
           "base_model": "restored-base",
           "full_config": {"weight_sync_strategy": "delta"},
           "restore_optimizer": True,
-        }
+        },
       )
 
     model_id = result["request_id"]
@@ -143,23 +152,24 @@ class GatewayInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
           "fine_tuning_type": "full",
         }
       )
-      await gateway.ensure_sampler_launched("model-x")
+      await api_server.bind_session(self.session_id, "model-x")
+      await api_server.ensure_sampler_launched("model-x")
 
     self.assertEqual(self.worker_manager.launched_sampler_model_ids, ["model-x"])
 
   async def test_create_model_launches_trainer_when_worker_manager_present(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "false"}):
-      result = await gateway.create_model({"base_model": "base-model"})
+      result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
     self.assertEqual(len(self.store.forwarded_requests), 1)
 
 
-class GatewayLifespanTest(unittest.IsolatedAsyncioTestCase):
+class ApiServerLifespanTest(unittest.IsolatedAsyncioTestCase):
   async def test_lifespan_full_mode_requires_redis(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
-      async with gateway.lifespan(gateway.app):
+      async with api_server.lifespan(api_server.app):
         pass
 
 
@@ -236,15 +246,10 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       self.assertEqual(kwargs_s["env"].get("OPEN_RL_WEIGHT_SYNC_STRATEGY"), "delta")
 
 
-class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
+class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
-    self.old_store = gateway.store
-    gateway.store = self.store
-    self.addCleanup(self._restore)
-
-  def _restore(self) -> None:
-    gateway.store = self.old_store
+    self.enterContext(patch.object(api_server, "store", self.store))
 
   async def test_extract_and_persist_metadata_from_headers(self) -> None:
     import json
@@ -259,8 +264,8 @@ class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
       ],
     }
     request = Request(scope)
-    model_id = await gateway._extract_and_persist_model_metadata(
-      {"base_model": "Qwen/Qwen2.5-0.5B"},
+    model_id = await api_server._extract_and_persist_model_metadata(
+      api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"),
       request,
       default_fine_tuning_type="full",
     )
@@ -273,10 +278,10 @@ class GatewayMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(meta_dict["weight_sync_config"]["strategy"], "delta")
 
 
-class GatewayFutureTranslationTest(unittest.TestCase):
+class ApiServerFutureTranslationTest(unittest.TestCase):
   def test_create_model_result_translates_to_tinker_shape(self) -> None:
     self.assertEqual(
-      gateway.translate_future_result(
+      api_server.translate_future_result(
         {
           "type": "model_created",
           "model_id": "model-a",
@@ -295,7 +300,7 @@ class GatewayFutureTranslationTest(unittest.TestCase):
 
   def test_create_model_from_state_result_translates_to_tinker_shape(self) -> None:
     self.assertEqual(
-      gateway.translate_future_result(
+      api_server.translate_future_result(
         {
           "type": "model_loaded_from_state",
           "model_id": "model-a",
@@ -314,7 +319,7 @@ class GatewayFutureTranslationTest(unittest.TestCase):
 
   def test_lora_create_model_result_translates_rank_to_tinker_shape(self) -> None:
     self.assertEqual(
-      gateway.translate_future_result(
+      api_server.translate_future_result(
         {
           "type": "model_created",
           "model_id": "model-a",
@@ -346,7 +351,7 @@ class GatewayFutureTranslationTest(unittest.TestCase):
     for internal_type, public_type in cases:
       with self.subTest(internal_type=internal_type):
         self.assertEqual(
-          gateway.translate_future_result({"type": internal_type, "path": "/tmp/x"}),
+          api_server.translate_future_result({"type": internal_type, "path": "/tmp/x"}),
           {"type": public_type, "path": "/tmp/x"},
         )
 

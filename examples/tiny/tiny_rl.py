@@ -99,7 +99,11 @@ def main(config: Config) -> None:
 
   try:
     tokenizer = trainer.get_tokenizer()
-    prompt_tokens = tokenizer.encode(config.prompt, add_special_tokens=False)
+    # The API server names this tokenizer; a wrong one turns every sample below into token soup.
+    print(f"[tiny-rl] base_model={config.base_model} tokenizer={getattr(tokenizer, 'name_or_path', type(tokenizer).__name__)}")
+    # Keep the tokenizer's special tokens: Gemma degenerates into repeated
+    # fragments without its BOS token, and Qwen tokenizers add nothing here.
+    prompt_tokens = tokenizer.encode(config.prompt, add_special_tokens=True)
     prompt = types.ModelInput.from_ints(tokens=prompt_tokens)
     sampling_params = types.SamplingParams(max_tokens=config.max_tokens, temperature=config.temperature)
 
@@ -114,6 +118,7 @@ def main(config: Config) -> None:
         if not tokens or len(tokens) != len(logprobs):
           raise RuntimeError(f"Sampler must return aligned tokens and logprobs, got {len(tokens)} tokens and {len(logprobs)} logprobs")
         rewards.append(1.0 if config.target in tokenizer.decode(tokens) else 0.0)
+      print(f"[tiny-rl] step={step:02d} sample[0]={tokenizer.decode(list(sequences[0].tokens))[:160]!r}")
 
       # Group-centered advantages; when every reward ties, fall back to a uniform
       # positive advantage so the update still exercises a nonzero gradient.
@@ -144,7 +149,7 @@ def main(config: Config) -> None:
     import urllib.request
 
     # The upstream Tinker SDK does not expose a delete_model() method. We make a
-    # direct HTTP POST call to Open-RL's custom /api/v1/delete_model gateway
+    # direct HTTP POST call to Open-RL's custom /api/v1/delete_model API server
     # endpoint to signal background trainer and sampler worker processes to exit.
     try:
       model_id = trainer._guaranteed_model_id()
@@ -159,7 +164,7 @@ def main(config: Config) -> None:
 
 
 if __name__ == "__main__":
-  # Turns OPEN_RL_FINE_TUNING_TYPE into the header the gateway reads. Without
+  # Turns OPEN_RL_FINE_TUNING_TYPE into the header the API server reads. Without
   # it a "fft" scenario silently trains a LoRA adapter: the harness sets the
   # env, but nothing puts it on the wire.
   patch_tinker_default_headers()

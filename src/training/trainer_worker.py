@@ -31,13 +31,43 @@ class BaseTrainerWorker:
     else:
       self.device = torch.device("cpu")
 
-  def forward_backward(self, model: PreTrainedModel, data: list[Datum], loss_fn: str, loss_config: dict | None = None) -> dict[str, Any]:
-    """Run a forward/backward pass on model and return Tinker-shaped loss outputs."""
-    total_loss = 0.0
+  def forward_backward(
+    self,
+    model: PreTrainedModel,
+    data: list[Datum],
+    loss_fn: str,
+    loss_config: dict | None = None,
+    forward_only: bool = False,
+  ) -> dict[str, Any]:
+    """Run a forward/backward pass on model and return Tinker-shaped loss outputs.
+
+    With ``forward_only`` (TrainingClient.forward) the pass runs without
+    autograd and in eval mode, and no gradient is accumulated: the cookbook's
+    NLL evaluator calls it on held-out data right before a training step, so
+    a backward here would fold the test set into the next optim_step.
+    """
     loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
 
-    model.train()
+    if forward_only:
+      model.eval()
+    else:
+      model.train()
 
+    with torch.set_grad_enabled(not forward_only):
+      total_loss = self._run_batches(model, data, loss_fn, loss_config, forward_only, loss_fn_outputs)
+    return self._finish(data, loss_fn_outputs, total_loss)
+
+  def _run_batches(
+    self,
+    model: PreTrainedModel,
+    data: list[Datum],
+    loss_fn: str,
+    loss_config: dict | None,
+    forward_only: bool,
+    loss_fn_outputs: list[dict[str, Any] | None],
+  ) -> float:
+    """Run every batch, fill ``loss_fn_outputs`` in place, and return the summed loss."""
+    total_loss = 0.0
     for batch in self.make_training_batches(data):
       batch_indices = [idx for idx, _ in batch]
       batch_data = [datum for _, datum in batch]
@@ -73,7 +103,8 @@ class BaseTrainerWorker:
 
       per_datum_loss = elementwise_loss.sum(dim=1)
       loss = per_datum_loss.sum()
-      loss.backward()
+      if not forward_only:
+        loss.backward()
       total_loss += loss.item()
 
       detached_logprobs = target_logprobs.detach().cpu()
@@ -82,7 +113,9 @@ class BaseTrainerWorker:
         logprobs_list = detached_logprobs[row, :row_len].tolist()
         logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
         loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
+    return total_loss
 
+  def _finish(self, data: list[Datum], loss_fn_outputs: list[dict[str, Any] | None], total_loss: float) -> dict[str, Any]:
     mean_loss = total_loss / max(1, len(data))
     completed_loss_fn_outputs = []
     for output in loss_fn_outputs:

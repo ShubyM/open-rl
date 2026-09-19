@@ -101,7 +101,7 @@ type WorkloadSpec struct {
 	TrainingKind TrainingKind `json:"trainingKind,omitempty"`
 
 	// Exclusive keeps this worker alone on its GPU. Two workers share a
-	// claim only when neither is exclusive. The gateway sets it from the
+	// claim only when neither is exclusive. The API server sets it from the
 	// training kind, true for LoRA workers because they cannot suspend
 	// between turns. Omitted means exclusive.
 	// +kubebuilder:default=true

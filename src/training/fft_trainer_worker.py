@@ -179,18 +179,21 @@ class FFTTrainingWorker(BaseTrainerWorker):
         "GPU time-slicer lock is not held during save operations."
       )
 
-    if self.weight_sync_cfg.strategy == "delta" and not include_optimizer:
+    # Under the delta strategy save_state writes the sparse delta the sampler
+    # consumes. load_from_state cannot open it, so FFT is not resumable yet.
+    if self.weight_sync_cfg.strategy == "delta":
+      if kind != "sampler":
+        logger.warning("save_state for %s under the delta strategy writes a delta, not a resumable checkpoint", model_id)
       return self.save_state_delta(model_id=model_id, state_path=state_path, kind=kind)
 
+    # FFT cannot be resumed yet, so a saved optimizer has no reader and only
+    # costs disk. include_optimizer is ignored until FFT resume exists.
     os.makedirs(state_path, exist_ok=True)
     was_offloaded = self._prepare_for_save()
     try:
       self.model.save_pretrained(state_path)
       if self.tokenizer is not None:
         self.tokenizer.save_pretrained(state_path)
-
-      if include_optimizer and self.optimizer is not None:
-        torch.save(self.optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
     finally:
       self._cleanup_after_save(was_offloaded)
 
@@ -198,7 +201,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
       "kind": kind,
-      "has_optimizer": include_optimizer and self.optimizer is not None,
+      "has_optimizer": False,
       "model_id": model_id,
       "timestamp": time.time(),
     }
@@ -309,9 +312,11 @@ class FFTTrainingWorker(BaseTrainerWorker):
     print(f"Loaded full fine-tuning state from {state_path}")
     return {"model_id": model_id, "base_model": base_model}
 
-  def forward_backward(self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None) -> dict[str, Any]:
+  def forward_backward(
+    self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
+  ) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
-    res = super().forward_backward(self.model, data, loss_fn, loss_config)
+    res = super().forward_backward(self.model, data, loss_fn, loss_config, forward_only=forward_only)
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
     return res

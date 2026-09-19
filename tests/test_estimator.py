@@ -48,12 +48,12 @@ class FootprintTest(unittest.TestCase):
     trainer = footprint("Qwen/Qwen2.5-0.5B", "full", "trainer")
     sampler = footprint("Qwen/Qwen2.5-0.5B", "full", "sampler")
     self.assertTrue(24 * GIB <= trainer.host_request_bytes <= 32 * GIB, trainer)
-    self.assertTrue(16 * GIB <= sampler.host_request_bytes <= 24 * GIB, sampler)
+    self.assertTrue(20 * GIB <= sampler.host_request_bytes <= 28 * GIB, sampler)
     # A Qwen2.5-7B FFT trainer was OOM-killed at a 110Gi limit; the request
     # alone must already say that much.
     big = footprint("Qwen/Qwen2.5-7B", "full", "trainer")
     self.assertGreater(big.host_request_bytes, 110 * GIB)
-    self.assertGreater(big.host_limit_bytes, big.host_request_bytes)
+    self.assertEqual(big.host_limit_bytes, big.host_request_bytes)
 
   def test_resources_render_as_whole_gib(self) -> None:
     fp = footprint("Qwen/Qwen2.5-0.5B", "lora", "trainer")

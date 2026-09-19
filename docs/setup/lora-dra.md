@@ -1,7 +1,7 @@
 # OpenRL on an existing DRA cluster
 
 The LoRA overlays schedule trainer and vLLM sampler processes on **separate
-GPUs**. They install the gateway, scheduler, Redis, CRDs, RBAC, and shared storage
+GPUs**. They install the API server, scheduler, Redis, CRDs, RBAC, and shared storage
 into `openrl-system`. Workers start when a client requests a model and wait, without a deadline,
 until a GPU is free. The FFT GKE overlay adds FFT support and its
 time-slicing daemons. LoRA workers keep exclusive GPUs in both deployments.
@@ -43,7 +43,7 @@ Choose the release bundle for the worker types you want:
 | `openrl-lora.yaml` | LoRA | `k8s/deploy/lora` |
 | `openrl-fft.yaml` | LoRA and FFT | `k8s/deploy/fft` |
 
-Both use the same gateway, scheduler, Redis, and GKE storage. The FFT
+Both use the same API server, scheduler, Redis, and GKE storage. The FFT
 bundle also installs the accelerator time-slicer and llm-d snapshot agent.
 These require GPU nodes labeled `nvidia.com/gpu.present=true`, access to the
 GKE NVIDIA driver directory `/home/kubernetes/bin/nvidia`, and permission to
@@ -82,8 +82,8 @@ pod schema and exceeds the client-side apply annotation limit.
 For custom storage or model defaults, add a Kustomize overlay over the platform
 directory and pass that directory to `make render`. GKE needs shared RWX storage
 across nodes; kind uses RWO storage because every process runs on one node.
-Gateway and workers must mount the same PVC. If reusing a differently named PVC,
-patch the gateway's `shared-storage` volume and `OPEN_RL_SHARED_PVC` environment
+API server and workers must mount the same PVC. If reusing a differently named PVC,
+patch the API server's `shared-storage` volume and `OPEN_RL_SHARED_PVC` environment
 variable, and omit the default PVC resource from your overlay.
 
 Check readiness and connect to the API:
@@ -91,12 +91,16 @@ Check readiness and connect to the API:
 ```bash
 kubectl --context my-cluster -n openrl-system rollout status deployment/redis-store
 kubectl --context my-cluster -n openrl-system rollout status deployment/open-rl-scheduler
-kubectl --context my-cluster -n openrl-system rollout status deployment/open-rl-gateway
-kubectl --context my-cluster -n openrl-system port-forward svc/open-rl-gateway-service 8000:8000
+kubectl --context my-cluster -n openrl-system rollout status deployment/open-rl-api-server
+kubectl --context my-cluster -n openrl-system port-forward svc/open-rl-api-server-service 8000:8000
 ```
 
 The default model is public `Qwen/Qwen2.5-0.5B`. Workers download model weights
-on first use; gateway readiness does not imply model loading has completed.
+on first use; API server readiness does not imply model loading has completed.
+
+Any Tinker SDK from 0.23 onward can talk to the API server. SDKs from 0.25 send
+training requests and read training and sampling results as protobuf; the
+API server serves both that and the older JSON encoding.
 
 ## Verify and upgrade
 

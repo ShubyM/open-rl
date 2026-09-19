@@ -151,7 +151,7 @@ def main(config: Config) -> None:
 
 
 if __name__ == "__main__":
-  # Turns OPEN_RL_FINE_TUNING_TYPE into the header the gateway reads. Without
+  # Turns OPEN_RL_FINE_TUNING_TYPE into the header the API server reads. Without
   # it a "fft" scenario silently trains a LoRA adapter: the harness sets the
   # env, but nothing puts it on the wire.
   patch_tinker_default_headers()

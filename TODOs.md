@@ -2,7 +2,7 @@
 
 ## 1. Do Not Cache Worker Pod Templates in Memory
 - **Current Behavior:** `KubernetesFFTWorkerManager.__init__` reads and parses pod templates (`/etc/open-rl/trainer/trainer-worker-pod.yaml`) once at startup and stores them in memory (`self.trainer_template`).
-- **Improvement:** Read and parse the template file dynamically from disk on every `render_pod()` invocation so live ConfigMap updates take effect immediately without requiring a rolling restart of the gateway deployment (`kubectl rollout restart deployment open-rl-gateway`).
+- **Improvement:** Read and parse the template file dynamically from disk on every `render_pod()` invocation so live ConfigMap updates take effect immediately without requiring a rolling restart of the API server deployment (`kubectl rollout restart deployment open-rl-api-server`).
 
 ## 2. Implement Reliable Queue Acknowledgment for Training Steps
 - **Current Behavior:** The trainer requests processor pops training request items immediately from Redis upon picking up a step.
@@ -25,5 +25,5 @@
 - **Improvement:** Update `scheduler_worker_manager.py` (`render_template()`) and static Kubernetes manifests to inject an optional `open-rl-hf-secret` (`or ConfigMap via envFrom / set_env`) into all worker containers, ensuring authenticated, high-bandwidth model downloads without rate-limiting across multi-pod cluster setups.
 
 ## 6. Pin `uv` Image to Specific SHA Digest in Dockerfiles
-- **Current Behavior:** `src/server/Dockerfile` and `src/server/Dockerfile.gateway` copy the `uv` binary from `ghcr.io/astral-sh/uv:latest`. Because the `:latest` tag is mutable and updated frequently upstream, any new `uv` release invalidates the Docker BuildKit cache at that layer, forcing a complete rebuild from scratch (e.g. re-downloading Python, dependency trees, and recompiling custom vLLM C++ extensions).
+- **Current Behavior:** `src/server/Dockerfile` and `src/server/Dockerfile.api_server` copy the `uv` binary from `ghcr.io/astral-sh/uv:latest`. Because the `:latest` tag is mutable and updated frequently upstream, any new `uv` release invalidates the Docker BuildKit cache at that layer, forcing a complete rebuild from scratch (e.g. re-downloading Python, dependency trees, and recompiling custom vLLM C++ extensions).
 - **Improvement:** Pin the `uv` image to a specific static version or SHA digest (e.g. `ghcr.io/astral-sh/uv:0.2.27` or via `@sha256:...`) across all `Dockerfile`s to guarantee reproducible, blazing-fast cached builds unless dependency files (`pyproject.toml`, `uv.lock`) actually change.

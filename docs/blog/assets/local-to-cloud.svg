@@ -50,13 +50,13 @@
   <text x="128" y="334" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="7" fill="#94a3b8">async + long-poll</text>
 
   <!-- ============================================ -->
-  <!-- GATEWAY POD -->
+  <!-- API SERVER POD -->
   <!-- ============================================ -->
   <rect x="250" y="110" width="165" height="186" rx="12" fill="#ffffff" stroke="#93c5fd" stroke-width="1.5"/>
   <rect x="250" y="110" width="165" height="22" rx="12" fill="#eff6ff"/>
   <rect x="250" y="120" width="165" height="12" fill="#eff6ff"/>
   <text x="264" y="126" font-family="ui-sans-serif, system-ui, sans-serif" font-size="7" font-weight="700" fill="#1e40af" letter-spacing="0.03em">POD</text>
-  <text x="290" y="126" font-family="ui-monospace, SFMono-Regular, monospace" font-size="7" fill="#2563eb">open-rl-gateway</text>
+  <text x="290" y="126" font-family="ui-monospace, SFMono-Regular, monospace" font-size="7" fill="#2563eb">open-rl-api-server</text>
 
 
   <text x="264" y="148" font-family="ui-sans-serif, system-ui, sans-serif" font-size="8" font-weight="600" fill="#64748b">FastAPI :8000</text>
@@ -274,10 +274,10 @@
   <!-- FLOW ARROWS -->
   <!-- ============================================ -->
 
-  <!-- Client -> Gateway (always active) -->
+  <!-- Client -> API server (always active) -->
   <line x1="205" y1="220" x2="246" y2="220" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arr)"/>
 
-  <!-- Gateway -> Redis -->
+  <!-- API server -> Redis -->
   <line x1="332" y1="296" x2="332" y2="312" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#arr)"/>
 
   <!-- Redis -> Trainer -->

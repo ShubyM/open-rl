@@ -11,6 +11,31 @@ This directory contains examples, demos, and helper scripts for using the OpenRL
   uv sync
   ```
 
+## Client commands
+
+Run client tools from `examples/`; uv discovers this directory's
+`pyproject.toml`, installs its declared commands, and keeps the environment
+in sync automatically:
+
+```bash
+uv run harvey-train --help
+uv run harvey-eval --help
+uv run harvey-results log_dir=artifacts/harvey-labs/my-run json=True plot=True
+uv run harvey-plot log_dir=artifacts/harvey-labs/my-run out=run.png
+```
+
+From the repository root, use `uv run --project examples <command>`.
+Paths remain relative to your current directory. The root project is the
+server runtime; the client has its own lockfile and CPU dependencies.
+`[project.scripts]` declares CLI commands. Use `--locked` in CI to reject
+lockfile drift.
+
+Run the Harvey renderer regression test from the repository root with
+`uv run --project examples python -m harvey_labs.renderers.qwen35_renderer`.
+It uses standard `unittest` in the examples environment.
+
+See [Harvey LAB RL](harvey_labs) for setup and recipe options.
+
 ---
 
 ## Examples Overview
@@ -24,7 +49,7 @@ This directory contains examples, demos, and helper scripts for using the OpenRL
 * **[Text-to-SQL RL](rl/text-to-sql):** Runs the Gemma 4 SFT+RL recipe with SQL execution rewards and curve plotting.
 
 ### Autoresearch
-* **[Autoresearch Demo](autoresearch):** Runs code-RL researchers against the same OpenRL gateway using cookbook DeepCoder rewards, Sandbox Fusion, and optional Agent Sandbox CRDs.
+* **[Autoresearch Demo](autoresearch):** Runs code-RL researchers against the same OpenRL API server using cookbook DeepCoder rewards, Sandbox Fusion, and optional Agent Sandbox CRDs.
 
 ### Tinker Cookbook
 * **[Tinker Cookbook Recipes](tinker-cookbook):** Examples showing how to run [Tinker Cookbook](https://github.com/thinking-machines-lab/tinker-cookbook) recipes with OpenRL.

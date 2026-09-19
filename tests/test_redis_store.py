@@ -133,6 +133,19 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     batch = await self.store.get_requests(active_set_id="base-1")
     self.assertEqual([r["request_id"] for r in batch], ["a0", "a1"])
 
+  async def test_values_expire_and_sets_hold_members(self) -> None:
+    await self.store.set_value("k", "v", ttl_seconds=60)
+    self.assertEqual(await self.store.get_value("k"), "v")
+    await self.store.set_value("k", "v", ttl_seconds=0.2)
+    await asyncio.sleep(0.5)
+    self.assertIsNone(await self.store.get_value("k"))
+
+    await self.store.add_to_set("s", "a")
+    await self.store.add_to_set("s", "b")
+    await self.store.remove_from_set("s", "a")
+    self.assertEqual(await self.store.set_members("s"), {"b"})
+    self.assertEqual(await self.store.set_members("missing"), set())
+
 
 class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
@@ -184,6 +197,19 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
 
     batch = await self.store.get_requests(active_set_id="base-1")
     self.assertEqual([r["request_id"] for r in batch], ["a0", "a1"])
+
+  async def test_values_expire_and_sets_hold_members(self) -> None:
+    await self.store.set_value("k", "v", ttl_seconds=60)
+    self.assertEqual(await self.store.get_value("k"), "v")
+    await self.store.set_value("k", "v", ttl_seconds=0.2)
+    await asyncio.sleep(0.5)
+    self.assertIsNone(await self.store.get_value("k"))
+
+    await self.store.add_to_set("s", "a")
+    await self.store.add_to_set("s", "b")
+    await self.store.remove_from_set("s", "a")
+    self.assertEqual(await self.store.set_members("s"), {"b"})
+    self.assertEqual(await self.store.set_members("missing"), set())
 
 
 if __name__ == "__main__":

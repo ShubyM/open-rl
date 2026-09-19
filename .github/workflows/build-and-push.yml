@@ -14,15 +14,15 @@ jobs:
     strategy:
       matrix:
         include:
-          - image_name: gateway
+          - image_name: api-server
             context: .
-            dockerfile: src/server/Dockerfile.gateway
+            dockerfile: src/server/Dockerfile.api_server
           - image_name: server
             context: .
             dockerfile: src/server/Dockerfile
           - image_name: client
             context: .
-            dockerfile: examples/autoresearch/Dockerfile
+            dockerfile: src/server/Dockerfile.client
           - image_name: scheduler
             context: scheduler/controller
             dockerfile: scheduler/controller/Dockerfile
