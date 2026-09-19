@@ -28,9 +28,8 @@ class ApiRuntime:
     self.tasks: list[asyncio.Task[Any]] = []
 
   async def submit(self, command: commands.TrainingCommand) -> str:
-    """Start trainers for create commands, register one future, then route the work."""
+    """Start trainers for create commands, then route the work by request ID."""
     request_id = command.request_id
-    await self.store.set_future(request_id, {"status": "pending"})
     try:
       if self.worker_manager is not None and isinstance(command, commands.CreateModel | commands.CreateModelFromState):
         await asyncio.to_thread(self.worker_manager.ensure, command.model_id, "trainer")

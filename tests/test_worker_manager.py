@@ -96,7 +96,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
     self.assertEqual(len(self.store.forwarded_requests), 1)
-    self.assertEqual(self.store.future_updates, [(model_id, {"status": "pending"})])
+    self.assertEqual(self.store.future_updates, [])
     request = self.store.forwarded_requests[0]
     self.assertEqual(request["op"], "create_model")
     self.assertEqual(request["model_id"], model_id)
@@ -177,7 +177,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(request_id, "step")
     self.assertEqual(self.worker_manager.launched_model_ids, [])
     self.assertEqual(self.store.active_sets, ["shared-base-1"])
-    self.assertEqual(self.store.future_updates, [("step", {"status": "pending"})])
+    self.assertEqual(self.store.future_updates, [])
 
   async def test_queue_failure_resolves_pending_future(self) -> None:
     with (

@@ -269,9 +269,8 @@ def new_request_id() -> str:
 
 
 async def enqueue_sampling(runtime: ApiRuntime, request: dict[str, Any]) -> str:
-  """Register the pending result and inject the active trace at the sampling queue boundary."""
+  """Inject the active trace at the sampling queue boundary."""
   request_id = request["request_id"]
-  await runtime.store.set_future(request_id, {"status": "pending"})
   carrier: dict[str, str] = {}
   propagate.inject(carrier)
   await runtime.store.put_sampling_request({**request, "trace_context": carrier})

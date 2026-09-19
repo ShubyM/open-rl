@@ -298,7 +298,7 @@ class SampleSequenceIdsTest(ApiServerTest):
       promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)
 
-  def test_vllm_submission_registers_future_and_carries_http_trace(self) -> None:
+  def test_vllm_submission_carries_http_trace_without_future_registration(self) -> None:
     trace_id = "1234567890abcdef1234567890abcdef"
     with patch.object(api_server, "get_sampler_backend", return_value="vllm"):
       response = self.post(
@@ -310,7 +310,7 @@ class SampleSequenceIdsTest(ApiServerTest):
     promise = response.json()
     queued = asyncio.run(self.runtime.store.get_sampling_requests_for_model("job-a"))[0]
     self.assertEqual(queued["request_id"], promise["request_id"])
-    self.assertEqual(self.runtime.store.futures_store[promise["request_id"]], {"status": "pending"})
+    self.assertNotIn(promise["request_id"], self.runtime.store.futures_store)
     self.assertEqual(queued["prompt_token_ids"], [1, 2])
     self.assertEqual(len(promise["sample_sequence_ids"]), 2)
     context = trace.get_current_span(propagate.extract(queued["trace_context"])).get_span_context()
@@ -338,7 +338,7 @@ class QueueTraceContextTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["trace_context"], {"old": "context"})
         raw = (await store.get_sampling_requests_for_model("model"))[0]
       self.assertEqual(returned_id, request_id)
-      self.assertEqual(store.futures_store[request_id], {"status": "pending"})
+      self.assertNotIn(request_id, store.futures_store)
       return raw["trace_context"]
 
     for queue in ("training", "sampling"):
