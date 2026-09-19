@@ -8,6 +8,7 @@ from server import api_server
 from server.estimator import footprint
 from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager
 from server.store import InMemoryStore
+from tests.api_client import asgi_client, post_json
 
 
 class ApiError(Exception):
@@ -221,8 +222,9 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
       patch.object(api_server, "get_store", return_value=store),
       patch.object(api_server, "worker_manager", SchedulerWorkerManager(custom_api=api)),
     ):
-      for model_id in ("lora-a", "fft-a", "lora-b"):
-        await api_server.create_sampling_session({"model_path": f"tinker://{model_id}/sampler_weights/checkpoint"})
+      async with asgi_client() as client:
+        for model_id in ("lora-a", "fft-a", "lora-b"):
+          await post_json(client, "create_sampling_session", {"model_path": f"tinker://{model_id}/sampler_weights/checkpoint"})
 
     self.assertEqual(len(api.created), 2, "LoRA sessions should reuse one sampler while FFT gets its own")
     lora, fft = api.created

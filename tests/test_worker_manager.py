@@ -5,6 +5,7 @@ from unittest.mock import patch
 from server import api_server
 from server.session_registry import SessionRegistry
 from server.worker_manager import LocalWorkerManager
+from tests.api_client import asgi_client, post_json
 
 
 class StoreStub:
@@ -75,13 +76,17 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.enterContext(patch("server.store.get_store", return_value=self.store))
 
   async def asyncSetUp(self) -> None:
-    self.session_id = (await api_server.create_session({}))["session_id"]
+    self.client = await self.enterAsyncContext(asgi_client())
+    self.session_id = (await self.post("create_session", {}))["session_id"]
+
+  async def post(self, path: str, body: dict) -> dict:
+    return await post_json(self.client, path, body)
 
   async def test_create_model_launches_worker_then_enqueues(self) -> None:
     import json
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
-      result = await api_server.create_model({"base_model": "base-model", "session_id": self.session_id})
+      result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
@@ -97,7 +102,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.worker_manager.error = RuntimeError("boom")
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}), patch("server.api_server.traceback.print_exc"):
-      result = await api_server.create_model({"base_model": "base-model", "session_id": self.session_id})
+      result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
@@ -108,14 +113,15 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     import json
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
-      result = await api_server.create_model_from_state(
+      result = await self.post(
+        "create_model_from_state",
         {
           "session_id": self.session_id,
           "state_path": "/tmp/checkpoint",
           "base_model": "restored-base",
           "full_config": {"weight_sync_strategy": "delta"},
           "restore_optimizer": True,
-        }
+        },
       )
 
     model_id = result["request_id"]
@@ -153,7 +159,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_create_model_launches_trainer_when_worker_manager_present(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "false"}):
-      result = await api_server.create_model({"base_model": "base-model", "session_id": self.session_id})
+      result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
     self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
@@ -259,7 +265,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     }
     request = Request(scope)
     model_id = await api_server._extract_and_persist_model_metadata(
-      {"base_model": "Qwen/Qwen2.5-0.5B"},
+      api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"),
       request,
       default_fine_tuning_type="full",
     )
