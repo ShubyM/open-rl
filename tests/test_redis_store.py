@@ -10,6 +10,9 @@ import socket
 import subprocess
 import time
 import unittest
+from unittest.mock import patch
+
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from server.store import RedisStore
 
@@ -64,6 +67,7 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
 
   async def asyncTearDown(self) -> None:
     await self.store.redis.aclose()
+    self.store.sync_redis.close()
 
   async def test_get_future_returns_already_resolved_result(self) -> None:
     await self.store.set_future("req-1", {"type": "sample", "ok": True})
@@ -80,7 +84,7 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     await resolver
 
     self.assertEqual(result, {"type": "sample"})
-    # Woken by the publish, not by grinding through the whole long-poll window.
+    # Returns as soon as a polling read finds the result.
     self.assertLess(time.monotonic() - started, 5.0)
 
   async def test_result_survives_repeated_and_concurrent_reads(self) -> None:
@@ -91,6 +95,56 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     for result in await asyncio.gather(*waiters):
       self.assertEqual(result, {"type": "sample"})
     self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample"})
+
+  async def test_read_preserves_legacy_list_and_renews_expiry(self) -> None:
+    key = "open_rl:future:req-1"
+    previous = '{"type": "sample", "ok": false}'
+    raw = '{"type": "sample", "ok": true}'
+    await self.store.redis.rpush(key, previous, raw)
+    await self.store.redis.expire(key, 30)
+
+    self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample", "ok": True})
+    self.assertEqual(await self.store.redis.lrange(key, 0, -1), [previous, raw])
+    self.assertGreater(await self.store.redis.ttl(key), 290)
+
+  async def test_repeated_resolution_replaces_the_result(self) -> None:
+    await self.store.set_future("req-1", {"type": "first"})
+    await self.store.set_future("req-1", {"type": "replacement"})
+    for _ in range(2):
+      self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "replacement"})
+    self.assertEqual(await self.store.redis.llen("open_rl:future:req-1"), 1)
+
+  async def test_cancelled_reader_does_not_remove_result(self) -> None:
+    await self.store.set_future("req-1", {"type": "sample"})
+    read = asyncio.Event()
+    execute_command = self.store.redis.execute_command
+
+    async def pause_after_read(*args, **kwargs):
+      result = await execute_command(*args, **kwargs)
+      if args[0] in {"LINDEX", "LPOP"}:
+        read.set()
+        await asyncio.Event().wait()
+      return result
+
+    # Cancel after Redis has executed the read but before get_future can
+    # continue. A destructive read loses the result at this boundary.
+    with patch.object(self.store.redis, "execute_command", side_effect=pause_after_read):
+      reader = asyncio.create_task(self.store.get_future("req-1", timeout=1.0))
+      try:
+        await asyncio.wait_for(read.wait(), timeout=1.0)
+      finally:
+        reader.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+          await reader
+
+    self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample"})
+
+  async def test_redis_failure_is_not_reported_as_pending(self) -> None:
+    with (
+      patch.object(self.store.redis, "execute_command", side_effect=RedisConnectionError("unavailable")),
+      self.assertRaises(RedisConnectionError),
+    ):
+      await self.store.get_future("req-1", timeout=0.2)
 
   async def test_unresolved_future_times_out_with_try_again(self) -> None:
     result = await self.store.get_future("req-never", timeout=0.3)
@@ -152,6 +206,74 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
     from server.store import InMemoryStore
 
     self.store = InMemoryStore()
+
+  async def test_future_wakes_all_waiters_without_registration(self) -> None:
+    waiters = [asyncio.create_task(self.store.get_future("req-1", timeout=1.0)) for _ in range(3)]
+    await asyncio.sleep(0)
+    await self.store.set_future("req-1", {"type": "sample"})
+
+    self.assertEqual(await asyncio.gather(*waiters), [{"type": "sample"}] * 3)
+    self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample"})
+    self.assertEqual(self.store.futures_events, {})
+
+  async def test_timed_out_waiter_does_not_disconnect_other_waiters(self) -> None:
+    short = asyncio.create_task(self.store.get_future("req-1", timeout=0.01))
+    long = asyncio.create_task(self.store.get_future("req-1", timeout=1.0))
+    self.assertEqual((await short)["type"], "try_again")
+    await self.store.set_future("req-1", {"type": "sample"})
+
+    self.assertEqual(await long, {"type": "sample"})
+    self.assertEqual(self.store.futures_events, {})
+
+  async def test_cancelled_waiter_does_not_disconnect_other_waiters(self) -> None:
+    cancelled = asyncio.create_task(self.store.get_future("req-1", timeout=1.0))
+    waiting = asyncio.create_task(self.store.get_future("req-1", timeout=1.0))
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with self.assertRaises(asyncio.CancelledError):
+      await cancelled
+    await self.store.set_future("req-1", {"type": "sample"})
+
+    self.assertEqual(await waiting, {"type": "sample"})
+    self.assertEqual(self.store.futures_events, {})
+
+  async def test_pending_markers_do_not_store_or_overwrite_results(self) -> None:
+    await self.store.set_future("req-1", {"status": "pending"})
+    self.assertNotIn("req-1", self.store.futures_store)
+    self.assertEqual((await self.store.get_future("req-1", timeout=0.01))["type"], "try_again")
+    self.assertEqual(self.store.futures_events, {})
+
+    await self.store.set_future("req-1", {"type": "sample"})
+    await self.store.set_future("req-1", {"status": "pending"})
+    self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample"})
+
+  async def test_repeated_resolution_replaces_the_result(self) -> None:
+    await self.store.set_future("req-1", {"type": "first"})
+    await self.store.set_future("req-1", {"type": "replacement"})
+    for _ in range(2):
+      self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "replacement"})
+
+  async def test_metadata_updates_preserve_existing_fields(self) -> None:
+    await self.store.set_value("open_rl:model_meta:model-1", '{"base_model": "base", "total_steps_completed": 1}')
+    with patch("server.store.time.time", return_value=123.0):
+      await self.store.update_job_metadata("model-1", {"total_steps_completed": 2})
+    self.assertEqual(
+      await self.store.get_model_metadata("model-1"),
+      {"model_id": "model-1", "base_model": "base", "total_steps_completed": 2, "updated_at": 123.0},
+    )
+
+  async def test_metadata_missing_or_invalid_can_be_updated(self) -> None:
+    for raw in (None, "invalid JSON"):
+      with self.subTest(raw=raw):
+        if raw is not None:
+          await self.store.set_value("open_rl:model_meta:model-1", raw)
+        self.assertIsNone(await self.store.get_model_metadata("model-1"))
+        with patch("server.store.time.time", return_value=123.0):
+          await self.store.update_job_metadata("model-1", {"status": "completed"})
+        self.assertEqual(
+          await self.store.get_model_metadata("model-1"),
+          {"model_id": "model-1", "status": "completed", "updated_at": 123.0},
+        )
 
   async def test_sampling_queue_put_and_get(self) -> None:
     req1 = {"model_id": "base-m1", "request_id": "r1"}
