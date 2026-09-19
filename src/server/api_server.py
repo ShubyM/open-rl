@@ -8,6 +8,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
@@ -293,49 +294,36 @@ def is_sampler_weights_ref(model_id: str | None) -> bool:
   return len(parts) >= 3 and parts[1] == "sampler_weights"
 
 
-async def _extract_and_persist_model_metadata(
+def build_model_metadata(
   req: CreateModelRequest | CreateModelFromStateRequest,
-  request: Request | None = None,
-  default_fine_tuning_type: str = "lora",
-) -> tuple[str, TrainingModelMetadata]:
-  """Extract and normalize model configuration from headers and payload, persisting TrainingModelMetadata exactly once."""
-  base_model = req.base_model
-  if not base_model and default_fine_tuning_type != "restored":
+  headers: Mapping[str, str],
+) -> TrainingModelMetadata:
+  """Normalize model settings without writing to the store or changing the request."""
+  restoring = isinstance(req, CreateModelFromStateRequest)
+  if not req.base_model and not restoring:
     raise ValueError("base_model is required in request payload")
 
-  full_config = dict(req.full_config or {})
-  lora_config = dict(req.lora_config or {})
-
-  headers = request.headers if request is not None else {}
-  weight_sync_cfg = extract_weight_sync_config(headers)
-
-  fine_tuning_type = default_fine_tuning_type
-  h_val = (headers.get("x-open-rl-fine-tuning-type") or "").lower()
-  if h_val == "full":
-    fine_tuning_type = "full"
-  elif h_val == "lora":
-    fine_tuning_type = "lora"
-
+  fine_tuning_type = (headers.get("x-open-rl-fine-tuning-type") or "").lower()
+  if fine_tuning_type not in {"full", "lora"}:
+    fine_tuning_type = "restored" if restoring else "lora"
   if fine_tuning_type == "full" and not is_fft_enabled():
     raise ValueError("Full Fine-Tuning (FFT) is disabled on this Open-RL API server instance")
 
-  if fine_tuning_type != "full" and default_fine_tuning_type != "restored":
-    fine_tuning_type = "lora"
-
-  full_config["weight_sync_strategy"] = weight_sync_cfg.strategy
-
-  model_id = str(uuid.uuid4())
-  meta_obj = TrainingModelMetadata(
-    base_model=base_model,
+  weight_sync_config = extract_weight_sync_config(headers)
+  return TrainingModelMetadata(
+    base_model=req.base_model,
     created_at=time.time(),
     fine_tuning_type=fine_tuning_type,
-    weight_sync_config=weight_sync_cfg,
-    full_config=full_config,
-    lora_config=lora_config,
+    weight_sync_config=weight_sync_config,
+    full_config={**(req.full_config or {}), "weight_sync_strategy": weight_sync_config.strategy},
+    lora_config=dict(req.lora_config or {}),
   )
-  await store.set_value(f"open_rl:model_meta:{model_id}", json.dumps(meta_obj.to_dict()))
 
-  return model_id, meta_obj
+
+async def persist_model_metadata(metadata: TrainingModelMetadata) -> str:
+  model_id = new_request_id()
+  await store.set_value(f"open_rl:model_meta:{model_id}", json.dumps(metadata.to_dict()))
+  return model_id
 
 
 def new_request_id() -> str:
@@ -600,7 +588,8 @@ async def session_heartbeat(req: SessionHeartbeatRequest):
 async def create_model(req: CreateModelRequest, request: Request) -> dict[str, Any]:
   """ServiceClient.create_lora_training_client_async()"""
   try:
-    model_id, meta = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="lora")
+    meta = build_model_metadata(req, request.headers)
+    model_id = await persist_model_metadata(meta)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -642,7 +631,8 @@ async def create_model_from_state(req: CreateModelFromStateRequest, request: Req
   if resolved_path is None:
     resolved_path = state_path if os.path.isabs(state_path) else os.path.join(TMP_DIR, "checkpoints", state_path)
   try:
-    model_id, meta = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="restored")
+    meta = build_model_metadata(req, request.headers)
+    model_id = await persist_model_metadata(meta)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 

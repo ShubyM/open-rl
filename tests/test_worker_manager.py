@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -251,7 +252,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     self.store = StoreStub()
     self.enterContext(patch.object(api_server, "store", self.store))
 
-  async def test_extract_and_persist_metadata_from_headers(self) -> None:
+  async def test_build_and_persist_metadata_from_headers(self) -> None:
     import json
 
     from fastapi import Request
@@ -264,11 +265,9 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
       ],
     }
     request = Request(scope)
-    model_id, _meta = await api_server._extract_and_persist_model_metadata(
-      api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"),
-      request,
-      default_fine_tuning_type="full",
-    )
+    metadata = api_server.build_model_metadata(api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"), request.headers)
+    self.assertEqual(self.store.kv_store, {})
+    model_id = await api_server.persist_model_metadata(metadata)
 
     meta_val = self.store.kv_store.get(f"open_rl:model_meta:{model_id}")
     self.assertIsNotNone(meta_val)
@@ -276,6 +275,39 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(meta_dict["base_model"], "Qwen/Qwen2.5-0.5B")
     self.assertEqual(meta_dict["fine_tuning_type"], "lora")
     self.assertEqual(meta_dict["weight_sync_config"]["strategy"], "delta")
+
+  def test_metadata_defaults_depend_on_create_or_restore_request(self) -> None:
+    for header in ({}, {"x-open-rl-fine-tuning-type": "unknown"}):
+      with self.subTest(headers=header):
+        created = api_server.build_model_metadata(api_server.CreateModelRequest(base_model="base"), header)
+        restored = api_server.build_model_metadata(api_server.CreateModelFromStateRequest(state_path="/checkpoint"), header)
+        self.assertEqual(created.fine_tuning_type, "lora")
+        self.assertEqual(restored.fine_tuning_type, "restored")
+        self.assertIsNone(restored.base_model)
+    self.assertEqual(self.store.kv_store, {})
+
+  def test_headers_override_config_without_mutating_request(self) -> None:
+    req = api_server.CreateModelRequest(
+      base_model="base", full_config={"cpu_offload": False, "weight_sync_strategy": "delta"}, lora_config={"rank": 8}
+    )
+    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
+      meta = api_server.build_model_metadata(req, {"x-open-rl-fine-tuning-type": "FULL", "x-open-rl-weight-sync-strategy": "full"})
+    self.assertEqual(meta.fine_tuning_type, "full")
+    self.assertEqual(meta.full_config, {"cpu_offload": False, "weight_sync_strategy": "full"})
+    self.assertEqual(meta.weight_sync_config.strategy, "full")
+    self.assertEqual(req.full_config["weight_sync_strategy"], "delta")
+    meta.lora_config["rank"] = 16
+    self.assertEqual(req.lora_config["rank"], 8)
+
+  def test_disabled_fft_is_rejected_for_create_and_restore(self) -> None:
+    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "false"}):
+      for req in (
+        api_server.CreateModelRequest(base_model="base"),
+        api_server.CreateModelFromStateRequest(state_path="/checkpoint"),
+      ):
+        with self.subTest(request=type(req).__name__), self.assertRaisesRegex(ValueError, "FFT.*disabled"):
+          api_server.build_model_metadata(req, {"x-open-rl-fine-tuning-type": "full"})
+    self.assertEqual(self.store.kv_store, {})
 
 
 class ApiServerFutureTranslationTest(unittest.TestCase):
