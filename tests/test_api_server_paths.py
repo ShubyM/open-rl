@@ -88,13 +88,52 @@ class GetInfoTest(ApiServerTest):
     self.assertEqual(response.status_code, 400)
     self.assertIn("rank", response.json()["error"])
     self.assertEqual(self.runtime.store.queues, {})
-    self.assertEqual([k for k in self.runtime.store.kv_store if k.startswith("open_rl:model_meta:")], [])
+    self.assertEqual(self.runtime.state.kv_store, {})
 
   def test_create_model_from_state_refuses_a_malformed_tinker_path(self) -> None:
     response = self.post("create_model_from_state", {"state_path": "tinker://job-a/sampler_weights/sampler-3"})
     self.assertEqual(response.status_code, 400)
     self.assertIn("is not a tinker://<model>/weights/<name> path", response.json()["error"])
     self.assertEqual(self.runtime.store.queues, {})
+
+
+class RestoreTest(ApiServerTest):
+  def test_restore_uses_checkpoint_metadata_for_routing_and_tokenizer(self) -> None:
+    for kind in ("lora", "full"):
+      with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
+        with open(os.path.join(directory, "metadata.json"), "w") as f:
+          json.dump({"base_model": "checkpoint-base", "model_id": "old"}, f)
+        if kind == "lora":
+          os.makedirs(os.path.join(directory, "old"))
+          with open(os.path.join(directory, "old", "adapter_config.json"), "w") as f:
+            json.dump({"r": 8}, f)
+        response = self.post("create_model_from_state", {"state_path": directory})
+        self.assertEqual(response.status_code, 200)
+        model_id = response.json()["request_id"]
+        metadata = json.loads(self.runtime.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+        self.assertEqual(metadata["base_model"], "checkpoint-base")
+        self.assertEqual(metadata["fine_tuning_type"], kind)
+        active_set = "checkpoint-base-1" if kind == "lora" else "default"
+        self.assertIn(model_id, self.runtime.store.active_tenants[active_set])
+        command = asyncio.run(self.runtime.store.get_requests(active_set))[0]
+        self.assertEqual(command["fine_tuning_type"], kind)
+        info = self.post("get_info", {"model_id": model_id}).json()
+        self.assertEqual(info["model_name"], "checkpoint-base")
+        self.assertEqual(info["model_data"]["tokenizer_id"], "checkpoint-base")
+
+  def test_bad_restore_does_not_persist_metadata(self) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+      for saved in ([], None, {}, {"base_model": None}, {"base_model": "checkpoint-base", "model_id": None}, {"base_model": "checkpoint-base"}):
+        with open(os.path.join(directory, "metadata.json"), "w") as f:
+          json.dump(saved, f)
+        response = self.post("create_model_from_state", {"state_path": directory, "base_model": "wrong-base"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.runtime.state.kv_store, {})
+        self.assertEqual(self.runtime.store.queues, {})
+
+  def test_deleting_unknown_model_does_not_create_stub_metadata(self) -> None:
+    self.assertEqual(self.post("delete_model", {"model_id": "missing"}).status_code, 404)
+    self.assertEqual(self.runtime.state.kv_store, {})
 
 
 class ErrorShapeTest(ApiServerTest):

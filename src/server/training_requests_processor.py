@@ -477,12 +477,9 @@ async def run_training_requests_processor(
 async def main_async(args: argparse.Namespace) -> None:
   fine_tuning_type = os.getenv("OPEN_RL_FINE_TUNING_TYPE") or ("full" if is_fft_enabled() else "lora")
   if args.model_id:
-    try:
-      metadata = await get_model_metadata(get_state_store(), args.model_id)
-      if metadata:
-        fine_tuning_type = metadata.get("fine_tuning_type", fine_tuning_type)
-    except Exception as exc:
-      print(f"[WORKER] Failed to fetch model metadata for {args.model_id}: {exc}")
+    metadata = await get_model_metadata(get_state_store(), args.model_id)
+    if metadata is not None:
+      fine_tuning_type = metadata.get("fine_tuning_type", fine_tuning_type)
 
   is_lora = fine_tuning_type == "lora"
   print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")

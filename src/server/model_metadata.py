@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from server.store import StateStore
+from training.types import FineTuningType
 
 
 @dataclass
@@ -69,10 +70,10 @@ def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
 class TrainingModelMetadata:
   base_model: str
   created_at: float
-  fine_tuning_type: str = "lora"
+  fine_tuning_type: FineTuningType = "lora"
   weight_sync_config: WeightSyncConfig = field(default_factory=WeightSyncConfig)
-  full_config: dict[str, Any] | None = None
-  lora_config: dict[str, Any] | None = None
+  full_config: dict[str, Any] = field(default_factory=dict)
+  lora_config: dict[str, Any] = field(default_factory=dict)
   status: str = "active"
   updated_at: float = 0.0
   completed_at: float | None = None
@@ -95,18 +96,18 @@ class TrainingModelMetadata:
       cfg = WeightSyncConfig()
 
     ft_type = data.get("fine_tuning_type", "lora")
-    if ft_type == "full":
-      ft_type = "full"
-    else:
-      ft_type = "lora"
+    if ft_type not in {"lora", "full"}:
+      raise ValueError(f"Invalid fine_tuning_type: {ft_type!r}")
+    if not isinstance(data.get("base_model"), str) or not data["base_model"]:
+      raise ValueError("Model metadata must specify base_model")
 
     return cls(
-      base_model=str(data.get("base_model") or ""),
+      base_model=data["base_model"],
       created_at=data.get("created_at", 0.0),
       fine_tuning_type=ft_type,
       weight_sync_config=cfg,
-      full_config=data.get("full_config"),
-      lora_config=data.get("lora_config"),
+      full_config=data.get("full_config") or {},
+      lora_config=data.get("lora_config") or {},
       status=data.get("status", "active"),
       updated_at=data.get("updated_at", data.get("created_at", 0.0)),
       completed_at=data.get("completed_at"),
@@ -138,13 +139,16 @@ class TrainingModelMetadata:
 
 
 def _decode_metadata(raw: str | None) -> dict[str, Any] | None:
-  if not raw:
+  if raw is None:
     return None
-  try:
-    data = json.loads(raw)
-  except (TypeError, ValueError):
-    return None
-  return data if isinstance(data, dict) else None
+  data = json.loads(raw)
+  if not isinstance(data, dict):
+    raise ValueError("Model metadata must be a JSON object")
+  if not isinstance(data.get("base_model"), str) or not data["base_model"]:
+    raise ValueError("Model metadata must specify base_model")
+  if data.get("fine_tuning_type", "lora") not in {"lora", "full"}:
+    raise ValueError("Model metadata must specify lora or full fine_tuning_type")
+  return data
 
 
 async def get_model_metadata(state: StateStore, model_id: str) -> dict[str, Any] | None:
@@ -163,7 +167,9 @@ def get_model_metadata_sync(state: StateStore, model_id: str) -> dict[str, Any] 
 
 async def update_model_metadata(state: StateStore, model_id: str, updates: dict[str, Any]) -> None:
   key = f"open_rl:model_meta:{model_id}"
-  data = _decode_metadata(await state.get_value(key)) or {}
+  data = _decode_metadata(await state.get_value(key))
+  if data is None:
+    raise KeyError(f"Unknown model: {model_id}")
   data.update(updates)
   data["updated_at"] = time.time()
   await state.set_value(key, json.dumps(data))

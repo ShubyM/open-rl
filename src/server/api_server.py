@@ -249,13 +249,12 @@ def build_model_metadata(
   headers: Mapping[str, str],
 ) -> TrainingModelMetadata:
   """Normalize model settings without writing to the store or changing the request."""
-  restoring = isinstance(req, CreateModelFromStateRequest)
-  if not req.base_model and not restoring:
+  if not req.base_model:
     raise ValueError("base_model is required in request payload")
 
   fine_tuning_type = (headers.get("x-open-rl-fine-tuning-type") or "").lower()
   if fine_tuning_type not in {"full", "lora"}:
-    fine_tuning_type = "restored" if restoring else "lora"
+    fine_tuning_type = "lora"
   if fine_tuning_type == "full" and not is_fft_enabled():
     raise ValueError("Full Fine-Tuning (FFT) is disabled on this Open-RL API server instance")
 
@@ -333,18 +332,28 @@ def checkpoint_uri(root: str, state_path: str) -> str:
 
 
 def checkpoint_info(root: str, path: str) -> dict[str, Any] | None:
-  state_dir = checkpoint_from_uri(root, path)
+  state_dir = checkpoint_from_uri(root, path) or (path if os.path.isabs(path) else None)
   metadata_path = os.path.join(state_dir, "metadata.json") if state_dir else None
   if not metadata_path or not os.path.exists(metadata_path):
     return None
   with open(metadata_path) as f:
     saved = json.load(f)
-  adapter_config_path = os.path.join(state_dir, saved.get("model_id", ""), "adapter_config.json")
+  if not isinstance(saved, dict) or not isinstance(saved.get("base_model"), str) or not saved["base_model"]:
+    raise ValueError("Checkpoint metadata must specify base_model")
+  saved_model_id = saved.get("model_id", "")
+  if not isinstance(saved_model_id, str):
+    raise ValueError("Checkpoint model_id must be a string")
+  adapter_config_path = os.path.join(state_dir, saved_model_id, "adapter_config.json")
+  if not os.path.exists(adapter_config_path):
+    adapter_config_path = os.path.join(state_dir, "adapter_config.json")
   is_lora = os.path.exists(adapter_config_path)
   rank = None
   if is_lora:
     with open(adapter_config_path) as f:
-      rank = json.load(f).get("r")
+      adapter_config = json.load(f)
+    if not isinstance(adapter_config, dict):
+      raise ValueError("Checkpoint adapter config must be an object")
+    rank = adapter_config.get("r")
   return {"base_model": saved["base_model"], "is_lora": is_lora, "lora_rank": rank, "type": "weights_info"}
 
 
@@ -512,8 +521,8 @@ async def create_model(runtime: Runtime, req: CreateModelRequest, request: Reque
     model_id=model_id,
     base_model=meta.base_model,
     fine_tuning_type=meta.fine_tuning_type,
-    lora_config=meta.lora_config or {},
-    full_config=meta.full_config or {},
+    lora_config=meta.lora_config,
+    full_config=meta.full_config,
   )
   await persist_model_metadata(runtime.state, model_id, meta)
   await runtime.bind_session(req.session_id, model_id)
@@ -525,7 +534,9 @@ async def create_model(runtime: Runtime, req: CreateModelRequest, request: Reque
 async def delete_model(runtime: Runtime, req: ModelRequest):
   model_id = req.model_id
   meta = await get_model_metadata(runtime.state, model_id)
-  is_lora = bool(meta and meta.get("fine_tuning_type") == "lora")
+  if meta is None:
+    raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+  is_lora = meta.get("fine_tuning_type", "lora") == "lora"
   if is_fft_enabled() and not is_lora:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
     await runtime.store.put_request(commands.wire(commands.Shutdown(model_id=model_id)))
@@ -548,9 +559,20 @@ async def create_model_from_state(runtime: Runtime, req: CreateModelFromStateReq
   else:
     # Legacy restore names are relative to the checkpoint root, not a new model.
     resolved_path = os.path.join(runtime.checkpoint_root, state_path)
+  # The checkpoint names its own base model and tuning kind; the request may only agree with it.
   try:
-    meta = build_model_metadata(req, request.headers)
-  except ValueError as exc:
+    checkpoint = await asyncio.to_thread(checkpoint_info, runtime.checkpoint_root, resolved_path)
+    if checkpoint is None:
+      raise ValueError(f"No checkpoint at {state_path}")
+    kind = "lora" if checkpoint["is_lora"] else "full"
+    if req.base_model is not None and req.base_model != checkpoint["base_model"]:
+      raise ValueError("base_model does not match the checkpoint")
+    requested_kind = request.headers.get("x-open-rl-fine-tuning-type", "").lower()
+    if requested_kind in {"lora", "full"} and requested_kind != kind:
+      raise ValueError("fine-tuning type does not match the checkpoint")
+    req = req.model_copy(update={"base_model": checkpoint["base_model"]})
+    meta = build_model_metadata(req, {**request.headers, "x-open-rl-fine-tuning-type": kind})
+  except (ValueError, OSError) as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
   model_id = new_request_id()
   command = commands.CreateModelFromState(
@@ -558,7 +580,7 @@ async def create_model_from_state(runtime: Runtime, req: CreateModelFromStateReq
     model_id=model_id,
     state_path=resolved_path,
     restore_optimizer=req.restore_optimizer,
-    fine_tuning_type="full" if meta.fine_tuning_type == "full" else "lora",
+    fine_tuning_type=meta.fine_tuning_type,
   )
   await persist_model_metadata(runtime.state, model_id, meta)
   await runtime.bind_session(req.session_id, model_id)

@@ -27,11 +27,8 @@ logger = logging.getLogger(__name__)
 
 def metadata_for(model_id: str) -> TrainingModelMetadata | None:
   """The metadata create_model stored for this model, or None."""
-  try:
-    data = get_model_metadata_sync(get_state_store(), model_id)
-    return TrainingModelMetadata.from_dict(data) if data is not None else None
-  except Exception:
-    return None
+  data = get_model_metadata_sync(get_state_store(), model_id)
+  return TrainingModelMetadata.from_dict(data) if data is not None else None
 
 
 def runtime_of(model_id: str) -> tuple[TrainingModelMetadata, str, bool]:

@@ -97,7 +97,10 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
   async def test_create_model_from_state_launches_worker_then_enqueues(self) -> None:
     import json
 
-    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
+    with (
+      patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}),
+      patch.object(api_server, "checkpoint_info", return_value={"base_model": "restored-base", "is_lora": False}),
+    ):
       result = await self.post(
         "create_model_from_state",
         {
@@ -120,7 +123,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     # Assert canonical metadata persistence:
     meta = json.loads(self.runtime.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "restored-base")
-    self.assertEqual(meta["fine_tuning_type"], "restored")
+    self.assertEqual(meta["fine_tuning_type"], "full")
     self.assertEqual(meta["full_config"]["weight_sync_strategy"], "delta")
 
     # Assert no dual-key writing:
@@ -327,14 +330,14 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(meta_dict["fine_tuning_type"], "lora")
     self.assertEqual(meta_dict["weight_sync_config"]["strategy"], "delta")
 
-  def test_metadata_defaults_depend_on_create_or_restore_request(self) -> None:
+  def test_resolved_metadata_defaults_to_lora(self) -> None:
     for header in ({}, {"x-open-rl-fine-tuning-type": "unknown"}):
       with self.subTest(headers=header):
         created = api_server.build_model_metadata(api_server.CreateModelRequest(base_model="base"), header)
-        restored = api_server.build_model_metadata(api_server.CreateModelFromStateRequest(state_path="/checkpoint"), header)
+        restored = api_server.build_model_metadata(api_server.CreateModelFromStateRequest(state_path="/checkpoint", base_model="base"), header)
         self.assertEqual(created.fine_tuning_type, "lora")
-        self.assertEqual(restored.fine_tuning_type, "restored")
-        self.assertIsNone(restored.base_model)
+        self.assertEqual(restored.fine_tuning_type, "lora")
+        self.assertEqual(restored.base_model, "base")
     self.assertEqual(self.runtime.state.kv_store, {})
 
   def test_headers_override_config_without_mutating_request(self) -> None:
@@ -354,7 +357,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "false"}):
       for req in (
         api_server.CreateModelRequest(base_model="base"),
-        api_server.CreateModelFromStateRequest(state_path="/checkpoint"),
+        api_server.CreateModelFromStateRequest(state_path="/checkpoint", base_model="base"),
       ):
         with self.subTest(request=type(req).__name__), self.assertRaisesRegex(ValueError, "FFT.*disabled"):
           api_server.build_model_metadata(req, {"x-open-rl-fine-tuning-type": "full"})
