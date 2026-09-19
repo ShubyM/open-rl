@@ -6,9 +6,12 @@ import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from opentelemetry import propagate, trace
+from opentelemetry.sdk.trace import TracerProvider
 
 from server import api_server
 from server.store import InMemoryStore
+from training import commands
 
 
 class ApiServerTest(unittest.TestCase):
@@ -295,6 +298,58 @@ class SampleSequenceIdsTest(ApiServerTest):
     with patch.object(api_server, "get_sampler_backend", return_value="torch"):
       promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)
+
+  def test_vllm_submission_registers_future_and_carries_http_trace(self) -> None:
+    trace_id = "1234567890abcdef1234567890abcdef"
+    with patch.object(api_server, "get_sampler_backend", return_value="vllm"):
+      response = self.post(
+        "asample",
+        {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 2},
+        headers={"traceparent": f"00-{trace_id}-1234567890abcdef-01"},
+      )
+    self.assertEqual(response.status_code, 200)
+    promise = response.json()
+    queued = asyncio.run(api_server.store.get_sampling_requests_for_model("job-a"))[0]
+    self.assertEqual(queued["request_id"], promise["request_id"])
+    self.assertEqual(api_server.store.futures_store[promise["request_id"]], {"status": "pending"})
+    self.assertEqual(queued["prompt_token_ids"], [1, 2])
+    self.assertEqual(len(promise["sample_sequence_ids"]), 2)
+    context = trace.get_current_span(propagate.extract(queued["trace_context"])).get_span_context()
+    self.assertEqual(context.trace_id, int(trace_id, 16))
+
+
+class QueueTraceContextTest(unittest.IsolatedAsyncioTestCase):
+  async def test_submissions_capture_current_context_without_mutation_or_leakage(self) -> None:
+    provider = TracerProvider()
+    self.addCleanup(provider.shutdown)
+    tracer = provider.get_tracer(__name__)
+    store = InMemoryStore()
+    self.enterContext(patch.object(api_server, "store", store))
+
+    async def submit(queue, request_id):
+      if queue == "training":
+        command = commands.OptimStep(request_id=request_id, model_id="model", trace_context={"old": "context"})
+        returned_id = await api_server.enqueue(command)
+        self.assertEqual(command.trace_context, {"old": "context"})
+        raw = (await store.get_requests())[0]
+        commands.parse_command(raw)
+      else:
+        request = {"request_id": request_id, "model_id": "model", "trace_context": {"old": "context"}}
+        returned_id = await api_server.enqueue_sampling(request)
+        self.assertEqual(request["trace_context"], {"old": "context"})
+        raw = (await store.get_sampling_requests_for_model("model"))[0]
+      self.assertEqual(returned_id, request_id)
+      self.assertEqual(store.futures_store[request_id], {"status": "pending"})
+      return raw["trace_context"]
+
+    for queue in ("training", "sampling"):
+      for index in range(2):
+        with tracer.start_as_current_span(f"request-{index}") as parent:
+          carrier = await submit(queue, f"{queue}-{index}")
+          extracted = trace.get_current_span(propagate.extract(carrier)).get_span_context()
+          self.assertEqual(extracted.trace_id, parent.get_span_context().trace_id)
+          self.assertEqual(extracted.span_id, parent.get_span_context().span_id)
+      self.assertEqual(await submit(queue, f"{queue}-untraced"), {})
 
 
 if __name__ == "__main__":

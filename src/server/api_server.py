@@ -351,17 +351,11 @@ async def _resolve_active_set_id(model_id: str | None) -> str | None:
   return None
 
 
-async def open_future(request_id: str) -> dict[str, str]:
-  """Register a pending future and return the trace carrier to send with its request."""
+async def enqueue(command: Command) -> str:
+  """Register the pending result and inject the active trace at the training queue boundary."""
+  await store.set_future(command.request_id, {"status": "pending"})
   carrier: dict[str, str] = {}
   propagate.inject(carrier)
-  await store.set_future(request_id, {"status": "pending"})
-  return carrier
-
-
-async def enqueue(command: Command) -> str:
-  """Create a pending future, inject trace context, push the command to the store. Returns its request_id."""
-  carrier = await open_future(command.request_id)
 
   active_set_id = await _resolve_active_set_id(command.model_id)
   await store.put_request(commands.wire(command.model_copy(update={"trace_context": carrier})), active_set_id=active_set_id)
@@ -369,6 +363,16 @@ async def enqueue(command: Command) -> str:
   # be traced end to end (the workers log the same id when they pop it).
   print(f"[API_SERVER] enqueued op={command.op} request_id={command.request_id} model_id={command.model_id} active_set={active_set_id}")
   return command.request_id
+
+
+async def enqueue_sampling(request: dict[str, Any]) -> str:
+  """Register the pending result and inject the active trace at the sampling queue boundary."""
+  request_id = request["request_id"]
+  await store.set_future(request_id, {"status": "pending"})
+  carrier: dict[str, str] = {}
+  propagate.inject(carrier)
+  await store.put_sampling_request({**request, "trace_context": carrier})
+  return request_id
 
 
 async def launch_worker_and_enqueue(command: Command) -> str:
@@ -931,7 +935,6 @@ async def asample(req: AsampleRequest):
 
   # vLLM backend
   req_id = str(uuid.uuid4())
-  carrier = await open_future(req_id)
 
   model_meta = await store.get_model_metadata(lookup_id)
   fine_tuning_type = model_meta.get("fine_tuning_type", "lora") if model_meta else "lora"
@@ -963,10 +966,9 @@ async def asample(req: AsampleRequest):
     "weights_path": weights_path,
     "include_prompt_logprobs": req.prompt_logprobs,
     "model_id": queue_id,
-    "trace_context": carrier,
   }
 
-  await store.put_sampling_request(sampling_req)
+  await enqueue_sampling(sampling_req)
   return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
 
