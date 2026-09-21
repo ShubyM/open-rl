@@ -409,7 +409,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
   async def test_lora_processor_create_model_uses_worker_create_model(self) -> None:
     worker = _RecordingLoraWorker()
     store = _FutureStoreStub()
-    processor = training_requests_processor_module.LoraTrainingRequestsProcessor(store, InMemoryStateStore(), worker)
+    processor = training_requests_processor_module.TrainingRequestsProcessor(store, InMemoryStateStore(), worker)
 
     await processor.process_request(
       {
@@ -439,7 +439,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     time_slicer = _TimeSlicerStub()
 
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
-      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(
+      processor = training_requests_processor_module.TrainingRequestsProcessor(
         store, InMemoryStateStore(), worker, "model-a", time_slicer=time_slicer
       )
       await processor.process_request(
@@ -470,7 +470,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     time_slicer = _TimeSlicerStub()
 
     with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test", "REDIS_URL": "redis://localhost:6379"}):
-      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(
+      processor = training_requests_processor_module.TrainingRequestsProcessor(
         store, InMemoryStateStore(), worker, "model-a", time_slicer=time_slicer
       )
       await processor.process_request(
@@ -508,9 +508,9 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
           load_from_state=lambda *_args: {"base_model": "checkpoint-base", "model_id": "model-a"},
         )
         if kind == "lora":
-          processor = training_requests_processor_module.LoraTrainingRequestsProcessor(store, state, worker)
+          processor = training_requests_processor_module.TrainingRequestsProcessor(store, state, worker)
         else:
-          processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, state, worker, "model-a", _TimeSlicerStub())
+          processor = training_requests_processor_module.TrainingRequestsProcessor(store, state, worker, "model-a", time_slicer=_TimeSlicerStub())
         await processor.process_request(
           {
             "op": "create_model",
@@ -546,9 +546,9 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         await state.set_value("open_rl:model_meta:model-a", json.dumps({"base_model": "base-model", "total_steps_completed": 4}))
         worker = types.SimpleNamespace(optim_step=lambda *_args: {"metrics": {}}, save_adapter=lambda *_args: None)
         if kind == "lora":
-          processor = training_requests_processor_module.LoraTrainingRequestsProcessor(store, state, worker)
+          processor = training_requests_processor_module.TrainingRequestsProcessor(store, state, worker)
         else:
-          processor = training_requests_processor_module.FFTTrainingRequestsProcessor(store, state, worker, "model-a", _TimeSlicerStub())
+          processor = training_requests_processor_module.TrainingRequestsProcessor(store, state, worker, "model-a", time_slicer=_TimeSlicerStub())
 
         await processor.process_request({"request_id": "step", "model_id": "model-a", "op": "optim_step"})
 
@@ -638,7 +638,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     time_slicer = _TimeSlicerStub(events=events)
 
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
-      processor = training_requests_processor_module.FFTTrainingRequestsProcessor(
+      processor = training_requests_processor_module.TrainingRequestsProcessor(
         store, InMemoryStateStore(), worker, "model-a", time_slicer=time_slicer
       )
       await processor.run_once()

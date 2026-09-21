@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from server.store import InMemoryStateStore, InMemoryStore
-from server.training_requests_processor import FFTTrainingRequestsProcessor
+from server.training_requests_processor import TrainingRequestsProcessor
 
 
 class SlicerStub:
@@ -51,7 +51,7 @@ class BatchStore(InMemoryStore):
 
 def processor(store, slicer):
   with patch.dict(os.environ, {"REDIS_URL": "redis://test"}):
-    return FFTTrainingRequestsProcessor(store, InMemoryStateStore(), BrokenWorker(), "run-a", slicer)
+    return TrainingRequestsProcessor(store, InMemoryStateStore(), BrokenWorker(), "run-a", time_slicer=slicer)
 
 
 class FFTBatchFailureTest(unittest.TestCase):

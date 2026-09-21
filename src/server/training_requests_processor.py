@@ -8,7 +8,7 @@ import shutil
 import threading
 import time
 import traceback
-from typing import Any, Protocol
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -39,8 +39,175 @@ def describe_requests(batch: list[dict[str, Any]]) -> str:
   return ", ".join(f"{r.get('op')}:{r.get('request_id')}" for r in batch)
 
 
-class TrainingRequestsProcessor(Protocol):
-  store: RequestStore
+# Sampler weight versions kept on the volume. The sampler applies each delta
+# as it lands, so older versions are dead weight; an 8B run otherwise leaves
+# 3 GiB per step behind.
+SAMPLER_VERSIONS_KEPT = int(os.getenv("OPEN_RL_SAMPLER_VERSIONS_KEPT", "3"))
+
+
+def older_versions(path: str, keep: int) -> list[str]:
+  """Sibling version directories of `path` beyond the newest `keep`, oldest first."""
+  parent = os.path.dirname(path)
+  if not os.path.isdir(parent):
+    return []
+  versions = sorted((p for p in (os.path.join(parent, name) for name in os.listdir(parent)) if os.path.isdir(p)), key=os.path.getmtime)
+  return versions[: max(0, len(versions) - keep)]
+
+
+class TrainingRequestsProcessor:
+  """Drains training commands for one worker.
+
+  With a time slicer the worker is dedicated to one model: it drains that
+  model's queue under GPU leases and exits when the model is deleted. Without
+  one it serves every model in a shared active set, as LoRA trainers do.
+  """
+
+  def __init__(
+    self,
+    store: RequestStore,
+    state: StateStore,
+    worker: TrainingWorker,
+    model_id: str | None = None,
+    active_tenant_set_id: str | None = None,
+    time_slicer: TimeSlicerClient | None = None,
+  ):
+    if time_slicer is not None:
+      if not os.getenv("REDIS_URL"):
+        raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the API server")
+      if not model_id:
+        raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
+
+    self.store = store
+    self.state = state
+    self.worker = worker
+    self.model_id = model_id
+    self.active_tenant_set_id = active_tenant_set_id
+    self.time_slicer = time_slicer
+    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM) if time_slicer else None
+    self.snapshot_registered = False
+
+  async def run(self) -> None:
+    print(f"[WORKER] Training requests processor started (model={self.model_id} active_set={self.active_tenant_set_id}).")
+    try:
+      if self.time_slicer is not None:
+        await self.time_slicer.register(self.workload)
+        self.snapshot_registered = True
+      while True:
+        try:
+          await self.run_once()
+        except asyncio.CancelledError:
+          break
+        except Exception as exc:
+          print(f"Error in training requests processor: {exc}")
+          traceback.print_exc()
+          await asyncio.sleep(1)
+    finally:
+      if self.time_slicer is not None:
+        try:
+          if self.snapshot_registered:
+            await self.time_slicer.unregister(self.workload)
+        finally:
+          await self.time_slicer.close()
+
+  async def exit_gracefully(self, unregister: bool = True) -> None:
+    print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
+    if unregister and self.snapshot_registered:
+      try:
+        await self.time_slicer.unregister(self.workload)
+        self.snapshot_registered = False
+      except Exception as exc:
+        print(f"[WORKER] Failed to unregister: {exc}")
+    try:
+      await self.time_slicer.close()
+    except Exception:
+      pass
+    os._exit(0)
+
+  async def next_batch(self) -> list[dict[str, Any]]:
+    if self.time_slicer is not None:
+      return await self.store.get_requests_for_model(self.model_id)
+    return await self.store.get_requests(active_set_id=self.active_tenant_set_id)
+
+  async def run_once(self) -> None:
+    batch = await self.next_batch()
+    if not batch:
+      await asyncio.sleep(0.1)
+      return
+
+    shutdown = any(req.get("op") == "shutdown_workers" for req in batch)
+    work = [req for req in batch if req.get("op") != "shutdown_workers"]
+    model_id = batch[0].get("model_id", "default")
+
+    results: list[tuple[str | None, dict[str, Any]]] = []
+    failure: Exception | None = None
+    with tracer.start_as_current_span("training_requests_batch") as batch_span:
+      batch_span.set_attribute("batch_size", len(work))
+      batch_span.set_attribute("model_id", model_id)
+      if work:
+        print(f"\n[TRAINING REQUESTS] Popped {len(work)} requests for model: {model_id}: {describe_requests(work)}")
+        results, failure = await self.answer_batch(work)
+
+    for request_id, result in results:
+      if request_id is not None:
+        await self.store.set_future(request_id, result)
+    if failure is not None:
+      raise failure
+
+    if self.time_slicer is None:
+      return
+    if self.time_slicer.faulted:
+      # This process still holds the accelerator. Exit without unregistering so
+      # the grant moves on only once the memory is gone. Exit 0 keeps the pod
+      # from restarting on fresh weights mid-run; the run fails on its next call.
+      print(f"[WORKER] Time slicer could not park this process: {self.time_slicer.faulted}. Exiting to free the accelerator.")
+      await self.exit_gracefully(unregister=False)
+    if shutdown:
+      await self.exit_gracefully()
+
+  async def answer_batch(self, requests: list[dict[str, Any]]) -> tuple[list[tuple[str | None, dict[str, Any]]], Exception | None]:
+    """Every request gets an answer: its result, or the failure that stopped the batch."""
+    results: list[tuple[str | None, dict[str, Any]]] = []
+    try:
+      await self.handle_batch(requests, results)
+    except Exception as exc:
+      answered = {request_id for request_id, _ in results}
+      for request in requests:
+        request_id = request.get("request_id")
+        if request_id and request_id not in answered:
+          results.append((request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
+      return results, exc
+    return results, None
+
+  async def handle_batch(self, requests: list[dict[str, Any]], results: list[tuple[str | None, dict[str, Any]]]) -> None:
+    """GPU work under one time-slicer turn; saves need the device only when the worker is not offloaded."""
+    if self.time_slicer is None:
+      # No lease to hold, so each answer goes out as soon as it is ready.
+      for request in requests:
+        await self.process_request(request)
+      return
+
+    save_ops = {"save_state", "save_weights_for_sampler"}
+    gpu_reqs = [r for r in requests if r.get("op") not in save_ops]
+    save_reqs = [r for r in requests if r.get("op") in save_ops]
+
+    if gpu_reqs:
+      async with self.time_slicer.acquire(self.workload):
+        await asyncio.to_thread(self.worker.wake_up)
+        try:
+          for request in gpu_reqs:
+            results.append(await self.handle_request(request))
+        finally:
+          await asyncio.to_thread(self.worker.sleep)
+
+    if not save_reqs:
+      return
+    if self.worker.cpu_offload:
+      for request in save_reqs:
+        results.append(await self.handle_request(request))
+    else:
+      async with self.time_slicer.acquire(self.workload):
+        for request in save_reqs:
+          results.append(await self.handle_request(request))
 
   async def process_request(self, raw_request: dict[str, Any]) -> None:
     request_id, result = await self.handle_request(raw_request)
@@ -92,294 +259,19 @@ class TrainingRequestsProcessor(Protocol):
       case _:
         raise NotImplementedError(f"Training request op {command.op!r} is not supported")
 
-  async def create_model(self, command: commands.CreateModel) -> dict[str, Any]: ...
-
-  async def create_model_from_state(self, command: commands.CreateModelFromState) -> dict[str, Any]: ...
-
-  async def forward_backward(self, command: commands.ForwardBackward) -> dict[str, Any]: ...
-
-  async def optim_step(self, command: commands.OptimStep) -> dict[str, Any]: ...
-
-  async def sample(self, command: commands.Sample) -> dict[str, Any]: ...
-
-  async def save_state(self, command: commands.SaveState) -> dict[str, Any]: ...
-
-  async def load_weights(self, command: commands.LoadWeights) -> dict[str, Any]: ...
-
-  async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler) -> dict[str, Any]: ...
-
-
-class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
-  def __init__(
-    self,
-    store: RequestStore,
-    state: StateStore,
-    worker: LoraTrainingWorker,
-    model_id: str | None = None,
-    active_tenant_set_id: str | None = None,
-  ):
-    self.store = store
-    self.state = state
-    self.worker = worker
-    self.model_id = model_id
-    self.active_tenant_set_id = active_tenant_set_id or (f"{model_id}-1" if model_id else None)
-
-  async def run(self) -> None:
-    print(f"[WORKER] LoRA training requests processor started (Active Set ID: {self.active_tenant_set_id}).")
-
-    while True:
-      try:
-        await self.run_once()
-      except asyncio.CancelledError:
-        break
-      except Exception as exc:
-        print(f"Error in training requests processor: {exc}")
-        traceback.print_exc()
-        await asyncio.sleep(1)
-
-  async def run_once(self) -> None:
-    batch = await self.store.get_requests(active_set_id=self.active_tenant_set_id)
-    if not batch:
-      await asyncio.sleep(0.1)
-      return
-
-    model_id = batch[0].get("model_id", "default")
-
-    with tracer.start_as_current_span("training_requests_batch") as batch_span:
-      batch_span.set_attribute("batch_size", len(batch))
-      batch_span.set_attribute("model_id", model_id)
-
-      print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {model_id}: {describe_requests(batch)}")
-      for request in batch:
-        await self.process_request(request)
-
   async def create_model(self, command: commands.CreateModel) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, command.lora_config)
-    return {
-      "base_model": command.base_model,
-      "model_id": command.model_id,
-      "rank": command.lora_config.rank,
-      "fine_tuning_type": command.fine_tuning_type,
-      "type": "model_created",
-    }
-
-  async def create_model_from_state(self, command: commands.CreateModelFromState) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
-    return {
-      "base_model": result.get("base_model"),
-      "model_id": result.get("model_id", command.model_id),
-      "fine_tuning_type": command.fine_tuning_type,
-      "type": "model_loaded_from_state",
-    }
-
-  async def forward_backward(self, command: commands.ForwardBackward) -> dict[str, Any]:
-    result = await asyncio.to_thread(
-      self.worker.forward_backward,
-      command.data,
-      command.loss_fn,
-      command.loss_config,
-      command.model_id,
-      forward_only=command.forward_only,
-    )
-    result["type"] = "forward_backward_completed"
-    return result
-
-  async def optim_step(self, command: commands.OptimStep) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, command.model_id)
-    result["type"] = "optim_step_completed"
-    await asyncio.to_thread(self.worker.save_adapter, command.model_id)
-    try:
-      metadata = await get_model_metadata(self.state, command.model_id)
-      current_step = metadata.get("total_steps_completed", 0) if metadata else 0
-      await update_model_metadata(self.state, command.model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
-    except Exception as exc:
-      print(f"[PROCESSOR] Failed to update step metadata for model {command.model_id}: {exc}")
-    return result
-
-  async def sample(self, command: commands.Sample) -> dict[str, Any]:
-    result = await asyncio.to_thread(
-      self.worker.generate,
-      command.prompt_tokens,
-      command.max_tokens,
-      command.num_samples,
-      command.temperature,
-      command.model_id,
-      command.prompt_logprobs,
-    )
-    result["type"] = "sample_completed"
-    return result
-
-  async def save_state(self, command: commands.SaveState) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
-    return {"path": result.get("path", command.state_path), "type": "state_saved"}
-
-  async def load_weights(self, command: commands.LoadWeights) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
-    return {"path": command.state_path, "type": "weights_loaded"}
-
-  async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.save_adapter, command.model_id, command.alias)
-    return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved"}
-
-
-# Sampler weight versions kept on the volume. The sampler applies each delta
-# as it lands, so older versions are dead weight; an 8B run otherwise leaves
-# 3 GiB per step behind.
-SAMPLER_VERSIONS_KEPT = int(os.getenv("OPEN_RL_SAMPLER_VERSIONS_KEPT", "3"))
-
-
-def older_versions(path: str, keep: int) -> list[str]:
-  """Sibling version directories of `path` beyond the newest `keep`, oldest first."""
-  parent = os.path.dirname(path)
-  if not os.path.isdir(parent):
-    return []
-  versions = sorted((p for p in (os.path.join(parent, name) for name in os.listdir(parent)) if os.path.isdir(p)), key=os.path.getmtime)
-  return versions[: max(0, len(versions) - keep)]
-
-
-class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
-  def __init__(
-    self,
-    store: RequestStore,
-    state: StateStore,
-    worker: FFTTrainingWorker,
-    model_id: str | None,
-    time_slicer: TimeSlicerClient,
-  ):
-    if not os.getenv("REDIS_URL"):
-      raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the API server")
-    if not model_id:
-      raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
-
-    self.store = store
-    self.state = state
-    self.worker = worker
-    self.model_id = model_id
-    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM)
-    self.time_slicer = time_slicer
-    self.snapshot_registered = False
-
-  async def exit_gracefully(self, unregister: bool = True) -> None:
-    print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if unregister and self.snapshot_registered:
-      try:
-        await self.time_slicer.unregister(self.workload)
-        self.snapshot_registered = False
-      except Exception as exc:
-        print(f"[WORKER] Failed to unregister: {exc}")
-    try:
-      await self.time_slicer.close()
-    except Exception:
-      pass
-    os._exit(0)
-
-  async def run(self) -> None:
-    print("[WORKER] Full fine-tuning training requests processor started.")
-
-    try:
-      await self.time_slicer.register(self.workload)
-      self.snapshot_registered = True
-      while True:
-        try:
-          await self.run_once()
-        except asyncio.CancelledError:
-          break
-        except Exception as exc:
-          print(f"Error in training requests processor: {exc}")
-          traceback.print_exc()
-          await asyncio.sleep(1)
-    finally:
-      try:
-        if self.snapshot_registered:
-          await self.time_slicer.unregister(self.workload)
-      finally:
-        await self.time_slicer.close()
-
-  async def run_once(self) -> None:
-    batch = await self.store.get_requests_for_model(self.model_id)
-    if not batch:
-      await asyncio.sleep(0.1)
-      return
-
-    has_shutdown = False
-    training_reqs = []
-    for req in batch:
-      if req.get("op") == "shutdown_workers":
-        has_shutdown = True
-      else:
-        training_reqs.append(req)
-
-    results: list[tuple[str | None, dict[str, Any]]] = []
-    failure: Exception | None = None
-    with tracer.start_as_current_span("training_requests_batch") as batch_span:
-      batch_span.set_attribute("batch_size", len(training_reqs))
-      batch_span.set_attribute("model_id", self.model_id)
-      if training_reqs:
-        print(f"\n[TRAINING REQUESTS] Popped {len(training_reqs)} requests for model: {self.model_id}: {describe_requests(training_reqs)}")
-        results, failure = await self.answer_batch(training_reqs)
-
-    for request_id, result in results:
-      if request_id is not None:
-        await self.store.set_future(request_id, result)
-    if failure is not None:
-      raise failure
-
-    if self.time_slicer.faulted:
-      # This process still holds the accelerator. Exit without unregistering so
-      # the grant moves on only once the memory is gone. Exit 0 keeps the pod
-      # from restarting on fresh weights mid-run; the run fails on its next call.
-      print(f"[WORKER] Time slicer could not park this process: {self.time_slicer.faulted}. Exiting to free the accelerator.")
-      await self.exit_gracefully(unregister=False)
-    if has_shutdown:
-      await self.exit_gracefully()
-
-  async def answer_batch(self, requests: list[dict[str, Any]]) -> tuple[list[tuple[str | None, dict[str, Any]]], Exception | None]:
-    """Every request gets an answer: its result, or the failure that stopped the batch."""
-    results: list[tuple[str | None, dict[str, Any]]] = []
-    try:
-      await self.handle_batch(requests, results)
-    except Exception as exc:
-      answered = {request_id for request_id, _ in results}
-      for request in requests:
-        request_id = request.get("request_id")
-        if request_id and request_id not in answered:
-          results.append((request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
-      return results, exc
-    return results, None
-
-  async def handle_batch(self, requests: list[dict[str, Any]], results: list[tuple[str | None, dict[str, Any]]]) -> None:
-    """GPU work under one time-slicer turn; saves need the device only when the worker is not offloaded."""
-    save_ops = {"save_state", "save_weights_for_sampler"}
-    gpu_reqs = [r for r in requests if r.get("op") not in save_ops]
-    save_reqs = [r for r in requests if r.get("op") in save_ops]
-
-    if gpu_reqs:
-      async with self.time_slicer.acquire(self.workload):
-        await asyncio.to_thread(self.worker.wake_up)
-        try:
-          for request in gpu_reqs:
-            results.append(await self.handle_request(request))
-        finally:
-          await asyncio.to_thread(self.worker.sleep)
-
-    if not save_reqs:
-      return
-    if self.worker.cpu_offload:
-      for request in save_reqs:
-        results.append(await self.handle_request(request))
-    else:
-      async with self.time_slicer.acquire(self.workload):
-        for request in save_reqs:
-          results.append(await self.handle_request(request))
-
-  async def create_model(self, command: commands.CreateModel) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, command.full_config)
-    return {
+    is_lora = command.fine_tuning_type == "lora"
+    config = command.lora_config if is_lora else command.full_config
+    await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, config)
+    result = {
       "base_model": command.base_model,
       "model_id": command.model_id,
       "fine_tuning_type": command.fine_tuning_type,
       "type": "model_created",
     }
+    if is_lora:
+      result["rank"] = command.lora_config.rank
+    return result
 
   async def create_model_from_state(self, command: commands.CreateModelFromState) -> dict[str, Any]:
     result = await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
@@ -436,23 +328,21 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
   async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler) -> dict[str, Any]:
     ref = command.path or command.sampling_session_id
-    if not ref:
-      raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
-    rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
-    local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
-    await asyncio.to_thread(self.worker.save_state, command.model_id, local_path, False, "sampler")
+    checkpoint = await asyncio.to_thread(self.worker.save_for_sampler, command.model_id, command.alias, ref)
+    if checkpoint:
+      await self.publish_checkpoint(command.model_id, checkpoint)
+    return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved"}
+
+  async def publish_checkpoint(self, model_id: str, local_path: str) -> None:
+    """Tell the samplers about a new checkpoint and drop the versions they no longer need."""
     if hasattr(self.store, "redis"):
-      num_subs = await self.store.redis.publish(
-        f"open_rl:weight_update:{command.model_id}",
-        json.dumps({"weights_path": local_path}),
-      )
+      num_subs = await self.store.redis.publish(f"open_rl:weight_update:{model_id}", json.dumps({"weights_path": local_path}))
       print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")
     older = older_versions(local_path, SAMPLER_VERSIONS_KEPT)
     for path in older:
       shutil.rmtree(path, ignore_errors=True)
     if older:
       print(f"[Trainer] Removed {len(older)} sampler weight versions older than the newest {SAMPLER_VERSIONS_KEPT}")
-    return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved"}
 
 
 async def run_training_requests_processor(
@@ -468,10 +358,7 @@ async def run_training_requests_processor(
   state = get_state_store() if state is None else state
   if isinstance(worker, FFTTrainingWorker):
     time_slicer = time_slicer or time_slicer_client_from_env()
-    processor = FFTTrainingRequestsProcessor(store, state, worker, model_id, time_slicer)
-  else:
-    processor = LoraTrainingRequestsProcessor(store, state, worker, model_id, active_tenant_set_id)
-  await processor.run()
+  await TrainingRequestsProcessor(store, state, worker, model_id, active_tenant_set_id, time_slicer).run()
 
 
 async def main_async(args: argparse.Namespace) -> None:

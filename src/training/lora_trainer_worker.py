@@ -197,6 +197,11 @@ class LoraTrainingWorker(BaseTrainerWorker):
     print(f"Saved state for '{model_id}' to {state_path}")
     return {"path": state_path}
 
+  def save_for_sampler(self, model_id: str, alias: str | None, ref: str | None) -> str | None:
+    """The sampler hot-loads the adapter from its directory, so there is no checkpoint to announce."""
+    self.save_adapter(model_id, alias)
+    return None
+
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
     """Create an adapter from a saved state directory.
 

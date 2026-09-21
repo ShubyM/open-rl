@@ -301,6 +301,15 @@ class FFTTrainingWorker(BaseTrainerWorker):
     print(f"Saved sparse delta ({metadata['density_pct']}% changed elements, {total_changed}/{total_elements}) to {state_path}")
     return {"path": state_path, "density_pct": metadata["density_pct"]}
 
+  def save_for_sampler(self, model_id: str, alias: str | None, ref: str | None) -> str:
+    """Write a checkpoint under a versioned path the samplers reload from."""
+    if not ref:
+      raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
+    rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
+    local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
+    self.save_state(model_id, local_path, False, "sampler")
+    return local_path
+
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
     metadata_path = os.path.join(state_path, "metadata.json")
     if not os.path.exists(metadata_path):

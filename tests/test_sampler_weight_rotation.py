@@ -11,8 +11,9 @@ from tests.test_fft_batch_failure import SlicerStub
 from training import commands
 
 
-class RecordingWorker:
+class RecordingWorker(trp.FFTTrainingWorker):
   def __init__(self):
+    super().__init__()
     self.saves = []
 
   def save_state(self, model_id, state_path, include_optimizer=False, kind="state"):
@@ -30,7 +31,7 @@ class SamplerWeightRotationTest(unittest.TestCase):
       patch.object(trp, "SAMPLER_VERSIONS_KEPT", 3),
     ):
       worker = RecordingWorker()
-      proc = trp.FFTTrainingRequestsProcessor(InMemoryStore(), InMemoryStateStore(), worker, "run-a", SlicerStub())
+      proc = trp.TrainingRequestsProcessor(InMemoryStore(), InMemoryStateStore(), worker, "run-a", time_slicer=SlicerStub())
       versions = os.path.join(tmp, "sampler_full", "run-a", "sampler_weights")
       for step in range(1, 6):
         command = commands.SaveWeightsForSampler(request_id=f"r{step}", model_id="run-a", path=f"tinker://run-a/sampler_weights/sampler-{step}")
