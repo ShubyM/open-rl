@@ -74,7 +74,7 @@ class FFTBatchFailureTest(unittest.TestCase):
     async def record_exit(unregister=True):
       exits.append(unregister)
 
-    async def handled(request, model_id):
+    async def handled(request):
       slicer.faulted = "checkpoint failed for workload run-a; it still holds the accelerator and must exit"
       return request["request_id"], {"type": "SaveWeightsResponse"}
 

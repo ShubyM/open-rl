@@ -352,30 +352,22 @@ class QueueTraceContextTest(unittest.IsolatedAsyncioTestCase):
     store = InMemoryStore()
     self.runtime = self.enterContext(runtime_context(store))
 
-    async def submit(queue, request_id):
-      if queue == "training":
-        command = commands.OptimStep(request_id=request_id, model_id="model", trace_context={"old": "context"})
-        returned_id = await self.runtime.submit(command)
-        self.assertEqual(command.trace_context, {"old": "context"})
-        raw = (await store.get_requests())[0]
-        commands.parse_command(raw)
-      else:
-        request = {"request_id": request_id, "model_id": "model", "trace_context": {"old": "context"}}
-        returned_id = await api_server.enqueue_sampling(self.runtime, request)
-        self.assertEqual(request["trace_context"], {"old": "context"})
-        raw = (await store.get_sampling_requests_for_model("model"))[0]
-      self.assertEqual(returned_id, request_id)
+    async def submit(request_id):
+      command = commands.OptimStep(request_id=request_id, model_id="model", trace_context={"old": "context"})
+      self.assertEqual(await self.runtime.submit(command), request_id)
+      self.assertEqual(command.trace_context, {"old": "context"})
       self.assertNotIn(request_id, store.futures_store)
+      raw = (await store.get_requests())[0]
+      commands.parse_command(raw)
       return raw["trace_context"]
 
-    for queue in ("training", "sampling"):
-      for index in range(2):
-        with tracer.start_as_current_span(f"request-{index}") as parent:
-          carrier = await submit(queue, f"{queue}-{index}")
-          extracted = trace.get_current_span(propagate.extract(carrier)).get_span_context()
-          self.assertEqual(extracted.trace_id, parent.get_span_context().trace_id)
-          self.assertEqual(extracted.span_id, parent.get_span_context().span_id)
-      self.assertEqual(await submit(queue, f"{queue}-untraced"), {})
+    for index in range(2):
+      with tracer.start_as_current_span(f"request-{index}") as parent:
+        carrier = await submit(f"training-{index}")
+        extracted = trace.get_current_span(propagate.extract(carrier)).get_span_context()
+        self.assertEqual(extracted.trace_id, parent.get_span_context().trace_id)
+        self.assertEqual(extracted.span_id, parent.get_span_context().span_id)
+    self.assertEqual(await submit("training-untraced"), {})
 
 
 if __name__ == "__main__":

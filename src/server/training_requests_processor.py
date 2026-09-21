@@ -41,24 +41,23 @@ def describe_requests(batch: list[dict[str, Any]]) -> str:
 class TrainingRequestsProcessor(Protocol):
   store: RequestStore
 
-  async def process_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> None:
-    request_id, result = await self.handle_request(raw_request, model_id)
+  async def process_request(self, raw_request: dict[str, Any]) -> None:
+    request_id, result = await self.handle_request(raw_request)
     if request_id is not None:
       await self.store.set_future(request_id, result)
 
-  async def handle_request(self, raw_request: dict[str, Any], model_id: str | None = None) -> tuple[str | None, dict[str, Any]]:
+  async def handle_request(self, raw_request: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     request_id = raw_request.get("request_id")
     token = None
 
     try:
       command = parse_command(raw_request)
       request_id = command.request_id
-      resolved_model_id = model_id or command.model_id or "default"
 
       ctx = propagate.extract(command.trace_context) if command.trace_context else None
       token = otel_context.attach(ctx) if ctx else None
 
-      result = await self.dispatch_operation(command, resolved_model_id)
+      result = await self.dispatch_operation(command)
       return request_id, result
     except Exception as exc:
       traceback.print_exc()
@@ -69,44 +68,44 @@ class TrainingRequestsProcessor(Protocol):
       if token:
         otel_context.detach(token)
 
-  async def dispatch_operation(self, command: commands.TrainingCommand, model_id: str) -> dict[str, Any]:
+  async def dispatch_operation(self, command: commands.TrainingCommand) -> dict[str, Any]:
     match command:
       case commands.CreateModel():
-        return await self.create_model(command, model_id)
+        return await self.create_model(command)
       case commands.CreateModelFromState():
-        return await self.create_model_from_state(command, model_id)
+        return await self.create_model_from_state(command)
       case commands.ForwardBackward():
-        return await self.forward_backward(command, model_id)
+        return await self.forward_backward(command)
       case commands.OptimStep():
-        return await self.optim_step(command, model_id)
+        return await self.optim_step(command)
       case commands.Sample():
-        return await self.sample(command, model_id)
+        return await self.sample(command)
       case commands.SaveState():
-        return await self.save_state(command, model_id)
+        return await self.save_state(command)
       case commands.LoadWeights():
-        return await self.load_weights(command, model_id)
+        return await self.load_weights(command)
       case commands.SaveWeightsForSampler():
-        return await self.save_weights_for_sampler(command, model_id)
+        return await self.save_weights_for_sampler(command)
       case commands.Shutdown():
         return {"status": "ok", "type": "shutdown_acknowledged"}
       case _:
         raise NotImplementedError(f"Training request op {command.op!r} is not supported")
 
-  async def create_model(self, command: commands.CreateModel, model_id: str) -> dict[str, Any]: ...
+  async def create_model(self, command: commands.CreateModel) -> dict[str, Any]: ...
 
-  async def create_model_from_state(self, command: commands.CreateModelFromState, model_id: str) -> dict[str, Any]: ...
+  async def create_model_from_state(self, command: commands.CreateModelFromState) -> dict[str, Any]: ...
 
-  async def forward_backward(self, command: commands.ForwardBackward, model_id: str) -> dict[str, Any]: ...
+  async def forward_backward(self, command: commands.ForwardBackward) -> dict[str, Any]: ...
 
-  async def optim_step(self, command: commands.OptimStep, model_id: str) -> dict[str, Any]: ...
+  async def optim_step(self, command: commands.OptimStep) -> dict[str, Any]: ...
 
-  async def sample(self, command: commands.Sample, model_id: str) -> dict[str, Any]: ...
+  async def sample(self, command: commands.Sample) -> dict[str, Any]: ...
 
-  async def save_state(self, command: commands.SaveState, model_id: str) -> dict[str, Any]: ...
+  async def save_state(self, command: commands.SaveState) -> dict[str, Any]: ...
 
-  async def load_weights(self, command: commands.LoadWeights, model_id: str) -> dict[str, Any]: ...
+  async def load_weights(self, command: commands.LoadWeights) -> dict[str, Any]: ...
 
-  async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler, model_id: str) -> dict[str, Any]: ...
+  async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler) -> dict[str, Any]: ...
 
 
 class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
@@ -149,75 +148,75 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
 
       print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {model_id}: {describe_requests(batch)}")
       for request in batch:
-        await self.process_request(request, request.get("model_id") or model_id)
+        await self.process_request(request)
 
-  async def create_model(self, command: commands.CreateModel, model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.create_model, command.base_model, model_id, command.lora_config)
+  async def create_model(self, command: commands.CreateModel) -> dict[str, Any]:
+    await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, command.lora_config)
     return {
       "base_model": command.base_model,
-      "model_id": model_id,
+      "model_id": command.model_id,
       "rank": command.lora_config.rank,
       "fine_tuning_type": command.fine_tuning_type,
       "type": "model_created",
     }
 
-  async def create_model_from_state(self, command: commands.CreateModelFromState, model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.load_from_state, model_id, command.state_path, command.restore_optimizer)
+  async def create_model_from_state(self, command: commands.CreateModelFromState) -> dict[str, Any]:
+    result = await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
     return {
       "base_model": result.get("base_model"),
-      "model_id": result.get("model_id", model_id),
+      "model_id": result.get("model_id", command.model_id),
       "fine_tuning_type": command.fine_tuning_type,
       "type": "model_loaded_from_state",
     }
 
-  async def forward_backward(self, command: commands.ForwardBackward, model_id: str) -> dict[str, Any]:
+  async def forward_backward(self, command: commands.ForwardBackward) -> dict[str, Any]:
     result = await asyncio.to_thread(
       self.worker.forward_backward,
       command.data,
       command.loss_fn,
       command.loss_config,
-      model_id,
+      command.model_id,
       forward_only=command.forward_only,
     )
     result["type"] = "forward_backward_completed"
     return result
 
-  async def optim_step(self, command: commands.OptimStep, model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, model_id)
+  async def optim_step(self, command: commands.OptimStep) -> dict[str, Any]:
+    result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, command.model_id)
     result["type"] = "optim_step_completed"
-    await asyncio.to_thread(self.worker.save_adapter, model_id)
+    await asyncio.to_thread(self.worker.save_adapter, command.model_id)
     if hasattr(self, "store") and self.store:
       try:
-        raw_meta = await self.store.get_value(f"open_rl:model_meta:{model_id}")
+        raw_meta = await self.store.get_value(f"open_rl:model_meta:{command.model_id}")
         current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
-        await self.store.update_job_metadata(model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
+        await self.store.update_job_metadata(command.model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
       except Exception as exc:
-        print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
+        print(f"[PROCESSOR] Failed to update step metadata for model {command.model_id}: {exc}")
     return result
 
-  async def sample(self, command: commands.Sample, model_id: str) -> dict[str, Any]:
+  async def sample(self, command: commands.Sample) -> dict[str, Any]:
     result = await asyncio.to_thread(
       self.worker.generate,
       command.prompt_tokens,
       command.max_tokens,
       command.num_samples,
       command.temperature,
-      model_id,
+      command.model_id,
       command.prompt_logprobs,
     )
     result["type"] = "sample_completed"
     return result
 
-  async def save_state(self, command: commands.SaveState, model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.save_state, model_id, command.state_path, command.include_optimizer, command.kind)
+  async def save_state(self, command: commands.SaveState) -> dict[str, Any]:
+    result = await asyncio.to_thread(self.worker.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
     return {"path": result.get("path", command.state_path), "type": "state_saved"}
 
-  async def load_weights(self, command: commands.LoadWeights, model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.load_from_state, model_id, command.state_path, command.restore_optimizer)
+  async def load_weights(self, command: commands.LoadWeights) -> dict[str, Any]:
+    await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
     return {"path": command.state_path, "type": "weights_loaded"}
 
-  async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler, model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.save_adapter, model_id, command.alias)
+  async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler) -> dict[str, Any]:
+    await asyncio.to_thread(self.worker.save_adapter, command.model_id, command.alias)
     return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved"}
 
 
@@ -355,7 +354,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
         await asyncio.to_thread(self.worker.wake_up)
         try:
           for request in gpu_reqs:
-            results.append(await self.handle_request(request, self.model_id))
+            results.append(await self.handle_request(request))
         finally:
           await asyncio.to_thread(self.worker.sleep)
 
@@ -363,85 +362,85 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
       return
     if self.worker.cpu_offload:
       for request in save_reqs:
-        results.append(await self.handle_request(request, self.model_id))
+        results.append(await self.handle_request(request))
     else:
       async with self.time_slicer.acquire(self.workload):
         for request in save_reqs:
-          results.append(await self.handle_request(request, self.model_id))
+          results.append(await self.handle_request(request))
 
-  async def create_model(self, command: commands.CreateModel, model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.create_model, command.base_model, model_id, command.full_config)
+  async def create_model(self, command: commands.CreateModel) -> dict[str, Any]:
+    await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, command.full_config)
     return {
       "base_model": command.base_model,
-      "model_id": model_id,
+      "model_id": command.model_id,
       "fine_tuning_type": command.fine_tuning_type,
       "type": "model_created",
     }
 
-  async def create_model_from_state(self, command: commands.CreateModelFromState, model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.load_from_state, model_id, command.state_path, command.restore_optimizer)
+  async def create_model_from_state(self, command: commands.CreateModelFromState) -> dict[str, Any]:
+    result = await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
     return {
       "base_model": result.get("base_model"),
-      "model_id": result.get("model_id", model_id),
+      "model_id": result.get("model_id", command.model_id),
       "fine_tuning_type": command.fine_tuning_type,
       "type": "model_loaded_from_state",
     }
 
-  async def forward_backward(self, command: commands.ForwardBackward, model_id: str) -> dict[str, Any]:
+  async def forward_backward(self, command: commands.ForwardBackward) -> dict[str, Any]:
     result = await asyncio.to_thread(
       self.worker.forward_backward,
       command.data,
       command.loss_fn,
       command.loss_config,
-      model_id,
+      command.model_id,
       forward_only=command.forward_only,
     )
     result["type"] = "forward_backward_completed"
     return result
 
-  async def optim_step(self, command: commands.OptimStep, model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, model_id)
+  async def optim_step(self, command: commands.OptimStep) -> dict[str, Any]:
+    result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, command.model_id)
     result["type"] = "optim_step_completed"
     if hasattr(self, "store") and self.store:
       try:
-        raw_meta = await self.store.get_value(f"open_rl:model_meta:{model_id}")
+        raw_meta = await self.store.get_value(f"open_rl:model_meta:{command.model_id}")
         current_step = json.loads(raw_meta).get("total_steps_completed", 0) if raw_meta else 0
-        await self.store.update_job_metadata(model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
+        await self.store.update_job_metadata(command.model_id, {"total_steps_completed": current_step + 1, "updated_at": time.time()})
       except Exception as exc:
-        print(f"[PROCESSOR] Failed to update step metadata for model {model_id}: {exc}")
+        print(f"[PROCESSOR] Failed to update step metadata for model {command.model_id}: {exc}")
     return result
 
-  async def sample(self, command: commands.Sample, model_id: str) -> dict[str, Any]:
+  async def sample(self, command: commands.Sample) -> dict[str, Any]:
     result = await asyncio.to_thread(
       self.worker.generate,
       command.prompt_tokens,
       command.max_tokens,
       command.num_samples,
       command.temperature,
-      model_id,
+      command.model_id,
       command.prompt_logprobs,
     )
     result["type"] = "sample_completed"
     return result
 
-  async def save_state(self, command: commands.SaveState, model_id: str) -> dict[str, Any]:
-    result = await asyncio.to_thread(self.worker.save_state, model_id, command.state_path, command.include_optimizer, command.kind)
+  async def save_state(self, command: commands.SaveState) -> dict[str, Any]:
+    result = await asyncio.to_thread(self.worker.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
     return {"path": result.get("path", command.state_path), "type": "state_saved"}
 
-  async def load_weights(self, command: commands.LoadWeights, model_id: str) -> dict[str, Any]:
-    await asyncio.to_thread(self.worker.load_from_state, model_id, command.state_path, command.restore_optimizer)
+  async def load_weights(self, command: commands.LoadWeights) -> dict[str, Any]:
+    await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
     return {"path": command.state_path, "type": "weights_loaded"}
 
-  async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler, model_id: str) -> dict[str, Any]:
+  async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler) -> dict[str, Any]:
     ref = command.path or command.sampling_session_id
     if not ref:
       raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
     rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
     local_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "sampler_full", rel_path)
-    await asyncio.to_thread(self.worker.save_state, model_id, local_path, False, "sampler")
+    await asyncio.to_thread(self.worker.save_state, command.model_id, local_path, False, "sampler")
     if hasattr(self.store, "redis"):
       num_subs = await self.store.redis.publish(
-        f"open_rl:weight_update:{model_id}",
+        f"open_rl:weight_update:{command.model_id}",
         json.dumps({"weights_path": local_path}),
       )
       print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")

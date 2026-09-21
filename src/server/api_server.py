@@ -268,15 +268,6 @@ def new_request_id() -> str:
   return str(uuid.uuid4())
 
 
-async def enqueue_sampling(runtime: ApiRuntime, request: dict[str, Any]) -> str:
-  """Inject the active trace at the sampling queue boundary."""
-  request_id = request["request_id"]
-  carrier: dict[str, str] = {}
-  propagate.inject(carrier)
-  await runtime.store.put_sampling_request({**request, "trace_context": carrier})
-  return request_id
-
-
 async def ensure_sampler_launched(runtime: ApiRuntime, model_id: str) -> None:
   if runtime.worker_manager is not None and get_sampler_backend() == "vllm":
     try:
@@ -874,7 +865,9 @@ async def asample(runtime: Runtime, req: AsampleRequest):
     "model_id": queue_id,
   }
 
-  await enqueue_sampling(runtime, sampling_req)
+  carrier: dict[str, str] = {}
+  propagate.inject(carrier)
+  await runtime.store.put_sampling_request({**sampling_req, "trace_context": carrier})
   return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
 

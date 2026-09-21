@@ -426,7 +426,6 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         "base_model": "base-model",
         "lora_config": {"seed": 123, "rank": 2},
       },
-      "adapter-a",
     )
 
     self.assertEqual(worker.loaded_base_models, [])
@@ -457,7 +456,6 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
           "base_model": "base-model",
           "full_config": {"seed": 123, "rank": 8},
         },
-        "model-a",
       )
 
     self.assertEqual(worker.loaded_base_models, [])
@@ -486,7 +484,6 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
           "path": "tinker://model-a/sampler_weights/final",
           "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
         },
-        "model-a",
       )
 
     self.assertEqual(
