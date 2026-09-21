@@ -7,19 +7,25 @@ import os
 import shutil
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 
-from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
+from accel_timeslicer.time_slicer import NoOpTimeSlicer, TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.model_metadata import get_model_metadata
 from server.store import RequestStore, get_state_store, get_store
 from training import commands
 from training.commands import parse_command
+from training.distributed import barrier, broadcast_object, is_distributed, is_primary, local_rank
+from training.distributed import close as close_distributed
+from training.distributed import initialize as initialize_distributed
 from training.fft_trainer_worker import FFTTrainingWorker
 from training.lora_trainer_worker import LoraTrainingWorker
 
@@ -27,6 +33,34 @@ tracer = trace.get_tracer(__name__)
 
 
 TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
+
+
+def pin_worker_threads_to_this_rank() -> None:
+  """Give every executor thread this rank's CUDA device.
+
+  Torch's current device is thread-local, and every worker call here is handed
+  to a thread with asyncio.to_thread. set_device() is only reached once, deep
+  inside create_model, so exactly one pool thread -- whichever served that
+  request -- ends up pointing at this rank's GPU. Any thread the pool spawns
+  afterwards still points at cuda:0, and a device-less allocation on one of them
+  lands there: correct on rank 0, wrong on every other rank.
+
+  run33 died of this. Four steps ran on the single warm thread that had run
+  create_model; the pool then grew a second thread and rank 2 hit
+  `cuda:0 and cuda:2` in a forward. The cuda:0 buffer then reached a NCCL
+  communicator bound to cuda:2, which is an illegal access, and the watchdog
+  aborted the rank -- so it reads as a NCCL fault rather than a device bug.
+  """
+  if not torch.cuda.is_available():
+    return
+  device = local_rank()
+  torch.cuda.set_device(device)
+  # An initializer, not a call at each entry point: the pool creates threads
+  # lazily and on demand, so the only place guaranteed to run once per thread is
+  # the thread's own startup.
+  asyncio.get_running_loop().set_default_executor(
+    ThreadPoolExecutor(thread_name_prefix="trainer-worker", initializer=torch.cuda.set_device, initargs=(device,))
+  )
 
 
 def is_fft_enabled() -> bool:
@@ -69,18 +103,17 @@ class TrainingRequestsProcessor:
     active_tenant_set_id: str | None = None,
     time_slicer: TimeSlicerClient | None = None,
   ):
-    if time_slicer is not None:
-      if not os.getenv("REDIS_URL"):
-        raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the API server")
-      if not model_id:
-        raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
+    if time_slicer is not None and not os.getenv("REDIS_URL"):
+      raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the API server")
 
     self.store = store
     self.worker = worker
     self.model_id = model_id
     self.active_tenant_set_id = active_tenant_set_id
     self.time_slicer = time_slicer
-    self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM) if time_slicer else None
+    self.workload = (
+      workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id or "shared"), claim=TRAINER_CLAIM) if time_slicer else None
+    )
     self.snapshot_registered = False
 
   async def run(self) -> None:
@@ -99,12 +132,15 @@ class TrainingRequestsProcessor:
           traceback.print_exc()
           await asyncio.sleep(1)
     finally:
-      if self.time_slicer is not None:
-        try:
-          if self.snapshot_registered:
-            await self.time_slicer.unregister(self.workload)
-        finally:
-          await self.time_slicer.close()
+      try:
+        if self.time_slicer is not None:
+          try:
+            if self.snapshot_registered:
+              await self.time_slicer.unregister(self.workload)
+          finally:
+            await self.time_slicer.close()
+      finally:
+        close_distributed()
 
   async def exit_gracefully(self, unregister: bool = True) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
@@ -121,9 +157,36 @@ class TrainingRequestsProcessor:
     os._exit(0)
 
   async def next_batch(self) -> list[dict[str, Any]]:
-    if self.time_slicer is not None:
+    """The next request batch, identical on every rank.
+
+    Collectives are positional, so every rank must execute the same request
+    sequence: rank 0 owns the queue and fans each batch out.
+    """
+    batch = await self.fetch_requests() if is_primary() else None
+    if is_distributed():
+      batch = await asyncio.to_thread(broadcast_object, batch)
+    return batch or []
+
+  async def fetch_requests(self) -> list[dict[str, Any]]:
+    if self.time_slicer is not None and self.model_id:
       return await self.store.get_requests_for_model(self.model_id)
     return await self.store.get_requests(active_set_id=self.active_tenant_set_id)
+
+  async def publish_result(self, request_id: str | None, result: dict[str, Any]) -> None:
+    # Only rank 0 writes to the store; the other ranks computed the same result.
+    if request_id is not None and is_primary():
+      await self.store.set_future(request_id, result)
+
+  @asynccontextmanager
+  async def gpu_lease(self):
+    """Rank 0 holds the lease; the other ranks enter and leave with it."""
+    async with AsyncExitStack() as stack:
+      await stack.enter_async_context(self.time_slicer.acquire(self.workload))
+      await asyncio.to_thread(barrier)
+      try:
+        yield
+      finally:
+        await asyncio.to_thread(barrier)
 
   async def run_once(self) -> None:
     batch = await self.next_batch()
@@ -145,8 +208,7 @@ class TrainingRequestsProcessor:
         results, failure = await self.answer_batch(work)
 
     for request_id, result in results:
-      if request_id is not None:
-        await self.store.set_future(request_id, result)
+      await self.publish_result(request_id, result)
     if failure is not None:
       raise failure
 
@@ -188,7 +250,7 @@ class TrainingRequestsProcessor:
     save_reqs = [r for r in requests if r.get("op") in save_ops]
 
     if gpu_reqs:
-      async with self.time_slicer.acquire(self.workload):
+      async with self.gpu_lease():
         await asyncio.to_thread(self.worker.wake_up)
         try:
           for request in gpu_reqs:
@@ -202,14 +264,13 @@ class TrainingRequestsProcessor:
       for request in save_reqs:
         results.append(await self.handle_request(request))
     else:
-      async with self.time_slicer.acquire(self.workload):
+      async with self.gpu_lease():
         for request in save_reqs:
           results.append(await self.handle_request(request))
 
   async def process_request(self, raw_request: dict[str, Any]) -> None:
     request_id, result = await self.handle_request(raw_request)
-    if request_id is not None:
-      await self.store.set_future(request_id, result)
+    await self.publish_result(request_id, result)
 
   async def handle_request(self, raw_request: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     request_id = raw_request.get("request_id")
@@ -302,6 +363,8 @@ class TrainingRequestsProcessor:
 
   async def publish_checkpoint(self, model_id: str, local_path: str) -> None:
     """Tell the samplers about a new checkpoint and drop the versions they no longer need."""
+    if not is_primary():
+      return
     if hasattr(self.store, "redis"):
       num_subs = await self.store.redis.publish(f"open_rl:weight_update:{model_id}", json.dumps({"weights_path": local_path}))
       print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")
@@ -321,9 +384,19 @@ async def run_training_requests_processor(
   store: RequestStore | None = None,
 ) -> None:
   store = get_store() if store is None else store
-  if isinstance(worker, FFTTrainingWorker):
-    time_slicer = time_slicer or time_slicer_client_from_env()
+  pin_worker_threads_to_this_rank()
+  if worker.full_parameter:
+    # Rank 0 holds the GPU lease for the whole group; the other ranks follow it through barriers.
+    time_slicer = time_slicer or (time_slicer_client_from_env() if is_primary() else NoOpTimeSlicer())
   await TrainingRequestsProcessor(store, worker, model_id, active_tenant_set_id, time_slicer).run()
+
+
+def build_worker(is_lora: bool) -> TrainingWorker:
+  if os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower() == "automodel":
+    from training.automodel_worker import AutomodelTrainingWorker
+
+    return AutomodelTrainingWorker()
+  return LoraTrainingWorker() if is_lora else FFTTrainingWorker()
 
 
 async def main_async(args: argparse.Namespace) -> None:
@@ -336,7 +409,7 @@ async def main_async(args: argparse.Namespace) -> None:
   is_lora = fine_tuning_type == "lora"
   print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")
 
-  worker: TrainingWorker = LoraTrainingWorker() if is_lora else FFTTrainingWorker()
+  worker = build_worker(is_lora)
   preload_target = os.getenv("BASE_MODEL")
   is_ready = False
   if preload_target and is_lora:
@@ -349,7 +422,7 @@ async def main_async(args: argparse.Namespace) -> None:
       print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
     is_ready = True
 
-  if is_lora:
+  if is_lora and is_primary():
     probe_app = FastAPI()
 
     @probe_app.get("/healthz")
@@ -378,6 +451,7 @@ def start_request_processing_loop() -> None:
   parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated trainer worker drains.")
   parser.add_argument("--active-tenant-set-id", help="Active tenant rotation set ID for LoRA workers (e.g. Qwen/Qwen3-0.6B-1).")
   args = parser.parse_args()
+  initialize_distributed()
 
   print("\n" + "=" * 50)
   print("      Open-RL PyTorch Training Worker")
