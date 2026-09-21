@@ -326,9 +326,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     self.store = StoreStub()
     self.runtime = self.enterContext(runtime_context(self.store))
 
-  async def test_build_and_persist_metadata_from_headers(self) -> None:
-    import json
-
+  async def test_build_metadata_from_headers(self) -> None:
     from fastapi import Request
 
     scope = {
@@ -340,13 +338,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     }
     request = Request(scope)
     metadata = api_server.build_model_metadata(api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"), request.headers)
-    self.assertEqual(self.store.kv_store, {})
-    model_id = "model-1"
-    await self.runtime.persist_model_metadata(model_id, metadata)
-
-    meta_val = self.store.kv_store.get(f"open_rl:model_meta:{model_id}")
-    self.assertIsNotNone(meta_val)
-    meta_dict = json.loads(meta_val)
+    meta_dict = metadata.to_dict()
     self.assertEqual(meta_dict["base_model"], "Qwen/Qwen2.5-0.5B")
     self.assertEqual(meta_dict["fine_tuning_type"], "lora")
     self.assertEqual(meta_dict["weight_sync_config"]["strategy"], "delta")

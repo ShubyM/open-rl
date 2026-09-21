@@ -22,7 +22,6 @@ from training import commands
 from training.commands import parse_command
 from training.fft_trainer_worker import FFTTrainingWorker
 from training.lora_trainer_worker import LoraTrainingWorker
-from training.types import FFTConfig, LoraConfig
 
 tracer = trace.get_tracer(__name__)
 
@@ -110,38 +109,6 @@ class TrainingRequestsProcessor(Protocol):
   async def save_weights_for_sampler(self, command: commands.SaveWeightsForSampler, model_id: str) -> dict[str, Any]: ...
 
 
-async def _fetch_model_meta(
-  store: RequestStore,
-  model_id: str,
-  command: commands.CreateModel | commands.CreateModelFromState,
-  default_kind: str = "full",
-) -> tuple[str, dict[str, Any], dict[str, Any], str]:
-  payload = command.model_dump(include={"base_model", "full_config", "lora_config", "fine_tuning_type"})
-  val = None
-  if hasattr(store, "get_value"):
-    try:
-      val = await store.get_value(f"open_rl:model_meta:{model_id}")
-    except Exception:
-      pass
-  if val:
-    try:
-      meta = json.loads(val) if isinstance(val, str) else val
-      if isinstance(meta, dict):
-        base_model = meta.get("base_model") or payload.get("base_model") or ""
-        full_config = meta.get("full_config") or payload.get("full_config") or {}
-        lora_config = meta.get("lora_config") or payload.get("lora_config") or {}
-        fine_tuning_type = meta.get("fine_tuning_type") or payload.get("fine_tuning_type") or ("lora" if "lora_config" in meta else default_kind)
-        return base_model, full_config, lora_config, fine_tuning_type
-    except Exception:
-      pass
-  return (
-    payload.get("base_model", ""),
-    payload.get("full_config") or {},
-    payload.get("lora_config") or {},
-    payload.get("fine_tuning_type") or ("lora" if default_kind == "lora" else "full"),
-  )
-
-
 class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
   def __init__(
     self,
@@ -182,28 +149,24 @@ class LoraTrainingRequestsProcessor(TrainingRequestsProcessor):
 
       print(f"\n[TRAINING REQUESTS] Popped {len(batch)} requests for model: {model_id}: {describe_requests(batch)}")
       for request in batch:
-        target_model_id = request.get("adapter_id") or request.get("model_id") or model_id
-        await self.process_request(request, target_model_id)
+        await self.process_request(request, request.get("model_id") or model_id)
 
   async def create_model(self, command: commands.CreateModel, model_id: str) -> dict[str, Any]:
-    base_model, _, raw_config, fine_tuning_type = await _fetch_model_meta(self.store, model_id, command, default_kind="lora")
-    lora_config = LoraConfig.model_validate(raw_config)
-    await asyncio.to_thread(self.worker.create_model, base_model, model_id, lora_config)
+    await asyncio.to_thread(self.worker.create_model, command.base_model, model_id, command.lora_config)
     return {
-      "base_model": base_model,
+      "base_model": command.base_model,
       "model_id": model_id,
-      "rank": lora_config.rank,
-      "fine_tuning_type": fine_tuning_type,
+      "rank": command.lora_config.rank,
+      "fine_tuning_type": command.fine_tuning_type,
       "type": "model_created",
     }
 
   async def create_model_from_state(self, command: commands.CreateModelFromState, model_id: str) -> dict[str, Any]:
-    base_model, _, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, command, default_kind="lora")
     result = await asyncio.to_thread(self.worker.load_from_state, model_id, command.state_path, command.restore_optimizer)
     return {
-      "base_model": result.get("base_model") or base_model,
+      "base_model": result.get("base_model"),
       "model_id": result.get("model_id", model_id),
-      "fine_tuning_type": fine_tuning_type,
+      "fine_tuning_type": command.fine_tuning_type,
       "type": "model_loaded_from_state",
     }
 
@@ -338,7 +301,7 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
     has_shutdown = False
     training_reqs = []
     for req in batch:
-      if req.get("request_id") == "SHUTDOWN_SENTINEL" or req.get("op") in {"shutdown", "shutdown_workers"}:
+      if req.get("op") == "shutdown_workers":
         has_shutdown = True
       else:
         training_reqs.append(req)
@@ -407,23 +370,20 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
           results.append(await self.handle_request(request, self.model_id))
 
   async def create_model(self, command: commands.CreateModel, model_id: str) -> dict[str, Any]:
-    base_model, raw_config, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, command, default_kind="full")
-    full_config = FFTConfig.model_validate(raw_config)
-    await asyncio.to_thread(self.worker.create_model, base_model, model_id, full_config)
+    await asyncio.to_thread(self.worker.create_model, command.base_model, model_id, command.full_config)
     return {
-      "base_model": base_model,
+      "base_model": command.base_model,
       "model_id": model_id,
-      "fine_tuning_type": fine_tuning_type,
+      "fine_tuning_type": command.fine_tuning_type,
       "type": "model_created",
     }
 
   async def create_model_from_state(self, command: commands.CreateModelFromState, model_id: str) -> dict[str, Any]:
-    base_model, _, _, fine_tuning_type = await _fetch_model_meta(self.store, model_id, command, default_kind="full")
     result = await asyncio.to_thread(self.worker.load_from_state, model_id, command.state_path, command.restore_optimizer)
     return {
-      "base_model": result.get("base_model") or base_model,
+      "base_model": result.get("base_model"),
       "model_id": result.get("model_id", model_id),
-      "fine_tuning_type": fine_tuning_type,
+      "fine_tuning_type": command.fine_tuning_type,
       "type": "model_loaded_from_state",
     }
 

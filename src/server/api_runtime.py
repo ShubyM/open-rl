@@ -1,7 +1,6 @@
 """Application-owned training submission, sessions, and background task lifetime."""
 
 import asyncio
-import json
 import os
 import traceback
 from collections import defaultdict
@@ -9,7 +8,6 @@ from typing import Any
 
 from opentelemetry import propagate
 
-from server.model_metadata import TrainingModelMetadata
 from server.session_registry import SessionRegistry
 from server.store import RequestStore
 from server.worker_manager import WorkerManager, owner_of
@@ -45,9 +43,6 @@ class ApiRuntime:
     await self.store.put_request(commands.wire(command.model_copy(update={"trace_context": carrier})), active_set_id=active_set_id)
     print(f"[API_SERVER] enqueued op={command.op} request_id={request_id} model_id={command.model_id} active_set={active_set_id}")
     return request_id
-
-  async def persist_model_metadata(self, model_id: str, metadata: TrainingModelMetadata) -> None:
-    await self.store.set_value(f"open_rl:model_meta:{model_id}", json.dumps(metadata.to_dict()))
 
   async def bind_session(self, session_id: str | None, model_id: str) -> None:
     if self.worker_manager is not None and session_id:

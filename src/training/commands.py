@@ -81,40 +81,20 @@ class SaveWeightsForSampler(Command):
   sampling_session_id: str | None = None
 
 
-class DeleteModel(Command):
-  op: Literal["delete_model"] = "delete_model"
-
-
 class Shutdown(Command):
   op: Literal["shutdown_workers"] = "shutdown_workers"
   request_id: str = SHUTDOWN_REQUEST_ID
 
 
 TrainingCommand = Annotated[
-  CreateModel
-  | CreateModelFromState
-  | ForwardBackward
-  | OptimStep
-  | Sample
-  | SaveState
-  | LoadWeights
-  | SaveWeightsForSampler
-  | DeleteModel
-  | Shutdown,
+  CreateModel | CreateModelFromState | ForwardBackward | OptimStep | Sample | SaveState | LoadWeights | SaveWeightsForSampler | Shutdown,
   Field(discriminator="op"),
 ]
-
-# Commands whose work touches the model on the GPU. The rest are saves that a
-# worker may serve from the host. Read by the shared trainer core, which lands
-# in the next PR along with DeleteModel and SamplerWeights.
-GPU_COMMANDS = (CreateModel, CreateModelFromState, ForwardBackward, OptimStep, Sample, LoadWeights)
 
 command_adapter: TypeAdapter[TrainingCommand] = TypeAdapter(TrainingCommand)
 
 
 def parse_command(raw: dict[str, Any]) -> TrainingCommand:
-  if raw.get("request_id") == SHUTDOWN_REQUEST_ID or raw.get("op") in {"shutdown", "shutdown_workers"}:
-    return Shutdown(model_id=raw.get("model_id", "default"))
   return command_adapter.validate_python(raw)
 
 

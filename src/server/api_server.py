@@ -517,7 +517,7 @@ async def create_model(runtime: Runtime, req: CreateModelRequest, request: Reque
     lora_config=meta.lora_config or {},
     full_config=meta.full_config or {},
   )
-  await runtime.persist_model_metadata(model_id, meta)
+  await runtime.store.set_value(f"open_rl:model_meta:{model_id}", json.dumps(meta.to_dict()))
   await runtime.bind_session(req.session_id, model_id)
   req_id = await runtime.submit(command)
   return {"request_id": req_id}
@@ -562,7 +562,7 @@ async def create_model_from_state(runtime: Runtime, req: CreateModelFromStateReq
     restore_optimizer=req.restore_optimizer,
     fine_tuning_type="full" if meta.fine_tuning_type == "full" else "lora",
   )
-  await runtime.persist_model_metadata(model_id, meta)
+  await runtime.store.set_value(f"open_rl:model_meta:{model_id}", json.dumps(meta.to_dict()))
   await runtime.bind_session(req.session_id, model_id)
   req_id = await runtime.submit(command)
   return {"request_id": req_id}

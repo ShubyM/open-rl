@@ -52,11 +52,3 @@ class FFTConfig(BaseModel):
 
 
 FineTuningType = Literal["lora", "full"]
-
-
-class SamplerWeights(BaseModel):
-  """What a trainer published for the samplers: a LoRA adapter directory the
-  sampler hot-loads, or a whole checkpoint it reloads."""
-
-  kind: Literal["adapter", "checkpoint"]
-  path: str

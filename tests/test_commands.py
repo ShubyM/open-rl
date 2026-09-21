@@ -46,11 +46,6 @@ class CommandWireFormatTest(unittest.TestCase):
     self.assertEqual(commands.parse_command(commands.wire(command)), command)
     self.assertEqual(Datum.model_validate(datum.model_dump()), datum)
 
-  def test_legacy_shutdown_sentinel_parses(self) -> None:
-    command = commands.parse_command({"request_id": "SHUTDOWN_SENTINEL", "model_id": "m", "op": "shutdown_workers"})
-    self.assertIsInstance(command, commands.Shutdown)
-    self.assertEqual(command.model_id, "m")
-
   def test_unknown_op_is_rejected(self) -> None:
     with self.assertRaises(ValueError):
       commands.parse_command({"request_id": "r", "model_id": "m", "op": "frobnicate"})
@@ -59,10 +54,6 @@ class CommandWireFormatTest(unittest.TestCase):
     # A pre-upgrade queue item must not run as an optim_step with default adam params.
     with self.assertRaises(ValueError):
       commands.parse_command({"request_id": "r", "model_id": "m", "op": "optim_step", "payload": {"adam_params": {"learning_rate": 1e-5}}})
-
-  def test_gpu_commands_cover_every_model_touching_op(self) -> None:
-    gpu_ops = {command.model_fields["op"].default for command in commands.GPU_COMMANDS}
-    self.assertEqual(gpu_ops, {"create_model", "create_model_from_state", "forward_backward", "optim_step", "sample", "load_weights"})
 
 
 if __name__ == "__main__":
