@@ -74,7 +74,7 @@ class GetInfoTest(ApiServerTest):
     model_id = self.post("create_model", {"base_model": "my-model"}).json()["request_id"]
     queued = self.queued()
     self.assertEqual(queued[0]["model_id"], model_id)
-    self.assertEqual(queued[0]["payload"], {})
+    self.assertEqual(queued[0]["payload"]["base_model"], "my-model")
     meta = json.loads(api_server.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "my-model")
 
@@ -295,3 +295,27 @@ class SampleSequenceIdsTest(ApiServerTest):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class InputBoundaryTest(ApiServerTest):
+  def test_invalid_training_datum_is_a_validation_error(self) -> None:
+    response = self.post(
+      "forward_backward",
+      {"model_id": "m", "forward_backward_input": {"data": [{"model_input": {"chunks": [{"tokens": ["bad"]}]}, "loss_fn_inputs": {}}]}},
+    )
+    self.assertEqual(response.status_code, 422)
+    self.assertEqual(api_server.store.queues, {})
+
+  def test_null_configs_and_sampling_defaults_preserve_zero(self) -> None:
+    response = self.post("create_model", {"base_model": "base", "lora_config": None, "full_config": None})
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(self.queued()[0]["payload"]["lora_config"]["rank"], 16)
+    for value in (None, 0):
+      with self.subTest(value=value), patch.object(api_server, "get_sampler_backend", return_value="torch"):
+        response = self.post(
+          "asample", {"model_id": "base", "prompt": {"chunks": [{"tokens": [1]}]}, "sampling_params": {"temperature": value, "max_tokens": value}}
+        )
+        self.assertEqual(response.status_code, 200)
+        queued = self.queued()[0]["payload"]
+        self.assertEqual(queued["temperature"], 1.0 if value is None else 0)
+        self.assertEqual(queued["max_tokens"], 20 if value is None else 0)
