@@ -102,12 +102,6 @@ RUN set -eu; \
         done; \
     done
 
-# Copy patch script specifically
-COPY src/server/scripts/patch_vllm_lora_dedup.py /app/src/server/scripts/patch_vllm_lora_dedup.py
-
-# Apply vLLM patches (Gemma 4 LoRA dedup)
-RUN uv run --no-sync python /app/src/server/scripts/patch_vllm_lora_dedup.py
-
 # Copy source code
 COPY . .
 
