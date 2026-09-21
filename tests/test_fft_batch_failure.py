@@ -66,7 +66,7 @@ class FFTBatchFailureTest(unittest.TestCase):
       self.assertIn("CUDA out of memory", result["error_message"])
 
   def test_a_worker_the_slicer_could_not_park_exits_without_unregistering(self) -> None:
-    store = BatchStore([{"request_id": "sv-1", "op": "save_weights"}])
+    store = BatchStore([{"request_id": "sv-1", "op": "save_state"}])
     slicer = SlicerStub()
     proc = processor(store, slicer)
     exits = []

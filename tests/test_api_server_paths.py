@@ -83,6 +83,19 @@ class GetInfoTest(ApiServerTest):
     meta = json.loads(self.runtime.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "my-model")
 
+  def test_an_invalid_config_is_a_400_and_persists_nothing(self) -> None:
+    response = self.post("create_model", {"base_model": "my-model", "lora_config": {"rank": "big"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("rank", response.json()["error"])
+    self.assertEqual(self.runtime.store.queues, {})
+    self.assertEqual([k for k in self.runtime.store.kv_store if k.startswith("open_rl:model_meta:")], [])
+
+  def test_create_model_from_state_refuses_a_malformed_tinker_path(self) -> None:
+    response = self.post("create_model_from_state", {"state_path": "tinker://job-a/sampler_weights/sampler-3"})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("is not a tinker://<model>/weights/<name> path", response.json()["error"])
+    self.assertEqual(self.runtime.store.queues, {})
+
 
 class ErrorShapeTest(ApiServerTest):
   """Every refused request answers {"error": ...}, whichever layer refused it."""
@@ -297,6 +310,20 @@ class SampleSequenceIdsTest(ApiServerTest):
     with patch.object(api_server, "get_sampler_backend", return_value="torch"):
       promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)
+
+  def test_asample_takes_defaults_for_explicit_nulls(self) -> None:
+    # tinker's SamplingParams serializes an explicitly-set None; the worker's old defaults apply.
+    body = {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}, "sampling_params": {"max_tokens": None, "temperature": None}}
+    with patch.object(api_server, "get_sampler_backend", return_value="torch"):
+      response = self.post("asample", body)
+    self.assertEqual(response.status_code, 200)
+    queued = self.queued()[0]
+    self.assertEqual((queued["max_tokens"], queued["temperature"]), (20, 0.0))
+
+  def test_asample_without_a_model_is_a_400(self) -> None:
+    with patch.object(api_server, "get_sampler_backend", return_value="torch"):
+      response = self.post("asample", {"prompt": {"chunks": [{"tokens": [1]}]}})
+    self.assertEqual(response.status_code, 400)
 
   def test_vllm_submission_carries_http_trace_without_future_registration(self) -> None:
     trace_id = "1234567890abcdef1234567890abcdef"

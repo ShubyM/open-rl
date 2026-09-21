@@ -179,14 +179,14 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self.store.active_sets, ["shared-base-1"])
     self.assertEqual(self.store.future_updates, [])
 
-  async def test_queue_failure_resolves_pending_future(self) -> None:
+  async def test_queue_failure_raises_so_the_client_retries(self) -> None:
+    # A store outage must surface as a 500 the SDK retries, not a terminal failed future.
     with (
       patch.object(self.store, "put_request", new=AsyncMock(side_effect=RuntimeError("queue unavailable"))),
-      patch("server.api_runtime.traceback.print_exc"),
+      self.assertRaises(RuntimeError),
     ):
-      request_id = await self.runtime.submit(api_server.commands.OptimStep(request_id="step", model_id="adapter"))
-    self.assertEqual(request_id, "step")
-    self.assertEqual(self.store.futures["step"], {"type": "RequestFailedResponse", "error_message": "queue unavailable"})
+      await self.runtime.submit(api_server.commands.OptimStep(request_id="step", model_id="adapter"))
+    self.assertNotIn("step", self.store.futures)
 
 
 class ApiServerLifespanTest(unittest.IsolatedAsyncioTestCase):
@@ -341,7 +341,8 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     request = Request(scope)
     metadata = api_server.build_model_metadata(api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"), request.headers)
     self.assertEqual(self.store.kv_store, {})
-    model_id = await self.runtime.persist_model_metadata(metadata)
+    model_id = "model-1"
+    await self.runtime.persist_model_metadata(model_id, metadata)
 
     meta_val = self.store.kv_store.get(f"open_rl:model_meta:{model_id}")
     self.assertIsNotNone(meta_val)

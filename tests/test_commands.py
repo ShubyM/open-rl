@@ -14,7 +14,6 @@ class CommandWireFormatTest(unittest.TestCase):
       commands.SaveState(request_id="r", model_id="m", state_path="/ckpt", include_optimizer=True, kind="weights"),
       commands.LoadWeights(request_id="r", model_id="m", state_path="/ckpt"),
       commands.SaveWeightsForSampler(request_id="r", model_id="m", alias="final", sampling_session_id="tinker://m/sampler_weights/sampler-0"),
-      commands.SaveWeights(request_id="r", model_id="m", alias="final"),
       commands.Shutdown(model_id="m"),
     ):
       with self.subTest(op=command.op):
@@ -55,6 +54,11 @@ class CommandWireFormatTest(unittest.TestCase):
   def test_unknown_op_is_rejected(self) -> None:
     with self.assertRaises(ValueError):
       commands.parse_command({"request_id": "r", "model_id": "m", "op": "frobnicate"})
+
+  def test_legacy_nested_payload_is_rejected(self) -> None:
+    # A pre-upgrade queue item must not run as an optim_step with default adam params.
+    with self.assertRaises(ValueError):
+      commands.parse_command({"request_id": "r", "model_id": "m", "op": "optim_step", "payload": {"adam_params": {"learning_rate": 1e-5}}})
 
   def test_gpu_commands_cover_every_model_touching_op(self) -> None:
     gpu_ops = {command.model_fields["op"].default for command in commands.GPU_COMMANDS}

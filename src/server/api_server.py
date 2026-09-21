@@ -421,6 +421,12 @@ async def request_validation_error(_: Request, exc: RequestValidationError) -> J
   return JSONResponse(status_code=422, content={"error": "invalid request", "detail": errors})
 
 
+@app.exception_handler(ValidationError)
+async def command_validation_error(_: Request, exc: ValidationError) -> JSONResponse:
+  """A request that passed the route model but does not make a valid command."""
+  return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
 @app.exception_handler(StarletteHTTPException)
 async def http_error(_: Request, exc: StarletteHTTPException) -> Response:
   """Every refused request answers {"error": ...}; handlers raise instead of building responses."""
@@ -499,11 +505,10 @@ async def create_model(runtime: Runtime, req: CreateModelRequest, request: Reque
   """ServiceClient.create_lora_training_client_async()"""
   try:
     meta = build_model_metadata(req, request.headers)
-    model_id = await runtime.persist_model_metadata(meta)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-  await runtime.bind_session(req.session_id, model_id)
+  # Build the command before anything is persisted so a bad config leaves no orphaned metadata.
+  model_id = new_request_id()
   command = commands.CreateModel(
     request_id=model_id,
     model_id=model_id,
@@ -512,6 +517,8 @@ async def create_model(runtime: Runtime, req: CreateModelRequest, request: Reque
     lora_config=meta.lora_config or {},
     full_config=meta.full_config or {},
   )
+  await runtime.persist_model_metadata(model_id, meta)
+  await runtime.bind_session(req.session_id, model_id)
   req_id = await runtime.submit(command)
   return {"request_id": req_id}
 
@@ -536,15 +543,18 @@ async def delete_model(runtime: Runtime, req: ModelRequest):
 async def create_model_from_state(runtime: Runtime, req: CreateModelFromStateRequest, request: Request) -> dict[str, Any]:
   """ServiceClient.create_training_client_from_state_async()"""
   state_path = req.state_path
-  # Legacy restore names are relative to the checkpoint root, not a new model.
-  resolved_path = checkpoint_from_uri(runtime.checkpoint_root, state_path) or os.path.join(runtime.checkpoint_root, state_path)
+  if state_path.startswith("tinker://"):
+    resolved_path = checkpoint_from_uri(runtime.checkpoint_root, state_path)
+    if resolved_path is None:
+      raise HTTPException(status_code=400, detail=f"{state_path} is not a tinker://<model>/weights/<name> path")
+  else:
+    # Legacy restore names are relative to the checkpoint root, not a new model.
+    resolved_path = os.path.join(runtime.checkpoint_root, state_path)
   try:
     meta = build_model_metadata(req, request.headers)
-    model_id = await runtime.persist_model_metadata(meta)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-  await runtime.bind_session(req.session_id, model_id)
+  model_id = new_request_id()
   command = commands.CreateModelFromState(
     request_id=model_id,
     model_id=model_id,
@@ -552,6 +562,8 @@ async def create_model_from_state(runtime: Runtime, req: CreateModelFromStateReq
     restore_optimizer=req.restore_optimizer,
     fine_tuning_type="full" if meta.fine_tuning_type == "full" else "lora",
   )
+  await runtime.persist_model_metadata(model_id, meta)
+  await runtime.bind_session(req.session_id, model_id)
   req_id = await runtime.submit(command)
   return {"request_id": req_id}
 
@@ -811,13 +823,16 @@ async def asample(runtime: Runtime, req: AsampleRequest):
   lookup_id = base_model_id or model_id
 
   if get_sampler_backend() == "torch":
+    if not lookup_id:
+      raise HTTPException(status_code=400, detail="model_id or sampling_session_id is required")
+    # The SDK may send explicit nulls; the command takes the same defaults the worker always used.
     req_id = await runtime.submit(
       commands.Sample(
         request_id=new_request_id(),
         model_id=lookup_id,
         prompt_tokens=prompt,
-        max_tokens=params.max_tokens,
-        temperature=params.temperature,
+        max_tokens=params.max_tokens if params.max_tokens is not None else 20,
+        temperature=params.temperature if params.temperature is not None else 0.0,
         num_samples=num_samples,
         prompt_logprobs=req.prompt_logprobs,
       )

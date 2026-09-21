@@ -7,7 +7,7 @@ the model's dump, with `op` naming the type.
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from training.types import Datum, FFTConfig, FineTuningType, LoraConfig
 
@@ -15,6 +15,10 @@ SHUTDOWN_REQUEST_ID = "SHUTDOWN_SENTINEL"
 
 
 class Command(BaseModel):
+  # Queues are never flushed on upgrade. A stale item in the old nested-payload
+  # shape must fail here, not run with every field at its default.
+  model_config = ConfigDict(extra="forbid")
+
   request_id: str
   model_id: str
   trace_context: dict[str, str] | None = None
@@ -77,11 +81,6 @@ class SaveWeightsForSampler(Command):
   sampling_session_id: str | None = None
 
 
-class SaveWeights(Command):
-  op: Literal["save_weights"] = "save_weights"
-  alias: str | None = None
-
-
 class DeleteModel(Command):
   op: Literal["delete_model"] = "delete_model"
 
@@ -100,14 +99,14 @@ TrainingCommand = Annotated[
   | SaveState
   | LoadWeights
   | SaveWeightsForSampler
-  | SaveWeights
   | DeleteModel
   | Shutdown,
   Field(discriminator="op"),
 ]
 
 # Commands whose work touches the model on the GPU. The rest are saves that a
-# worker may serve from the host; see TrainingWorker.save_needs_gpu.
+# worker may serve from the host. Read by the shared trainer core, which lands
+# in the next PR along with DeleteModel and SamplerWeights.
 GPU_COMMANDS = (CreateModel, CreateModelFromState, ForwardBackward, OptimStep, Sample, LoadWeights)
 
 command_adapter: TypeAdapter[TrainingCommand] = TypeAdapter(TrainingCommand)
