@@ -95,16 +95,10 @@ class TrainingModelMetadata:
     else:
       cfg = WeightSyncConfig()
 
-    ft_type = data.get("fine_tuning_type", "lora")
-    if ft_type not in {"lora", "full"}:
-      raise ValueError(f"Invalid fine_tuning_type: {ft_type!r}")
-    if not isinstance(data.get("base_model"), str) or not data["base_model"]:
-      raise ValueError("Model metadata must specify base_model")
-
     return cls(
-      base_model=data["base_model"],
+      base_model=data.get("base_model") or "",
       created_at=data.get("created_at", 0.0),
-      fine_tuning_type=ft_type,
+      fine_tuning_type="full" if data.get("fine_tuning_type") == "full" else "lora",
       weight_sync_config=cfg,
       full_config=data.get("full_config") or {},
       lora_config=data.get("lora_config") or {},
@@ -144,8 +138,10 @@ def _decode_metadata(raw: str | None) -> dict[str, Any] | None:
   data = json.loads(raw)
   if not isinstance(data, dict):
     raise ValueError("Model metadata must be a JSON object")
-  if not isinstance(data.get("base_model"), str) or not data["base_model"]:
-    raise ValueError("Model metadata must specify base_model")
+  # Restores written before the server resolved the checkpoint carry this
+  # placeholder kind and no base model. They must keep decoding after an upgrade.
+  if data.get("fine_tuning_type") == "restored":
+    data["fine_tuning_type"] = "lora"
   if data.get("fine_tuning_type", "lora") not in {"lora", "full"}:
     raise ValueError("Model metadata must specify lora or full fine_tuning_type")
   return data

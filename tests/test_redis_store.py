@@ -328,7 +328,7 @@ class InMemoryStateStoreTest(unittest.IsolatedAsyncioTestCase):
     with self.assertRaises(KeyError):
       await update_model_metadata(self.state, "model-1", {"status": "completed"})
     self.assertIsNone(await self.state.get_value(key))
-    for raw in ("invalid JSON", "[]", "null", "{}", '{"base_model": null}'):
+    for raw in ("invalid JSON", "[]", "null", '{"fine_tuning_type": "sparse"}'):
       with self.subTest(raw=raw):
         await self.state.set_value(key, raw)
         with self.assertRaises(ValueError):
@@ -336,6 +336,11 @@ class InMemoryStateStoreTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
           await update_model_metadata(self.state, "model-1", {"status": "completed"})
         self.assertEqual(await self.state.get_value(key), raw)
+
+  async def test_legacy_restored_records_still_decode(self) -> None:
+    # The previous server wrote this shape for every create_model_from_state.
+    await self.state.set_value("open_rl:model_meta:old", '{"base_model": null, "fine_tuning_type": "restored"}')
+    self.assertEqual(await get_model_metadata(self.state, "old"), {"model_id": "old", "base_model": None, "fine_tuning_type": "lora"})
 
   async def test_persisted_model_is_readable_by_sync_worker_lookup(self) -> None:
     metadata = TrainingModelMetadata(base_model="base", created_at=123.0)
