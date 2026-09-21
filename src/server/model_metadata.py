@@ -132,7 +132,7 @@ class TrainingModelMetadata:
     return res
 
 
-def _decode_metadata(raw: str | None) -> dict[str, Any] | None:
+def decode_model_metadata(raw: str | None) -> dict[str, Any] | None:
   if raw is None:
     return None
   data = json.loads(raw)
@@ -148,14 +148,7 @@ def _decode_metadata(raw: str | None) -> dict[str, Any] | None:
 
 
 async def get_model_metadata(state: StateStore, model_id: str) -> dict[str, Any] | None:
-  data = _decode_metadata(await state.get_value(f"open_rl:model_meta:{model_id}"))
-  if data is not None:
-    data["model_id"] = model_id
-  return data
-
-
-def get_model_metadata_sync(state: StateStore, model_id: str) -> dict[str, Any] | None:
-  data = _decode_metadata(state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+  data = decode_model_metadata(await state.get_value(f"open_rl:model_meta:{model_id}"))
   if data is not None:
     data["model_id"] = model_id
   return data
@@ -163,7 +156,7 @@ def get_model_metadata_sync(state: StateStore, model_id: str) -> dict[str, Any] 
 
 async def update_model_metadata(state: StateStore, model_id: str, updates: dict[str, Any]) -> None:
   key = f"open_rl:model_meta:{model_id}"
-  data = _decode_metadata(await state.get_value(key))
+  data = decode_model_metadata(await state.get_value(key))
   if data is None:
     raise KeyError(f"Unknown model: {model_id}")
   data.update(updates)

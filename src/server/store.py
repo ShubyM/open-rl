@@ -130,8 +130,6 @@ class InMemoryStore(RequestStore):
     return batch
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
-    if result.get("status") == "pending":
-      return
     self.futures_store[req_id] = result
     for event in self.futures_events.get(req_id, ()):
       event.set()
@@ -269,9 +267,6 @@ class RedisStore(RequestStore):
     return batch
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
-    if result.get("status") == "pending":
-      return
-
     key = f"open_rl:future:{req_id}"
     # Keep the list format for existing workers, with one result per request.
     async with self.redis.pipeline(transaction=True) as pipeline:
@@ -399,19 +394,19 @@ class RedisStateStore(StateStore):
 
 
 @cache
-def _redis_client(redis_url: str) -> redis.Redis:
+def redis_client(redis_url: str) -> redis.Redis:
   return redis.from_url(redis_url, decode_responses=True, health_check_interval=2, max_connections=10000)
 
 
 @cache
 def get_store() -> RequestStore:
   redis_url = os.environ.get("REDIS_URL")
-  return RedisStore(_redis_client(redis_url)) if redis_url else InMemoryStore()
+  return RedisStore(redis_client(redis_url)) if redis_url else InMemoryStore()
 
 
 @cache
 def get_state_store() -> StateStore:
   redis_url = os.environ.get("REDIS_URL")
   if redis_url:
-    return RedisStateStore(_redis_client(redis_url), sync_redis.Redis.from_url(redis_url, decode_responses=True))
+    return RedisStateStore(redis_client(redis_url), sync_redis.Redis.from_url(redis_url, decode_responses=True))
   return InMemoryStateStore()

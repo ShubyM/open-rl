@@ -20,7 +20,6 @@ from server import store as stores
 from server.model_metadata import (
   TrainingModelMetadata,
   get_model_metadata,
-  get_model_metadata_sync,
   persist_model_metadata,
   update_model_metadata,
 )
@@ -162,10 +161,6 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     result = await self.store.get_future("req-never", timeout=0.3)
     self.assertEqual(result["type"], "try_again")
 
-  async def test_pending_markers_are_not_stored(self) -> None:
-    await self.store.set_future("req-1", {"status": "pending"})
-    self.assertEqual((await self.store.get_future("req-1", timeout=0.3))["type"], "try_again")
-
   async def test_get_requests_rotates_between_tenants(self) -> None:
     for i in range(3):
       await self.store.put_request({"model_id": "tenant-a", "request_id": f"a{i}"}, active_set_id="base-1")
@@ -246,16 +241,6 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual(await waiting, {"type": "sample"})
     self.assertEqual(self.store.futures_events, {})
-
-  async def test_pending_markers_do_not_store_or_overwrite_results(self) -> None:
-    await self.store.set_future("req-1", {"status": "pending"})
-    self.assertNotIn("req-1", self.store.futures_store)
-    self.assertEqual((await self.store.get_future("req-1", timeout=0.01))["type"], "try_again")
-    self.assertEqual(self.store.futures_events, {})
-
-    await self.store.set_future("req-1", {"type": "sample"})
-    await self.store.set_future("req-1", {"status": "pending"})
-    self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample"})
 
   async def test_repeated_resolution_replaces_the_result(self) -> None:
     await self.store.set_future("req-1", {"type": "first"})
@@ -347,7 +332,6 @@ class InMemoryStateStoreTest(unittest.IsolatedAsyncioTestCase):
     model_id = "model-1"
     await persist_model_metadata(self.state, model_id, metadata)
     self.assertEqual(await get_model_metadata(self.state, model_id), {**metadata.to_dict(), "model_id": model_id})
-    self.assertEqual(get_model_metadata_sync(self.state, model_id), await get_model_metadata(self.state, model_id))
 
   async def test_values_expire_and_sets_hold_members(self) -> None:
     await self.state.set_value("k", "v", ttl_seconds=60)
@@ -371,7 +355,7 @@ class StoreFactoryTest(unittest.TestCase):
   def clear_factories(self) -> None:
     stores.get_store.cache_clear()
     stores.get_state_store.cache_clear()
-    stores._redis_client.cache_clear()
+    stores.redis_client.cache_clear()
 
   def test_redis_backends_share_one_async_client(self) -> None:
     with (

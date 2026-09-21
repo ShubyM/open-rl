@@ -14,7 +14,7 @@ from typing import Protocol
 
 from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.estimator import footprint
-from server.model_metadata import TrainingModelMetadata, get_model_metadata_sync
+from server.model_metadata import TrainingModelMetadata, decode_model_metadata
 from server.store import get_state_store
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 def metadata_for(model_id: str) -> TrainingModelMetadata | None:
   """The metadata create_model stored for this model, or None."""
-  data = get_model_metadata_sync(get_state_store(), model_id)
+  data = decode_model_metadata(get_state_store().get_value_sync(f"open_rl:model_meta:{model_id}"))
   return TrainingModelMetadata.from_dict(data) if data is not None else None
 
 

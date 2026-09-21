@@ -10,7 +10,7 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
-from server.store import RedisStateStore, get_state_store, get_store
+from server.store import get_state_store, get_store
 from server.vllm_options import gpu_memory_utilization, split_stop, text_only_engine_kwargs
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
@@ -176,9 +176,8 @@ async def main():
   engine = AsyncLLMEngine.from_engine_args(engine_args)
   print("[LoRA Sampler] Engine initialized successfully.")
 
-  if isinstance(state, RedisStateStore):
-    await state.set_value(f"open_rl:sampler_ready:{model_id}", "1", ttl_seconds=3600)
-    print(f"[LoRA Sampler] Registered ready signal for model {model_id} in Redis.")
+  await state.set_value(f"open_rl:sampler_ready:{model_id}", "1", ttl_seconds=3600)
+  print(f"[LoRA Sampler] Registered ready signal for model {model_id}.")
 
   last_ready_refresh = asyncio.get_running_loop().time()
   while True:
@@ -186,7 +185,7 @@ async def main():
       # Standing deployments outlive the 3600s ready-key TTL; keep it fresh so
       # new sampling sessions don't time out waiting on a sampler that is live.
       now = asyncio.get_running_loop().time()
-      if isinstance(state, RedisStateStore) and now - last_ready_refresh > 60:
+      if now - last_ready_refresh > 60:
         await state.set_value(f"open_rl:sampler_ready:{model_id}", "1", ttl_seconds=3600)
         last_ready_refresh = now
       sampling_reqs = await store.get_sampling_requests_for_model(model_id)

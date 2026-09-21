@@ -11,7 +11,7 @@ from typing import Any
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
-from server.store import RedisStateStore, get_state_store, get_store
+from server.store import get_state_store, get_store
 from server.vllm_options import gpu_memory_utilization, split_stop, text_only_engine_kwargs
 
 try:
@@ -391,8 +391,7 @@ async def run_sampling_worker(model_id: str) -> None:
     except NotImplementedError:
       pass
 
-  if isinstance(state, RedisStateStore):
-    await state.set_value(f"open_rl:sampler_ready:{model_id}", "1", ttl_seconds=3600)
+  await state.set_value(f"open_rl:sampler_ready:{model_id}", "1", ttl_seconds=3600)
 
   print(f"[vLLM Worker] Listening for sampling requests on queue for model: {model_id}...")
   try:
