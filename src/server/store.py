@@ -60,7 +60,7 @@ class InMemoryStore(RequestStore):
     self.active_tenants: dict[str, list[str]] = {}
     self.active_tenants_cv = asyncio.Condition()
     self.futures_store: dict[str, dict[str, Any]] = {}
-    self.futures_events: dict[str, set[asyncio.Event]] = {}
+    self.futures_cv = asyncio.Condition()
     self.sampling_queues: dict[str, asyncio.Queue] = {}
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
@@ -130,26 +130,17 @@ class InMemoryStore(RequestStore):
     return batch
 
   async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
-    self.futures_store[req_id] = result
-    for event in self.futures_events.get(req_id, ()):
-      event.set()
+    async with self.futures_cv:
+      self.futures_store[req_id] = result
+      self.futures_cv.notify_all()
 
   async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
-    if req_id in self.futures_store:
+    async with self.futures_cv:
+      try:
+        await asyncio.wait_for(self.futures_cv.wait_for(lambda: req_id in self.futures_store), timeout=timeout)
+      except TimeoutError:
+        return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
       return self.futures_store[req_id]
-
-    event = asyncio.Event()
-    waiters = self.futures_events.setdefault(req_id, set())
-    waiters.add(event)
-    try:
-      await asyncio.wait_for(event.wait(), timeout=timeout)
-      return self.futures_store[req_id]
-    except TimeoutError:
-      return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
-    finally:
-      waiters.remove(event)
-      if not waiters:
-        del self.futures_events[req_id]
 
 
 class RedisStore(RequestStore):

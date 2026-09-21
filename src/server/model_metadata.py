@@ -148,10 +148,7 @@ def decode_model_metadata(raw: str | None) -> dict[str, Any] | None:
 
 
 async def get_model_metadata(state: StateStore, model_id: str) -> dict[str, Any] | None:
-  data = decode_model_metadata(await state.get_value(f"open_rl:model_meta:{model_id}"))
-  if data is not None:
-    data["model_id"] = model_id
-  return data
+  return decode_model_metadata(await state.get_value(f"open_rl:model_meta:{model_id}"))
 
 
 async def update_model_metadata(state: StateStore, model_id: str, updates: dict[str, Any]) -> None:

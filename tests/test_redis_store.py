@@ -219,7 +219,6 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual(await asyncio.gather(*waiters), [{"type": "sample"}] * 3)
     self.assertEqual(await self.store.get_future("req-1", timeout=1.0), {"type": "sample"})
-    self.assertEqual(self.store.futures_events, {})
 
   async def test_timed_out_waiter_does_not_disconnect_other_waiters(self) -> None:
     short = asyncio.create_task(self.store.get_future("req-1", timeout=0.01))
@@ -228,7 +227,6 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
     await self.store.set_future("req-1", {"type": "sample"})
 
     self.assertEqual(await long, {"type": "sample"})
-    self.assertEqual(self.store.futures_events, {})
 
   async def test_cancelled_waiter_does_not_disconnect_other_waiters(self) -> None:
     cancelled = asyncio.create_task(self.store.get_future("req-1", timeout=1.0))
@@ -240,7 +238,6 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
     await self.store.set_future("req-1", {"type": "sample"})
 
     self.assertEqual(await waiting, {"type": "sample"})
-    self.assertEqual(self.store.futures_events, {})
 
   async def test_repeated_resolution_replaces_the_result(self) -> None:
     await self.store.set_future("req-1", {"type": "first"})
@@ -304,7 +301,7 @@ class InMemoryStateStoreTest(unittest.IsolatedAsyncioTestCase):
       await update_model_metadata(self.state, "model-1", {"total_steps_completed": 2})
     self.assertEqual(
       await get_model_metadata(self.state, "model-1"),
-      {"model_id": "model-1", "base_model": "base", "total_steps_completed": 2, "updated_at": 123.0},
+      {"base_model": "base", "total_steps_completed": 2, "updated_at": 123.0},
     )
 
   async def test_metadata_updates_refuse_missing_or_corrupt_records(self) -> None:
@@ -325,13 +322,13 @@ class InMemoryStateStoreTest(unittest.IsolatedAsyncioTestCase):
   async def test_legacy_restored_records_still_decode(self) -> None:
     # The previous server wrote this shape for every create_model_from_state.
     await self.state.set_value("open_rl:model_meta:old", '{"base_model": null, "fine_tuning_type": "restored"}')
-    self.assertEqual(await get_model_metadata(self.state, "old"), {"model_id": "old", "base_model": None, "fine_tuning_type": "lora"})
+    self.assertEqual(await get_model_metadata(self.state, "old"), {"base_model": None, "fine_tuning_type": "lora"})
 
   async def test_persisted_model_is_readable_by_sync_worker_lookup(self) -> None:
     metadata = TrainingModelMetadata(base_model="base", created_at=123.0)
     model_id = "model-1"
     await persist_model_metadata(self.state, model_id, metadata)
-    self.assertEqual(await get_model_metadata(self.state, model_id), {**metadata.to_dict(), "model_id": model_id})
+    self.assertEqual(await get_model_metadata(self.state, model_id), metadata.to_dict())
 
   async def test_values_expire_and_sets_hold_members(self) -> None:
     await self.state.set_value("k", "v", ttl_seconds=60)
