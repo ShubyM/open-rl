@@ -370,6 +370,9 @@ async def _extract_and_persist_model_metadata(
   )
   if meta_obj.trainer_parallelism.cp > 1:
     raise ValueError("trainer context parallelism is not supported yet")
+  sampler = meta_obj.sampler_parallelism
+  if sampler.tp > 1 or sampler.cp > 1:
+    raise ValueError("sampler parallelism supports dp only for now (one single-GPU sampler per replica)")
   await persist_model_metadata(state, model_id, meta_obj)
 
   return model_id, meta_obj
