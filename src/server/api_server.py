@@ -368,6 +368,9 @@ async def _extract_and_persist_model_metadata(
     trainer_parallelism=resolve_parallelism("trainer", user_metadata, session_metadata, headers=headers),
     sampler_parallelism=resolve_parallelism("sampler", user_metadata, session_metadata, headers=headers),
   )
+  sampler = meta_obj.sampler_parallelism
+  if sampler.tp > 1 or sampler.cp > 1:
+    raise ValueError("sampler parallelism supports dp only for now (one single-GPU sampler per replica)")
   await persist_model_metadata(state, model_id, meta_obj)
 
   return model_id, meta_obj

@@ -371,3 +371,12 @@ class ParallelismMetadataTest(ApiServerTest):
     own = {"open_rl.trainer.parallelism": "tp=2"}
     overridden = self.post("create_model", {"base_model": "m", "session_id": session_id, "user_metadata": own}).json()["request_id"]
     self.assertEqual(self.metadata(overridden)["trainer_parallelism"], {"dp": 1, "tp": 2, "cp": 1})
+
+  def test_sampler_tensor_parallelism_is_refused_for_now(self) -> None:
+    response = self.post("create_model", {"base_model": "m", "user_metadata": {"open_rl.sampler.parallelism": "tp=2"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("dp only", response.json()["error"])
+
+  def test_sampler_dp_is_kept_on_the_model(self) -> None:
+    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"open_rl.sampler.parallelism": "dp=2"}}).json()["request_id"]
+    self.assertEqual(self.metadata(model_id)["sampler_parallelism"], {"dp": 2, "tp": 1, "cp": 1})
