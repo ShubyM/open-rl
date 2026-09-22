@@ -8,6 +8,7 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
+from training.distributed import local_rank
 from training.types import Datum
 
 
@@ -16,7 +17,7 @@ class BaseTrainerWorker:
     self.tokenizer: PreTrainedTokenizerBase | None = None
 
     if torch.cuda.is_available():
-      self.device = torch.device("cuda")
+      self.device = torch.device("cuda", local_rank())
     elif torch.backends.mps.is_available():
       self.device = torch.device("mps")
     else:
