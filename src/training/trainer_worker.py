@@ -46,10 +46,10 @@ class BaseTrainerWorker:
       model.train()
 
     with torch.set_grad_enabled(not forward_only):
-      total_loss = self._run_batches(model, data, loss_fn, loss_config, forward_only, loss_fn_outputs)
+      total_loss = self.run_batches(model, data, loss_fn, loss_config, forward_only, loss_fn_outputs)
     return self._finish(data, loss_fn_outputs, total_loss)
 
-  def _run_batches(
+  def run_batches(
     self,
     model: PreTrainedModel,
     data: list[Datum],
