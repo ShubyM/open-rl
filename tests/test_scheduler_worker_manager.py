@@ -5,7 +5,7 @@ from typing import Any
 from unittest.mock import patch
 
 from server import api_server
-from server.estimator import footprint
+from server.estimator import footprint, gib
 from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager
 from server.store import InMemoryStateStore, InMemoryStore
 from tests.api_client import asgi_client, post_json
@@ -238,3 +238,63 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class ParallelTrainerWorkloadTest(unittest.TestCase):
+  def setUp(self) -> None:
+    self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}))
+    self.api = FakeCustomObjectsApi()
+    self.manager = SchedulerWorkerManager(custom_api=self.api)
+
+  def store_with(self, model_id: str, meta: dict) -> InMemoryStateStore:
+    s = InMemoryStateStore()
+    s.kv_store[f"open_rl:model_meta:{model_id}"] = json.dumps(meta)
+    return s
+
+  def env_of(self, workload: dict) -> dict[str, str]:
+    return {e["name"]: e.get("value") for e in workload["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+  def test_a_tensor_parallel_trainer_is_a_multigpu_workload_on_the_automodel_image(self) -> None:
+    s = self.store_with("job-tp", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "trainer_parallelism": {"tp": 2}})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-tp", "trainer")
+
+    (workload,) = self.api.created
+    whole = footprint("Qwen/Qwen3-8B", "full", "trainer").accelerator_bytes
+    self.assertEqual(workload["spec"]["accelerator"], {"mode": "MultiGPU", "devices": 2, "memory": gib(whole // 2)})
+    self.assertTrue(workload["spec"]["exclusive"])
+    container = workload["spec"]["template"]["spec"]["containers"][0]
+    self.assertEqual(container["image"], "ghcr.io/gke-labs/open-rl/automodel:latest")
+    self.assertEqual(
+      container["command"],
+      ["python", "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=2", "-m", "server.training_requests_processor"],
+    )
+    env = self.env_of(workload)
+    self.assertEqual(env["OPEN_RL_TRAINER_BACKEND"], "automodel")
+    self.assertEqual((env["OPEN_RL_AUTOMODEL_TP"], env["OPEN_RL_AUTOMODEL_CP"], env["OPEN_RL_AUTOMODEL_LORA_RANK"]), ("2", "1", "0"))
+    self.assertEqual((env["OPEN_RL_FSDP_WORLD_SIZE"], env["OPEN_RL_TIME_SLICING"]), ("2", "off"))
+
+  def test_a_data_parallel_trainer_runs_the_fsdp_worker_under_torchrun(self) -> None:
+    s = self.store_with("job-dp", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "trainer_parallelism": {"dp": 2}})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-dp", "trainer")
+
+    (workload,) = self.api.created
+    whole = footprint("Qwen/Qwen3-8B", "full", "trainer").accelerator_bytes
+    # Each data-parallel replica holds a whole model.
+    self.assertEqual(workload["spec"]["accelerator"], {"mode": "MultiGPU", "devices": 2, "memory": gib(whole)})
+    container = workload["spec"]["template"]["spec"]["containers"][0]
+    self.assertEqual(container["image"], "ghcr.io/gke-labs/open-rl/server:latest")
+    self.assertEqual(container["command"][:4], ["uv", "run", "--no-sync", "torchrun"])
+    env = self.env_of(workload)
+    self.assertNotIn("OPEN_RL_TRAINER_BACKEND", env)
+    self.assertEqual(env["OPEN_RL_FSDP_WORLD_SIZE"], "2")
+
+  def test_a_single_device_trainer_is_unchanged(self) -> None:
+    s = self.store_with("job-one", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-one", "trainer")
+    (workload,) = self.api.created
+    self.assertEqual(workload["spec"]["accelerator"]["mode"], "SingleGPU")
+    self.assertFalse(workload["spec"]["exclusive"])
+    self.assertEqual(workload["spec"]["template"]["spec"]["containers"][0]["command"][:3], ["uv", "run", "python"])
