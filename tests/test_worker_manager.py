@@ -94,7 +94,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     request = self.store.forwarded_requests[0]
     self.assertEqual(request["op"], "create_model")
     self.assertEqual(request["model_id"], model_id)
-    self.assertEqual(request["payload"], {})
+    self.assertEqual(request["payload"]["base_model"], "base-model")
     meta = json.loads(self.store.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "base-model")
 
@@ -264,7 +264,7 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
       ],
     }
     request = Request(scope)
-    model_id = await api_server._extract_and_persist_model_metadata(
+    model_id, _ = await api_server._extract_and_persist_model_metadata(
       api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"),
       request,
       default_fine_tuning_type="full",
