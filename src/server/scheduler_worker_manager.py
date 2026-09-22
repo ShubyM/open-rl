@@ -21,7 +21,7 @@ from typing import Any
 
 from kubernetes import client, config
 
-from server.estimator import Footprint, footprint
+from server.estimator import Footprint, footprint, gib
 from server.worker_manager import base_model_of, owner_id, runtime_of, worker_args, worker_env, worker_module
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,9 @@ class Worker:
   exclusive: bool
   meta: Any
   footprint: Footprint
+  # GPUs this worker drives as one process group; more than one is a
+  # MultiGPU claim and a torchrun pod.
+  devices: int = 1
 
   @property
   def owner(self) -> str:
@@ -58,15 +61,43 @@ class Worker:
 
   @property
   def name(self) -> str:
-    return workload_name(self.role, self.owner, self.is_lora)
+    name = workload_name(self.role, self.owner, self.is_lora)
+    # A torchrun group must not reuse the single-GPU worker for the same model.
+    if self.devices > 1:
+      parallelism = self.meta.trainer_parallelism
+      name += f"-dp{parallelism.dp}-tp{parallelism.tp}"
+    return name
 
 
 def describe_worker(model_id: str, role: str) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
+  devices = meta.trainer_parallelism.devices if role == "trainer" else 1
   # LoRA workers stay resident on the GPU, so they never share one. FFT
-  # workers suspend between turns and may.
-  return Worker(role, runtime, base_model, is_lora, is_lora, meta, footprint(base_model, meta.fine_tuning_type, role))
+  # workers suspend between turns and may; a torchrun group never parks.
+  exclusive = is_lora or devices > 1
+  return Worker(role, runtime, base_model, is_lora, exclusive, meta, footprint(base_model, meta.fine_tuning_type, role), devices)
+
+
+def worker_command(worker: Worker) -> tuple[str, list[str]]:
+  """The image and command for one worker pod. A group is the Automodel
+  backend, one torchrun process per device, out of its own image."""
+  module = worker_module(worker.role, worker.is_lora)
+  if worker.devices <= 1:
+    return os.getenv("OPEN_RL_WORKER_IMAGE", "ghcr.io/gke-labs/open-rl/server:latest"), ["uv", "run", "python", "-u", "-m", module]
+  torchrun = ["--standalone", f"--nproc-per-node={worker.devices}", "-m", module]
+  return os.getenv("OPEN_RL_AUTOMODEL_IMAGE", "ghcr.io/gke-labs/open-rl/automodel:latest"), ["python", "-m", "torch.distributed.run", *torchrun]
+
+
+def accelerator_spec(worker: Worker) -> dict[str, Any]:
+  """The claim shape. A single device carries the whole footprint; a group
+  asks for exactly its devices with the per-device share of the footprint
+  (data-parallel replicas each hold a whole model, tensor-parallel ranks
+  split one)."""
+  if worker.devices <= 1:
+    return {"mode": "SingleGPU", "memory": worker.footprint.accelerator}
+  per_device = worker.footprint.accelerator_bytes // worker.meta.trainer_parallelism.tp
+  return {"mode": "MultiGPU", "devices": worker.devices, "memory": gib(per_device)}
 
 
 def pod_env(worker: Worker) -> list[dict[str, Any]]:
@@ -93,14 +124,15 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
 def pod_template(worker: Worker) -> dict[str, Any]:
   """The complete worker pod minus placement. Node selection and claims are
   the scheduler's; it rejects a template that carries them."""
+  image, command = worker_command(worker)
   template = {
     "spec": {
       "restartPolicy": "OnFailure",
       "containers": [
         {
           "name": "worker",
-          "image": os.getenv("OPEN_RL_WORKER_IMAGE", "ghcr.io/gke-labs/open-rl/server:latest"),
-          "command": ["uv", "run", "python", "-u", "-m", worker_module(worker.role, worker.is_lora)],
+          "image": image,
+          "command": command,
           "args": worker_args(worker.runtime, worker.role, worker.is_lora),
           "env": pod_env(worker),
           "resources": worker.footprint.resources,
@@ -133,7 +165,7 @@ def workload_body(worker: Worker) -> dict[str, Any]:
       "exclusive": worker.exclusive,
       "modelID": worker.runtime,
       "ownerID": worker.owner,
-      "accelerator": {"mode": "SingleGPU", "memory": worker.footprint.accelerator},
+      "accelerator": accelerator_spec(worker),
       "workerContainerName": "worker",
       "template": pod_template(worker),
     },

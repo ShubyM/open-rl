@@ -90,12 +90,35 @@ def worker_env(meta: TrainingModelMetadata, base_model: str, runtime: str, is_lo
     env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = weight_sync.delta_apply_method
   if role == "trainer":
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    env.update(trainer_shape_env(meta, is_lora))
   else:
     env["OPEN_RL_MODEL_ID"] = runtime
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     if not is_lora and ("gemma-4" in base_model.lower() or "gemma4" in base_model.lower()):
       env["VLLM_ARCHITECTURE_OVERRIDE"] = "Gemma4ForCausalLM"
+  return env
+
+
+def trainer_backend(meta: TrainingModelMetadata) -> str:
+  """automodel for a multi-GPU trainer or when the deployment says so;
+  otherwise the FSDP trainer."""
+  if meta.trainer_parallelism.devices > 1 or os.getenv("OPEN_RL_TRAINER_BACKEND", "").lower() == "automodel":
+    return "automodel"
+  return "fsdp"
+
+
+def trainer_shape_env(meta: TrainingModelMetadata, is_lora: bool) -> dict[str, str]:
+  """What a trainer needs to know about its GPUs. More than one device is
+  a torchrun group; the Automodel backend gets its tensor-parallel size."""
+  parallelism = meta.trainer_parallelism
+  env = {"OPEN_RL_TRAINER_PARALLELISM": parallelism.spec}
+  if parallelism.devices > 1:
+    env["OPEN_RL_CONTROL_BACKEND"] = "cpu:gloo,cuda:nccl"
+  if trainer_backend(meta) == "automodel":
+    env["OPEN_RL_TRAINER_BACKEND"] = "automodel"
+    env["OPEN_RL_AUTOMODEL_TP"] = str(parallelism.tp)
+    env["OPEN_RL_AUTOMODEL_LORA_RANK"] = str(meta.lora_config.rank if is_lora else 0)
   return env
 
 
