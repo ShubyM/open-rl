@@ -1,0 +1,53 @@
+# The Automodel trainer image: the server image's toolchain with the
+# nemo-automodel interpreter that scripts/setup_automodel_env.sh builds on a
+# box. It is its own image because nemo-automodel pins transformers and pulls
+# in packages that must not enter the project venv; the worker pod runs it as
+#   torchrun --nproc-per-node=N -m server.training_requests_processor
+# with OPEN_RL_TRAINER_BACKEND=automodel.
+#
+# Same CUDA 12.9 base and nvcc subset as src/server/Dockerfile: torch links the
+# pip cu129 wheels, and causal-conv1d, tilelang and the flash-linear-attention
+# kernels JIT against CUDA_HOME.
+FROM nvidia/cuda:12.9.0-base-ubuntu22.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+ARG NV_CUDA_NVCC_VERSION=12.9.86-1
+ARG NV_CUDA_CUDART_DEV_VERSION=12.9.79-1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    git \
+    build-essential \
+    python3-dev \
+    ninja-build \
+    cuda-nvcc-12-9=${NV_CUDA_NVCC_VERSION} \
+    cuda-cudart-dev-12-9=${NV_CUDA_CUDART_DEV_VERSION} \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uv/bin/uv
+ENV PATH="/uv/bin:$PATH" \
+    CUDA_HOME=/usr/local/cuda \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
+
+RUN uv python install 3.12
+
+WORKDIR /app
+# The venv recipe is the script the box uses, so the two stay one definition.
+COPY scripts/setup_automodel_env.sh scripts/setup_automodel_env.sh
+COPY src src
+# setup_automodel_env.sh imports server.training_requests_processor at the end
+# to prove the interpreter can run the worker; src is already in place for that.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    AUTOMODEL_VENV=/app/automodel/.venv HOME=/root bash scripts/setup_automodel_env.sh
+
+ENV PYTHONPATH=/app/src \
+    PATH="/app/automodel/.venv/bin:$PATH" \
+    OPEN_RL_TRAINER_BACKEND=automodel
+
+# torchrun args (--nproc-per-node, -m server.training_requests_processor
+# --model-id ...) come from the pod spec the API server renders.
+ENTRYPOINT ["python", "-m", "torch.distributed.run"]
