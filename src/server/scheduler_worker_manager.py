@@ -31,13 +31,13 @@ VERSION = "v1alpha1"
 PLURAL = "workloads"
 
 
-def workload_name(role: str, owner: str, is_lora: bool) -> str:
-  # A second compatible LoRA request renders the same name, and the create's
-  # AlreadyExists is the reuse. The instance index stays 0 until adapter
-  # capacity accounting exists.
+def workload_name(role: str, owner: str, is_lora: bool, index: int = 0) -> str:
+  # A second compatible request renders the same name, and the create's
+  # AlreadyExists is the reuse. The index numbers the replicas of a role
+  # (sampler dp); the first keeps the name it always had.
   if is_lora:
-    return f"lora-{owner}-0-{role}"
-  return f"fft-{owner}-{role}"
+    return f"lora-{owner}-{index}-{role}"
+  return f"fft-{owner}-{role}" if index == 0 else f"fft-{owner}-{role}-{index}"
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,8 @@ class Worker:
   # GPUs this worker drives as one process group; more than one is a
   # MultiGPU claim and a torchrun pod.
   devices: int = 1
+  # Which replica of its role this is; samplers scale out by count.
+  index: int = 0
 
   @property
   def owner(self) -> str:
@@ -61,7 +63,7 @@ class Worker:
 
   @property
   def name(self) -> str:
-    name = workload_name(self.role, self.owner, self.is_lora)
+    name = workload_name(self.role, self.owner, self.is_lora, self.index)
     # A torchrun group must not reuse the single-GPU worker for the same model.
     if self.devices > 1:
       parallelism = self.meta.trainer_parallelism
@@ -69,14 +71,24 @@ class Worker:
     return name
 
 
-def describe_worker(model_id: str, role: str) -> Worker:
+def describe_worker(model_id: str, role: str, index: int = 0) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
   devices = meta.trainer_parallelism.devices if role == "trainer" else 1
   # LoRA workers stay resident on the GPU, so they never share one. FFT
   # workers suspend between turns and may; a torchrun group never parks.
   exclusive = is_lora or devices > 1
-  return Worker(role, runtime, base_model, is_lora, exclusive, meta, footprint(base_model, meta.fine_tuning_type, role), devices)
+  return Worker(role, runtime, base_model, is_lora, exclusive, meta, footprint(base_model, meta.fine_tuning_type, role), devices, index)
+
+
+def replicas_of(model_id: str, role: str) -> int:
+  """How many workers of this role the model asked for. A sampler scales out
+  by data parallelism: each replica is its own single-device Workload draining
+  the shared sampling queue, so the scheduler places them independently."""
+  if role != "sampler":
+    return 1
+  meta, _, _ = runtime_of(model_id)
+  return meta.sampler_parallelism.dp
 
 
 def worker_command(worker: Worker) -> tuple[str, list[str]]:
@@ -185,7 +197,11 @@ class SchedulerWorkerManager:
     self.custom_api = custom_api
 
   def ensure(self, model_id: str, role: str) -> None:
-    worker = describe_worker(model_id, role)
+    for index in range(replicas_of(model_id, role)):
+      self.ensure_workload(describe_worker(model_id, role, index))
+
+  def ensure_workload(self, worker: Worker) -> None:
+    role = worker.role
     deadline = time.monotonic() + 180
     while True:
       try:

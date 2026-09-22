@@ -294,5 +294,40 @@ class ParallelTrainerWorkloadTest(unittest.TestCase):
     self.assertEqual(workload["spec"]["template"]["spec"]["containers"][0]["command"][:3], ["uv", "run", "python"])
 
 
+class SamplerReplicasTest(unittest.TestCase):
+  def setUp(self) -> None:
+    self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}))
+    self.api = FakeCustomObjectsApi()
+    self.manager = SchedulerWorkerManager(custom_api=self.api)
+
+  def store_with(self, model_id: str, meta: dict) -> InMemoryStateStore:
+    s = InMemoryStateStore()
+    s.kv_store[f"open_rl:model_meta:{model_id}"] = json.dumps(meta)
+    return s
+
+  def test_sampler_dp_becomes_that_many_single_device_workloads(self) -> None:
+    s = self.store_with("Model_A.1", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "sampler_parallelism": {"dp": 2}})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("Model_A.1", "sampler")
+      self.manager.ensure("Model_A.1", "trainer")
+
+    names = [w["metadata"]["name"] for w in self.api.created]
+    self.assertEqual(names, ["fft-model-a-1-sampler", "fft-model-a-1-sampler-1", "fft-model-a-1-trainer"])
+    for sampler in self.api.created[:2]:
+      self.assertEqual(sampler["spec"]["accelerator"]["mode"], "SingleGPU")
+      self.assertEqual(sampler["spec"]["ownerID"], "model-a-1")
+    # Release finds every replica through the owner, not through a name.
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.release("Model_A.1")
+    self.assertEqual(sorted(self.api.deleted), sorted(names))
+
+  def test_lora_sampler_replicas_number_the_instance_slot(self) -> None:
+    s = self.store_with("job-lora", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora", "sampler_parallelism": {"dp": 3}})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-lora", "sampler")
+    names = [w["metadata"]["name"] for w in self.api.created]
+    self.assertEqual(names, [f"lora-qwen-qwen2-5-0-5b-{i}-sampler" for i in range(3)])
+
+
 if __name__ == "__main__":
   unittest.main()
