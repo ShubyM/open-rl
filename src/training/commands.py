@@ -80,16 +80,12 @@ class SaveWeightsForSampler(Command):
   sampling_session_id: str | None = None
 
 
-class SaveWeights(Command):
-  op: Literal["save_weights"] = "save_weights"
-  alias: str | None = None
-
-
 class Shutdown(Command):
   op: Literal["shutdown_workers"] = "shutdown_workers"
   request_id: str = SHUTDOWN_REQUEST_ID
 
 
+# fmt: off
 TrainingCommand = Annotated[
   CreateModel
   | CreateModelFromState
@@ -99,10 +95,10 @@ TrainingCommand = Annotated[
   | SaveState
   | LoadWeights
   | SaveWeightsForSampler
-  | SaveWeights
   | Shutdown,
   Field(discriminator="op"),
 ]
+# fmt: on
 
 command_adapter: TypeAdapter[TrainingCommand] = TypeAdapter(TrainingCommand)
 
