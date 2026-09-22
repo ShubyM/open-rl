@@ -67,6 +67,62 @@ def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
   )
 
 
+class Parallelism(BaseModel):
+  """How many GPUs a worker drives and how it splits them: data-parallel
+  replicas, each sharded over tp tensor-parallel and cp context-parallel ranks.
+  The client states it as "dp=1,tp=4,cp=1"; every key is optional and 1."""
+
+  dp: int = Field(default=1, ge=1)
+  tp: int = Field(default=1, ge=1)
+  cp: int = Field(default=1, ge=1)
+
+  @property
+  def devices(self) -> int:
+    return self.dp * self.tp * self.cp
+
+  @property
+  def spec(self) -> str:
+    return f"dp={self.dp},tp={self.tp},cp={self.cp}"
+
+  @classmethod
+  def parse(cls, spec: str) -> "Parallelism":
+    values: dict[str, int] = {}
+    for part in spec.replace(";", ",").split(","):
+      if not part.strip():
+        continue
+      key, sep, value = part.partition("=")
+      if not sep or key.strip() not in ("dp", "tp", "cp"):
+        raise ValueError(f"parallelism {spec!r}: expected dp=N,tp=N,cp=N")
+      try:
+        values[key.strip()] = int(value)
+      except ValueError:
+        raise ValueError(f"parallelism {spec!r}: {key.strip()} must be an integer") from None
+    return cls(**values)
+
+
+# The user_metadata keys a client sets per model or per session, and the
+# header older clients send; the API server reads them in that order, then
+# the server's own default.
+PARALLELISM_KEY = {"trainer": "open_rl.trainer.parallelism", "sampler": "open_rl.sampler.parallelism"}
+PARALLELISM_HEADER = {"trainer": "x-open-rl-trainer-parallelism", "sampler": "x-open-rl-sampler-parallelism"}
+PARALLELISM_ENV = {"trainer": "OPEN_RL_TRAINER_PARALLELISM", "sampler": "OPEN_RL_SAMPLER_PARALLELISM"}
+
+
+def resolve_parallelism(role: str, *user_metadata: dict[str, str], headers: Any = None) -> Parallelism:
+  """The role's parallelism from the first source that states it: the
+  user_metadata dicts in the order given (per model, then per session), the
+  request header, the server env; else one device."""
+  for source in user_metadata:
+    if spec := (source or {}).get(PARALLELISM_KEY[role]):
+      return Parallelism.parse(spec)
+  get_header = headers.get if headers is not None and hasattr(headers, "get") else (lambda k, default=None: default)
+  if spec := get_header(PARALLELISM_HEADER[role]):
+    return Parallelism.parse(spec)
+  if spec := os.getenv(PARALLELISM_ENV[role]):
+    return Parallelism.parse(spec)
+  return Parallelism()
+
+
 class TrainingModelMetadata(BaseModel):
   # Preserve fields written by other server versions when updating a record.
   model_config = ConfigDict(extra="allow")
@@ -77,6 +133,11 @@ class TrainingModelMetadata(BaseModel):
   weight_sync_config: WeightSyncConfig = Field(default_factory=WeightSyncConfig)
   full_config: FFTConfig = Field(default_factory=FFTConfig)
   lora_config: LoraConfig = Field(default_factory=LoraConfig)
+  # What the client attached to the run (tinker's user_metadata): the
+  # cookbook's recipe, git revision, wandb link, renderer, plus our own keys.
+  user_metadata: dict[str, str] = Field(default_factory=dict)
+  trainer_parallelism: Parallelism = Field(default_factory=Parallelism)
+  sampler_parallelism: Parallelism = Field(default_factory=Parallelism)
   status: str = "active"
   updated_at: float = 0.0
   completed_at: float | None = None
