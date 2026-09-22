@@ -295,10 +295,6 @@ class SampleSequenceIdsTest(ApiServerTest):
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)
 
 
-if __name__ == "__main__":
-  unittest.main()
-
-
 class InputBoundaryTest(ApiServerTest):
   def test_invalid_training_datum_is_a_validation_error(self) -> None:
     response = self.post(
@@ -371,3 +367,12 @@ class ParallelismMetadataTest(ApiServerTest):
     own = {"open_rl.trainer.parallelism": "tp=2"}
     overridden = self.post("create_model", {"base_model": "m", "session_id": session_id, "user_metadata": own}).json()["request_id"]
     self.assertEqual(self.metadata(overridden)["trainer_parallelism"], {"dp": 1, "tp": 2, "cp": 1})
+
+  def test_trainer_context_parallelism_is_refused_for_now(self) -> None:
+    response = self.post("create_model", {"base_model": "m", "user_metadata": {"open_rl.trainer.parallelism": "cp=2"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("context parallelism", response.json()["error"])
+
+
+if __name__ == "__main__":
+  unittest.main()

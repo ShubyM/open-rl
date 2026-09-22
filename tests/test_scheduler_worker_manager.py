@@ -5,7 +5,7 @@ from typing import Any
 from unittest.mock import patch
 
 from server import api_server
-from server.estimator import footprint
+from server.estimator import footprint, gib
 from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager
 from server.store import InMemoryStateStore, InMemoryStore
 from tests.api_client import asgi_client, post_json
@@ -234,6 +234,64 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(lora["spec"]["template"]["spec"]["containers"][0]["command"][-1], "server.lora_sampler")
     self.assertEqual(fft["spec"]["trainingKind"], "fft")
     self.assertEqual(fft["metadata"]["name"], "fft-fft-a-sampler")
+
+
+class ParallelTrainerWorkloadTest(unittest.TestCase):
+  def setUp(self) -> None:
+    self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}))
+    self.api = FakeCustomObjectsApi()
+    self.manager = SchedulerWorkerManager(custom_api=self.api)
+
+  def store_with(self, model_id: str, meta: dict) -> InMemoryStateStore:
+    s = InMemoryStateStore()
+    s.kv_store[f"open_rl:model_meta:{model_id}"] = json.dumps(meta)
+    return s
+
+  def env_of(self, workload: dict) -> dict[str, str]:
+    return {e["name"]: e.get("value") for e in workload["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+  def test_a_tensor_parallel_trainer_is_a_multigpu_workload_on_the_automodel_image(self) -> None:
+    s = self.store_with("job-tp", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "trainer_parallelism": {"tp": 2}})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-tp", "trainer")
+
+    (workload,) = self.api.created
+    self.assertTrue(workload["metadata"]["name"].endswith("-trainer-dp1-tp2"))
+    whole = footprint("Qwen/Qwen3-8B", "full", "trainer").accelerator_bytes
+    self.assertEqual(workload["spec"]["accelerator"], {"mode": "MultiGPU", "devices": 2, "memory": gib(whole // 2)})
+    self.assertTrue(workload["spec"]["exclusive"])
+    container = workload["spec"]["template"]["spec"]["containers"][0]
+    self.assertEqual(container["image"], "ghcr.io/gke-labs/open-rl/automodel:latest")
+    self.assertEqual(
+      container["command"],
+      ["python", "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=2", "-m", "server.training_requests_processor"],
+    )
+    env = self.env_of(workload)
+    self.assertEqual(env["OPEN_RL_TRAINER_BACKEND"], "automodel")
+    self.assertEqual((env["OPEN_RL_AUTOMODEL_TP"], env["OPEN_RL_AUTOMODEL_LORA_RANK"]), ("2", "0"))
+
+  def test_a_data_parallel_trainer_is_an_automodel_group(self) -> None:
+    s = self.store_with("job-dp", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "trainer_parallelism": {"dp": 2}})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-dp", "trainer")
+
+    (workload,) = self.api.created
+    self.assertTrue(workload["metadata"]["name"].endswith("-trainer-dp2-tp1"))
+    whole = footprint("Qwen/Qwen3-8B", "full", "trainer").accelerator_bytes
+    # Each data-parallel replica holds a whole model.
+    self.assertEqual(workload["spec"]["accelerator"], {"mode": "MultiGPU", "devices": 2, "memory": gib(whole)})
+    self.assertEqual(workload["spec"]["template"]["spec"]["containers"][0]["image"], "ghcr.io/gke-labs/open-rl/automodel:latest")
+    self.assertEqual(self.env_of(workload)["OPEN_RL_TRAINER_BACKEND"], "automodel")
+
+  def test_a_single_device_trainer_is_unchanged(self) -> None:
+    s = self.store_with("job-one", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-one", "trainer")
+    (workload,) = self.api.created
+    self.assertTrue(workload["metadata"]["name"].endswith("-trainer"))
+    self.assertEqual(workload["spec"]["accelerator"]["mode"], "SingleGPU")
+    self.assertFalse(workload["spec"]["exclusive"])
+    self.assertEqual(workload["spec"]["template"]["spec"]["containers"][0]["command"][:3], ["uv", "run", "python"])
 
 
 if __name__ == "__main__":

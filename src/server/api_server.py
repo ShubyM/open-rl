@@ -368,6 +368,8 @@ async def _extract_and_persist_model_metadata(
     trainer_parallelism=resolve_parallelism("trainer", user_metadata, session_metadata, headers=headers),
     sampler_parallelism=resolve_parallelism("sampler", user_metadata, session_metadata, headers=headers),
   )
+  if meta_obj.trainer_parallelism.cp > 1:
+    raise ValueError("trainer context parallelism is not supported yet")
   await persist_model_metadata(state, model_id, meta_obj)
 
   return model_id, meta_obj
