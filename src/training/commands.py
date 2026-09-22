@@ -85,10 +85,20 @@ class Shutdown(Command):
   request_id: str = SHUTDOWN_REQUEST_ID
 
 
+# fmt: off
 TrainingCommand = Annotated[
-  CreateModel | CreateModelFromState | ForwardBackward | OptimStep | Sample | SaveState | LoadWeights | SaveWeightsForSampler | Shutdown,
+  CreateModel
+  | CreateModelFromState
+  | ForwardBackward
+  | OptimStep
+  | Sample
+  | SaveState
+  | LoadWeights
+  | SaveWeightsForSampler
+  | Shutdown,
   Field(discriminator="op"),
 ]
+# fmt: on
 
 command_adapter: TypeAdapter[TrainingCommand] = TypeAdapter(TrainingCommand)
 
