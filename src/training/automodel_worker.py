@@ -5,8 +5,12 @@ left after TP. Only the DP axis shards datums, since TP ranks cooperate on one
 sequence and must see identical data. The shard_* hooks scope to that axis.
 """
 
+import json
 import math
 import os
+import shutil
+import time
+from datetime import datetime
 from typing import Any
 
 import torch
@@ -14,8 +18,10 @@ import torch.distributed as dist
 from pydantic import BaseModel
 from transformers import AutoConfig, AutoTokenizer
 
+from training.distributed import barrier, is_primary
 from training.trainer_worker import BaseTrainerWorker, Datum
 
+TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 AUTOMODEL_TP = int(os.getenv("OPEN_RL_AUTOMODEL_TP", "1"))
 AUTOMODEL_SEED = int(os.getenv("OPEN_RL_AUTOMODEL_SEED", "1234"))
 
@@ -67,6 +73,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.base_model_name: str | None = None
     self.trainable_params: list[torch.nn.Parameter] = []
     self.optimizer: torch.optim.Optimizer | None = None
+    self.checkpointer: Any = None
     self.is_lora = AUTOMODEL_LORA_RANK > 0
 
   def build_distributed_setup(self, base_model_name: str) -> Any:
@@ -233,11 +240,79 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
   def generate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
     raise RuntimeError("Sampling from the Automodel trainer is unsupported; use the vLLM sampler.")
 
-  def save_state(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-    raise NotImplementedError("The Automodel trainer does not save checkpoints yet.")
+  def get_checkpointer(self) -> Any:
+    """Automodel's Checkpointer gathers DTensor shards, maps native keys back to
+    the hub layout, and writes a PEFT adapter that vLLM loads."""
+    if self.checkpointer is None:
+      from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+
+      config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=os.path.join(TMP_DIR, "automodel"),
+        model_save_format="safetensors",
+        save_consolidated=not self.is_lora,
+        is_peft=self.is_lora,
+        model_repo_id=self.base_model_name,
+      )
+      self.checkpointer = Checkpointer(config, dp_rank=self.shard_rank(), tp_rank=self.device_mesh["tp"].get_local_rank(), pp_rank=0)
+    return self.checkpointer
+
+  def write_weights(self, path: str) -> None:
+    """Write the adapter (or the consolidated model) as plain files in path.
+
+    Every rank calls this because the gathers are collective. The checkpointer
+    nests its output under model/, which rank 0 lifts into path.
+    """
+    self.get_checkpointer().save_model(
+      self.model, weights_path=path, peft_config=self.build_peft_config() if self.is_lora else None, tokenizer=self.tokenizer
+    )
+    if is_primary():
+      model_dir = os.path.join(path, "model")
+      source = model_dir if self.is_lora else os.path.join(model_dir, "consolidated")
+      for entry in os.listdir(source):
+        os.replace(os.path.join(source, entry), os.path.join(path, entry))
+      shutil.rmtree(model_dir, ignore_errors=True)
+    barrier()
+
+  def write_staged(self, path: str, metadata: dict[str, Any] | None = None) -> None:
+    """Write into a staging dir and rename it over path, so a reader never
+    sees a half-written directory."""
+    staging, previous = f"{path}.staging-{os.getpid()}", f"{path}.previous-{os.getpid()}"
+    if is_primary():
+      shutil.rmtree(staging, ignore_errors=True)
+      os.makedirs(staging)
+    barrier()
+    self.write_weights(staging)
+    if is_primary():
+      if metadata is not None:
+        with open(os.path.join(staging, "metadata.json"), "w") as f:
+          json.dump(metadata, f)
+      if os.path.exists(path):
+        os.rename(path, previous)
+      os.rename(staging, path)
+      shutil.rmtree(previous, ignore_errors=True)
+    barrier()
+
+  def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
+    assert self.model is not None, "Model must be loaded first."
+    # Weights only for now; the optimizer state is not saved.
+    metadata = {
+      "base_model": self.base_model_name,
+      "created_at": datetime.now().isoformat(),
+      "kind": kind,
+      "has_optimizer": False,
+      "model_id": model_id,
+      "timestamp": time.time(),
+    }
+    self.write_staged(state_path, metadata)
+    return {"path": state_path}
 
   def load_from_state(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
     raise NotImplementedError("The Automodel trainer does not load checkpoints yet.")
 
-  def save_for_sampler(self, *args: Any, **kwargs: Any) -> str | None:
-    raise NotImplementedError("The Automodel trainer does not publish sampler weights yet.")
+  def save_for_sampler(self, model_id: str, alias: str | None, ref: str | None) -> str | None:
+    """Write the adapter where the LoRA sampler hot-loads it, peft/<id>/<id>."""
+    if not self.is_lora:
+      raise NotImplementedError("The Automodel trainer publishes sampler weights for LoRA only.")
+    self.write_staged(os.path.join(TMP_DIR, "peft", model_id, model_id))
+    return None

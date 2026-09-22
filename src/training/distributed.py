@@ -40,6 +40,11 @@ def initialize() -> None:
   )
 
 
+def barrier() -> None:
+  if is_distributed():
+    dist.barrier()
+
+
 def broadcast_object(value: Any = None) -> Any:
   if not is_distributed():
     return value
