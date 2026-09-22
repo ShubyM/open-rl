@@ -39,6 +39,8 @@ class Config:
   seed: int = 0
   behavior_if_log_dir_exists: str = "delete"
   sample_after_train: bool = False
+  # e.g. "tp=2" to put the trainer on a multi-GPU Automodel worker.
+  trainer_parallelism: str = ""
 
 
 def reset_log_dir(path: Path, behavior: str) -> None:
@@ -99,6 +101,7 @@ def main(config: Config) -> None:
     # Qwen2.5-0.5B ties lm_head to embed_tokens; LoRA on the tied head trips a
     # PEFT warning and vLLM cannot load lm_head adapter weights at all.
     train_unembed=False,
+    user_metadata={"open_rl.trainer.parallelism": config.trainer_parallelism} if config.trainer_parallelism else None,
   )
   tokenizer = trainer.get_tokenizer()
   datum, active_tokens = build_datum(tokenizer, config.prompt, config.completion)
