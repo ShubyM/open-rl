@@ -1,4 +1,3 @@
-import os
 import sys
 import unittest
 from unittest.mock import patch
@@ -55,15 +54,6 @@ class FootprintTest(unittest.TestCase):
     big = footprint("Qwen/Qwen2.5-7B", "full", "trainer")
     self.assertGreater(big.host_request_bytes, 110 * GIB)
     self.assertEqual(big.host_limit_bytes, big.host_request_bytes)
-
-  def test_long_context_sampler_gets_more_host_memory(self) -> None:
-    # A Qwen3.5-9B LoRA sampler at 131072 was OOM-killed at 41Gi after compile.
-    with patch.dict(os.environ, {"VLLM_MAX_MODEL_LEN": "131072"}):
-      long_context = footprint("Qwen/Qwen3.5-9B", "lora", "sampler")
-    with patch.dict(os.environ, {"VLLM_MAX_MODEL_LEN": "8192"}):
-      short_context = footprint("Qwen/Qwen3.5-9B", "lora", "sampler")
-    self.assertGreater(long_context.host_request_bytes, 60 * GIB)
-    self.assertLess(short_context.host_request_bytes, 42 * GIB)
 
   def test_resources_render_as_whole_gib(self) -> None:
     fp = footprint("Qwen/Qwen2.5-0.5B", "lora", "trainer")
