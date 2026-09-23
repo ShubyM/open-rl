@@ -26,8 +26,6 @@ class SlicerStub:
 
 
 class BrokenWorker:
-  cpu_offload = True
-
   def wake_up(self):
     raise RuntimeError("CUDA out of memory")
 
@@ -80,7 +78,8 @@ class FFTBatchFailureTest(unittest.TestCase):
 
     proc.handle_request = handled
     proc.exit_gracefully = record_exit
-    asyncio.run(proc.run_once())
+    with patch.object(proc.worker, "wake_up"), self.assertRaisesRegex(RuntimeError, "checkpoint failed"):
+      asyncio.run(proc.run_once())
     self.assertEqual(store.futures["sv-1"]["type"], "SaveWeightsResponse")
     self.assertEqual(exits, [False])
 

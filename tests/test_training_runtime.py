@@ -3,6 +3,7 @@
 import asyncio
 import subprocess
 import sys
+import threading
 import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
@@ -38,16 +39,18 @@ class ResidentWorker:
     return {"path": path}
 
 
-class OffloadedWorker(ResidentWorker):
+class SuspendableWorker(ResidentWorker):
   def __init__(self):
     super().__init__()
-    self.cpu_offload = True
     self.asleep = True
+    self.transitions = []
 
   def wake_up(self):
+    self.transitions.append("wake")
     self.asleep = False
 
   def sleep(self):
+    self.transitions.append("sleep")
     self.asleep = True
 
   def optim_step(self, adam_params, model_id):
@@ -55,7 +58,7 @@ class OffloadedWorker(ResidentWorker):
     return super().optim_step(adam_params, model_id)
 
   def save_state(self, model_id, path, include_optimizer, kind):
-    assert self.asleep
+    assert not self.asleep
     return super().save_state(model_id, path, include_optimizer, kind)
 
 
@@ -135,6 +138,10 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     with self.assertRaisesRegex(ValueError, "not both"):
       TrainingRequestsProcessor(InMemoryStore(), ResidentWorker(), "model-a", active_tenant_set_id="base-1")
 
+  async def test_resident_backend_cannot_be_launched_with_time_slicing(self):
+    with self.assertRaisesRegex(ValueError, "cannot suspend"):
+      TrainingRequestsProcessor(InMemoryStore(), ResidentWorker(), "model-a", time_slicer=RecordingSlicer())
+
   async def test_rejects_commands_for_another_model(self):
     store = RecordingStore()
     worker = ResidentWorker()
@@ -145,7 +152,7 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_leased_runner_preserves_save_position_and_cleans_up(self):
     store = RecordingStore()
-    worker = OffloadedWorker()
+    worker = SuspendableWorker()
     slicer = RecordingSlicer()
     await store.put_request(step("first"))
     await store.put_request(commands.wire(commands.SaveState(request_id="save", model_id="model-a", state_path="snapshot")))
@@ -155,8 +162,97 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(worker.saved_values, [1])
     self.assertEqual(worker.value, 2)
     self.assertTrue(worker.asleep)
-    self.assertEqual(slicer.events, ["register", "acquire", "release", "acquire", "release", "unregister", "close"])
+    self.assertEqual(slicer.events, ["register", "acquire", "release", "unregister", "close"])
+    self.assertEqual(worker.transitions, ["wake", "sleep"])
     self.assertEqual(store.published, ["first", "save", "second"])
+
+  async def test_save_only_batch_also_runs_awake(self):
+    store = RecordingStore()
+    worker = SuspendableWorker()
+    slicer = RecordingSlicer()
+    processor = TrainingRequestsProcessor(store, worker, "model-a", time_slicer=slicer)
+    await store.put_request(commands.wire(commands.SaveState(request_id="save", model_id="model-a", state_path="snapshot")))
+    await processor.run_once()
+    self.assertEqual(worker.saved_values, [0])
+    self.assertEqual(worker.transitions, ["wake", "sleep"])
+    self.assertEqual(slicer.events, ["acquire", "release"])
+    self.assertEqual(store.futures_store["save"]["type"], "state_saved")
+
+  async def test_cancellation_waits_for_native_work_before_sleep_and_release(self):
+    started = threading.Event()
+    finish = threading.Event()
+    events = []
+
+    class BlockingWorker(SuspendableWorker):
+      def optim_step(self, adam_params, model_id):
+        started.set()
+        if not finish.wait(timeout=5):
+          raise TimeoutError("Test did not release the worker thread")
+        events.append("finished")
+        return super().optim_step(adam_params, model_id)
+
+      def sleep(self):
+        events.append("sleep")
+        super().sleep()
+
+    store = RecordingStore()
+    worker = BlockingWorker()
+    slicer = RecordingSlicer()
+    processor = TrainingRequestsProcessor(store, worker, "model-a", time_slicer=slicer)
+    await store.put_request(step("step"))
+    task = asyncio.create_task(processor.run_once())
+    try:
+      self.assertTrue(await asyncio.to_thread(started.wait, 2))
+      task.cancel()
+      await asyncio.sleep(0.01)
+      task.cancel()
+      await asyncio.sleep(0.01)
+      self.assertEqual(events, [])
+      self.assertEqual(slicer.events, ["acquire"])
+    finally:
+      finish.set()
+      with self.assertRaises(asyncio.CancelledError):
+        await task
+    self.assertEqual(events, ["finished", "sleep"])
+    self.assertEqual(slicer.events, ["acquire", "release"])
+
+  async def test_cancellation_during_wake_still_sleeps_before_release(self):
+    started = threading.Event()
+    finish = threading.Event()
+    events = []
+
+    class BlockingWakeWorker(SuspendableWorker):
+      def wake_up(self):
+        started.set()
+        if not finish.wait(timeout=5):
+          raise TimeoutError("Test did not release the wake thread")
+        super().wake_up()
+        events.append("awake")
+
+      def sleep(self):
+        events.append("sleep")
+        super().sleep()
+
+    store = RecordingStore()
+    worker = BlockingWakeWorker()
+    slicer = RecordingSlicer()
+    processor = TrainingRequestsProcessor(store, worker, "model-a", time_slicer=slicer)
+    await store.put_request(step("step"))
+    task = asyncio.create_task(processor.run_once())
+    try:
+      self.assertTrue(await asyncio.to_thread(started.wait, 2))
+      task.cancel()
+      await asyncio.sleep(0.01)
+      self.assertEqual(events, [])
+      self.assertEqual(slicer.events, ["acquire"])
+    finally:
+      finish.set()
+      with self.assertRaises(asyncio.CancelledError):
+        await task
+    self.assertEqual(events, ["awake", "sleep"])
+    self.assertTrue(worker.asleep)
+    self.assertEqual(worker.value, 0)
+    self.assertEqual(slicer.events, ["acquire", "release"])
 
   async def test_late_batch_failure_does_not_overwrite_published_success(self):
     store = RecordingStore()
@@ -172,9 +268,9 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(store.futures_store["first"]["type"], "optim_step_completed")
     self.assertEqual(store.futures_store["unanswered"]["type"], "RequestFailedResponse")
 
-  async def test_faulted_lease_stops_before_the_next_compute_group(self):
+  async def test_faulted_lease_publishes_completed_batch_then_exits(self):
     store = RecordingStore()
-    worker = OffloadedWorker()
+    worker = SuspendableWorker()
     slicer = RecordingSlicer(fault_on_release=True)
     processor = TrainingRequestsProcessor(store, worker, "model-a", time_slicer=slicer)
     await store.put_request(step("first"))
@@ -184,14 +280,15 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
       with self.assertRaisesRegex(RuntimeError, "Could not park"):
         await processor.run_once()
       exit_worker.assert_awaited_once_with(unregister=False)
-    self.assertEqual(worker.value, 1)
+    self.assertEqual(worker.value, 2)
+    self.assertEqual(worker.saved_values, [1])
     self.assertEqual(slicer.events, ["acquire", "release"])
     self.assertEqual(store.futures_store["first"]["type"], "optim_step_completed")
-    self.assertEqual(store.futures_store["second"]["type"], "RequestFailedResponse")
+    self.assertEqual(store.futures_store["second"]["type"], "optim_step_completed")
 
   async def test_faulted_lease_answers_requests_after_shutdown_before_exiting(self):
     store = RecordingStore()
-    worker = OffloadedWorker()
+    worker = SuspendableWorker()
     slicer = RecordingSlicer(fault_on_release=True)
     processor = TrainingRequestsProcessor(store, worker, "model-a", time_slicer=slicer)
     await store.put_request(step("first"))

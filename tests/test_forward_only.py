@@ -12,7 +12,7 @@ import unittest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from training.trainer import Trainer
+from training.hf_operations import forward_backward
 from training.types import Datum, TensorData
 
 
@@ -44,26 +44,25 @@ def _datums() -> list[Datum]:
 class ForwardOnlyTest(unittest.TestCase):
   def setUp(self) -> None:
     self.model = _tiny_model()
-    self.trainer = Trainer(self.model, list(self.model.parameters()))
 
   def _grad_norm(self) -> float:
     return sum(float(p.grad.norm()) for p in self.model.parameters() if p.grad is not None)
 
   def test_forward_only_leaves_no_gradients(self) -> None:
-    result = self.trainer.forward_backward(_datums(), "cross_entropy", forward_only=True)
+    result = forward_backward(self.model, _datums(), "cross_entropy", forward_only=True)
     self.assertTrue(all(p.grad is None for p in self.model.parameters()))
     self.assertEqual(len(result["loss_fn_outputs"]), 2)
     self.assertEqual(len(result["loss_fn_outputs"][0]["logprobs"]["data"]), 5)
     self.assertGreater(result["metrics"]["loss:sum"], 0.0)
 
   def test_training_pass_still_accumulates(self) -> None:
-    self.trainer.forward_backward(_datums(), "cross_entropy")
+    forward_backward(self.model, _datums(), "cross_entropy")
     self.assertGreater(self._grad_norm(), 0.0)
 
   def test_forward_only_after_training_does_not_change_gradients(self) -> None:
-    self.trainer.forward_backward(_datums(), "cross_entropy")
+    forward_backward(self.model, _datums(), "cross_entropy")
     before = [p.grad.clone() for p in self.model.parameters() if p.grad is not None]
-    self.trainer.forward_backward(_datums(), "cross_entropy", forward_only=True)
+    forward_backward(self.model, _datums(), "cross_entropy", forward_only=True)
     after = [p.grad for p in self.model.parameters() if p.grad is not None]
     self.assertEqual(len(before), len(after))
     for a, b in zip(before, after, strict=True):
@@ -71,8 +70,8 @@ class ForwardOnlyTest(unittest.TestCase):
 
   def test_forward_only_returns_the_same_logprobs_as_a_training_pass(self) -> None:
     # No dropout in the tiny config, so eval and train mode agree.
-    forward_only = self.trainer.forward_backward(_datums(), "cross_entropy", forward_only=True)
-    trained = self.trainer.forward_backward(_datums(), "cross_entropy")
+    forward_only = forward_backward(self.model, _datums(), "cross_entropy", forward_only=True)
+    trained = forward_backward(self.model, _datums(), "cross_entropy")
     for lhs, rhs in zip(forward_only["loss_fn_outputs"], trained["loss_fn_outputs"], strict=True):
       for a, b in zip(lhs["logprobs"]["data"], rhs["logprobs"]["data"], strict=True):
         self.assertAlmostEqual(a, b, places=5)

@@ -7,13 +7,13 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from peft import LoraConfig, get_peft_model
 from tokenizers import Tokenizer, models
 from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 
+from server.model_metadata import WeightSyncConfig
 from training.fft_trainer_worker import FFTTrainingWorker
+from training.hf_operations import build_optimizer, forward_backward, optim_step
 from training.lora_trainer_worker import LoraTrainingWorker
-from training.trainer import Trainer
 from training.types import Datum
 from training.types import LoraConfig as WorkerLoraConfig
 
@@ -40,15 +40,27 @@ def training_data() -> list[Datum]:
   ]
 
 
+def fft_worker() -> FFTTrainingWorker:
+  return FFTTrainingWorker(
+    model=tiny_model(),
+    tokenizer=PreTrainedTokenizerFast(
+      tokenizer_object=Tokenizer(models.WordLevel({"<unk>": 0, **{str(i): i for i in range(1, 32)}}, unk_token="<unk>"))
+    ),
+    device="cpu",
+    base_model_name="tiny-llama",
+    cpu_offload=False,
+    weight_sync_cfg=WeightSyncConfig(strategy="full"),
+  )
+
+
 class TrainerStateTest(unittest.TestCase):
   def test_accumulated_requests_match_one_batch_and_default_adamw(self) -> None:
     model = tiny_model()
     reference = copy.deepcopy(model)
-    trainer = Trainer(model, list(model.parameters()))
     data = training_data()
 
     for datum in data:
-      trainer.forward_backward([datum], "cross_entropy")
+      forward_backward(model, [datum], "cross_entropy")
     for datum in data:
       inputs = torch.tensor([datum.model_input])
       targets = torch.tensor([datum.loss_fn_inputs["target_tokens"].data])
@@ -63,91 +75,98 @@ class TrainerStateTest(unittest.TestCase):
     reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=1e-4, betas=(0.9, 0.95), eps=1e-12, weight_decay=0.0)
     expected_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), float("inf"))
     reference_optimizer.step()
-    result = trainer.optim_step({})
+    optimizer = build_optimizer(list(model.parameters()), {})
+    result = optim_step(optimizer, {})
 
-    self.assertAlmostEqual(result["metrics"]["grad_norm:mean"], expected_norm.item())
-    self.assertTrue(all(param.grad is None for param in trainer.params))
+    self.assertAlmostEqual(result["grad_norm:mean"], expected_norm.item())
+    self.assertTrue(all(param.grad is None for param in model.parameters()))
     for actual, expected in zip(model.parameters(), reference.parameters(), strict=True):
       torch.testing.assert_close(actual, expected)
 
-  def test_lora_trainers_preserve_each_others_pending_gradients_and_optimizer(self) -> None:
-    config = LoraConfig(task_type="CAUSAL_LM", r=2, lora_alpha=2, lora_dropout=0.0, target_modules=["q_proj", "v_proj"])
-    model = get_peft_model(tiny_model(), config, adapter_name="a")
-    model.add_adapter("b", config)
-    trainers = {}
-    for name in ("a", "b"):
-      model.set_adapter(name)
-      trainers[name] = Trainer(model, [param for param in model.parameters() if param.requires_grad])
+  def test_lora_adapters_preserve_each_others_pending_gradients_and_optimizer(self) -> None:
+    worker = LoraTrainingWorker(base_model=tiny_model(), device="cpu", base_model_name="tiny-llama")
+    config = WorkerLoraConfig(rank=2, lora_alpha=2, lora_dropout=0.0, seed=1)
+    worker.create_adapter("a", config)
+    worker.create_adapter("b", config)
 
-    model.set_adapter("a")
-    trainers["a"].forward_backward(training_data(), "cross_entropy")
-    a_grads = [param.grad.clone() for param in trainers["a"].params]
-    model.set_adapter("b")
-    trainers["b"].forward_backward(training_data(), "cross_entropy")
-    b_weights = [param.detach().clone() for param in trainers["b"].params]
-    b_grads = [param.grad.clone() for param in trainers["b"].params]
-    for param, saved in zip(trainers["a"].params, a_grads, strict=True):
+    worker.forward_backward(training_data(), "cross_entropy", model_id="a")
+    a_grads = [param.grad.clone() for param in worker.adapters["a"].params]
+    worker.forward_backward(training_data(), "cross_entropy", model_id="b")
+    b_weights = [param.detach().clone() for param in worker.adapters["b"].params]
+    b_grads = [param.grad.clone() for param in worker.adapters["b"].params]
+    for param, saved in zip(worker.adapters["a"].params, a_grads, strict=True):
       torch.testing.assert_close(param.grad, saved)
 
-    model.set_adapter("a")
-    trainers["a"].optim_step({"learning_rate": 1e-2})
-    self.assertIsNone(trainers["b"].optimizer)
-    for param, weight, grad in zip(trainers["b"].params, b_weights, b_grads, strict=True):
+    worker.optim_step({"learning_rate": 1e-2}, "a")
+    self.assertIsNone(worker.adapters["b"].optimizer)
+    for param, weight, grad in zip(worker.adapters["b"].params, b_weights, b_grads, strict=True):
       torch.testing.assert_close(param, weight)
       torch.testing.assert_close(param.grad, grad)
 
-    model.set_adapter("b")
-    trainers["b"].optim_step({"learning_rate": 2e-2})
-    self.assertIsNot(trainers["a"].optimizer, trainers["b"].optimizer)
-    self.assertTrue(any(not torch.equal(param, before) for param, before in zip(trainers["b"].params, b_weights, strict=True)))
+    worker.optim_step({"learning_rate": 2e-2}, "b")
+    self.assertIsNot(worker.adapters["a"].optimizer, worker.adapters["b"].optimizer)
+    self.assertTrue(any(not torch.equal(param, before) for param, before in zip(worker.adapters["b"].params, b_weights, strict=True)))
 
   def test_learning_rate_changes_preserve_optimizer_moments(self) -> None:
     model = torch.nn.Linear(2, 1, bias=False)
-    trainer = Trainer(model, list(model.parameters()))
+    optimizer = build_optimizer(list(model.parameters()), {"learning_rate": 0.01})
     model(torch.ones(1, 2)).sum().backward()
-    trainer.optim_step({"learning_rate": 0.01})
-    optimizer = trainer.optimizer
+    optim_step(optimizer, {"learning_rate": 0.01})
     model(torch.ones(1, 2)).sum().backward()
-    trainer.optim_step({"learning_rate": 0.02})
-    self.assertIs(trainer.optimizer, optimizer)
-    self.assertEqual(trainer.optimizer.param_groups[0]["lr"], 0.02)
-    self.assertEqual(trainer.optimizer.state[model.weight]["step"].item(), 2)
+    optim_step(optimizer, {"learning_rate": 0.02})
+    self.assertEqual(optimizer.param_groups[0]["lr"], 0.02)
+    self.assertEqual(optimizer.state[model.weight]["step"].item(), 2)
 
   def test_fft_reload_uses_fresh_parameters_and_discards_the_old_optimizer(self) -> None:
-    worker = FFTTrainingWorker()
-    worker.device = torch.device("cpu")
-    worker.model = tiny_model()
-    worker.base_model_name = "tiny-llama"
-    worker.tokenizer = PreTrainedTokenizerFast(
-      tokenizer_object=Tokenizer(models.WordLevel({"<unk>": 0, **{str(i): i for i in range(1, 32)}}, unk_token="<unk>"))
-    )
-    worker.cpu_offload = False
-    worker.set_weight_sync_strategy("full")
-    worker.prepare_model_for_training()
+    worker = fft_worker()
     worker.forward_backward(training_data(), "cross_entropy")
     worker.optim_step({})
-    previous = worker.trainer
-    old_params = {id(param) for param in previous.params}
+    previous_params = worker.params
+    old_params = {id(param) for param in previous_params}
 
     with tempfile.TemporaryDirectory() as directory:
       path = os.path.join(directory, "checkpoint")
       worker.save_state("m", path)
       worker.load_from_state("m", path)
 
-    self.assertIsNot(worker.trainer, previous)
-    self.assertIsNone(worker.trainer.optimizer)
-    new_params = {id(param) for param in worker.trainer.params}
+    self.assertIsNone(worker.optimizer)
+    new_params = {id(param) for param in worker.params}
     self.assertTrue(old_params.isdisjoint(new_params))
     worker.forward_backward(training_data(), "cross_entropy")
     worker.optim_step({})
-    optimized_params = {id(param) for group in worker.trainer.optimizer.param_groups for param in group["params"]}
+    optimized_params = {id(param) for group in worker.optimizer.param_groups for param in group["params"]}
     self.assertEqual(optimized_params, new_params)
 
-  def test_lora_worker_save_and_restore_select_the_named_trainer(self) -> None:
-    worker = LoraTrainingWorker()
-    worker.device = torch.device("cpu")
-    worker.base_model = tiny_model()
-    worker.base_model_name = "tiny-llama"
+  def test_fft_optimizer_resume_matches_the_uninterrupted_next_update(self) -> None:
+    worker = fft_worker()
+    worker.forward_backward(training_data(), "cross_entropy")
+    worker.optim_step({"learning_rate": 0.003, "beta1": 0.7, "beta2": 0.8, "eps": 1e-8, "weight_decay": 0.1})
+
+    with tempfile.TemporaryDirectory() as directory:
+      path = os.path.join(directory, "checkpoint")
+      worker.save_state("m", path, include_optimizer=True)
+      worker.forward_backward(training_data(), "cross_entropy")
+      worker.optim_step({"learning_rate": 0.002})
+      uninterrupted = [param.detach().clone() for param in worker.params]
+
+      worker.load_from_state("m", path, restore_optimizer=True)
+      worker.forward_backward(training_data(), "cross_entropy")
+      worker.optim_step({"learning_rate": 0.002})
+
+    for param, expected in zip(worker.params, uninterrupted, strict=True):
+      torch.testing.assert_close(param, expected)
+
+  def test_optimizer_restore_requires_optimizer_state_for_both_backends(self) -> None:
+    lora = LoraTrainingWorker(base_model=tiny_model(), device="cpu", base_model_name="tiny-llama")
+    lora.create_adapter("m", WorkerLoraConfig(rank=2, seed=1))
+    for worker in (fft_worker(), lora):
+      with self.subTest(backend=type(worker).__name__), tempfile.TemporaryDirectory() as path:
+        worker.save_state("m", path, include_optimizer=False)
+        with self.assertRaisesRegex(ValueError, "has no optimizer state"):
+          worker.load_from_state("m", path, restore_optimizer=True)
+
+  def test_lora_worker_save_and_restore_select_the_named_adapter(self) -> None:
+    worker = LoraTrainingWorker(base_model=tiny_model(), device="cpu", base_model_name="tiny-llama")
     config = WorkerLoraConfig(rank=2, lora_dropout=0.0, seed=1)
 
     with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"OPEN_RL_TMP_DIR": directory}):
@@ -156,10 +175,10 @@ class TrainerStateTest(unittest.TestCase):
       worker.forward_backward(training_data(), "cross_entropy", model_id="a")
       worker.optim_step({"learning_rate": 0.01}, "a")
       expected = worker.forward_backward(training_data(), "cross_entropy", model_id="a", forward_only=True)
-      previous = worker.trainers["a"]
+      previous = worker.adapters["a"]
 
       worker.forward_backward(training_data(), "cross_entropy", model_id="b")
-      b_grads = [param.grad.clone() for param in worker.trainers["b"].params]
+      b_grads = [param.grad.clone() for param in worker.adapters["b"].params]
       path = os.path.join(directory, "checkpoint")
       worker.save_state("a", path, include_optimizer=True)
 
@@ -169,7 +188,7 @@ class TrainerStateTest(unittest.TestCase):
       expected_next = [param.detach().clone() for param in previous.params]
       worker.load_from_state("a", path, restore_optimizer=True)
 
-      restored = worker.trainers["a"]
+      restored = worker.adapters["a"]
       self.assertIsNot(restored, previous)
       self.assertTrue({id(param) for param in previous.params}.isdisjoint({id(param) for param in restored.params}))
       self.assertEqual(restored.optimizer.param_groups[0]["lr"], 0.01)
@@ -181,7 +200,7 @@ class TrainerStateTest(unittest.TestCase):
       worker.optim_step({"learning_rate": 0.01}, "a")
       for param, uninterrupted in zip(restored.params, expected_next, strict=True):
         torch.testing.assert_close(param, uninterrupted)
-      for param, saved in zip(worker.trainers["b"].params, b_grads, strict=True):
+      for param, saved in zip(worker.adapters["b"].params, b_grads, strict=True):
         torch.testing.assert_close(param.grad, saved)
 
 

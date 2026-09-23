@@ -1,85 +1,95 @@
-# Trainers and worker processes
+# Training operations and worker execution
 
-This is the first foundation change toward an exclusive AutoModel backend.
-It keeps the existing HF LoRA and full fine-tuning deployment modes. It does
-not add AutoModel, torchrun, or a new scheduler mode.
+The backend is the command target. It owns numerical state; the process loop
+owns queues, replies, and resource leases. There is no nested `Trainer`, base
+worker class, or backend registry. The existing HF workers implement the
+structural operation contract in `training/backend.py` directly.
 
-## Ownership
+## State and operations
 
-`training.trainer.Trainer` holds an already constructed model, the
-parameter objects to optimize (including pending gradients) and their
-optimizer state. It runs the existing forward/backward, optimizer, and local
-generation algorithms. It
-does not load models, select an accelerator, save files, or publish weights.
-Tests can construct it directly with a small CPU model.
+Full fine-tuning owns a model, its trainable parameters, and an optimizer.
+LoRA owns one shared PEFT model and a small parameter/optimizer record per
+adapter. Pending gradients live on those parameter objects. These records
+do not copy the shared model or introduce another execution layer.
 
-`LoraTrainingWorker` owns a shared base model and a trainer for each adapter.
-It selects the adapter before delegating a command; parameter references,
-pending gradients, and optimizer state remain separate across trainers.
-`FFTTrainingWorker` owns one trainer and the existing offload/delta state.
-Reloading a model creates a fresh trainer bound to the new parameters.
-The trainer holds references to existing parameters; it does not copy them.
-The API's client session still controls client lifetime and may own several
-models. It is distinct from a trainer's numerical state and a worker process.
+The backends share ordinary functions in `hf_operations.py` for HF forward,
+loss, backward, generation, and AdamW updates. Model, device, tokenizer, and
+batching limits are explicit inputs. This is HF math, not an inheritance
+contract that another backend must adopt.
 
-Model loading, checkpoint serialization, and the existing automatic LoRA
-publication remain explicit worker responsibilities. Separating resumable
-checkpoints from sampler exports is follow-up work, not part of this change.
+| Operation | Effect |
+| --- | --- |
+| Forward | Read current weights without changing accumulated gradients |
+| Forward/backward | Accumulate gradients for the selected model or adapter |
+| Optimizer step | Update parameters and optimizer state, then clear gradients |
+| Save/load state | Write/read a model checkpoint, optionally with optimizer state |
+| Export for sampler | Write the weights the sampler consumes |
 
-## Process execution
+Optimizer steps perform no checkpoint writes, delta comparisons, or sampler
+format conversion. Full checkpoints remain full checkpoints even when sampler
+export uses deltas. A checkpoint does not advance the sampler's delta baseline.
+Requesting optimizer restoration from a weights-only checkpoint fails explicitly.
 
-`TrainingRequestsProcessor` receives a worker, a request store, and concrete
-queue/resource choices:
+Both HF backends accept an existing model in their constructor for CPU tests.
+Device and loading choices are resolved once and reused on load. In production,
+the create/load command still performs allocation inside the resource lease.
+A future AutoModel backend can use its own resolved distributed topology and
+native optimizer, while exposing the same operation semantics.
 
-| Queue identity | GPU resource policy | Use |
-| --- | --- | --- |
-| `active_tenant_set_id` (or the default active set) | No time slicer | Shared LoRA host |
-| `model_id` | Supplied time-slicer client | Existing full fine-tuning worker |
-| `model_id` | No time slicer | Resident, dedicated worker on exclusive GPUs |
+## Process loop and suspension
 
-The two queue identities are mutually exclusive. A dedicated runner only
-executes commands for its model and exits on shutdown even without a lease.
-The shared LoRA launch passes only its active-set argument. The standalone
-FFT entry point still creates its time-slicer client explicitly.
+Queue identity and resource policy are independent. `model_id` drains a
+dedicated queue; an active tenant set serves a shared LoRA host. Supplying a
+time slicer requires the optional whole-worker `Suspendable` contract.
+Without one, the backend stays resident and needs no sleep/wake methods.
+Exclusive GPU admission is still the launcher's and scheduler's responsibility.
 
-The unleased path invokes only command methods: a resident backend does not
-need no-op sleep/wake methods. Existing FFT callers still need the leased
-offload path, or an explicitly resident model (`cpu_offload=False`); omitting
-the time slicer alone does not change a model's residency policy or reserve
-its GPU. Scheduler admission remains the launcher's responsibility.
+Every leased batch follows one sequence:
 
-Sleep/wake belongs to the worker's accelerator resources: pausing a shared
-LoRA host would affect every adapter on it. A backend can initially stay
-resident and later support suspension without changing trainer identity.
-Cooperative tensor offload and external CUDA parking remain separate steps
-in the existing FFT path. A future backend must establish a safe command
-boundary across its ranks and preserve pending gradients as well as weights,
-optimizer state, buffers, and RNG before supporting suspension.
+```text
+acquire -> wake -> execute commands in queue order -> sleep -> release -> reply
+```
 
-Commands preserve their queue order, including saves between optimizer steps.
-Leased workers offload between contiguous compute and save groups and publish
-results after releasing the GPU. Resident workers publish each result as it
-is ready. A later batch failure does not overwrite earlier published results.
+Creation, checkpoint saves, and sampler exports follow the same sequence as
+compute. The loop never inspects `cpu_offload`, tensor layouts, or save formats.
+Cancellation waits for native work to finish before sleeping and releasing;
+cancelling a Python await does not stop its underlying worker thread.
+This intentionally holds the lease during serialization. An optimization
+that serializes after release would need evidence that its scheduling benefit
+justifies a second execution path.
 
-The runner imports no concrete model backend. Its lifecycle and queue tests
-use an in-memory store; separate worker processes continue to require Redis.
+Suspension preserves the next command's behavior, including pending gradients,
+optimizer state, model buffers, and backend state. It applies to the whole
+accelerator allocation, including all shared adapters or distributed ranks.
+AutoModel may start resident; supporting suspension later does not change its
+training operations. The existing FFT tensor offload and external CUDA parking
+remain separate physical steps.
 
-## AutoModel follow-up
+## Explicit export and physical storage
 
-Add AutoModel as one model per process group, with scheduler exclusivity and
-no time-slicer client. Keep its distributed execution scope around the whole
-forward/loss/backward operation rather than extending a forward-only hook.
-Resolve topology at launch and consume training configuration from the typed
-create command. Rank zero should own external queue/result operations.
+LoRA writes the existing `peft/<model_id>` directory only on explicit sampler
+export. Training changes do not update it. Named and ephemeral LoRA references
+still share that directory; historical immutable LoRA snapshots are separate
+work. Export errors propagate to the request's result.
 
-Trainer ownership must become role-specific before adding AutoModel LoRA:
-its trainer is dedicated by model ID even if its vLLM sampler shares a base
-model. The existing `runtime_of()` shared-LoRA policy must not be reused for
-that trainer. Multi-GPU claims and torchrun wiring can then be added as a
-separate, reviewable step.
+FFT delta export compares current weights against the last successful export,
+then emits the existing absolute replacement indices/values. Several optimizer
+steps may precede an export. Failed serialization does not consume the changes.
+Loading a checkpoint makes the next delta export send all weights, establishing
+a new baseline. Consumers still must apply incremental exports in order.
 
-Validation for this foundation is included in `make test`: CPU numerical
-references, adapter isolation, forward-only behavior, checkpoint reloads,
-dedicated/shared queue selection, FIFO saves, shutdown, and failure handling.
-These tests do not validate CUDA offload or distributed restoration; those
-require the GPU test paths.
+The delta baseline is an ordinary CPU copy, allocated only in delta mode.
+It is separate from offload buffers, which sleep overwrites with current state.
+Combining delta export and CPU offload therefore costs an additional model-sized
+host copy. This removes the old per-step comparison and CPU-to-GPU baseline copy;
+it does not claim to reduce peak host memory. Full export needs no delta baseline.
+
+## Validation
+
+CPU tests compare the shared math to an independent reference, verify adapter
+gradient isolation and checkpoint continuation, reconstruct weights from delta
+exports, and check that training leaves exported files unchanged. Runtime tests
+verify ordered operations, one wake/sleep pair per leased batch, resident
+backends without suspension, shutdown, and failure replies. CUDA offload and
+distributed restoration require GPU validation; this cleanup does not establish
+their numerical equivalence.

@@ -9,11 +9,12 @@ import os
 import shutil
 import threading
 import traceback
-from itertools import groupby
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from contextlib import asynccontextmanager
+from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 
@@ -22,15 +23,30 @@ from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.model_metadata import get_model_metadata
 from server.store import RequestStore, get_state_store, get_store
 from training import commands
+from training.backend import Suspendable, TrainingBackend
 from training.commands import parse_command
 
-if TYPE_CHECKING:
-  from training.fft_trainer_worker import FFTTrainingWorker
-  from training.lora_trainer_worker import LoraTrainingWorker
-
-  TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
-
 tracer = trace.get_tracer(__name__)
+
+
+async def call_backend(operation: Callable[..., Any], *args, **kwargs) -> Any:
+  """A cancelled waiter must not leave native work running across sleep/release."""
+  task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+  cancellation = None
+  while not task.done():
+    try:
+      await asyncio.shield(task)
+    except asyncio.CancelledError as exc:
+      # Repeated cancellation must not cancel the task while its native
+      # thread is still running. Drain it before parking the process.
+      cancellation = exc
+    except Exception:
+      break
+  if cancellation is not None:
+    if not task.cancelled():
+      task.exception()
+    raise cancellation
+  return task.result()
 
 
 def is_fft_enabled() -> bool:
@@ -68,7 +84,7 @@ class TrainingRequestsProcessor:
   def __init__(
     self,
     store: RequestStore,
-    worker: TrainingWorker,
+    worker: TrainingBackend,
     model_id: str | None = None,
     active_tenant_set_id: str | None = None,
     time_slicer: TimeSlicerClient | None = None,
@@ -77,12 +93,15 @@ class TrainingRequestsProcessor:
       raise ValueError("Choose a dedicated model_id or a shared active_tenant_set_id, not both")
     if time_slicer is not None and not model_id:
       raise ValueError("A time-sliced trainer needs a dedicated model_id")
+    if time_slicer is not None and not isinstance(worker, Suspendable):
+      raise ValueError("This backend cannot suspend; launch it with exclusive resources")
 
     self.store = store
     self.worker = worker
     self.model_id = model_id
     self.active_tenant_set_id = active_tenant_set_id
     self.time_slicer = time_slicer
+    self.suspension = worker if time_slicer is not None else None
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM) if time_slicer else None
     self.snapshot_registered = False
     self.stopping = False
@@ -173,7 +192,13 @@ class TrainingRequestsProcessor:
     """Every request gets an answer: its result, or the failure that stopped the batch."""
     results: list[tuple[str | None, dict[str, Any]]] = []
     try:
-      await self.handle_batch(requests, results)
+      async with self.execution():
+        for request in requests:
+          result = await self.handle_request(request)
+          request_id, response = result
+          if self.time_slicer is None and request_id is not None:
+            await self.store.set_future(request_id, response)
+          results.append(result)
     except Exception as exc:
       published = len(results) if self.time_slicer is None else 0
       answered = {request_id for request_id, _ in results}
@@ -186,36 +211,20 @@ class TrainingRequestsProcessor:
     # the device has been released. Return just the answers still to publish.
     return ([] if self.time_slicer is None else results), None
 
-  async def handle_batch(self, requests: list[dict[str, Any]], results: list[tuple[str | None, dict[str, Any]]]) -> None:
-    """GPU work under one time-slicer turn; saves need the device only when the worker is not offloaded."""
+  @asynccontextmanager
+  async def execution(self):
+    """Every operation, including creation and export, runs while the backend is awake."""
     if self.time_slicer is None:
-      # No lease to hold, so each answer goes out as soon as it is ready.
-      for request in requests:
-        result = await self.handle_request(request)
-        request_id, response = result
-        if request_id is not None:
-          await self.store.set_future(request_id, response)
-        results.append(result)
+      yield
       return
-
-    save_ops = {"save_state", "save_weights_for_sampler"}
-    # Preserve command order: step A -> save -> step B must save A's weights.
-    for is_save, group in groupby(requests, key=lambda request: request.get("op") in save_ops):
-      if is_save and self.worker.cpu_offload:
-        for request in group:
-          results.append(await self.handle_request(request))
-      else:
-        async with self.time_slicer.acquire(self.workload):
-          if not is_save:
-            await asyncio.to_thread(self.worker.wake_up)
-          try:
-            for request in group:
-              results.append(await self.handle_request(request))
-          finally:
-            if not is_save:
-              await asyncio.to_thread(self.worker.sleep)
-        if self.time_slicer.faulted:
-          raise TimeSlicerFault(self.time_slicer.faulted)
+    async with self.time_slicer.acquire(self.workload):
+      try:
+        await call_backend(self.suspension.wake_up)
+        yield
+      finally:
+        await call_backend(self.suspension.sleep)
+    if self.time_slicer.faulted:
+      raise TimeSlicerFault(self.time_slicer.faulted)
 
   async def process_request(self, raw_request: dict[str, Any]) -> None:
     request_id, result = await self.handle_request(raw_request)
@@ -251,7 +260,7 @@ class TrainingRequestsProcessor:
       case commands.CreateModel():
         is_lora = command.fine_tuning_type == "lora"
         config = command.lora_config if is_lora else command.full_config
-        await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, config)
+        await call_backend(self.worker.create_model, command.base_model, command.model_id, config)
         result = {
           "base_model": command.base_model,
           "model_id": command.model_id,
@@ -262,7 +271,7 @@ class TrainingRequestsProcessor:
           result["rank"] = command.lora_config.rank
         return result
       case commands.CreateModelFromState():
-        result = await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
+        result = await call_backend(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
         return {
           "base_model": result.get("base_model"),
           "model_id": result.get("model_id", command.model_id),
@@ -270,7 +279,7 @@ class TrainingRequestsProcessor:
           "type": "model_loaded_from_state",
         }
       case commands.ForwardBackward():
-        result = await asyncio.to_thread(
+        result = await call_backend(
           self.worker.forward_backward,
           command.data,
           command.loss_fn,
@@ -281,11 +290,11 @@ class TrainingRequestsProcessor:
         result["type"] = "forward_backward_completed"
         return result
       case commands.OptimStep():
-        result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, command.model_id)
+        result = await call_backend(self.worker.optim_step, command.adam_params, command.model_id)
         result["type"] = "optim_step_completed"
         return result
       case commands.Sample():
-        result = await asyncio.to_thread(
+        result = await call_backend(
           self.worker.generate,
           command.prompt_tokens,
           command.max_tokens,
@@ -297,14 +306,14 @@ class TrainingRequestsProcessor:
         result["type"] = "sample_completed"
         return result
       case commands.SaveState():
-        result = await asyncio.to_thread(self.worker.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
+        result = await call_backend(self.worker.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
         return {"path": result.get("path", command.state_path), "type": "state_saved"}
       case commands.LoadWeights():
-        await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
+        await call_backend(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
         return {"path": command.state_path, "type": "weights_loaded"}
       case commands.SaveWeightsForSampler():
         ref = command.path or command.sampling_session_id
-        checkpoint = await asyncio.to_thread(self.worker.save_for_sampler, command.model_id, command.alias, ref)
+        checkpoint = await call_backend(self.worker.save_for_sampler, command.model_id, command.alias, ref)
         if checkpoint:
           await self.publish_checkpoint(command.model_id, checkpoint)
         return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved"}
@@ -326,7 +335,7 @@ class TrainingRequestsProcessor:
 
 
 async def run_training_requests_processor(
-  worker: TrainingWorker,
+  worker: TrainingBackend,
   model_id: str | None = None,
   time_slicer: TimeSlicerClient | None = None,
   active_tenant_set_id: str | None = None,
@@ -355,27 +364,21 @@ async def main_async(args: argparse.Namespace) -> None:
       raise RuntimeError("A dedicated trainer worker needs --model-id")
   print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")
 
-  worker: TrainingWorker = LoraTrainingWorker() if is_lora else FFTTrainingWorker()
-  preload_target = os.getenv("BASE_MODEL")
-  is_ready = False
-  if preload_target and is_lora:
-    worker.load_base_model(preload_target)
-    is_ready = True
+  worker: TrainingBackend
+  if is_lora:
+    worker = LoraTrainingWorker()
+    if preload_target := os.getenv("BASE_MODEL"):
+      worker.load_base_model(preload_target)
   else:
-    if not is_lora:
-      print("[WORKER] Full fine-tuning mode loads its model from the create_model request.")
-    else:
-      print("[WARNING] BASE_MODEL not provided. Cold-start penalty will apply on first request.")
-    is_ready = True
+    # Allocation happens when create_model executes under its resource lease.
+    worker = FFTTrainingWorker()
 
   if is_lora:
     probe_app = FastAPI()
 
     @probe_app.get("/healthz")
     def healthz():
-      if is_ready:
-        return {"status": "ready"}
-      raise HTTPException(status_code=503, detail="Model Loading")
+      return {"status": "ready"}
 
     def run_probe_server():
       try:

@@ -3,7 +3,7 @@
 import json
 import os
 import time
-import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -12,7 +12,7 @@ from peft import LoraConfig as PeftLoraConfig
 from peft import PeftModelForCausalLM, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
-from training.trainer import Trainer, default_device
+from training import hf_operations
 from training.types import Datum, LoraConfig
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
@@ -26,14 +26,35 @@ def active_adapter_parameters(model: PeftModelForCausalLM, adapter_id: str) -> l
   return params
 
 
+@dataclass
+class AdapterState:
+  params: list[torch.nn.Parameter]
+  optimizer: torch.optim.Optimizer | None = None
+
+
 class LoraTrainingWorker:
-  def __init__(self):
-    self.device = default_device()
-    self.tokenizer = None
-    self.base_model: PreTrainedModel | None = None
+  def __init__(
+    self,
+    *,
+    base_model: PreTrainedModel | None = None,
+    tokenizer: Any = None,
+    device: torch.device | str | None = None,
+    base_model_name: str | None = None,
+    token_budget: int | None = None,
+  ):
+    if device is None:
+      device = next(base_model.parameters()).device if base_model is not None else hf_operations.default_device()
+    self.device = torch.device(device)
+    if base_model is not None:
+      self.dtype = next(base_model.parameters()).dtype
+    else:
+      self.dtype = torch.bfloat16 if self.device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+    self.tokenizer = tokenizer
+    self.token_budget = int(os.getenv("OPEN_RL_TRAIN_TOKEN_BUDGET", "0")) if token_budget is None else token_budget
+    self.base_model = base_model
     self.peft_model: PeftModelForCausalLM | None = None
-    self.base_model_name: str | None = None
-    self.trainers: dict[str, Trainer] = {}
+    self.base_model_name = base_model_name
+    self.adapters: dict[str, AdapterState] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
 
   def load_base_model(self, base_model_name: str) -> None:
@@ -45,9 +66,7 @@ class LoraTrainingWorker:
     print(f"Loading base model {base_model_name} to {self.device}...")
     self.base_model_name = base_model_name
     self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-
-    self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
+    self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=self.dtype, device_map=self.device)
     print("Successfully loaded.")
 
   def target_lora_modules(self, config: LoraConfig) -> list[str]:
@@ -98,9 +117,6 @@ class LoraTrainingWorker:
     """Create a new LoRA adapter on top of the loaded base model."""
     assert self.base_model is not None, "Base model is not loaded. Call load_base_model first."
 
-    if adapter_id in self.trainers:
-      del self.trainers[adapter_id]
-
     if not any([config.train_attn, config.train_mlp, config.train_unembed]):
       raise ValueError("At least one LoRA training target must be enabled.")
 
@@ -123,10 +139,7 @@ class LoraTrainingWorker:
     else:
       self.peft_model.add_adapter(adapter_id, peft_config)
 
-    self.peft_model.set_adapter(adapter_id)
-    self.trainers[adapter_id] = Trainer(
-      self.peft_model, active_adapter_parameters(self.peft_model, adapter_id), tokenizer=self.tokenizer, device=self.device
-    )
+    self.adapters[adapter_id] = AdapterState(active_adapter_parameters(self.peft_model, adapter_id))
 
     if ENABLE_GRADIENT_CHECKPOINTING:
       try:
@@ -139,48 +152,22 @@ class LoraTrainingWorker:
     self.peft_model.train()
     print(f"LoRA adapter '{adapter_id}' created and set to active.")
 
-    self.save_adapter(adapter_id)
-
   def create_model(self, base_model_name: str, model_id: str, config: LoraConfig) -> None:
     """Load the shared base model if needed, then create a trainable LoRA adapter."""
     self.load_base_model(base_model_name)
     self.create_adapter(model_id, config)
 
-  def save_adapter(self, adapter_id: str, alias: str | None = None) -> None:
-    """Save adapter weights to disk for reliability and sharing."""
-    if self.peft_model is None:
-      print(f"[LoRA] Cannot save adapter '{adapter_id}': no active PEFT model initialized.")
-      return
-    try:
-      tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-      save_path = os.path.join(tmp_dir, "peft", adapter_id)
-      os.makedirs(save_path, exist_ok=True)
-
-      # Save the adapter weights
-      self.peft_model.set_adapter(adapter_id)
-      self.peft_model.save_pretrained(save_path, selected_adapters=[adapter_id])
-
-      # Save minimal metadata
-      metadata = {"model_id": adapter_id, "created_at": datetime.now().isoformat(), "timestamp": time.time()}
-      if alias is not None:
-        metadata["alias"] = alias
-      with open(os.path.join(save_path, "metadata.json"), "w") as f:
-        json.dump(metadata, f)
-
-      print(f"Auto-saved adapter '{adapter_id}' to {save_path}")
-    except Exception as e:
-      print(f"[ERROR] Failed to auto-save weights for {adapter_id}: {e}")
-      traceback.print_exc()
-
-  def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
+  def save_state(
+    self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state", *, alias: str | None = None
+  ) -> dict[str, Any]:
     """Save adapter weights (and optionally optimizer state) to a specific path."""
     assert self.peft_model is not None, "Model must be loaded first."
 
-    self.peft_model.set_adapter(model_id)
+    adapter = self.adapter_for(model_id)
     os.makedirs(state_path, exist_ok=True)
     self.peft_model.save_pretrained(state_path, selected_adapters=[model_id])
 
-    optimizer = self.trainer_for(model_id).optimizer
+    optimizer = adapter.optimizer
     if include_optimizer and optimizer is not None:
       torch.save(optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
 
@@ -192,6 +179,8 @@ class LoraTrainingWorker:
       "model_id": model_id,
       "timestamp": time.time(),
     }
+    if alias is not None:
+      metadata["alias"] = alias
     with open(os.path.join(state_path, "metadata.json"), "w") as f:
       json.dump(metadata, f)
 
@@ -199,8 +188,11 @@ class LoraTrainingWorker:
     return {"path": state_path}
 
   def save_for_sampler(self, model_id: str, alias: str | None, ref: str | None) -> str | None:
-    """The sampler hot-loads the adapter from its directory, so there is no checkpoint to announce."""
-    self.save_adapter(model_id, alias)
+    """Explicitly export to the shared adapter directory used by the sampler."""
+    save_path = os.path.join(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "peft", model_id)
+    self.save_state(model_id, save_path, kind="sampler", alias=alias)
+    # LoRA references share this mutable directory; FFT version publication
+    # and pruning must not treat sibling adapters as old versions.
     return None
 
   def load_from_state(self, model_id: str, state_path: str, restore_optimizer: bool = False) -> dict[str, Any]:
@@ -219,6 +211,9 @@ class LoraTrainingWorker:
     base_model = metadata.get("base_model")
     if not base_model:
       raise ValueError(f"metadata.json at {state_path} missing base_model")
+    optimizer_path = os.path.join(state_path, "optimizer.pt")
+    if restore_optimizer and (not metadata.get("has_optimizer") or not os.path.isfile(optimizer_path)):
+      raise ValueError(f"Checkpoint {state_path} has no optimizer state")
 
     src_adapter_id = metadata.get("model_id")
     adapter_dir = state_path
@@ -233,14 +228,11 @@ class LoraTrainingWorker:
     else:
       if model_id in self.peft_model.peft_config:
         self.peft_model.delete_adapter(model_id)
-        if model_id in self.trainers:
-          del self.trainers[model_id]
       self.peft_model.load_adapter(adapter_dir, adapter_name=model_id, is_trainable=True)
 
-    self.peft_model.set_adapter(model_id)
     params = active_adapter_parameters(self.peft_model, model_id)
-    trainer = Trainer(self.peft_model, params, tokenizer=self.tokenizer, device=self.device)
-    self.trainers[model_id] = trainer
+    adapter = AdapterState(params)
+    self.adapters[model_id] = adapter
 
     if ENABLE_GRADIENT_CHECKPOINTING:
       try:
@@ -252,37 +244,37 @@ class LoraTrainingWorker:
 
     self.peft_model.train()
 
-    if restore_optimizer and metadata.get("has_optimizer"):
-      optimizer_path = os.path.join(state_path, "optimizer.pt")
-      if os.path.exists(optimizer_path):
-        optimizer = trainer.build_optimizer({})
-        optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
-        trainer.optimizer = optimizer
-        print(f"Restored optimizer state for '{model_id}' from {optimizer_path}")
+    if restore_optimizer:
+      optimizer = hf_operations.build_optimizer(params, {})
+      optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device, weights_only=True))
+      adapter.optimizer = optimizer
 
     print(f"Loaded state for '{model_id}' from {state_path}")
     return {"model_id": model_id, "is_lora": True, "base_model": base_model}
 
-  def trainer_for(self, model_id: str | None) -> Trainer:
+  def adapter_for(self, model_id: str | None) -> AdapterState:
     if model_id is None:
       raise ValueError("model_id is required for a LoRA trainer")
     try:
-      trainer = self.trainers[model_id]
+      adapter = self.adapters[model_id]
     except KeyError:
-      raise ValueError(f"No trainer for adapter '{model_id}'") from None
+      raise ValueError(f"No state for adapter '{model_id}'") from None
     self.peft_model.set_adapter(model_id)
-    return trainer
+    return adapter
 
   def forward_backward(
     self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
   ) -> dict[str, Any]:
-    return self.trainer_for(model_id).forward_backward(data, loss_fn, loss_config, forward_only=forward_only)
+    self.adapter_for(model_id)
+    return hf_operations.forward_backward(
+      self.peft_model, data, loss_fn, loss_config, forward_only, tokenizer=self.tokenizer, device=self.device, token_budget=self.token_budget
+    )
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str) -> dict[str, Any]:
-    result = self.trainer_for(model_id).optim_step(adam_params)
-    # Existing worker policy: LoRA samplers hot-load this directory after a step.
-    self.save_adapter(model_id)
-    return result
+    adapter = self.adapter_for(model_id)
+    if adapter.optimizer is None:
+      adapter.optimizer = hf_operations.build_optimizer(adapter.params, adam_params)
+    return {"metrics": hf_operations.optim_step(adapter.optimizer, adam_params)}
 
   def generate(
     self,
@@ -293,4 +285,14 @@ class LoraTrainingWorker:
     model_id: str | None = None,
     include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
-    return self.trainer_for(model_id).generate(prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
+    self.adapter_for(model_id)
+    return hf_operations.generate(
+      self.peft_model,
+      prompt_tokens,
+      max_tokens,
+      num_samples,
+      temperature,
+      include_prompt_logprobs,
+      tokenizer=self.tokenizer,
+      device=self.device,
+    )

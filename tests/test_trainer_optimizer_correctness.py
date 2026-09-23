@@ -10,12 +10,13 @@ from unittest.mock import patch
 import torch
 
 from server import training_requests_processor as training_requests_processor_module
+from server.model_metadata import WeightSyncConfig
 from training import fft_trainer_worker as fft_trainer_worker_module
+from training import hf_operations
 from training import lora_trainer_worker as lora_trainer_worker_module
 from training import losses as losses_module
 from training.fft_trainer_worker import FFTTrainingWorker
-from training.lora_trainer_worker import LoraTrainingWorker
-from training.trainer import Trainer
+from training.lora_trainer_worker import AdapterState, LoraTrainingWorker
 from training.types import Datum
 
 
@@ -59,24 +60,23 @@ class _LogitModelStub(torch.nn.Module):
     return types.SimpleNamespace(logits=logits)
 
 
-class _FullModelStub:
+class _FullModelStub(torch.nn.Module):
   def __init__(self, params):
-    self.params = params
-
-  def train(self):
-    return None
-
-  def parameters(self):
-    yield from self.params
-
-
-class _RecordingFullWorker(FFTTrainingWorker):
-  def __init__(self):
     super().__init__()
+    self.params = torch.nn.ParameterList(params)
+    self.saved = []
+
+  def save_pretrained(self, path):
+    self.saved.append(path)
+
+
+class _RecordingFullWorker:
+  def __init__(self):
     self.base_model_name = None
     self.loaded_base_models = []
     self.created_models = []
     self.saved_states = []
+    self.sampler_exports = []
 
   def load_base_model(self, base_model_name):
     self.base_model_name = base_model_name
@@ -91,6 +91,10 @@ class _RecordingFullWorker(FFTTrainingWorker):
   def save_state(self, model_id, state_path, include_optimizer=False, kind="state"):
     self.saved_states.append((model_id, state_path, include_optimizer, kind))
     return {"path": state_path}
+
+  def save_for_sampler(self, model_id, alias, ref):
+    self.sampler_exports.append((model_id, alias, ref))
+    return "/tmp/open-rl-test/sampler_full/model-a/sampler_weights/final"
 
   cpu_offload = True
 
@@ -195,8 +199,7 @@ class TestLoraTargetModules(unittest.TestCase):
     block.gate_proj = torch.nn.Linear(4, 4)
     model = torch.nn.Module()
     model.layer = block
-    worker = LoraTrainingWorker()
-    worker.base_model = model
+    worker = LoraTrainingWorker(base_model=model, device="cpu")
 
     attn_only = LoraConfig(train_attn=True, train_mlp=False, train_unembed=False)
     self.assertEqual(worker.target_lora_modules(attn_only), ["layer.q_proj"])
@@ -209,46 +212,11 @@ class TestLoraTargetModules(unittest.TestCase):
 
 
 class TestTrainerOptimizerCorrectness(unittest.TestCase):
-  def test_lora_create_model_loads_base_then_creates_adapter(self) -> None:
-    worker = LoraTrainingWorker()
-    config = lora_trainer_worker_module.LoraConfig(rank=2, seed=123)
-    calls = []
-
-    worker.load_base_model = lambda base_model_name: calls.append(("load", base_model_name))
-    worker.create_adapter = lambda model_id, adapter_config: calls.append(("adapter", model_id, adapter_config))
-
-    worker.create_model("base-model", "adapter-a", config)
-
-    self.assertEqual(calls[0], ("load", "base-model"))
-    self.assertEqual(calls[1][0], "adapter")
-    self.assertEqual(calls[1][1], "adapter-a")
-    self.assertIs(calls[1][2], config)
-
-  def test_save_adapter_selects_adapter_it_saves(self) -> None:
-    adapter_a_param = torch.nn.Parameter(torch.tensor([1.0]))
-    adapter_b_param = torch.nn.Parameter(torch.tensor([1.0]))
-    worker = LoraTrainingWorker()
-    worker.peft_model = _PeftModelStub(
-      {
-        "adapter-a": [adapter_a_param],
-        "adapter-b": [adapter_b_param],
-      }
-    )
-    worker.peft_model.set_adapter("adapter-b")
-
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(os.environ, {"OPEN_RL_TMP_DIR": tmp_dir}):
-      worker.save_adapter("adapter-a")
-      self.assertTrue(os.path.exists(os.path.join(tmp_dir, "peft", "adapter-a", "metadata.json")))
-
-    self.assertEqual(worker.peft_model.active_adapter, "adapter-a")
-
   def test_lora_save_state_writes_the_optimizer_next_to_the_adapter(self) -> None:
     param = torch.nn.Parameter(torch.tensor([1.0]))
-    worker = LoraTrainingWorker()
-    worker.base_model_name = "base"
+    worker = LoraTrainingWorker(device="cpu", base_model_name="base")
     worker.peft_model = _PeftModelStub({"job-a": [param]})
-    worker.trainers["job-a"] = Trainer(worker.peft_model, [param])
-    worker.trainers["job-a"].optimizer = torch.optim.AdamW([param], lr=0.1)
+    worker.adapters["job-a"] = AdapterState([param], torch.optim.AdamW([param], lr=0.1))
 
     with tempfile.TemporaryDirectory() as tmp_dir:
       state_dir = os.path.join(tmp_dir, "step-5")
@@ -257,43 +225,20 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
       with open(os.path.join(state_dir, "metadata.json")) as f:
         self.assertTrue(json.load(f)["has_optimizer"])
 
-  def test_fft_save_state_under_delta_writes_a_delta_whatever_was_asked(self) -> None:
-    worker = FFTTrainingWorker()
-    worker.model = _FullModelStub([])
-    worker.cpu_offload = False
-    worker.weight_sync_cfg.strategy = "delta"
-    with patch.object(worker, "save_state_delta", return_value={"path": "delta"}) as delta:
-      self.assertEqual(worker.save_state("job-a", "/tmp/x", include_optimizer=True), {"path": "delta"})
-    delta.assert_called_once()
-
-  def test_fft_save_state_skips_the_optimizer_until_fft_resume_exists(self) -> None:
-    param = torch.nn.Parameter(torch.tensor([1.0]))
-    worker = FFTTrainingWorker()
-    worker.model = _FullModelStub([param])
-    worker.model.save_pretrained = lambda path: None
-    worker.tokenizer = None
-    worker.trainer = Trainer(worker.model, [param])
-    worker.trainer.optimizer = torch.optim.AdamW([param], lr=0.1)
-    worker.cpu_offload = False
-    worker.weight_sync_cfg.strategy = "full"
-    with tempfile.TemporaryDirectory() as tmp_dir:
-      state_dir = os.path.join(tmp_dir, "step-5")
-      worker.save_state("job-a", state_dir, include_optimizer=True)
-      self.assertFalse(os.path.exists(os.path.join(state_dir, "optimizer.pt")))
-      with open(os.path.join(state_dir, "metadata.json")) as f:
-        self.assertFalse(json.load(f)["has_optimizer"])
-
-  def test_fft_create_model_loads_base_then_prepares_model(self) -> None:
-    worker = FFTTrainingWorker()
-    config = fft_trainer_worker_module.FFTConfig(seed=123)
-    calls = []
-
-    worker.load_base_model = lambda base_model_name: calls.append(("load", base_model_name))
-    worker.prepare_model_for_training = lambda: calls.append(("prepare", None))
-
-    worker.create_model("base-model", "model-a", config)
-
-    self.assertEqual(calls, [("load", "base-model"), ("prepare", None)])
+  def test_fft_checkpoint_has_optimizer_independently_of_sampler_strategy(self) -> None:
+    for strategy in ("full", "delta"):
+      with self.subTest(strategy=strategy):
+        param = torch.nn.Parameter(torch.tensor([1.0]))
+        model = _FullModelStub([param])
+        worker = FFTTrainingWorker(model=model, device="cpu", cpu_offload=False, weight_sync_cfg=WeightSyncConfig(strategy=strategy))
+        worker.optimizer = hf_operations.build_optimizer(worker.params, {})
+        with tempfile.TemporaryDirectory() as directory:
+          worker.save_state("job-a", directory, include_optimizer=True)
+          self.assertEqual(model.saved, [directory])
+          self.assertTrue(os.path.exists(os.path.join(directory, "optimizer.pt")))
+          self.assertFalse(os.path.exists(os.path.join(directory, "delta.safetensors")))
+          with open(os.path.join(directory, "metadata.json")) as saved:
+            self.assertTrue(json.load(saved)["has_optimizer"])
 
   def test_optim_step_only_updates_active_adapter_params(self) -> None:
     active_param = torch.nn.Parameter(torch.tensor([1.0]))
@@ -308,8 +253,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
         "adapter-b": [other_param],
       }
     )
-    worker.trainers["adapter-a"] = Trainer(worker.peft_model, lora_trainer_worker_module.active_adapter_parameters(worker.peft_model, "adapter-a"))
-    worker.save_adapter = lambda *_args, **_kwargs: None
+    worker.adapters["adapter-a"] = AdapterState(lora_trainer_worker_module.active_adapter_parameters(worker.peft_model, "adapter-a"))
 
     result = worker.optim_step(
       {
@@ -330,27 +274,19 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
       self.assertTrue(torch.allclose(active_param.grad, torch.zeros_like(active_param.grad)))
     self.assertIsNotNone(other_param.grad)
 
-  def test_fft_optim_step_updates_full_model_trainable_params(self) -> None:
+  def test_optimizer_step_updates_only_its_trainable_params(self) -> None:
     trainable_param = torch.nn.Parameter(torch.tensor([1.0]))
     frozen_param = torch.nn.Parameter(torch.tensor([1.0]), requires_grad=False)
     trainable_param.grad = torch.tensor([1.0])
     frozen_param.grad = torch.tensor([10.0])
 
-    worker = FFTTrainingWorker()
-    worker.model = _FullModelStub([trainable_param, frozen_param])
-    worker.trainer = Trainer(worker.model, fft_trainer_worker_module.trainable_model_parameters(worker.model))
+    model = _FullModelStub([trainable_param, frozen_param])
+    params = fft_trainer_worker_module.trainable_model_parameters(model)
+    adam_params = {"learning_rate": 0.1, "beta1": 0.0, "beta2": 0.0, "eps": 1e-8, "weight_decay": 0.0}
+    optimizer = hf_operations.build_optimizer(params, adam_params)
+    metrics = hf_operations.optim_step(optimizer, adam_params)
 
-    result = worker.optim_step(
-      {
-        "learning_rate": 0.1,
-        "beta1": 0.0,
-        "beta2": 0.0,
-        "eps": 1e-8,
-        "weight_decay": 0.0,
-      }
-    )
-
-    self.assertAlmostEqual(result["metrics"]["grad_norm:mean"], 1.0)
+    self.assertAlmostEqual(metrics["grad_norm:mean"], 1.0)
     self.assertFalse(torch.allclose(trainable_param.detach(), torch.tensor([1.0])))
     self.assertTrue(torch.allclose(frozen_param.detach(), torch.tensor([1.0])))
     if trainable_param.grad is not None:
@@ -422,7 +358,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result["fine_tuning_type"], "full")
     self.assertEqual(result["type"], "model_created")
 
-  async def test_full_processor_saves_sampler_checkpoint_as_full_state(self) -> None:
+  async def test_full_processor_dispatches_explicit_sampler_export(self) -> None:
     worker = _RecordingFullWorker()
     store = _FutureStoreStub()
     time_slicer = _TimeSlicerStub()
@@ -442,8 +378,8 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       )
 
     self.assertEqual(
-      worker.saved_states,
-      [("model-a", "/tmp/open-rl-test/sampler_full/model-a/sampler_weights/final", False, "sampler")],
+      worker.sampler_exports,
+      [("model-a", None, "tinker://model-a/sampler_weights/final")],
     )
     self.assertEqual(
       store.results["req-a"],
@@ -535,10 +471,6 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
-  def _trainer(self) -> Trainer:
-    model = _LogitModelStub()
-    return Trainer(model, list(model.parameters()), tokenizer=_TokenizerStub())
-
   def _data(self):
     return [
       _datum(
@@ -563,20 +495,20 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       ),
     ]
 
-  def training_tensors(self, worker, data):
-    input_ids, attention_mask, input_lengths = worker.pad_model_inputs(data)
-    target_token_ids, weights, lengths = worker.pad_targets_and_weights(data, input_lengths)
-    logprobs = worker.compute_target_logprobs(input_ids, attention_mask, target_token_ids)
-    old_logprobs = worker.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in data], lengths, torch.float32)
-    advantages = worker.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in data], lengths, torch.float32)
+  def training_tensors(self, model, data):
+    input_ids, attention_mask, input_lengths = hf_operations.pad_model_inputs(data, tokenizer=_TokenizerStub())
+    target_token_ids, weights, lengths = hf_operations.pad_targets_and_weights(data, input_lengths)
+    logprobs = hf_operations.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+    old_logprobs = hf_operations.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in data], lengths, torch.float32)
+    advantages = hf_operations.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in data], lengths, torch.float32)
     return logprobs, weights, old_logprobs, advantages, lengths
 
   def test_padded_batch_logprobs_and_losses_match_per_example_math(self) -> None:
-    worker = self._trainer()
+    model = _LogitModelStub()
     data = self._data()
 
-    batch_logprobs, batch_weights, batch_old_logprobs, batch_advantages, batch_lengths = self.training_tensors(worker, data)
-    single_results = [self.training_tensors(worker, [datum]) for datum in data]
+    batch_logprobs, batch_weights, batch_old_logprobs, batch_advantages, batch_lengths = self.training_tensors(model, data)
+    single_results = [self.training_tensors(model, [datum]) for datum in data]
 
     for row, (single_logprobs, single_weights, single_old_logprobs, single_advantages, single_lengths) in enumerate(single_results):
       length = batch_lengths[row]
@@ -634,10 +566,8 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     )
 
   def test_token_budget_batches_preserve_examples(self) -> None:
-    worker = self._trainer()
     data = self._data()
-    with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "6"}):
-      batches = worker.make_training_batches(data)
+    batches = hf_operations.make_training_batches(data, token_budget=6)
 
     seen = [idx for batch in batches for idx, _datum in batch]
     self.assertCountEqual(seen, range(len(data)))
@@ -646,12 +576,10 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       self.assertTrue(len(batch) == 1 or padded_tokens <= 6)
 
   def test_forward_backward_padded_batches_preserve_client_output_shape(self) -> None:
-    worker = self._trainer()
-    model = worker.model
+    model = _LogitModelStub()
     data = self._data()
 
-    with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "12"}):
-      result = worker.forward_backward(data, "cross_entropy")
+    result = hf_operations.forward_backward(model, data, "cross_entropy", tokenizer=_TokenizerStub(), token_budget=12)
 
     self.assertEqual(len(result["loss_fn_outputs"]), len(data))
     self.assertGreater(len(model.calls), 0)
@@ -661,11 +589,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       self.assertEqual(logprobs["shape"], [min(len(datum.model_input), len(datum.loss_fn_inputs["target_tokens"].data))])
 
   def test_fft_forward_backward_uses_single_process_model(self) -> None:
-    worker = FFTTrainingWorker()
-    worker.device = torch.device("cpu")
-    worker.tokenizer = _TokenizerStub()
-    worker.model = _LogitModelStub()
-    worker.trainer = Trainer(worker.model, list(worker.model.parameters()), tokenizer=worker.tokenizer)
+    worker = FFTTrainingWorker(model=_LogitModelStub(), tokenizer=_TokenizerStub(), device="cpu")
     data = self._data()
 
     result = worker.forward_backward(data, "cross_entropy")
