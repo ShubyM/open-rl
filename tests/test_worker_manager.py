@@ -196,7 +196,8 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       manager = LocalWorkerManager()
       manager.ensure("Model_A.1", "trainer")
 
-    _, kwargs = popen.call_args
+    args, kwargs = popen.call_args
+    self.assertEqual(args[0][-2:], ["--model-id", "Model_A.1"])
     self.assertTrue(kwargs["start_new_session"])
     self.assertEqual(kwargs["env"]["OPEN_RL_ENABLE_FFT"], "true")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "trainer-Model_A.1")
@@ -210,12 +211,29 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       manager = LocalWorkerManager()
       manager.ensure("Model_A.1", "sampler")
 
-    _, kwargs = popen.call_args
+    args, kwargs = popen.call_args
+    self.assertEqual(args[0][-2:], ["--model-id", "Model_A.1"])
     self.assertTrue(kwargs["start_new_session"])
     self.assertEqual(kwargs["env"]["OPEN_RL_ENABLE_FFT"], "true")
     self.assertEqual(kwargs["env"]["OPEN_RL_MODEL_ID"], "Model_A.1")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "sampler-Model_A.1")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "samplers")
+
+  async def test_shared_lora_trainer_drains_only_its_active_set(self) -> None:
+    from server.model_metadata import TrainingModelMetadata
+
+    metadata = TrainingModelMetadata(base_model="Qwen/Qwen2.5-0.5B", fine_tuning_type="lora")
+    with (
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379"}, clear=True),
+      patch("server.worker_manager.metadata_for", return_value=metadata),
+      patch("server.worker_manager.subprocess.Popen") as popen,
+    ):
+      manager = LocalWorkerManager()
+      manager.ensure("adapter-1", "trainer")
+
+    command = popen.call_args.args[0]
+    self.assertEqual(command[-2:], ["--active-tenant-set-id", "Qwen/Qwen2.5-0.5B-1"])
+    self.assertNotIn("--model-id", command)
 
   async def test_launch_fetches_metadata_from_store(self) -> None:
     import json
@@ -389,7 +407,7 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
 
     cmd_args = mock_popen.call_args[0][0]
     self.assertIn("server.lora_sampler", cmd_args)
-    self.assertIn("Qwen/Qwen2.5-0.5B", cmd_args)
+    self.assertEqual(cmd_args[-2:], ["--model-id", "Qwen/Qwen2.5-0.5B"])
 
     # Launch for second LoRA model ID sharing the same base model
     self.manager.ensure("model-lora-2", "sampler")
@@ -417,7 +435,7 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
 
     cmd_args = mock_popen.call_args[0][0]
     self.assertIn("server.vllm_sampler", cmd_args)
-    self.assertIn("model-fft-1", cmd_args)
+    self.assertEqual(cmd_args[-2:], ["--model-id", "model-fft-1"])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 # LoRA trainer worker lifecycle and adapter management.
 
 import json
-import math
 import os
 import time
 import traceback
@@ -13,8 +12,8 @@ from peft import LoraConfig as PeftLoraConfig
 from peft import PeftModelForCausalLM, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
-from training.trainer_worker import BaseTrainerWorker, Datum
-from training.types import LoraConfig
+from training.session import TrainingSession, default_device
+from training.types import Datum, LoraConfig
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
 
@@ -27,13 +26,14 @@ def active_adapter_parameters(model: PeftModelForCausalLM, adapter_id: str) -> l
   return params
 
 
-class LoraTrainingWorker(BaseTrainerWorker):
+class LoraTrainingWorker:
   def __init__(self):
-    super().__init__()
+    self.device = default_device()
+    self.tokenizer = None
     self.base_model: PreTrainedModel | None = None
     self.peft_model: PeftModelForCausalLM | None = None
     self.base_model_name: str | None = None
-    self.adapter_states: dict[str, dict[str, Any]] = {}
+    self.sessions: dict[str, TrainingSession] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
 
   def load_base_model(self, base_model_name: str) -> None:
@@ -98,8 +98,8 @@ class LoraTrainingWorker(BaseTrainerWorker):
     """Create a new LoRA adapter on top of the loaded base model."""
     assert self.base_model is not None, "Base model is not loaded. Call load_base_model first."
 
-    if adapter_id in self.adapter_states:
-      del self.adapter_states[adapter_id]
+    if adapter_id in self.sessions:
+      del self.sessions[adapter_id]
 
     if not any([config.train_attn, config.train_mlp, config.train_unembed]):
       raise ValueError("At least one LoRA training target must be enabled.")
@@ -124,7 +124,9 @@ class LoraTrainingWorker(BaseTrainerWorker):
       self.peft_model.add_adapter(adapter_id, peft_config)
 
     self.peft_model.set_adapter(adapter_id)
-    self.adapter_states[adapter_id] = {"trainable_params": active_adapter_parameters(self.peft_model, adapter_id), "optimizer": None}
+    self.sessions[adapter_id] = TrainingSession(
+      self.peft_model, active_adapter_parameters(self.peft_model, adapter_id), tokenizer=self.tokenizer, device=self.device
+    )
 
     if ENABLE_GRADIENT_CHECKPOINTING:
       try:
@@ -178,8 +180,7 @@ class LoraTrainingWorker(BaseTrainerWorker):
     os.makedirs(state_path, exist_ok=True)
     self.peft_model.save_pretrained(state_path, selected_adapters=[model_id])
 
-    adapter_state = self.adapter_states.get(model_id)
-    optimizer = adapter_state.get("optimizer") if adapter_state is not None else None
+    optimizer = self.session_for(model_id).optimizer
     if include_optimizer and optimizer is not None:
       torch.save(optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
 
@@ -232,14 +233,14 @@ class LoraTrainingWorker(BaseTrainerWorker):
     else:
       if model_id in self.peft_model.peft_config:
         self.peft_model.delete_adapter(model_id)
-        if model_id in self.adapter_states:
-          del self.adapter_states[model_id]
+        if model_id in self.sessions:
+          del self.sessions[model_id]
       self.peft_model.load_adapter(adapter_dir, adapter_name=model_id, is_trainable=True)
 
     self.peft_model.set_adapter(model_id)
     params = active_adapter_parameters(self.peft_model, model_id)
-    adapter_state = {"trainable_params": params, "optimizer": None}
-    self.adapter_states[model_id] = adapter_state
+    session = TrainingSession(self.peft_model, params, tokenizer=self.tokenizer, device=self.device)
+    self.sessions[model_id] = session
 
     if ENABLE_GRADIENT_CHECKPOINTING:
       try:
@@ -254,77 +255,34 @@ class LoraTrainingWorker(BaseTrainerWorker):
     if restore_optimizer and metadata.get("has_optimizer"):
       optimizer_path = os.path.join(state_path, "optimizer.pt")
       if os.path.exists(optimizer_path):
-        lr = 1e-4
-        optimizer = torch.optim.AdamW(params, lr=lr)
+        optimizer = session.build_optimizer({})
         optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
-        adapter_state["optimizer"] = optimizer
+        session.optimizer = optimizer
         print(f"Restored optimizer state for '{model_id}' from {optimizer_path}")
 
     print(f"Loaded state for '{model_id}' from {state_path}")
     return {"model_id": model_id, "is_lora": True, "base_model": base_model}
 
+  def session_for(self, model_id: str | None) -> TrainingSession:
+    if model_id is None:
+      raise ValueError("model_id is required for a LoRA training session")
+    try:
+      session = self.sessions[model_id]
+    except KeyError:
+      raise ValueError(f"No training session for adapter '{model_id}'") from None
+    self.peft_model.set_adapter(model_id)
+    return session
+
   def forward_backward(
     self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
   ) -> dict[str, Any]:
-    assert self.peft_model is not None, "Model must be loaded first."
-    if model_id:
-      self.peft_model.set_adapter(model_id)
-    return super().forward_backward(self.peft_model, data, loss_fn, loss_config, forward_only=forward_only)
+    return self.session_for(model_id).forward_backward(data, loss_fn, loss_config, forward_only=forward_only)
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str) -> dict[str, Any]:
-    """Apply accumulated gradients and update model weights."""
-    assert self.peft_model is not None, "Model must be loaded first."
-    if not model_id:
-      raise ValueError("model_id is required for optim_step")
-
-    self.peft_model.set_adapter(model_id)
-    try:
-      adapter_state = self.adapter_states[model_id]
-    except KeyError as e:
-      raise ValueError(f"Adapter '{model_id}' has no cached trainable parameters") from e
-    params = adapter_state["trainable_params"]
-
-    if adapter_state.get("optimizer") is None:
-      lr = adam_params.get("learning_rate", 1e-4)
-      beta1 = adam_params.get("beta1", 0.9)
-      beta2 = adam_params.get("beta2", 0.95)
-      eps = adam_params.get("eps", 1e-12)
-      weight_decay = adam_params.get("weight_decay", 0.0)
-
-      print(f"Initializing AdamW optimizer for '{model_id}' with lr={lr}")
-      adapter_state["optimizer"] = torch.optim.AdamW(
-        params,
-        lr=lr,
-        betas=(beta1, beta2),
-        eps=eps,
-        weight_decay=weight_decay,
-      )
-
-    optimizer = adapter_state["optimizer"]
-    learning_rate = adam_params.get("learning_rate")
-    if learning_rate is not None:
-      for param_group in optimizer.param_groups:
-        param_group["lr"] = learning_rate
-
-    max_grad_norm = adam_params.get("grad_clip_norm") or math.inf
-    if max_grad_norm <= 0.0:
-      max_grad_norm = math.inf
-
-    total_norm = torch.nn.utils.clip_grad_norm_(
-      params,
-      max_grad_norm,
-    )
-
-    optimizer.step()
-    optimizer.zero_grad()
-
+    result = self.session_for(model_id).optim_step(adam_params)
+    # Existing worker policy: LoRA samplers hot-load this directory after a step.
     self.save_adapter(model_id)
-
-    return {
-      "metrics": {
-        "grad_norm:mean": self.sanitize_float(total_norm.item()),
-      },
-    }
+    return result
 
   def generate(
     self,
@@ -335,6 +293,4 @@ class LoraTrainingWorker(BaseTrainerWorker):
     model_id: str | None = None,
     include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
-    if model_id:
-      self.peft_model.set_adapter(model_id)
-    return super().generate(self.peft_model, prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
+    return self.session_for(model_id).generate(prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)

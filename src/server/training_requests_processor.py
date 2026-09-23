@@ -1,5 +1,7 @@
 # This file contains the training request processor implementation for Open-RL.
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -7,26 +9,28 @@ import os
 import shutil
 import threading
 import traceback
-from typing import Any
+from itertools import groupby
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 
-from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
+from accel_timeslicer.time_slicer import TimeSlicerClient, TimeSlicerFault, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.model_metadata import get_model_metadata
 from server.store import RequestStore, get_state_store, get_store
 from training import commands
 from training.commands import parse_command
-from training.fft_trainer_worker import FFTTrainingWorker
-from training.lora_trainer_worker import LoraTrainingWorker
+
+if TYPE_CHECKING:
+  from training.fft_trainer_worker import FFTTrainingWorker
+  from training.lora_trainer_worker import LoraTrainingWorker
+
+  TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
 
 tracer = trace.get_tracer(__name__)
-
-
-TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
 
 
 def is_fft_enabled() -> bool:
@@ -56,9 +60,9 @@ def older_versions(path: str, keep: int) -> list[str]:
 class TrainingRequestsProcessor:
   """Drains training commands for one worker.
 
-  With a time slicer the worker is dedicated to one model: it drains that
-  model's queue under GPU leases and exits when the model is deleted. Without
-  one it serves every model in a shared active set, as LoRA trainers do.
+  A model_id selects one dedicated queue; otherwise the worker serves a
+  shared active set. An optional time slicer controls GPU leases separately
+  from queue ownership. Resident workers on exclusive GPUs need no slicer.
   """
 
   def __init__(
@@ -69,11 +73,10 @@ class TrainingRequestsProcessor:
     active_tenant_set_id: str | None = None,
     time_slicer: TimeSlicerClient | None = None,
   ):
-    if time_slicer is not None:
-      if not os.getenv("REDIS_URL"):
-        raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the API server")
-      if not model_id:
-        raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
+    if model_id is not None and active_tenant_set_id is not None:
+      raise ValueError("Choose a dedicated model_id or a shared active_tenant_set_id, not both")
+    if time_slicer is not None and not model_id:
+      raise ValueError("A time-sliced trainer needs a dedicated model_id")
 
     self.store = store
     self.worker = worker
@@ -82,6 +85,7 @@ class TrainingRequestsProcessor:
     self.time_slicer = time_slicer
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM) if time_slicer else None
     self.snapshot_registered = False
+    self.stopping = False
 
   async def run(self) -> None:
     print(f"[WORKER] Training requests processor started (model={self.model_id} active_set={self.active_tenant_set_id}).")
@@ -89,7 +93,7 @@ class TrainingRequestsProcessor:
       if self.time_slicer is not None:
         await self.time_slicer.register(self.workload)
         self.snapshot_registered = True
-      while True:
+      while not self.stopping:
         try:
           await self.run_once()
         except asyncio.CancelledError:
@@ -108,20 +112,21 @@ class TrainingRequestsProcessor:
 
   async def exit_gracefully(self, unregister: bool = True) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if unregister and self.snapshot_registered:
+    if unregister and self.time_slicer is not None and self.snapshot_registered:
       try:
         await self.time_slicer.unregister(self.workload)
         self.snapshot_registered = False
       except Exception as exc:
         print(f"[WORKER] Failed to unregister: {exc}")
-    try:
-      await self.time_slicer.close()
-    except Exception:
-      pass
+    if self.time_slicer is not None:
+      try:
+        await self.time_slicer.close()
+      except Exception:
+        pass
     os._exit(0)
 
   async def next_batch(self) -> list[dict[str, Any]]:
-    if self.time_slicer is not None:
+    if self.model_id is not None:
       return await self.store.get_requests_for_model(self.model_id)
     return await self.store.get_requests(active_set_id=self.active_tenant_set_id)
 
@@ -131,8 +136,9 @@ class TrainingRequestsProcessor:
       await asyncio.sleep(0.1)
       return
 
-    shutdown = any(req.get("op") == "shutdown_workers" for req in batch)
-    work = [req for req in batch if req.get("op") != "shutdown_workers"]
+    shutdown_index = next((index for index, req in enumerate(batch) if req.get("op") == "shutdown_workers"), len(batch))
+    shutdown = shutdown_index < len(batch)
+    work = batch[:shutdown_index]
     model_id = batch[0].get("model_id", "default")
 
     results: list[tuple[str | None, dict[str, Any]]] = []
@@ -147,19 +153,21 @@ class TrainingRequestsProcessor:
     for request_id, result in results:
       if request_id is not None:
         await self.store.set_future(request_id, result)
-    if failure is not None:
-      raise failure
-
-    if self.time_slicer is None:
-      return
-    if self.time_slicer.faulted:
+    if self.time_slicer is not None and self.time_slicer.faulted:
       # This process still holds the accelerator. Exit without unregistering so
       # the grant moves on only once the memory is gone. Exit 0 keeps the pod
       # from restarting on fresh weights mid-run; the run fails on its next call.
       print(f"[WORKER] Time slicer could not park this process: {self.time_slicer.faulted}. Exiting to free the accelerator.")
       await self.exit_gracefully(unregister=False)
     if shutdown:
-      await self.exit_gracefully()
+      # A dedicated process ends after its model is deleted, whether or not
+      # it uses leases. Let run() close its resources normally.
+      self.stopping = self.model_id is not None
+      for request in batch[shutdown_index + 1 :]:
+        if request_id := request.get("request_id"):
+          await self.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": "Trainer model has been shut down"})
+    if failure is not None:
+      raise failure
 
   async def answer_batch(self, requests: list[dict[str, Any]]) -> tuple[list[tuple[str | None, dict[str, Any]]], Exception | None]:
     """Every request gets an answer: its result, or the failure that stopped the batch."""
@@ -167,44 +175,47 @@ class TrainingRequestsProcessor:
     try:
       await self.handle_batch(requests, results)
     except Exception as exc:
+      published = len(results) if self.time_slicer is None else 0
       answered = {request_id for request_id, _ in results}
       for request in requests:
         request_id = request.get("request_id")
         if request_id and request_id not in answered:
           results.append((request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
-      return results, exc
-    return results, None
+      return results[published:], exc
+    # Resident workers publish immediately; leased workers publish only once
+    # the device has been released. Return just the answers still to publish.
+    return ([] if self.time_slicer is None else results), None
 
   async def handle_batch(self, requests: list[dict[str, Any]], results: list[tuple[str | None, dict[str, Any]]]) -> None:
     """GPU work under one time-slicer turn; saves need the device only when the worker is not offloaded."""
     if self.time_slicer is None:
       # No lease to hold, so each answer goes out as soon as it is ready.
       for request in requests:
-        await self.process_request(request)
+        result = await self.handle_request(request)
+        request_id, response = result
+        if request_id is not None:
+          await self.store.set_future(request_id, response)
+        results.append(result)
       return
 
     save_ops = {"save_state", "save_weights_for_sampler"}
-    gpu_reqs = [r for r in requests if r.get("op") not in save_ops]
-    save_reqs = [r for r in requests if r.get("op") in save_ops]
-
-    if gpu_reqs:
-      async with self.time_slicer.acquire(self.workload):
-        await asyncio.to_thread(self.worker.wake_up)
-        try:
-          for request in gpu_reqs:
-            results.append(await self.handle_request(request))
-        finally:
-          await asyncio.to_thread(self.worker.sleep)
-
-    if not save_reqs:
-      return
-    if self.worker.cpu_offload:
-      for request in save_reqs:
-        results.append(await self.handle_request(request))
-    else:
-      async with self.time_slicer.acquire(self.workload):
-        for request in save_reqs:
+    # Preserve command order: step A -> save -> step B must save A's weights.
+    for is_save, group in groupby(requests, key=lambda request: request.get("op") in save_ops):
+      if is_save and self.worker.cpu_offload:
+        for request in group:
           results.append(await self.handle_request(request))
+      else:
+        async with self.time_slicer.acquire(self.workload):
+          if not is_save:
+            await asyncio.to_thread(self.worker.wake_up)
+          try:
+            for request in group:
+              results.append(await self.handle_request(request))
+          finally:
+            if not is_save:
+              await asyncio.to_thread(self.worker.sleep)
+        if self.time_slicer.faulted:
+          raise TimeSlicerFault(self.time_slicer.faulted)
 
   async def process_request(self, raw_request: dict[str, Any]) -> None:
     request_id, result = await self.handle_request(raw_request)
@@ -218,6 +229,8 @@ class TrainingRequestsProcessor:
     try:
       command = parse_command(raw_request)
       request_id = command.request_id
+      if self.model_id is not None and command.model_id != self.model_id:
+        raise ValueError(f"This trainer serves model {self.model_id}, not {command.model_id}")
 
       ctx = propagate.extract(command.trace_context) if command.trace_context else None
       token = otel_context.attach(ctx) if ctx else None
@@ -321,12 +334,13 @@ async def run_training_requests_processor(
   store: RequestStore | None = None,
 ) -> None:
   store = get_store() if store is None else store
-  if isinstance(worker, FFTTrainingWorker):
-    time_slicer = time_slicer or time_slicer_client_from_env()
   await TrainingRequestsProcessor(store, worker, model_id, active_tenant_set_id, time_slicer).run()
 
 
 async def main_async(args: argparse.Namespace) -> None:
+  from training.fft_trainer_worker import FFTTrainingWorker
+  from training.lora_trainer_worker import LoraTrainingWorker
+
   fine_tuning_type = os.getenv("OPEN_RL_FINE_TUNING_TYPE") or ("full" if is_fft_enabled() else "lora")
   if args.model_id:
     metadata = await get_model_metadata(get_state_store(), args.model_id)
@@ -334,6 +348,11 @@ async def main_async(args: argparse.Namespace) -> None:
       fine_tuning_type = metadata.fine_tuning_type
 
   is_lora = fine_tuning_type == "lora"
+  if not is_lora:
+    if not os.getenv("REDIS_URL"):
+      raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the API server")
+    if not args.model_id:
+      raise RuntimeError("A dedicated trainer worker needs --model-id")
   print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")
 
   worker: TrainingWorker = LoraTrainingWorker() if is_lora else FFTTrainingWorker()
@@ -369,6 +388,7 @@ async def main_async(args: argparse.Namespace) -> None:
   await run_training_requests_processor(
     worker,
     args.model_id,
+    time_slicer=None if is_lora else time_slicer_client_from_env(),
     active_tenant_set_id=getattr(args, "active_tenant_set_id", None),
   )
 

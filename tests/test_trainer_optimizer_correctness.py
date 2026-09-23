@@ -1,8 +1,6 @@
 import asyncio
-import importlib
 import json
 import os
-import sys
 import tempfile
 import types
 import unittest
@@ -11,61 +9,14 @@ from unittest.mock import patch
 
 import torch
 
-
-def _load_trainer_modules():
-  stubs = {
-    "peft": types.SimpleNamespace(
-      LoraConfig=object,
-      PeftModelForCausalLM=object,
-      get_peft_model=lambda *_args, **_kwargs: None,
-    ),
-    "transformers": types.SimpleNamespace(
-      AutoModelForCausalLM=object,
-      AutoTokenizer=object,
-      PreTrainedModel=object,
-      PreTrainedTokenizerBase=object,
-    ),
-  }
-  with patch.dict(sys.modules, stubs):
-    for module_name in list(sys.modules):
-      if module_name == "training" or module_name.startswith("training."):
-        del sys.modules[module_name]
-    from training import fft_trainer_worker, lora_trainer_worker, losses, trainer_worker
-
-  return trainer_worker, lora_trainer_worker, fft_trainer_worker, losses
-
-
-def _load_training_requests_processor_module():
-  stubs = {
-    "peft": types.SimpleNamespace(
-      LoraConfig=object,
-      PeftModelForCausalLM=object,
-      get_peft_model=lambda *_args, **_kwargs: None,
-    ),
-    "transformers": types.SimpleNamespace(
-      AutoModelForCausalLM=object,
-      AutoTokenizer=object,
-      PreTrainedModel=object,
-      PreTrainedTokenizerBase=object,
-    ),
-  }
-  env = {
-    "OPEN_RL_ENABLE_FFT": "true",
-    "REDIS_URL": "redis://localhost:6379",
-  }
-  with patch.dict(sys.modules, stubs), patch.dict(os.environ, env):
-    for module_name in list(sys.modules):
-      if module_name == "server.training_requests_processor":
-        del sys.modules[module_name]
-    training_requests_processor = importlib.import_module("server.training_requests_processor")
-  return training_requests_processor
-
-
-trainer_worker_module, lora_trainer_worker_module, fft_trainer_worker_module, losses_module = _load_trainer_modules()
-training_requests_processor_module = _load_training_requests_processor_module()
-BaseTrainerWorker = trainer_worker_module.BaseTrainerWorker
-FFTTrainingWorker = fft_trainer_worker_module.FFTTrainingWorker
-LoraTrainingWorker = lora_trainer_worker_module.LoraTrainingWorker
+from server import training_requests_processor as training_requests_processor_module
+from training import fft_trainer_worker as fft_trainer_worker_module
+from training import lora_trainer_worker as lora_trainer_worker_module
+from training import losses as losses_module
+from training.fft_trainer_worker import FFTTrainingWorker
+from training.lora_trainer_worker import LoraTrainingWorker
+from training.session import TrainingSession
+from training.types import Datum
 
 
 class _PeftModelStub:
@@ -92,21 +43,19 @@ class _TokenizerStub:
   pad_token_id = 0
 
 
-class _LogitModelStub:
+class _LogitModelStub(torch.nn.Module):
   def __init__(self, vocab_size: int = 17):
+    super().__init__()
+    self.weight = torch.nn.Parameter(torch.ones(()))
     self.vocab_size = vocab_size
     self.calls = []
 
-  def train(self):
-    return None
-
-  def __call__(self, input_tensor, attention_mask=None, **_kwargs):
+  def forward(self, input_tensor, attention_mask=None, **_kwargs):
     if attention_mask is not None:
       self.calls.append((input_tensor.detach().clone(), attention_mask.detach().clone()))
     vocab = torch.arange(self.vocab_size, dtype=torch.float32, device=input_tensor.device).view(1, 1, -1)
     positions = torch.arange(input_tensor.shape[1], dtype=torch.float32, device=input_tensor.device).view(1, -1, 1)
-    logits = torch.cos(input_tensor.float().unsqueeze(-1) * 0.11 + positions * 0.07 + vocab * 0.13)
-    logits.requires_grad_()
+    logits = self.weight * torch.cos(input_tensor.float().unsqueeze(-1) * 0.11 + positions * 0.07 + vocab * 0.13)
     return types.SimpleNamespace(logits=logits)
 
 
@@ -121,7 +70,7 @@ class _FullModelStub:
     yield from self.params
 
 
-class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker):
+class _RecordingFullWorker(FFTTrainingWorker):
   def __init__(self):
     super().__init__()
     self.base_model_name = None
@@ -152,7 +101,7 @@ class _RecordingFullWorker(training_requests_processor_module.FFTTrainingWorker)
     return None
 
 
-class _RecordingLoraWorker(training_requests_processor_module.LoraTrainingWorker):
+class _RecordingLoraWorker(LoraTrainingWorker):
   def __init__(self):
     super().__init__()
     self.loaded_base_models = []
@@ -232,7 +181,7 @@ def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantage
     loss_fn_inputs["logprobs"] = {"data": logprobs}
   if advantages is not None:
     loss_fn_inputs["advantages"] = {"data": advantages}
-  return trainer_worker_module.Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs)
+  return Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs)
 
 
 class TestLoraTargetModules(unittest.TestCase):
@@ -298,7 +247,8 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     worker = LoraTrainingWorker()
     worker.base_model_name = "base"
     worker.peft_model = _PeftModelStub({"job-a": [param]})
-    worker.adapter_states["job-a"] = {"trainable_params": [param], "optimizer": torch.optim.AdamW([param], lr=0.1)}
+    worker.sessions["job-a"] = TrainingSession(worker.peft_model, [param])
+    worker.sessions["job-a"].optimizer = torch.optim.AdamW([param], lr=0.1)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
       state_dir = os.path.join(tmp_dir, "step-5")
@@ -322,7 +272,8 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     worker.model = _FullModelStub([param])
     worker.model.save_pretrained = lambda path: None
     worker.tokenizer = None
-    worker.optimizer = torch.optim.AdamW([param], lr=0.1)
+    worker.session = TrainingSession(worker.model, [param])
+    worker.session.optimizer = torch.optim.AdamW([param], lr=0.1)
     worker.cpu_offload = False
     worker.weight_sync_cfg.strategy = "full"
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -357,9 +308,9 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
         "adapter-b": [other_param],
       }
     )
-    worker.adapter_states = {
-      "adapter-a": {"trainable_params": lora_trainer_worker_module.active_adapter_parameters(worker.peft_model, "adapter-a"), "optimizer": None}
-    }
+    worker.sessions["adapter-a"] = TrainingSession(
+      worker.peft_model, lora_trainer_worker_module.active_adapter_parameters(worker.peft_model, "adapter-a")
+    )
     worker.save_adapter = lambda *_args, **_kwargs: None
 
     result = worker.optim_step(
@@ -389,7 +340,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
 
     worker = FFTTrainingWorker()
     worker.model = _FullModelStub([trainable_param, frozen_param])
-    worker.trainable_params = fft_trainer_worker_module.trainable_model_parameters(worker.model)
+    worker.session = TrainingSession(worker.model, fft_trainer_worker_module.trainable_model_parameters(worker.model))
 
     result = worker.optim_step(
       {
@@ -505,30 +456,14 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       },
     )
 
-  async def test_full_processor_requires_redis(self) -> None:
-    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
-      await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
-
-  async def test_full_processor_uses_default_time_slicer_client(self) -> None:
+  async def test_processor_does_not_infer_a_time_slicer_from_worker_type(self) -> None:
     store = _TrainingRequestsStoreStub([])
-    time_slicer = _TimeSlicerStub()
-
     with (
-      patch.dict(
-        os.environ,
-        {
-          "OPEN_RL_ENABLE_FFT": "true",
-          "REDIS_URL": "redis://localhost:6379",
-        },
-        clear=True,
-      ),
       patch.object(training_requests_processor_module, "get_store", return_value=store),
-      patch.object(training_requests_processor_module, "time_slicer_client_from_env", return_value=time_slicer) as time_slicer_client_from_env,
+      patch.object(training_requests_processor_module, "time_slicer_client_from_env") as make_slicer,
     ):
       await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
-
-    time_slicer_client_from_env.assert_called_once_with()
-    self.assertEqual([event[0] for event in time_slicer.events], ["register", "unregister", "close"])
+    make_slicer.assert_not_called()
 
   async def test_full_processor_uses_injected_time_slicer(self) -> None:
     worker = _RecordingFullWorker()
@@ -602,11 +537,9 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
-  def _worker(self) -> BaseTrainerWorker:
-    worker = BaseTrainerWorker()
-    worker.device = torch.device("cpu")
-    worker.tokenizer = _TokenizerStub()
-    return worker
+  def _session(self) -> TrainingSession:
+    model = _LogitModelStub()
+    return TrainingSession(model, list(model.parameters()), tokenizer=_TokenizerStub())
 
   def _data(self):
     return [
@@ -632,21 +565,20 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       ),
     ]
 
-  def training_tensors(self, worker, model, data):
+  def training_tensors(self, worker, data):
     input_ids, attention_mask, input_lengths = worker.pad_model_inputs(data)
     target_token_ids, weights, lengths = worker.pad_targets_and_weights(data, input_lengths)
-    logprobs = worker.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+    logprobs = worker.compute_target_logprobs(input_ids, attention_mask, target_token_ids)
     old_logprobs = worker.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in data], lengths, torch.float32)
     advantages = worker.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in data], lengths, torch.float32)
     return logprobs, weights, old_logprobs, advantages, lengths
 
   def test_padded_batch_logprobs_and_losses_match_per_example_math(self) -> None:
-    worker = self._worker()
-    model = _LogitModelStub()
+    worker = self._session()
     data = self._data()
 
-    batch_logprobs, batch_weights, batch_old_logprobs, batch_advantages, batch_lengths = self.training_tensors(worker, model, data)
-    single_results = [self.training_tensors(worker, model, [datum]) for datum in data]
+    batch_logprobs, batch_weights, batch_old_logprobs, batch_advantages, batch_lengths = self.training_tensors(worker, data)
+    single_results = [self.training_tensors(worker, [datum]) for datum in data]
 
     for row, (single_logprobs, single_weights, single_old_logprobs, single_advantages, single_lengths) in enumerate(single_results):
       length = batch_lengths[row]
@@ -704,7 +636,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     )
 
   def test_token_budget_batches_preserve_examples(self) -> None:
-    worker = self._worker()
+    worker = self._session()
     data = self._data()
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "6"}):
       batches = worker.make_training_batches(data)
@@ -716,12 +648,12 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       self.assertTrue(len(batch) == 1 or padded_tokens <= 6)
 
   def test_forward_backward_padded_batches_preserve_client_output_shape(self) -> None:
-    worker = self._worker()
-    model = _LogitModelStub()
+    worker = self._session()
+    model = worker.model
     data = self._data()
 
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "12"}):
-      result = worker.forward_backward(model, data, "cross_entropy")
+      result = worker.forward_backward(data, "cross_entropy")
 
     self.assertEqual(len(result["loss_fn_outputs"]), len(data))
     self.assertGreater(len(model.calls), 0)
@@ -735,6 +667,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     worker.device = torch.device("cpu")
     worker.tokenizer = _TokenizerStub()
     worker.model = _LogitModelStub()
+    worker.session = TrainingSession(worker.model, list(worker.model.parameters()), tokenizer=worker.tokenizer)
     data = self._data()
 
     result = worker.forward_backward(data, "cross_entropy")

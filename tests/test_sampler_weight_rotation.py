@@ -9,9 +9,10 @@ from server import training_requests_processor as trp
 from server.store import InMemoryStore
 from tests.test_fft_batch_failure import SlicerStub
 from training import commands
+from training.fft_trainer_worker import FFTTrainingWorker
 
 
-class RecordingWorker(trp.FFTTrainingWorker):
+class RecordingWorker(FFTTrainingWorker):
   def __init__(self):
     super().__init__()
     self.saves = []

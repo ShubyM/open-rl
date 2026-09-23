@@ -84,7 +84,8 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     s_container = sampler["spec"]["template"]["spec"]["containers"][0]
     self.assertEqual(t_container["command"][-1], "server.training_requests_processor")
     self.assertEqual(s_container["command"][-1], "server.lora_sampler")
-    self.assertIn("--active-tenant-set-id", t_container["args"])
+    self.assertEqual(t_container["args"], ["--active-tenant-set-id", "Qwen/Qwen2.5-0.5B-1"])
+    self.assertEqual(s_container["args"], ["--model-id", "Qwen/Qwen2.5-0.5B"])
 
   def test_fft_worker_is_its_own_owner(self) -> None:
     s = self.store_with("Model_A.1", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
@@ -101,6 +102,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertFalse(worker["spec"]["exclusive"])
     self.assertEqual(worker["spec"]["accelerator"]["memory"], footprint("Qwen/Qwen3-8B", "full", "trainer").accelerator)
     container = worker["spec"]["template"]["spec"]["containers"][0]
+    self.assertEqual(container["args"], ["--model-id", "Model_A.1"])
     env = {e["name"]: e.get("value") for e in container["env"]}
     self.assertEqual(env["OPEN_RL_ENABLE_FFT"], "true")
     self.assertEqual(env["OPEN_RL_FINE_TUNING_TYPE"], "full")

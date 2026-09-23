@@ -106,10 +106,9 @@ def worker_module(role: str, is_lora: bool) -> str:
 
 
 def worker_args(runtime: str, role: str, is_lora: bool) -> list[str]:
-  args = ["--model-id", runtime]
   if role == "trainer" and is_lora:
-    args += ["--active-tenant-set-id", f"{runtime}-1"]
-  return args
+    return ["--active-tenant-set-id", f"{runtime}-1"]
+  return ["--model-id", runtime]
 
 
 # -- managers ----------------------------------------------------------------------

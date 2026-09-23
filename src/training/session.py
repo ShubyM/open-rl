@@ -1,30 +1,93 @@
-# Shared trainer worker logic for causal-LM forward/backward and generation.
+# Per-model training state and causal-LM math; process resources belong to workers.
 
 import math
 import os
+import time
 from typing import Any
 
 import torch
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
 from training.types import Datum
 
 
-class BaseTrainerWorker:
-  def __init__(self):
-    self.tokenizer: PreTrainedTokenizerBase | None = None
+def default_device() -> torch.device:
+  """Choose the worker's device at construction, outside session math."""
+  if torch.cuda.is_available():
+    return torch.device("cuda")
+  if torch.backends.mps.is_available():
+    return torch.device("mps")
+  return torch.device("cpu")
 
-    if torch.cuda.is_available():
-      self.device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-      self.device = torch.device("mps")
-    else:
-      self.device = torch.device("cpu")
+
+def sanitize_float(val: float) -> float:
+  if math.isinf(val):
+    return -9999.0 if val < 0 else 9999.0
+  if math.isnan(val):
+    return 0.0
+  return val
+
+
+class TrainingSession:
+  """One independently optimized parameter set on an already constructed model.
+
+  LoRA sessions can share a model while owning disjoint parameters and optimizer
+  state. Their worker selects the active adapter before executing a command.
+  Construction and optimizer steps perform no loading or weight publication.
+  """
+
+  def __init__(
+    self,
+    model: torch.nn.Module,
+    params: list[torch.nn.Parameter],
+    *,
+    tokenizer: Any = None,
+    device: torch.device | str = "cpu",
+  ):
+    if not params:
+      raise ValueError("A training session requires trainable parameters")
+    self.model = model
+    self.params = params
+    self.tokenizer = tokenizer
+    self.device = torch.device(device)
+    self.optimizer: torch.optim.Optimizer | None = None
+
+  def build_optimizer(self, adam_params: dict[str, Any]) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(
+      self.params,
+      lr=adam_params.get("learning_rate", 1e-4),
+      betas=(adam_params.get("beta1", 0.9), adam_params.get("beta2", 0.95)),
+      eps=adam_params.get("eps", 1e-12),
+      weight_decay=adam_params.get("weight_decay", 0.0),
+    )
+
+  def optim_step(self, adam_params: dict[str, Any]) -> dict[str, Any]:
+    """Step and clear only this session's accumulated gradients."""
+    if self.optimizer is None:
+      self.optimizer = self.build_optimizer(adam_params)
+    if (learning_rate := adam_params.get("learning_rate")) is not None:
+      for group in self.optimizer.param_groups:
+        group["lr"] = learning_rate
+    max_grad_norm = adam_params.get("grad_clip_norm") or math.inf
+    if max_grad_norm <= 0.0:
+      max_grad_norm = math.inf
+
+    t0 = time.perf_counter()
+    total_norm = torch.nn.utils.clip_grad_norm_(self.params, max_grad_norm)
+    t1 = time.perf_counter()
+    self.optimizer.step()
+    self.optimizer.zero_grad()
+    t2 = time.perf_counter()
+    return {
+      "metrics": {
+        "grad_norm:mean": sanitize_float(total_norm.item()),
+        "time/optimizer_step": sanitize_float(t2 - t1),
+        "time/clip_grad_norm": sanitize_float(t1 - t0),
+      }
+    }
 
   def forward_backward(
     self,
-    model: PreTrainedModel,
     data: list[Datum],
     loss_fn: str,
     loss_config: dict | None = None,
@@ -40,17 +103,16 @@ class BaseTrainerWorker:
     loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
 
     if forward_only:
-      model.eval()
+      self.model.eval()
     else:
-      model.train()
+      self.model.train()
 
     with torch.set_grad_enabled(not forward_only):
-      total_loss = self._run_batches(model, data, loss_fn, loss_config, forward_only, loss_fn_outputs)
+      total_loss = self._run_batches(data, loss_fn, loss_config, forward_only, loss_fn_outputs)
     return self._finish(data, loss_fn_outputs, total_loss)
 
   def _run_batches(
     self,
-    model: PreTrainedModel,
     data: list[Datum],
     loss_fn: str,
     loss_config: dict | None,
@@ -65,7 +127,7 @@ class BaseTrainerWorker:
 
       input_ids, attention_mask, input_lengths = self.pad_model_inputs(batch_data)
       target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
-      target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+      target_logprobs = self.compute_target_logprobs(input_ids, attention_mask, target_token_ids)
 
       match loss_fn:
         case "cross_entropy":
@@ -115,7 +177,7 @@ class BaseTrainerWorker:
       completed_loss_fn_outputs.append(output)
 
     return {
-      "metrics": {"loss:mean": self.sanitize_float(mean_loss), "loss:sum": self.sanitize_float(total_loss)},
+      "metrics": {"loss:mean": sanitize_float(mean_loss), "loss:sum": sanitize_float(total_loss)},
       "loss_fn_outputs": completed_loss_fn_outputs,
       "loss_fn_output_type": "ArrayRecord",
     }
@@ -204,19 +266,17 @@ class BaseTrainerWorker:
 
   def compute_target_logprobs(
     self,
-    model: PreTrainedModel,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     target_token_ids: torch.Tensor,
   ) -> torch.Tensor:
     """Return selected target logprobs with shape [batch, max_target_len]."""
-    outputs = model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+    outputs = self.model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
     logits = outputs.logits[:, : target_token_ids.shape[1], :]
     return torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
 
   def generate(
     self,
-    model: PreTrainedModel,
     prompt_tokens: list[int],
     max_tokens: int,
     num_samples: int = 1,
@@ -224,15 +284,15 @@ class BaseTrainerWorker:
     include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
     """Generate completions from model."""
-    model.eval()
+    self.model.eval()
 
     input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
     do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
-    prompt_logprobs = self.prompt_logprobs(model, input_tensor) if include_prompt_logprobs else None
+    prompt_logprobs = self.prompt_logprobs(input_tensor) if include_prompt_logprobs else None
 
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
-      outputs = model.generate(
+      outputs = self.model.generate(
         input_tensor,
         attention_mask=attention_mask,
         max_new_tokens=max_tokens,
@@ -257,7 +317,7 @@ class BaseTrainerWorker:
         logprob_dist = torch.nn.functional.log_softmax(score_tensor[seq_idx], dim=-1)
         token_id = generated_tokens[token_step_idx]
         logprob = logprob_dist[token_id].item()
-        logprobs.append(self.sanitize_float(logprob))
+        logprobs.append(sanitize_float(logprob))
 
       sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": "stop"})
 
@@ -266,23 +326,16 @@ class BaseTrainerWorker:
       result["prompt_logprobs"] = prompt_logprobs
     return result
 
-  def prompt_logprobs(self, model: PreTrainedModel, input_tensor: torch.Tensor) -> list[float | None]:
+  def prompt_logprobs(self, input_tensor: torch.Tensor) -> list[float | None]:
     with torch.no_grad():
       attention_mask = torch.ones_like(input_tensor)
-      outputs = model(input_tensor, attention_mask=attention_mask)
+      outputs = self.model(input_tensor, attention_mask=attention_mask)
       logprob_dist = torch.nn.functional.log_softmax(outputs.logits[0, :-1], dim=-1)
 
     prompt_tokens = input_tensor[0].tolist()
     prompt_logprobs: list[float | None] = [None]
     for token_idx, token_id in enumerate(prompt_tokens[1:]):
       logprob = logprob_dist[token_idx, token_id].item()
-      prompt_logprobs.append(self.sanitize_float(logprob))
+      prompt_logprobs.append(sanitize_float(logprob))
 
     return prompt_logprobs
-
-  def sanitize_float(self, val: float) -> float:
-    if math.isinf(val):
-      return -9999.0 if val < 0 else 9999.0
-    if math.isnan(val):
-      return 0.0
-    return val

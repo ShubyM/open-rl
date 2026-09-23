@@ -76,7 +76,7 @@ class InMemoryStore(RequestStore):
       tenants_list = self.active_tenants.setdefault(set_key, [])
       if model_id not in tenants_list:
         tenants_list.append(model_id)
-        self.active_tenants_cv.notify_all()
+      self.active_tenants_cv.notify_all()
 
   async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]:
     async with self.active_tenants_cv:
@@ -110,7 +110,11 @@ class InMemoryStore(RequestStore):
         await self.active_tenants_cv.wait()
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    raise RuntimeError("Per-model full fine-tuning workers require REDIS_URL; in-memory queues cannot be shared across processes")
+    """Serve a dedicated runner in this process; subprocesses still need Redis."""
+    async with self.active_tenants_cv:
+      await self.active_tenants_cv.wait_for(lambda: model_id in self.queues and not self.queues[model_id].empty())
+      queue = self.queues[model_id]
+      return [queue.get_nowait() for _ in range(queue.qsize())]
 
   async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
