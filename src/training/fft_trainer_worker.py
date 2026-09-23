@@ -1,5 +1,7 @@
 # Full fine-tuning trainer worker lifecycle.
 
+import gc
+import itertools
 import json
 import logging
 import math
@@ -16,7 +18,6 @@ from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
 from server.model_metadata import SPARSE_DELTA_VERSION, WeightSyncConfig
-from training.host_mirror import HostMirror
 from training.trainer_worker import BaseTrainerWorker, Datum
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
@@ -50,6 +51,25 @@ def trainable_model_parameters(model: PreTrainedModel) -> list[torch.nn.Paramete
   return params
 
 
+# (the device a tensor lives on, its pinned host copy)
+HostCopy = tuple[torch.device, torch.Tensor]
+
+
+def host_copy(table: dict, key: object, like: torch.Tensor) -> torch.Tensor:
+  """The pinned host copy under key, allocated to match `like` on first use or when its shape changes."""
+  entry = table.get(key)
+  if entry is None or entry[1].shape != like.shape or entry[1].dtype != like.dtype:
+    entry = (like.device, torch.empty(like.shape, dtype=like.dtype, device="cpu", pin_memory=torch.cuda.is_available()))
+    table[key] = entry
+  return entry[1]
+
+
+def per_param_state(optimizer: torch.optim.Optimizer | None) -> list[tuple[torch.Tensor, dict]]:
+  if optimizer is None:
+    return []
+  return [(param, state) for param, state in optimizer.state.items() if isinstance(state, dict)]
+
+
 class FFTTrainingWorker(BaseTrainerWorker):
   def __init__(self):
     super().__init__()
@@ -59,9 +79,16 @@ class FFTTrainingWorker(BaseTrainerWorker):
     self.optimizer: torch.optim.Optimizer | None = None
     self.cpu_offload: bool = True
     self.weight_sync_strategy: str = WeightSyncConfig.from_env().strategy
-    # Host copies of the training state: where sleep() puts it between GPU
-    # leases and, in delta mode, the baseline the next delta is taken against.
-    self.mirror = HostMirror()
+    # Pinned host copies of the training state, allocated once and reused: where
+    # sleep() puts it between GPU leases and, in delta mode, the baseline the
+    # next delta is taken against. Parameters and buffers are keyed by the tensor
+    # itself; gradients by their parameter, since backward makes a new grad
+    # tensor; optimizer state by (parameter, key), since the optimizer replaces
+    # its state tensors.
+    self.offloaded: bool = False
+    self.host_weights: dict[torch.Tensor, HostCopy] = {}
+    self.host_grads: dict[torch.Tensor, HostCopy] = {}
+    self.host_optimizer_state: dict[tuple[torch.Tensor, str], HostCopy] = {}
     # What the last optim_step changed, published by save_state_delta once the
     # GPU lease is released.
     self.pending_delta: SparseDelta | None = None
@@ -100,7 +127,9 @@ class FFTTrainingWorker(BaseTrainerWorker):
       param.requires_grad_(True)
     self.trainable_params = trainable_model_parameters(self.model)
     if self.weight_sync_strategy == "delta":
-      self.mirror.sync(self.model)
+      # The delta baseline: each trainable parameter's host copy equals its device value.
+      for param in self.trainable_params:
+        host_copy(self.host_weights, param, param.data).copy_(param.data, non_blocking=True)
 
     if ENABLE_GRADIENT_CHECKPOINTING:
       try:
@@ -114,7 +143,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
   def assert_off_gpu(self, action: str) -> None:
     """Saves run outside the time-slicer lease, so with offload on the state must already be on the host."""
-    if self.cpu_offload and not self.mirror.offloaded:
+    if self.cpu_offload and not self.offloaded:
       raise RuntimeError(f"Cannot {action} while the worker holds the GPU (cpu_offload=True, not offloaded); saves run outside the GPU lease.")
 
   def save_model(self, alias: str | None = None) -> dict[str, Any]:
@@ -255,7 +284,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     target_device = "auto" if num_gpus > 1 else self.device
     self.model = AutoModelForCausalLM.from_pretrained(state_path, dtype=dtype, device_map=target_device)
     # A new model means new tensors; the old model's host copies go with it.
-    self.mirror = HostMirror()
+    self.host_weights, self.host_grads, self.host_optimizer_state = {}, {}, {}
     self.pending_delta = None
     self.prepare_model_for_training()
 
@@ -283,10 +312,17 @@ class FFTTrainingWorker(BaseTrainerWorker):
     for name, param in self.model.named_parameters():
       if not param.requires_grad:
         continue
-      changed = self.mirror.diff(param)
-      if changed is None:
+      baseline = self.host_weights[param][1].view(-1)  # seeded by prepare_model_for_training
+      current = param.data.view(-1)
+      changed = current.ne(baseline.to(param.device, non_blocking=True))
+      indices = changed.nonzero(as_tuple=True)[0]
+      if indices.numel() == 0:
         continue
-      indices, values = changed
+      # int32 indices halve the file when they fit; the sampler accepts either.
+      index_dtype = torch.int32 if param.numel() <= 2**31 else torch.int64
+      indices = indices.to(index_dtype).cpu()
+      values = current[changed].cpu()
+      baseline[indices.to(torch.int64)] = values
       delta.names.append(name)
       delta.shapes.append(list(param.shape))
       delta.indices.append(indices)
@@ -379,9 +415,70 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
   # The processor brackets each GPU lease with these.
   def sleep(self) -> None:
-    if self.cpu_offload and self.model is not None:
-      self.mirror.sleep(self.model, self.optimizer)
+    """Copy the device-resident training state to the host and free it on the device.
+
+    Parameters are left pointing at their host copies, so shapes stay right and
+    save_pretrained reads them directly while the worker is off the GPU.
+    """
+    if not self.cpu_offload or self.model is None or self.offloaded or not torch.cuda.is_available():
+      return
+    start = time.perf_counter()
+
+    # Queue every device-to-host copy, then wait once, then free: the copies
+    # overlap and nothing is released before it has landed.
+    for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
+      if tensor.device.type == "cuda":
+        host_copy(self.host_weights, tensor, tensor.data).copy_(tensor.data, non_blocking=True)
+      grad = tensor.grad if isinstance(tensor, torch.nn.Parameter) else None
+      if grad is not None and grad.device.type == "cuda":
+        host_copy(self.host_grads, tensor, grad).copy_(grad, non_blocking=True)
+    for param, state in per_param_state(self.optimizer):
+      for key, value in list(state.items()):
+        if isinstance(value, torch.Tensor) and value.device.type == "cuda":
+          host_copy(self.host_optimizer_state, (param, key), value).copy_(value, non_blocking=True)
+
+    torch.cuda.synchronize()
+
+    for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
+      entry = self.host_weights.get(tensor)
+      if entry is not None:
+        tensor.data = entry[1]
+      grad = tensor.grad if isinstance(tensor, torch.nn.Parameter) else None
+      if grad is not None and tensor in self.host_grads:
+        grad.data = self.host_grads[tensor][1]
+    for param, state in per_param_state(self.optimizer):
+      for key in list(state):
+        entry = self.host_optimizer_state.get((param, key))
+        if entry is not None:
+          state[key] = entry[1]
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    self.offloaded = True
+    print(f"[FFTTrainingWorker] Offloaded weights & states to pinned host memory in {(time.perf_counter() - start) * 1000:.1f} ms.")
 
   def wake_up(self) -> None:
-    if self.cpu_offload and self.model is not None:
-      self.mirror.wake_up(self.model, self.optimizer)
+    """Bring the training state back to the device. The host copies stay allocated for the next sleep."""
+    if not self.offloaded:
+      return
+    assert self.model is not None, "Model must be loaded first."
+    start = time.perf_counter()
+
+    for tensor in itertools.chain(self.model.parameters(), self.model.buffers()):
+      entry = self.host_weights.get(tensor)
+      if entry is not None:
+        tensor.data = entry[1].to(entry[0], non_blocking=True)
+      grad = tensor.grad if isinstance(tensor, torch.nn.Parameter) else None
+      if grad is not None and tensor in self.host_grads:
+        device, host = self.host_grads[tensor]
+        grad.data = host.to(device, non_blocking=True)
+    for param, state in per_param_state(self.optimizer):
+      for key in list(state):
+        entry = self.host_optimizer_state.get((param, key))
+        if entry is not None:
+          state[key] = entry[1].to(entry[0], non_blocking=True)
+
+    torch.cuda.synchronize()
+    self.offloaded = False
+    print(f"[FFTTrainingWorker] Reloaded weights & states to the device in {(time.perf_counter() - start) * 1000:.1f} ms.")

@@ -107,7 +107,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
     with self.assertRaises(RuntimeError):
       worker.save_state_delta(model_id="test-model", state_path=state_path, kind="sampler")
 
-    worker.mirror.offloaded = True
+    worker.offloaded = True
     worker.save_state_delta(model_id="test-model", state_path=state_path, kind="sampler")
 
     delta_file = os.path.join(state_path, "delta.safetensors")

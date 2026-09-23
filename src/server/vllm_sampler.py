@@ -21,6 +21,7 @@ from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.lora.request import LoRARequest
+from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
@@ -30,7 +31,6 @@ from server.vllm_options import gpu_memory_utilization, split_stop, text_only_en
 
 tracer = trace.get_tracer("vllm.inference.worker")
 SHUTDOWN_SENTINEL = "SHUTDOWN_SENTINEL"
-TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 READY_TTL_SECONDS = 3600
 
 
@@ -64,43 +64,29 @@ def engine_kwargs_from_env(fft_enabled: bool) -> dict[str, Any]:
   return engine_kwargs
 
 
-def resolve_lora_path(lora_id: str, lora_path: str | None) -> str:
-  """Find the PEFT directory holding adapter_config.json for this adapter."""
-  if lora_path and os.path.exists(os.path.join(lora_path, "adapter_config.json")):
-    return lora_path
-
-  if lora_path:
-    # Check subfolders created by PEFT save_pretrained
-    base_candidates = [
-      lora_id,
-      lora_id.rsplit("/", 1)[-1],
-      lora_id.split("://")[-1].split("/")[0] if "://" in lora_id else lora_id,
-    ]
-    for candidate in base_candidates:
-      candidate_path = os.path.join(lora_path, candidate)
-      if os.path.exists(os.path.join(candidate_path, "adapter_config.json")):
-        return candidate_path
-
-  # Check auto-saved PEFT directory: TMP_DIR/peft/<model_id>/<model_id>
-  base_id = lora_id.split("://")[-1].split("/")[0] if "://" in lora_id else lora_id
-  peft_dir = os.path.join(TMP_DIR, "peft", base_id, base_id)
-  if os.path.exists(os.path.join(peft_dir, "adapter_config.json")):
-    return peft_dir
-
-  return lora_path or peft_dir
-
-
 def lora_request_for(request: dict[str, Any]) -> LoRARequest | None:
-  """A LoRA request when the adapter exists on disk. Before the first save a
-  LoRA job samples from the base model, so a missing adapter is not an error."""
-  lora_id = request.get("lora_id")
-  if not lora_id:
-    return None
-  path = resolve_lora_path(lora_id, request.get("lora_path"))
-  if not os.path.exists(os.path.join(path, "adapter_config.json")):
+  """A LoRA request when the adapter exists on disk. The gateway sends the adapter
+  directory once it exists; before the first save has finished a LoRA job samples
+  from the base model, so a missing adapter is not an error."""
+  lora_id, lora_path = request.get("lora_id"), request.get("lora_path")
+  if not lora_id or not lora_path or not os.path.exists(os.path.join(lora_path, "adapter_config.json")):
     return None
   lora_int_id = int(hashlib.md5(lora_id.encode("utf-8")).hexdigest(), 16) % (2**31 - 1) + 1
-  return LoRARequest(lora_id, lora_int_id, path)
+  return LoRARequest(lora_id, lora_int_id, lora_path)
+
+
+def sampled_logprobs(output: CompletionOutput) -> list[float]:
+  """One logprob per generated token; -9999.0 where vLLM did not report the sampled token."""
+  if not output.logprobs:
+    return []
+  return [step[token_id].logprob if step and token_id in step else -9999.0 for token_id, step in zip(output.token_ids, output.logprobs)]
+
+
+def prompt_logprobs(output: RequestOutput | None, prompt_token_ids: list[int]) -> list[float | None] | None:
+  """One logprob per prompt token; None where vLLM reports none (always the first token)."""
+  if output is None or not output.prompt_logprobs:
+    return None
+  return [step[token_id].logprob if step and token_id in step else None for token_id, step in zip(prompt_token_ids, output.prompt_logprobs)]
 
 
 class Sampler:
@@ -255,36 +241,12 @@ class Sampler:
       async for request_output in results_generator:
         final_output = request_output
 
-    outputs = final_output.outputs if final_output else []
-    sequences_out = []
-    for output in outputs:
-      generated_token_ids = list(output.token_ids)
-      logprobs = []
-      if output.logprobs:
-        for idx, token_logprobs in enumerate(output.logprobs):
-          # token_logprobs is a dict of {token_id: Logprob}
-          token_id = generated_token_ids[idx]
-          if token_logprobs and token_id in token_logprobs:
-            logprob = token_logprobs[token_id].logprob
-          else:
-            logprob = -9999.0
-          logprobs.append(logprob)
-      sequences_out.append({"tokens": generated_token_ids, "logprobs": logprobs, "stop_reason": output.finish_reason})
-
-    prompt_logprobs_out = None
-    if final_output and final_output.prompt_logprobs:
-      prompt_logprobs_out = []
-      for idx, token_logprobs in enumerate(final_output.prompt_logprobs):
-        if token_logprobs is None:
-          prompt_logprobs_out.append(None)
-        else:
-          token_id = prompt_token_ids[idx]
-          if token_id in token_logprobs:
-            prompt_logprobs_out.append(token_logprobs[token_id].logprob)
-          else:
-            prompt_logprobs_out.append(None)
-
-    res = {"sequences": sequences_out}
+    sequences = [
+      {"tokens": list(output.token_ids), "logprobs": sampled_logprobs(output), "stop_reason": output.finish_reason}
+      for output in (final_output.outputs if final_output else [])
+    ]
+    res: dict[str, Any] = {"sequences": sequences}
+    prompt_logprobs_out = prompt_logprobs(final_output, prompt_token_ids)
     if prompt_logprobs_out is not None:
       res["prompt_logprobs"] = prompt_logprobs_out
     return res
