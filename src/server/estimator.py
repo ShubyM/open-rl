@@ -1,6 +1,7 @@
 """Sizes a worker from its model's parameter count."""
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 
@@ -83,6 +84,10 @@ SAMPLER_KV_TOKENS = 8 * 8192  # eight max-length requests in flight
 # sampler 39Gi steady; 7B FFT trainer OOM-killed at 110Gi.
 HOST_BYTES_PER_PARAM = {("full", "trainer"): 14, ("lora", "trainer"): 2, ("full", "sampler"): 2, ("lora", "sampler"): 2}
 HOST_OVERHEAD_BYTES = {"trainer": 20 * GIB, "sampler": 24 * GIB}
+# vLLM's profiling and graph capture grow host memory with max_model_len. A
+# Qwen3.5-9B LoRA sampler at 131072 hit its 41Gi limit right after compile.
+SAMPLER_HOST_BASE_CONTEXT = 8192
+SAMPLER_HOST_BYTES_PER_CONTEXT_TOKEN = 256 * 1024
 # Limits equal requests. Placement admits pods by request, so a pod that
 # could burst past it can push a co-seated neighbour into the kernel's OOM
 # killer; an 8B FFT sampler ran at 39Gi against a 34Gi request.
@@ -128,4 +133,7 @@ def footprint(base_model: str, fine_tuning_type: str, role: str) -> Footprint:
   else:
     device = sampler_device_bytes(params, MODEL_TO_KV_BYTES_PER_TOKEN[model], kind)
   host = params * HOST_BYTES_PER_PARAM[(kind, role)] + HOST_OVERHEAD_BYTES[role]
+  if role == "sampler":
+    context = int(os.getenv("VLLM_MAX_MODEL_LEN", str(SAMPLER_HOST_BASE_CONTEXT)))
+    host += max(0, context - SAMPLER_HOST_BASE_CONTEXT) * SAMPLER_HOST_BYTES_PER_CONTEXT_TOKEN
   return Footprint(device, host, int(host * HOST_LIMIT_FACTOR))
