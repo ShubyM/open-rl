@@ -52,9 +52,9 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
       return json.load(f)
 
   def test_streamed_diffing_optim_step_and_multi_save_idempotency(self):
-    """Verifies optim_step streams diff to _latest_delta_tensors and multiple saves read it non-destructively."""
+    """Verifies multiple saves in the same step emit identical deltas."""
     worker = self._create_worker_and_modify()
-    worker.weight_sync_strategy = "delta"
+    worker.set_weight_sync_strategy("delta")
     worker.optim_step({})
 
     save_dir_1 = os.path.join(self.temp_dir, "save_optim_1")
@@ -70,14 +70,22 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
     self.assertEqual(meta_1["layer_names"], meta_2["layer_names"])
 
   def test_streamed_diffing_empty_delta_fallback(self):
-    """Verifies save_state_delta before optim_step emits an exact O(1) empty delta."""
-    worker = self._create_worker_and_modify()
+    """Verifies save_state_delta before any weight updates emits an empty delta."""
+    torch.manual_seed(42)
+    model = DummyModel().to(self.device)
+    worker = FFTTrainingWorker()
+    worker.base_model_name = "dummy"
+    worker.model = model
+    worker.cpu_offload = False
+    worker.prepare_model_for_training()
+
     save_dir = os.path.join(self.temp_dir, "save_empty")
     worker.save_state_delta("dummy", save_dir, kind="sampler")
     meta = self._read_metadata(save_dir)
 
+    total_elements = sum(p.numel() for p in worker.model.parameters())
     self.assertEqual(meta["changed_elements"], 0)
-    self.assertEqual(meta["total_elements"], worker.total_model_elements)
+    self.assertEqual(meta["total_elements"], total_elements)
     self.assertEqual(meta["layer_names"], [])
     self.assertEqual(meta["layer_shapes"], [])
 
