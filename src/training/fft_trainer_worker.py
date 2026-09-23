@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
-from training.session import TrainingSession, default_device, sanitize_float
+from training.trainer import Trainer, default_device, sanitize_float
 from training.types import Datum, FFTConfig
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
@@ -36,7 +36,7 @@ class FFTTrainingWorker:
     self.tokenizer = None
     self.model: PreTrainedModel | None = None
     self.base_model_name: str | None = None
-    self.session: TrainingSession | None = None
+    self.trainer: Trainer | None = None
     self.cpu_offload: bool = True
     self.weight_sync_cfg: WeightSyncConfig = WeightSyncConfig.from_env()
     self._is_offloaded: bool = False
@@ -96,7 +96,7 @@ class FFTTrainingWorker:
 
     for param in self.model.parameters():
       param.requires_grad_(True)
-    self.session = TrainingSession(self.model, trainable_model_parameters(self.model), tokenizer=self.tokenizer, device=self.device)
+    self.trainer = Trainer(self.model, trainable_model_parameters(self.model), tokenizer=self.tokenizer, device=self.device)
     # A reload creates new parameters; their optimizer and residency shadows
     # must not retain the previous model's parameter objects.
     self._param_shadow.clear()
@@ -342,8 +342,8 @@ class FFTTrainingWorker:
     if restore_optimizer and metadata.get("has_optimizer"):
       optimizer_path = os.path.join(state_path, "optimizer.pt")
       if os.path.exists(optimizer_path):
-        self.session.optimizer = self.session.build_optimizer({})
-        self.session.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
+        self.trainer.optimizer = self.trainer.build_optimizer({})
+        self.trainer.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
         print(f"Restored optimizer state from {optimizer_path}")
 
     print(f"Loaded full fine-tuning state from {state_path}")
@@ -353,7 +353,7 @@ class FFTTrainingWorker:
     self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
   ) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
-    res = self.require_session().forward_backward(data, loss_fn, loss_config, forward_only=forward_only)
+    res = self.require_trainer().forward_backward(data, loss_fn, loss_config, forward_only=forward_only)
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
     return res
@@ -420,7 +420,7 @@ class FFTTrainingWorker:
     assert self.model is not None, "Model must be loaded first."
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
-    metrics = self.require_session().optim_step(adam_params)["metrics"]
+    metrics = self.require_trainer().optim_step(adam_params)["metrics"]
     clip_time = metrics["time/clip_grad_norm"]
     step_time = metrics["time/optimizer_step"]
 
@@ -488,10 +488,10 @@ class FFTTrainingWorker:
     metrics["time/compute_delta_diff"] = sanitize_float(delta_compute_time)
     return {"metrics": metrics}
 
-  def require_session(self) -> TrainingSession:
-    if self.session is None:
-      raise ValueError("No full fine-tuning session is loaded")
-    return self.session
+  def require_trainer(self) -> Trainer:
+    if self.trainer is None:
+      raise ValueError("No full fine-tuning trainer is loaded")
+    return self.trainer
 
   def generate(
     self,
@@ -502,7 +502,7 @@ class FFTTrainingWorker:
     model_id: str | None = None,
     include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
-    return self.require_session().generate(prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
+    return self.require_trainer().generate(prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
 
   def sleep(self) -> None:
     """Offload GPU tensors to pinned host CPU memory and empty CUDA allocator cache."""
@@ -529,8 +529,8 @@ class FFTTrainingWorker:
           self._grad_shadow[tensor] = (orig_device, cpu_buf)
         cpu_buf.copy_(tensor.grad.data, non_blocking=True)
 
-    if self.session is not None and self.session.optimizer is not None:
-      for param, state in self.session.optimizer.state.items():
+    if self.trainer is not None and self.trainer.optimizer is not None:
+      for param, state in self.trainer.optimizer.state.items():
         if isinstance(state, dict):
           for k, v in list(state.items()):
             if isinstance(v, torch.Tensor) and v.device.type == "cuda":
@@ -556,8 +556,8 @@ class FFTTrainingWorker:
         orig_device = self._grad_shadow[tensor][0]
         tensor.grad.data = torch.empty(0, dtype=tensor.grad.dtype, device=orig_device)
 
-    if self.session is not None and self.session.optimizer is not None:
-      for param, state in self.session.optimizer.state.items():
+    if self.trainer is not None and self.trainer.optimizer is not None:
+      for param, state in self.trainer.optimizer.state.items():
         if isinstance(state, dict):
           for k in list(state.keys()):
             opt_key = (param, k)
@@ -588,8 +588,8 @@ class FFTTrainingWorker:
         orig_device, cpu_grad = self._grad_shadow[tensor]
         tensor.grad.data = cpu_grad.to(orig_device, non_blocking=True)
 
-    if self.session is not None and self.session.optimizer is not None:
-      for param, state in self.session.optimizer.state.items():
+    if self.trainer is not None and self.trainer.optimizer is not None:
+      for param, state in self.trainer.optimizer.state.items():
         if isinstance(state, dict):
           state.pop("_orig_devices", None)
           target_device = param.device

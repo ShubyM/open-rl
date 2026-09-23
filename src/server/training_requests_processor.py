@@ -153,19 +153,19 @@ class TrainingRequestsProcessor:
     for request_id, result in results:
       if request_id is not None:
         await self.store.set_future(request_id, result)
+    if shutdown:
+      # A dedicated process ends after its model is deleted, whether or not
+      # it uses leases. Answer every popped request before any fatal exit.
+      self.stopping = self.model_id is not None
+      for request in batch[shutdown_index + 1 :]:
+        if request_id := request.get("request_id"):
+          await self.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": "Trainer model has been shut down"})
     if self.time_slicer is not None and self.time_slicer.faulted:
       # This process still holds the accelerator. Exit without unregistering so
       # the grant moves on only once the memory is gone. Exit 0 keeps the pod
       # from restarting on fresh weights mid-run; the run fails on its next call.
       print(f"[WORKER] Time slicer could not park this process: {self.time_slicer.faulted}. Exiting to free the accelerator.")
       await self.exit_gracefully(unregister=False)
-    if shutdown:
-      # A dedicated process ends after its model is deleted, whether or not
-      # it uses leases. Let run() close its resources normally.
-      self.stopping = self.model_id is not None
-      for request in batch[shutdown_index + 1 :]:
-        if request_id := request.get("request_id"):
-          await self.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": "Trainer model has been shut down"})
     if failure is not None:
       raise failure
 

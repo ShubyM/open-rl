@@ -189,6 +189,25 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(store.futures_store["first"]["type"], "optim_step_completed")
     self.assertEqual(store.futures_store["second"]["type"], "RequestFailedResponse")
 
+  async def test_faulted_lease_answers_requests_after_shutdown_before_exiting(self):
+    store = RecordingStore()
+    worker = OffloadedWorker()
+    slicer = RecordingSlicer(fault_on_release=True)
+    processor = TrainingRequestsProcessor(store, worker, "model-a", time_slicer=slicer)
+    await store.put_request(step("first"))
+    await store.put_request(commands.wire(commands.Shutdown(model_id="model-a")))
+    await store.put_request(step("too-late"))
+
+    async def exit_worker(unregister=True):
+      self.assertFalse(unregister)
+      self.assertEqual(store.published, ["first", "too-late"])
+      self.assertEqual(store.futures_store["too-late"]["type"], "RequestFailedResponse")
+      raise SystemExit(0)
+
+    with patch.object(processor, "exit_gracefully", side_effect=exit_worker), self.assertRaises(SystemExit):
+      await processor.run_once()
+    self.assertEqual(worker.value, 1)
+
   def test_importing_runtime_does_not_import_training_backends(self):
     subprocess.run(
       [

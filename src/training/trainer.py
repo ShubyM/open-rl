@@ -12,7 +12,7 @@ from training.types import Datum
 
 
 def default_device() -> torch.device:
-  """Choose the worker's device at construction, outside session math."""
+  """Choose the worker's device at construction, outside trainer math."""
   if torch.cuda.is_available():
     return torch.device("cuda")
   if torch.backends.mps.is_available():
@@ -28,10 +28,10 @@ def sanitize_float(val: float) -> float:
   return val
 
 
-class TrainingSession:
+class Trainer:
   """One independently optimized parameter set on an already constructed model.
 
-  LoRA sessions can share a model while owning disjoint parameters and optimizer
+  LoRA trainers can share a model while owning disjoint parameters and optimizer
   state. Their worker selects the active adapter before executing a command.
   Construction and optimizer steps perform no loading or weight publication.
   """
@@ -45,7 +45,7 @@ class TrainingSession:
     device: torch.device | str = "cpu",
   ):
     if not params:
-      raise ValueError("A training session requires trainable parameters")
+      raise ValueError("A trainer requires trainable parameters")
     self.model = model
     self.params = params
     self.tokenizer = tokenizer
@@ -62,7 +62,7 @@ class TrainingSession:
     )
 
   def optim_step(self, adam_params: dict[str, Any]) -> dict[str, Any]:
-    """Step and clear only this session's accumulated gradients."""
+    """Step and clear only this trainer's accumulated gradients."""
     if self.optimizer is None:
       self.optimizer = self.build_optimizer(adam_params)
     if (learning_rate := adam_params.get("learning_rate")) is not None:

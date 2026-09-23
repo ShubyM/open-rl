@@ -12,7 +12,7 @@ from peft import LoraConfig as PeftLoraConfig
 from peft import PeftModelForCausalLM, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
-from training.session import TrainingSession, default_device
+from training.trainer import Trainer, default_device
 from training.types import Datum, LoraConfig
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
@@ -33,7 +33,7 @@ class LoraTrainingWorker:
     self.base_model: PreTrainedModel | None = None
     self.peft_model: PeftModelForCausalLM | None = None
     self.base_model_name: str | None = None
-    self.sessions: dict[str, TrainingSession] = {}
+    self.trainers: dict[str, Trainer] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
 
   def load_base_model(self, base_model_name: str) -> None:
@@ -98,8 +98,8 @@ class LoraTrainingWorker:
     """Create a new LoRA adapter on top of the loaded base model."""
     assert self.base_model is not None, "Base model is not loaded. Call load_base_model first."
 
-    if adapter_id in self.sessions:
-      del self.sessions[adapter_id]
+    if adapter_id in self.trainers:
+      del self.trainers[adapter_id]
 
     if not any([config.train_attn, config.train_mlp, config.train_unembed]):
       raise ValueError("At least one LoRA training target must be enabled.")
@@ -124,7 +124,7 @@ class LoraTrainingWorker:
       self.peft_model.add_adapter(adapter_id, peft_config)
 
     self.peft_model.set_adapter(adapter_id)
-    self.sessions[adapter_id] = TrainingSession(
+    self.trainers[adapter_id] = Trainer(
       self.peft_model, active_adapter_parameters(self.peft_model, adapter_id), tokenizer=self.tokenizer, device=self.device
     )
 
@@ -180,7 +180,7 @@ class LoraTrainingWorker:
     os.makedirs(state_path, exist_ok=True)
     self.peft_model.save_pretrained(state_path, selected_adapters=[model_id])
 
-    optimizer = self.session_for(model_id).optimizer
+    optimizer = self.trainer_for(model_id).optimizer
     if include_optimizer and optimizer is not None:
       torch.save(optimizer.state_dict(), os.path.join(state_path, "optimizer.pt"))
 
@@ -233,14 +233,14 @@ class LoraTrainingWorker:
     else:
       if model_id in self.peft_model.peft_config:
         self.peft_model.delete_adapter(model_id)
-        if model_id in self.sessions:
-          del self.sessions[model_id]
+        if model_id in self.trainers:
+          del self.trainers[model_id]
       self.peft_model.load_adapter(adapter_dir, adapter_name=model_id, is_trainable=True)
 
     self.peft_model.set_adapter(model_id)
     params = active_adapter_parameters(self.peft_model, model_id)
-    session = TrainingSession(self.peft_model, params, tokenizer=self.tokenizer, device=self.device)
-    self.sessions[model_id] = session
+    trainer = Trainer(self.peft_model, params, tokenizer=self.tokenizer, device=self.device)
+    self.trainers[model_id] = trainer
 
     if ENABLE_GRADIENT_CHECKPOINTING:
       try:
@@ -255,31 +255,31 @@ class LoraTrainingWorker:
     if restore_optimizer and metadata.get("has_optimizer"):
       optimizer_path = os.path.join(state_path, "optimizer.pt")
       if os.path.exists(optimizer_path):
-        optimizer = session.build_optimizer({})
+        optimizer = trainer.build_optimizer({})
         optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
-        session.optimizer = optimizer
+        trainer.optimizer = optimizer
         print(f"Restored optimizer state for '{model_id}' from {optimizer_path}")
 
     print(f"Loaded state for '{model_id}' from {state_path}")
     return {"model_id": model_id, "is_lora": True, "base_model": base_model}
 
-  def session_for(self, model_id: str | None) -> TrainingSession:
+  def trainer_for(self, model_id: str | None) -> Trainer:
     if model_id is None:
-      raise ValueError("model_id is required for a LoRA training session")
+      raise ValueError("model_id is required for a LoRA trainer")
     try:
-      session = self.sessions[model_id]
+      trainer = self.trainers[model_id]
     except KeyError:
-      raise ValueError(f"No training session for adapter '{model_id}'") from None
+      raise ValueError(f"No trainer for adapter '{model_id}'") from None
     self.peft_model.set_adapter(model_id)
-    return session
+    return trainer
 
   def forward_backward(
     self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
   ) -> dict[str, Any]:
-    return self.session_for(model_id).forward_backward(data, loss_fn, loss_config, forward_only=forward_only)
+    return self.trainer_for(model_id).forward_backward(data, loss_fn, loss_config, forward_only=forward_only)
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str) -> dict[str, Any]:
-    result = self.session_for(model_id).optim_step(adam_params)
+    result = self.trainer_for(model_id).optim_step(adam_params)
     # Existing worker policy: LoRA samplers hot-load this directory after a step.
     self.save_adapter(model_id)
     return result
@@ -293,4 +293,4 @@ class LoraTrainingWorker:
     model_id: str | None = None,
     include_prompt_logprobs: bool = False,
   ) -> dict[str, Any]:
-    return self.session_for(model_id).generate(prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
+    return self.trainer_for(model_id).generate(prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)

@@ -15,7 +15,7 @@ from training import lora_trainer_worker as lora_trainer_worker_module
 from training import losses as losses_module
 from training.fft_trainer_worker import FFTTrainingWorker
 from training.lora_trainer_worker import LoraTrainingWorker
-from training.session import TrainingSession
+from training.trainer import Trainer
 from training.types import Datum
 
 
@@ -247,8 +247,8 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     worker = LoraTrainingWorker()
     worker.base_model_name = "base"
     worker.peft_model = _PeftModelStub({"job-a": [param]})
-    worker.sessions["job-a"] = TrainingSession(worker.peft_model, [param])
-    worker.sessions["job-a"].optimizer = torch.optim.AdamW([param], lr=0.1)
+    worker.trainers["job-a"] = Trainer(worker.peft_model, [param])
+    worker.trainers["job-a"].optimizer = torch.optim.AdamW([param], lr=0.1)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
       state_dir = os.path.join(tmp_dir, "step-5")
@@ -272,8 +272,8 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     worker.model = _FullModelStub([param])
     worker.model.save_pretrained = lambda path: None
     worker.tokenizer = None
-    worker.session = TrainingSession(worker.model, [param])
-    worker.session.optimizer = torch.optim.AdamW([param], lr=0.1)
+    worker.trainer = Trainer(worker.model, [param])
+    worker.trainer.optimizer = torch.optim.AdamW([param], lr=0.1)
     worker.cpu_offload = False
     worker.weight_sync_cfg.strategy = "full"
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -308,9 +308,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
         "adapter-b": [other_param],
       }
     )
-    worker.sessions["adapter-a"] = TrainingSession(
-      worker.peft_model, lora_trainer_worker_module.active_adapter_parameters(worker.peft_model, "adapter-a")
-    )
+    worker.trainers["adapter-a"] = Trainer(worker.peft_model, lora_trainer_worker_module.active_adapter_parameters(worker.peft_model, "adapter-a"))
     worker.save_adapter = lambda *_args, **_kwargs: None
 
     result = worker.optim_step(
@@ -340,7 +338,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
 
     worker = FFTTrainingWorker()
     worker.model = _FullModelStub([trainable_param, frozen_param])
-    worker.session = TrainingSession(worker.model, fft_trainer_worker_module.trainable_model_parameters(worker.model))
+    worker.trainer = Trainer(worker.model, fft_trainer_worker_module.trainable_model_parameters(worker.model))
 
     result = worker.optim_step(
       {
@@ -537,9 +535,9 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
-  def _session(self) -> TrainingSession:
+  def _trainer(self) -> Trainer:
     model = _LogitModelStub()
-    return TrainingSession(model, list(model.parameters()), tokenizer=_TokenizerStub())
+    return Trainer(model, list(model.parameters()), tokenizer=_TokenizerStub())
 
   def _data(self):
     return [
@@ -574,7 +572,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     return logprobs, weights, old_logprobs, advantages, lengths
 
   def test_padded_batch_logprobs_and_losses_match_per_example_math(self) -> None:
-    worker = self._session()
+    worker = self._trainer()
     data = self._data()
 
     batch_logprobs, batch_weights, batch_old_logprobs, batch_advantages, batch_lengths = self.training_tensors(worker, data)
@@ -636,7 +634,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     )
 
   def test_token_budget_batches_preserve_examples(self) -> None:
-    worker = self._session()
+    worker = self._trainer()
     data = self._data()
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "6"}):
       batches = worker.make_training_batches(data)
@@ -648,7 +646,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
       self.assertTrue(len(batch) == 1 or padded_tokens <= 6)
 
   def test_forward_backward_padded_batches_preserve_client_output_shape(self) -> None:
-    worker = self._session()
+    worker = self._trainer()
     model = worker.model
     data = self._data()
 
@@ -667,7 +665,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     worker.device = torch.device("cpu")
     worker.tokenizer = _TokenizerStub()
     worker.model = _LogitModelStub()
-    worker.session = TrainingSession(worker.model, list(worker.model.parameters()), tokenizer=worker.tokenizer)
+    worker.trainer = Trainer(worker.model, list(worker.model.parameters()), tokenizer=worker.tokenizer)
     data = self._data()
 
     result = worker.forward_backward(data, "cross_entropy")

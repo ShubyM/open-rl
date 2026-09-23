@@ -1,4 +1,4 @@
-# Training sessions and worker processes
+# Trainers and worker processes
 
 This is the first foundation change toward an exclusive AutoModel backend.
 It keeps the existing HF LoRA and full fine-tuning deployment modes. It does
@@ -6,17 +6,21 @@ not add AutoModel, torchrun, or a new scheduler mode.
 
 ## Ownership
 
-`training.session.TrainingSession` holds an already constructed model, the
-parameter objects to optimize and their optimizer state. It runs the
-existing forward/backward, optimizer, and local generation algorithms. It
+`training.trainer.Trainer` holds an already constructed model, the
+parameter objects to optimize (including pending gradients) and their
+optimizer state. It runs the existing forward/backward, optimizer, and local
+generation algorithms. It
 does not load models, select an accelerator, save files, or publish weights.
 Tests can construct it directly with a small CPU model.
 
-`LoraTrainingWorker` owns a shared base model and a session for each adapter.
+`LoraTrainingWorker` owns a shared base model and a trainer for each adapter.
 It selects the adapter before delegating a command; parameter references,
-pending gradients, and optimizer state remain separate across sessions.
-`FFTTrainingWorker` owns one session and the existing offload/delta state.
-Reloading a model creates a fresh session bound to the new parameters.
+pending gradients, and optimizer state remain separate across trainers.
+`FFTTrainingWorker` owns one trainer and the existing offload/delta state.
+Reloading a model creates a fresh trainer bound to the new parameters.
+The trainer holds references to existing parameters; it does not copy them.
+The API's client session still controls client lifetime and may own several
+models. It is distinct from a trainer's numerical state and a worker process.
 
 Model loading, checkpoint serialization, and the existing automatic LoRA
 publication remain explicit worker responsibilities. Separating resumable
@@ -44,6 +48,14 @@ offload path, or an explicitly resident model (`cpu_offload=False`); omitting
 the time slicer alone does not change a model's residency policy or reserve
 its GPU. Scheduler admission remains the launcher's responsibility.
 
+Sleep/wake belongs to the worker's accelerator resources: pausing a shared
+LoRA host would affect every adapter on it. A backend can initially stay
+resident and later support suspension without changing trainer identity.
+Cooperative tensor offload and external CUDA parking remain separate steps
+in the existing FFT path. A future backend must establish a safe command
+boundary across its ranks and preserve pending gradients as well as weights,
+optimizer state, buffers, and RNG before supporting suspension.
+
 Commands preserve their queue order, including saves between optimizer steps.
 Leased workers offload between contiguous compute and save groups and publish
 results after releasing the GPU. Resident workers publish each result as it
@@ -69,4 +81,5 @@ separate, reviewable step.
 Validation for this foundation is included in `make test`: CPU numerical
 references, adapter isolation, forward-only behavior, checkpoint reloads,
 dedicated/shared queue selection, FIFO saves, shutdown, and failure handling.
-GPU offload behavior remains covered only by the existing GPU test paths.
+These tests do not validate CUDA offload or distributed restoration; those
+require the GPU test paths.
