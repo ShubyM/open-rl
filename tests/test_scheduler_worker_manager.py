@@ -136,6 +136,15 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     env = {e["name"]: e.get("value") for e in trainer["spec"]["template"]["spec"]["containers"][0]["env"]}
     self.assertEqual(env["OPEN_RL_TRAIN_TOKEN_BUDGET"], "131072")
 
+  def test_sampler_gets_the_deployment_build_job_cap(self) -> None:
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    with patch.dict(os.environ, {"MAX_JOBS": "4"}), patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-lora-1", "sampler")
+
+    (sampler,) = self.api.created
+    env = {e["name"]: e.get("value") for e in sampler["spec"]["template"]["spec"]["containers"][0]["env"]}
+    self.assertEqual(env["MAX_JOBS"], "4")
+
   def test_launch_is_idempotent(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.worker_manager.get_state_store", return_value=s):

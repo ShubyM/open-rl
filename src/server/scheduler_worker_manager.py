@@ -126,7 +126,9 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
     "OPEN_RL_TIME_SLICE_JOB_ID": worker.name,
     "OPEN_RL_ACCEL_TIMESLICER_PORT": os.getenv("OPEN_RL_ACCEL_TIMESLICER_PORT", "9753"),
   }
-  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET"):
+  # MAX_JOBS caps FlashInfer's JIT build, which otherwise runs one ~3GB
+  # compiler per core and blows through the pod's host memory limit.
+  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
     if os.getenv(name):
       values[name] = os.environ[name]
   env: list[dict[str, Any]] = [{"name": name, "value": value} for name, value in values.items()]
