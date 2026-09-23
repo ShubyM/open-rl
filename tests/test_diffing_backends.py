@@ -52,7 +52,7 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
       return json.load(f)
 
   def test_streamed_diffing_optim_step_and_multi_save_idempotency(self):
-    """Verifies optim_step streams diff to _latest_delta_tensors and multiple saves read it non-destructively."""
+    """Verifies optim_step leaves the diff in pending_delta and multiple saves read it non-destructively."""
     worker = self._create_worker_and_modify()
     worker.weight_sync_strategy = "delta"
     worker.optim_step({})
@@ -77,7 +77,7 @@ class TestUniversalStreamedDiffing(unittest.TestCase):
     meta = self._read_metadata(save_dir)
 
     self.assertEqual(meta["changed_elements"], 0)
-    self.assertEqual(meta["total_elements"], worker.total_model_elements)
+    self.assertEqual(meta["total_elements"], sum(p.numel() for p in worker.model.parameters()))
     self.assertEqual(meta["layer_names"], [])
     self.assertEqual(meta["layer_shapes"], [])
 

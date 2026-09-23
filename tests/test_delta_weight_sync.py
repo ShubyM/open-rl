@@ -7,7 +7,7 @@ import unittest
 import torch
 import torch.nn as nn
 
-from training.fft_trainer_worker import FFTTrainingWorker
+from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker, SparseDelta
 
 
 class SimpleModel(nn.Module):
@@ -76,51 +76,40 @@ class DeltaWeightSyncTest(unittest.TestCase):
       "Lossless selective overwrite must produce bitwise identical tensors (0 ULP drift)",
     )
 
-    # 4. Verify worker's CPU shadow was updated to W1 so next step diffs correctly
-    self.assertTrue(
-      torch.equal(worker._param_shadow[worker.model.fc.weight][1], worker.model.fc.weight.data.cpu()),
-      "Worker shadow must be updated after delta save",
-    )
+    # 4. The baseline advanced to W1, so a step that changes nothing publishes nothing.
+    worker.optim_step({})
+    self.assertEqual(worker.pending_delta.changed_elements, 0, "Baseline must advance after a delta is taken")
 
   def test_weight_sync_strategy_selection(self):
     worker = FFTTrainingWorker()
-    self.assertEqual(worker.weight_sync_cfg.strategy, "delta")
-    worker.set_weight_sync_strategy("full")
-    self.assertEqual(worker.weight_sync_cfg.strategy, "full")
+    self.assertEqual(worker.weight_sync_strategy, "delta")
+    self.assertEqual(FFTConfig(weight_sync_strategy="full").weight_sync_strategy, "full")
     with self.assertRaises(ValueError):
-      worker.set_weight_sync_strategy("invalid_strategy")
+      FFTConfig(weight_sync_strategy="invalid_strategy")
 
   def test_save_state_delta_with_offloading(self):
-    """Test that save_state_delta() succeeds cleanly when model is offloaded (_is_offloaded=True and param.data size 0)."""
+    """save_state_delta publishes the pending delta while the worker is off the GPU, and refuses while it is on."""
     worker = FFTTrainingWorker()
     worker.base_model_name = "test-offload-model"
     worker.model = SimpleModel()
+    worker.prepare_model_for_training()
 
-    # Initialize shadow with base weights W0
-    worker._param_shadow = {param: (param.device, param.data.detach().cpu().clone()) for param in worker.model.parameters() if param.requires_grad}
-
-    # Simulate what optim_step() produces on GPU before offload_to_cpu() moves weights and sets _is_offloaded=True
-    w1_fc = worker.model.fc.weight.data.detach().cpu().clone()
-    w1_fc[1, 1] = 77.7
-    worker._param_shadow[worker.model.fc.weight] = (torch.device("cuda" if torch.cuda.is_available() else "cpu"), w1_fc)
-    worker._latest_delta_tensors = {
-      "names": ["fc.weight"],
-      "indices_list": [torch.tensor([1 * 10 + 1], dtype=torch.int32)],
-      "values_list": [torch.tensor([77.7], dtype=torch.float32)],
-    }
-    worker.model_layer_shapes = {"fc.weight": (10, 10)}
-    worker.total_model_elements = 100
-    worker._latest_total_changed = 1
-    worker._latest_total_elements = 100
-
-    # Simulate offload state where GPU param.data is set to 0-size tensor
-    worker._is_offloaded = True
-    worker.model.fc.weight.data = torch.empty(0, dtype=worker.model.fc.weight.dtype, device="cpu")
+    # What optim_step left behind before the lease was released.
+    worker.pending_delta = SparseDelta(
+      total_elements=100,
+      names=["fc.weight"],
+      shapes=[[10, 10]],
+      indices=[torch.tensor([1 * 10 + 1], dtype=torch.int32)],
+      values=[torch.tensor([77.7], dtype=torch.float32)],
+    )
 
     state_path = os.path.join(self.test_dir, "step_offload")
+    with self.assertRaises(RuntimeError):
+      worker.save_state_delta(model_id="test-model", state_path=state_path, kind="sampler")
+
+    worker.mirror.offloaded = True
     worker.save_state_delta(model_id="test-model", state_path=state_path, kind="sampler")
 
-    # Verify that delta.safetensors was cleanly saved from offloaded CPU buffer
     delta_file = os.path.join(state_path, "delta.safetensors")
     self.assertTrue(os.path.exists(delta_file))
     import safetensors.torch
@@ -129,6 +118,10 @@ class DeltaWeightSyncTest(unittest.TestCase):
     self.assertIn("0.indices", sparse_delta)
     self.assertEqual(sparse_delta["0.indices"].numel(), 1)
     self.assertAlmostEqual(sparse_delta["0.values"][0].item(), 77.7, places=4)
+    with open(os.path.join(state_path, "metadata.json")) as f:
+      meta = json.load(f)
+    self.assertEqual(meta["layer_shapes"], [[10, 10]])
+    self.assertEqual(meta["changed_elements"], 1)
 
 
 if __name__ == "__main__":

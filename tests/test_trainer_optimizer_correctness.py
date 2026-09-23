@@ -340,6 +340,7 @@ class TestTrainerOptimizerCorrectness(unittest.TestCase):
     worker = FFTTrainingWorker()
     worker.model = _FullModelStub([trainable_param, frozen_param])
     worker.trainable_params = fft_trainer_worker_module.trainable_model_parameters(worker.model)
+    worker.weight_sync_strategy = "full"  # the stub has no named_parameters to diff
 
     result = worker.optim_step(
       {
