@@ -5,9 +5,12 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from transformers import LlamaConfig, LlamaForCausalLM
 
 from server.training_requests_processor import build_worker
+from training import automodel_worker
 from training.automodel_worker import AutomodelTrainingWorker
+from training.trainer_worker import BaseTrainerWorker
 
 
 class ClipGradientsTest(unittest.TestCase):
@@ -52,6 +55,33 @@ class BuildWorkerTest(unittest.TestCase):
     # No mesh until load_base_model, so the base loop runs every datum.
     worker = AutomodelTrainingWorker()
     self.assertEqual((worker.shard_rank(), worker.shard_count()), (0, 1))
+
+
+class ChunkedLogprobsTest(unittest.TestCase):
+  """Chunked projection from hidden states matches the full-logits path, values and gradients."""
+
+  def test_matches_full_logits(self) -> None:
+    torch.manual_seed(0)
+    config = LlamaConfig(vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2)
+    model = LlamaForCausalLM(config)
+    input_ids = torch.randint(0, 64, (2, 7))
+    attention_mask = torch.ones_like(input_ids)
+    attention_mask[1, 5:] = 0
+    targets = torch.randint(0, 64, (2, 7))
+
+    def logprobs_and_grad(compute):
+      model.zero_grad()
+      logprobs = compute(model, input_ids, attention_mask, targets)
+      logprobs[attention_mask.bool()].sum().backward()
+      return logprobs.detach(), model.model.embed_tokens.weight.grad.clone()
+
+    expected, expected_grad = logprobs_and_grad(BaseTrainerWorker().compute_target_logprobs)
+    with patch.object(automodel_worker, "LOGPROB_CHUNK", 3):
+      actual, actual_grad = logprobs_and_grad(AutomodelTrainingWorker().compute_target_logprobs)
+
+    mask = attention_mask.bool()
+    torch.testing.assert_close(actual[mask], expected[mask])
+    torch.testing.assert_close(actual_grad, expected_grad)
 
 
 if __name__ == "__main__":

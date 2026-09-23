@@ -3,6 +3,10 @@
 Automodel builds a (dp, tp) FSDP2 mesh from the torchrun world; DP is what is
 left after TP. Only the DP axis shards datums, since TP ranks cooperate on one
 sequence and must see identical data. The shard_* hooks scope to that axis.
+
+Long sequences fit because layers are checkpointed in groups and logprobs are
+projected from the final hidden states in chunks, so full [seq, vocab] logits
+never exist.
 """
 
 import json
@@ -15,6 +19,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.utils.checkpoint
 from pydantic import BaseModel
 from transformers import AutoConfig, AutoTokenizer
 
@@ -36,6 +41,14 @@ AUTOMODEL_LORA_TARGETS = os.getenv(
   "q_proj,k_proj,v_proj,o_proj,in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj,gate_proj,up_proj,down_proj",
 )
 
+# Decoder layers per activation checkpoint. Automodel's own checkpointing wraps
+# attention and MLP separately and stashes four tensors per layer; a group of
+# whole layers stashes one. 0 turns it off.
+RECOMPUTE_NUM_LAYERS = int(os.getenv("OPEN_RL_AUTOMODEL_RECOMPUTE_NUM_LAYERS", "4"))
+# Rows of hidden states projected through the vocab at a time. 1024 rows of a
+# 248k vocab is a 1 GiB fp32 chunk.
+LOGPROB_CHUNK = int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "1024"))
+
 
 def require_automodel():
   try:
@@ -52,6 +65,59 @@ def is_dtensor(tensor: Any) -> bool:
   from torch.distributed.tensor import DTensor
 
   return isinstance(tensor, DTensor)
+
+
+def chunk_target_logprob(hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor, softcap: float | None) -> torch.Tensor:
+  """logit[target] - logsumexp for one chunk of hidden states."""
+  logits = torch.nn.functional.linear(hidden, weight).float()
+  if softcap is not None:
+    logits = softcap * torch.tanh(logits / softcap)
+  return logits.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
+
+
+class LayerGroup:
+  """Runs a run of decoder layers under one non-reentrant checkpoint."""
+
+  def __init__(self, layers: list[torch.nn.Module]):
+    self.layers = layers
+
+  def run(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+    for layer in self.layers:
+      x = layer(x, **kwargs)
+    return x
+
+  def __call__(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+    if not torch.is_grad_enabled():
+      return self.run(x, **kwargs)
+    return torch.utils.checkpoint.checkpoint(self.run, x, use_reentrant=False, **kwargs)
+
+
+class GroupCheckpointedLayers(torch.nn.ModuleDict):
+  """Automodel's native backbones run `for layer in self.layers.values()`.
+  Swapping this class in after sharding changes only that iteration, so
+  parameter names and FSDP2 units are untouched."""
+
+  group_size = 1
+
+  def values(self):
+    layers = list(self._modules.values())
+    if not self.training:
+      return iter(layers)
+    return iter([LayerGroup(layers[start : start + self.group_size]) for start in range(0, len(layers), self.group_size)])
+
+
+def install_group_checkpointing(model: torch.nn.Module, group_size: int) -> None:
+  """Native backbones keep a ModuleDict of layers and get grouped checkpoints.
+  A stock HF backbone keeps a ModuleList and gets HF's per-layer checkpointing."""
+  backbone = model.model.language_model if hasattr(model.model, "language_model") else model.model
+  layers = getattr(backbone, "layers", None)
+  if isinstance(layers, torch.nn.ModuleDict):
+    layers.__class__ = GroupCheckpointedLayers
+    layers.group_size = group_size
+  elif isinstance(layers, torch.nn.ModuleList) and hasattr(model, "gradient_checkpointing_enable"):
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+  else:
+    raise RuntimeError(f"No decoder layers to checkpoint on {type(backbone).__name__}; set OPEN_RL_AUTOMODEL_RECOMPUTE_NUM_LAYERS=0.")
 
 
 class AutomodelConfig(BaseModel):
@@ -164,6 +230,11 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     if self.distributed_setup is None:
       self.distributed_setup = self.build_distributed_setup(base_model_name)
       self.device_mesh = self.distributed_setup.mesh_context.device_mesh
+    # Qwen3.5 ships a multi-token-prediction head that would run over the whole
+    # sequence on every forward; the loss never reads it.
+    extra = {}
+    if AutoConfig.from_pretrained(base_model_name).get_text_config().model_type.startswith("qwen3_5"):
+      extra["num_nextn_predict_layers"] = 0
     # from_pretrained applies LoRA before FSDP2 shards anything, loads the base
     # weights and freezes all but the adapters.
     self.model = NeMoAutoModelForCausalLM.from_pretrained(
@@ -172,7 +243,10 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       use_liger_kernel=False,
       distributed_setup=self.distributed_setup,
       peft_config=self.build_peft_config() if self.is_lora else None,
+      **extra,
     )
+    if RECOMPUTE_NUM_LAYERS > 0:
+      install_group_checkpointing(self.model, RECOMPUTE_NUM_LAYERS)
     print(f"Loaded Automodel {base_model_name} (LoRA rank {AUTOMODEL_LORA_RANK}).")
 
   def create_model(self, base_model_name: str, model_id: str | None = None, config: AutomodelConfig | None = None) -> None:
@@ -191,6 +265,34 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
   ) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     return super().forward_backward(self.model, data, loss_fn, loss_config, forward_only=forward_only)
+
+  def compute_target_logprobs(
+    self, model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, target_token_ids: torch.Tensor
+  ) -> torch.Tensor:
+    seq_len = target_token_ids.shape[1]
+    # An all-ones mask is plain causal attention; dropping it lets SDPA use flash.
+    if attention_mask is not None and bool(attention_mask.all()):
+      attention_mask = None
+    outputs = model(input_ids=input_ids[:, :seq_len], attention_mask=attention_mask, use_cache=False, logits_to_keep=1, output_hidden_states=True)
+    hidden = outputs.hidden_states[-1][:, :seq_len]
+    if is_dtensor(hidden):
+      hidden = hidden.full_tensor()
+    head = model.get_output_embeddings()
+    weight = head.weight.full_tensor() if is_dtensor(head.weight) else head.weight
+    softcap = getattr(model.config.get_text_config(), "final_logit_softcapping", None)
+
+    batch = hidden.shape[0]
+    flat_hidden = hidden.reshape(batch * seq_len, -1)
+    flat_targets = target_token_ids.reshape(batch * seq_len)
+    chunks = []
+    for start in range(0, flat_hidden.shape[0], LOGPROB_CHUNK):
+      args = (flat_hidden[start : start + LOGPROB_CHUNK], weight, flat_targets[start : start + LOGPROB_CHUNK], softcap)
+      chunks.append(
+        torch.utils.checkpoint.checkpoint(chunk_target_logprob, *args, use_reentrant=False)
+        if torch.is_grad_enabled()
+        else chunk_target_logprob(*args)
+      )
+    return torch.cat(chunks).reshape(batch, seq_len)
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
