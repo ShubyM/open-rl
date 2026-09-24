@@ -20,7 +20,6 @@ from server.model_metadata import WeightSyncConfig, get_model_metadata
 from server.store import RequestStore, get_state_store, get_store
 from training import commands
 from training.commands import parse_command
-from training.trained_weights import park, unpark, write
 from training.trainer_worker import TrainerWorker
 from training.weight_delta import SparseWeightDelta
 
@@ -84,9 +83,6 @@ class TrainingRequestsProcessor:
     self.time_slicer = time_slicer
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM) if time_slicer else None
     self.snapshot_registered = False
-    # Between time-slicer turns the worker's tensors are parked on the host.
-    # FFTConfig.cpu_offload=False keeps them on the device instead.
-    self.offload = True
     self.weight_sync = WeightSyncConfig.from_env()
     self.deltas: dict[str, SparseWeightDelta] = {}
 
@@ -196,18 +192,16 @@ class TrainingRequestsProcessor:
 
     if gpu_reqs:
       async with self.time_slicer.acquire(self.workload):
-        if self.offload:
-          await asyncio.to_thread(unpark, self.worker.tensors())
+        await asyncio.to_thread(self.worker.wake_up)
         try:
           for request in gpu_reqs:
             results.append(await self.handle_request(request))
         finally:
-          if self.offload:
-            await asyncio.to_thread(park, self.worker.tensors())
+          await asyncio.to_thread(self.worker.sleep)
 
     if not save_reqs:
       return
-    if self.offload:
+    if self.worker.cpu_offload:
       for request in save_reqs:
         results.append(await self.handle_request(request))
     else:
@@ -247,10 +241,10 @@ class TrainingRequestsProcessor:
       case commands.CreateModel():
         is_lora = command.fine_tuning_type == "lora"
         if not is_lora:
-          self.offload = command.full_config.cpu_offload
+          self.worker.cpu_offload = command.full_config.cpu_offload
           self.set_weight_sync_strategy(command.full_config.weight_sync_strategy)
         config = command.lora_config if is_lora else command.full_config
-        await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, command.lora_config if is_lora else None, config.seed)
+        await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, config)
         await asyncio.to_thread(self.track_new_weights, command.model_id)
         result = {
           "base_model": command.base_model,
@@ -289,7 +283,7 @@ class TrainingRequestsProcessor:
       case commands.Sample():
         raise NotImplementedError("Sampling from the trainer is not supported; sample through the vLLM sampler.")
       case commands.SaveState():
-        await asyncio.to_thread(self.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
+        await asyncio.to_thread(self.worker.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
         return {"path": command.state_path, "type": "state_saved"}
       case commands.LoadWeights():
         await asyncio.to_thread(self.worker.load_state, command.model_id, command.state_path, command.restore_optimizer)
@@ -317,42 +311,27 @@ class TrainingRequestsProcessor:
 
   def track_new_weights(self, model_id: str) -> None:
     """A model_id just got weights. Export a LoRA adapter so the sampler can load it, or start diffing full weights."""
-    trained = self.worker.models[model_id]
-    if trained.lora_config is not None:
+    model = self.worker.models[model_id]
+    if model.is_lora:
       self.export_adapter(model_id)
     elif self.weight_sync.strategy == "delta":
-      self.deltas[model_id] = SparseWeightDelta(trained.weights, getattr(self.worker.base.module, "config", None), self.weight_sync.delta_format)
+      self.deltas[model_id] = SparseWeightDelta(model.params, getattr(model.module, "config", None), self.weight_sync.delta_format)
 
   def track_step(self, model_id: str) -> None:
-    trained = self.worker.models[model_id]
-    if trained.lora_config is not None:
+    model = self.worker.models[model_id]
+    if model.is_lora:
       self.export_adapter(model_id)
     elif model_id in self.deltas:
-      self.deltas[model_id].record(trained.weights)
+      self.deltas[model_id].record(model.params)
 
   def export_adapter(self, model_id: str) -> None:
     """The LoRA sampler hot-loads adapters from this directory, so every change lands there."""
-    write(self.worker.models[model_id], os.path.join(tmp_dir(), "peft", model_id), base_model=self.worker.base.name, model_id=model_id, kind="weights")
-
-  def save_state(self, model_id: str, state_path: str, include_optimizer: bool, kind: str) -> None:
-    trained = self.worker.models[model_id]
-    full = trained.lora_config is None
-    write(
-      trained,
-      state_path,
-      base_model=self.worker.base.name,
-      model_id=model_id,
-      with_adam=include_optimizer,
-      kind=kind,
-      hf_config=getattr(self.worker.base.module, "config", None) if full else None,
-      tokenizer=self.worker.base.tokenizer if full else None,
-    )
-    print(f"Saved state for '{model_id}' to {state_path}")
+    self.worker.save_state(model_id, os.path.join(tmp_dir(), "peft", model_id), kind="weights")
 
   def save_for_sampler(self, model_id: str, ref: str | None) -> str | None:
     """Full weights go under a versioned path the samplers reload from. A LoRA
     adapter is hot-loaded from its export directory, so there is no checkpoint to announce."""
-    if self.worker.models[model_id].lora_config is not None:
+    if self.worker.models[model_id].is_lora:
       self.export_adapter(model_id)
       return None
     if not ref:
@@ -360,9 +339,9 @@ class TrainingRequestsProcessor:
     rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
     local_path = os.path.join(tmp_dir(), "sampler_full", rel_path)
     if model_id in self.deltas:
-      self.deltas[model_id].write(local_path, base_model=self.worker.base.name, model_id=model_id)
+      self.deltas[model_id].write(local_path, base_model=self.worker.base_name, model_id=model_id)
     else:
-      self.save_state(model_id, local_path, False, "sampler")
+      self.worker.save_state(model_id, local_path, False, "sampler")
     return local_path
 
   async def publish_checkpoint(self, model_id: str, local_path: str) -> None:
