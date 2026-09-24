@@ -99,7 +99,8 @@ class LoraExportTest(unittest.IsolatedAsyncioTestCase):
       processor = TrainingRequestsProcessor(store, worker)
       command = commands.SaveWeightsForSampler(request_id="export", model_id="a", sampling_session_id="tinker://a/sampler_weights/sampler-0")
       with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": str(unusable_root)}):
-        await processor.process_request(commands.wire(command))
+        await store.put_request(commands.wire(command))
+        await processor.run_once()
 
       result = store.futures_store["export"]
       self.assertEqual(result["type"], "RequestFailedResponse")

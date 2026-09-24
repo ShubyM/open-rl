@@ -28,7 +28,7 @@ redis-server --port 6379 --save "" --appendonly no
 REDIS_URL=redis://127.0.0.1:6379 \
 OPEN_RL_ENABLE_FFT=true \
 BASE_MODEL=Qwen/Qwen2.5-0.5B \
-SAMPLING_BACKEND=torch \
+REDIS_URL=redis://127.0.0.1:6379/0 \
 uv run --extra gpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
 ```
 

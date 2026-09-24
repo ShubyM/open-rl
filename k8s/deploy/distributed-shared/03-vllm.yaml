@@ -34,9 +34,8 @@ spec:
       - name: vllm
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: Always
-        # Pull-mode LoRA sampler: drains the per-base-model sampling queue from
-        # Redis (the HTTP vllm_sampler:app entrypoint no longer exists).
-        command: ["uv", "run", "python", "-u", "-m", "server.lora_sampler", "--model-id", "$(BASE_MODEL)"]
+        # Pull-mode LoRA sampler: drains the per-base-model sampling queue from Redis.
+        command: ["uv", "run", "python", "-u", "-m", "server.vllm_sampler", "--model-id", "$(BASE_MODEL)"]
         env:
         - name: BASE_MODEL
           valueFrom:

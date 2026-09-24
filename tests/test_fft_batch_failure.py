@@ -67,21 +67,20 @@ class FFTBatchFailureTest(unittest.TestCase):
     store = BatchStore([{"request_id": "sv-1", "op": "save_state"}])
     slicer = SlicerStub()
     proc = processor(store, slicer)
-    exits = []
-
-    async def record_exit(unregister=True):
-      exits.append(unregister)
 
     async def handled(request):
       slicer.faulted = "checkpoint failed for workload run-a; it still holds the accelerator and must exit"
       return request["request_id"], {"type": "SaveWeightsResponse"}
 
     proc.handle_request = handled
-    proc.exit_gracefully = record_exit
-    with patch.object(proc.worker, "wake_up"), self.assertRaisesRegex(RuntimeError, "checkpoint failed"):
+    with (
+      patch.object(proc.worker, "wake_up"),
+      patch("server.training_requests_processor.os._exit") as exit_worker,
+      self.assertRaisesRegex(RuntimeError, "checkpoint failed"),
+    ):
       asyncio.run(proc.run_once())
     self.assertEqual(store.futures["sv-1"]["type"], "SaveWeightsResponse")
-    self.assertEqual(exits, [False])
+    exit_worker.assert_called_once_with(0)
 
 
 if __name__ == "__main__":

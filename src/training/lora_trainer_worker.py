@@ -275,24 +275,3 @@ class LoraTrainingWorker:
     if adapter.optimizer is None:
       adapter.optimizer = hf_operations.build_optimizer(adapter.params, adam_params)
     return {"metrics": hf_operations.optim_step(adapter.optimizer, adam_params)}
-
-  def generate(
-    self,
-    prompt_tokens: list[int],
-    max_tokens: int,
-    num_samples: int = 1,
-    temperature: float = 0.0,
-    model_id: str | None = None,
-    include_prompt_logprobs: bool = False,
-  ) -> dict[str, Any]:
-    self.adapter_for(model_id)
-    return hf_operations.generate(
-      self.peft_model,
-      prompt_tokens,
-      max_tokens,
-      num_samples,
-      temperature,
-      include_prompt_logprobs,
-      tokenizer=self.tokenizer,
-      device=self.device,
-    )

@@ -406,7 +406,7 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
     self.assertEqual(mock_popen.call_count, 1)
 
     cmd_args = mock_popen.call_args[0][0]
-    self.assertIn("server.lora_sampler", cmd_args)
+    self.assertIn("server.vllm_sampler", cmd_args)
     self.assertEqual(cmd_args[-2:], ["--model-id", "Qwen/Qwen2.5-0.5B"])
 
     # Launch for second LoRA model ID sharing the same base model

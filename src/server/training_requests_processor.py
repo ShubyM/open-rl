@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
 import shutil
 import threading
@@ -58,9 +57,8 @@ def describe_requests(batch: list[dict[str, Any]]) -> str:
   return ", ".join(f"{r.get('op')}:{r.get('request_id')}" for r in batch)
 
 
-# Sampler weight versions kept on the volume. The sampler applies each delta
-# as it lands, so older versions are dead weight; an 8B run otherwise leaves
-# 3 GiB per step behind.
+# Limit sampler artifacts retained on the shared volume. Incremental deltas
+# still require consumers to apply each export in order before it is pruned.
 SAMPLER_VERSIONS_KEPT = int(os.getenv("OPEN_RL_SAMPLER_VERSIONS_KEPT", "3"))
 
 
@@ -129,21 +127,6 @@ class TrainingRequestsProcessor:
         finally:
           await self.time_slicer.close()
 
-  async def exit_gracefully(self, unregister: bool = True) -> None:
-    print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
-    if unregister and self.time_slicer is not None and self.snapshot_registered:
-      try:
-        await self.time_slicer.unregister(self.workload)
-        self.snapshot_registered = False
-      except Exception as exc:
-        print(f"[WORKER] Failed to unregister: {exc}")
-    if self.time_slicer is not None:
-      try:
-        await self.time_slicer.close()
-      except Exception:
-        pass
-    os._exit(0)
-
   async def next_batch(self) -> list[dict[str, Any]]:
     if self.model_id is not None:
       return await self.store.get_requests_for_model(self.model_id)
@@ -161,55 +144,40 @@ class TrainingRequestsProcessor:
     model_id = batch[0].get("model_id", "default")
 
     results: list[tuple[str | None, dict[str, Any]]] = []
-    failure: Exception | None = None
+    failure: Exception | asyncio.CancelledError | None = None
     with tracer.start_as_current_span("training_requests_batch") as batch_span:
       batch_span.set_attribute("batch_size", len(work))
       batch_span.set_attribute("model_id", model_id)
       if work:
         print(f"\n[TRAINING REQUESTS] Popped {len(work)} requests for model: {model_id}: {describe_requests(work)}")
-        results, failure = await self.answer_batch(work)
+        try:
+          async with self.execution():
+            for request in work:
+              results.append(await self.handle_request(request))
+        except (Exception, asyncio.CancelledError) as exc:
+          failure = exc
+          error = {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {str(exc) or type(exc).__name__}"}
+          results.extend((request.get("request_id"), error) for request in work[len(results) :])
 
-    for request_id, result in results:
-      if request_id is not None:
-        await self.store.set_future(request_id, result)
     if shutdown:
       # A dedicated process ends after its model is deleted, whether or not
       # it uses leases. Answer every popped request before any fatal exit.
       self.stopping = self.model_id is not None
       for request in batch[shutdown_index + 1 :]:
-        if request_id := request.get("request_id"):
-          await self.store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": "Trainer model has been shut down"})
-    if self.time_slicer is not None and self.time_slicer.faulted:
-      # This process still holds the accelerator. Exit without unregistering so
-      # the grant moves on only once the memory is gone. Exit 0 keeps the pod
-      # from restarting on fresh weights mid-run; the run fails on its next call.
-      print(f"[WORKER] Time slicer could not park this process: {self.time_slicer.faulted}. Exiting to free the accelerator.")
-      await self.exit_gracefully(unregister=False)
+        results.append((request.get("request_id"), {"type": "RequestFailedResponse", "error_message": "Trainer model has been shut down"}))
+    try:
+      for request_id, result in results:
+        if request_id is not None:
+          await self.store.set_future(request_id, result)
+    finally:
+      if self.time_slicer is not None and self.time_slicer.faulted:
+        # The process still holds the accelerator. Exit without unregistering,
+        # even if publishing failed, so the grant waits until its memory is gone.
+        # Exit 0 prevents a restart on fresh weights in the middle of the run.
+        print(f"[WORKER] Time slicer could not park this process: {self.time_slicer.faulted}. Exiting to free the accelerator.")
+        os._exit(0)
     if failure is not None:
       raise failure
-
-  async def answer_batch(self, requests: list[dict[str, Any]]) -> tuple[list[tuple[str | None, dict[str, Any]]], Exception | None]:
-    """Every request gets an answer: its result, or the failure that stopped the batch."""
-    results: list[tuple[str | None, dict[str, Any]]] = []
-    try:
-      async with self.execution():
-        for request in requests:
-          result = await self.handle_request(request)
-          request_id, response = result
-          if self.time_slicer is None and request_id is not None:
-            await self.store.set_future(request_id, response)
-          results.append(result)
-    except Exception as exc:
-      published = len(results) if self.time_slicer is None else 0
-      answered = {request_id for request_id, _ in results}
-      for request in requests:
-        request_id = request.get("request_id")
-        if request_id and request_id not in answered:
-          results.append((request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
-      return results[published:], exc
-    # Resident workers publish immediately; leased workers publish only once
-    # the device has been released. Return just the answers still to publish.
-    return ([] if self.time_slicer is None else results), None
 
   @asynccontextmanager
   async def execution(self):
@@ -225,11 +193,6 @@ class TrainingRequestsProcessor:
         await call_backend(self.suspension.sleep)
     if self.time_slicer.faulted:
       raise TimeSlicerFault(self.time_slicer.faulted)
-
-  async def process_request(self, raw_request: dict[str, Any]) -> None:
-    request_id, result = await self.handle_request(raw_request)
-    if request_id is not None:
-      await self.store.set_future(request_id, result)
 
   async def handle_request(self, raw_request: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     request_id = raw_request.get("request_id")
@@ -293,18 +256,6 @@ class TrainingRequestsProcessor:
         result = await call_backend(self.worker.optim_step, command.adam_params, command.model_id)
         result["type"] = "optim_step_completed"
         return result
-      case commands.Sample():
-        result = await call_backend(
-          self.worker.generate,
-          command.prompt_tokens,
-          command.max_tokens,
-          command.num_samples,
-          command.temperature,
-          command.model_id,
-          command.prompt_logprobs,
-        )
-        result["type"] = "sample_completed"
-        return result
       case commands.SaveState():
         result = await call_backend(self.worker.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
         return {"path": result.get("path", command.state_path), "type": "state_saved"}
@@ -315,23 +266,13 @@ class TrainingRequestsProcessor:
         ref = command.path or command.sampling_session_id
         checkpoint = await call_backend(self.worker.save_for_sampler, command.model_id, command.alias, ref)
         if checkpoint:
-          await self.publish_checkpoint(command.model_id, checkpoint)
+          for path in older_versions(checkpoint, SAMPLER_VERSIONS_KEPT):
+            shutil.rmtree(path, ignore_errors=True)
         return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved"}
       case commands.Shutdown():
         return {"status": "ok", "type": "shutdown_acknowledged"}
       case _:
         raise NotImplementedError(f"Training request op {command.op!r} is not supported")
-
-  async def publish_checkpoint(self, model_id: str, local_path: str) -> None:
-    """Tell the samplers about a new checkpoint and drop the versions they no longer need."""
-    if hasattr(self.store, "redis"):
-      num_subs = await self.store.redis.publish(f"open_rl:weight_update:{model_id}", json.dumps({"weights_path": local_path}))
-      print(f"[Trainer] Published weight update signal to {num_subs} subscribers for version path: {local_path}")
-    older = older_versions(local_path, SAMPLER_VERSIONS_KEPT)
-    for path in older:
-      shutil.rmtree(path, ignore_errors=True)
-    if older:
-      print(f"[Trainer] Removed {len(older)} sampler weight versions older than the newest {SAMPLER_VERSIONS_KEPT}")
 
 
 async def run_training_requests_processor(

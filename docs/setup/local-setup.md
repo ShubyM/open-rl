@@ -74,15 +74,7 @@ python3 examples/text-to-sql/utils/sanity_check.py
 
 All commands below assume you are in the **repository root** directory.
 
-### 1. Patch vLLM
-
-Patch vLLM for Gemma 4 LoRA support.
-
-```bash
-uv run --extra vllm python src/server/scripts/patch_vllm_lora_dedup.py
-```
-
-### 2. Start the OpenRL Server
+### 1. Start the OpenRL Server
 
 The API server now launches a dedicated trainer and vLLM sampler process per model
 on demand (they share request queues and futures through Redis), so a single
@@ -91,7 +83,6 @@ terminal starts everything:
 ```bash
 export REDIS_URL=redis://127.0.0.1:6379/0
 export BASE_MODEL=google/gemma-4-e2b
-export SAMPLING_BACKEND=vllm
 export VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM
 export TRAINER_CUDA_VISIBLE_DEVICES=0
 export SAMPLER_CUDA_VISIBLE_DEVICES=1

@@ -51,15 +51,6 @@ class OptimStep(Command):
   adam_params: dict[str, Any] = {}
 
 
-class Sample(Command):
-  op: Literal["sample"] = "sample"
-  prompt_tokens: list[int]
-  max_tokens: int = 20
-  num_samples: int = 1
-  temperature: float = 1.0
-  prompt_logprobs: bool = False
-
-
 class SaveState(Command):
   op: Literal["save_state"] = "save_state"
   state_path: str
@@ -91,7 +82,6 @@ TrainingCommand = Annotated[
   | CreateModelFromState
   | ForwardBackward
   | OptimStep
-  | Sample
   | SaveState
   | LoadWeights
   | SaveWeightsForSampler

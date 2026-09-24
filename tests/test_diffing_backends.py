@@ -1,45 +1,49 @@
 """Export format compatibility and the separation from GPU offload storage."""
 
+import json
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
+import safetensors.torch
 import torch
 
 from server.model_metadata import WeightSyncConfig
 from tests.test_delta_weight_sync import TwoWeights, apply_export, model_weights
 from training.fft_trainer_worker import FFTTrainingWorker
-from training.weight_export import remap_hf_to_vllm_fused
 
 
 class SamplerExportFormatTest(unittest.TestCase):
-  def test_fused_names_preserve_weight_and_bias_offsets(self):
-    model = TwoWeights()
-    model.config = SimpleNamespace(hidden_size=4, num_attention_heads=2, num_key_value_heads=1, head_dim=2, intermediate_size=8)
-    names = [
-      "model.layers.0.self_attn.q_proj.weight",
-      "model.layers.0.self_attn.k_proj.weight",
-      "model.layers.0.self_attn.v_proj.bias",
-      "model.layers.0.mlp.up_proj.weight",
-    ]
-    indices = [torch.tensor([1], dtype=torch.int64) for _ in names]
-    mapped, offsets = remap_hf_to_vllm_fused(model, names, indices)
-    self.assertEqual(mapped[0], "model.layers.0.self_attn.qkv_proj.weight")
-    self.assertEqual(mapped[1], mapped[0])
-    self.assertEqual(mapped[2], "model.layers.0.self_attn.qkv_proj.bias")
-    self.assertEqual(mapped[3], "model.layers.0.mlp.gate_up_proj.weight")
-    self.assertEqual([value.item() for value in offsets], [1, 17, 7, 33])
-    self.assertTrue(all(value.dtype == torch.int64 for value in offsets))
-    self.assertEqual([value.item() for value in indices], [1, 1, 1, 1])
+  def test_native_coordinates_preserve_shapes_biases_and_mixed_dtypes(self):
+    model = torch.nn.Module()
+    model.q_proj = torch.nn.Linear(3, 2).to(torch.bfloat16)
+    model.norm = torch.nn.LayerNorm(2)
+    worker = FFTTrainingWorker(model=model, device="cpu", cpu_offload=False, weight_sync_cfg=WeightSyncConfig())
+    sampler = model_weights(model)
+    with torch.no_grad():
+      model.q_proj.weight[1, 2] = 5.0
+      model.q_proj.bias[1] = 7.0
+      model.norm.weight[0] = 1.125
+
+    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"OPEN_RL_TMP_DIR": directory}):
+      path = worker.save_for_sampler("job", None, "tinker://job/sampler_weights/native")
+      with open(os.path.join(path, "metadata.json")) as file:
+        metadata = json.load(file)
+      delta = safetensors.torch.load_file(os.path.join(path, "delta.safetensors"))
+      self.assertEqual(metadata["format_version"], 2)
+      self.assertEqual(metadata["layer_names"], ["q_proj.weight", "q_proj.bias", "norm.weight"])
+      self.assertEqual(metadata["layer_shapes"], [[2, 3], [2], [2]])
+      self.assertEqual([delta[f"{i}.indices"].tolist() for i in range(3)], [[5], [1], [0]])
+      self.assertEqual([delta[f"{i}.values"].dtype for i in range(3)], [torch.bfloat16, torch.bfloat16, torch.float32])
+      apply_export(path, sampler)
+    for name, param in model.named_parameters():
+      torch.testing.assert_close(sampler[name], param.detach(), rtol=0, atol=0)
 
   @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA to exercise physical offload")
   def test_sleep_wake_preserves_unexported_updates_and_optimizer_identity(self):
     model = TwoWeights().cuda()
-    worker = FFTTrainingWorker(
-      model=model, device="cuda", cpu_offload=True, base_model_name="tiny", weight_sync_cfg=WeightSyncConfig(delta_format="native")
-    )
+    worker = FFTTrainingWorker(model=model, device="cuda", cpu_offload=True, base_model_name="tiny", weight_sync_cfg=WeightSyncConfig())
     sampler = model_weights(model)
     model.first.grad = torch.tensor([1.0, 0.0], device="cuda")
     worker.optim_step({"learning_rate": 0.1})

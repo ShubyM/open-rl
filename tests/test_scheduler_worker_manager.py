@@ -83,7 +83,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     t_container = trainer["spec"]["template"]["spec"]["containers"][0]
     s_container = sampler["spec"]["template"]["spec"]["containers"][0]
     self.assertEqual(t_container["command"][-1], "server.training_requests_processor")
-    self.assertEqual(s_container["command"][-1], "server.lora_sampler")
+    self.assertEqual(s_container["command"][-1], "server.vllm_sampler")
     self.assertEqual(t_container["args"], ["--active-tenant-set-id", "Qwen/Qwen2.5-0.5B-1"])
     self.assertEqual(s_container["args"], ["--model-id", "Qwen/Qwen2.5-0.5B"])
 
@@ -233,7 +233,7 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(len(api.created), 2, "LoRA sessions should reuse one sampler while FFT gets its own")
     lora, fft = api.created
     self.assertEqual(lora["spec"]["trainingKind"], "lora")
-    self.assertEqual(lora["spec"]["template"]["spec"]["containers"][0]["command"][-1], "server.lora_sampler")
+    self.assertEqual(lora["spec"]["template"]["spec"]["containers"][0]["command"][-1], "server.vllm_sampler")
     self.assertEqual(fft["spec"]["trainingKind"], "fft")
     self.assertEqual(fft["metadata"]["name"], "fft-fft-a-sampler")
 

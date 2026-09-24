@@ -1,70 +1,43 @@
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from server.store import StateStore
 from training.types import FFTConfig, FineTuningType, LoraConfig
 
+SPARSE_DELTA_VERSION = 2
+
 
 @dataclass
 class WeightSyncConfig:
+  """How the trainer exports weights: sparse deltas or full checkpoints.
+  The sampler reads the file format and applies either."""
+
   strategy: str = "delta"
-  delta_format: str = "vllm_fused"
-  delta_apply_method: str = "patch_in_place"
 
   @classmethod
-  def from_env(cls, env: Any = None) -> "WeightSyncConfig":
+  def from_env(cls, env: Mapping[str, str] | None = None) -> "WeightSyncConfig":
     """Reconstruct WeightSyncConfig dataclass from environment variables inside a worker process."""
-    get_val = (env.get if hasattr(env, "get") else None) or os.getenv
+    get_val = (os.environ if env is None else env).get
 
     strategy = (get_val("OPEN_RL_WEIGHT_SYNC_STRATEGY") or "delta").lower()
     if strategy not in ("delta", "full"):
       strategy = "delta"
-
-    delta_fmt = (get_val("OPEN_RL_WEIGHT_SYNC_DELTA_FORMAT") or "vllm_fused").lower()
-    if delta_fmt not in ("vllm_fused", "native"):
-      delta_fmt = "vllm_fused"
-
-    apply_method = (get_val("OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD") or "patch_in_place").lower()
-    if apply_method not in ("patch_in_place", "full_replace"):
-      apply_method = "patch_in_place"
-
-    return cls(
-      strategy=strategy,
-      delta_format=delta_fmt,
-      delta_apply_method=apply_method,
-    )
+    return cls(strategy=strategy)
 
 
-def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
+def extract_weight_sync_config(headers: Mapping[str, str] | None = None) -> WeightSyncConfig:
   """Extract and normalize WeightSyncConfig from HTTP headers with single-location defaults."""
   if not headers:
     return WeightSyncConfig()
 
-  get_header = headers.get if hasattr(headers, "get") else (lambda k, default=None: default)
-
-  strategy = (get_header("x-open-rl-weight-sync-strategy") or "delta").lower()
+  strategy = (headers.get("x-open-rl-weight-sync-strategy") or "delta").lower()
   if strategy not in ("delta", "full"):
     strategy = "delta"
-
-  delta_fmt = (get_header("x-open-rl-weight-sync-delta-format") or get_header("x-open-rl-weight-sync-format") or "vllm_fused").lower()
-  if delta_fmt not in ("vllm_fused", "native"):
-    delta_fmt = "vllm_fused"
-
-  delta_apply_method = (
-    get_header("x-open-rl-weight-sync-delta-apply-method") or get_header("x-open-rl-weight-sync-apply-method") or "patch_in_place"
-  ).lower()
-  if delta_apply_method not in ("patch_in_place", "full_replace"):
-    delta_apply_method = "patch_in_place"
-
-  return WeightSyncConfig(
-    strategy=strategy,
-    delta_format=delta_fmt,
-    delta_apply_method=delta_apply_method,
-  )
+  return WeightSyncConfig(strategy=strategy)
 
 
 class TrainingModelMetadata(BaseModel):

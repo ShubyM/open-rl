@@ -6,19 +6,19 @@
 	kind-client kind-e2e kind-status kind-logs kind-prune kind-delete
 
 # ---------------------------------------------------------------------------
-# Knobs (override on the command line: make server BASE_MODEL=... SAMPLING_BACKEND=...)
+# Knobs (override on the command line: make server BASE_MODEL=...)
 # ---------------------------------------------------------------------------
 # The HuggingFace base model checkpoint loaded by the server and training workers
 BASE_MODEL     ?= google/gemma-4-e2b
-# The backend used for sampling ("torch" for local inference, or "vllm" for optimized remote inference)
-SAMPLING_BACKEND ?= torch
+# The API, trainers, and samplers share queues through Redis
+REDIS_URL      ?= redis://127.0.0.1:6379/0
 # The network interface to bind the API server
 HOST           ?= 127.0.0.1
 # The local port number for the API server
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_api_server_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_trainer_state tests.test_lora_export tests.test_training_runtime tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_delta_weight_transfer_engine tests.test_diffing_backends tests.test_sampler_weight_rotation tests.test_commands
+UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_api_server_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_trainer_state tests.test_lora_export tests.test_training_runtime tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_diffing_backends tests.test_sampler_weight_rotation tests.test_commands tests.test_weight_sync_config tests.test_cpu_sampler
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -44,8 +44,8 @@ ifneq ($(origin CUDA_VISIBLE_DEVICES),undefined)
 endif
 
 help:
-	@echo "make server                              # $(BASE_MODEL), SAMPLING_BACKEND=$(SAMPLING_BACKEND), port $(PORT)"
-	@echo "make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm"
+	@echo "make server                              # $(BASE_MODEL), Redis at $(REDIS_URL), port $(PORT)"
+	@echo "make server BASE_MODEL=google/gemma-4-e2b"
 	@echo "VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make vllm BASE_MODEL=google/gemma-4-e2b"
 	@echo "make test                               # fast unit tests"
 	@echo "make test e2e tiny-lora|tiny-fft|tiny-rl|lora-textsql|fft-gsm8k|fft-gsm8k-x2|fft-textsql-rl|fft-textsql-rl-x2  # tiny-* = fast overfit smoke tests"
@@ -64,13 +64,13 @@ help:
 # ---------------------------------------------------------------------------
 server:
 	@-kill -9 $$(lsof -ti:$(PORT)) 2>/dev/null || true
-	BASE_MODEL="$(BASE_MODEL)" SAMPLING_BACKEND="$(SAMPLING_BACKEND)" \
-	  uv run --extra $(if $(filter vllm,$(SAMPLING_BACKEND)),gpu,cpu) \
+	BASE_MODEL="$(BASE_MODEL)" REDIS_URL="$(REDIS_URL)" \
+	  uv run --extra gpu --extra vllm \
 	  python -m uvicorn server.api_server:app --host $(HOST) --port $(PORT)
 
 vllm:
-	BASE_MODEL="$(BASE_MODEL)" \
-	  uv run --extra vllm python -m server.vllm_sampler
+	BASE_MODEL="$(BASE_MODEL)" REDIS_URL="$(REDIS_URL)" \
+	  uv run --extra vllm python -m server.vllm_sampler --model-id "$(BASE_MODEL)"
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -115,6 +115,10 @@ test:
 	  echo "Unknown test mode '$$mode'. Expected unit, e2e, or piglatin."; \
 	  exit 2; \
 	fi
+
+.PHONY: test-weight-transfer
+test-weight-transfer:
+	uv run --frozen --extra vllm --extra gpu --extra cluster python -m unittest tests.test_delta_weight_transfer_engine tests.test_delta_weight_sync tests.test_weight_sync_config tests.test_sampler_patch tests.test_weight_transfer_gpu
 
 lint:
 	uv run --extra dev ruff check .
@@ -285,8 +289,6 @@ cluster-e2e:
 	if [ -n "$(E2E_ARGS)" ]; then set -- "$$@" --args "$(E2E_ARGS)"; fi; \
 	if [ -n "$(E2E_NAMESPACE)" ]; then set -- "$$@" --namespace "$(E2E_NAMESPACE)"; fi; \
 	if [ -n "$(WEIGHT_SYNC_STRATEGY)" ]; then set -- "$$@" --weight-sync-strategy "$(WEIGHT_SYNC_STRATEGY)"; fi; \
-	if [ -n "$(WEIGHT_SYNC_DELTA_FORMAT)" ]; then set -- "$$@" --weight-sync-delta-format "$(WEIGHT_SYNC_DELTA_FORMAT)"; fi; \
-	if [ -n "$(WEIGHT_SYNC_DELTA_APPLY_METHOD)" ]; then set -- "$$@" --weight-sync-delta-apply-method "$(WEIGHT_SYNC_DELTA_APPLY_METHOD)"; fi; \
 	python3 scripts/run_cluster_e2e.py "$$@"
 
 # Local Redis (for testing distributed mode):

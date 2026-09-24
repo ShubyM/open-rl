@@ -151,7 +151,6 @@ class FFTTrainingWorker:
         path,
         model_id=model_id,
         base_model=self.base_model_name,
-        delta_format=self.weight_sync_cfg.delta_format,
       )
     else:
       self.save_state(model_id, path, include_optimizer=False, kind="sampler")
@@ -196,20 +195,6 @@ class FFTTrainingWorker:
     if self.optimizer is None:
       self.optimizer = hf_operations.build_optimizer(self.params, adam_params)
     return {"metrics": hf_operations.optim_step(self.optimizer, adam_params)}
-
-  def generate(
-    self,
-    prompt_tokens: list[int],
-    max_tokens: int,
-    num_samples: int = 1,
-    temperature: float = 0.0,
-    model_id: str | None = None,
-    include_prompt_logprobs: bool = False,
-  ) -> dict[str, Any]:
-    assert self.model is not None, "Model must be loaded first."
-    return hf_operations.generate(
-      self.model, prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs, tokenizer=self.tokenizer, device=self.device
-    )
 
   def sleep(self) -> None:
     """Offload GPU tensors to pinned host CPU memory and empty CUDA allocator cache."""

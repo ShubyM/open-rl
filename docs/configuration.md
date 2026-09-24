@@ -12,52 +12,26 @@ Install `uv` if needed:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Start the API server and trainer with the default torch sampling backend:
+Start Redis, then the API server. It launches trainer and vLLM sampler
+processes on demand; all three share queues through Redis.
 
 ```bash
-BASE_MODEL=google/gemma-4-e2b \
-SAMPLING_BACKEND=torch \
-uv run --extra cpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
+export REDIS_URL=redis://127.0.0.1:6379/0
+export TRAINER_CUDA_VISIBLE_DEVICES=0
+export SAMPLER_CUDA_VISIBLE_DEVICES=1
+VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make server BASE_MODEL=google/gemma-4-e2b
 ```
 
-Because `REDIS_URL` is unset, this starts the API server and trainer loop in one
-process on the same workstation or VM.
-
-For a separate vLLM sampler, use two terminals:
-
-```bash
-# Terminal 1: vLLM sampler
-BASE_MODEL=google/gemma-4-e2b \
-VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM \
-CUDA_VISIBLE_DEVICES=0 \
-uv run --extra vllm python -m server.vllm_sampler
-```
-
-```bash
-# Terminal 2: API server and trainer
-BASE_MODEL=google/gemma-4-e2b \
-SAMPLING_BACKEND=vllm \
-CUDA_VISIBLE_DEVICES=1 \
-uv run --extra gpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
-```
-
-The equivalent Makefile shortcuts are:
-
-```bash
-make server BASE_MODEL=google/gemma-4-e2b
-VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make vllm BASE_MODEL=google/gemma-4-e2b
-make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
-```
+Training workers do not generate. CPU end-to-end tests use a separate HF sampler
+in `tests/cpu_sampler.py`, which reads explicitly exported adapter weights.
 
 ## Core variables
 
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `BASE_MODEL` | unset | Hugging Face model id loaded by the trainer and, when using vLLM, by the sampler. |
-| `SAMPLING_BACKEND` | `torch` locally, `vllm` when distributed | Sampling backend selector. `torch` samples in the training process. `vllm` forwards sampling requests to a vLLM worker. |
-| `REDIS_URL` | unset | Enables distributed mode by switching the request store to Redis. Leave unset for a single-machine run. |
+| `REDIS_URL` | unset | Enables distributed mode by switching the request store to Redis. Required for separate trainer and sampler processes, including on a single machine. |
 | `OPEN_RL_FUTURE_TTL_S` | `300` | How long resolved request results stay readable by `retrieve_future` after a worker resolves them. |
-| `VLLM_URL` | `http://127.0.0.1:8001` | API server URL for the vLLM worker when `SAMPLING_BACKEND=vllm`. |
 
 ## Server paths
 
@@ -87,7 +61,6 @@ backend by default for physical checkpoint/restore.
 
 | Env var | Default | What it does |
 | --- | --- | --- |
-| `MOCK_VLLM` | `0` | `1` starts the vLLM worker without a real vLLM engine, useful for local API debugging. |
 | `VLLM_ARCHITECTURE_OVERRIDE` | unset | Optional architecture override passed to the in-repo vLLM worker. Gemma 4 examples use `Gemma4ForCausalLM`. |
 | `VLLM_ENABLE_MULTIMODAL` | `0` | By default the samplers pass `limit_mm_per_prompt={"image": 0, "video": 0}`. Text checkpoints published as `*ForConditionalGeneration` otherwise make vLLM reserve a multi-GiB encoder cache during startup that no OpenRL code path can use, which can OOM engine init. Set to `1` to restore stock vLLM behaviour. |
 

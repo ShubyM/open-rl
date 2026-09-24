@@ -21,16 +21,6 @@ class TrainingBackend(Protocol):
 
   def optim_step(self, adam_params: dict[str, Any], model_id: str) -> dict[str, Any]: ...
 
-  def generate(
-    self,
-    prompt_tokens: list[int],
-    max_tokens: int,
-    num_samples: int = 1,
-    temperature: float = 0.0,
-    model_id: str | None = None,
-    include_prompt_logprobs: bool = False,
-  ) -> dict[str, Any]: ...
-
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]: ...
 
   def save_for_sampler(self, model_id: str, alias: str | None, ref: str | None) -> str | None: ...

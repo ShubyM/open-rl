@@ -303,7 +303,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     store = _FutureStoreStub()
     processor = training_requests_processor_module.TrainingRequestsProcessor(store, worker)
 
-    await processor.process_request(
+    request_id, result = await processor.handle_request(
       {
         "request_id": "req-a",
         "model_id": "adapter-a",
@@ -321,7 +321,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(model_id, "adapter-a")
     self.assertEqual(config.seed, 123)
     self.assertEqual(config.rank, 2)
-    result = store.results["req-a"]
+    self.assertEqual(request_id, "req-a")
     self.assertEqual(result["model_id"], "adapter-a")
     self.assertEqual(result["rank"], 2)
     self.assertEqual(result["fine_tuning_type"], "lora")
@@ -334,7 +334,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
       processor = training_requests_processor_module.TrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
-      await processor.process_request(
+      request_id, result = await processor.handle_request(
         {
           "request_id": "req-a",
           "model_id": "model-a",
@@ -352,7 +352,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(base_model, "base-model")
     self.assertEqual(model_id, "model-a")
     self.assertEqual(config.seed, 123)
-    result = store.results["req-a"]
+    self.assertEqual(request_id, "req-a")
     self.assertEqual(result["model_id"], "model-a")
     self.assertEqual(result["base_model"], "base-model")
     self.assertEqual(result["fine_tuning_type"], "full")
@@ -365,7 +365,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
 
     with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test", "REDIS_URL": "redis://localhost:6379"}):
       processor = training_requests_processor_module.TrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
-      await processor.process_request(
+      request_id, result = await processor.handle_request(
         {
           "request_id": "req-a",
           "model_id": "model-a",
@@ -381,8 +381,9 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       worker.sampler_exports,
       [("model-a", None, "tinker://model-a/sampler_weights/final")],
     )
+    self.assertEqual(request_id, "req-a")
     self.assertEqual(
-      store.results["req-a"],
+      result,
       {
         "path": "tinker://model-a/sampler_weights/final",
         "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",

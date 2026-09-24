@@ -64,9 +64,8 @@ COPY uv.lock .
 # trainer and sampler launch, for ~0.4GB of image. The API server and client images
 # already set this.
 #
-# UV_NO_SYNC: the source is exposed through PYTHONPATH below rather than
-# installed, so the implicit sync `uv run` performs at container start only
-# rebuilds and reinstalls the project to no effect.
+# UV_NO_SYNC: dependencies and the plugin entry point are installed at build
+# time, so worker startup does not need to sync the environment again.
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     UV_NO_SYNC=1
@@ -102,14 +101,12 @@ RUN set -eu; \
         done; \
     done
 
-# Copy patch script specifically
-COPY src/server/scripts/patch_vllm_lora_dedup.py /app/src/server/scripts/patch_vllm_lora_dedup.py
-
-# Apply vLLM patches (Gemma 4 LoRA dedup)
-RUN uv run python /app/src/server/scripts/patch_vllm_lora_dedup.py
-
 # Copy source code
 COPY . .
+
+# Install the project, including the vLLM general plugin entry point used by
+# spawned workers to discover the checkpoint weight-transfer backend.
+RUN uv sync --frozen --extra gpu --extra vllm --extra cluster
 
 ENV PATH="/usr/local/cuda/bin:$PATH" \
     CUDA_HOME="/usr/local/cuda" \

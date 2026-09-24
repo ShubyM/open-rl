@@ -80,81 +80,55 @@ def forward_backward(
   """
   loss_fn_outputs: list[dict[str, Any] | None] = [None] * len(data)
 
-  if forward_only:
-    model.eval()
-  else:
-    model.train()
-
-  with torch.set_grad_enabled(not forward_only):
-    total_loss = _run_batches(
-      model, data, loss_fn, loss_config, forward_only, loss_fn_outputs, tokenizer=tokenizer, device=device, token_budget=token_budget
-    )
-  return _finish(data, loss_fn_outputs, total_loss)
-
-
-def _run_batches(
-  model: torch.nn.Module,
-  data: list[Datum],
-  loss_fn: str,
-  loss_config: dict | None,
-  forward_only: bool,
-  loss_fn_outputs: list[dict[str, Any] | None],
-  *,
-  tokenizer: Any,
-  device: torch.device | str,
-  token_budget: int,
-) -> float:
-  """Run every batch, fill ``loss_fn_outputs`` in place, and return the summed loss."""
+  model.train(not forward_only)
   total_loss = 0.0
-  for batch in make_training_batches(data, token_budget):
-    batch_indices = [idx for idx, _ in batch]
-    batch_data = [datum for _, datum in batch]
+  with torch.set_grad_enabled(not forward_only):
+    for batch in make_training_batches(data, token_budget):
+      batch_indices = [idx for idx, _ in batch]
+      batch_data = [datum for _, datum in batch]
 
-    input_ids, attention_mask, input_lengths = pad_model_inputs(batch_data, tokenizer=tokenizer, device=device)
-    target_token_ids, weights, lengths = pad_targets_and_weights(batch_data, input_lengths, device=device)
-    target_logprobs = compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
+      input_ids, attention_mask, input_lengths = pad_model_inputs(batch_data, tokenizer=tokenizer, device=device)
+      target_token_ids, weights, lengths = pad_targets_and_weights(batch_data, input_lengths, device=device)
+      target_logprobs = compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
 
-    match loss_fn:
-      case "cross_entropy":
-        elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
-      case "importance_sampling":
-        old_logprobs = pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32, device=device)
-        advantages = pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32, device=device)
-        elementwise_loss = losses.importance_sampling_loss(
-          target_logprobs,
-          weights,
-          old_logprobs,
-          advantages,
-        )
-      case "ppo":
-        old_logprobs = pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32, device=device)
-        advantages = pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32, device=device)
-        elementwise_loss = losses.ppo_loss(
-          target_logprobs,
-          weights,
-          old_logprobs,
-          advantages,
-          loss_config,
-        )
-      case _:
-        raise NotImplementedError(f"Loss {loss_fn} not supported")
+      match loss_fn:
+        case "cross_entropy":
+          elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
+        case "importance_sampling":
+          old_logprobs = pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32, device=device)
+          advantages = pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32, device=device)
+          elementwise_loss = losses.importance_sampling_loss(
+            target_logprobs,
+            weights,
+            old_logprobs,
+            advantages,
+          )
+        case "ppo":
+          old_logprobs = pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32, device=device)
+          advantages = pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32, device=device)
+          elementwise_loss = losses.ppo_loss(
+            target_logprobs,
+            weights,
+            old_logprobs,
+            advantages,
+            loss_config,
+          )
+        case _:
+          raise NotImplementedError(f"Loss {loss_fn} not supported")
 
-    per_datum_loss = elementwise_loss.sum(dim=1)
-    loss = per_datum_loss.sum()
-    if not forward_only:
-      loss.backward()
-    total_loss += loss.item()
+      per_datum_loss = elementwise_loss.sum(dim=1)
+      loss = per_datum_loss.sum()
+      if not forward_only:
+        loss.backward()
+      total_loss += loss.item()
 
-    detached_logprobs = target_logprobs.detach().cpu()
-    for row, original_idx in enumerate(batch_indices):
-      row_len = lengths[row]
-      logprobs_list = detached_logprobs[row, :row_len].tolist()
-      logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
-      loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
-  return total_loss
+      detached_logprobs = target_logprobs.detach().cpu()
+      for row, original_idx in enumerate(batch_indices):
+        row_len = lengths[row]
+        logprobs_list = detached_logprobs[row, :row_len].tolist()
+        logprobs_list = [max(l, -9999.0) if not math.isinf(l) else (-9999.0 if l < 0 else 9999.0) for l in logprobs_list]
+        loss_fn_outputs[original_idx] = {"logprobs": {"data": logprobs_list, "dtype": "float32", "shape": [len(logprobs_list)]}}
 
-
-def _finish(data: list[Datum], loss_fn_outputs: list[dict[str, Any] | None], total_loss: float) -> dict[str, Any]:
   mean_loss = total_loss / max(1, len(data))
   completed_loss_fn_outputs = []
   for output in loss_fn_outputs:
@@ -267,73 +241,3 @@ def compute_target_logprobs(
   outputs = model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
   logits = outputs.logits[:, : target_token_ids.shape[1], :]
   return torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
-
-
-def generate(
-  model: torch.nn.Module,
-  prompt_tokens: list[int],
-  max_tokens: int,
-  num_samples: int = 1,
-  temperature: float = 0.0,
-  include_prompt_logprobs: bool = False,
-  *,
-  tokenizer: Any,
-  device: torch.device | str = "cpu",
-) -> dict[str, Any]:
-  """Generate completions from model."""
-  model.eval()
-
-  input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
-  do_sample = (num_samples > 1) or (temperature and temperature > 0.0)
-  prompt_scores = prompt_logprobs(model, input_tensor) if include_prompt_logprobs else None
-
-  with torch.no_grad():
-    attention_mask = torch.ones_like(input_tensor)
-    outputs = model.generate(
-      input_tensor,
-      attention_mask=attention_mask,
-      max_new_tokens=max_tokens,
-      pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-      do_sample=do_sample,
-      temperature=temperature if do_sample else None,
-      top_p=None,
-      top_k=None,
-      num_return_sequences=num_samples,
-      output_scores=True,
-      return_dict_in_generate=True,
-    )
-
-  sequences_out = []
-  for seq_idx in range(num_samples):
-    gen_sequences = outputs.sequences[seq_idx]
-    generated_tokens = gen_sequences[len(prompt_tokens) :].cpu().tolist()
-
-    logprobs = []
-    for token_step_idx in range(len(generated_tokens)):
-      score_tensor = outputs.scores[token_step_idx]
-      logprob_dist = torch.nn.functional.log_softmax(score_tensor[seq_idx], dim=-1)
-      token_id = generated_tokens[token_step_idx]
-      logprob = logprob_dist[token_id].item()
-      logprobs.append(sanitize_float(logprob))
-
-    sequences_out.append({"tokens": generated_tokens, "logprobs": logprobs, "stop_reason": "stop"})
-
-  result = {"sequences": sequences_out}
-  if prompt_scores is not None:
-    result["prompt_logprobs"] = prompt_scores
-  return result
-
-
-def prompt_logprobs(model: torch.nn.Module, input_tensor: torch.Tensor) -> list[float | None]:
-  with torch.no_grad():
-    attention_mask = torch.ones_like(input_tensor)
-    outputs = model(input_tensor, attention_mask=attention_mask)
-    logprob_dist = torch.nn.functional.log_softmax(outputs.logits[0, :-1], dim=-1)
-
-  prompt_tokens = input_tensor[0].tolist()
-  prompt_logprobs: list[float | None] = [None]
-  for token_idx, token_id in enumerate(prompt_tokens[1:]):
-    logprob = logprob_dist[token_idx, token_id].item()
-    prompt_logprobs.append(sanitize_float(logprob))
-
-  return prompt_logprobs

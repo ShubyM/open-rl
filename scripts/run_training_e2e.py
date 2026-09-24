@@ -85,7 +85,6 @@ class RunConfig:
     "fft-textsql-rl-x2",
     "lora-fft-gsm8k-rl-x4",
   ]
-  sampling_backend: str = "vllm"
   trainer_gpu: str = "0"
   sampler_gpu: str = "1"
   base_url: str = ""
@@ -255,7 +254,6 @@ def base_env(config: RunConfig) -> dict[str, str]:
     "OPEN_RL_TMP_DIR": str(open_rl_tmp_dir(config)),
     "OPEN_RL_TRAIN_TOKEN_BUDGET": str(config.train_token_budget),
     "PYTHONUNBUFFERED": "1",
-    "SAMPLING_BACKEND": config.sampling_backend,
     "TINKER_API_KEY": os.environ.get("TINKER_API_KEY", "tml-dummy-key"),
     "TOKENIZERS_PARALLELISM": "false",
   }
@@ -272,27 +270,21 @@ def start_backend(config: RunConfig, processes: list[ManagedProcess]) -> str:
   env = base_env(config)
   env["TRAINER_CUDA_VISIBLE_DEVICES"] = config.trainer_gpu
   env["SAMPLER_CUDA_VISIBLE_DEVICES"] = config.sampler_gpu
-  if config.sampling_backend == "vllm":
-    env.pop("CUDA_VISIBLE_DEVICES", None)
-    env["VLLM_GPU_MEMORY_UTILIZATION"] = str(config.vllm_gpu_memory_utilization)
-  else:
-    env["CUDA_VISIBLE_DEVICES"] = config.trainer_gpu
-
-  need_redis = "fft" in config.scenario or config.sampling_backend == "vllm"
-  if need_redis:
-    if shutil.which("redis-server") is None:
-      raise RuntimeError("redis-server is required for multi-process e2e scenarios (vLLM sampling or FFT)")
-    redis_port = unused_tcp_port()
-    launch(
-      processes,
-      "redis",
-      ["redis-server", "--save", "", "--appendonly", "no", "--bind", "127.0.0.1", "--port", str(redis_port)],
-      os.environ.copy(),
-      log_dir / "redis.log",
-      lambda: redis_ok("127.0.0.1", redis_port),
-      timeout=60,
-    )
-    env["REDIS_URL"] = f"redis://127.0.0.1:{redis_port}/0"
+  env.pop("CUDA_VISIBLE_DEVICES", None)
+  env["VLLM_GPU_MEMORY_UTILIZATION"] = str(config.vllm_gpu_memory_utilization)
+  if shutil.which("redis-server") is None:
+    raise RuntimeError("redis-server is required for the trainer and sampler queues")
+  redis_port = unused_tcp_port()
+  launch(
+    processes,
+    "redis",
+    ["redis-server", "--save", "", "--appendonly", "no", "--bind", "127.0.0.1", "--port", str(redis_port)],
+    os.environ.copy(),
+    log_dir / "redis.log",
+    lambda: redis_ok("127.0.0.1", redis_port),
+    timeout=60,
+  )
+  env["REDIS_URL"] = f"redis://127.0.0.1:{redis_port}/0"
 
   if "fft" in config.scenario:
     if shutil.which("cuda-checkpoint") is None:
@@ -333,19 +325,6 @@ def clean_cli_extra(extra: str) -> list[str]:
   return [token for token in shlex.split(extra) if not (token.startswith("weight_sync_strategy=") or token.startswith("jitter_sec="))]
 
 
-def _set_fft_delta_apply(env: dict[str, str]) -> None:
-  """FFT scenarios default to in-place delta patching, but an apply method
-  already in the environment (run_cluster_e2e.py's
-  --weight-sync-delta-apply-method) wins. OPEN_RL_IN_PLACE_DELTA forces the
-  in-place path in the sampler regardless of the method, so it is only set
-  when in-place is what was asked for."""
-  method = env.setdefault("OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD", "patch_in_place")
-  if method == "patch_in_place":
-    env["OPEN_RL_IN_PLACE_DELTA"] = "1"
-  else:
-    env.pop("OPEN_RL_IN_PLACE_DELTA", None)
-
-
 def examples_env(config: RunConfig) -> dict[str, str]:
   env = os.environ.copy()
   env["OPEN_RL_TMP_DIR"] = str(open_rl_tmp_dir(config))
@@ -358,7 +337,6 @@ def examples_env(config: RunConfig) -> dict[str, str]:
     env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = config.weight_sync_strategy
   if config.scenario.startswith("fft") or "fft" in config.scenario:
     env["OPEN_RL_FINE_TUNING_TYPE"] = "full"
-    _set_fft_delta_apply(env)
   existing_path = env.get("PYTHONPATH", "")
   env["PYTHONPATH"] = f"examples:{existing_path}" if existing_path else "examples"
   return env
@@ -543,14 +521,13 @@ def check_snapshot_interleaving(config: RunConfig) -> None:
     )
   print(f"[training-e2e] trainer accel timeslicer time-sliced: checkpointed workloads {sorted(cp_t)}, restored workloads {sorted(rs_t)}")
 
-  if config.sampling_backend == "vllm":
-    cp_s = {workload for workload in checkpointed if ":sampler-" in workload or workload.startswith("sampler-")}
-    rs_s = {workload for workload in restored if ":sampler-" in workload or workload.startswith("sampler-")}
-    if len(cp_s) < 2 or len(rs_s) < 2:
-      raise RuntimeError(
-        f"Expected both FFT sampler workers to interleave, but saw checkpoints {sorted(cp_s)} and restores {sorted(rs_s)} in {log_path}"
-      )
-    print(f"[training-e2e] sampler accel timeslicer time-sliced: checkpointed workloads {sorted(cp_s)}, restored workloads {sorted(rs_s)}")
+  cp_s = {workload for workload in checkpointed if ":sampler-" in workload or workload.startswith("sampler-")}
+  rs_s = {workload for workload in restored if ":sampler-" in workload or workload.startswith("sampler-")}
+  if len(cp_s) < 2 or len(rs_s) < 2:
+    raise RuntimeError(
+      f"Expected both FFT sampler workers to interleave, but saw checkpoints {sorted(cp_s)} and restores {sorted(rs_s)} in {log_path}"
+    )
+  print(f"[training-e2e] sampler accel timeslicer time-sliced: checkpointed workloads {sorted(cp_s)}, restored workloads {sorted(rs_s)}")
 
 
 def run_gsm8k_x2(config: RunConfig, base_url: str, watch: list[ManagedProcess]) -> None:
@@ -714,10 +691,8 @@ def run_gsm8k_rl_x4_mixed(config: RunConfig, base_url: str, watch: list[ManagedP
       env = examples_env(config).copy()
       if mode == "lora":
         env["OPEN_RL_FINE_TUNING_TYPE"] = "lora"
-        env.pop("OPEN_RL_IN_PLACE_DELTA", None)
       else:
         env["OPEN_RL_FINE_TUNING_TYPE"] = "full"
-        _set_fft_delta_apply(env)
 
       results[job] = run_command(
         ["uv", "--project", "examples", "run", "python", "-m", module_name, *args],

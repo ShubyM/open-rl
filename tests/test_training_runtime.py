@@ -6,7 +6,7 @@ import sys
 import threading
 import unittest
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from server.store import InMemoryStore
 from server.training_requests_processor import TrainingRequestsProcessor, run_training_requests_processor
@@ -146,9 +146,10 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     store = RecordingStore()
     worker = ResidentWorker()
     processor = TrainingRequestsProcessor(store, worker, "model-a")
-    await processor.process_request(step("wrong", "model-b"))
+    request_id, result = await processor.handle_request(step("wrong", "model-b"))
     self.assertEqual(worker.value, 0)
-    self.assertEqual(store.futures_store["wrong"]["type"], "RequestFailedResponse")
+    self.assertEqual(request_id, "wrong")
+    self.assertEqual(result["type"], "RequestFailedResponse")
 
   async def test_leased_runner_preserves_save_position_and_cleans_up(self):
     store = RecordingStore()
@@ -200,6 +201,7 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     slicer = RecordingSlicer()
     processor = TrainingRequestsProcessor(store, worker, "model-a", time_slicer=slicer)
     await store.put_request(step("step"))
+    await store.put_request(step("never-started"))
     task = asyncio.create_task(processor.run_once())
     try:
       self.assertTrue(await asyncio.to_thread(started.wait, 2))
@@ -215,6 +217,9 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
         await task
     self.assertEqual(events, ["finished", "sleep"])
     self.assertEqual(slicer.events, ["acquire", "release"])
+    self.assertEqual(worker.value, 1)
+    self.assertEqual(store.published, ["step", "never-started"])
+    self.assertTrue(all(result["type"] == "RequestFailedResponse" for result in store.futures_store.values()))
 
   async def test_cancellation_during_wake_still_sleeps_before_release(self):
     started = threading.Event()
@@ -253,8 +258,9 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(worker.asleep)
     self.assertEqual(worker.value, 0)
     self.assertEqual(slicer.events, ["acquire", "release"])
+    self.assertEqual(store.futures_store["step"]["type"], "RequestFailedResponse")
 
-  async def test_late_batch_failure_does_not_overwrite_published_success(self):
+  async def test_late_batch_failure_preserves_completed_results(self):
     store = RecordingStore()
     worker = ResidentWorker()
     processor = TrainingRequestsProcessor(store, worker, "model-a")
@@ -276,10 +282,10 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     await store.put_request(step("first"))
     await store.put_request(commands.wire(commands.SaveState(request_id="save", model_id="model-a", state_path="snapshot")))
     await store.put_request(step("second"))
-    with patch.object(processor, "exit_gracefully", new_callable=AsyncMock) as exit_worker:
+    with patch("server.training_requests_processor.os._exit") as exit_worker:
       with self.assertRaisesRegex(RuntimeError, "Could not park"):
         await processor.run_once()
-      exit_worker.assert_awaited_once_with(unregister=False)
+      exit_worker.assert_called_once_with(0)
     self.assertEqual(worker.value, 2)
     self.assertEqual(worker.saved_values, [1])
     self.assertEqual(slicer.events, ["acquire", "release"])
@@ -295,15 +301,32 @@ class TrainingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     await store.put_request(commands.wire(commands.Shutdown(model_id="model-a")))
     await store.put_request(step("too-late"))
 
-    async def exit_worker(unregister=True):
-      self.assertFalse(unregister)
+    def exit_worker(status):
+      self.assertEqual(status, 0)
       self.assertEqual(store.published, ["first", "too-late"])
       self.assertEqual(store.futures_store["too-late"]["type"], "RequestFailedResponse")
       raise SystemExit(0)
 
-    with patch.object(processor, "exit_gracefully", side_effect=exit_worker), self.assertRaises(SystemExit):
+    with patch("server.training_requests_processor.os._exit", side_effect=exit_worker), self.assertRaises(SystemExit):
       await processor.run_once()
     self.assertEqual(worker.value, 1)
+
+  async def test_faulted_lease_exits_even_when_reply_publication_fails(self):
+    store = RecordingStore()
+    worker = SuspendableWorker()
+    slicer = RecordingSlicer(fault_on_release=True)
+    processor = TrainingRequestsProcessor(store, worker, "model-a", time_slicer=slicer)
+    await store.put_request(step("first"))
+    with (
+      patch.object(store, "set_future", side_effect=ConnectionError("Redis unavailable")) as publish,
+      patch("server.training_requests_processor.os._exit", side_effect=SystemExit(0)) as exit_worker,
+      self.assertRaises(SystemExit),
+    ):
+      await processor.run_once()
+    publish.assert_awaited_once()
+    exit_worker.assert_called_once_with(0)
+    self.assertEqual(worker.value, 1)
+    self.assertEqual(slicer.events, ["acquire", "release"])
 
   def test_importing_runtime_does_not_import_training_backends(self):
     subprocess.run(

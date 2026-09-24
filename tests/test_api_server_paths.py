@@ -283,15 +283,18 @@ class SampleSequenceIdsTest(ApiServerTest):
   sequence id per requested sample."""
 
   def test_asample_promise_carries_one_id_per_sample(self) -> None:
-    with patch.object(api_server, "get_sampler_backend", return_value="torch"):
-      promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}).json()
+    promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}).json()
+    queued = asyncio.run(api_server.store.get_sampling_requests_for_model("job-a"))
+    self.assertEqual(queued[0]["request_id"], promise["request_id"])
+    self.assertEqual(queued[0]["prompt_token_ids"], [1, 2])
+    self.assertEqual(queued[0]["num_samples"], 3)
+    self.assertEqual(api_server.store.queues, {})
     self.assertEqual(len(promise["sample_sequence_ids"]), 3)
     self.assertEqual(len(set(promise["sample_sequence_ids"])), 3)
     self.assertTrue(all(sid.startswith(promise["request_id"]) for sid in promise["sample_sequence_ids"]))
 
   def test_asample_defaults_to_a_single_sample(self) -> None:
-    with patch.object(api_server, "get_sampler_backend", return_value="torch"):
-      promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
+    promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)
 
 
@@ -313,12 +316,12 @@ class InputBoundaryTest(ApiServerTest):
     self.assertEqual(response.status_code, 200)
     self.assertEqual(self.queued()[0]["payload"]["lora_config"]["rank"], 16)
     for value in (None, 0):
-      with self.subTest(value=value), patch.object(api_server, "get_sampler_backend", return_value="torch"):
+      with self.subTest(value=value):
         response = self.post(
           "asample", {"model_id": "base", "prompt": {"chunks": [{"tokens": [1]}]}, "sampling_params": {"temperature": value, "max_tokens": value}}
         )
         self.assertEqual(response.status_code, 200)
-        queued = self.queued()[0]["payload"]
+        queued = asyncio.run(api_server.store.get_sampling_requests_for_model("base"))[0]
         self.assertEqual(queued["temperature"], 1.0 if value is None else 0)
         self.assertEqual(queued["max_tokens"], 20 if value is None else 0)
 

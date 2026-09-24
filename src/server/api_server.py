@@ -11,7 +11,6 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -87,7 +86,6 @@ class FilterNoisyEndpoints(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
 
 
 # *** Request bodies ***
@@ -217,12 +215,6 @@ class AsampleRequest(BaseModel):
 
 def is_single_process_mode() -> bool:
   return bool(os.getenv("BASE_MODEL")) and not bool(os.getenv("REDIS_URL"))
-
-
-def get_sampler_backend() -> str:
-  if sampling_backend := os.getenv("SAMPLING_BACKEND"):
-    return sampling_backend.lower()
-  return "torch" if is_single_process_mode() else "vllm"
 
 
 def get_default_model_name() -> str | None:
@@ -412,31 +404,11 @@ async def launch_worker_and_enqueue(command: Command) -> str:
 
 
 async def ensure_sampler_launched(model_id: str) -> None:
-  if worker_manager is not None and get_sampler_backend() == "vllm":
+  if worker_manager is not None:
     try:
       await asyncio.to_thread(worker_manager.ensure, model_id, "sampler")
     except Exception:
       traceback.print_exc()
-
-
-async def preflight_vllm() -> None:
-  """If SAMPLING_BACKEND=vllm, verify the vLLM worker is reachable at VLLM_URL.
-
-  Prints a clear, actionable error instead of letting the first asample
-  request fall through with a raw httpx connection refused.
-  """
-  if get_sampler_backend() != "vllm":
-    return
-  healthz = f"{VLLM_URL.rstrip('/')}/healthz"
-  try:
-    async with httpx.AsyncClient(timeout=3.0) as client:
-      resp = await client.get(healthz)
-      resp.raise_for_status()
-  except Exception as exc:
-    raise RuntimeError(
-      f"SAMPLING_BACKEND=vllm but no vLLM worker is reachable at {VLLM_URL}.\n"
-      f"Start it first with:  make vllm BASE_MODEL={os.getenv('BASE_MODEL') or '<model-id>'}"
-    ) from exc
 
 
 def translate_future_result(result: dict) -> dict:
@@ -504,10 +476,8 @@ async def lifespan(_: FastAPI):
     print(" Open-RL Single-Process Mode")
     print("=" * 50)
     print(f"-> Base model: {base_model or 'unset'}")
-    print(f"-> Sampling backend: {get_sampler_backend()}")
     print(f"-> FFT enabled     : {is_fft_enabled()}")
     print("-> Server mode     : API server + worker loop in one process\n")
-    await preflight_vllm()
     if not is_fft_enabled():
       from server import training_requests_processor
       from training.lora_trainer_worker import LoraTrainingWorker
@@ -904,7 +874,7 @@ async def create_sampling_session(req: CreateSamplingSessionRequest):
 
   await bind_session(req.session_id, target_model_id)
 
-  if get_sampler_backend() == "vllm" and ready_check_id:
+  if ready_check_id:
     # Launch by model ID so the worker manager retains the training kind.
     # LoRA readiness is still reported under the shared base-model runtime.
     await ensure_sampler_launched(target_model_id)
@@ -965,21 +935,6 @@ async def asample(req: AsampleRequest):
   base_model_id = base_model_id_from_sampling_ref(model_id)
   lookup_id = base_model_id or model_id
 
-  if get_sampler_backend() == "torch":
-    req_id = await enqueue(
-      commands.Sample(
-        request_id=new_request_id(),
-        model_id=lookup_id,
-        prompt_tokens=prompt,
-        max_tokens=params.max_tokens,
-        temperature=params.temperature,
-        num_samples=num_samples,
-        prompt_logprobs=req.prompt_logprobs,
-      )
-    )
-    return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
-
-  # vLLM backend
   req_id = str(uuid.uuid4())
   carrier = await open_future(req_id)
 

@@ -10,7 +10,6 @@ class CommandWireFormatTest(unittest.TestCase):
       commands.CreateModel(request_id="r", model_id="m", base_model="base", fine_tuning_type="full", full_config={"cpu_offload": False}),
       commands.CreateModelFromState(request_id="r", model_id="m", state_path="/ckpt", restore_optimizer=True),
       commands.OptimStep(request_id="r", model_id="m", adam_params={"learning_rate": 1e-4}),
-      commands.Sample(request_id="r", model_id="m", prompt_tokens=[1, 2, 3], max_tokens=4),
       commands.SaveState(request_id="r", model_id="m", state_path="/ckpt", include_optimizer=True, kind="weights"),
       commands.LoadWeights(request_id="r", model_id="m", state_path="/ckpt"),
       commands.SaveWeightsForSampler(request_id="r", model_id="m", alias="final", sampling_session_id="tinker://m/sampler_weights/sampler-0"),

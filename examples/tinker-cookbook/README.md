@@ -48,7 +48,7 @@ In another shell:
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
 BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" \
-SAMPLING_BACKEND=vllm \
+REDIS_URL=redis://127.0.0.1:6379/0 \
 VLLM_URL=http://127.0.0.1:8001 \
 TINKER_API_KEY=tml-dummy-key \
 uv run --extra gpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003

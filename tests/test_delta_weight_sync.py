@@ -26,10 +26,8 @@ def apply_export(path: str, weights: dict[str, torch.Tensor]) -> dict[str, torch
   with open(os.path.join(path, "metadata.json")) as file:
     metadata = json.load(file)
   delta = safetensors.torch.load_file(os.path.join(path, "delta.safetensors"))
-  indices = delta["delta.indices_flat"].split(delta["delta.layer_lengths"].tolist())
-  values = delta["delta.values_flat"].split(delta["delta.layer_lengths"].tolist())
-  for name, index, value in zip(metadata["layer_names"], indices, values, strict=True):
-    weights[name].view(-1)[index] = value
+  for i, name in enumerate(metadata["layer_names"]):
+    weights[name].view(-1)[delta[f"{i}.indices"]] = delta[f"{i}.values"]
   return weights
 
 
@@ -51,7 +49,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
       device="cpu",
       base_model_name="tiny-model",
       cpu_offload=False,
-      weight_sync_cfg=WeightSyncConfig(strategy=strategy, delta_format="native"),
+      weight_sync_cfg=WeightSyncConfig(strategy=strategy),
     )
 
   def export(self, worker, version):
@@ -75,8 +73,8 @@ class DeltaWeightSyncTest(unittest.TestCase):
     path = self.export(worker, "first")
     self.assert_weights_equal(apply_export(path, sampler), worker.model)
     delta = safetensors.torch.load_file(os.path.join(path, "delta.safetensors"))
-    self.assertEqual(delta["delta.indices_flat"].dtype, torch.int64)
-    self.assertEqual(delta["delta.indices_flat"].numel(), 2)
+    self.assertEqual(delta["0.indices"].dtype, torch.int32)
+    self.assertEqual(sum(value.numel() for name, value in delta.items() if name.endswith(".indices")), 2)
     with open(os.path.join(path, "delta.safetensors"), "rb") as file:
       exported = file.read()
     worker.model.first.grad = torch.ones(2)
@@ -133,7 +131,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
     apply_export(self.export(worker, "first"), sampler)
     path = self.export(worker, "second")
     delta = safetensors.torch.load_file(os.path.join(path, "delta.safetensors"))
-    self.assertEqual(delta["delta.indices_flat"].numel(), 0)
+    self.assertEqual(delta, {})
     self.assert_weights_equal(apply_export(path, sampler), worker.model)
 
   def test_full_export_uses_hf_checkpoint_format(self):
@@ -158,7 +156,7 @@ class DeltaWeightSyncTest(unittest.TestCase):
       device="cpu",
       base_model_name="tiny",
       cpu_offload=False,
-      weight_sync_cfg=WeightSyncConfig(delta_format="native"),
+      weight_sync_cfg=WeightSyncConfig(),
     )
     sampler = model_weights(model)
     with torch.no_grad():
