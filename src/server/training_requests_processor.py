@@ -287,17 +287,7 @@ class TrainingRequestsProcessor:
         result["type"] = "optim_step_completed"
         return result
       case commands.Sample():
-        result = await asyncio.to_thread(
-          self.worker.generate,
-          command.model_id,
-          command.prompt_tokens,
-          command.max_tokens,
-          command.num_samples,
-          command.temperature,
-          command.prompt_logprobs,
-        )
-        result["type"] = "sample_completed"
-        return result
+        raise NotImplementedError("Sampling from the trainer is not supported; sample through the vLLM sampler.")
       case commands.SaveState():
         await asyncio.to_thread(self.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
         return {"path": command.state_path, "type": "state_saved"}

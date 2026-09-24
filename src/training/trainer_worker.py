@@ -185,18 +185,6 @@ class TrainerWorker:
 
     return {"metrics": {"grad_norm:mean": sanitize_float(total_norm)}}
 
-  def generate(
-    self,
-    model_id: str,
-    prompt_tokens: list[int],
-    max_tokens: int,
-    num_samples: int = 1,
-    temperature: float = 0.0,
-    include_prompt_logprobs: bool = False,
-  ) -> dict[str, Any]:
-    with self.base.using(self.models[model_id]):
-      return self.base.generate(prompt_tokens, max_tokens, num_samples, temperature, include_prompt_logprobs)
-
   # -- batching --------------------------------------------------------------------
 
   def make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:
