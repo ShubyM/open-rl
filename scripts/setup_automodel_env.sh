@@ -59,13 +59,17 @@ MAX_JOBS=$(nproc) uv pip install --python "$V" --no-build-isolation "causal-conv
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHONPATH="$REPO/src" "$V" - <<'EOF'
+import os
+
 import torch, transformers
 from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM  # noqa: F401
 import fla.ops.cp  # noqa: F401
 import tilelang  # noqa: F401
 import causal_conv1d  # noqa: F401
-import server.training_requests_processor  # noqa: F401
-import training.automodel_worker  # noqa: F401
+# The image checks these after copying src, so its venv layer does not depend on the source.
+if os.environ.get("AUTOMODEL_CHECK_REPO", "1") == "1":
+  import server.training_requests_processor  # noqa: F401
+  import training.automodel_worker  # noqa: F401
 
 print(f"automodel env OK: torch {torch.__version__}, transformers {transformers.__version__}")
 EOF

@@ -37,12 +37,14 @@ RUN uv python install 3.12
 
 WORKDIR /app
 # The venv recipe is the script the box uses, so the two stay one definition.
+# The venv layer depends only on the script, so a source change rebuilds in
+# minutes off the registry cache; the compile below is paid when the pins move.
 COPY scripts/setup_automodel_env.sh scripts/setup_automodel_env.sh
-COPY src src
-# setup_automodel_env.sh imports server.training_requests_processor at the end
-# to prove the interpreter can run the worker; src is already in place for that.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    AUTOMODEL_VENV=/app/automodel/.venv HOME=/root bash scripts/setup_automodel_env.sh
+    AUTOMODEL_VENV=/app/automodel/.venv HOME=/root AUTOMODEL_CHECK_REPO=0 bash scripts/setup_automodel_env.sh
+COPY src src
+# The worker imports the script skipped, now that src is in place.
+RUN PYTHONPATH=/app/src /app/automodel/.venv/bin/python -c "import server.training_requests_processor, training.automodel_worker"
 
 ENV PYTHONPATH=/app/src \
     PATH="/app/automodel/.venv/bin:$PATH" \
