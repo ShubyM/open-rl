@@ -38,3 +38,26 @@ def ppo_loss(
 
 def policy_ratio(target_logprobs: torch.Tensor, ref_logprobs: torch.Tensor) -> torch.Tensor:
   return torch.exp(torch.clamp(target_logprobs - ref_logprobs, min=-20.0, max=20.0))
+
+
+def elementwise_loss(
+  loss_fn: str,
+  target_logprobs: torch.Tensor,
+  weights: torch.Tensor,
+  inputs: dict[str, torch.Tensor],
+  loss_config: dict | None,
+) -> torch.Tensor:
+  """The per-position loss for one of Tinker's loss functions.
+
+  inputs holds the per-token side inputs padded like target_logprobs:
+  "logprobs" (the sampler's) and "advantages" for the policy losses.
+  """
+  match loss_fn:
+    case "cross_entropy":
+      return cross_entropy_loss(target_logprobs, weights)
+    case "importance_sampling":
+      return importance_sampling_loss(target_logprobs, weights, inputs["logprobs"], inputs["advantages"])
+    case "ppo":
+      return ppo_loss(target_logprobs, weights, inputs["logprobs"], inputs["advantages"], loss_config)
+    case _:
+      raise NotImplementedError(f"Loss {loss_fn} not supported")

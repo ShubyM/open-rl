@@ -13,8 +13,11 @@
 # 0.1.9 needs apache-tvm-ffi pinned to 0.1.9. causal-conv1d compiles against
 # this env's torch, which is why it is installed without build isolation.
 #
-# Verified on the 8xH200 box (CUDA 12.9, driver cu129) with nemo-automodel
-# 0.6.0 / torch 2.11.0+cu129 / transformers 5.12.1 / fla 0.5.1 / tilelang 0.1.9.
+# The 0.6.0 release was verified on the 8xH200 box (CUDA 12.9, driver cu129)
+# with torch 2.11.0+cu129 / transformers 5.12.1 / fla 0.5.1 / tilelang 0.1.9.
+# The pin below is a main commit past 0.6.0 for its Datum/collate_datums and
+# merged PEFT export; it moves transformers to 5.15.1 and tilelang to 0.1.11,
+# and is not verified on the box yet.
 #
 #   ./scripts/setup_automodel_env.sh              # builds ~/automodel/.venv
 #   AUTOMODEL_VENV=~/other ./scripts/setup_automodel_env.sh
@@ -25,6 +28,8 @@ export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 VENV="${AUTOMODEL_VENV:-$HOME/automodel/.venv}"
 V="$VENV/bin/python"
 TORCH_INDEX=https://download.pytorch.org/whl/cu129
+AUTOMODEL_SHA="${AUTOMODEL_SHA:-5811fc844e4d8ba112b60fc7b3c05f30532bbc15}"
+TRANSFORMERS="transformers==5.15.1"
 
 if [ ! -x "$V" ]; then
   uv venv --python 3.12 "$VENV"
@@ -35,16 +40,20 @@ uv pip install --python "$V" torch==2.11.0 torchvision --index-url "$TORCH_INDEX
 # The open-rl trainer's runtime imports.
 uv pip install --python "$V" \
   packaging ninja pybind11 einops peft accelerate safetensors rich regex pyyaml tqdm omegaconf \
-  "transformers==5.12.1" datasets "chz>=0.4.0" fastapi pydantic "redis>=5.0.0" uvicorn httpx psutil setuptools \
+  "$TRANSFORMERS" datasets "chz>=0.4.0" fastapi pydantic "redis>=5.0.0" uvicorn httpx psutil setuptools \
   opentelemetry-api opentelemetry-sdk opentelemetry-instrumentation-fastapi opentelemetry-exporter-gcp-trace
 
-# nemo-automodel with its dependencies, torch held at the cu129 build.
-uv pip install --python "$V" "nemo-automodel==0.6.0" "torch==2.11.0" "transformers==5.12.1" \
+# nemo-automodel at the pinned commit with its dependencies, torch held at the
+# cu129 build. cutlass-dsl is floored at 4.6.0: the 4.5.x that vllm 0.25.x
+# resolves cannot compile the FA4 CuTe kernels Gemma 4's head_dim selects.
+uv pip install --python "$V" "nemo-automodel @ git+https://github.com/NVIDIA-NeMo/Automodel.git@$AUTOMODEL_SHA" "torch==2.11.0" "$TRANSFORMERS" \
+  "nvidia-cutlass-dsl>=4.6.0" \
   --index-url "$TORCH_INDEX" --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
 
 # GDN kernels: fla for the delta rule (its ops.cp is what Automodel's GDN
-# context parallelism runs on), tilelang for the Hopper backward.
-uv pip install --python "$V" "flash-linear-attention==0.5.1" "tilelang==0.1.9" "apache-tvm-ffi==0.1.9" "torch==2.11.0" \
+# context parallelism runs on), tilelang for the Hopper backward. tilelang
+# brings its own apache-tvm-ffi pin; 0.1.9 needed it held at 0.1.9 by hand.
+uv pip install --python "$V" "flash-linear-attention==0.5.1" "tilelang>=0.1.11" "torch==2.11.0" \
   --index-url "$TORCH_INDEX" --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
 MAX_JOBS=$(nproc) uv pip install --python "$V" --no-build-isolation "causal-conv1d>=1.4"
 

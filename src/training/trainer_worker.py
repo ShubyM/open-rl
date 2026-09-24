@@ -115,30 +115,13 @@ class BaseTrainerWorker:
       target_token_ids, weights, lengths = self.pad_targets_and_weights(batch_data, input_lengths)
       target_logprobs = self.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
 
-      match loss_fn:
-        case "cross_entropy":
-          elementwise_loss = losses.cross_entropy_loss(target_logprobs, weights)
-        case "importance_sampling":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
-          elementwise_loss = losses.importance_sampling_loss(
-            target_logprobs,
-            weights,
-            old_logprobs,
-            advantages,
-          )
-        case "ppo":
-          old_logprobs = self.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in batch_data], lengths, torch.float32)
-          advantages = self.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in batch_data], lengths, torch.float32)
-          elementwise_loss = losses.ppo_loss(
-            target_logprobs,
-            weights,
-            old_logprobs,
-            advantages,
-            loss_config,
-          )
-        case _:
-          raise NotImplementedError(f"Loss {loss_fn} not supported")
+      side_inputs = {}
+      if loss_fn in ("importance_sampling", "ppo"):
+        side_inputs = {
+          key: self.pad_sequences([datum.loss_fn_inputs[key].data for datum in batch_data], lengths, torch.float32)
+          for key in ("logprobs", "advantages")
+        }
+      elementwise_loss = losses.elementwise_loss(loss_fn, target_logprobs, weights, side_inputs, loss_config)
 
       per_datum_loss = elementwise_loss.sum(dim=1)
       loss = per_datum_loss.sum()

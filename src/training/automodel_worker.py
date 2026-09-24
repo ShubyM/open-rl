@@ -4,9 +4,11 @@ Automodel builds a (dp, tp) FSDP2 mesh from the torchrun world; DP is what is
 left after TP. Only the DP axis shards datums, since TP ranks cooperate on one
 sequence and must see identical data. The shard_* hooks scope to that axis.
 
-Long sequences fit because layers are checkpointed in groups and logprobs are
-projected from the final hidden states in chunks, so full [seq, vocab] logits
-never exist.
+Batches are Automodel's own Datum records through collate_datums, padded
+[B, T] by default or one packed THD row per pass with OPEN_RL_AUTOMODEL_PACKED=1.
+The loss stays ours: per-token logprobs come out of the final hidden states in
+chunks, so full [seq, vocab] logits never exist, and losses.py scores them.
+Long sequences fit because layers are checkpointed in groups.
 """
 
 import json
@@ -23,8 +25,9 @@ import torch.utils.checkpoint
 from pydantic import BaseModel
 from transformers import AutoConfig, AutoTokenizer
 
+from training import losses
 from training.distributed import barrier, is_primary
-from training.trainer_worker import BaseTrainerWorker, Datum
+from training.trainer_worker import FILLER_DATUM_INDEX, BaseTrainerWorker, Datum, shard_datum_indices
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 AUTOMODEL_TP = int(os.getenv("OPEN_RL_AUTOMODEL_TP", "1"))
@@ -48,6 +51,19 @@ RECOMPUTE_NUM_LAYERS = int(os.getenv("OPEN_RL_AUTOMODEL_RECOMPUTE_NUM_LAYERS", "
 # Rows of hidden states projected through the vocab at a time. 1024 rows of a
 # 248k vocab is a 1 GiB fp32 chunk.
 LOGPROB_CHUNK = int(os.getenv("OPEN_RL_LOGPROB_CHUNK", "1024"))
+
+# Pack every datum of a pass into one THD row instead of padding them to the
+# longest. The backbone has to take seq_lens/qkv_format, which Automodel's
+# native ones do. The token budget then bounds the row's total tokens.
+AUTOMODEL_PACKED = os.getenv("OPEN_RL_AUTOMODEL_PACKED", "0") == "1"
+# What save_weights_for_sampler publishes for a LoRA run. "adapter" writes the
+# PEFT adapter the LoRA sampler hot-loads. "merged" also folds it into the
+# base weights as a plain HF checkpoint under sampler_full/, for a sampler
+# that reloads full weights.
+SAMPLER_WEIGHTS = os.getenv("OPEN_RL_AUTOMODEL_SAMPLER_WEIGHTS", "adapter")
+
+# Keys collate_datums emits that the model forward takes. The rest are ours.
+MODEL_INPUT_KEYS = ("input_ids", "attention_mask", "position_ids", "seq_lens", "qkv_format", "cu_seqlens", "max_seqlen")
 
 
 def require_automodel():
@@ -73,6 +89,44 @@ def chunk_target_logprob(hidden: torch.Tensor, weight: torch.Tensor, targets: to
   if softcap is not None:
     logits = softcap * torch.tanh(logits / softcap)
   return logits.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
+
+
+def datum_inputs(datum: Datum) -> tuple[list[int], dict[str, list], int]:
+  """Our datum as Automodel's Datum wants it, plus how many positions carry a loss.
+
+  Automodel keys every per-token input to the input length. Targets past the
+  input are dropped, and input positions past the targets get a zero weight,
+  so neither is scored or returned, the same rule the padded path applies.
+  """
+  length = len(datum.model_input)
+  targets = list(datum.loss_fn_inputs["target_tokens"].data)
+  scored = min(length, len(targets))
+  inputs: dict[str, list] = {"target_tokens": (targets + [0] * length)[:length]}
+  weights = list(datum.loss_fn_inputs["weights"].data) if "weights" in datum.loss_fn_inputs else [1.0] * len(targets)
+  inputs["weights"] = ([float(w) for w in weights[:scored]] + [0.0] * length)[:length]
+  for key in ("logprobs", "advantages"):
+    if key in datum.loss_fn_inputs:
+      inputs[key] = ([float(v) for v in datum.loss_fn_inputs[key].data[:scored]] + [0.0] * length)[:length]
+  return list(datum.model_input), inputs, scored
+
+
+def model_inputs(batch: dict[str, Any]) -> dict[str, Any]:
+  """The forward kwargs for one collated batch. An all-ones mask is plain causal attention; dropping it lets SDPA use flash."""
+  kwargs = {key: batch[key] for key in MODEL_INPUT_KEYS if key in batch}
+  mask = kwargs.get("attention_mask")
+  if mask is not None and bool(mask.all()):
+    del kwargs["attention_mask"]
+  return kwargs
+
+
+def split_rows(logprobs: torch.Tensor, seq_lens: list[int] | None, scored: list[int]) -> list[list[float]]:
+  """Per-datum logprob lists from a padded [B, T] or a packed [1, total] result."""
+  rows = list(logprobs[0].split(seq_lens)) if seq_lens is not None else list(logprobs)
+  out = []
+  for row, count in zip(rows, scored, strict=True):
+    values = row[:count].tolist()
+    out.append([max(v, -9999.0) if not math.isinf(v) else (-9999.0 if v < 0 else 9999.0) for v in values])
+  return out
 
 
 class LayerGroup:
@@ -220,6 +274,17 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       use_triton=False,
     )
 
+  def load_kwargs(self, base_model_name: str) -> dict[str, Any]:
+    """from_pretrained arguments every copy of the model shares, sharded or not."""
+    kwargs: dict[str, Any] = {"torch_dtype": torch.bfloat16, "use_liger_kernel": False}
+    if self.is_lora:
+      kwargs["peft_config"] = self.build_peft_config()
+    # Qwen3.5 ships a multi-token-prediction head that would run over the whole
+    # sequence on every forward; the loss never reads it.
+    if AutoConfig.from_pretrained(base_model_name).get_text_config().model_type.startswith("qwen3_5"):
+      kwargs["num_nextn_predict_layers"] = 0
+    return kwargs
+
   def load_base_model(self, base_model_name: str) -> None:
     if self.model is not None and self.base_model_name == base_model_name:
       return
@@ -230,24 +295,14 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     if self.distributed_setup is None:
       self.distributed_setup = self.build_distributed_setup(base_model_name)
       self.device_mesh = self.distributed_setup.mesh_context.device_mesh
-    # Qwen3.5 ships a multi-token-prediction head that would run over the whole
-    # sequence on every forward; the loss never reads it.
-    extra = {}
-    if AutoConfig.from_pretrained(base_model_name).get_text_config().model_type.startswith("qwen3_5"):
-      extra["num_nextn_predict_layers"] = 0
     # from_pretrained applies LoRA before FSDP2 shards anything, loads the base
     # weights and freezes all but the adapters.
     self.model = NeMoAutoModelForCausalLM.from_pretrained(
-      base_model_name,
-      torch_dtype=torch.bfloat16,
-      use_liger_kernel=False,
-      distributed_setup=self.distributed_setup,
-      peft_config=self.build_peft_config() if self.is_lora else None,
-      **extra,
+      base_model_name, distributed_setup=self.distributed_setup, **self.load_kwargs(base_model_name)
     )
     if RECOMPUTE_NUM_LAYERS > 0:
       install_group_checkpointing(self.model, RECOMPUTE_NUM_LAYERS)
-    print(f"Loaded Automodel {base_model_name} (LoRA rank {AUTOMODEL_LORA_RANK}).")
+    print(f"Loaded Automodel {base_model_name} (LoRA rank {AUTOMODEL_LORA_RANK}, {'packed' if AUTOMODEL_PACKED else 'padded'} batches).")
 
   def create_model(self, base_model_name: str, model_id: str | None = None, config: AutomodelConfig | None = None) -> None:
     self.load_base_model(base_model_name)
@@ -260,20 +315,109 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       raise ValueError("No trainable parameters found in the Automodel model")
     self.optimizer = None
 
+  # -- the step --------------------------------------------------------------------
+
   def forward_backward(
     self, data: list[Datum], loss_fn: str, loss_config: dict | None = None, model_id: str | None = None, forward_only: bool = False
   ) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     return super().forward_backward(self.model, data, loss_fn, loss_config, forward_only=forward_only)
 
-  def compute_target_logprobs(
-    self, model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, target_token_ids: torch.Tensor
-  ) -> torch.Tensor:
+  def make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:
+    """Padded passes are bounded by longest x count, as the base class does. A packed pass is bounded by its total tokens."""
+    if not AUTOMODEL_PACKED:
+      return super().make_training_batches(data)
+    token_budget = int(os.getenv("OPEN_RL_TRAIN_TOKEN_BUDGET", "0"))
+    if len(data) <= 1 or token_budget <= 0:
+      return [[(idx, datum)] for idx, datum in enumerate(data)]
+    batches: list[list[tuple[int, Datum]]] = []
+    batch: list[tuple[int, Datum]] = []
+    tokens = 0
+    for idx, datum in sorted(enumerate(data), key=lambda item: len(item[1].model_input)):
+      length = len(datum.model_input)
+      if batch and tokens + length > token_budget:
+        batches.append(batch)
+        batch, tokens = [], 0
+      batch.append((idx, datum))
+      tokens += length
+    if batch:
+      batches.append(batch)
+    return batches
+
+  def collate(self, batch_data: list[Datum]) -> tuple[dict[str, Any], list[int]]:
+    """One pass's datums through Automodel's collater, on the device, plus each datum's scored length."""
+    from nemo_automodel.components.datasets.datum import Datum as AutomodelDatum
+    from nemo_automodel.components.datasets.datum import collate_datums
+
+    converted = [datum_inputs(datum) for datum in batch_data]
+    datums = [
+      AutomodelDatum(torch.tensor(ids, dtype=torch.long), {key: torch.tensor(values) for key, values in inputs.items()})
+      for ids, inputs, _ in converted
+    ]
+    batch = collate_datums(datums, packed=AUTOMODEL_PACKED)
+    batch = {key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
+    return batch, [scored for _, _, scored in converted]
+
+  def run_batches(
+    self,
+    model: torch.nn.Module,
+    data: list[Datum],
+    loss_fn: str,
+    loss_config: dict | None,
+    forward_only: bool,
+    loss_fn_outputs: list[dict[str, Any] | None],
+  ) -> float:
+    """The base loop over Automodel's collated batches.
+
+    Each DP rank runs a round-robin shard of the datums and scales its loss by
+    the shard count, which undoes FSDP's gradient mean; short ranks run
+    zero-scaled filler passes so every rank makes the same number of backward calls.
+    """
+    shard_count = self.shard_count()
+    local_indices = shard_datum_indices(len(data), self.shard_rank(), shard_count)
+    local_data = [data[idx] for idx in local_indices]
+    local_batches = self.make_training_batches(local_data)
+    if shard_count > 1:
+      filler_passes = self.shard_all_reduce_max(len(local_batches)) - len(local_batches)
+      filler = local_data[0] if local_data else data[0]
+      local_batches.extend([[(FILLER_DATUM_INDEX, filler)]] * filler_passes)
+
+    total_loss = 0.0
+    for batch in local_batches:
+      batch_positions = [idx for idx, _ in batch]
+      batch_data = [datum for _, datum in batch]
+      is_filler = batch_positions == [FILLER_DATUM_INDEX]
+      batch_indices = [] if is_filler else [local_indices[position] for position in batch_positions]
+
+      collated, scored = self.collate(batch_data)
+      # Masked positions carry ignore_index in labels; any token id works there since their weight is zero.
+      target_logprobs = self.compute_target_logprobs(model, collated["labels"].clamp_min(0), **model_inputs(collated))
+      side_inputs = {key: collated[key] for key in ("logprobs", "advantages") if key in collated}
+      loss = losses.elementwise_loss(loss_fn, target_logprobs, collated["weights"], side_inputs, loss_config).sum()
+      if not forward_only:
+        (loss * (0.0 if is_filler else float(shard_count))).backward()
+      if not is_filler:
+        total_loss += loss.item()
+
+      seq_lens = [int(n) for n in collated["seq_lens"].flatten().tolist() if n > 0] if AUTOMODEL_PACKED else None
+      for original_idx, values in zip(batch_indices, split_rows(target_logprobs.detach().cpu(), seq_lens, scored)[: len(batch_indices)], strict=True):
+        loss_fn_outputs[original_idx] = {"logprobs": {"data": values, "dtype": "float32", "shape": [len(values)]}}
+
+    if shard_count > 1:
+      total_loss = self.shard_all_reduce_sum(total_loss)
+      for part in self.shard_all_gather_object({idx: loss_fn_outputs[idx] for idx in local_indices}):
+        for idx, output in part.items():
+          loss_fn_outputs[idx] = output
+    return total_loss
+
+  def compute_target_logprobs(self, model: torch.nn.Module, target_token_ids: torch.Tensor, **inputs: Any) -> torch.Tensor:
+    """Per-position logprob of each target, projected from the final hidden states in chunks.
+
+    inputs are the forward kwargs from model_inputs: input_ids with either an
+    attention_mask (padded) or position_ids/seq_lens/qkv_format (packed).
+    """
     seq_len = target_token_ids.shape[1]
-    # An all-ones mask is plain causal attention; dropping it lets SDPA use flash.
-    if attention_mask is not None and bool(attention_mask.all()):
-      attention_mask = None
-    outputs = model(input_ids=input_ids[:, :seq_len], attention_mask=attention_mask, use_cache=False, logits_to_keep=1, output_hidden_states=True)
+    outputs = model(**inputs, use_cache=False, logits_to_keep=1, output_hidden_states=True)
     hidden = outputs.hidden_states[-1][:, :seq_len]
     if is_dtensor(hidden):
       hidden = hidden.full_tensor()
@@ -342,6 +486,8 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
   def generate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
     raise RuntimeError("Sampling from the Automodel trainer is unsupported; use the vLLM sampler.")
 
+  # -- checkpoints -----------------------------------------------------------------
+
   def get_checkpointer(self) -> Any:
     """Automodel's Checkpointer gathers DTensor shards, maps native keys back to
     the hub layout, and writes a PEFT adapter that vLLM loads."""
@@ -389,16 +535,67 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       if metadata is not None:
         with open(os.path.join(staging, "metadata.json"), "w") as f:
           json.dump(metadata, f)
-      if os.path.exists(path):
-        os.rename(path, previous)
-      os.rename(staging, path)
-      shutil.rmtree(previous, ignore_errors=True)
+      replace_dir(staging, path, previous)
     barrier()
 
   def save_state(self, model_id: str, state_path: str, include_optimizer: bool = False, kind: str = "state") -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     # Weights only for now; the optimizer state is not saved.
-    metadata = {
+    self.write_staged(state_path, self.metadata(model_id, kind))
+    return {"path": state_path}
+
+  def load_from_state(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    raise NotImplementedError("The Automodel trainer does not load checkpoints yet.")
+
+  def save_for_sampler(self, model_id: str, alias: str | None, ref: str | None) -> str | None:
+    """Write the adapter where the LoRA sampler hot-loads it, peft/<id>/<id>.
+
+    With OPEN_RL_AUTOMODEL_SAMPLER_WEIGHTS=merged the adapter is also folded
+    into the base weights under sampler_full/<ref>, and that path is returned
+    so the processor announces it the way it announces full checkpoints.
+    """
+    if not self.is_lora:
+      raise NotImplementedError("The Automodel trainer publishes sampler weights for LoRA only.")
+    adapter_dir = os.path.join(TMP_DIR, "peft", model_id, model_id)
+    self.write_staged(adapter_dir)
+    if SAMPLER_WEIGHTS != "merged":
+      return None
+    if not ref:
+      raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
+    rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
+    local_path = os.path.join(TMP_DIR, "sampler_full", rel_path)
+    if is_primary():
+      self.export_merged(adapter_dir, local_path, self.metadata(model_id, "sampler"))
+    barrier()
+    return local_path
+
+  def export_merged(self, adapter_dir: str, path: str, metadata: dict[str, Any]) -> None:
+    """The adapter folded into the base weights as a plain HF checkpoint.
+
+    Automodel merges in place and only on an unsharded model, so each export
+    builds a fresh CPU copy of the base from the hub cache. That is a minute
+    or two for a 9B model, paid by rank 0 while the others wait.
+    """
+    from nemo_automodel._transformers.peft_export import export_merged_peft_checkpoint
+
+    NeMoAutoModelForCausalLM = require_automodel()
+    started = time.perf_counter()
+    staging, previous = f"{path}.staging-{os.getpid()}", f"{path}.previous-{os.getpid()}"
+    shutil.rmtree(staging, ignore_errors=True)
+    model = NeMoAutoModelForCausalLM.from_pretrained(self.base_model_name, **self.load_kwargs(self.base_model_name))
+    try:
+      export_merged_peft_checkpoint(model, adapter_path=adapter_dir, output_dir=staging)
+    finally:
+      del model
+    if self.tokenizer is not None:
+      self.tokenizer.save_pretrained(staging)
+    with open(os.path.join(staging, "metadata.json"), "w") as f:
+      json.dump({**metadata, "format": "merged"}, f)
+    replace_dir(staging, path, previous)
+    print(f"Exported merged weights to {path} in {time.perf_counter() - started:.0f}s")
+
+  def metadata(self, model_id: str, kind: str) -> dict[str, Any]:
+    return {
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
       "kind": kind,
@@ -406,15 +603,11 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       "model_id": model_id,
       "timestamp": time.time(),
     }
-    self.write_staged(state_path, metadata)
-    return {"path": state_path}
 
-  def load_from_state(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-    raise NotImplementedError("The Automodel trainer does not load checkpoints yet.")
 
-  def save_for_sampler(self, model_id: str, alias: str | None, ref: str | None) -> str | None:
-    """Write the adapter where the LoRA sampler hot-loads it, peft/<id>/<id>."""
-    if not self.is_lora:
-      raise NotImplementedError("The Automodel trainer publishes sampler weights for LoRA only.")
-    self.write_staged(os.path.join(TMP_DIR, "peft", model_id, model_id))
-    return None
+def replace_dir(staging: str, path: str, previous: str) -> None:
+  """Rename staging over path in two moves, so path is never half-written or missing for long."""
+  if os.path.exists(path):
+    os.rename(path, previous)
+  os.rename(staging, path)
+  shutil.rmtree(previous, ignore_errors=True)
