@@ -42,6 +42,10 @@ class Config:
   rank: int = 16
   seed: int = 0
   behavior_if_log_dir_exists: str = "delete"
+  # The trainer's GPU shape. Anything above 1 makes it a torchrun group on the Automodel backend.
+  dp: int = 1
+  tp: int = 1
+  cp: int = 1
 
 
 def reset_log_dir(path: Path, behavior: str) -> None:
@@ -79,6 +83,12 @@ def build_datum(prompt_tokens: list[int], completion_tokens: list[int], logprobs
   )
 
 
+def trainer_metadata(config) -> dict | None:
+  """The trainer shape for the server, or nothing for the one-GPU default."""
+  shape = {"dp": config.dp, "tp": config.tp, "cp": config.cp}
+  return {"trainer": shape} if any(n > 1 for n in shape.values()) else None
+
+
 def main(config: Config) -> None:
   if config.steps < 1:
     raise ValueError("Tiny RL needs steps >= 1")
@@ -95,6 +105,7 @@ def main(config: Config) -> None:
     # Qwen2.5-0.5B ties lm_head to embed_tokens; LoRA on the tied head trips a
     # PEFT warning and vLLM cannot load lm_head adapter weights at all.
     train_unembed=False,
+    user_metadata=trainer_metadata(config),
   )
 
   try:

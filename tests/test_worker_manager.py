@@ -441,13 +441,13 @@ class ParallelismTest(unittest.TestCase):
     from server.worker_manager import trainer_shape_env
 
     single = TrainingModelMetadata(base_model="m", fine_tuning_type="full")
-    self.assertEqual(trainer_shape_env(single, is_lora=False), {"OPEN_RL_TRAINER_PARALLELISM": "dp=1,tp=1,cp=1"})
+    self.assertEqual(trainer_shape_env(single), {"OPEN_RL_TRAINER_PARALLELISM": "dp=1,tp=1,cp=1"})
 
     lora = TrainingModelMetadata(base_model="m", fine_tuning_type="lora", trainer_parallelism=Parallelism(tp=2))
-    env = trainer_shape_env(lora, is_lora=True)
+    env = trainer_shape_env(lora)
     self.assertEqual(env["OPEN_RL_TRAINER_BACKEND"], "automodel")
     self.assertEqual((env["OPEN_RL_AUTOMODEL_TP"], env["OPEN_RL_CONTROL_BACKEND"]), ("2", "cpu:gloo,cuda:nccl"))
-    self.assertEqual(env["OPEN_RL_AUTOMODEL_LORA_RANK"], str(lora.lora_config.rank))
+    self.assertNotIn("OPEN_RL_AUTOMODEL_LORA_RANK", env)
 
 
 if __name__ == "__main__":

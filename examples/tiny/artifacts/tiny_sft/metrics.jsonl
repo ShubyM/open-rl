@@ -1,0 +1,7 @@
+{"loss": 0.8902327219645182, "phase": "initial", "step": 0}
+{"loss": 0.8902327219645182, "phase": "train", "step": 1}
+{"loss": 0.0049343109130859375, "phase": "train", "step": 2}
+{"loss": 9.5367431640625e-06, "phase": "train", "step": 3}
+{"loss": 1.9073486328125e-06, "phase": "train", "step": 4}
+{"loss": 5.8492024739583336e-05, "phase": "train", "step": 5}
+{"final_state_path": "tinker://40dbf939-0d45-4f81-98da-2a2245cdd981/weights/tiny-sft-final", "loss": 3.814697265625e-05, "loss_drop": 0.9999571494377649, "phase": "final", "step": 5}

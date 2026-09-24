@@ -9,9 +9,9 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from server.training_requests_processor import build_worker
 from training import automodel_worker
-from training.automodel_worker import AutomodelTrainingWorker, datum_inputs, model_inputs, split_rows
+from training.automodel_worker import AutomodelTrainingWorker, datum_inputs, lora_target_patterns, model_inputs, split_rows
 from training.trainer_worker import BaseTrainerWorker
-from training.types import Datum, TensorData
+from training.types import Datum, LoraConfig, TensorData
 
 
 def datum(model_input, target_tokens, **inputs) -> Datum:
@@ -61,6 +61,25 @@ class BuildWorkerTest(unittest.TestCase):
     # No mesh until load_base_model, so the base loop runs every datum.
     worker = AutomodelTrainingWorker()
     self.assertEqual((worker.shard_rank(), worker.shard_count()), (0, 1))
+
+
+class LoraTargetsTest(unittest.TestCase):
+  """The adapter wraps what the client's LoraConfig asks for, the way the HF LoRA worker does."""
+
+  def test_targets_follow_the_config(self) -> None:
+    attn = lora_target_patterns(LoraConfig(train_attn=True, train_mlp=False), tied_embeddings=False)
+    self.assertIn("model.*.layers.*.q_proj", attn)
+    self.assertIn("model.*.layers.*.in_proj_qkv", attn)
+    self.assertFalse(any(pattern.endswith(("gate_proj", "up_proj", "down_proj", "lm_head")) for pattern in attn))
+    both = lora_target_patterns(LoraConfig(), tied_embeddings=False)
+    self.assertIn("model.*.layers.*.gate_proj", both)
+    self.assertNotIn("lm_head", both)
+
+  def test_unembed_is_wrapped_only_when_the_head_is_untied(self) -> None:
+    self.assertIn("lm_head", lora_target_patterns(LoraConfig(train_unembed=True), tied_embeddings=False))
+    self.assertNotIn("lm_head", lora_target_patterns(LoraConfig(train_unembed=True), tied_embeddings=True))
+    with self.assertRaises(ValueError):
+      lora_target_patterns(LoraConfig(train_attn=False, train_mlp=False, train_unembed=True), tied_embeddings=True)
 
 
 class DatumInputsTest(unittest.TestCase):

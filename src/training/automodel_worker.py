@@ -22,27 +22,25 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.utils.checkpoint
-from pydantic import BaseModel
 from transformers import AutoConfig, AutoTokenizer
 
 from training import losses
 from training.distributed import barrier, is_primary
 from training.trainer_worker import FILLER_DATUM_INDEX, BaseTrainerWorker, Datum, shard_datum_indices
+from training.types import FFTConfig, LoraConfig
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 AUTOMODEL_TP = int(os.getenv("OPEN_RL_AUTOMODEL_TP", "1"))
 AUTOMODEL_SEED = int(os.getenv("OPEN_RL_AUTOMODEL_SEED", "1234"))
 
-# Rank 0 trains full parameters. Alpha 16 and the kaiming A init are PEFT's
-# defaults, so an lr means the same thing here as on the FSDP worker.
-AUTOMODEL_LORA_RANK = int(os.getenv("OPEN_RL_AUTOMODEL_LORA_RANK", "16"))
-AUTOMODEL_LORA_ALPHA = int(os.getenv("OPEN_RL_AUTOMODEL_LORA_ALPHA", "16"))
-# Matched as model.*.layers.*.<name>: the decoder projections, not a vision
-# tower or an MTP head the samplers cannot place.
-AUTOMODEL_LORA_TARGETS = os.getenv(
-  "OPEN_RL_AUTOMODEL_LORA_TARGETS",
-  "q_proj,k_proj,v_proj,o_proj,in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj,gate_proj,up_proj,down_proj",
-)
+# LoRA targets per LoraConfig flag, matched as model.*.layers.*.<name> so a
+# vision tower or an MTP head the samplers cannot place is never wrapped.
+# train_attn covers Qwen3.5's linear-attention projections too. The kaiming A
+# init is PEFT's, so an lr means the same thing here as on the FSDP worker.
+LORA_TARGETS = {
+  "train_attn": ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"),
+  "train_mlp": ("gate_proj", "up_proj", "down_proj"),
+}
 
 # Decoder layers per activation checkpoint. Automodel's own checkpointing wraps
 # attention and MLP separately and stashes four tensors per layer; a group of
@@ -89,6 +87,20 @@ def chunk_target_logprob(hidden: torch.Tensor, weight: torch.Tensor, targets: to
   if softcap is not None:
     logits = softcap * torch.tanh(logits / softcap)
   return logits.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
+
+
+def lora_target_patterns(config: LoraConfig, tied_embeddings: bool) -> list[str]:
+  """Automodel PEFT patterns for the modules a LoraConfig asks to train."""
+  patterns = [f"model.*.layers.*.{name}" for flag, names in LORA_TARGETS.items() if getattr(config, flag) for name in names]
+  if config.train_unembed:
+    if tied_embeddings:
+      # vLLM refuses lm_head adapter weights for a tied head, so the adapter would be unloadable.
+      print("[LoRA] Ignoring train_unembed=True: the model ties lm_head to embed_tokens, so vLLM could not load the adapter.")
+    else:
+      patterns.append("lm_head")
+  if not patterns:
+    raise ValueError("At least one LoRA training target must be enabled.")
+  return patterns
 
 
 def datum_inputs(datum: Datum) -> tuple[list[int], dict[str, list], int]:
@@ -174,13 +186,7 @@ def install_group_checkpointing(model: torch.nn.Module, group_size: int) -> None
     raise RuntimeError(f"No decoder layers to checkpoint on {type(backbone).__name__}; set OPEN_RL_AUTOMODEL_RECOMPUTE_NUM_LAYERS=0.")
 
 
-class AutomodelConfig(BaseModel):
-  seed: int | None = None
-
-
 class AutomodelTrainingWorker(BaseTrainerWorker):
-  config_class = AutomodelConfig
-
   # FSDP2 reduces gradients inside backward, so every DP rank needs the same
   # number of passes.
   backward_runs_collectives = True
@@ -194,7 +200,13 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.trainable_params: list[torch.nn.Parameter] = []
     self.optimizer: torch.optim.Optimizer | None = None
     self.checkpointer: Any = None
-    self.is_lora = AUTOMODEL_LORA_RANK > 0
+    # Set by create_model from the client's LoraConfig; None means full fine-tuning.
+    self.lora_config: LoraConfig | None = None
+    self.peft_config: Any = None
+
+  @property
+  def is_lora(self) -> bool:
+    return self.peft_config is not None
 
   def build_distributed_setup(self, base_model_name: str) -> Any:
     if not dist.is_initialized():
@@ -262,14 +274,18 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     dist.all_gather_object(gathered, value, group=self.dp_group())
     return gathered
 
-  def build_peft_config(self) -> Any:
+  def build_peft_config(self, config: LoraConfig, base_model_name: str) -> Any:
     from nemo_automodel.components._peft.lora import PeftConfig
 
-    names = [name.strip() for name in AUTOMODEL_LORA_TARGETS.split(",") if name.strip()]
+    hf_config = AutoConfig.from_pretrained(base_model_name)
+    tied = getattr(hf_config, "tie_word_embeddings", None)
+    if tied is None:
+      tied = getattr(hf_config.get_text_config(), "tie_word_embeddings", False)
     return PeftConfig(
-      target_modules=[f"model.*.layers.*.{name}" for name in names],
-      dim=AUTOMODEL_LORA_RANK,
-      alpha=AUTOMODEL_LORA_ALPHA,
+      target_modules=lora_target_patterns(config, bool(tied)),
+      dim=config.rank,
+      alpha=config.lora_alpha,
+      dropout=config.lora_dropout,
       lora_A_init="kaiming",
       use_triton=False,
     )
@@ -277,8 +293,8 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
   def load_kwargs(self, base_model_name: str) -> dict[str, Any]:
     """from_pretrained arguments every copy of the model shares, sharded or not."""
     kwargs: dict[str, Any] = {"torch_dtype": torch.bfloat16, "use_liger_kernel": False}
-    if self.is_lora:
-      kwargs["peft_config"] = self.build_peft_config()
+    if self.peft_config is not None:
+      kwargs["peft_config"] = self.peft_config
     # Qwen3.5 ships a multi-token-prediction head that would run over the whole
     # sequence on every forward; the loss never reads it.
     if AutoConfig.from_pretrained(base_model_name).get_text_config().model_type.startswith("qwen3_5"):
@@ -286,12 +302,17 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     return kwargs
 
   def load_base_model(self, base_model_name: str) -> None:
-    if self.model is not None and self.base_model_name == base_model_name:
-      return
+    """The processor preloads BASE_MODEL before any create_model arrives. Automodel
+    applies LoRA at load, before sharding, so the load itself waits for the
+    client's LoraConfig; only the tokenizer is fetched here."""
+    if self.tokenizer is None or self.base_model_name != base_model_name:
+      self.base_model_name = base_model_name
+      self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+
+  def load_model(self, base_model_name: str) -> None:
     NeMoAutoModelForCausalLM = require_automodel()
     torch.cuda.set_device(self.device)
-    self.base_model_name = base_model_name
-    self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    self.load_base_model(base_model_name)
     if self.distributed_setup is None:
       self.distributed_setup = self.build_distributed_setup(base_model_name)
       self.device_mesh = self.distributed_setup.mesh_context.device_mesh
@@ -302,10 +323,21 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     )
     if RECOMPUTE_NUM_LAYERS > 0:
       install_group_checkpointing(self.model, RECOMPUTE_NUM_LAYERS)
-    print(f"Loaded Automodel {base_model_name} (LoRA rank {AUTOMODEL_LORA_RANK}, {'packed' if AUTOMODEL_PACKED else 'padded'} batches).")
+    shape = f"LoRA rank {self.lora_config.rank}" if self.lora_config else "full fine-tuning"
+    print(f"Loaded Automodel {base_model_name} ({shape}, {'packed' if AUTOMODEL_PACKED else 'padded'} batches).")
 
-  def create_model(self, base_model_name: str, model_id: str | None = None, config: AutomodelConfig | None = None) -> None:
-    self.load_base_model(base_model_name)
+  def create_model(self, base_model_name: str, model_id: str | None = None, config: LoraConfig | FFTConfig | None = None) -> None:
+    """Load the model for the client's config. One process serves one shape:
+    LoRA is applied before sharding, so a different base or LoraConfig needs a fresh trainer."""
+    lora_config = config if isinstance(config, LoraConfig) else None
+    if self.model is None:
+      self.lora_config = lora_config
+      self.peft_config = self.build_peft_config(lora_config, base_model_name) if lora_config is not None else None
+      self.load_model(base_model_name)
+    elif (self.base_model_name, self.lora_config) != (base_model_name, lora_config):
+      raise RuntimeError(
+        f"This Automodel trainer holds {self.base_model_name} with {self.lora_config}; restart it for {base_model_name} with {lora_config}."
+      )
     torch.manual_seed(config.seed if config is not None and config.seed is not None else AUTOMODEL_SEED)
     if not self.is_lora:
       for param in self.model.parameters():
@@ -511,9 +543,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     Every rank calls this because the gathers are collective. The checkpointer
     nests its output under model/, which rank 0 lifts into path.
     """
-    self.get_checkpointer().save_model(
-      self.model, weights_path=path, peft_config=self.build_peft_config() if self.is_lora else None, tokenizer=self.tokenizer
-    )
+    self.get_checkpointer().save_model(self.model, weights_path=path, peft_config=self.peft_config, tokenizer=self.tokenizer)
     if is_primary():
       model_dir = os.path.join(path, "model")
       source = model_dir if self.is_lora else os.path.join(model_dir, "consolidated")

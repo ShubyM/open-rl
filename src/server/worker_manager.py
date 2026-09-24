@@ -90,7 +90,7 @@ def worker_env(meta: TrainingModelMetadata, base_model: str, runtime: str, is_lo
     env["OPEN_RL_WEIGHT_SYNC_DELTA_APPLY_METHOD"] = weight_sync.delta_apply_method
   if role == "trainer":
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    env.update(trainer_shape_env(meta, is_lora))
+    env.update(trainer_shape_env(meta))
   else:
     env["OPEN_RL_MODEL_ID"] = runtime
     env["VLLM_SERVER_DEV_MODE"] = "1"
@@ -108,7 +108,7 @@ def trainer_backend(meta: TrainingModelMetadata) -> str:
   return "fsdp"
 
 
-def trainer_shape_env(meta: TrainingModelMetadata, is_lora: bool) -> dict[str, str]:
+def trainer_shape_env(meta: TrainingModelMetadata) -> dict[str, str]:
   """What a trainer needs to know about its GPUs. More than one device is
   a torchrun group; the Automodel backend gets its tensor-parallel size."""
   parallelism = meta.trainer_parallelism
@@ -118,7 +118,6 @@ def trainer_shape_env(meta: TrainingModelMetadata, is_lora: bool) -> dict[str, s
   if trainer_backend(meta) == "automodel":
     env["OPEN_RL_TRAINER_BACKEND"] = "automodel"
     env["OPEN_RL_AUTOMODEL_TP"] = str(parallelism.tp)
-    env["OPEN_RL_AUTOMODEL_LORA_RANK"] = str(meta.lora_config.rank if is_lora else 0)
   return env
 
 

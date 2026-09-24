@@ -22,6 +22,7 @@ attach to an owner between the check and the delete.
 """
 
 import json
+from typing import Any
 
 from server.store import StateStore
 
@@ -38,11 +39,11 @@ class SessionRegistry:
   async def heartbeat(self, session_id: str) -> None:
     await self.state.set_value(f"open_rl:session:{session_id}", "1", ttl_seconds=self.ttl_seconds)
 
-  async def remember(self, session_id: str, user_metadata: dict[str, str]) -> None:
+  async def remember(self, session_id: str, user_metadata: dict[str, Any]) -> None:
     if user_metadata:
       await self.state.set_value(f"open_rl:session_meta:{session_id}", json.dumps(user_metadata), ttl_seconds=SESSION_METADATA_TTL_SECONDS)
 
-  async def user_metadata(self, session_id: str | None) -> dict[str, str]:
+  async def user_metadata(self, session_id: str | None) -> dict[str, Any]:
     raw = await self.state.get_value(f"open_rl:session_meta:{session_id}") if session_id else None
     return json.loads(raw) if raw else {}
 

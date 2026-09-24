@@ -344,7 +344,7 @@ class ParallelismMetadataTest(ApiServerTest):
     return json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
 
   def test_user_metadata_states_the_trainer_parallelism_and_is_kept(self) -> None:
-    user_metadata = {"open_rl.trainer.parallelism": "tp=2", "wandb_link": "https://wandb/run/1"}
+    user_metadata = {"trainer": {"tp": 2}, "wandb_link": "https://wandb/run/1"}
     model_id = self.post("create_model", {"base_model": "m", "user_metadata": user_metadata}).json()["request_id"]
     meta = self.metadata(model_id)
     self.assertEqual(meta["trainer_parallelism"], {"dp": 1, "tp": 2, "cp": 1})
@@ -352,7 +352,7 @@ class ParallelismMetadataTest(ApiServerTest):
     self.assertEqual(meta["user_metadata"], user_metadata)
 
   def test_a_malformed_parallelism_is_refused(self) -> None:
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"open_rl.trainer.parallelism": "gpus=4"}})
+    response = self.post("create_model", {"base_model": "m", "user_metadata": {"trainer": {"gpus": 4}}})
     self.assertEqual(response.status_code, 400)
     self.assertIn("parallelism", response.json()["error"])
 
@@ -361,25 +361,25 @@ class ParallelismMetadataTest(ApiServerTest):
     self.assertEqual(self.metadata(model_id)["trainer_parallelism"]["tp"], 4)
 
   def test_the_session_supplies_defaults_the_model_may_override(self) -> None:
-    session_id = self.post("create_session", {"user_metadata": {"open_rl.trainer.parallelism": "dp=2"}}).json()["session_id"]
+    session_id = self.post("create_session", {"user_metadata": {"trainer": {"dp": 2}}}).json()["session_id"]
     inherited = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
     self.assertEqual(self.metadata(inherited)["trainer_parallelism"], {"dp": 2, "tp": 1, "cp": 1})
-    own = {"open_rl.trainer.parallelism": "tp=2"}
+    own = {"trainer": {"tp": 2}}
     overridden = self.post("create_model", {"base_model": "m", "session_id": session_id, "user_metadata": own}).json()["request_id"]
     self.assertEqual(self.metadata(overridden)["trainer_parallelism"], {"dp": 1, "tp": 2, "cp": 1})
 
   def test_trainer_context_parallelism_is_refused_for_now(self) -> None:
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"open_rl.trainer.parallelism": "cp=2"}})
+    response = self.post("create_model", {"base_model": "m", "user_metadata": {"trainer": {"cp": 2}}})
     self.assertEqual(response.status_code, 400)
     self.assertIn("context parallelism", response.json()["error"])
 
   def test_sampler_tensor_parallelism_is_refused_for_now(self) -> None:
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"open_rl.sampler.parallelism": "tp=2"}})
+    response = self.post("create_model", {"base_model": "m", "user_metadata": {"sampler": {"tp": 2}}})
     self.assertEqual(response.status_code, 400)
     self.assertIn("dp only", response.json()["error"])
 
   def test_sampler_dp_is_kept_on_the_model(self) -> None:
-    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"open_rl.sampler.parallelism": "dp=2"}}).json()["request_id"]
+    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"sampler": {"dp": 2}}}).json()["request_id"]
     self.assertEqual(self.metadata(model_id)["sampler_parallelism"], {"dp": 2, "tp": 1, "cp": 1})
 
 

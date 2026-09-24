@@ -100,13 +100,13 @@ class SessionHeartbeatRequest(BaseModel):
 
 
 class CreateSessionRequest(BaseModel):
-  user_metadata: dict[str, str] | None = None
+  user_metadata: dict[str, Any] | None = None
 
 
 class CreateModelRequest(BaseModel):
   base_model: str
   session_id: str | None = None
-  user_metadata: dict[str, str] | None = None
+  user_metadata: dict[str, Any] | None = None
   lora_config: LoraConfig = Field(default_factory=LoraConfig)
   full_config: FFTConfig = Field(default_factory=FFTConfig)
 
@@ -122,7 +122,7 @@ class CreateModelFromStateRequest(BaseModel):
   # The checkpoint's metadata names the base model when the client does not.
   base_model: str | None = None
   session_id: str | None = None
-  user_metadata: dict[str, str] | None = None
+  user_metadata: dict[str, Any] | None = None
   lora_config: LoraConfig = Field(default_factory=LoraConfig)
   full_config: FFTConfig = Field(default_factory=FFTConfig)
 

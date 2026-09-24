@@ -295,7 +295,8 @@ class ParallelTrainerWorkloadTest(unittest.TestCase):
     )
     env = self.env_of(workload)
     self.assertEqual(env["OPEN_RL_TRAINER_BACKEND"], "automodel")
-    self.assertEqual((env["OPEN_RL_AUTOMODEL_TP"], env["OPEN_RL_AUTOMODEL_LORA_RANK"]), ("2", "0"))
+    self.assertEqual(env["OPEN_RL_AUTOMODEL_TP"], "2")
+    self.assertNotIn("OPEN_RL_AUTOMODEL_LORA_RANK", env)
 
   def test_a_data_parallel_trainer_is_an_automodel_group(self) -> None:
     s = self.store_with("job-dp", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "trainer_parallelism": {"dp": 2}})

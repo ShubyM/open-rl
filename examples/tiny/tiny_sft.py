@@ -40,7 +40,10 @@ class Config:
   behavior_if_log_dir_exists: str = "delete"
   sample_after_train: bool = False
   # e.g. "tp=2" to put the trainer on a multi-GPU Automodel worker.
-  trainer_parallelism: str = ""
+  # The trainer's GPU shape. Anything above 1 makes it a torchrun group on the Automodel backend.
+  dp: int = 1
+  tp: int = 1
+  cp: int = 1
 
 
 def reset_log_dir(path: Path, behavior: str) -> None:
@@ -87,6 +90,12 @@ def measure_loss(trainer: tinker.TrainingClient, datum: types.Datum, active_toke
   return loss
 
 
+def trainer_metadata(config) -> dict | None:
+  """The trainer shape for the server, or nothing for the one-GPU default."""
+  shape = {"dp": config.dp, "tp": config.tp, "cp": config.cp}
+  return {"trainer": shape} if any(n > 1 for n in shape.values()) else None
+
+
 def main(config: Config) -> None:
   log_dir = Path(config.log_dir)
   reset_log_dir(log_dir, config.behavior_if_log_dir_exists)
@@ -101,7 +110,7 @@ def main(config: Config) -> None:
     # Qwen2.5-0.5B ties lm_head to embed_tokens; LoRA on the tied head trips a
     # PEFT warning and vLLM cannot load lm_head adapter weights at all.
     train_unembed=False,
-    user_metadata={"open_rl.trainer.parallelism": config.trainer_parallelism} if config.trainer_parallelism else None,
+    user_metadata=trainer_metadata(config),
   )
   tokenizer = trainer.get_tokenizer()
   datum, active_tokens = build_datum(tokenizer, config.prompt, config.completion)
