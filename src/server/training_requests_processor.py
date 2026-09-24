@@ -16,21 +16,23 @@ from opentelemetry import propagate, trace
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
-from server.model_metadata import get_model_metadata
+from server.model_metadata import WeightSyncConfig, get_model_metadata
 from server.store import RequestStore, get_state_store, get_store
 from training import commands
 from training.commands import parse_command
-from training.fft_trainer_worker import FFTTrainingWorker
-from training.lora_trainer_worker import LoraTrainingWorker
+from training.trained_weights import park, unpark, write
+from training.trainer_worker import TrainerWorker
+from training.weight_delta import SparseWeightDelta
 
 tracer = trace.get_tracer(__name__)
 
 
-TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
-
-
 def is_fft_enabled() -> bool:
   return os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true"
+
+
+def tmp_dir() -> str:
+  return os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 
 
 def describe_requests(batch: list[dict[str, Any]]) -> str:
@@ -64,7 +66,7 @@ class TrainingRequestsProcessor:
   def __init__(
     self,
     store: RequestStore,
-    worker: TrainingWorker,
+    worker: TrainerWorker,
     model_id: str | None = None,
     active_tenant_set_id: str | None = None,
     time_slicer: TimeSlicerClient | None = None,
@@ -82,6 +84,11 @@ class TrainingRequestsProcessor:
     self.time_slicer = time_slicer
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM) if time_slicer else None
     self.snapshot_registered = False
+    # Between time-slicer turns the worker's tensors are parked on the host.
+    # FFTConfig.cpu_offload=False keeps them on the device instead.
+    self.offload = True
+    self.weight_sync = WeightSyncConfig.from_env()
+    self.deltas: dict[str, SparseWeightDelta] = {}
 
   async def run(self) -> None:
     print(f"[WORKER] Training requests processor started (model={self.model_id} active_set={self.active_tenant_set_id}).")
@@ -189,16 +196,18 @@ class TrainingRequestsProcessor:
 
     if gpu_reqs:
       async with self.time_slicer.acquire(self.workload):
-        await asyncio.to_thread(self.worker.wake_up)
+        if self.offload:
+          await asyncio.to_thread(unpark, self.worker.tensors())
         try:
           for request in gpu_reqs:
             results.append(await self.handle_request(request))
         finally:
-          await asyncio.to_thread(self.worker.sleep)
+          if self.offload:
+            await asyncio.to_thread(park, self.worker.tensors())
 
     if not save_reqs:
       return
-    if self.worker.cpu_offload:
+    if self.offload:
       for request in save_reqs:
         results.append(await self.handle_request(request))
     else:
@@ -237,8 +246,12 @@ class TrainingRequestsProcessor:
     match command:
       case commands.CreateModel():
         is_lora = command.fine_tuning_type == "lora"
+        if not is_lora:
+          self.offload = command.full_config.cpu_offload
+          self.set_weight_sync_strategy(command.full_config.weight_sync_strategy)
         config = command.lora_config if is_lora else command.full_config
-        await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, config)
+        await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, command.lora_config if is_lora else None, config.seed)
+        await asyncio.to_thread(self.track_new_weights, command.model_id)
         result = {
           "base_model": command.base_model,
           "model_id": command.model_id,
@@ -249,7 +262,8 @@ class TrainingRequestsProcessor:
           result["rank"] = command.lora_config.rank
         return result
       case commands.CreateModelFromState():
-        result = await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
+        result = await asyncio.to_thread(self.worker.load_state, command.model_id, command.state_path, command.restore_optimizer)
+        await asyncio.to_thread(self.track_new_weights, command.model_id)
         return {
           "base_model": result.get("base_model"),
           "model_id": result.get("model_id", command.model_id),
@@ -259,39 +273,41 @@ class TrainingRequestsProcessor:
       case commands.ForwardBackward():
         result = await asyncio.to_thread(
           self.worker.forward_backward,
+          command.model_id,
           command.data,
           command.loss_fn,
           command.loss_config,
-          command.model_id,
           forward_only=command.forward_only,
         )
         result["type"] = "forward_backward_completed"
         return result
       case commands.OptimStep():
-        result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, command.model_id)
+        result = await asyncio.to_thread(self.worker.optim_step, command.model_id, command.adam_params)
+        await asyncio.to_thread(self.track_step, command.model_id)
         result["type"] = "optim_step_completed"
         return result
       case commands.Sample():
         result = await asyncio.to_thread(
           self.worker.generate,
+          command.model_id,
           command.prompt_tokens,
           command.max_tokens,
           command.num_samples,
           command.temperature,
-          command.model_id,
           command.prompt_logprobs,
         )
         result["type"] = "sample_completed"
         return result
       case commands.SaveState():
-        result = await asyncio.to_thread(self.worker.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
-        return {"path": result.get("path", command.state_path), "type": "state_saved"}
+        await asyncio.to_thread(self.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
+        return {"path": command.state_path, "type": "state_saved"}
       case commands.LoadWeights():
-        await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
+        await asyncio.to_thread(self.worker.load_state, command.model_id, command.state_path, command.restore_optimizer)
+        await asyncio.to_thread(self.track_new_weights, command.model_id)
         return {"path": command.state_path, "type": "weights_loaded"}
       case commands.SaveWeightsForSampler():
         ref = command.path or command.sampling_session_id
-        checkpoint = await asyncio.to_thread(self.worker.save_for_sampler, command.model_id, command.alias, ref)
+        checkpoint = await asyncio.to_thread(self.save_for_sampler, command.model_id, ref)
         if checkpoint:
           await self.publish_checkpoint(command.model_id, checkpoint)
         return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved"}
@@ -299,6 +315,65 @@ class TrainingRequestsProcessor:
         return {"status": "ok", "type": "shutdown_acknowledged"}
       case _:
         raise NotImplementedError(f"Training request op {command.op!r} is not supported")
+
+  # -- getting weights to the samplers --------------------------------------------------
+
+  def set_weight_sync_strategy(self, strategy: str | None) -> None:
+    if strategy is None:
+      return
+    if strategy not in ("full", "delta"):
+      raise ValueError(f"Invalid weight_sync_strategy '{strategy}'. Must be 'full' or 'delta'.")
+    self.weight_sync.strategy = strategy
+
+  def track_new_weights(self, model_id: str) -> None:
+    """A model_id just got weights. Export a LoRA adapter so the sampler can load it, or start diffing full weights."""
+    trained = self.worker.models[model_id]
+    if trained.lora_config is not None:
+      self.export_adapter(model_id)
+    elif self.weight_sync.strategy == "delta":
+      self.deltas[model_id] = SparseWeightDelta(trained.weights, getattr(self.worker.base.module, "config", None), self.weight_sync.delta_format)
+
+  def track_step(self, model_id: str) -> None:
+    trained = self.worker.models[model_id]
+    if trained.lora_config is not None:
+      self.export_adapter(model_id)
+    elif model_id in self.deltas:
+      self.deltas[model_id].record(trained.weights)
+
+  def export_adapter(self, model_id: str) -> None:
+    """The LoRA sampler hot-loads adapters from this directory, so every change lands there."""
+    write(self.worker.models[model_id], os.path.join(tmp_dir(), "peft", model_id), base_model=self.worker.base.name, model_id=model_id, kind="weights")
+
+  def save_state(self, model_id: str, state_path: str, include_optimizer: bool, kind: str) -> None:
+    trained = self.worker.models[model_id]
+    full = trained.lora_config is None
+    write(
+      trained,
+      state_path,
+      base_model=self.worker.base.name,
+      model_id=model_id,
+      with_adam=include_optimizer,
+      kind=kind,
+      hf_config=getattr(self.worker.base.module, "config", None) if full else None,
+      tokenizer=self.worker.base.tokenizer if full else None,
+    )
+    print(f"Saved state for '{model_id}' to {state_path}")
+
+  def save_for_sampler(self, model_id: str, ref: str | None) -> str | None:
+    """Full weights go under a versioned path the samplers reload from. A LoRA
+    adapter is hot-loaded from its export directory, so there is no checkpoint to announce."""
+    if self.worker.models[model_id].lora_config is not None:
+      self.export_adapter(model_id)
+      return None
+    if not ref:
+      raise ValueError("save_weights_for_sampler requires path or sampling_session_id")
+    rel_path = ref[len("tinker://") :] if ref.startswith("tinker://") else ref.lstrip("/")
+    local_path = os.path.join(tmp_dir(), "sampler_full", rel_path)
+    if model_id in self.deltas:
+      self.deltas[model_id].write(local_path, base_model=self.worker.base.name, model_id=model_id)
+    else:
+      self.save_state(model_id, local_path, False, "sampler")
+    return local_path
 
   async def publish_checkpoint(self, model_id: str, local_path: str) -> None:
     """Tell the samplers about a new checkpoint and drop the versions they no longer need."""
@@ -313,16 +388,18 @@ class TrainingRequestsProcessor:
 
 
 async def run_training_requests_processor(
-  worker: TrainingWorker,
+  worker: TrainerWorker,
   model_id: str | None = None,
   time_slicer: TimeSlicerClient | None = None,
   active_tenant_set_id: str | None = None,
   *,
   store: RequestStore | None = None,
+  time_sliced: bool = False,
 ) -> None:
+  """time_sliced is how full fine-tuning trainers run, one model per process taking turns on the accelerator."""
   store = get_store() if store is None else store
-  if isinstance(worker, FFTTrainingWorker):
-    time_slicer = time_slicer or time_slicer_client_from_env()
+  if time_sliced and time_slicer is None:
+    time_slicer = time_slicer_client_from_env()
   await TrainingRequestsProcessor(store, worker, model_id, active_tenant_set_id, time_slicer).run()
 
 
@@ -336,7 +413,7 @@ async def main_async(args: argparse.Namespace) -> None:
   is_lora = fine_tuning_type == "lora"
   print(f"-> Fine-Tuning Type: {fine_tuning_type} (Is LoRA: {is_lora})\n")
 
-  worker: TrainingWorker = LoraTrainingWorker() if is_lora else FFTTrainingWorker()
+  worker = TrainerWorker()
   preload_target = os.getenv("BASE_MODEL")
   is_ready = False
   if preload_target and is_lora:
@@ -370,6 +447,7 @@ async def main_async(args: argparse.Namespace) -> None:
     worker,
     args.model_id,
     active_tenant_set_id=getattr(args, "active_tenant_set_id", None),
+    time_sliced=not is_lora,
   )
 
 

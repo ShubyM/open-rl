@@ -511,7 +511,7 @@ async def lifespan(_: FastAPI):
     if not is_fft_enabled():
       from server import training_requests_processor
 
-      worker = training_requests_processor.LoraTrainingWorker()
+      worker = training_requests_processor.TrainerWorker()
       if base_model:
         await asyncio.to_thread(worker.load_base_model, base_model)
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
