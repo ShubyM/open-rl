@@ -21,6 +21,8 @@ class WeightTransferGPUTest(unittest.TestCase):
     from vllm import LLM, SamplingParams
     from vllm.config import WeightTransferConfig
 
+    # collective_rpc(runtime_weights) ships a function to the worker, which vLLM only pickles when this is set.
+    os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     torch.manual_seed(7)
     with tempfile.TemporaryDirectory() as directory:
       path = Path(directory)
