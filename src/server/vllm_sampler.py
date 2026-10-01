@@ -11,7 +11,7 @@ from typing import Any
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
-from server.observability import gpu_turn, observe_operation
+from server.observability import gpu_turn, observe_operation, turn_phase
 from server.vllm_options import gpu_memory_utilization, sampler_batch_limits, split_stop, text_only_engine_kwargs
 
 try:
@@ -232,29 +232,30 @@ async def process_sampling_request(req: dict, store: Any) -> None:
           if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
             print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
             if engine is not None:
-              print("[vLLM Worker] Triggering sleep level 1 (CPU offload weights)...")
-              await engine.sleep(level=1)
-              print("[vLLM Worker] Waking up weights...")
-              await engine.wake_up(tags=["weights"])
-              if WeightSyncConfig.from_env().strategy == "delta":
+              with turn_phase("weight_sync"):
+                print("[vLLM Worker] Triggering sleep level 1 (CPU offload weights)...")
+                await engine.sleep(level=1)
+                print("[vLLM Worker] Waking up weights...")
+                await engine.wake_up(tags=["weights"])
+                if WeightSyncConfig.from_env().strategy == "delta":
 
-                def _trigger_wt(worker, path=weights_path):
-                  worker.start_weight_update()
-                  try:
-                    worker.update_weights({"target_weights_path": path})
-                  finally:
-                    worker.finish_weight_update()
+                  def _trigger_wt(worker, path=weights_path):
+                    worker.start_weight_update()
+                    try:
+                      worker.update_weights({"target_weights_path": path})
+                    finally:
+                      worker.finish_weight_update()
 
-                res = await engine.collective_rpc(_trigger_wt)
-                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
-                print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
-              else:
-                res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
-                print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
-                print(f"[vLLM Worker] Full weights reloaded from {weights_path} in-place.")
-              print("[vLLM Worker] Waking up KV cache...")
-              await engine.wake_up(tags=["kv_cache"])
-              IS_ENGINE_SLEEPING = False
+                  res = await engine.collective_rpc(_trigger_wt)
+                  print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                  print(f"[vLLM Worker] Incremental delta weights from {weights_path} synchronized via native WeightTransferEngine.")
+                else:
+                  res = await engine.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+                  print(f"[vLLM Worker] collective_rpc weight transfer result: {res}")
+                  print(f"[vLLM Worker] Full weights reloaded from {weights_path} in-place.")
+                print("[vLLM Worker] Waking up KV cache...")
+                await engine.wake_up(tags=["kv_cache"])
+                IS_ENGINE_SLEEPING = False
             CURRENT_LOADED_SAMPLER_WEIGHTS = weights_path
             print("[vLLM Worker] Weights reload completed successfully!")
 
@@ -319,11 +320,13 @@ async def run_sampling_worker(model_id: str) -> None:
       snapshot_registered = True
       async with gpu_turn(time_slicer, workload, store, "sampler", model_id):
         print("[vLLM Worker] Initializing vLLM engine under parent lock...")
-        init_engine()
+        with turn_phase("init"):
+          init_engine()
         print("[vLLM Worker] Engine initialized successfully.")
         if engine is not None:
           print("[vLLM Worker] Sleeping engine after init to yield GPU memory (CPU offload)...")
-          await engine.sleep(level=1)
+          with turn_phase("sleep"):
+            await engine.sleep(level=1)
           IS_ENGINE_SLEEPING = True
     except Exception as exc:
       print(f"[vLLM Worker] Failed to perform coordinated initialization: {exc}")
@@ -431,7 +434,8 @@ async def run_sampling_worker(model_id: str) -> None:
             async with gpu_turn(time_slicer, workload, store, "sampler", model_id):
               if engine is not None and IS_ENGINE_SLEEPING:
                 print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")
-                await engine.wake_up(tags=["weights", "kv_cache"])
+                with turn_phase("wake_up"):
+                  await engine.wake_up(tags=["weights", "kv_cache"])
                 IS_ENGINE_SLEEPING = False
               unanswered = []
               await sample_batch(sampling_reqs)
@@ -439,7 +443,8 @@ async def run_sampling_worker(model_id: str) -> None:
                 await exit_gracefully()
               if engine is not None:
                 print("[vLLM Worker] Exiting batch: sleeping engine (CPU offload weights) to yield GPU memory...")
-                await engine.sleep(level=1)
+                with turn_phase("sleep"):
+                  await engine.sleep(level=1)
                 IS_ENGINE_SLEEPING = True
             faulted = getattr(time_slicer, "faulted", None)
             if faulted:

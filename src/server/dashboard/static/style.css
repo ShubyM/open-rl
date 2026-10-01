@@ -843,6 +843,47 @@ body {
   stroke: var(--allocation-color);
   stroke-width: 1px;
 }
+/* Worker-recorded phases inside a GPU turn. The turn underneath stays visible
+   where no phase was recorded (time between ops). */
+#orl-design-lab [data-phase] {
+  --phase-color: #2a9d8f;
+}
+#orl-design-lab [data-phase="forward_backward"] { --phase-color: #3366cc; }
+#orl-design-lab [data-phase="forward"] { --phase-color: #6fa8dc; }
+#orl-design-lab [data-phase="optim_step"] { --phase-color: #8e44ad; }
+#orl-design-lab [data-phase="sample"] { --phase-color: #2e9e5b; }
+#orl-design-lab [data-phase="weight_sync"] { --phase-color: #e67e22; }
+#orl-design-lab [data-phase="wake_up"],
+#orl-design-lab [data-phase="sleep"] { --phase-color: #95a5a6; }
+#orl-design-lab [data-phase="init"] { --phase-color: #5d6d7e; }
+#orl-design-lab .activity-block.phase {
+  fill: var(--phase-color);
+}
+#orl-design-lab .activity-block.phase:hover {
+  fill: color-mix(in srgb, var(--phase-color) 75%, var(--ink, #000));
+}
+#orl-design-lab .phase-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 8px 0 0 var(--activity-label-width, 0);
+  font-size: 12px;
+  color: var(--muted, inherit);
+}
+#orl-design-lab .phase-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+#orl-design-lab .phase-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--phase-color);
+}
+#orl-design-lab .phase-swatch.turn {
+  background: color-mix(in srgb, currentColor 25%, transparent);
+}
 #orl-design-lab .cross-node-activity {
   --activity-label-width: 240px;
   border-top: 1px solid var(--line);

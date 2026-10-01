@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from server import observability as telemetry
-from server.dashboard import cluster, experiments, gke, metrics
+from server.dashboard import cluster, experiments, gke, local, metrics, sources
 from server.dashboard.snapshot import snapshot
 from server.store import get_store
 
@@ -61,7 +61,7 @@ async def inspection_index():
 async def snapshot_view():
   await gke.discover()
   state = await snapshot.current(get_store())
-  return {**state, "telemetry_sources": {"gke": gke.configuration()}}
+  return {**state, "telemetry_sources": await asyncio.to_thread(sources.describe)}
 
 
 @router.get("/api/v1/dashboard/experiments")
@@ -122,8 +122,10 @@ async def run_logs(
 
 @router.get("/api/v1/dashboard/pods/{pod}/logs")
 async def pod_logs(pod: str, container: str | None = None, previous: bool = False, tail: int = Query(200, ge=1, le=1000)):
-  """Current or previous container output straight from the kubelet, for any pod in the namespace."""
+  """Current or previous container output straight from the kubelet, for any pod in the namespace; locally, the worker's log file."""
   try:
+    if sources.mode() == "local":
+      return await asyncio.to_thread(local.pod_logs, pod, tail)
     return await asyncio.to_thread(cluster.pod_logs, pod, container, tail, previous)
   except Exception as exc:
     raise HTTPException(503, "Pod logs unavailable in the configured namespace") from exc

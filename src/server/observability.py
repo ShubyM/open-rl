@@ -1,6 +1,7 @@
 """Bounded operation samples shared by workers and read-only inspection clients."""
 
 import asyncio
+import contextvars
 import math
 import os
 import time
@@ -93,6 +94,7 @@ async def observe_operation(store, request: dict, role: str, runtime_id: str | N
             span.set_attribute(f"openrl.{field}", str(sample[field]))
         if status != "succeeded":
           span.set_status(StatusCode.ERROR)
+        add_phase(operation, started_at, sample["at"], run_id=run_id, request_id=sample["request_id"], status=status)
         if run_id:
           await asyncio.wait_for(store.append_sample(key(run_id), sample, SAMPLE_LIMIT), timeout=0.1)
       except Exception:
@@ -112,30 +114,78 @@ async def read(store, run_id: str) -> dict:
 
 
 TURN_KEY_PREFIX = "open_rl:turns:"
+MAX_PHASES = 64
+
+# The phases of the GPU turn the current task is inside, or None outside a turn.
+# Tasks created inside a turn copy the context, so concurrent sample requests
+# land in the turn that launched them.
+_turn_phases: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar("openrl_turn_phases", default=None)
 
 
 def turn_key(workload: str) -> str:
   return TURN_KEY_PREFIX + workload
 
 
+def add_phase(name: str, start: float, end: float, run_id: str | None = None, request_id: str | None = None, status: str = "succeeded") -> None:
+  """Record what the GPU was doing inside the current turn. Concurrent phases of
+  the same name and run (a batch of sample requests) merge into one with a count."""
+  phases = _turn_phases.get()
+  if phases is None:
+    return
+  for phase in reversed(phases):
+    if phase["name"] == name and phase.get("run_id") == run_id and start < phase["end"]:
+      phase.update(start=min(start, phase["start"]), end=max(end, phase["end"]), count=phase["count"] + 1)
+      if status != "succeeded":
+        phase["status"] = status
+      return
+  if len(phases) >= MAX_PHASES:
+    return
+  phase = {"name": name[:64], "start": start, "end": end, "count": 1, "status": status}
+  if run_id:
+    phase["run_id"] = run_id
+  if request_id:
+    phase["request_id"] = request_id
+  phases.append(phase)
+
+
+@contextmanager
+def turn_phase(name: str):
+  """Time a block of work inside the current GPU turn (wake_up, sleep, weight sync)."""
+  start, status = time.time(), "succeeded"
+  try:
+    yield
+  except BaseException:
+    status = "failed"
+    raise
+  finally:
+    add_phase(name, start, time.time(), status=status)
+
+
 @asynccontextmanager
 async def gpu_turn(time_slicer, workload, store, role: str, runtime_id: str | None):
   """Hold the GPU through the time-slicer and record the turn: the interval the
-  device was ours, which by construction never overlaps another workload's."""
+  device was ours, which by construction never overlaps another workload's,
+  and the phases that ran inside it."""
+  requested = time.time()
   async with time_slicer.acquire(workload):
     started = time.time()
+    phases: list[dict] = []
+    token = _turn_phases.set(phases)
     try:
       yield
     finally:
+      _turn_phases.reset(token)
       sample = {
         "at": time.time(),
         "started_at": started,
+        "requested_at": requested,
         "operation": "gpu_turn",
         "workload": workload.name,
         "role": os.getenv("OPEN_RL_PROCESS_ROLE") or role,
         "runtime_id": runtime_id,
         "node": os.getenv("NODE_NAME"),
         "pod_uid": os.getenv("POD_UID"),
+        "phases": phases,
       }
       try:
         await asyncio.wait_for(store.append_sample(turn_key(workload.name), sample, SAMPLE_LIMIT), timeout=0.1)

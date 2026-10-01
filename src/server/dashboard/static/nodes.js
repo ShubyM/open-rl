@@ -87,10 +87,17 @@ function operationActivity(placement, range) {
   // A shared worker's turn has no logical run ID. Its operations remain the
   // per-run evidence; copying the worker's turns to every run would duplicate it.
   if (!placement.allocation_id && turns.data?.samples?.length) {
-    const intervals = turns.data.samples
-      .map((t) => [Math.max(range.start, placement.start, t.started_at), Math.min(range.now, placement.end, t.at)])
-      .filter(([from, to]) => to > from);
-    return save({ intervals: mergeIntervals(intervals), error: turns.error || "", errorStatus: turns.errorStatus, loading: false, exact: true });
+    const clip = (from, to) => [Math.max(range.start, placement.start, from), Math.min(range.now, placement.end, to)];
+    const intervals = turns.data.samples.map((t) => clip(t.started_at, t.at)).filter(([from, to]) => to > from);
+    // What the GPU was doing inside each turn, recorded by the worker: one interval list per phase name.
+    const phases = {};
+    for (const turn of turns.data.samples)
+      for (const phase of turn.phases || []) {
+        const [from, to] = clip(phase.start, phase.end);
+        if (to > from) (phases[phase.name] ||= []).push([from, to]);
+      }
+    for (const name of Object.keys(phases)) phases[name] = mergeIntervals(phases[name]);
+    return save({ intervals: mergeIntervals(intervals), phases, error: turns.error || "", errorStatus: turns.errorStatus, loading: false, exact: true });
   }
   const intervals = [];
   let error = "", errorStatus = null, loading = !placement.allocation_id && turns.pending && !turns.data && !turns.error;
@@ -231,6 +238,20 @@ function processLabel(placement) {
 
 const processOrder = (a, b) => ({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""));
 
+// Compute first, then the weight movement around it, so a weight sync inside a
+// sample batch stays visible on top of it.
+const PHASE_ORDER = ["forward_backward", "forward", "optim_step", "sample", "init", "wake_up", "sleep", "weight_sync"];
+const phaseRank = (name) => (PHASE_ORDER.includes(name) ? PHASE_ORDER.indexOf(name) : PHASE_ORDER.length);
+const phaseLabel = (name) => name.replace(/_/g, " ");
+const phaseNames = (activities) => [...new Set(activities.flatMap((a) => Object.keys(a.phases || {})))].sort((a, b) => phaseRank(a) - phaseRank(b) || a.localeCompare(b));
+
+function phaseLegend(activities) {
+  const names = phaseNames(activities);
+  return names.length
+    ? `<div class="phase-legend" aria-label="GPU phases">${names.map((name) => `<span data-phase="${escape(name)}"><span class="phase-swatch"></span>${escape(phaseLabel(name))}</span>`).join("")}<span><span class="phase-swatch turn"></span>held, unlabelled</span></div>`
+    : "";
+}
+
 function activityTimeline(placements, range, { acrossNodes = false, activeOnly = false } = {}) {
   const href = (p) => acrossNodes ? ui.state.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : p.run_ids?.[0] ? `#run/${encode(p.run_ids[0])}/activity` : null;
   const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
@@ -254,11 +275,16 @@ function activityTimeline(placements, range, { acrossNodes = false, activeOnly =
     // One path per run, with separate blocks at their exact times. Dense
     // histories stay cheap, and labels remain selectable even for tiny bursts.
     const blocks = intervals.map(([from, to]) => block(from, to)).join(" ");
+    const rowLabel = acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label;
+    const phases = Object.entries(p.phases || {})
+      .sort(([a], [b]) => phaseRank(a) - phaseRank(b))
+      .map(([phase, spans]) => `<path class="activity-block phase" data-phase="${escape(phase)}" data-label="${escape(`${phaseLabel(phase)} · ${rowLabel}`)}" data-source="Worker-recorded phase" data-intervals="${escape(JSON.stringify(spans))}" d="${spans.map(([from, to]) => block(from, to)).join(" ")}" vector-effect="non-scaling-stroke"/>`)
+      .join("");
     return `<div class="activity-row ${placementColor(p)}" data-key="${escape(p.id)}" data-selected="${!acrossNodes && p.id === ui.expanded}">
       ${label}
-      <div class="activity-track" data-start="${range.start}" data-end="${range.now}"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-label="Recorded activity">${path(p, blocks)}</svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}</span>` : ""}</div></div>`;
+      <div class="activity-track" data-start="${range.start}" data-end="${range.now}"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-label="Recorded activity">${path(p, blocks)}${phases}</svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}</span>` : ""}</div></div>`;
   }).join("");
-  return `<div class="activity-timeline" aria-label="Recorded run activity"><div class="activity-header"><h3>${acrossNodes ? "Process" : "Run"}</h3><div class="activity-axis">${axis}</div></div>${rows}</div>`;
+  return `<div class="activity-timeline" aria-label="Recorded run activity"><div class="activity-header"><h3>${acrossNodes ? "Process" : "Run"}</h3><div class="activity-axis">${axis}</div></div>${rows}${phaseLegend(shown)}</div>`;
 }
 
 function activityNotes(placements, range) {
@@ -294,7 +320,10 @@ function nodeMetrics(node, placements, range) {
     return data || { ...device, utilization: [], memory_mib: [], reason: source?.error || source?.data?.reason || (source?.pending ? "Loading GPU metrics…" : "No recorded telemetry for this GPU") };
   });
   const errors = [...new Set([...sources].filter(([id]) => ui.device === "all" || id === ui.device).map(([, source]) => source.error).filter(Boolean))];
-  return { data: { devices, reason: !devices.length ? "GPU device mapping unavailable" : null }, error: errors.join(" · ") };
+  const entries = [...new Set(sources.values())];
+  const workers = entries.map((entry) => entry.data?.worker).filter(Boolean);
+  const source = entries.map((entry) => entry.data?.source).find(Boolean);
+  return { data: { devices, workers, source, reason: !devices.length ? "GPU device mapping unavailable" : null }, error: errors.join(" · ") };
 }
 
 function detail(node, range, placements) {
@@ -313,7 +342,29 @@ function detail(node, range, placements) {
   return `<section class="allocation-expansion" id="placement-detail"><div class="allocation-detail-head inspector-heading"><h2 title="${escape(node.name)}">${escape(label)}</h2><button type="button" class="detail-close" data-close-details aria-label="Close node details" title="Close (Esc)">×</button></div>
     ${devices.length ? `<div class="allocation-device-picker" aria-label="GPU selection">${picker}</div>` : ""}
     <div class="node-activity" data-key="node-timeline">${activityTimeline(visible, range, { activeOnly: true })}${notes.warnings}</div>
-    ${node.gpu_capacity ? `<div class="node-gpu-detail" data-key="node-gpu-detail"><div>${gpuChart(metrics, range, label)}</div><div class="allocation-detail-footer"><span>${notes.source}</span><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div></div>` : ""}</section>`;
+    ${node.gpu_capacity ? `<div class="node-gpu-detail" data-key="node-gpu-detail"><div>${gpuChart(metrics, range, label)}</div><div class="allocation-detail-footer"><span>${notes.source}</span><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div></div>` : ""}
+    ${metrics.data.workers.length ? `<div class="node-gpu-detail" data-key="node-worker-detail"><div>${workerChart(metrics, range)}</div><div class="allocation-detail-footer"><span>${escape(sourceNote(metrics.data.source))}</span><span class="allocation-memory">Worker memory <strong>${workerMemory(metrics, range)}</strong></span></div></div>` : ""}</section>`;
+}
+
+const SOURCE_NOTES = { gke: "GPU: DCGM via Cloud Monitoring · CPU/memory: GKE container metrics", prometheus: "GPU: DCGM via Prometheus · CPU/memory: GKE container metrics", local: "GPU: nvidia-smi · CPU/memory: psutil, sampled on this host" };
+const sourceNote = (source) => SOURCE_NOTES[source] || "";
+
+// The OpenRL worker processes holding this node's GPUs, summed at each sample.
+function sumSeries(workers, field) {
+  const byTime = new Map();
+  for (const worker of workers) for (const [at, value] of worker[field] || []) byTime.set(at, (byTime.get(at) || 0) + value);
+  return [...byTime].sort((a, b) => a[0] - b[0]);
+}
+
+function workerChart(metrics, range) {
+  const { workers } = metrics.data;
+  const reason = workers.map((w) => w.reason).find(Boolean) || "No CPU samples for these workers";
+  return chart({ title: `Worker CPU · ${workers.length} process${workers.length === 1 ? "" : "es"}`, unit: "cores", points: sumSeries(workers, "cpu_cores"), start: range.start, end: range.now, min: 0, gapSeconds: 180, empty: reason });
+}
+
+function workerMemory(metrics, range) {
+  const latest = lastValue(sumSeries(metrics.data.workers, "memory_bytes"), range);
+  return Number.isFinite(latest) ? `${(latest / 2 ** 30).toFixed(1)} GiB` : "—";
 }
 
 const selectedDevices = (metrics) => [...new Map((metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id).map((d) => [d.uuid || d.id, d])).values()];
@@ -374,7 +425,7 @@ export function renderNodes() {
   const errors = [...new Set([cluster.error, cluster.nodes_error, cluster.devices?.error, cluster.scheduler?.error, ui.state.history_error].filter(Boolean))];
   morph(
     content,
-    `<div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>${timeControl(range)}</div>${errors.map((error) => `<p class="source-error" role="status">${escape(error)}</p>`).join("")}${!cluster.available && !errors.length ? empty("Kubernetes unavailable") : ""}
+    `<div class="nodes-heading"><h1 class="heading">${ui.state.telemetry_sources?.mode === "local" ? "This host" : "Kubernetes nodes"}</h1>${timeControl(range)}</div>${errors.map((error) => `<p class="source-error" role="status">${escape(error)}</p>`).join("")}${!cluster.available && !errors.length ? empty("Kubernetes unavailable") : ""}
     ${unavailable ? `<div class="unavailable-selection" role="status"><span>${ui.inspectorNode ? "The selected node is no longer reported." : "The selected placement is not in retained history."}</span><button type="button" class="detail-close" data-close-details aria-label="Clear unavailable selection" title="Clear selection">×</button></div>` : ""}
     <div class="node-time-header"><span>Node</span><div class="node-axis">${axis}</div><span class="node-duty" title="GPU claimed time over this window, not measured GPU utilization">Claimed</span></div>
     ${nodes.map((node) => lane(node, all, range)).join("") || (!errors.length && cluster.available ? empty("No nodes reported by Kubernetes") : "")}`,

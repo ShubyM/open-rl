@@ -17,7 +17,7 @@ from opentelemetry import propagate, trace
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
-from server.observability import gpu_turn, observe_operation
+from server.observability import gpu_turn, observe_operation, turn_phase
 from server.store import RequestStore, get_store
 from training.fft_trainer_worker import FFTConfig, FFTTrainingWorker
 from training.lora_trainer_worker import LoraConfig, LoraTrainingWorker
@@ -435,12 +435,14 @@ class FFTTrainingRequestsProcessor(TrainingRequestsProcessor):
 
     if gpu_reqs:
       async with gpu_turn(self.time_slicer, self.workload, self.store, "trainer", self.model_id):
-        await asyncio.to_thread(self.worker.wake_up)
+        with turn_phase("wake_up"):
+          await asyncio.to_thread(self.worker.wake_up)
         try:
           for request in gpu_reqs:
             results.append(await self.handle_request(request, self.model_id))
         finally:
-          await asyncio.to_thread(self.worker.sleep)
+          with turn_phase("sleep"):
+            await asyncio.to_thread(self.worker.sleep)
 
     if not save_reqs:
       return

@@ -21,6 +21,7 @@ dependencies = [
     "uvicorn",
     "httpx",
     "google-auth[requests]>=2",
+    "psutil",
     "tqdm>=4.50",
 ]
 
