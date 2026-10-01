@@ -1,80 +1,25 @@
-"""Where the dashboard reads each kind of data, chosen once per deployment.
+"""GPU and worker hardware series from any Prometheus-compatible query API.
 
-  kubernetes  inventory from the K8s API (pods, nodes, DRA devices, scheduler
-              Workloads). Hardware from PromQL: OPEN_RL_PROMETHEUS_URL if set,
-              otherwise Cloud Monitoring's PromQL API when GKE is detected, which
-              serves DCGM GPU metrics and GKE container CPU/memory in one place.
-              Logs from Cloud Logging (GKE) and the kubelet.
-  local       one host and no Kubernetes: inventory and hardware from the
-              nvidia-smi/psutil sampler in local.py; logs from worker log files.
+On GKE that is Managed Service for Prometheus, which serves DCGM GPU metrics
+and GKE's own container CPU/memory in one place; through the in-cluster
+gmp-frontend, or Cloud Monitoring's PromQL endpoint directly.
 
-OPEN_RL_DASHBOARD_SOURCE=kubernetes|local forces a mode; the default picks
-kubernetes whenever cluster credentials load.
-
-Every hardware backend answers the same two questions, keyed the way the
-inventory names things (GPU UUID, pod name), over [start, end]:
+Answers the two questions every hardware source answers (local.Sampler too),
+keyed the way the inventory names things, over [start, end]:
   devices(uuids, start, end)        -> {uuid: {"utilization": [[t, %]], "memory_mib": [[t, MiB]]}}
   workers_series(pods, start, end)  -> {pod: {"cpu_cores": [[t, cores]], "memory_bytes": [[t, B]]}}
 """
 
 import asyncio
 import json
-import os
 import re
 from collections.abc import Callable
 
 import httpx
 
-from server.dashboard import cluster, gke, local
-
 GPU_METRICS = {"utilization": "DCGM_FI_DEV_GPU_UTIL", "memory_mib": "DCGM_FI_DEV_FB_USED"}
 MAX_POINTS = 600
 MIN_STEP_SECONDS = 15
-
-
-def mode() -> str:
-  forced = os.getenv("OPEN_RL_DASHBOARD_SOURCE", "auto").strip().lower()
-  if forced in {"kubernetes", "local"}:
-    return forced
-  core, _, _ = cluster.clients()
-  return "kubernetes" if core is not None else "local"
-
-
-def describe() -> dict:
-  """What the snapshot reports as its sources, so pages and agents can say where numbers come from."""
-  current = mode()
-  backend, reason = hardware()
-  if current == "local":
-    logs = "local_files"
-  else:
-    logs = "cloud_logging" if gke.configuration()["configured"] else "kubelet"
-  return {
-    "mode": current,
-    "inventory": "kubernetes" if current == "kubernetes" else "local",
-    "hardware": getattr(backend, "name", None),
-    "hardware_error": reason,
-    "logs": logs,
-    "gke": gke.configuration(),
-  }
-
-
-def inventory() -> dict:
-  return cluster.read() if mode() == "kubernetes" else local.read()
-
-
-def hardware():
-  """(backend, None) or (None, why there is no hardware source)."""
-  if mode() == "local":
-    local.sampler.start()
-    return local.sampler, None
-  config = gke.configuration()
-  url = os.getenv("OPEN_RL_PROMETHEUS_URL", "").rstrip("/")
-  if url:
-    return PromQL("prometheus", url, None, config["cluster"] or None), None
-  if config["configured"]:
-    endpoint = f"https://monitoring.googleapis.com/v1/projects/{config['project']}/location/global/prometheus"
-    return PromQL("gke", endpoint, gke.access_token, config["cluster"]), None
-  return None, "No GPU metrics source: not on GKE and OPEN_RL_PROMETHEUS_URL is unset"
 
 
 def any_of(values: list[str]) -> str:
@@ -83,13 +28,12 @@ def any_of(values: list[str]) -> str:
 
 
 class PromQL:
-  """Any Prometheus-compatible query API; on GKE, Cloud Monitoring's."""
-
-  def __init__(self, name: str, url: str, token: Callable[[], str] | None, cluster_name: str | None) -> None:
+  def __init__(self, name: str, url: str, token: Callable[[], str] | None, cluster_name: str | None, namespace: str) -> None:
     self.name = name
     self.url = url
     self.token = token
     self.cluster = cluster_name
+    self.namespace = namespace
 
   async def query_range(self, query: str, start: float, end: float) -> dict[str, list[list[float]]]:
     """{series label value: points} for a query aggregated `by (<one label>)`."""
@@ -121,7 +65,7 @@ class PromQL:
 
   async def workers_series(self, pods: list[str], start: float, end: float) -> dict[str, dict]:
     # GKE system metrics, free on every GKE cluster; absent on other Prometheus servers.
-    namespace = json.dumps(cluster.namespace())
+    namespace = json.dumps(self.namespace)
     match = f'monitored_resource="k8s_container",namespace_name={namespace},pod_name=~{any_of(pods)}{self.scope("cluster_name")}'
     cpu, memory = await asyncio.gather(
       self.query_range(f"sum by (pod_name) (rate(kubernetes_io:container_cpu_core_usage_time{{{match}}}[2m]))", start, end),

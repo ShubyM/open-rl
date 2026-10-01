@@ -843,26 +843,26 @@ body {
   stroke: var(--allocation-color);
   stroke-width: 1px;
 }
-/* Worker-recorded phases inside a GPU turn. The turn underneath stays visible
-   where no phase was recorded (time between ops). */
-#orl-design-lab [data-phase] {
-  --phase-color: #2a9d8f;
+/* Worker-recorded ops inside a GPU turn. The turn underneath stays visible
+   where no op was recorded. */
+#orl-design-lab [data-op] {
+  --op-color: #2a9d8f;
 }
-#orl-design-lab [data-phase="forward_backward"] { --phase-color: #3366cc; }
-#orl-design-lab [data-phase="forward"] { --phase-color: #6fa8dc; }
-#orl-design-lab [data-phase="optim_step"] { --phase-color: #8e44ad; }
-#orl-design-lab [data-phase="sample"] { --phase-color: #2e9e5b; }
-#orl-design-lab [data-phase="weight_sync"] { --phase-color: #e67e22; }
-#orl-design-lab [data-phase="wake_up"],
-#orl-design-lab [data-phase="sleep"] { --phase-color: #95a5a6; }
-#orl-design-lab [data-phase="init"] { --phase-color: #5d6d7e; }
-#orl-design-lab .activity-block.phase {
-  fill: var(--phase-color);
+#orl-design-lab [data-op="forward_backward"] { --op-color: #3366cc; }
+#orl-design-lab [data-op="forward"] { --op-color: #6fa8dc; }
+#orl-design-lab [data-op="optim_step"] { --op-color: #8e44ad; }
+#orl-design-lab [data-op="sample"] { --op-color: #2e9e5b; }
+#orl-design-lab [data-op="weight_sync"] { --op-color: #e67e22; }
+#orl-design-lab [data-op="wake_up"],
+#orl-design-lab [data-op="sleep"] { --op-color: #95a5a6; }
+#orl-design-lab [data-op="init"] { --op-color: #5d6d7e; }
+#orl-design-lab .activity-block.op {
+  fill: var(--op-color);
 }
-#orl-design-lab .activity-block.phase:hover {
-  fill: color-mix(in srgb, var(--phase-color) 75%, var(--ink, #000));
+#orl-design-lab .activity-block.op:hover {
+  fill: color-mix(in srgb, var(--op-color) 75%, var(--ink, #000));
 }
-#orl-design-lab .phase-legend {
+#orl-design-lab .op-legend {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 14px;
@@ -870,18 +870,18 @@ body {
   font-size: 12px;
   color: var(--muted, inherit);
 }
-#orl-design-lab .phase-legend > span {
+#orl-design-lab .op-legend > span {
   display: inline-flex;
   align-items: center;
   gap: 5px;
 }
-#orl-design-lab .phase-swatch {
+#orl-design-lab .op-swatch {
   width: 10px;
   height: 10px;
   border-radius: 2px;
-  background: var(--phase-color);
+  background: var(--op-color);
 }
-#orl-design-lab .phase-swatch.turn {
+#orl-design-lab .op-swatch.turn {
   background: color-mix(in srgb, currentColor 25%, transparent);
 }
 #orl-design-lab .cross-node-activity {

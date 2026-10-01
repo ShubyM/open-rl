@@ -6,7 +6,8 @@ import asyncio
 import copy
 import time
 
-from server.dashboard import history, sources
+from server.dashboard import history
+from server.telemetry import backends
 
 CACHE_SECONDS = 5
 HISTORY_WINDOW_SECONDS = 24 * 3600
@@ -119,7 +120,7 @@ class Snapshot:
     async with self.lock:
       if self.latest is not None and time.monotonic() - self.updated < CACHE_SECONDS:
         return self.latest
-      state = await asyncio.to_thread(sources.inventory)
+      state = await asyncio.to_thread(lambda: backends.current().inventory())
       store_error = None
       try:
         metadata = await asyncio.wait_for(store.list_jobs_metadata(), timeout=5)

@@ -19,7 +19,7 @@ import google.auth
 import httpx
 from google.auth.transport.requests import Request
 
-from server.dashboard import cluster
+from server.telemetry import kubernetes
 
 MAX_MESSAGE = 16 * 1024
 MAX_SOURCES = 64
@@ -165,7 +165,7 @@ def scope_filter() -> list[str]:
     ("project_id", config["project"]),
     ("location", config["location"]),
     ("cluster_name", config["cluster"]),
-    ("namespace_name", cluster.namespace()),
+    ("namespace_name", kubernetes.namespace()),
   )
   return ['resource.type="k8s_container"', *[f"resource.labels.{label}={json.dumps(value)}" for label, value in labels]]
 

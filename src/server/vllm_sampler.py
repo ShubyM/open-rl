@@ -11,7 +11,7 @@ from typing import Any
 os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 from server.model_metadata import WeightSyncConfig
-from server.observability import gpu_turn, observe_operation, turn_phase
+from server.telemetry.ops import gpu_turn, observe_operation, record_op
 from server.vllm_options import gpu_memory_utilization, sampler_batch_limits, split_stop, text_only_engine_kwargs
 
 try:
@@ -232,7 +232,7 @@ async def process_sampling_request(req: dict, store: Any) -> None:
           if weights_path != CURRENT_LOADED_SAMPLER_WEIGHTS:
             print(f"[vLLM Worker] Weight change detected. Current: {CURRENT_LOADED_SAMPLER_WEIGHTS}, Target: {weights_path}")
             if engine is not None:
-              with turn_phase("weight_sync"):
+              with record_op("weight_sync"):
                 print("[vLLM Worker] Triggering sleep level 1 (CPU offload weights)...")
                 await engine.sleep(level=1)
                 print("[vLLM Worker] Waking up weights...")
@@ -320,12 +320,12 @@ async def run_sampling_worker(model_id: str) -> None:
       snapshot_registered = True
       async with gpu_turn(time_slicer, workload, store, "sampler", model_id):
         print("[vLLM Worker] Initializing vLLM engine under parent lock...")
-        with turn_phase("init"):
+        with record_op("init"):
           init_engine()
         print("[vLLM Worker] Engine initialized successfully.")
         if engine is not None:
           print("[vLLM Worker] Sleeping engine after init to yield GPU memory (CPU offload)...")
-          with turn_phase("sleep"):
+          with record_op("sleep"):
             await engine.sleep(level=1)
           IS_ENGINE_SLEEPING = True
     except Exception as exc:
@@ -434,7 +434,7 @@ async def run_sampling_worker(model_id: str) -> None:
             async with gpu_turn(time_slicer, workload, store, "sampler", model_id):
               if engine is not None and IS_ENGINE_SLEEPING:
                 print("[vLLM Worker] Engine is sleeping. Waking up weights and KV cache before batch processing...")
-                with turn_phase("wake_up"):
+                with record_op("wake_up"):
                   await engine.wake_up(tags=["weights", "kv_cache"])
                 IS_ENGINE_SLEEPING = False
               unanswered = []
@@ -443,7 +443,7 @@ async def run_sampling_worker(model_id: str) -> None:
                 await exit_gracefully()
               if engine is not None:
                 print("[vLLM Worker] Exiting batch: sleeping engine (CPU offload weights) to yield GPU memory...")
-                with turn_phase("sleep"):
+                with record_op("sleep"):
                   await engine.sleep(level=1)
                 IS_ENGINE_SLEEPING = True
             faulted = getattr(time_slicer, "faulted", None)

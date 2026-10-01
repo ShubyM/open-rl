@@ -3,8 +3,8 @@ import contextlib
 import types
 import unittest
 
-from server import observability
 from server.store import InMemoryStore
+from server.telemetry import ops
 
 
 class SlicerStub:
@@ -24,11 +24,11 @@ class GpuTurnTest(unittest.TestCase):
     workload = types.SimpleNamespace(name="fft-run-a-trainer")
 
     async def run():
-      async with observability.gpu_turn(slicer, workload, store, "trainer", "run-a"):
+      async with ops.gpu_turn(slicer, workload, store, "trainer", "run-a"):
         await asyncio.sleep(0.01)
-      async with observability.gpu_turn(slicer, workload, store, "trainer", "run-a"):
+      async with ops.gpu_turn(slicer, workload, store, "trainer", "run-a"):
         pass
-      return await observability.read_turns(store, "fft-run-a-trainer")
+      return await ops.read_turns(store, "fft-run-a-trainer")
 
     turns = asyncio.run(run())
     self.assertEqual(slicer.acquired, 2)
@@ -47,28 +47,28 @@ class GpuTurnTest(unittest.TestCase):
         await asyncio.sleep(delay)
         return {"type": "ok"}
 
-      return await observability.observe_operation(store, {"op": name, "model_id": run_id, "request_id": request_id}, "trainer", run_id, call)
+      return await ops.observe_operation(store, {"op": name, "model_id": run_id, "request_id": request_id}, "trainer", run_id, call)
 
     async def run():
       await op("forward_backward", "run-a", "outside")  # no turn: must not leak into the next one
-      async with observability.gpu_turn(SlicerStub(), workload, store, "trainer", "run-a"):
-        with observability.turn_phase("wake_up"):
+      async with ops.gpu_turn(SlicerStub(), workload, store, "trainer", "run-a"):
+        with ops.record_op("wake_up"):
           await asyncio.sleep(0.005)
         await op("forward_backward", "run-a", "r1", 0.005)
         await op("optim_step", "run-a", "r2")
         await asyncio.gather(*(asyncio.create_task(op("sample", "run-a", f"s{i}", 0.01)) for i in range(5)))
-        with observability.turn_phase("sleep"):
+        with ops.record_op("sleep"):
           pass
-      return await observability.read_turns(store, "fft-run-a-trainer")
+      return await ops.read_turns(store, "fft-run-a-trainer")
 
     (turn,) = asyncio.run(run())
-    self.assertEqual([p["name"] for p in turn["phases"]], ["wake_up", "forward_backward", "optim_step", "sample", "sleep"])
-    by_name = {p["name"]: p for p in turn["phases"]}
+    self.assertEqual([o["name"] for o in turn["ops"]], ["wake_up", "forward_backward", "optim_step", "sample", "sleep"])
+    by_name = {o["name"]: o for o in turn["ops"]}
     self.assertEqual(by_name["forward_backward"]["request_id"], "r1")
     self.assertEqual(by_name["forward_backward"]["run_id"], "run-a")
     self.assertEqual(by_name["sample"]["count"], 5)
     self.assertLessEqual(turn["requested_at"], turn["started_at"])
-    for phase in turn["phases"]:
-      self.assertLessEqual(turn["started_at"], phase["start"])
-      self.assertLessEqual(phase["start"], phase["end"])
-      self.assertLessEqual(phase["end"], turn["at"])
+    for recorded in turn["ops"]:
+      self.assertLessEqual(turn["started_at"], recorded["start"])
+      self.assertLessEqual(recorded["start"], recorded["end"])
+      self.assertLessEqual(recorded["end"], turn["at"])

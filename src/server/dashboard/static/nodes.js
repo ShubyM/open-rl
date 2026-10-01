@@ -89,15 +89,15 @@ function operationActivity(placement, range) {
   if (!placement.allocation_id && turns.data?.samples?.length) {
     const clip = (from, to) => [Math.max(range.start, placement.start, from), Math.min(range.now, placement.end, to)];
     const intervals = turns.data.samples.map((t) => clip(t.started_at, t.at)).filter(([from, to]) => to > from);
-    // What the GPU was doing inside each turn, recorded by the worker: one interval list per phase name.
-    const phases = {};
+    // What the GPU was doing inside each turn, recorded by the worker: one interval list per op name.
+    const ops = {};
     for (const turn of turns.data.samples)
-      for (const phase of turn.phases || []) {
-        const [from, to] = clip(phase.start, phase.end);
-        if (to > from) (phases[phase.name] ||= []).push([from, to]);
+      for (const op of turn.ops || []) {
+        const [from, to] = clip(op.start, op.end);
+        if (to > from) (ops[op.name] ||= []).push([from, to]);
       }
-    for (const name of Object.keys(phases)) phases[name] = mergeIntervals(phases[name]);
-    return save({ intervals: mergeIntervals(intervals), phases, error: turns.error || "", errorStatus: turns.errorStatus, loading: false, exact: true });
+    for (const name of Object.keys(ops)) ops[name] = mergeIntervals(ops[name]);
+    return save({ intervals: mergeIntervals(intervals), ops, error: turns.error || "", errorStatus: turns.errorStatus, loading: false, exact: true });
   }
   const intervals = [];
   let error = "", errorStatus = null, loading = !placement.allocation_id && turns.pending && !turns.data && !turns.error;
@@ -240,15 +240,15 @@ const processOrder = (a, b) => ({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ tr
 
 // Compute first, then the weight movement around it, so a weight sync inside a
 // sample batch stays visible on top of it.
-const PHASE_ORDER = ["forward_backward", "forward", "optim_step", "sample", "init", "wake_up", "sleep", "weight_sync"];
-const phaseRank = (name) => (PHASE_ORDER.includes(name) ? PHASE_ORDER.indexOf(name) : PHASE_ORDER.length);
-const phaseLabel = (name) => name.replace(/_/g, " ");
-const phaseNames = (activities) => [...new Set(activities.flatMap((a) => Object.keys(a.phases || {})))].sort((a, b) => phaseRank(a) - phaseRank(b) || a.localeCompare(b));
+const OP_ORDER = ["forward_backward", "forward", "optim_step", "sample", "init", "wake_up", "sleep", "weight_sync"];
+const opRank = (name) => (OP_ORDER.includes(name) ? OP_ORDER.indexOf(name) : OP_ORDER.length);
+const opLabel = (name) => name.replace(/_/g, " ");
+const opNames = (activities) => [...new Set(activities.flatMap((a) => Object.keys(a.ops || {})))].sort((a, b) => opRank(a) - opRank(b) || a.localeCompare(b));
 
-function phaseLegend(activities) {
-  const names = phaseNames(activities);
+function opLegend(activities) {
+  const names = opNames(activities);
   return names.length
-    ? `<div class="phase-legend" aria-label="GPU phases">${names.map((name) => `<span data-phase="${escape(name)}"><span class="phase-swatch"></span>${escape(phaseLabel(name))}</span>`).join("")}<span><span class="phase-swatch turn"></span>held, unlabelled</span></div>`
+    ? `<div class="op-legend" aria-label="GPU ops">${names.map((name) => `<span data-op="${escape(name)}"><span class="op-swatch"></span>${escape(opLabel(name))}</span>`).join("")}<span><span class="op-swatch turn"></span>held, unlabelled</span></div>`
     : "";
 }
 
@@ -276,15 +276,15 @@ function activityTimeline(placements, range, { acrossNodes = false, activeOnly =
     // histories stay cheap, and labels remain selectable even for tiny bursts.
     const blocks = intervals.map(([from, to]) => block(from, to)).join(" ");
     const rowLabel = acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label;
-    const phases = Object.entries(p.phases || {})
-      .sort(([a], [b]) => phaseRank(a) - phaseRank(b))
-      .map(([phase, spans]) => `<path class="activity-block phase" data-phase="${escape(phase)}" data-label="${escape(`${phaseLabel(phase)} · ${rowLabel}`)}" data-source="Worker-recorded phase" data-intervals="${escape(JSON.stringify(spans))}" d="${spans.map(([from, to]) => block(from, to)).join(" ")}" vector-effect="non-scaling-stroke"/>`)
+    const ops = Object.entries(p.ops || {})
+      .sort(([a], [b]) => opRank(a) - opRank(b))
+      .map(([op, spans]) => `<path class="activity-block op" data-op="${escape(op)}" data-label="${escape(`${opLabel(op)} · ${rowLabel}`)}" data-source="Worker-recorded op" data-intervals="${escape(JSON.stringify(spans))}" d="${spans.map(([from, to]) => block(from, to)).join(" ")}" vector-effect="non-scaling-stroke"/>`)
       .join("");
     return `<div class="activity-row ${placementColor(p)}" data-key="${escape(p.id)}" data-selected="${!acrossNodes && p.id === ui.expanded}">
       ${label}
-      <div class="activity-track" data-start="${range.start}" data-end="${range.now}"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-label="Recorded activity">${path(p, blocks)}${phases}</svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}</span>` : ""}</div></div>`;
+      <div class="activity-track" data-start="${range.start}" data-end="${range.now}"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-label="Recorded activity">${path(p, blocks)}${ops}</svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}</span>` : ""}</div></div>`;
   }).join("");
-  return `<div class="activity-timeline" aria-label="Recorded run activity"><div class="activity-header"><h3>${acrossNodes ? "Process" : "Run"}</h3><div class="activity-axis">${axis}</div></div>${rows}${phaseLegend(shown)}</div>`;
+  return `<div class="activity-timeline" aria-label="Recorded run activity"><div class="activity-header"><h3>${acrossNodes ? "Process" : "Run"}</h3><div class="activity-axis">${axis}</div></div>${rows}${opLegend(shown)}</div>`;
 }
 
 function activityNotes(placements, range) {

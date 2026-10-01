@@ -7,10 +7,10 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from server import observability as telemetry
-from server.dashboard import cluster, experiments, gke, local, metrics, sources
+from server.dashboard import experiments, metrics
 from server.dashboard.snapshot import snapshot
 from server.store import get_store
+from server.telemetry import backends, gke, kubernetes, ops
 
 router = APIRouter()
 STATIC = Path(__file__).parent / "static"
@@ -35,7 +35,7 @@ async def inspection_index():
   """Entry point for read-only agent inspection; no browser automation required."""
   return {
     "schema_version": 2,
-    "scope": {"namespace": cluster.namespace(), "identity": "shared_operator"},
+    "scope": {"namespace": kubernetes.namespace(), "identity": "shared_operator"},
     "links": {
       "snapshot": "/api/v1/dashboard/snapshot",
       "run": "/api/v1/dashboard/runs/{run_id}",
@@ -53,7 +53,7 @@ async def inspection_index():
       "Read logs and metrics with explicit since/until timestamps; keep filters fixed when following next_cursor.",
     ],
     "capabilities": {"read_only": True, "pod_exec": False, "filesystem": False, "secrets": False},
-    "limits": {"placement_history_days": 7, "operation_samples_per_run": telemetry.SAMPLE_LIMIT},
+    "limits": {"placement_history_days": 7, "operation_samples_per_run": ops.SAMPLE_LIMIT},
   }
 
 
@@ -61,7 +61,7 @@ async def inspection_index():
 async def snapshot_view():
   await gke.discover()
   state = await snapshot.current(get_store())
-  return {**state, "telemetry_sources": await asyncio.to_thread(sources.describe)}
+  return {**state, "telemetry_sources": await asyncio.to_thread(backends.current().describe)}
 
 
 @router.get("/api/v1/dashboard/experiments")
@@ -91,7 +91,7 @@ async def run_metrics(run_id: str, since: str | None = None, until: str | None =
     start, end = gke.time_range(since, until)
   except ValueError as exc:
     raise HTTPException(400, str(exc)) from exc
-  result = await telemetry.read(get_store(), run_id)
+  result = await ops.read(get_store(), run_id)
   low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
   result["samples"] = [sample for sample in result["samples"] if low <= sample.get("at", 0) <= high]
   return {**result, "available": bool(result["samples"]), "since": start, "until": end}
@@ -124,9 +124,7 @@ async def run_logs(
 async def pod_logs(pod: str, container: str | None = None, previous: bool = False, tail: int = Query(200, ge=1, le=1000)):
   """Current or previous container output straight from the kubelet, for any pod in the namespace; locally, the worker's log file."""
   try:
-    if sources.mode() == "local":
-      return await asyncio.to_thread(local.pod_logs, pod, tail)
-    return await asyncio.to_thread(cluster.pod_logs, pod, container, tail, previous)
+    return await asyncio.to_thread(backends.current().pod_logs, pod, container, tail, previous)
   except Exception as exc:
     raise HTTPException(503, "Pod logs unavailable in the configured namespace") from exc
 
@@ -145,7 +143,7 @@ async def allocation_turns(placement_id: str, since: str | None = None, until: s
   if placement is None:
     raise HTTPException(404, "Allocation not found")
   low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
-  turns = [t for t in await telemetry.read_turns(get_store(), placement["name"]) if t.get("at", 0) >= low and t.get("started_at", 0) <= high]
+  turns = [t for t in await ops.read_turns(get_store(), placement["name"]) if t.get("at", 0) >= low and t.get("started_at", 0) <= high]
   return {"placement_id": placement_id, "workload": placement["name"], "samples": turns, "available": bool(turns), "since": start, "until": end}
 
 

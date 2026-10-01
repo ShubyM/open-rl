@@ -2,7 +2,9 @@ import asyncio
 import unittest
 from unittest import mock
 
-from server.dashboard import local, metrics, snapshot, sources
+from server.dashboard import metrics, snapshot
+from server.telemetry import backends, local
+from server.telemetry.prometheus import PromQL
 
 GPU = "GPU-375ff71c-7c41-a89e-3843-c62c7476bc2b"
 
@@ -52,7 +54,7 @@ class LocalInventoryTest(unittest.TestCase):
 
 class PromQLTest(unittest.TestCase):
   def test_one_query_per_metric_scoped_to_the_cluster_and_deduplicated_by_uuid(self) -> None:
-    backend = sources.PromQL("gke", "https://example", None, "open-rl-fft-test")
+    backend = PromQL("gke", "https://example", None, "open-rl-fft-test", "openrl-system")
     queries = []
 
     async def fake(query, start, end):
@@ -68,14 +70,14 @@ class PromQLTest(unittest.TestCase):
     self.assertEqual(result["GPU-other"], {"utilization": [], "memory_mib": []})
 
   def test_worker_series_use_gke_container_metrics_by_pod(self) -> None:
-    backend = sources.PromQL("gke", "https://example", None, None)
+    backend = PromQL("gke", "https://example", None, None, "openrl-system")
     queries = []
 
     async def fake(query, start, end):
       queries.append(query)
       return {"orw-trainer": [[1.0, 3.0]]}
 
-    with mock.patch.object(backend, "query_range", side_effect=fake), mock.patch.object(sources.cluster, "namespace", return_value="openrl-system"):
+    with mock.patch.object(backend, "query_range", side_effect=fake):
       result = asyncio.run(backend.workers_series(["orw-trainer"], 0, 60))
     self.assertIn("kubernetes_io:container_cpu_core_usage_time", queries[0])
     self.assertIn('namespace_name="openrl-system"', queries[0])
@@ -83,23 +85,32 @@ class PromQLTest(unittest.TestCase):
     self.assertEqual(result["orw-trainer"], {"cpu_cores": [[1.0, 3.0]], "memory_bytes": [[1.0, 3.0]]})
 
 
-class SelectionTest(unittest.TestCase):
-  def test_explicit_prometheus_wins_then_gke_then_nothing(self) -> None:
+class BackendTest(unittest.TestCase):
+  def test_cluster_when_kubernetes_credentials_load_else_host_unless_forced(self) -> None:
+    with mock.patch.dict("os.environ", {"OPEN_RL_TELEMETRY_BACKEND": ""}):
+      with mock.patch.object(backends.kubernetes, "clients", return_value=(object(), object(), None)):
+        self.assertIs(backends.current(), backends.CLUSTER)
+      with mock.patch.object(backends.kubernetes, "clients", return_value=(None, None, "no cluster credentials")):
+        self.assertIs(backends.current(), backends.HOST)
+    with mock.patch.dict("os.environ", {"OPEN_RL_TELEMETRY_BACKEND": "local"}):
+      self.assertIs(backends.current(), backends.HOST)
+
+  def test_cluster_hardware_explicit_prometheus_wins_then_gke_then_nothing(self) -> None:
     gke_on = {"project": "p", "cluster": "c", "location": "l", "mode": "auto", "enabled": True, "configured": True}
     gke_off = {**gke_on, "project": "", "configured": False, "cluster": ""}
-    with mock.patch.object(sources, "mode", return_value="kubernetes"):
-      gmp = {"OPEN_RL_PROMETHEUS_URL": "http://gmp:9090/"}
-      with mock.patch.dict("os.environ", gmp), mock.patch.object(sources.gke, "configuration", return_value=gke_on):
-        backend, _ = sources.hardware()
-        self.assertEqual((backend.name, backend.url, backend.cluster), ("prometheus", "http://gmp:9090", "c"))
-      with mock.patch.dict("os.environ", {"OPEN_RL_PROMETHEUS_URL": ""}), mock.patch.object(sources.gke, "configuration", return_value=gke_on):
-        backend, _ = sources.hardware()
-        self.assertEqual(backend.name, "gke")
-        self.assertIn("/projects/p/location/global/prometheus", backend.url)
-      with mock.patch.dict("os.environ", {"OPEN_RL_PROMETHEUS_URL": ""}), mock.patch.object(sources.gke, "configuration", return_value=gke_off):
-        backend, reason = sources.hardware()
-        self.assertIsNone(backend)
-        self.assertIn("OPEN_RL_PROMETHEUS_URL", reason)
+    cluster = backends.CLUSTER
+    gmp = {"OPEN_RL_PROMETHEUS_URL": "http://gmp:9090/"}
+    with mock.patch.dict("os.environ", gmp), mock.patch.object(backends.gke, "configuration", return_value=gke_on):
+      source, _ = cluster.hardware()
+      self.assertEqual((source.name, source.url, source.cluster), ("prometheus", "http://gmp:9090", "c"))
+    with mock.patch.dict("os.environ", {"OPEN_RL_PROMETHEUS_URL": ""}), mock.patch.object(backends.gke, "configuration", return_value=gke_on):
+      source, _ = cluster.hardware()
+      self.assertEqual(source.name, "gke")
+      self.assertIn("/projects/p/location/global/prometheus", source.url)
+    with mock.patch.dict("os.environ", {"OPEN_RL_PROMETHEUS_URL": ""}), mock.patch.object(backends.gke, "configuration", return_value=gke_off):
+      source, reason = cluster.hardware()
+      self.assertIsNone(source)
+      self.assertIn("OPEN_RL_PROMETHEUS_URL", reason)
 
 
 class AllocationMetricsTest(unittest.TestCase):
@@ -121,7 +132,8 @@ class AllocationMetricsTest(unittest.TestCase):
 
     with (
       mock.patch.object(metrics.snapshot, "current", mock.AsyncMock(return_value=state)),
-      mock.patch.object(metrics.sources, "hardware", return_value=(Backend(), None)),
+      mock.patch.object(metrics.backends.CLUSTER, "hardware", return_value=(Backend(), None)),
+      mock.patch.object(metrics.backends, "current", return_value=metrics.backends.CLUSTER),
     ):
       result = asyncio.run(metrics.gpu_history("w1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:10:00+00:00"))
     self.assertTrue(result["available"])

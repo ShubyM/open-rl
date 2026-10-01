@@ -9,9 +9,9 @@ from datetime import datetime
 
 import httpx
 
-from server.dashboard import gke, sources
 from server.dashboard.snapshot import snapshot
 from server.store import get_store
+from server.telemetry import backends, gke
 
 UNAVAILABLE = "GPU metrics query unavailable"
 
@@ -33,7 +33,7 @@ async def gpu_history(placement_id: str, since=None, until=None) -> dict:
   )
   if placement is None:
     return {"available": False, "reason": "Allocation not found", "devices": [], "worker": None}
-  backend, reason = sources.hardware()
+  backend, reason = backends.current().hardware()
   if backend is None:
     return {"available": False, "reason": reason, "devices": [], "worker": None}
   known = device_uuids(state)

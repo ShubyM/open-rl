@@ -1,9 +1,9 @@
-"""The dashboard's sources on a single host without Kubernetes.
+"""The Host backend's data: a single machine without Kubernetes.
 
 Inventory and hardware come from the same poll: `nvidia-smi` for GPUs and the
 processes holding them, `psutil` for OpenRL worker processes (found by the
 OPEN_RL_PROCESS_ROLE the launcher stamps into their environment). read()
-returns the shape cluster.read() does, so runs, placements and history are
+returns the shape kubernetes.read() does, so runs, placements and history are
 joined by the same code on a laptop, a GPU VM, and GKE.
 """
 
@@ -134,7 +134,7 @@ class Sampler:
       }
     return workers
 
-  # ---- the Hardware interface (see hardware.py) ----
+  # ---- the hardware interface (see prometheus.py) ----
 
   async def devices(self, uuids: list[str], start: float, end: float) -> dict[str, dict]:
     with self.lock:
@@ -158,7 +158,7 @@ def iso(ts: float) -> str:
 
 
 def read() -> dict:
-  """This host in cluster.read()'s shape: one node, its GPUs, and each worker as a placed workload and pod."""
+  """This host in kubernetes.read()'s shape: one node, its GPUs, and each worker as a placed workload and pod."""
   sampler.start()
   name = host()
   with sampler.lock:

@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from server.dashboard import gke
+from server.telemetry import gke
 
 CONFIG = {"project": "proj", "location": "us-central1", "cluster": "c1", "mode": "auto", "enabled": True, "configured": True}
 SOURCE = {"pod": "orw-a", "node": "n1", "role": "trainer", "created_at": "2026-09-10T10:00:00+00:00", "until": "2026-09-10T11:00:00+00:00"}
@@ -20,7 +20,7 @@ def entry(pod="orw-a", at="2026-09-10T10:30:00Z", **extra):
 
 class GkeLogHelpersTest(unittest.TestCase):
   def setUp(self) -> None:
-    for module, name, value in ((gke, "configuration", lambda: CONFIG), (gke.cluster, "namespace", lambda: "openrl-system")):
+    for module, name, value in ((gke, "configuration", lambda: CONFIG), (gke.kubernetes, "namespace", lambda: "openrl-system")):
       patcher = patch.object(module, name, value)
       patcher.start()
       self.addCleanup(patcher.stop)
