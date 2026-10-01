@@ -36,26 +36,20 @@ whose default renderer is hardcoded for a different family, such as
 
 ## Start the Server
 
-From the repository root, start one vLLM sampler and one OpenRL API server on
-separate GPUs. These examples are written for two L4 GPUs or better.
+These recipes need a GPU deployment of OpenRL. On Kubernetes, follow the
+[GKE setup guide](../../docs/setup/gke-setup.md) and port-forward the API server
+to `127.0.0.1:9003`.
+
+For development on a machine with two GPUs, start Redis and run the API server
+from the repository root. It launches the trainer and the vLLM sampler as
+separate processes when a recipe creates a model:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" uv run --extra vllm python -m server.vllm_sampler
+REDIS_URL=redis://127.0.0.1:6379/0 \
+TRAINER_CUDA_VISIBLE_DEVICES=0 \
+SAMPLER_CUDA_VISIBLE_DEVICES=1 \
+make server BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507"
 ```
-
-In another shell:
-
-```bash
-CUDA_VISIBLE_DEVICES=1 \
-BASE_MODEL="Qwen/Qwen3-4B-Instruct-2507" \
-SAMPLING_BACKEND=vllm \
-VLLM_URL=http://127.0.0.1:8001 \
-TINKER_API_KEY=tml-dummy-key \
-uv run --extra gpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
-```
-
-CPU mode is useful for tiny model fixtures, but Qwen-sized cookbook runs should
-use GPU/vLLM.
 
 ## Checkpointing Limitation
 

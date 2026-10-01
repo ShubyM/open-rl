@@ -1,4 +1,4 @@
-.PHONY: server vllm test lint fmt help render release-bundle push-vm pull-vm cluster-eval \
+.PHONY: server test lint fmt help render release-bundle push-vm pull-vm cluster-eval \
 	cloud-build-api-server cloud-build-server cloud-build-client \
 	cloud-deploy-api-server cloud-deploy-server \
 	cloud-rollout-api-server cloud-rollout-server cloud-rollout \
@@ -10,8 +10,9 @@
 # ---------------------------------------------------------------------------
 # The HuggingFace base model checkpoint loaded by the server and training workers
 BASE_MODEL     ?= google/gemma-4-e2b
-# The backend used for sampling ("torch" for local inference, or "vllm" for optimized remote inference)
-SAMPLING_BACKEND ?= torch
+# The sampling backend. Unset lets the server choose: torch in one process, or
+# vllm when REDIS_URL is set and the server launches trainer and sampler workers.
+SAMPLING_BACKEND ?=
 # The network interface to bind the API server
 HOST           ?= 127.0.0.1
 # The local port number for the API server
@@ -44,9 +45,8 @@ ifneq ($(origin CUDA_VISIBLE_DEVICES),undefined)
 endif
 
 help:
-	@echo "make server                              # $(BASE_MODEL), SAMPLING_BACKEND=$(SAMPLING_BACKEND), port $(PORT)"
-	@echo "make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm"
-	@echo "VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make vllm BASE_MODEL=google/gemma-4-e2b"
+	@echo "make server                              # one process on CPU: $(BASE_MODEL), port $(PORT)"
+	@echo "REDIS_URL=redis://127.0.0.1:6379/0 make server  # trainer and vLLM sampler workers on GPUs (needs redis-server)"
 	@echo "make test                               # fast unit tests"
 	@echo "make test e2e tiny-lora|tiny-fft|tiny-rl|lora-textsql|fft-gsm8k|fft-gsm8k-x2|fft-textsql-rl|fft-textsql-rl-x2  # tiny-* = fast overfit smoke tests"
 	@echo "make test e2e tiny-lora BASE_URL=http://host:9003"
@@ -64,13 +64,9 @@ help:
 # ---------------------------------------------------------------------------
 server:
 	@-kill -9 $$(lsof -ti:$(PORT)) 2>/dev/null || true
-	BASE_MODEL="$(BASE_MODEL)" SAMPLING_BACKEND="$(SAMPLING_BACKEND)" \
-	  uv run --extra $(if $(filter vllm,$(SAMPLING_BACKEND)),gpu,cpu) \
+	BASE_MODEL="$(BASE_MODEL)" $(if $(SAMPLING_BACKEND),SAMPLING_BACKEND="$(SAMPLING_BACKEND)") \
+	  uv run --extra $(if $(or $(filter vllm,$(SAMPLING_BACKEND)),$(REDIS_URL)),gpu,cpu) \
 	  python -m uvicorn server.api_server:app --host $(HOST) --port $(PORT)
-
-vllm:
-	BASE_MODEL="$(BASE_MODEL)" \
-	  uv run --extra vllm python -m server.vllm_sampler
 
 # ---------------------------------------------------------------------------
 # CLI

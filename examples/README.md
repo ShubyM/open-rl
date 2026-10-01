@@ -46,7 +46,7 @@ See [Harvey LAB RL](harvey_labs) for setup and recipe options.
 * **[FunctionGemma](sft/function-gemma):** Provides a recipe specifically targeted at fine-tuning tool-use capabilities, enabling models to reliably select and invoke functions.
 
 ### Reinforcement Learning (RL)
-* **[Text-to-SQL RL](rl/text-to-sql):** Runs the Gemma 4 SFT+RL recipe with SQL execution rewards and curve plotting.
+* **[Text-to-SQL RL](text-to-sql):** Runs the Gemma 4 SFT+RL recipe with SQL execution rewards and curve plotting.
 
 ### Autoresearch
 * **[Autoresearch Demo](autoresearch):** Runs code-RL researchers against the same OpenRL API server using cookbook DeepCoder rewards, Sandbox Fusion, and optional Agent Sandbox CRDs.

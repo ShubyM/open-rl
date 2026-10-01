@@ -82,8 +82,8 @@ Run `make help` to see the available targets and their default knobs.
 ### Running the server locally
 
 ```bash
-make server                                   # defaults to SAMPLING_BACKEND=torch on port 9003
-make server SAMPLING_BACKEND=vllm             # use vLLM for sampling
+make server                                   # one process on CPU, google/gemma-4-e2b, port 9003
+REDIS_URL=redis://127.0.0.1:6379/0 make server  # trainer and vLLM sampler workers on GPUs (needs redis-server)
 ```
 
 ### Running tests

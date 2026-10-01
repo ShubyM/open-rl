@@ -276,7 +276,7 @@ timeslice.io/group: <claim name>    # the ResourceClaim the pod shares
 timeslice.io/job-id: <workload name>
 ```
 
-The API server's `open-rl-sa` service account has a Role allowing Workload CRUD in the workload namespace (`03-rbac.yaml`); the scheduler runs as the same account with the roles its own manifests add. When weight updates occur during FFT training, Trainers write checkpoints to NFS `/mnt/shared`, and Samplers dynamically reload those checkpoint safetensors in-place in ~1.1 seconds while yielding GPU VRAM via cooperative sleep.
+The API server's `open-rl-sa` service account has a Role allowing Workload CRUD in the workload namespace (`k8s/deploy/base/rbac.yaml`); the scheduler runs as the same account with the roles its own manifests add. When weight updates occur during FFT training, Trainers write checkpoints to NFS `/mnt/shared`, and Samplers dynamically reload those checkpoint safetensors in-place in ~1.1 seconds while yielding GPU VRAM via cooperative sleep.
 
 ### Structured Model Serialization in Redis
 To ensure reliable metadata persistence across API server restarts and worker spawns, model configuration is serialized in Redis using the `TrainingModelMetadata` dataclass:
@@ -297,8 +297,8 @@ The Kustomize rollout includes `10-dcgm-monitoring.yaml`, deploying the NVIDIA D
 ## Setup 3: Run training on the cluster
 
 ```bash
-kubectl port-forward svc/open-rl-api-server-service 8000:8000 &
-make test e2e fft-gsm8k BASE_URL=http://127.0.0.1:8000
+kubectl port-forward svc/open-rl-api-server-service 9003:8000 &
+make test e2e fft-gsm8k BASE_URL=http://127.0.0.1:9003
 ```
 
 ## Troubleshooting

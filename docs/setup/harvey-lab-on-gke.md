@@ -62,16 +62,16 @@ so an enabled L4 node would take it and OOM on the first batch.
 The API server service is ClusterIP. From a workstation:
 
 ```bash
-nohup sh -c 'while true; do kubectl port-forward svc/open-rl-api-server-service 8000:8000 >/dev/null 2>&1; sleep 1; done' &
+nohup sh -c 'while true; do kubectl port-forward svc/open-rl-api-server-service 9003:8000 >/dev/null 2>&1; sleep 1; done' &
 ```
 
 If the driver runs on another machine (it needs Podman and the LAB checkout),
-forward the port on: `ssh -N -R 8000:127.0.0.1:8000 <driver-host>`.
+forward the port on: `ssh -N -R 9003:127.0.0.1:9003 <driver-host>`.
 
 `kubectl port-forward` keeps a dead session when the API server pod is replaced
 (every `kubectl set env` or `set image` on the deployment does that). Kill and
 restart the loop after an API server rollout, then check
-`curl http://127.0.0.1:8000/api/v1/healthz` from the driver host; the tinker
+`curl http://127.0.0.1:9003/api/v1/healthz` from the driver host; the tinker
 client gives up after a few minutes of connection errors.
 
 ## Driver host
@@ -87,7 +87,7 @@ pass `judge_model=gemini-3.5-flash` and export `GEMINI_API_KEY`.
 ```bash
 cd examples
 TINKER_API_KEY=tml-dummy-key uv run harvey-train \
-  base_url=http://127.0.0.1:8000 \
+  base_url=http://127.0.0.1:9003 \
   model_name=Qwen/Qwen3.5-9B renderer_name=qwen3_5 \
   max_trajectory_tokens=81920 max_tool_result_tokens=4096 max_tokens=16384 \
   batch_size=1 rollouts_per_example=4 max_steps=2 task=<area>/<task> \

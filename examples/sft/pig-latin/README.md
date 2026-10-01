@@ -13,10 +13,10 @@ This script demonstrates fine-tuning a model to translate English into Pig Latin
 
 ## Running the Training Server
 
-### Option 1: Qwen (Default)
-Start the local single-process OpenRL server for Qwen (`BASE_MODEL` defaults to `Qwen/Qwen3-0.6B`):
+### Option 1: Qwen
+Start the local single-process OpenRL server for Qwen:
 ```bash
-make server
+make server BASE_MODEL=Qwen/Qwen3-0.6B
 ```
 
 ### Option 2: Gemma

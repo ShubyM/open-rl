@@ -17,7 +17,7 @@ Open-RL uses `uv` for environment isolation. There are two primary environments:
 - **Server-Side Environment (`src/server`)**: Contains the API server server and worker controllers.
 - **Client/Examples Environment (`examples`)**: Contains recipes, client-side SDK compatibility checks, and E2E integration test scripts.
 
-Always run tasks using the appropriate Makefile targets (such as `make server`, `make vllm`, or `make test`). If you must execute custom scripts, make sure to target the correct environment using the appropriate project flag (e.g., `uv --project examples ...` or `uv --project src/server ...`).
+Always run tasks using the appropriate Makefile targets (such as `make server` or `make test`). If you must execute custom scripts, make sure to target the correct environment using the appropriate project flag (e.g., `uv --project examples ...` or `uv --project src/server ...`).
 
 ---
 

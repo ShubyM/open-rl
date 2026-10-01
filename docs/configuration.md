@@ -12,41 +12,35 @@ Install `uv` if needed:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Start the API server and trainer with the default torch sampling backend:
+Start the API server and trainer in one process, sampling with torch:
 
 ```bash
 BASE_MODEL=google/gemma-4-e2b \
-SAMPLING_BACKEND=torch \
 uv run --extra cpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
 ```
 
-Because `REDIS_URL` is unset, this starts the API server and trainer loop in one
-process on the same workstation or VM.
+Because `REDIS_URL` is unset, the API server runs the trainer loop in its own
+process and samples with torch. This works on a laptop without a GPU.
 
-For a separate vLLM sampler, use two terminals:
+To train and sample on GPUs with vLLM, set `REDIS_URL`. The API server then
+launches a trainer and a vLLM sampler as separate worker processes when a client
+creates a model, and they share queues through Redis:
 
 ```bash
-# Terminal 1: vLLM sampler
+REDIS_URL=redis://127.0.0.1:6379/0 \
 BASE_MODEL=google/gemma-4-e2b \
 VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM \
-CUDA_VISIBLE_DEVICES=0 \
-uv run --extra vllm python -m server.vllm_sampler
-```
-
-```bash
-# Terminal 2: API server and trainer
-BASE_MODEL=google/gemma-4-e2b \
-SAMPLING_BACKEND=vllm \
-CUDA_VISIBLE_DEVICES=1 \
+TRAINER_CUDA_VISIBLE_DEVICES=0 \
+SAMPLER_CUDA_VISIBLE_DEVICES=1 \
 uv run --extra gpu python -m uvicorn server.api_server:app --host 127.0.0.1 --port 9003
 ```
 
 The equivalent Makefile shortcuts are:
 
 ```bash
-make server BASE_MODEL=google/gemma-4-e2b
-VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM make vllm BASE_MODEL=google/gemma-4-e2b
-make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
+make server
+REDIS_URL=redis://127.0.0.1:6379/0 VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM \
+  TRAINER_CUDA_VISIBLE_DEVICES=0 SAMPLER_CUDA_VISIBLE_DEVICES=1 make server
 ```
 
 ## Core variables
@@ -54,10 +48,9 @@ make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `BASE_MODEL` | unset | Hugging Face model id loaded by the trainer and, when using vLLM, by the sampler. |
-| `SAMPLING_BACKEND` | `torch` locally, `vllm` when distributed | Sampling backend selector. `torch` samples in the training process. `vllm` forwards sampling requests to a vLLM worker. |
+| `SAMPLING_BACKEND` | `torch` in one process, `vllm` when `REDIS_URL` is set | Sampling backend selector. `torch` samples in the training process. `vllm` queues sampling requests for a vLLM sampler worker and needs `REDIS_URL`. |
 | `REDIS_URL` | unset | Enables distributed mode by switching the request store to Redis. Leave unset for a single-machine run. |
 | `OPEN_RL_FUTURE_TTL_S` | `300` | How long resolved request results stay readable by `retrieve_future` after a worker resolves them. |
-| `VLLM_URL` | `http://127.0.0.1:8001` | API server URL for the vLLM worker when `SAMPLING_BACKEND=vllm`. |
 
 ## Server paths
 
@@ -65,13 +58,13 @@ make server BASE_MODEL=google/gemma-4-e2b SAMPLING_BACKEND=vllm
 | --- | --- | --- |
 | `OPEN_RL_TMP_DIR` | `/tmp/open-rl` | Root directory for adapter snapshots under `peft/` and saved states under `checkpoints/`. |
 | `OPEN_RL_TRAIN_TOKEN_BUDGET` | `0` | Maximum `batch_size * max_sequence_length` for padded trainer chunks inside one `forward_backward` request. `0` keeps the previous one-datum-at-a-time execution path. |
-| `CUDA_VISIBLE_DEVICES` | unset | Standard PyTorch GPU selector. Use different devices when the vLLM worker and trainer run on separate GPUs. |
+| `TRAINER_CUDA_VISIBLE_DEVICES`, `SAMPLER_CUDA_VISIBLE_DEVICES` | unset | GPUs given to the trainer and sampler worker processes the local worker manager launches. |
 
 ## Worker manager
 
 | Env var | Default | What it does |
 | --- | --- | --- |
-| `OPEN_RL_WORKER_MANAGER` | `local` | Trainer worker manager mode. Use `local` for subprocess workers or `kubernetes` for the DRA worker-manager deployment. |
+| `OPEN_RL_WORKER_MANAGER` | `local` | How the API server starts trainer and sampler workers: `local` runs them as subprocesses, `scheduler` creates `Workload`s for the OpenRL scheduler on Kubernetes, and `none` leaves workers to something else. |
 | `OPEN_RL_ACCEL_TIMESLICER_SOCKET` | `/tmp/open-rl/accel-timeslicer.sock` | Unix socket path for a local accelerator time-slicer. Used when `OPEN_RL_ACCEL_TIMESLICER_HOST` is unset. |
 | `OPEN_RL_ACCEL_TIMESLICER_HOST` | unset | Node-local accelerator time-slicer host for Kubernetes workers. When set, the worker uses TCP instead of the Unix socket; Kubernetes sets this from `status.hostIP`. |
 | `OPEN_RL_ACCEL_TIMESLICER_PORT` | `9753` | Node-local accelerator time-slicer TCP port for Kubernetes workers. |
@@ -100,27 +93,10 @@ backend by default for physical checkpoint/restore.
 | `ENABLE_GCP_TRACE` | `0` | `1` exports OpenTelemetry traces to Google Cloud Trace. |
 | `ENABLE_CONSOLE_TRACE` | `0` | `1` prints trace spans to stdout for debugging. |
 
-## Distributed deployment
+## Kubernetes deployment
 
-Kubernetes deployment manifests set these variables in pod specs. The important split is:
-
-```bash
-# API server pod
-REDIS_URL=redis://redis-service:6379 \
-VLLM_URL=http://vllm-service:8001 \
-BASE_MODEL=google/gemma-4-e2b \
-uv run uvicorn server.api_server:app --host 0.0.0.0 --port 8000
-```
-
-```bash
-# Trainer worker pod
-REDIS_URL=redis://redis-service:6379 \
-BASE_MODEL=google/gemma-4-e2b \
-uv run python -m server.training_requests_processor
-```
-
-```bash
-# vLLM worker pod
-BASE_MODEL=google/gemma-4-e2b \
-uv run uvicorn server.vllm_sampler:app --host 0.0.0.0 --port 8001
-```
+On Kubernetes the release bundles set these variables. The API server runs with
+`REDIS_URL` and `OPEN_RL_WORKER_MANAGER=scheduler`; it creates a `Workload` for
+each trainer and sampler, and the OpenRL scheduler starts their pods. The API
+server writes each worker's environment into the `Workload`'s pod template, so
+there are no worker deployments to configure by hand.

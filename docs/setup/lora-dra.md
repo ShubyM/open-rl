@@ -86,7 +86,7 @@ Check readiness and connect to the API:
 kubectl --context my-cluster -n openrl-system rollout status deployment/redis-store
 kubectl --context my-cluster -n openrl-system rollout status deployment/open-rl-scheduler
 kubectl --context my-cluster -n openrl-system rollout status deployment/open-rl-api-server
-kubectl --context my-cluster -n openrl-system port-forward svc/open-rl-api-server-service 8000:8000
+kubectl --context my-cluster -n openrl-system port-forward svc/open-rl-api-server-service 9003:8000
 ```
 
 The default model is public `Qwen/Qwen2.5-0.5B`. Workers download model weights
@@ -151,7 +151,7 @@ sample the trained adapter:
 
 ```bash
 uv --project examples run python examples/tiny/tiny_sft.py \
-  base_model=Qwen/Qwen2.5-0.5B base_url=http://127.0.0.1:8000 sample_after_train=true
+  base_model=Qwen/Qwen2.5-0.5B base_url=http://127.0.0.1:9003 sample_after_train=true
 ```
 
 This checks falling training loss and successful generation from the saved

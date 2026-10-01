@@ -83,13 +83,11 @@ terminal starts everything:
 ```bash
 export REDIS_URL=redis://127.0.0.1:6379/0
 export BASE_MODEL=google/gemma-4-e2b
-export SAMPLING_BACKEND=vllm
 export VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM
 export TRAINER_CUDA_VISIBLE_DEVICES=0
 export SAMPLER_CUDA_VISIBLE_DEVICES=1
 
-# Required for gated models such as google/gemma-4-e2b (and recommended
-# generally to avoid Hugging Face rate limits)
+# Recommended to avoid Hugging Face rate limits, and required for gated models
 # export HF_TOKEN="your_huggingface_token"
 make server
 ```

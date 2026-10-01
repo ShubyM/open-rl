@@ -11,7 +11,6 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -87,7 +86,6 @@ class FilterNoisyEndpoints(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(FilterNoisyEndpoints())
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
-VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8001")
 
 
 # *** Request bodies ***
@@ -419,24 +417,14 @@ async def ensure_sampler_launched(model_id: str) -> None:
       traceback.print_exc()
 
 
-async def preflight_vllm() -> None:
-  """If SAMPLING_BACKEND=vllm, verify the vLLM worker is reachable at VLLM_URL.
-
-  Prints a clear, actionable error instead of letting the first asample
-  request fall through with a raw httpx connection refused.
-  """
-  if get_sampler_backend() != "vllm":
-    return
-  healthz = f"{VLLM_URL.rstrip('/')}/healthz"
-  try:
-    async with httpx.AsyncClient(timeout=3.0) as client:
-      resp = await client.get(healthz)
-      resp.raise_for_status()
-  except Exception as exc:
+def check_single_process_backend() -> None:
+  """vLLM sampling runs in a worker the API server launches, and they share queues
+  through Redis, so one process can only sample with torch."""
+  if get_sampler_backend() == "vllm":
     raise RuntimeError(
-      f"SAMPLING_BACKEND=vllm but no vLLM worker is reachable at {VLLM_URL}.\n"
-      f"Start it first with:  make vllm BASE_MODEL={os.getenv('BASE_MODEL') or '<model-id>'}"
-    ) from exc
+      "SAMPLING_BACKEND=vllm needs REDIS_URL: the API server launches the vLLM sampler as a separate worker. "
+      "Set REDIS_URL (for example redis://127.0.0.1:6379/0), or unset SAMPLING_BACKEND to sample with torch in one process."
+    )
 
 
 def translate_future_result(result: dict) -> dict:
@@ -507,7 +495,7 @@ async def lifespan(_: FastAPI):
     print(f"-> Sampling backend: {get_sampler_backend()}")
     print(f"-> FFT enabled     : {is_fft_enabled()}")
     print("-> Server mode     : API server + worker loop in one process\n")
-    await preflight_vllm()
+    check_single_process_backend()
     if not is_fft_enabled():
       from server import training_requests_processor
 
