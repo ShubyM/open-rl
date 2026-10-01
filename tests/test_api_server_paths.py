@@ -338,3 +338,43 @@ class RestoreRoutingTest(ApiServerTest):
         metadata = json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
         self.assertEqual((metadata["base_model"], metadata["fine_tuning_type"]), ("checkpoint-base", kind))
         self.assertEqual(self.queued()[0]["payload"]["fine_tuning_type"], kind)
+
+
+class ExclusiveMetadataTest(ApiServerTest):
+  """A model may ask for GPUs no other worker shares; nothing parks it there."""
+
+  def metadata(self, model_id: str) -> dict:
+    return json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+
+  def test_exclusive_is_kept_and_keeps_the_trainer_resident(self) -> None:
+    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}}).json()["request_id"]
+    meta = self.metadata(model_id)
+    self.assertTrue(meta["exclusive"])
+    self.assertFalse(meta["full_config"]["cpu_offload"])
+
+  def test_a_json_boolean_is_accepted_too(self) -> None:
+    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": True}}).json()["request_id"]
+    self.assertTrue(self.metadata(model_id)["exclusive"])
+
+  def test_models_share_by_default(self) -> None:
+    meta = self.metadata(self.post("create_model", {"base_model": "m"}).json()["request_id"])
+    self.assertFalse(meta["exclusive"])
+    self.assertTrue(meta["full_config"]["cpu_offload"])
+
+  def test_the_session_supplies_exclusive_and_the_model_may_override(self) -> None:
+    session_id = self.post("create_session", {"user_metadata": {"openrl.exclusive": "true"}}).json()["session_id"]
+    inherited = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
+    self.assertTrue(self.metadata(inherited)["exclusive"])
+    own = self.post("create_model", {"base_model": "m", "session_id": session_id, "user_metadata": {"openrl.exclusive": "false"}}).json()[
+      "request_id"
+    ]
+    self.assertFalse(self.metadata(own)["exclusive"])
+
+  def test_a_non_boolean_exclusive_is_refused(self) -> None:
+    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "yes"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("openrl.exclusive", response.json()["error"])
+
+
+if __name__ == "__main__":
+  unittest.main()

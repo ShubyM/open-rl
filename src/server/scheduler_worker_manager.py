@@ -65,8 +65,9 @@ def describe_worker(model_id: str, role: str) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
   # LoRA workers stay resident on the GPU, so they never share one. FFT
-  # workers suspend between turns and may.
-  return Worker(role, runtime, base_model, is_lora, is_lora, meta, footprint(base_model, meta.fine_tuning_type, role))
+  # workers suspend between turns and may, unless the model asked for its own.
+  exclusive = is_lora or meta.exclusive
+  return Worker(role, runtime, base_model, is_lora, exclusive, meta, footprint(base_model, meta.fine_tuning_type, role))
 
 
 def pod_env(worker: Worker) -> list[dict[str, Any]]:
@@ -85,6 +86,9 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   }
   if os.getenv("VLLM_GPU_MEMORY_UTILIZATION"):
     values["VLLM_GPU_MEMORY_UTILIZATION"] = os.environ["VLLM_GPU_MEMORY_UTILIZATION"]
+  # No other worker shares an exclusive worker's GPUs, so it never parks.
+  if worker.exclusive:
+    values["OPEN_RL_TIME_SLICING"] = "off"
   env: list[dict[str, Any]] = [{"name": name, "value": value} for name, value in values.items()]
   env.append({"name": "OPEN_RL_ACCEL_TIMESLICER_HOST", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}}})
   return env
