@@ -69,11 +69,14 @@ class TrainingRequestsProcessor:
     active_tenant_set_id: str | None = None,
     time_slicer: TimeSlicerClient | None = None,
   ):
-    if time_slicer is not None or (model_id and not active_tenant_set_id):
-      if not os.getenv("REDIS_URL"):
-        raise RuntimeError("Full fine-tuning workers require REDIS_URL so they can share queues and futures with the API server")
-      if not model_id:
-        raise RuntimeError("A dedicated trainer worker needs --model-id so it knows which per-model queue to drain")
+    # A trainer started for one model drains that model's queue, sliced or not.
+    # Only a LoRA trainer serving a tenant set reads the set instead.
+    self.dedicated = bool(model_id) and not active_tenant_set_id
+    if time_slicer is not None and not self.dedicated:
+      raise RuntimeError("A time-sliced trainer needs --model-id and no tenant set")
+    # The API server's in-process trainer is the only one that works without Redis.
+    if self.dedicated and not os.getenv("REDIS_URL"):
+      raise RuntimeError("A dedicated trainer worker requires REDIS_URL so it can share queues and futures with the API server")
 
     self.store = store
     self.worker = worker
@@ -121,8 +124,7 @@ class TrainingRequestsProcessor:
     os._exit(0)
 
   async def next_batch(self) -> list[dict[str, Any]]:
-    # A dedicated trainer drains its model's queue, with or without a slicer.
-    if self.time_slicer is not None or (self.model_id and not self.active_tenant_set_id):
+    if self.dedicated:
       return await self.store.get_requests_for_model(self.model_id)
     return await self.store.get_requests(active_set_id=self.active_tenant_set_id)
 

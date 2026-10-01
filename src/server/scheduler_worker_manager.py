@@ -64,8 +64,9 @@ class Worker:
 def describe_worker(model_id: str, role: str) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
-  # LoRA workers stay resident on the GPU, so they never share one. FFT
-  # workers suspend between turns and may, unless the model asked for its own.
+  # LoRA workers stay resident on the GPU, so they are always exclusive and
+  # openrl.exclusive changes nothing for them. FFT workers suspend between
+  # turns and share, unless the model asked for its own.
   exclusive = is_lora or meta.exclusive
   return Worker(role, runtime, base_model, is_lora, exclusive, meta, footprint(base_model, meta.fine_tuning_type, role))
 

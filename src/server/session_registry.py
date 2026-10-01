@@ -10,11 +10,11 @@ Everything lives in the store, so an API server restart keeps it:
 
   open_rl:session:<id>    present while the session is live. Each heartbeat
                           resets its expiry, so a silent session vanishes
-                          on its own.
+                          on its own. Its value is the user_metadata the
+                          client opened the session with, the defaults for
+                          every model it creates.
   open_rl:owner:<owner>   the sessions using this owner's workers.
   open_rl:owners          every owner that has workers.
-  open_rl:session_meta:<id>  the user_metadata the client opened the session
-                          with; defaults for every model it creates.
 
 Nothing here is atomic. The API server holds a lock per owner around attach and
 around the in_use check and the teardown that follows it, so a session cannot
@@ -26,10 +26,6 @@ from typing import Any
 
 from server.store import StateStore
 
-# Session metadata outlives heartbeats: a resumed run reads it back long after
-# the session's own key expired.
-SESSION_METADATA_TTL_SECONDS = 7 * 24 * 3600
-
 
 class SessionRegistry:
   def __init__(self, state: StateStore, ttl_seconds: float = 120.0):
@@ -37,15 +33,17 @@ class SessionRegistry:
     self.ttl_seconds = ttl_seconds
 
   async def heartbeat(self, session_id: str) -> None:
-    await self.state.set_value(f"open_rl:session:{session_id}", "1", ttl_seconds=self.ttl_seconds)
+    key = f"open_rl:session:{session_id}"
+    await self.state.set_value(key, await self.state.get_value(key) or "{}", ttl_seconds=self.ttl_seconds)
 
-  async def remember(self, session_id: str, user_metadata: dict[str, Any]) -> None:
-    if user_metadata:
-      await self.state.set_value(f"open_rl:session_meta:{session_id}", json.dumps(user_metadata), ttl_seconds=SESSION_METADATA_TTL_SECONDS)
+  async def update_metadata(self, session_id: str, user_metadata: dict[str, Any]) -> None:
+    await self.state.set_value(f"open_rl:session:{session_id}", json.dumps(user_metadata), ttl_seconds=self.ttl_seconds)
 
   async def user_metadata(self, session_id: str | None) -> dict[str, Any]:
-    raw = await self.state.get_value(f"open_rl:session_meta:{session_id}") if session_id else None
-    return json.loads(raw) if raw else {}
+    raw = await self.state.get_value(f"open_rl:session:{session_id}") if session_id else None
+    data = json.loads(raw) if raw else {}
+    # Sessions opened before metadata was stored hold "1".
+    return data if isinstance(data, dict) else {}
 
   async def live(self, session_id: str) -> bool:
     return await self.state.get_value(f"open_rl:session:{session_id}") is not None

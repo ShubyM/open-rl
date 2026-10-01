@@ -370,6 +370,12 @@ class ExclusiveMetadataTest(ApiServerTest):
     ]
     self.assertFalse(self.metadata(own)["exclusive"])
 
+  def test_heartbeats_keep_the_session_metadata(self) -> None:
+    session_id = self.post("create_session", {"user_metadata": {"openrl.exclusive": "true"}}).json()["session_id"]
+    self.post("session_heartbeat", {"session_id": session_id})
+    model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
+    self.assertTrue(self.metadata(model_id)["exclusive"])
+
   def test_a_non_boolean_exclusive_is_refused(self) -> None:
     response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "yes"}})
     self.assertEqual(response.status_code, 400)

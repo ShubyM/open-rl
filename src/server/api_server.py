@@ -623,8 +623,7 @@ async def client_config(_: dict):
 @app.post("/api/v1/create_session")
 async def create_session(req: CreateSessionRequest):
   session_id = f"sess-{uuid.uuid4().hex[:12]}"
-  await session_registry.heartbeat(session_id)
-  await session_registry.remember(session_id, req.user_metadata or {})
+  await session_registry.update_metadata(session_id, req.user_metadata or {})
   return {"session_id": session_id, "type": "create_session"}
 
 
