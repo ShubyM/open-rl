@@ -171,6 +171,19 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
 
     self.assertEqual(self.api.deleted, [])
 
+  def test_exclusive_lora_models_get_runtimes_of_their_own(self) -> None:
+    s = InMemoryStateStore()
+    for model_id in ("job-a", "job-b"):
+      meta = {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora", "exclusive": True}
+      s.kv_store[f"open_rl:model_meta:{model_id}"] = json.dumps(meta)
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-a", "trainer")
+      self.manager.ensure("job-b", "trainer")
+      self.manager.release("job-a")
+
+    self.assertEqual([w["metadata"]["name"] for w in self.api.created], ["lora-job-a-0-trainer", "lora-job-b-0-trainer"])
+    self.assertEqual(self.api.deleted, ["lora-job-a-0-trainer"])
+
   def test_release_owner_deletes_a_shared_lora_pair_and_nothing_else(self) -> None:
     s = self.store_with("adapter", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     s.kv_store["open_rl:model_meta:other"] = json.dumps({"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora"})

@@ -361,6 +361,9 @@ async def _extract_and_persist_model_metadata(
   # The model's own user_metadata wins over what the session was opened with.
   session_metadata = await session_registry.user_metadata(req.session_id)
   exclusive = resolve_exclusive(req.user_metadata or {}, session_metadata)
+  # Without a worker manager one static runtime serves every model.
+  if exclusive and worker_manager is None:
+    raise ValueError("openrl.exclusive needs a server that launches workers per model")
   # Nothing parks an exclusive trainer, so it stays on the GPU.
   if exclusive:
     full_config["cpu_offload"] = False
@@ -389,7 +392,7 @@ async def _resolve_active_set_id(model_id: str | None) -> str | None:
     return None
   meta = await get_model_metadata(state, model_id)
   if meta and meta.fine_tuning_type == "lora" and meta.base_model:
-    return f"{meta.base_model}-1"
+    return f"{meta.runtime(model_id)}-1"
   return None
 
 
@@ -661,13 +664,11 @@ async def delete_model(req: ModelRequest):
   meta = await get_model_metadata(state, model_id)
   if meta is None:
     raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
-  is_lora = meta.fine_tuning_type == "lora"
-  if is_fft_enabled() and not is_lora:
+  if not meta.shares_runtime() and worker_manager is not None:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
-    await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)))
+    await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)), active_set_id=await _resolve_active_set_id(model_id))
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
-    if worker_manager is not None:
-      await asyncio.to_thread(worker_manager.release, model_id)
+    await asyncio.to_thread(worker_manager.release, model_id)
   now = time.time()
   meta.status = "completed"
   meta.completed_at = now
@@ -918,8 +919,7 @@ async def create_sampling_session(req: CreateSamplingSessionRequest):
     target_model_id = sess_id
 
   model_meta = await get_model_metadata(state, target_model_id) if target_model_id else None
-  fine_tuning_type = model_meta.fine_tuning_type if model_meta else "lora"
-  ready_check_id = (model_meta.base_model or target_model_id) if (fine_tuning_type == "lora" and model_meta) else target_model_id
+  ready_check_id = (model_meta.runtime(target_model_id) or target_model_id) if model_meta else target_model_id
 
   await bind_session(req.session_id, target_model_id)
 
@@ -1010,7 +1010,7 @@ async def asample(req: AsampleRequest):
     lora_id = model_id
     peft_dir = os.path.join(TMP_DIR, "peft", lookup_id, lookup_id)
     lora_path = peft_dir if os.path.exists(peft_dir) else None
-    queue_id = (model_meta.base_model if model_meta else None) or lookup_id
+    queue_id = (model_meta.runtime(lookup_id) if model_meta else None) or lookup_id
   else:
     resolved_path = resolve_sampler_weights_path(model_id) if is_sampler_weights_ref(model_id) or is_fft_enabled() else None
     weights_path = resolved_path

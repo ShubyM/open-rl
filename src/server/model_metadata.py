@@ -42,8 +42,9 @@ def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
   return WeightSyncConfig(strategy=strategy)
 
 
-# The user_metadata key asking for GPUs no other worker shares. Nothing
-# time-slices an exclusive worker, so any workload runs on them as it is.
+# The user_metadata key asking for an exclusive workload, one no other
+# workload shares: the model gets its own trainer and sampler, and nothing
+# time-slices their GPUs, so any workload runs on them as it is.
 # Prefixed because the client owns user_metadata and puts its own keys there.
 EXCLUSIVE_KEY = "openrl.exclusive"
 
@@ -75,6 +76,20 @@ class TrainingModelMetadata(BaseModel):
   status: str = "active"
   updated_at: float = 0.0
   completed_at: float | None = None
+
+  def shares_gpu(self) -> bool:
+    """Whether other workers may time-slice this model's GPUs. FFT workers
+    suspend between turns. LoRA workers cannot, so their GPUs are never shared."""
+    return self.fine_tuning_type != "lora" and not self.exclusive
+
+  def shares_runtime(self) -> bool:
+    """Whether other models may run in this model's trainer and sampler. A LoRA
+    runtime serves every adapter on its base model. An FFT runtime serves one model."""
+    return self.fine_tuning_type == "lora" and not self.exclusive
+
+  def runtime(self, model_id: str) -> str:
+    """The id of the trainer and sampler pair that serves this model."""
+    return self.base_model if self.shares_runtime() else model_id
 
 
 def decode_model_metadata(raw: str | None) -> TrainingModelMetadata | None:

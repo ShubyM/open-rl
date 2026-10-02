@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from server import api_server
 from server.store import InMemoryStateStore, InMemoryStore
+from tests.test_session_lifecycle import RuntimeManager
 
 
 class ApiServerTest(unittest.TestCase):
@@ -341,7 +342,12 @@ class RestoreRoutingTest(ApiServerTest):
 
 
 class ExclusiveMetadataTest(ApiServerTest):
-  """A model may ask for GPUs no other worker shares; nothing parks it there."""
+  """A model may ask for a workload no other workload shares; nothing parks it there."""
+
+  def setUp(self) -> None:
+    super().setUp()
+    self.enterContext(patch("server.worker_manager.get_state_store", return_value=api_server.state))
+    self.enterContext(patch.object(api_server, "worker_manager", RuntimeManager()))
 
   def metadata(self, model_id: str) -> dict:
     return json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
@@ -375,6 +381,12 @@ class ExclusiveMetadataTest(ApiServerTest):
     self.post("session_heartbeat", {"session_id": session_id})
     model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
     self.assertTrue(self.metadata(model_id)["exclusive"])
+
+  def test_a_server_without_a_worker_manager_refuses_exclusive(self) -> None:
+    with patch.object(api_server, "worker_manager", None):
+      response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("openrl.exclusive", response.json()["error"])
 
   def test_a_non_boolean_exclusive_is_refused(self) -> None:
     response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "yes"}})

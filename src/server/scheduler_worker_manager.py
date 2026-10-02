@@ -64,10 +64,7 @@ class Worker:
 def describe_worker(model_id: str, role: str) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
-  # LoRA workers stay resident on the GPU, so they are always exclusive and
-  # openrl.exclusive changes nothing for them. FFT workers suspend between
-  # turns and share, unless the model asked for its own.
-  exclusive = is_lora or meta.exclusive
+  exclusive = not meta.shares_gpu()
   return Worker(role, runtime, base_model, is_lora, exclusive, meta, footprint(base_model, meta.fine_tuning_type, role))
 
 
@@ -186,10 +183,11 @@ class SchedulerWorkerManager:
 
   def release(self, model_id: str) -> None:
     try:
-      _, runtime, is_lora = runtime_of(model_id)
+      meta, runtime, _ = runtime_of(model_id)
+      shared = meta.shares_runtime()
     except Exception:
-      runtime, is_lora = model_id, False
-    if is_lora:
+      runtime, shared = model_id, False
+    if shared:
       return  # a shared runtime outlives any one job
     self.release_owner(owner_id(runtime))
 
