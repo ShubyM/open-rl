@@ -356,10 +356,20 @@ function sumSeries(workers, field) {
   return [...byTime].sort((a, b) => a[0] - b[0]);
 }
 
+// Break a line only where samples are missing. Longer windows are queried at a
+// coarser step (144s at 24 hours), so the gap is three typical sample spacings,
+// never less than the source's own interval floor.
+function gapFor(points, floor) {
+  const times = points.map(([at]) => at).sort((a, b) => a - b);
+  const spacings = times.slice(1).map((at, i) => at - times[i]).filter((d) => d > 0).sort((a, b) => a - b);
+  return Math.max(floor, 3 * (spacings[Math.floor(spacings.length / 2)] || 0));
+}
+
 function workerChart(metrics, range) {
   const { workers } = metrics.data;
   const reason = workers.map((w) => w.reason).find(Boolean) || "No CPU samples for these workers";
-  return chart({ title: `Worker CPU · ${workers.length} process${workers.length === 1 ? "" : "es"}`, unit: "cores", points: sumSeries(workers, "cpu_cores"), start: range.start, end: range.now, min: 0, gapSeconds: 180, empty: reason });
+  const points = sumSeries(workers, "cpu_cores");
+  return chart({ title: `Worker CPU · ${workers.length} process${workers.length === 1 ? "" : "es"}`, unit: "cores", points, start: range.start, end: range.now, min: 0, gapSeconds: gapFor(points, 180), empty: reason });
 }
 
 function workerMemory(metrics, range) {
@@ -393,7 +403,7 @@ function gpuChart(metrics, range, label) {
     end: range.now,
     min: 0,
     max: 100,
-    gapSeconds: 60,
+    gapSeconds: gapFor(points, 60),
     empty: metrics.error || reason,
   })}${hasSamples && failures.length ? `<p class="source-error" role="status">${escape(failures.join(" · "))}${metrics.error ? " · Showing previously fetched samples" : ""}</p>` : ""}`;
 }
