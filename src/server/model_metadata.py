@@ -42,26 +42,6 @@ def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
   return WeightSyncConfig(strategy=strategy)
 
 
-# The user_metadata key asking for an exclusive workload, one no other
-# workload shares: the model gets its own trainer and sampler, and nothing
-# time-slices their GPUs, so any workload runs on them as it is.
-# Prefixed because the client owns user_metadata and puts its own keys there.
-EXCLUSIVE_KEY = "openrl.exclusive"
-
-
-def resolve_exclusive(*user_metadata: dict[str, Any]) -> bool:
-  """Whether the model asked for exclusive GPUs, per model then per session.
-  The SDK types user_metadata values as strings, so "true" and "false" count."""
-  for source in user_metadata:
-    if (value := (source or {}).get(EXCLUSIVE_KEY)) is not None:
-      if isinstance(value, str) and value.lower() in ("true", "false"):
-        return value.lower() == "true"
-      if not isinstance(value, bool):
-        raise ValueError(f"{EXCLUSIVE_KEY} must be 'true' or 'false', got {value!r}")
-      return value
-  return False
-
-
 class TrainingModelMetadata(BaseModel):
   # Preserve fields written by other server versions when updating a record.
   model_config = ConfigDict(extra="allow")

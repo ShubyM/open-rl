@@ -393,6 +393,29 @@ class ExclusiveMetadataTest(ApiServerTest):
     self.assertEqual(response.status_code, 400)
     self.assertIn("openrl.exclusive", response.json()["error"])
 
+  def test_session_tags_set_defaults_and_user_metadata_beats_them(self) -> None:
+    tags = ["openrl.exclusive=true", "my-label"]
+    tagged = self.post("create_session", {"tags": tags}).json()["session_id"]
+    model_id = self.post("create_model", {"base_model": "m", "session_id": tagged}).json()["request_id"]
+    self.assertTrue(self.metadata(model_id)["exclusive"])
+
+    overridden = self.post("create_session", {"tags": tags, "user_metadata": {"openrl.exclusive": "false"}}).json()["session_id"]
+    model_id = self.post("create_model", {"base_model": "m", "session_id": overridden}).json()["request_id"]
+    self.assertFalse(self.metadata(model_id)["exclusive"])
+
+  def test_bad_openrl_tags_are_refused_when_the_session_opens(self) -> None:
+    for tag, error in [("openrl.exclusiv=true", "openrl.exclusiv: unknown setting"), ("openrl.exclusive", "needs a value")]:
+      response = self.post("create_session", {"tags": [tag]})
+      self.assertEqual(response.status_code, 400)
+      self.assertIn(error, response.json()["error"])
+
+  def test_only_openrl_keys_are_settings(self) -> None:
+    ok = self.post("create_model", {"base_model": "m", "user_metadata": {"wandb_link": "x", "exclusive": "yes"}})
+    self.assertEqual(ok.status_code, 200)
+    unknown = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusiv": "true"}})
+    self.assertEqual(unknown.status_code, 400)
+    self.assertIn("openrl.exclusiv: unknown setting", unknown.json()["error"])
+
 
 if __name__ == "__main__":
   unittest.main()

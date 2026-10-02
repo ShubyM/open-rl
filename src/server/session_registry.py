@@ -11,8 +11,8 @@ Everything lives in the store, so an API server restart keeps it:
   open_rl:session:<id>    present while the session is live. Each heartbeat
                           resets its expiry, so a silent session vanishes
                           on its own. Its value is the user_metadata the
-                          client opened the session with, the defaults for
-                          every model it creates.
+                          client opened the session with, plus its openrl.
+                          tags, the defaults for every model it creates.
   open_rl:owner:<owner>   the sessions using this owner's workers.
   open_rl:owners          every owner that has workers.
 
