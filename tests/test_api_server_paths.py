@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from server import api_server
 from server.store import InMemoryStateStore, InMemoryStore
+from server.worker_manager import LocalWorkerManager
 from tests.test_session_lifecycle import RuntimeManager
 
 
@@ -467,6 +468,23 @@ class TrainerBackendTest(ApiServerTest):
     response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "nope"}})
     self.assertEqual(response.status_code, 400)
     self.assertIn("openrl.trainer_backend", response.json()["error"])
+
+  def test_jobs_on_one_trainer_image_share_apart_from_other_images(self) -> None:
+    def create(image: str) -> str:
+      session_id = self.post("create_session", {"tags": [f"openrl.trainer_backend={image}"]}).json()["session_id"]
+      return self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
+
+    first, second, other = create("ghcr.io/org/trainer:1"), create("ghcr.io/org/trainer:1"), create("ghcr.io/org/trainer:2")
+    self.assertEqual(self.metadata(first)["trainer_backend"], "ghcr.io/org/trainer:1")
+    self.assertRegex(self.active_set(first), r"^image-[0-9a-f]{10}-m-1$")
+    self.assertEqual(self.active_set(second), self.active_set(first))
+    self.assertNotEqual(self.active_set(other), self.active_set(first))
+
+  def test_a_local_worker_manager_refuses_a_trainer_image(self) -> None:
+    with patch.object(api_server, "worker_manager", object.__new__(LocalWorkerManager)):
+      response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "ghcr.io/org/trainer:1"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("pods", response.json()["error"])
 
   def test_a_server_without_a_worker_manager_refuses_automodel(self) -> None:
     with patch.object(api_server, "worker_manager", None):

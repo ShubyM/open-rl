@@ -11,6 +11,8 @@ Two FFT jobs and two LoRA jobs on the same base model come in:
   lora-job 7a8b    qwen-qwen2-5-0-5b   lora-qwen-qwen2-5-0-5b-0-trainer   with 5e6f
   automodel 9c0d   automodel-qwen-qwen2-5-0-5b   lora-automodel-qwen-qwen2-5-0-5b-0-trainer   one Automodel
                                                                                   runtime, apart from PyTorch's
+  image 1d2e       image-<hash>-qwen-qwen2-5-0-5b   lora-image-<hash>-qwen-qwen2-5-0-5b-0-trainer   one runtime
+                                                                                  per trainer image
 
 The Workload name is what the pod label and the time-slicer call job_id.
 """
@@ -95,10 +97,10 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
 
 
 def worker_container(worker: Worker) -> tuple[str, list[str]]:
-  """The image and command. An Automodel trainer runs from its own image,
-  whose venv is already on PATH."""
-  if worker.role == "trainer" and worker.meta.trainer_backend == "automodel":
-    image = os.getenv("OPEN_RL_AUTOMODEL_IMAGE", "ghcr.io/gke-labs/open-rl/automodel:latest")
+  """The image and command. An Automodel trainer, or one from an image the job
+  names, runs the python on its image's PATH."""
+  if worker.role == "trainer" and worker.meta.trainer_backend != "pytorch":
+    image = worker.meta.trainer_image() or os.getenv("OPEN_RL_AUTOMODEL_IMAGE", "ghcr.io/gke-labs/open-rl/automodel:latest")
     return image, ["python", "-u", "-m", worker_module(worker.role)]
   image = os.getenv("OPEN_RL_WORKER_IMAGE", "ghcr.io/gke-labs/open-rl/server:latest")
   return image, ["uv", "run", "python", "-u", "-m", worker_module(worker.role)]
