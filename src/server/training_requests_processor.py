@@ -298,6 +298,9 @@ class TrainingRequestsProcessor:
         if checkpoint:
           await self.publish_checkpoint(command.model_id, checkpoint)
         return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved"}
+      case commands.DeleteModel():
+        await asyncio.to_thread(self.worker.delete_model, command.model_id)
+        return {"status": "ok", "type": "model_deleted"}
       case commands.Shutdown():
         return {"status": "ok", "type": "shutdown_acknowledged"}
       case _:
