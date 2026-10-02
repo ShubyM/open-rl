@@ -58,17 +58,17 @@ class TrainingModelMetadata(BaseModel):
   completed_at: float | None = None
 
   def shares_gpu(self) -> bool:
-    """Whether other workers may time-slice this model's GPUs. FFT workers
-    suspend between turns. LoRA workers cannot, so their GPUs are never shared."""
+    """Whether other workers may time-slice this job's GPUs. An FFT worker
+    suspends between turns. A LoRA worker cannot, so its GPUs are never shared."""
     return self.fine_tuning_type != "lora" and not self.exclusive
 
   def shares_runtime(self) -> bool:
-    """Whether other models may run in this model's trainer and sampler. A LoRA
-    runtime serves every adapter on its base model. An FFT runtime serves one model."""
+    """Whether this job's workers may serve other jobs too. A LoRA worker serves
+    many jobs, one adapter each. An FFT worker serves one job."""
     return self.fine_tuning_type == "lora" and not self.exclusive
 
   def runtime(self, model_id: str) -> str:
-    """The id of the trainer and sampler pair that serves this model."""
+    """The id of the workers that serve this job."""
     return self.base_model if self.shares_runtime() else model_id
 
 
