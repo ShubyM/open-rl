@@ -20,11 +20,16 @@ from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from pydantic import AliasChoices, BaseModel, Field, ValidationError, ValidationInfo, field_validator
+from pydantic import AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import proto_codec
-from server.model_metadata import TrainingModelMetadata, extract_weight_sync_config, get_model_metadata, persist_model_metadata
+from server.model_metadata import (
+  TrainingModelMetadata,
+  extract_weight_sync_config,
+  get_model_metadata,
+  persist_model_metadata,
+)
 from server.session_registry import SessionRegistry
 from server.store import RedisStateStore, get_state_store, get_store
 from server.worker_manager import WorkerManager, create_worker_manager, owner_of
@@ -97,9 +102,15 @@ class SessionHeartbeatRequest(BaseModel):
   session_id: str | None = None
 
 
+class CreateSessionRequest(BaseModel):
+  tags: list[str] = Field(default_factory=list)
+  user_metadata: dict[str, Any] | None = None
+
+
 class CreateModelRequest(BaseModel):
   base_model: str
   session_id: str | None = None
+  user_metadata: dict[str, Any] | None = None
   lora_config: LoraConfig = Field(default_factory=LoraConfig)
   full_config: FFTConfig = Field(default_factory=FFTConfig)
 
@@ -115,6 +126,7 @@ class CreateModelFromStateRequest(BaseModel):
   # The checkpoint's metadata names the base model when the client does not.
   base_model: str | None = None
   session_id: str | None = None
+  user_metadata: dict[str, Any] | None = None
   lora_config: LoraConfig = Field(default_factory=LoraConfig)
   full_config: FFTConfig = Field(default_factory=FFTConfig)
 
@@ -122,6 +134,59 @@ class CreateModelFromStateRequest(BaseModel):
   @classmethod
   def default_config(cls, value):
     return {} if value is None else value
+
+
+# The settings a client chooses for its models. Highest precedence first, they
+# come from the model's user_metadata, the session's user_metadata, and the
+# session's openrl. tags (TINKER_TAGS), for scripts that cannot pass
+# user_metadata. Only openrl. keys are ours; the client owns the rest.
+SETTINGS_PREFIX = "openrl."
+
+
+def parse_bool(value: Any) -> bool:
+  # The SDK types user_metadata values as strings, and tags are always strings.
+  if isinstance(value, str) and value.lower() in ("true", "false"):
+    return value.lower() == "true"
+  if not isinstance(value, bool):
+    raise ValueError(f"must be 'true' or 'false', got {value!r}")
+  return value
+
+
+class Settings(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  # A workload no other workload shares. The model gets its own trainer and
+  # sampler, and nothing time-slices their GPUs.
+  exclusive: Annotated[bool, BeforeValidator(parse_bool)] = False
+
+
+def tag_metadata(tags: list[str]) -> dict[str, str]:
+  """The openrl. tags as user_metadata entries. The SDK splits TINKER_TAGS on
+  commas, so a value cannot hold one."""
+  entries = {}
+  for tag in tags:
+    if tag.startswith(SETTINGS_PREFIX):
+      key, sep, value = tag.partition("=")
+      if not sep:
+        raise ValueError(f"tag {tag!r} needs a value, like {key}=true")
+      entries[key] = value
+  return entries
+
+
+def resolve_settings(*user_metadata: dict[str, Any]) -> Settings:
+  """The settings from user_metadata layers, highest precedence first. An
+  unknown openrl. key or a bad value is an error, not a silent default."""
+  merged = {}
+  for layer in reversed(user_metadata):
+    merged.update({key.removeprefix(SETTINGS_PREFIX): value for key, value in (layer or {}).items() if key.startswith(SETTINGS_PREFIX)})
+  try:
+    return Settings.model_validate(merged)
+  except ValidationError as exc:
+    problems = []
+    for error in exc.errors():
+      message = "unknown setting" if error["type"] == "extra_forbidden" else error["msg"].removeprefix("Value error, ")
+      problems.append(f"{SETTINGS_PREFIX}{error['loc'][0]}: {message}")
+    raise ValueError("; ".join(problems)) from None
 
 
 class ModelRequest(BaseModel):
@@ -344,6 +409,15 @@ async def _extract_and_persist_model_metadata(
 
   full_config["weight_sync_strategy"] = weight_sync_cfg.strategy
 
+  # The model's own user_metadata wins over what the session was opened with.
+  settings = resolve_settings(req.user_metadata or {}, await session_registry.user_metadata(req.session_id))
+  # Without a worker manager one static runtime serves every model.
+  if settings.exclusive and worker_manager is None:
+    raise ValueError("openrl.exclusive needs a server that launches workers per model")
+  # Nothing parks an exclusive trainer, so it stays on the GPU.
+  if settings.exclusive:
+    full_config["cpu_offload"] = False
+
   model_id = str(uuid.uuid4())
   meta_obj = TrainingModelMetadata(
     base_model=base_model,
@@ -352,6 +426,7 @@ async def _extract_and_persist_model_metadata(
     weight_sync_config=weight_sync_cfg,
     full_config=full_config,
     lora_config=lora_config,
+    exclusive=settings.exclusive,
   )
   await persist_model_metadata(state, model_id, meta_obj)
 
@@ -367,7 +442,7 @@ async def _resolve_active_set_id(model_id: str | None) -> str | None:
     return None
   meta = await get_model_metadata(state, model_id)
   if meta and meta.fine_tuning_type == "lora" and meta.base_model:
-    return f"{meta.base_model}-1"
+    return f"{meta.runtime(model_id)}-1"
   return None
 
 
@@ -589,9 +664,15 @@ async def client_config(_: dict):
 
 
 @app.post("/api/v1/create_session")
-async def create_session(_: dict):
+async def create_session(req: CreateSessionRequest):
+  # Tags are the session's defaults when the script cannot pass user_metadata.
+  try:
+    user_metadata = {**tag_metadata(req.tags), **(req.user_metadata or {})}
+    resolve_settings(user_metadata)
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
   session_id = f"sess-{uuid.uuid4().hex[:12]}"
-  await session_registry.heartbeat(session_id)
+  await session_registry.update_metadata(session_id, user_metadata)
   return {"session_id": session_id, "type": "create_session"}
 
 
@@ -629,13 +710,11 @@ async def delete_model(req: ModelRequest):
   meta = await get_model_metadata(state, model_id)
   if meta is None:
     raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
-  is_lora = meta.fine_tuning_type == "lora"
-  if is_fft_enabled() and not is_lora:
+  if not meta.shares_runtime() and worker_manager is not None:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
-    await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)))
+    await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)), active_set_id=await _resolve_active_set_id(model_id))
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
-    if worker_manager is not None:
-      await asyncio.to_thread(worker_manager.release, model_id)
+    await asyncio.to_thread(worker_manager.release, model_id)
   now = time.time()
   meta.status = "completed"
   meta.completed_at = now
@@ -886,8 +965,7 @@ async def create_sampling_session(req: CreateSamplingSessionRequest):
     target_model_id = sess_id
 
   model_meta = await get_model_metadata(state, target_model_id) if target_model_id else None
-  fine_tuning_type = model_meta.fine_tuning_type if model_meta else "lora"
-  ready_check_id = (model_meta.base_model or target_model_id) if (fine_tuning_type == "lora" and model_meta) else target_model_id
+  ready_check_id = (model_meta.runtime(target_model_id) or target_model_id) if model_meta else target_model_id
 
   await bind_session(req.session_id, target_model_id)
 
@@ -978,7 +1056,7 @@ async def asample(req: AsampleRequest):
     lora_id = model_id
     peft_dir = os.path.join(TMP_DIR, "peft", lookup_id, lookup_id)
     lora_path = peft_dir if os.path.exists(peft_dir) else None
-    queue_id = (model_meta.base_model if model_meta else None) or lookup_id
+    queue_id = (model_meta.runtime(lookup_id) if model_meta else None) or lookup_id
   else:
     resolved_path = resolve_sampler_weights_path(model_id) if is_sampler_weights_ref(model_id) or is_fft_enabled() else None
     weights_path = resolved_path

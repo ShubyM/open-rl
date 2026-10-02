@@ -64,9 +64,8 @@ class Worker:
 def describe_worker(model_id: str, role: str) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
-  # LoRA workers stay resident on the GPU, so they never share one. FFT
-  # workers suspend between turns and may.
-  return Worker(role, runtime, base_model, is_lora, is_lora, meta, footprint(base_model, meta.fine_tuning_type, role))
+  exclusive = not meta.shares_gpu()
+  return Worker(role, runtime, base_model, is_lora, exclusive, meta, footprint(base_model, meta.fine_tuning_type, role))
 
 
 def pod_env(worker: Worker) -> list[dict[str, Any]]:
@@ -85,6 +84,9 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   }
   if os.getenv("VLLM_GPU_MEMORY_UTILIZATION"):
     values["VLLM_GPU_MEMORY_UTILIZATION"] = os.environ["VLLM_GPU_MEMORY_UTILIZATION"]
+  # No other worker shares an exclusive worker's GPUs, so it never parks.
+  if worker.exclusive:
+    values["OPEN_RL_TIME_SLICING"] = "off"
   env: list[dict[str, Any]] = [{"name": name, "value": value} for name, value in values.items()]
   env.append({"name": "OPEN_RL_ACCEL_TIMESLICER_HOST", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}}})
   return env
@@ -181,10 +183,11 @@ class SchedulerWorkerManager:
 
   def release(self, model_id: str) -> None:
     try:
-      _, runtime, is_lora = runtime_of(model_id)
+      meta, runtime, _ = runtime_of(model_id)
+      shared = meta.shares_runtime()
     except Exception:
-      runtime, is_lora = model_id, False
-    if is_lora:
+      runtime, shared = model_id, False
+    if shared:
       return  # a shared runtime outlives any one job
     self.release_owner(owner_id(runtime))
 

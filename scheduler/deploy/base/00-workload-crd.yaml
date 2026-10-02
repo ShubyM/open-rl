@@ -99,9 +99,9 @@ spec:
                 default: true
                 description: |-
                   Exclusive keeps this worker alone on its GPU. Two workers share a
-                  claim only when neither is exclusive. The API server sets it from the
-                  training kind, true for LoRA workers because they cannot suspend
-                  between turns. Omitted means exclusive.
+                  claim only when neither is exclusive. The API server sets it when the
+                  worker cannot suspend between turns, as LoRA workers cannot, or when
+                  the model asked to share nothing. Omitted means exclusive.
                 type: boolean
               modelID:
                 description: |-

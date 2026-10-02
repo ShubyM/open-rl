@@ -86,6 +86,17 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(s_container["command"][-1], "server.vllm_sampler")
     self.assertIn("--active-tenant-set-id", t_container["args"])
 
+  def test_an_exclusive_fft_worker_is_placed_alone_and_never_time_sliced(self) -> None:
+    s = self.store_with("Model_A.1", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "exclusive": True})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("Model_A.1", "trainer")
+      self.manager.ensure("Model_A.1", "sampler")
+
+    for worker in self.api.created:
+      self.assertTrue(worker["spec"]["exclusive"])
+      env = {e["name"]: e.get("value") for e in worker["spec"]["template"]["spec"]["containers"][0]["env"]}
+      self.assertEqual(env["OPEN_RL_TIME_SLICING"], "off")
+
   def test_fft_worker_is_its_own_owner(self) -> None:
     s = self.store_with("Model_A.1", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
     with patch("server.worker_manager.get_state_store", return_value=s):
@@ -103,6 +114,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     container = worker["spec"]["template"]["spec"]["containers"][0]
     env = {e["name"]: e.get("value") for e in container["env"]}
     self.assertEqual(env["OPEN_RL_ENABLE_FFT"], "true")
+    self.assertNotIn("OPEN_RL_TIME_SLICING", env)
     self.assertEqual(env["OPEN_RL_FINE_TUNING_TYPE"], "full")
     self.assertEqual(env["OPEN_RL_WORKLOAD_ID"], worker["metadata"]["name"])
 
@@ -158,6 +170,19 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       self.manager.release("job-lora-1")
 
     self.assertEqual(self.api.deleted, [])
+
+  def test_exclusive_lora_models_get_runtimes_of_their_own(self) -> None:
+    s = InMemoryStateStore()
+    for model_id in ("job-a", "job-b"):
+      meta = {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora", "exclusive": True}
+      s.kv_store[f"open_rl:model_meta:{model_id}"] = json.dumps(meta)
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-a", "trainer")
+      self.manager.ensure("job-b", "trainer")
+      self.manager.release("job-a")
+
+    self.assertEqual([w["metadata"]["name"] for w in self.api.created], ["lora-job-a-0-trainer", "lora-job-b-0-trainer"])
+    self.assertEqual(self.api.deleted, ["lora-job-a-0-trainer"])
 
   def test_release_owner_deletes_a_shared_lora_pair_and_nothing_else(self) -> None:
     s = self.store_with("adapter", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
