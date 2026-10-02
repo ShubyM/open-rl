@@ -52,3 +52,4 @@ class FFTConfig(BaseModel):
 
 
 FineTuningType = Literal["lora", "full"]
+TrainerBackend = Literal["pytorch", "automodel"]
