@@ -35,7 +35,7 @@ from server.store import RedisStateStore, get_state_store, get_store
 from server.worker_manager import WorkerManager, create_worker_manager, owner_of
 from training import commands
 from training.commands import Command
-from training.types import Datum, FFTConfig, LoraConfig
+from training.types import Datum, FFTConfig, LoraConfig, TrainerBackend
 
 store = get_store()
 state = get_state_store()
@@ -158,6 +158,8 @@ class Settings(BaseModel):
   # A workload no other workload shares. The model gets its own trainer and
   # sampler, and nothing time-slices their GPUs.
   exclusive: Annotated[bool, BeforeValidator(parse_bool)] = False
+  # The trainer the model runs on. Automodel is LoRA only.
+  trainer_backend: TrainerBackend = "pytorch"
 
 
 def tag_metadata(tags: list[str]) -> dict[str, str]:
@@ -414,6 +416,10 @@ async def _extract_and_persist_model_metadata(
   # Without a worker manager one static runtime serves every model.
   if settings.exclusive and worker_manager is None:
     raise ValueError("openrl.exclusive needs a server that launches workers per model")
+  if settings.trainer_backend == "automodel" and worker_manager is None:
+    raise ValueError("openrl.trainer_backend=automodel needs a server that launches workers per model")
+  if settings.trainer_backend == "automodel" and fine_tuning_type != "lora":
+    raise ValueError("The automodel trainer supports LoRA only")
   # Nothing parks an exclusive trainer, so it stays on the GPU.
   if settings.exclusive:
     full_config["cpu_offload"] = False
@@ -427,6 +433,7 @@ async def _extract_and_persist_model_metadata(
     full_config=full_config,
     lora_config=lora_config,
     exclusive=settings.exclusive,
+    trainer_backend=settings.trainer_backend,
   )
   await persist_model_metadata(state, model_id, meta_obj)
 

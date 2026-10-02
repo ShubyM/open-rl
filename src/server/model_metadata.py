@@ -6,7 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from server.store import StateStore
-from training.types import FFTConfig, FineTuningType, LoraConfig
+from training.types import FFTConfig, FineTuningType, LoraConfig, TrainerBackend
 
 SPARSE_DELTA_VERSION = 2
 
@@ -53,6 +53,7 @@ class TrainingModelMetadata(BaseModel):
   full_config: FFTConfig = Field(default_factory=FFTConfig)
   lora_config: LoraConfig = Field(default_factory=LoraConfig)
   exclusive: bool = False
+  trainer_backend: TrainerBackend = "pytorch"
   status: str = "active"
   updated_at: float = 0.0
   completed_at: float | None = None
@@ -68,8 +69,13 @@ class TrainingModelMetadata(BaseModel):
     return self.fine_tuning_type == "lora" and not self.exclusive
 
   def runtime(self, model_id: str) -> str:
-    """The id of the workers that serve this job."""
-    return self.base_model if self.shares_runtime() else model_id
+    """The id of the workers that serve this job. Automodel LoRA jobs share
+    workers of their own, apart from PyTorch's."""
+    if not self.shares_runtime():
+      return model_id
+    if self.trainer_backend == "automodel":
+      return f"automodel-{self.base_model}"
+    return self.base_model
 
 
 def decode_model_metadata(raw: str | None) -> TrainingModelMetadata | None:
