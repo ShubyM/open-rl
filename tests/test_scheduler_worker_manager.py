@@ -226,6 +226,31 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(trainer["spec"]["template"]["spec"]["containers"][0]["image"], "am:1")
     self.assertEqual(self.api.deleted, ["lora-job-am-0-trainer"])
 
+  def test_a_multi_gpu_automodel_trainer_is_one_torchrun_group(self) -> None:
+    meta = {"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora", "trainer_backend": "automodel", "trainer_gpus": 4}
+    s = self.store_with("job-dp", meta)
+    with patch("server.worker_manager.get_state_store", return_value=s), patch.dict(os.environ, {"OPEN_RL_AUTOMODEL_IMAGE": "am:1"}):
+      self.manager.ensure("job-dp", "trainer")
+      self.manager.ensure("job-dp", "sampler")
+
+    trainer, sampler = self.api.created
+    self.assertEqual(trainer["metadata"]["name"], "lora-job-dp-0-trainer")
+    self.assertTrue(trainer["spec"]["exclusive"])
+    one = footprint("Qwen/Qwen3-0.6B", "lora", "trainer")
+    self.assertEqual(trainer["spec"]["accelerator"], {"mode": "MultiGPU", "devices": 4, "memory": one.accelerator})
+    pod = trainer["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    self.assertEqual(container["command"][:6], ["python", "-u", "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=4"])
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    self.assertEqual(env["OPEN_RL_CONTROL_BACKEND"], "cpu:gloo,cuda:nccl")
+    self.assertEqual(env["OPEN_RL_TIME_SLICING"], "off")
+    self.assertIn({"name": "dshm", "mountPath": "/dev/shm"}, container["volumeMounts"])
+    self.assertEqual(container["resources"]["requests"]["memory"], f"{-(-one.host_request_bytes * 4 // 2**30)}Gi")
+    # The sampler is the usual single-GPU one, alone with this job.
+    self.assertEqual(sampler["metadata"]["name"], "lora-job-dp-0-sampler")
+    self.assertEqual(sampler["spec"]["accelerator"]["mode"], "SingleGPU")
+    self.assertTrue(sampler["spec"]["exclusive"])
+
   def test_a_job_that_names_an_image_runs_its_trainer_from_it(self) -> None:
     meta = {"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora", "trainer_backend": "ghcr.io/org/trainer:1"}
     s = self.store_with("job-img", meta)
