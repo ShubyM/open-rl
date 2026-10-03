@@ -1,8 +1,9 @@
-"""A LoRA trainer worker built on NVIDIA NeMo Automodel, on one GPU.
+"""A LoRA trainer worker built on NVIDIA NeMo Automodel.
 
-The model loads through Automodel's FSDP2 path on a one-rank mesh, so the
-same code can grow data and tensor parallelism later. Batching and the loss
-are the base class's. Per-token logprobs come out of the final hidden states
+The model loads through Automodel's FSDP2 path. Under torchrun the mesh is
+data parallel over every rank, each rank runs a round-robin share of the
+datums, and FSDP2 reduces the grads. Alone it is a one-rank mesh. Batching and
+the loss are the base class's. Per-token logprobs come out of the final hidden states
 in chunks, so full [seq, vocab] logits never exist, and decoder layers are
 checkpointed in groups so long sequences fit.
 
@@ -31,6 +32,7 @@ import torch.distributed as dist
 import torch.utils.checkpoint
 from transformers import AutoConfig, AutoTokenizer
 
+from training.distributed import is_primary
 from training.trainer_worker import BaseTrainerWorker, Datum
 from training.types import FFTConfig, LoraConfig
 
@@ -75,9 +77,22 @@ def is_dtensor(tensor: Any) -> bool:
   return isinstance(tensor, DTensor)
 
 
-def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-  """The whole tensor on this worker's one-rank mesh."""
-  return tensor.to_local() if is_dtensor(tensor) else tensor
+def zero_rows_from(weight: torch.Tensor, start: int) -> None:
+  """Zero rows start: of a weight that FSDP2 may have sharded by row."""
+  with torch.no_grad():
+    if not is_dtensor(weight):
+      weight[start:].zero_()
+      return
+    from torch.distributed.tensor import distribute_tensor
+
+    full = weight.full_tensor()
+    full[start:].zero_()
+    weight.copy_(distribute_tensor(full, weight.device_mesh, weight.placements))
+
+
+def barrier() -> None:
+  if dist.is_initialized() and dist.get_world_size() > 1:
+    dist.barrier()
 
 
 def initialize_single_process_group(device: torch.device) -> None:
@@ -166,11 +181,11 @@ class AdapterState:
 
 
 class AutomodelTrainingWorker(BaseTrainerWorker):
+  # FSDP2 reduces grads inside backward, so every rank needs the same number of passes.
+  backward_runs_collectives = True
+
   def __init__(self):
     super().__init__()
-    # set_device and NCCL want an index, and this worker has one GPU.
-    if self.device.type == "cuda":
-      self.device = torch.device("cuda", 0)
     self.model: torch.nn.Module | None = None
     self.base_model_name: str | None = None
     self.trainable_params: list[torch.nn.Parameter] = []
@@ -180,15 +195,47 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.checkpointer: Any = None
     # The LoRA modules as built, at MAX_LORA_RANK on every target.
     self.peft_config: Any = None
+    self.device_mesh: Any = None
 
   def build_distributed_setup(self) -> Any:
     from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config
     from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 
+    # torchrun's processor has already made the group.
     initialize_single_process_group(self.device)
+    world = dist.get_world_size()
     strategy = FSDP2Config(activation_checkpointing=False)
-    mesh_context = MeshContext.build(strategy, ParallelismSizes(), world_size=1)
+    mesh_context = MeshContext.build(strategy, ParallelismSizes(), world_size=world)
+    self.device_mesh = mesh_context.device_mesh
+    print(f"Automodel device mesh: DP={world}")
     return DistributedSetup(mesh_context=mesh_context, strategy_config=strategy, activation_checkpointing=False)
+
+  # Datums shard over the dp_shard axis, which is every rank, so the
+  # world's rank and size are the shard's.
+
+  def dp_group(self):
+    return self.device_mesh["dp_shard"].get_group()
+
+  def shard_rank(self) -> int:
+    return dist.get_rank() if self.device_mesh is not None else 0
+
+  def shard_count(self) -> int:
+    return dist.get_world_size() if self.device_mesh is not None else 1
+
+  def shard_all_reduce_max(self, value: int) -> int:
+    tensor = torch.tensor([value], dtype=torch.long, device=self.device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=self.dp_group())
+    return int(tensor.item())
+
+  def shard_all_reduce_sum(self, value: float) -> float:
+    tensor = torch.tensor([value], dtype=torch.float64, device=self.device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.dp_group())
+    return float(tensor.item())
+
+  def shard_all_gather_object(self, value: Any) -> list[Any]:
+    gathered: list[Any] = [None] * self.shard_count()
+    dist.all_gather_object(gathered, value, group=self.dp_group())
+    return gathered
 
   def build_peft_config(self, config: LoraConfig) -> Any:
     from nemo_automodel.components._peft.lora import PeftConfig
@@ -247,8 +294,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     torch.manual_seed(config.seed if config.seed is not None else AUTOMODEL_SEED)
     for name, module in self.lora_modules():
       module.init_lora_weights("kaiming")
-      with torch.no_grad():
-        local_tensor(module.lora_A.weight)[config.rank if name.rsplit(".", 1)[-1] in targets else 0 :].zero_()
+      zero_rows_from(module.lora_A.weight, config.rank if name.rsplit(".", 1)[-1] in targets else 0)
     self.adapters[model_id] = AdapterState(config)
     self.active = model_id
     self.apply_scale_and_dropout(config)
@@ -398,7 +444,8 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
         is_peft=True,
         model_repo_id=self.base_model_name,
       )
-      self.checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+      dp_rank = self.shard_rank()
+      self.checkpointer = Checkpointer(config, dp_rank=dp_rank, tp_rank=0, pp_rank=0)
     return self.checkpointer
 
   def saved_peft_config(self, config: LoraConfig) -> Any:
@@ -409,11 +456,19 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
   def write_staged(self, path: str, peft_config: Any, metadata: dict[str, Any] | None = None) -> None:
     """Write the adapter into a staging dir and rename it over path, so a reader
     never sees a half-written directory. The checkpointer nests its output
-    under model/, which is lifted into the staging dir."""
-    staging, previous = f"{path}.staging-{os.getpid()}", f"{path}.previous-{os.getpid()}"
-    shutil.rmtree(staging, ignore_errors=True)
-    os.makedirs(staging)
+    under model/, which is lifted into the staging dir. Every rank joins the
+    save's gather and rank 0 writes and moves the files."""
+    staging, previous = f"{path}.staging", f"{path}.previous"
+    if is_primary():
+      shutil.rmtree(staging, ignore_errors=True)
+      os.makedirs(staging)
+    barrier()
     self.get_checkpointer().save_model(self.model, weights_path=staging, peft_config=peft_config, tokenizer=self.tokenizer)
+    if is_primary():
+      self.publish_staged(staging, path, previous, metadata)
+    barrier()
+
+  def publish_staged(self, staging: str, path: str, previous: str, metadata: dict[str, Any] | None) -> None:
     model_dir = os.path.join(staging, "model")
     for entry in os.listdir(model_dir):
       os.replace(os.path.join(model_dir, entry), os.path.join(staging, entry))
