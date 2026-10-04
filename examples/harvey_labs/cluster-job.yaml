@@ -11,8 +11,13 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      # The default pool has no room; the Substrate nodes have spare CPU.
       nodeSelector:
-        cloud.google.com/gke-nodepool: default-pool
+        cloud.google.com/gke-nodepool: substrate
+      tolerations:
+        - key: ate.dev/sandboxClass
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: driver
           image: us-central1-docker.pkg.dev/open-rl-2-sandbox-102433/open-rl/harvey-labs-client:latest
