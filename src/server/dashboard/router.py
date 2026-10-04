@@ -1,4 +1,5 @@
-"""The operator UI and the identical read-only interface used by agents."""
+"""The operator UI and the identical interface used by agents. Everything is
+read-only except deleting the records of finished or abandoned runs."""
 
 import asyncio
 from datetime import datetime
@@ -6,9 +7,11 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from server.dashboard import experiments, metrics
-from server.dashboard.snapshot import snapshot
+from server.dashboard.snapshot import TERMINAL_STATUSES, snapshot
+from server.session_registry import SessionRegistry
 from server.store import get_store
 from server.telemetry import backends, gke, kubernetes, ops
 
@@ -45,6 +48,7 @@ async def inspection_index():
       "gpu_metrics": "/api/v1/dashboard/allocations/{placement_id}/metrics",
       "gpu_turns": "/api/v1/dashboard/allocations/{placement_id}/turns",
       "experiments": "/api/v1/dashboard/experiments",
+      "delete_runs": "POST /api/v1/dashboard/runs/delete",
       "openapi": "/openapi.json",
     },
     "workflow": [
@@ -52,7 +56,7 @@ async def inspection_index():
       "Read the run to resolve shared-runtime membership before attributing logs or GPU activity.",
       "Read logs and metrics with explicit since/until timestamps; keep filters fixed when following next_cursor.",
     ],
-    "capabilities": {"read_only": True, "pod_exec": False, "filesystem": False, "secrets": False},
+    "capabilities": {"read_only": False, "delete_runs": True, "pod_exec": False, "filesystem": False, "secrets": False},
     "limits": {"placement_history_days": 7, "operation_samples_per_run": ops.SAMPLE_LIMIT},
   }
 
@@ -82,6 +86,36 @@ async def run_of(run_id: str) -> tuple[dict, dict]:
 async def run_detail(run_id: str):
   state, run = await run_of(run_id)
   return {"observed_at": state["observed_at"], **run, "placements": [p for p in state["placements"] if run_id in p["run_ids"]]}
+
+
+class DeleteRuns(BaseModel):
+  run_ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+@router.post("/api/v1/dashboard/runs/delete")
+async def delete_runs(body: DeleteRuns):
+  """Forget finished or abandoned runs: their record and their recorded ops.
+  Workers, checkpoints and metrics files are not touched. A run that still has
+  workers or a live client session is kept and reported with the reason."""
+  store = get_store()
+  runs = {r["run_id"]: r for r in (await snapshot.current(store))["runs"]}
+  sessions = SessionRegistry(store)
+  deleted, kept = [], []
+  for run_id in dict.fromkeys(body.run_ids):
+    run = runs.get(run_id)
+    reason = "Run not found" if run is None else run["delete_blocker"]
+    if reason is None and str(run["status"]).lower() not in TERMINAL_STATUSES:
+      session_id = ((await store.get_model_metadata(run_id)) or {}).get("session_id")
+      if session_id and await sessions.live(session_id):
+        reason = "The run's client session is still live"
+    if reason:
+      kept.append({"run_id": run_id, "reason": reason})
+      continue
+    await store.delete_values(f"open_rl:model_meta:{run_id}", ops.key(run_id))
+    deleted.append(run_id)
+  if deleted:
+    snapshot.invalidate()
+  return {"deleted": deleted, "kept": kept}
 
 
 @router.get("/api/v1/dashboard/runs/{run_id}/metrics")

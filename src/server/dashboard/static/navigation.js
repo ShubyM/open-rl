@@ -15,10 +15,13 @@ function restoreNodes(params) {
   ui.device = params.get("gpu") || "all";
 }
 
+const OVERVIEW = ["", "overview", "runs"];
+
 export function restoreView() {
   appliedHash = location.hash;
   const [page, id] = route(), params = viewParams();
   if (page === "nodes") restoreNodes(params);
+  if (OVERVIEW.includes(page)) ui.runFilter = { q: params.get("q") || "", status: params.get("status") || "all" };
   if (page === "run") {
     openRun(id);
     const window = windowFrom(params), back = params.get("back");
@@ -48,9 +51,12 @@ function runParams(freeze = false) {
     back: runView.nodeBack, event: runView.eventAt, q: logState.q, pod: logState.pod };
 }
 
+const overviewParams = () => ({ q: ui.runFilter.q, status: ui.runFilter.status === "all" ? null : ui.runFilter.status });
+
 export function currentView(freeze = false, tab = route()[2]) {
   const [page, id] = route();
   if (page === "nodes") return viewLink("nodes", nodeParams(freeze));
+  if (OVERVIEW.includes(page)) return viewLink("overview", overviewParams());
   if (page === "run") {
     const metrics = root.querySelector("details[data-run-metrics]");
     if (metrics && ["activity", "metrics", undefined].includes(tab)) tab = metrics.open ? "metrics" : "activity";
@@ -65,6 +71,7 @@ export function syncViewURL() {
   if (location.hash !== hash) history.replaceState(history.state, "", hash);
   appliedHash = hash;
   root.querySelector('.appbar nav a[href^="#nodes"]').href = viewLink("nodes", nodeParams());
+  root.querySelectorAll('a[href^="#overview"]').forEach((link) => link.setAttribute("href", viewLink("overview", overviewParams())));
   root.querySelectorAll('a[href^="#run/"]').forEach((link) => {
     const [, runId, tab] = route(link.getAttribute("href"));
     if (page === "run" && id === runId) link.setAttribute("href", currentView(false, tab));

@@ -227,6 +227,75 @@ body {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+
+/* Overview: search, status chips and bulk delete above the run list. */
+#orl-design-lab .overview-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  margin-bottom: 14px;
+}
+#orl-design-lab #run-search {
+  flex: 1 1 280px;
+  max-width: 420px;
+}
+#orl-design-lab .run-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+#orl-design-lab .run-filter-count {
+  margin-left: 4px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+#orl-design-lab .run-delete {
+  margin-left: auto;
+}
+#orl-design-lab .run-delete:not(:disabled) {
+  border-color: currentColor;
+  color: var(--status-error);
+}
+#orl-design-lab .run-notice {
+  margin-bottom: 12px;
+  color: var(--dim);
+}
+#orl-design-lab :is(.job-list-head, .job-list-row).run-row {
+  position: relative;
+  grid-template-columns: 16px minmax(0, 1fr) 128px 100px 112px 90px 80px;
+}
+#orl-design-lab .run-row > :nth-child(4) {
+  text-align: left;
+}
+#orl-design-lab .run-select {
+  position: relative;
+  z-index: 1;
+  display: flex;
+}
+#orl-design-lab .run-select input {
+  width: 15px;
+  height: 15px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+#orl-design-lab .run-select input:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+/* The run link covers its row; the checkbox sits above it. */
+#orl-design-lab .run-row .job-identity a::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+#orl-design-lab .run-row:hover .job-identity a {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 #orl-design-lab .state {
   display: inline-flex;
   align-items: center;
@@ -1506,5 +1575,38 @@ body {
   #orl-design-lab .scheduler-reservation {
     grid-template-columns: 1fr;
     gap: 8px;
+  }
+}
+
+/* Overview rows on narrow screens: checkbox, run and status on one line, details below. */
+@media (max-width: 760px) {
+  #orl-design-lab .job-list-row.run-row {
+    grid-template-columns: 16px minmax(0, 1fr) auto;
+  }
+  #orl-design-lab .job-list-row.run-row > :nth-child(2) {
+    justify-self: stretch;
+  }
+  #orl-design-lab .job-list-row.run-row > :nth-child(3) {
+    grid-column: auto;
+    justify-self: end;
+    color: inherit;
+  }
+  #orl-design-lab .job-list-row.run-row > :nth-child(n + 4) {
+    grid-column: 2 / -1;
+    text-align: left;
+    color: var(--dim);
+    font-size: 12px;
+  }
+  #orl-design-lab .job-list-row.run-row > :nth-child(4)::after {
+    content: none;
+  }
+  #orl-design-lab .job-list-row.run-row > :nth-child(5)::after {
+    content: " steps";
+  }
+  #orl-design-lab .job-list-row.run-row > :nth-child(6)::before {
+    content: "Created ";
+  }
+  #orl-design-lab .run-delete {
+    margin-left: 0;
   }
 }

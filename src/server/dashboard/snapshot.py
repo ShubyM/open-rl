@@ -11,6 +11,7 @@ from server.telemetry import backends
 
 CACHE_SECONDS = 5
 HISTORY_WINDOW_SECONDS = 24 * 3600
+TERMINAL_STATUSES = {"completed", "failed", "ended"}
 
 
 def iso(ts: float) -> str:
@@ -20,7 +21,7 @@ def iso(ts: float) -> str:
 def observed_status(metadata: dict, workloads: list[dict], pods: list[dict], available: bool) -> str:
   """Recorded lifecycle first; otherwise what Kubernetes shows right now."""
   recorded = str(metadata.get("status", "")).lower()
-  if recorded in {"completed", "failed", "ended"}:
+  if recorded in TERMINAL_STATUSES:
     return recorded.capitalize()
   if not available:
     return "Unknown"
@@ -33,6 +34,18 @@ def observed_status(metadata: dict, workloads: list[dict], pods: list[dict], ava
   if workloads:
     return "Queued"
   return "Unassigned"
+
+
+def delete_blocker(run: dict, available: bool) -> str | None:
+  """Why the run's record must stay, or None. Finished runs can always go; an
+  unfinished one only once the cluster shows it has no workers."""
+  if str(run["status"]).lower() in TERMINAL_STATUSES:
+    return None
+  if not available:
+    return "Cluster state is unavailable, so the run may still have workers"
+  if run["pods"] or run["workloads"]:
+    return "The run still has workers"
+  return None
 
 
 def join_runs(metadata: list[dict], state: dict) -> list[dict]:
@@ -78,6 +91,7 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
     )
   for run in runs:
     run["runtime_run_ids"] = [r["run_id"] for r in runs if r["runtime_id"] == run["runtime_id"]]
+    run["delete_blocker"] = delete_blocker(run, state["available"])
   return sorted(runs, key=lambda r: str(r.get("created_at") or ""), reverse=True)
 
 
@@ -147,6 +161,9 @@ class Snapshot:
 
   async def placements(self, store) -> list[dict]:
     return (await self.current(store))["placements"]
+
+  def invalidate(self) -> None:
+    self.latest = None
 
 
 snapshot = Snapshot()

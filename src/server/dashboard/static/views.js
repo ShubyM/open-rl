@@ -2,29 +2,70 @@
 
 import { escape, encode, empty, runStatus, elapsedTime, duration, shortNodeName } from "./ui.js";
 import { chart, chartNumber } from "./charts.js";
-import { route } from "./store.js";
+import { route, ui } from "./store.js";
+
+// Status chips on the Overview, by what the cluster shows rather than the
+// recorded lifecycle: a run recorded "active" with no workers is Unassigned.
+const RUN_GROUPS = {
+  active: ["Running", "Starting", "Queued", "Needs attention", "Unknown"],
+  unassigned: ["Unassigned"],
+  finished: ["Completed", "Ended"],
+  failed: ["Failed"],
+};
+const RUN_FILTERS = [
+  ["all", "All", "Every recorded run"],
+  ["active", "Active", "Runs with workers, or whose workers cannot be checked"],
+  ["unassigned", "Unassigned", "Recorded as active, but no workers are assigned; usually a client that exited without finishing"],
+  ["finished", "Finished", "Completed or ended"],
+  ["failed", "Failed", "Recorded as failed"],
+];
+const runGroup = (r) => Object.keys(RUN_GROUPS).find((group) => RUN_GROUPS[group].includes(r.display_status)) || "active";
+const KINDS = { lora: "LoRA", full: "FFT", fft: "FFT" };
+
+// The runs the Overview shows for the current search and chip: active first, then newest.
+export function filterRuns(state, filter = ui.runFilter) {
+  const terms = filter.q.toLowerCase().split(/\s+/).filter(Boolean);
+  const text = (r) => [r.run_id, r.name, r.model, r.recipe_name, r.display_status, KINDS[r.fine_tuning_type], ...r.nodes, ...r.pods.map((p) => p.name)].filter(Boolean).join(" ").toLowerCase();
+  return state.runs
+    .filter((r) => (filter.status === "all" || runGroup(r) === filter.status) && terms.every((term) => text(r).includes(term)))
+    .sort((a, b) => Number(runGroup(b) === "active") - Number(runGroup(a) === "active"));
+}
+
+const age = (run, observedAt) => {
+  const created = typeof run.created_at === "number" ? run.created_at : Date.parse(run.created_at) / 1000, now = Date.parse(observedAt) / 1000;
+  return Number.isFinite(created) && created > 0 && Number.isFinite(now) ? `${duration(Math.max(0, now - created))} ago` : "—";
+};
 
 export function runs(state) {
   const error = state.store_error ? `<p class="source-error" role="status">${escape(state.store_error)}</p>` : "";
   if (error && !state.runs.length) return `<h1 class="heading">Overview</h1>${error}`;
-  const active = (r) => ["active", "running"].includes(String(r.status || "").toLowerCase());
-  const count = (test) => state.runs.filter(test).length;
-  const summary = [
-    [count(active), "Active"],
-    [count((r) => r.status === "failed"), "Failed"],
-    [count((r) => ["completed", "ended"].includes(r.status)), "Finished"],
-  ]
-    .map(([n, label]) => `<span><strong>${n}</strong> ${label}</span>`)
-    .join("");
-  const rows = [...state.runs]
-    .sort((a, b) => Number(active(b)) - Number(active(a)))
+  const filter = ui.runFilter;
+  const chips = RUN_FILTERS.map(([key, label, title]) => {
+    const count = key === "all" ? state.runs.length : state.runs.filter((r) => runGroup(r) === key).length;
+    return `<button type="button" class="chip" data-run-filter="${key}" title="${escape(title)}" aria-pressed="${filter.status === key}">${escape(label)} <span class="run-filter-count">${count}</span></button>`;
+  }).join("");
+  const shown = filterRuns(state);
+  const deletable = shown.filter((r) => !r.delete_blocker);
+  const selected = deletable.filter((r) => ui.selectedRuns.has(r.run_id));
+  const all = deletable.length > 0 && selected.length === deletable.length;
+  const rows = shown
     .map((r) => {
       const label = [r.display_name, r.recipe_name].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ");
-      return `<a class="job-list-row" data-key="${escape(r.run_id)}" href="#run/${encode(r.run_id)}/activity"><span class="job-identity"><span>${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></span>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape({ lora: "LoRA", full: "FFT", fft: "FFT" }[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(elapsedTime(r, state.observed_at))}</span></a>`;
+      const short = `${(r.model || "Run").split("/").at(-1)} · ${r.run_id.slice(0, 8)}`;
+      const box = `<input type="checkbox" data-select-run="${escape(r.run_id)}" aria-label="Select ${escape(short)}"${ui.selectedRuns.has(r.run_id) && !r.delete_blocker ? " checked" : ""}${r.delete_blocker ? ` disabled title="${escape(`Cannot delete: ${r.delete_blocker}`)}"` : ""}>`;
+      return `<div class="job-list-row run-row" data-key="${escape(r.run_id)}"><span class="run-select">${box}</span><span class="job-identity"><a href="#run/${encode(r.run_id)}/activity" title="${escape(r.run_id)}">${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></a>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape(KINDS[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(age(r, state.observed_at))}</span><span>${escape(runGroup(r) === "unassigned" ? "—" : elapsedTime(r, state.observed_at))}</span></div>`;
     })
     .join("");
-  return `<h1 class="heading">Overview</h1><div class="overview-summary">${summary}</div>${error}
-    <div class="job-list"><div class="job-list-head"><span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Elapsed</span></div>${rows}</div>${!state.runs.length ? empty("No runs recorded") : ""}`;
+  const head = `<div class="job-list-head run-row"><span class="run-select"><input type="checkbox" data-select-all-runs aria-label="Select all shown runs that can be deleted"${all ? " checked" : ""}${deletable.length ? "" : " disabled"}></span><span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Created</span><span>Elapsed</span></div>`;
+  const notice = ui.runNotice ? `<p class="run-notice" role="status">${escape(ui.runNotice)}</p>` : "";
+  const none = !state.runs.length ? empty("No runs recorded") : !shown.length ? empty("No runs match the search and status filter") : "";
+  return `<h1 class="heading">Overview</h1>${error}
+    <div class="overview-toolbar">
+      <input id="run-search" type="search" placeholder="Search by run ID, model, name, recipe, node or pod" aria-label="Search runs" value="${escape(filter.q)}" autocomplete="off">
+      <div class="run-filters" role="group" aria-label="Filter by status">${chips}</div>
+      <button type="button" class="chip run-delete" data-delete-runs${selected.length ? "" : " disabled"} title="Removes the run records and their recorded ops; workers, checkpoints and metrics files are not touched">${selected.length ? `Delete ${selected.length} run${selected.length === 1 ? "" : "s"}` : "Delete selected"}</button>
+    </div>${notice}
+    <div class="job-list run-list">${shown.length ? head + rows : ""}</div>${none}`;
 }
 
 export function scheduler(state) {

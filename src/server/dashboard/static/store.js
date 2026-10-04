@@ -13,6 +13,9 @@ export const ui = {
   nodeSelection: { duration: 1800, end: null },
   nodeNavigating: false, // redraw cached data while a timeline gesture is active
   nodeQueryRange: null, // GPU query frozen until the gesture settles
+  runFilter: { q: "", status: "all" }, // Overview search and status chip
+  selectedRuns: new Set(), // run IDs ticked on the Overview
+  runNotice: null, // outcome of the last delete
   // Installed by app.js once the page is wired up.
   render: () => {},
 };
@@ -28,11 +31,11 @@ export const viewLink = (path, params = {}) => {
 };
 export const nodeLink = (placement, range) => viewLink("nodes", { placement, duration: range.now - range.start, end: range.now });
 
-export async function get(url, signal) {
+export async function get(url, signal, init = {}) {
   const timeout = AbortSignal.timeout(15000);
   let response;
   try {
-    response = await fetch(url, { cache: "no-store", signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+    response = await fetch(url, { cache: "no-store", ...init, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
   } catch (error) {
     if (signal?.aborted) throw error;
     throw new Error(timeout.aborted ? "Dashboard request timed out. Try again." : "Cannot reach the dashboard. Check the connection and try again.");
@@ -46,6 +49,7 @@ export async function get(url, signal) {
   }
   return response.json().catch(() => { throw new Error("The dashboard returned an invalid response. Try again."); });
 }
+export const post = (url, body) => get(url, undefined, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 export const nodeNow = () => Date.parse(ui.state?.observed_at) / 1000 || Date.now() / 1000;
 export const nodeTime = (at, seconds = false) => new Date(at * 1000).toISOString().slice(11, seconds ? 19 : 16);

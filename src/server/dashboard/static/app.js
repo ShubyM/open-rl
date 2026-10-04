@@ -3,10 +3,10 @@
 // runs, keeps the snapshot fresh, and turns user input into state changes.
 
 import { morph } from "./ui.js";
-import { runs, scheduler, health, experiments } from "./views.js";
+import { runs, scheduler, health, experiments, filterRuns } from "./views.js";
 import { hoverChart, inspectChart } from "./charts.js";
 import { installActivityHover, hideActivityHover } from "./activity.js";
-import { root, content, ui, route, get, nodeNow } from "./store.js";
+import { root, content, ui, route, get, post, nodeNow } from "./store.js";
 import { renderNodes } from "./nodes.js";
 import { installNodeTime, cancelNodeGesture, timeWindow } from "./node-time.js";
 import { runPage, ensureLogs, loadLogs, runView, resetRunWindow, syncRunRoute, setLogFilter, setLogEvent, toggleLogFollow } from "./run.js";
@@ -90,6 +90,12 @@ root.addEventListener("click", (event) => {
   if (!target) return;
   if (target.hasAttribute("data-copy-view")) return void copyView(target);
   if (target.hasAttribute("data-close-details")) return closeDetails();
+  if (target.dataset.runFilter) {
+    ui.runFilter = { ...ui.runFilter, status: target.dataset.runFilter };
+    ui.runNotice = null;
+    return render();
+  }
+  if (target.hasAttribute("data-delete-runs")) return void deleteRuns(target);
   if (target.dataset.nodeDetails) {
     if (ui.inspectorNode === target.dataset.nodeDetails) return closeDetails();
     root.style.removeProperty("min-height");
@@ -117,6 +123,25 @@ root.addEventListener("click", (event) => {
   if (target.dataset.logFollow !== undefined) toggleLogFollow();
   if (target.dataset.older) loadLogs(route()[1], true);
 });
+
+async function deleteRuns(button) {
+  const ids = filterRuns(ui.state).filter((r) => !r.delete_blocker && ui.selectedRuns.has(r.run_id)).map((r) => r.run_id);
+  const noun = (n) => `${n} run${n === 1 ? "" : "s"}`;
+  if (!ids.length || !confirm(`Delete ${noun(ids.length)}?\n\nThis removes their records and recorded ops from the dashboard. Workers, checkpoints and metrics files are not touched.`)) return;
+  button.disabled = true;
+  try {
+    const result = await post("/api/v1/dashboard/runs/delete", { run_ids: ids });
+    const gone = new Set(result.deleted);
+    ui.state = { ...ui.state, runs: ui.state.runs.filter((r) => !gone.has(r.run_id)) };
+    ui.selectedRuns.clear();
+    const reasons = [...new Set(result.kept.map((k) => k.reason))].join("; ");
+    ui.runNotice = `Deleted ${noun(gone.size)}.${result.kept.length ? ` Kept ${noun(result.kept.length)}: ${reasons}.` : ""}`;
+  } catch (error) {
+    ui.runNotice = `Delete failed: ${error.message}`;
+  }
+  render();
+  refresh();
+}
 
 function keepViewport() {
   // A smaller GPU section must not shorten the document past the viewport
@@ -154,10 +179,27 @@ root.addEventListener("input", (event) => {
       if (route()[0] === "run" && route()[2] === "logs") loadLogs(route()[1]);
     }, 250);
   }
+  if (event.target.id === "run-search") {
+    ui.runFilter = { ...ui.runFilter, q: event.target.value };
+    ui.runNotice = null;
+    render();
+  }
 });
 
 root.addEventListener("change", (event) => {
   const { target } = event;
+  if (target.dataset.selectRun) {
+    if (target.checked) ui.selectedRuns.add(target.dataset.selectRun);
+    else ui.selectedRuns.delete(target.dataset.selectRun);
+    render();
+  }
+  if (target.hasAttribute("data-select-all-runs")) {
+    for (const run of filterRuns(ui.state).filter((r) => !r.delete_blocker)) {
+      if (target.checked) ui.selectedRuns.add(run.run_id);
+      else ui.selectedRuns.delete(run.run_id);
+    }
+    render();
+  }
   if (target.id === "log-source") {
     setLogFilter("pod", target.value);
     loadLogs(route()[1]);
@@ -208,9 +250,12 @@ window.addEventListener("hashchange", () => {
 
 // ---- polling -----------------------------------------------------------------
 
-let refreshing = false;
+let refreshing = false, refreshAgain = false;
 async function refresh() {
-  if (refreshing) return;
+  if (refreshing) {
+    refreshAgain = true;
+    return;
+  }
   refreshing = true;
   try {
     ui.state = await get("/api/v1/dashboard/snapshot");
@@ -227,6 +272,10 @@ async function refresh() {
     if (!ui.state) content.replaceChildren();
   } finally {
     refreshing = false;
+    if (refreshAgain) {
+      refreshAgain = false;
+      refresh();
+    }
   }
 }
 refresh();

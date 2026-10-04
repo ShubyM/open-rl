@@ -101,5 +101,7 @@ function morphNode(node, next) {
   morphChildren(node, next);
   // Patch options too; skipping SELECT left time ranges and pod lists stale.
   if (["INPUT", "SELECT"].includes(node.tagName) && node !== document.activeElement && node.value !== value) node.value = value;
+  // A ticked checkbox stops following its checked attribute; set the property.
+  if (node.tagName === "INPUT" && node.type === "checkbox") node.checked = next.hasAttribute("checked");
   return node;
 }
