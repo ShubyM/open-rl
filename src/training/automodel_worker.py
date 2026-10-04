@@ -1,9 +1,16 @@
 """A LoRA trainer worker built on NVIDIA NeMo Automodel.
 
 The model loads through Automodel's FSDP2 path. Under torchrun the mesh is
-data parallel over every rank, each rank runs a round-robin share of the
-datums, and FSDP2 reduces the grads. Alone it is a one-rank mesh. Batching and
-the loss are the base class's. Per-token logprobs come out of the final hidden states
+DP x CP, with DP whatever the world has left after OPEN_RL_AUTOMODEL_CP. Each
+DP rank runs a round-robin share of the datums and FSDP2 reduces the grads.
+Alone it is a one-rank mesh. Batching and the loss are the base class's.
+
+Under CP the ranks of a CP group run one datum per pass together. Automodel
+round-robin shards the sequence, the ring-attention context stays open through
+the backward, and the local logprobs are gathered back into position order. The
+gather's backward scales by CP to undo FSDP2's mean over the CP ranks. This path
+matched a single-GPU reference at CP2 and CP4 on Qwen3.5-9B (adapter grad cosine
+>= 0.9987); compare again after touching it. Per-token logprobs come out of the final hidden states
 in chunks, so full [seq, vocab] logits never exist, and decoder layers are
 checkpointed in groups so long sequences fit.
 
@@ -18,6 +25,7 @@ keeps A and B at zero. B starts at zero too, so none of those ever get a
 gradient. Scale and dropout are set per adapter on each swap.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -38,6 +46,8 @@ from training.types import FFTConfig, LoraConfig
 
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 AUTOMODEL_SEED = int(os.getenv("OPEN_RL_AUTOMODEL_SEED", "1234"))
+# Ranks that share one sequence. The rest of the torchrun world is DP.
+AUTOMODEL_CP = int(os.getenv("OPEN_RL_AUTOMODEL_CP", "1"))
 # The rank the LoRA modules are built at. Saved adapters carry it, so it must
 # fit the sampler's limit, and it is the same knob.
 MAX_LORA_RANK = int(os.getenv("VLLM_MAX_LORA_RANK", "64"))
@@ -107,6 +117,31 @@ def chunk_target_logprob(hidden: torch.Tensor, weight: torch.Tensor, targets: to
   if softcap is not None:
     logits = softcap * torch.tanh(logits / softcap)
   return logits.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
+
+
+def round_robin_permutation(cp_size: int, padded_seq_len: int, device: torch.device) -> torch.Tensor:
+  """Global position of every element of the rank-major all-gather of CP shards."""
+  chunks = torch.arange(padded_seq_len, device=device).chunk(2 * cp_size)
+  return torch.cat([part for rank in range(cp_size) for part in (chunks[rank], chunks[2 * cp_size - 1 - rank])])
+
+
+class GatherSequenceShards(torch.autograd.Function):
+  """All-gather [batch, local_seq] shards along the sequence. The backward
+  keeps this rank's slice, scaled by CP."""
+
+  @staticmethod
+  def forward(ctx, local: torch.Tensor, group: dist.ProcessGroup, cp_size: int, cp_rank: int) -> torch.Tensor:
+    ctx.cp_size = cp_size
+    ctx.cp_rank = cp_rank
+    ctx.local_len = local.shape[1]
+    gathered = [torch.empty_like(local) for _ in range(cp_size)]
+    dist.all_gather(gathered, local.contiguous(), group=group)
+    return torch.cat(gathered, dim=1)
+
+  @staticmethod
+  def backward(ctx, grad: torch.Tensor):
+    start = ctx.cp_rank * ctx.local_len
+    return grad[:, start : start + ctx.local_len] * ctx.cp_size, None, None, None
 
 
 def lora_target_names(config: LoraConfig) -> set[str]:
@@ -196,6 +231,9 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     # The LoRA modules as built, at MAX_LORA_RANK on every target.
     self.peft_config: Any = None
     self.device_mesh: Any = None
+    self.cp_size = AUTOMODEL_CP
+    # Open from a CP forward until the next pass, so its backward runs under it too.
+    self.cp_context: contextlib.ExitStack | None = None
 
   def build_distributed_setup(self) -> Any:
     from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config
@@ -204,23 +242,24 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     # torchrun's processor has already made the group.
     initialize_single_process_group(self.device)
     world = dist.get_world_size()
+    if world % self.cp_size:
+      raise RuntimeError(f"{world} trainer GPUs do not split into CP groups of {self.cp_size}.")
     strategy = FSDP2Config(activation_checkpointing=False)
-    mesh_context = MeshContext.build(strategy, ParallelismSizes(), world_size=world)
+    mesh_context = MeshContext.build(strategy, ParallelismSizes(cp_size=self.cp_size), world_size=world)
     self.device_mesh = mesh_context.device_mesh
-    print(f"Automodel device mesh: DP={world}")
+    print(f"Automodel device mesh: DP={world // self.cp_size} CP={self.cp_size}")
     return DistributedSetup(mesh_context=mesh_context, strategy_config=strategy, activation_checkpointing=False)
 
-  # Datums shard over the dp_shard axis, which is every rank, so the
-  # world's rank and size are the shard's.
+  # Datums shard over the dp_shard axis. The ranks of a CP group see the same datums.
 
   def dp_group(self):
     return self.device_mesh["dp_shard"].get_group()
 
   def shard_rank(self) -> int:
-    return dist.get_rank() if self.device_mesh is not None else 0
+    return self.device_mesh["dp_shard"].get_local_rank() if self.device_mesh is not None else 0
 
   def shard_count(self) -> int:
-    return dist.get_world_size() if self.device_mesh is not None else 1
+    return self.device_mesh["dp_shard"].size() if self.device_mesh is not None else 1
 
   def shard_all_reduce_max(self, value: int) -> int:
     tensor = torch.tensor([value], dtype=torch.long, device=self.device)
@@ -267,6 +306,9 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     # sequence on every forward; the loss never reads it.
     if AutoConfig.from_pretrained(base_model_name).get_text_config().model_type.startswith("qwen3_5"):
       kwargs["num_nextn_predict_layers"] = 0
+    # The CP context swaps SDPA for ring attention.
+    if self.cp_size > 1:
+      kwargs["attn_implementation"] = "sdpa"
     # from_pretrained applies LoRA, loads the base weights and freezes all but the adapters.
     self.model = NeMoAutoModelForCausalLM.from_pretrained(base_model_name, distributed_setup=self.build_distributed_setup(), **kwargs)
     if RECOMPUTE_NUM_LAYERS > 0:
@@ -354,17 +396,59 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
   ) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     self.activate(model_id)
-    return super().forward_backward(self.model, data, loss_fn, loss_config, forward_only=forward_only)
+    try:
+      return super().forward_backward(self.model, data, loss_fn, loss_config, forward_only=forward_only)
+    finally:
+      self.close_cp_context()
+
+  def close_cp_context(self) -> None:
+    if self.cp_context is not None:
+      self.cp_context.close()
+      self.cp_context = None
+
+  def make_training_batches(self, data: list[Datum]) -> list[list[tuple[int, Datum]]]:
+    # The CP shard takes one unpadded sequence per pass.
+    if self.cp_size > 1:
+      return [[(idx, datum)] for idx, datum in enumerate(data)]
+    return super().make_training_batches(data)
 
   def compute_target_logprobs(
     self, model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, target_token_ids: torch.Tensor
   ) -> torch.Tensor:
     """Per-position logprob of each target, projected from the final hidden states in chunks."""
     seq_len = target_token_ids.shape[1]
+    if self.cp_size > 1:
+      return self.compute_target_logprobs_cp(model, input_ids[:, :seq_len], target_token_ids)
     # An all-ones mask is plain causal attention; dropping it lets SDPA use flash.
     mask = None if bool(attention_mask.all()) else attention_mask
     outputs = model(input_ids=input_ids, attention_mask=mask, use_cache=False, logits_to_keep=1, output_hidden_states=True)
-    hidden = outputs.hidden_states[-1][:, :seq_len]
+    return self.project_target_logprobs(model, outputs.hidden_states[-1][:, :seq_len], target_token_ids)
+
+  def compute_target_logprobs_cp(self, model: torch.nn.Module, input_ids: torch.Tensor, target_token_ids: torch.Tensor) -> torch.Tensor:
+    """The logprobs of one sequence sharded over the CP group."""
+    from nemo_automodel.components.distributed.context_parallel.sharder import shard_batch_aux_only
+
+    seq_len = target_token_ids.shape[1]
+    cp_mesh = self.device_mesh["cp"]
+    context, batch, layout = shard_batch_aux_only(cp_mesh, None, {"input_ids": input_ids, "labels": target_token_ids.clone()})
+    # Closing the context before the backward runs the attention grads and the
+    # checkpoint recompute as local attention, and the grads come out wrong.
+    self.close_cp_context()
+    self.cp_context = contextlib.ExitStack()
+    self.cp_context.enter_context(context())
+    aux = {key: batch[key] for key in ("padding_mask", "_packed_seq_ids") if key in batch}
+    outputs = model(
+      input_ids=batch["input_ids"], position_ids=batch["position_ids"], use_cache=False, logits_to_keep=1, output_hidden_states=True, **aux
+    )
+    # Padding slots carry an ignore index and are cut off after the gather.
+    local = self.project_target_logprobs(model, outputs.hidden_states[-1], batch["labels"].clamp_min(0))
+    gathered = GatherSequenceShards.apply(local, cp_mesh.get_group(), self.cp_size, cp_mesh.get_local_rank())
+    order = round_robin_permutation(self.cp_size, layout.padded_seq_len, gathered.device)
+    return torch.zeros_like(gathered).index_copy(1, order, gathered)[:, :seq_len]
+
+  def project_target_logprobs(self, model: torch.nn.Module, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """logit[target] - logsumexp over the vocab, in checkpointed chunks."""
+    seq_len = targets.shape[1]
     if is_dtensor(hidden):
       hidden = hidden.full_tensor()
     head = model.get_output_embeddings()
@@ -373,7 +457,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
 
     batch = hidden.shape[0]
     flat_hidden = hidden.reshape(batch * seq_len, -1)
-    flat_targets = target_token_ids.reshape(batch * seq_len)
+    flat_targets = targets.reshape(batch * seq_len)
     chunks = []
     for start in range(0, flat_hidden.shape[0], LOGPROB_CHUNK):
       args = (flat_hidden[start : start + LOGPROB_CHUNK], weight, flat_targets[start : start + LOGPROB_CHUNK], softcap)

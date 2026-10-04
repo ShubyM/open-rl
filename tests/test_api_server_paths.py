@@ -496,6 +496,15 @@ class TrainerBackendTest(ApiServerTest):
     self.assertEqual(response.status_code, 400)
     self.assertIn("openrl.trainer_backend=automodel", response.json()["error"])
 
+  def test_trainer_cp_must_divide_the_trainer_gpus(self) -> None:
+    tags = {"openrl.trainer_backend": "automodel", "openrl.trainer_gpus": "4"}
+    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {**tags, "openrl.trainer_cp": "4"}}).json()["request_id"]
+    self.assertEqual(self.metadata(model_id)["trainer_cp"], 4)
+
+    response = self.post("create_model", {"base_model": "m", "user_metadata": {**tags, "openrl.trainer_cp": "3"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("openrl.trainer_cp=3 must divide", response.json()["error"])
+
   def test_a_server_without_a_worker_manager_refuses_automodel(self) -> None:
     with patch.object(api_server, "worker_manager", None):
       response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "automodel"}})

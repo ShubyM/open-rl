@@ -171,6 +171,9 @@ class Settings(BaseModel):
   # GPUs the trainer drives as one data-parallel torchrun group. More than
   # one is Automodel only and makes the model exclusive.
   trainer_gpus: int = Field(default=1, ge=1, le=8)
+  # Trainer GPUs that share one sequence, as context parallelism. The rest
+  # of trainer_gpus is data parallel.
+  trainer_cp: int = Field(default=1, ge=1, le=8)
 
 
 def tag_metadata(tags: list[str]) -> dict[str, str]:
@@ -437,6 +440,8 @@ async def _extract_and_persist_model_metadata(
     raise ValueError("openrl.trainer_gpus above 1 needs openrl.trainer_backend=automodel")
   if settings.trainer_gpus > 1 and isinstance(worker_manager, LocalWorkerManager):
     raise ValueError("openrl.trainer_gpus above 1 needs a server that launches workers as pods")
+  if settings.trainer_gpus % settings.trainer_cp:
+    raise ValueError(f"openrl.trainer_cp={settings.trainer_cp} must divide openrl.trainer_gpus={settings.trainer_gpus}")
   # Nothing parks an exclusive trainer, so it stays on the GPU.
   if settings.exclusive:
     full_config["cpu_offload"] = False
@@ -452,6 +457,7 @@ async def _extract_and_persist_model_metadata(
     exclusive=settings.exclusive,
     trainer_backend=settings.trainer_backend,
     trainer_gpus=settings.trainer_gpus,
+    trainer_cp=settings.trainer_cp,
   )
   await persist_model_metadata(state, model_id, meta_obj)
 
