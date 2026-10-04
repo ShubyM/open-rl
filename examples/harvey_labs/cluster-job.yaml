@@ -25,6 +25,11 @@ spec:
             - base_url=http://open-rl-gateway-service.openrl-system.svc:8000
             - substrate_endpoint=ate-env-api.ate-env.svc:7777
             - log_path=/mnt/shared/harvey-labs/$(RUN)
+            # The longest sequence a CP4 trainer fits on 80 GB H100s; the gateway's
+            # VLLM_MAX_MODEL_LEN and OPEN_RL_TRAIN_TOKEN_BUDGET must match.
+            - max_trajectory_tokens=196608
+            - max_tokens=65536
+            - max_turns=200
           env:
             - name: RUN
               value: harvey-substrate-2
