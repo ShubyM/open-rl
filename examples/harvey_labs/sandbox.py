@@ -115,6 +115,14 @@ class PodmanLabSandbox:
     await asyncio.to_thread(self._sandbox.stop)
 
 
+def configured_sandbox_factory(substrate_endpoint: str | None, substrate_template: str) -> SandboxFactory:
+  if not substrate_endpoint:
+    return podman_sandbox_factory
+  from .substrate_sandbox import SubstrateSandboxFactory
+
+  return SubstrateSandboxFactory(substrate_endpoint, substrate_template)
+
+
 async def podman_sandbox_factory(request: SandboxRequest) -> LabSandbox:
   add_lab_to_path(request.lab_root)
   from harness.tools import ToolExecutor, get_all_tool_definitions

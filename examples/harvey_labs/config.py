@@ -28,6 +28,8 @@ class RunConfig:
   max_trajectory_tokens: int = 128 * 1024
   max_tool_result_tokens: int = 8 * 1024
   command_timeout: int = 60
+  substrate_endpoint: str | None = None  # ate-env-api host:port; runs sandboxes on Agent Substrate instead of Podman.
+  substrate_template: str = "lab-sandbox"
   judge_model: str = "gpt-glm-5.2"  # OpenAI-compatible GLM endpoint via OPENAI_BASE_URL / OPENAI_API_KEY.
   judge_parallel: int = 0  # Auto: 16 for GLM, 1 otherwise.
 
