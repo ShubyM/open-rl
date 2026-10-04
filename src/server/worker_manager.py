@@ -92,6 +92,8 @@ def worker_env(meta: TrainingModelMetadata, base_model: str, runtime: str, is_lo
     if meta.trainer_gpus > 1:
       # FSDP2 needs NCCL; the batch broadcast between ranks goes over gloo.
       env["OPEN_RL_CONTROL_BACKEND"] = "cpu:gloo,cuda:nccl"
+    if meta.trainer_cp > 1:
+      env["OPEN_RL_AUTOMODEL_CP"] = str(meta.trainer_cp)
   else:
     env["OPEN_RL_MODEL_ID"] = runtime
     env["VLLM_SERVER_DEV_MODE"] = "1"

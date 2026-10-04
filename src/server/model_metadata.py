@@ -56,6 +56,7 @@ class TrainingModelMetadata(BaseModel):
   exclusive: bool = False
   trainer_backend: str = "pytorch"
   trainer_gpus: int = 1
+  trainer_cp: int = 1
   status: str = "active"
   updated_at: float = 0.0
   completed_at: float | None = None

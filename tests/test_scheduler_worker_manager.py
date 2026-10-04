@@ -256,12 +256,23 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     env = {e["name"]: e.get("value") for e in container["env"]}
     self.assertEqual(env["OPEN_RL_CONTROL_BACKEND"], "cpu:gloo,cuda:nccl")
     self.assertEqual(env["OPEN_RL_TIME_SLICING"], "off")
+    self.assertNotIn("OPEN_RL_AUTOMODEL_CP", env)
     self.assertIn({"name": "dshm", "mountPath": "/dev/shm"}, container["volumeMounts"])
     self.assertEqual(container["resources"]["requests"]["memory"], f"{-(-one.host_request_bytes * 4 // 2**30)}Gi")
     # The sampler is the usual single-GPU one, alone with this job.
     self.assertEqual(sampler["metadata"]["name"], "lora-job-dp-0-sampler")
     self.assertEqual(sampler["spec"]["accelerator"]["mode"], "SingleGPU")
     self.assertTrue(sampler["spec"]["exclusive"])
+
+  def test_a_context_parallel_trainer_gets_its_cp_size(self) -> None:
+    meta = {"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora", "trainer_backend": "automodel", "trainer_gpus": 4, "trainer_cp": 4}
+    s = self.store_with("job-cp", meta)
+    with patch("server.worker_manager.get_state_store", return_value=s), patch.dict(os.environ, {"OPEN_RL_AUTOMODEL_IMAGE": "am:1"}):
+      self.manager.ensure("job-cp", "trainer")
+
+    (trainer,) = self.api.created
+    env = {e["name"]: e.get("value") for e in trainer["spec"]["template"]["spec"]["containers"][0]["env"]}
+    self.assertEqual(env["OPEN_RL_AUTOMODEL_CP"], "4")
 
   def test_a_job_that_names_an_image_runs_its_trainer_from_it(self) -> None:
     meta = {"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora", "trainer_backend": "ghcr.io/org/trainer:1"}
