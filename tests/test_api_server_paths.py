@@ -511,6 +511,15 @@ class TrainerBackendTest(ApiServerTest):
     self.assertEqual(response.status_code, 400)
     self.assertIn("launches workers", response.json()["error"])
 
+  def test_sampler_replicas_need_a_server_that_launches_pods(self) -> None:
+    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.sampler_replicas": "4"}}).json()["request_id"]
+    self.assertEqual(self.metadata(model_id)["sampler_replicas"], 4)
+
+    with patch.object(api_server, "worker_manager", object.__new__(LocalWorkerManager)):
+      response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.sampler_replicas": "4"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("openrl.sampler_replicas above 1", response.json()["error"])
+
 
 if __name__ == "__main__":
   unittest.main()

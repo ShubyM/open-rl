@@ -17,6 +17,7 @@ Two FFT jobs and two LoRA jobs on the same base model come in:
 The Workload name is what the pod label and the time-slicer call job_id.
 """
 
+import dataclasses
 import logging
 import os
 import time
@@ -35,13 +36,13 @@ VERSION = "v1alpha1"
 PLURAL = "workloads"
 
 
-def workload_name(role: str, owner: str, is_lora: bool) -> str:
-  # A second compatible LoRA request renders the same name, and the create's
-  # AlreadyExists is the reuse. The instance index stays 0 until adapter
-  # capacity accounting exists.
+def workload_name(role: str, owner: str, is_lora: bool, index: int = 0) -> str:
+  # A second compatible request renders the same name, and the create's
+  # AlreadyExists is the reuse. The index numbers sampler replicas; the first
+  # keeps the name it always had.
   if is_lora:
-    return f"lora-{owner}-0-{role}"
-  return f"fft-{owner}-{role}"
+    return f"lora-{owner}-{index}-{role}"
+  return f"fft-{owner}-{role}" if index == 0 else f"fft-{owner}-{role}-{index}"
 
 
 @dataclass(frozen=True)
@@ -58,13 +59,25 @@ class Worker:
   # GPUs the worker drives as one torchrun group.
   devices: int = 1
 
+  # Which replica of its role this is.
+  index: int = 0
+
   @property
   def owner(self) -> str:
     return owner_id(self.runtime)
 
   @property
   def name(self) -> str:
-    return workload_name(self.role, self.owner, self.is_lora)
+    return workload_name(self.role, self.owner, self.is_lora, self.index)
+
+
+def replicas_of(model_id: str, role: str) -> int:
+  """How many workers of this role the model asked for. Each sampler replica
+  is its own Workload draining the shared sampling queue."""
+  if role != "sampler":
+    return 1
+  meta, _, _ = runtime_of(model_id)
+  return meta.sampler_replicas
 
 
 def describe_worker(model_id: str, role: str) -> Worker:
@@ -194,7 +207,11 @@ class SchedulerWorkerManager:
     self.custom_api = custom_api
 
   def ensure(self, model_id: str, role: str) -> None:
-    worker = describe_worker(model_id, role)
+    for index in range(replicas_of(model_id, role)):
+      self.ensure_workload(dataclasses.replace(describe_worker(model_id, role), index=index))
+
+  def ensure_workload(self, worker: Worker) -> None:
+    role = worker.role
     deadline = time.monotonic() + 180
     while True:
       try:

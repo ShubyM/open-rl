@@ -162,6 +162,8 @@ def parse_trainer_backend(value: str) -> str:
 class Settings(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
+  # Single-GPU samplers that drain the model's sampling queue together.
+  sampler_replicas: int = Field(default=1, ge=1, le=8)
   # A workload no other workload shares. The model gets its own trainer and
   # sampler, and nothing time-slices their GPUs.
   exclusive: Annotated[bool, BeforeValidator(parse_bool)] = False
@@ -430,6 +432,8 @@ async def _extract_and_persist_model_metadata(
   # Without a worker manager one static runtime serves every model.
   if settings.exclusive and worker_manager is None:
     raise ValueError("openrl.exclusive needs a server that launches workers per model")
+  if settings.sampler_replicas > 1 and isinstance(worker_manager, LocalWorkerManager):
+    raise ValueError("openrl.sampler_replicas above 1 needs a server that launches workers as pods")
   if settings.trainer_backend != "pytorch" and worker_manager is None:
     raise ValueError(f"openrl.trainer_backend={settings.trainer_backend} needs a server that launches workers per model")
   if settings.trainer_backend not in TRAINER_BACKENDS and isinstance(worker_manager, LocalWorkerManager):
@@ -454,6 +458,7 @@ async def _extract_and_persist_model_metadata(
     weight_sync_config=weight_sync_cfg,
     full_config=full_config,
     lora_config=lora_config,
+    sampler_replicas=settings.sampler_replicas,
     exclusive=settings.exclusive,
     trainer_backend=settings.trainer_backend,
     trainer_gpus=settings.trainer_gpus,
