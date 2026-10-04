@@ -1,0 +1,44 @@
+# One Harvey LAB training run as a Job beside the gateway. Sandboxes run on
+# Agent Substrate through ate-env-api and logs land on the shared volume.
+# Set the image, the judge endpoint, and RUN, then kubectl apply -f.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: harvey-labs
+  namespace: openrl-system
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: default-pool
+      containers:
+        - name: driver
+          image: us-central1-docker.pkg.dev/open-rl-2-sandbox-102433/open-rl/harvey-labs-client:latest
+          args:
+            - base_url=http://open-rl-gateway-service.openrl-system.svc:8000
+            - substrate_endpoint=ate-env-api.ate-env.svc:7777
+            - log_path=/mnt/shared/harvey-labs/$(RUN)
+          env:
+            - name: RUN
+              value: harvey-substrate-1
+            - name: TINKER_API_KEY
+              value: tml-dummy-key
+            - name: TINKER_TAGS
+              value: openrl.trainer_backend=automodel,openrl.trainer_gpus=4
+            - name: OPENAI_BASE_URL
+              value: http://10.142.0.15:8000/v1
+            - name: OPENAI_API_KEY
+              value: unused
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+          volumeMounts:
+            - name: shared-storage
+              mountPath: /mnt/shared
+      volumes:
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: open-rl-shared-pvc
