@@ -130,6 +130,18 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     # Reusing kind-dev must fetch the rebuilt worker rather than its cached predecessor.
     self.assertEqual(container["imagePullPolicy"], "Always")
 
+  def test_workers_get_the_deployment_settings(self) -> None:
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    settings = {"VLLM_MAX_MODEL_LEN": "131072", "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072", "MAX_JOBS": "4"}
+    with patch.dict(os.environ, settings), patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-lora-1", "sampler")
+      self.manager.ensure("job-lora-1", "trainer")
+
+    self.assertEqual(len(self.api.created), 2)
+    for pod in self.api.created:
+      env = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
+      self.assertEqual({k: env.get(k) for k in settings}, settings)
+
   def test_launch_is_idempotent(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.worker_manager.get_state_store", return_value=s):
