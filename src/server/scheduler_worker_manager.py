@@ -92,8 +92,11 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
     "OPEN_RL_TIME_SLICE_JOB_ID": worker.name,
     "OPEN_RL_ACCEL_TIMESLICER_PORT": os.getenv("OPEN_RL_ACCEL_TIMESLICER_PORT", "9753"),
   }
-  if os.getenv("VLLM_GPU_MEMORY_UTILIZATION"):
-    values["VLLM_GPU_MEMORY_UTILIZATION"] = os.environ["VLLM_GPU_MEMORY_UTILIZATION"]
+  # MAX_JOBS caps FlashInfer's JIT build, which otherwise runs one ~3GB
+  # compiler per core and blows through the pod's host memory limit.
+  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
+    if os.getenv(name):
+      values[name] = os.environ[name]
   # No other worker shares an exclusive worker's GPUs, so it never parks.
   if worker.exclusive:
     values["OPEN_RL_TIME_SLICING"] = "off"
