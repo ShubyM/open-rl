@@ -48,12 +48,17 @@ class LabRubricReward:
     return self.lab_root / "results" / self.run_id
 
   async def __call__(self, history: list[Message]) -> tuple[float, dict[str, float]]:
-    await self.collect_outputs(self.run_dir / "output")
+    try:
+      await self.collect_outputs(self.run_dir / "output")
+    except Exception as exc:
+      # Raising here fails the whole rollout group, and a streamed step then
+      # waits forever for it. Fail just this episode.
+      print(f"[reward] could not collect outputs for {self.run_id}: {exc!r}")
+      return 0.0, {**self.base_metrics(), "lab/reward_error": 1.0}
     return await asyncio.to_thread(self.score, history)
 
-  def score(self, history: list[Message]) -> tuple[float, dict[str, float]]:
-    self.write_metadata(history)
-    metrics = {
+  def base_metrics(self) -> dict[str, float]:
+    return {
       "lab/criteria_passed": 0.0,
       "lab/criteria_total": float(self.criteria_count),
       "lab/criteria_pass_fraction": 0.0,
@@ -63,6 +68,10 @@ class LabRubricReward:
       "lab/no_output": 0.0,
       "lab/reward_error": 0.0,
     }
+
+  def score(self, history: list[Message]) -> tuple[float, dict[str, float]]:
+    self.write_metadata(history)
+    metrics = self.base_metrics()
     if not any(path.is_file() and path.stat().st_size > 0 for path in (self.run_dir / "output").rglob("*")):
       return 0.0, {**metrics, "lab/no_output": 1.0}
 

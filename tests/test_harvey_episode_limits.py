@@ -8,9 +8,10 @@ from __future__ import annotations
 import asyncio
 import unittest
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from harvey_labs.episode import LabEpisodeEnv
-from harvey_labs.reward import reward_from_scores
+from harvey_labs.reward import LabRubricReward, reward_from_scores
 
 
 @dataclass
@@ -108,6 +109,27 @@ class RewardFromScoresTest(unittest.TestCase):
   def test_no_criteria_scores_zero(self):
     reward, _ = reward_from_scores({})
     self.assertEqual(reward, 0.0)
+
+
+class CollectFailureTest(unittest.TestCase):
+  def test_a_sandbox_that_cannot_return_outputs_fails_only_its_episode(self):
+    async def collect(destination):
+      raise ConnectionError("502 Bad Gateway")
+
+    reward_fn = LabRubricReward(
+      lab_root=Path("/nonexistent"),
+      run_id="r",
+      task_name="t",
+      judge_model="gpt-glm-5.2",
+      judge_parallel=1,
+      criteria_count=7,
+      tool_metrics=dict,
+      collect_outputs=collect,
+    )
+    reward, metrics = asyncio.run(reward_fn([]))
+    self.assertEqual(reward, 0.0)
+    self.assertEqual(metrics["lab/reward_error"], 1.0)
+    self.assertEqual(metrics["lab/criteria_total"], 7.0)
 
 
 if __name__ == "__main__":

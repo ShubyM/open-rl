@@ -27,6 +27,7 @@ OUTPUT = "/workspace/output"
 READY_TIMEOUT = 180
 # Slack over the in-guest coreutils timeout for the gRPC round trips.
 RPC_SLACK = 30
+COLLECT_ATTEMPTS = 4
 
 # Runs in the guest so glob and grep see the sandbox filesystem, with the same
 # ordering, limits, and symlink rules as LAB's host-side versions.
@@ -178,15 +179,26 @@ class SubstrateLabSandbox:
     return self.executor.get_metrics()
 
   async def collect_outputs(self, destination: Path) -> None:
-    archive = "/tmp/lab-output.tar"
-    packed = await self.shell(f"tar -C {OUTPUT} -cf {archive} .", 120)
-    if packed.exit_code != 0:
-      raise RuntimeError(f"could not pack outputs in {self.env.id}: {packed.stderr.strip()}")
-    data = await self.read_bytes(archive)
+    # Packing and reading are safe to repeat, so ride out a transient 502.
+    for attempt in range(COLLECT_ATTEMPTS):
+      try:
+        data = await self.pack_outputs()
+        break
+      except Exception:
+        if attempt == COLLECT_ATTEMPTS - 1:
+          raise
+        await asyncio.sleep(2**attempt)
     destination.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
       # The data filter rejects members and links that escape destination.
       await asyncio.to_thread(tar.extractall, destination, filter="data")
+
+  async def pack_outputs(self) -> bytes:
+    archive = "/tmp/lab-output.tar"
+    packed = await self.shell(f"tar -C {OUTPUT} -cf {archive} .", 120)
+    if packed.exit_code != 0:
+      raise RuntimeError(f"could not pack outputs in {self.env.id}: {packed.stderr.strip()}")
+    return await self.read_bytes(archive)
 
   async def cleanup(self) -> None:
     async with asyncio.timeout(60):
