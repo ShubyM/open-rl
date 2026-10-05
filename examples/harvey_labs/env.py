@@ -155,7 +155,9 @@ class LabDatasetBuilder(RLDatasetBuilder):
     if config.task:
       train_names, eval_names = [config.task], []
     else:
-      train_names, eval_names = random_task_split(config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed)
+      train_names, eval_names = random_task_split(
+        config.lab_root, config.train_tasks, config.eval_tasks, config.task_split_seed, train_seed=config.train_split_seed
+      )
 
     def dataset(names: list[str], group_size: int) -> LabDataset:
       return LabDataset(

@@ -28,8 +28,16 @@ spec:
             # The longest sequence a CP4 trainer fits on 80 GB H100s; the gateway's
             # VLLM_MAX_MODEL_LEN and OPEN_RL_TRAIN_TOKEN_BUDGET must match.
             - max_trajectory_tokens=196608
-            - max_tokens=65536
-            - max_turns=200
+            # The rest matches the reference Qwen3.5-9B run.
+            - max_tokens=32768
+            - max_tool_result_tokens=16384
+            - max_turns=40
+            - learning_rate=2e-4
+            - stream_minibatches=True
+            - max_steps=35
+            - eval_every=5
+            - save_every=5
+            - train_split_seed=242
             # 48 rollouts a step keep all four samplers busy.
             - batch_size=8
             - rollouts_per_example=6
@@ -37,7 +45,7 @@ spec:
             - eval_rollouts_per_task=1
           env:
             - name: RUN
-              value: harvey-substrate-4
+              value: harvey-substrate-5
             - name: TINKER_API_KEY
               value: tml-dummy-key
             - name: TINKER_TAGS

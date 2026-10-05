@@ -94,9 +94,9 @@ class EpisodeLimitTest(unittest.TestCase):
 
 
 class RewardFromScoresTest(unittest.TestCase):
-  def test_reward_weights_pass_fraction_and_all_pass(self):
+  def test_reward_is_the_pass_fraction(self):
     reward, metrics = reward_from_scores({"n_criteria": 10, "n_passed": 9, "all_pass": False})
-    self.assertAlmostEqual(reward, 0.72)
+    self.assertAlmostEqual(reward, 0.9)
     self.assertEqual(metrics["lab/criteria_pass_fraction"], 0.9)
     self.assertEqual(metrics["lab/all_pass"], 0.0)
 

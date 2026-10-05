@@ -18,6 +18,7 @@ class RunConfig:
   train_tasks: int = 300
   eval_tasks: int = 50
   task_split_seed: int = 0
+  train_split_seed: int | None = None  # Reorders the train pool; the reference runs used 242.
   batch_size: int = 1
   rollouts_per_example: int = 4
   eval_rollouts_per_task: int = 4
