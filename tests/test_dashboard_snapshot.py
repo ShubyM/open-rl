@@ -87,3 +87,10 @@ class SnapshotJoinTest(unittest.TestCase):
     self.assertEqual(sorted(placements[0]["run_ids"]), ["r1", "r3"])
     self.assertEqual(placements[0]["label"], "Qwen/Qwen3-8B")
     self.assertEqual(placements[0]["devices"], ["gpu.nvidia.com/n1/gpu-0"])
+
+  def test_a_finished_lora_run_lets_go_of_the_shared_runtime(self) -> None:
+    done = {"model_id": "r0", "base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "lora", "status": "completed", "created_at": 0}
+    runs = {r["run_id"]: r for r in snapshot.join_runs([*METADATA, done], STATE)}
+    self.assertEqual((runs["r0"]["pods"], runs["r0"]["workloads"], runs["r0"]["display_status"]), ([], [], "Completed"))
+    placements = snapshot.placements_of(STATE, list(runs.values()))
+    self.assertEqual(sorted(placements[0]["run_ids"]), ["r1", "r3"])

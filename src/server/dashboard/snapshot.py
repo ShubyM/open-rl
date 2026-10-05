@@ -49,8 +49,8 @@ def delete_blocker(run: dict, available: bool) -> str | None:
 
 
 def join_runs(metadata: list[dict], state: dict) -> list[dict]:
-  """LoRA workers serve a base-model runtime shared by every LoRA run on it;
-  an FFT worker's modelID is the run itself."""
+  """LoRA workers serve a base-model runtime shared by every unfinished LoRA
+  run on it; an FFT worker's modelID is the run itself."""
   workloads = state["scheduler"]["workloads"]
   claims = state["devices"]["claims"]
   runs = []
@@ -58,7 +58,9 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
     run_id = row["model_id"]
     lora = row.get("fine_tuning_type", "lora") == "lora"
     runtime = row.get("base_model") if lora else run_id
-    matched = [w for w in workloads if w.get("model_id") == runtime and w.get("training_kind") == ("lora" if lora else "fft")]
+    finished = str(row.get("status", "")).lower() in TERMINAL_STATUSES
+    kind = "lora" if lora else "fft"
+    matched = [] if lora and finished else [w for w in workloads if w.get("model_id") == runtime and w.get("training_kind") == kind]
     pods = []
     for pod in state["pods"]:
       owned = [w for w in matched if w["uid"] in pod["owner_uids"] or (w.get("pod_name") == pod["name"] and pod.get("worker") == w["name"])]
