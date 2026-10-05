@@ -41,6 +41,10 @@ class PromQL:
     if self.token is not None:
       headers["Authorization"] = f"Bearer {await asyncio.wait_for(asyncio.to_thread(self.token), timeout=10)}"
     step = max(MIN_STEP_SECONDS, int((end - start) / MAX_POINTS))
+    # Samples land on multiples of step, not offsets from start, so queries made
+    # at different moments (or for different allocations) share timestamps and
+    # can be averaged or summed sample by sample.
+    start -= start % step
     async with httpx.AsyncClient(timeout=10) as client:
       params = {"query": query, "start": start, "end": end, "step": step}
       response = await client.get(f"{self.url}/api/v1/query_range", params=params, headers=headers)

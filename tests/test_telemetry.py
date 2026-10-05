@@ -2,6 +2,8 @@ import asyncio
 import unittest
 from unittest import mock
 
+import httpx
+
 from server.dashboard import metrics, snapshot
 from server.telemetry import backends, local
 from server.telemetry.prometheus import PromQL
@@ -83,6 +85,24 @@ class PromQLTest(unittest.TestCase):
     self.assertIn('namespace_name="openrl-system"', queries[0])
     self.assertIn("kubernetes_io:container_memory_used_bytes", queries[1])
     self.assertEqual(result["orw-trainer"], {"cpu_cores": [[1.0, 3.0]], "memory_bytes": [[1.0, 3.0]]})
+
+  def test_queries_made_at_different_moments_share_sample_times(self) -> None:
+    # Each allocation is fetched separately and the window slides with every
+    # refresh; unaligned starts gave every response its own timestamps, so the
+    # per-sample average across GPUs came out empty until all requests landed.
+    backend = PromQL("gke", "https://example", None, None, "openrl-system")
+    sent = []
+
+    async def get(self, url, params, headers):
+      sent.append(params)
+      return httpx.Response(200, json={"status": "success", "data": {"result": []}}, request=httpx.Request("GET", url))
+
+    with mock.patch.object(httpx.AsyncClient, "get", get):
+      for start in (1000.4, 1010.4):
+        asyncio.run(backend.query_range("q", start, start + 1800))
+    self.assertEqual([p["step"] for p in sent], [15, 15])
+    self.assertEqual([p["start"] % 15 for p in sent], [0, 0])
+    self.assertTrue(all(p["start"] <= s for p, s in zip(sent, (1000.4, 1010.4), strict=True)))
 
 
 class BackendTest(unittest.TestCase):
