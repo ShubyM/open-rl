@@ -18,7 +18,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uv/bin/uv
 ENV PATH="/uv/bin:$PATH"
 
 ARG LAB_REPO=https://github.com/ShubyM/harvey-labs
-ARG LAB_REF=462f1323da7de10d67ce767df2e7e8665b584332
+ARG LAB_REF=401bf7f0448044cb112556d26492652d56e8c317
 RUN git clone --filter=blob:none "$LAB_REPO" /app/harvey_labs/harvey-labs \
     && git -C /app/harvey_labs/harvey-labs checkout "$LAB_REF"
 RUN --mount=type=cache,target=/root/.cache/uv \
