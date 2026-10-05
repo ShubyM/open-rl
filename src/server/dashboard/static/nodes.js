@@ -84,17 +84,22 @@ function operationActivity(placement, range) {
   const save = (value) => { activityCache.set(placement.id, value); return value; };
   const allocationId = placement.allocation_id || placement.id;
   const turns = use(turnsUrl(allocationId), `turns:${allocationId}`);
-  // A shared worker's turn has no logical run ID. Its operations remain the
-  // per-run evidence; copying the worker's turns to every run would duplicate it.
-  if (!placement.allocation_id && turns.data?.samples?.length) {
+  // A shared worker's turn serves several runs; its request ops carry the run
+  // they served, so a run's lane on that worker is its own ops in those turns.
+  if (turns.data?.samples?.length) {
+    const runId = placement.allocation_id ? placement.run_ids[0] : null;
     const clip = (from, to) => [Math.max(range.start, placement.start, from), Math.min(range.now, placement.end, to)];
-    const intervals = turns.data.samples.map((t) => clip(t.started_at, t.at)).filter(([from, to]) => to > from);
+    const intervals = runId ? [] : turns.data.samples.map((t) => clip(t.started_at, t.at)).filter(([from, to]) => to > from);
     // What the GPU was doing inside each turn, recorded by the worker: one interval list per op name.
     const ops = {};
     for (const turn of turns.data.samples)
       for (const op of turn.ops || []) {
+        if (runId && op.run_id !== runId) continue;
         const [from, to] = clip(op.start, op.end);
-        if (to > from) (ops[op.name] ||= []).push([from, to]);
+        if (to > from) {
+          (ops[op.name] ||= []).push([from, to]);
+          if (runId) intervals.push([from, to]);
+        }
       }
     for (const name of Object.keys(ops)) ops[name] = mergeIntervals(ops[name]);
     return save({ intervals: mergeIntervals(intervals), ops, error: turns.error || "", errorStatus: turns.errorStatus, loading: false, exact: true });
