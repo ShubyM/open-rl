@@ -30,9 +30,12 @@ spec:
             - max_trajectory_tokens=196608
             - max_tokens=65536
             - max_turns=200
+            # 48 rollouts a step keep all four samplers busy.
+            - batch_size=8
+            - rollouts_per_example=6
           env:
             - name: RUN
-              value: harvey-substrate-3
+              value: harvey-substrate-4
             - name: TINKER_API_KEY
               value: tml-dummy-key
             - name: TINKER_TAGS
