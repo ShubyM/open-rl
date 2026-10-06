@@ -265,6 +265,27 @@ body {
   position: relative;
   grid-template-columns: 16px minmax(0, 1fr) 128px 100px 112px 90px 80px;
 }
+#orl-design-lab .with-reward > .run-row {
+  grid-template-columns: 16px minmax(0, 1fr) 128px 100px 112px 80px 90px 80px;
+}
+#orl-design-lab .run-meta {
+  display: flex;
+  gap: 0 10px;
+}
+#orl-design-lab .step-bar {
+  display: block;
+  width: 72px;
+  height: 3px;
+  margin: 5px 0 0 auto;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+#orl-design-lab .step-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
 #orl-design-lab .run-row > :nth-child(4) {
   text-align: left;
 }
@@ -716,6 +737,25 @@ body {
 }
 #orl-design-lab .hold:is(:hover, .selected) {
   background: color-mix(in srgb, var(--allocation-color) 65%, var(--ground));
+}
+/* GPU turns still loading: stripes, so a bar does not read as idle. */
+#orl-design-lab .capacity-allocation.loading {
+  background-image: repeating-linear-gradient(
+    135deg,
+    transparent 0 6px,
+    color-mix(in srgb, var(--allocation-color, var(--dim)) 22%, transparent) 6px 12px
+  );
+  animation: orl-loading 1.2s linear infinite;
+}
+@keyframes orl-loading {
+  to {
+    background-position: 16.97px 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  #orl-design-lab .capacity-allocation.loading {
+    animation: none;
+  }
 }
 #orl-design-lab .allocation-unobserved {
   position: absolute;
@@ -1191,9 +1231,15 @@ body {
   gap: 8px 16px;
 }
 #orl-design-lab .run-description {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 12px;
   margin-top: 4px;
   color: var(--dim);
   overflow-wrap: anywhere;
+}
+#orl-design-lab .run-reward-chart {
+  margin-bottom: 16px;
 }
 #orl-design-lab .run-toolbar {
   display: flex;
@@ -1421,7 +1467,7 @@ body {
 }
 #orl-design-lab :is(.experiment-head, .experiment-row) {
   grid-template-columns: minmax(120px, 1.2fr) minmax(90px, 1fr) 90px repeat(
-      4,
+      var(--metric-columns, 4),
       80px
     );
 }
@@ -1454,13 +1500,13 @@ body {
   #orl-design-lab .job-list-row:not(.experiment-row) > :last-child::before {
     content: "Elapsed ";
   }
-  #orl-design-lab .experiment-row > :nth-child(5)::before {
+  #orl-design-lab .exp-reward::before {
     content: "Reward ";
   }
-  #orl-design-lab .experiment-row > :nth-child(6)::before {
+  #orl-design-lab .exp-correct::before {
     content: "Correct ";
   }
-  #orl-design-lab .experiment-row > :nth-child(7)::before {
+  #orl-design-lab .exp-format::before {
     content: "Format ";
   }
   #orl-design-lab .experiment-row > :nth-child(n + 5) {
@@ -1600,10 +1646,19 @@ body {
   #orl-design-lab .job-list-row.run-row > :nth-child(4)::after {
     content: none;
   }
-  #orl-design-lab .job-list-row.run-row > :nth-child(5)::after {
+  #orl-design-lab .run-row .step-count::after {
     content: " steps";
   }
-  #orl-design-lab .job-list-row.run-row > :nth-child(6)::before {
+  #orl-design-lab .run-row .step-bar {
+    margin-left: 0;
+  }
+  #orl-design-lab .run-reward::before {
+    content: "Reward ";
+  }
+  #orl-design-lab .run-reward.none {
+    display: none;
+  }
+  #orl-design-lab .run-created::before {
     content: "Created ";
   }
   #orl-design-lab .run-delete {

@@ -3,6 +3,7 @@
 import { escape, encode, empty, runStatus, elapsedTime, duration, shortNodeName } from "./ui.js";
 import { chart, chartNumber } from "./charts.js";
 import { route, ui } from "./store.js";
+import { use } from "./cache.js";
 
 // Status chips on the Overview, by what the cluster shows rather than the
 // recorded lifecycle: a run recorded "active" with no workers is Unassigned.
@@ -36,6 +37,20 @@ const age = (run, observedAt) => {
   return Number.isFinite(created) && created > 0 && Number.isFinite(now) ? `${duration(Math.max(0, now - created))} ago` : "—";
 };
 
+// Reward curves live in the metrics.jsonl files the Experiments page reads. A
+// run links to one only by name, so a run without a matching name has none.
+export function experimentsByName() {
+  const byName = new Map();
+  for (const exp of [...(use("/api/v1/dashboard/experiments").data?.runs || [])].sort((a, b) => a.updated_at - b.updated_at)) byName.set(exp.name, exp);
+  return byName;
+}
+
+const stepsCell = (r) => {
+  const count = `<span class="step-count">${escape(r.steps ?? "—")}${r.max_steps ? ` / ${escape(r.max_steps)}` : ""}</span>`;
+  if (!r.max_steps || r.steps == null) return count;
+  return `${count}<span class="step-bar" aria-hidden="true"><span style="width:${Math.min(100, (100 * r.steps) / r.max_steps)}%"></span></span>`;
+};
+
 export function runs(state) {
   const error = state.store_error ? `<p class="source-error" role="status">${escape(state.store_error)}</p>` : "";
   if (error && !state.runs.length) return `<h1 class="heading">Overview</h1>${error}`;
@@ -48,15 +63,19 @@ export function runs(state) {
   const deletable = shown.filter((r) => !r.delete_blocker);
   const selected = deletable.filter((r) => ui.selectedRuns.has(r.run_id));
   const all = deletable.length > 0 && selected.length === deletable.length;
+  const byName = experimentsByName();
+  const reward = (r) => byName.get(r.display_name)?.last.reward;
+  const withReward = shown.some((r) => Number.isFinite(reward(r)));
   const rows = shown
     .map((r) => {
-      const label = [r.display_name, r.recipe_name].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ");
-      const short = `${(r.model || "Run").split("/").at(-1)} · ${r.run_id.slice(0, 8)}`;
-      const box = `<input type="checkbox" data-select-run="${escape(r.run_id)}" aria-label="Select ${escape(short)}"${ui.selectedRuns.has(r.run_id) && !r.delete_blocker ? " checked" : ""}${r.delete_blocker ? ` disabled title="${escape(`Cannot delete: ${r.delete_blocker}`)}"` : ""}>`;
-      return `<div class="job-list-row run-row" data-key="${escape(r.run_id)}"><span class="run-select">${box}</span><span class="job-identity"><a href="#run/${encode(r.run_id)}/activity" title="${escape(r.run_id)}">${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></a>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape(KINDS[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(age(r, state.observed_at))}</span><span>${escape(runGroup(r) === "unassigned" ? "—" : elapsedTime(r, state.observed_at))}</span></div>`;
+      const model = (r.model || "Run").split("/").at(-1), id8 = `<span class="mono">${escape(r.run_id.slice(0, 8))}</span>`;
+      const name = r.display_name ? escape(r.display_name) : `${escape(model)} ${id8}`;
+      const meta = [r.display_name && `<span>${escape(model)}</span>${id8}`, r.recipe_name && r.recipe_name !== r.display_name && `<span>${escape(r.recipe_name)}</span>`].filter(Boolean).join("");
+      const box = `<input type="checkbox" data-select-run="${escape(r.run_id)}" aria-label="Select ${escape(r.display_name || `${model} ${r.run_id.slice(0, 8)}`)}"${ui.selectedRuns.has(r.run_id) && !r.delete_blocker ? " checked" : ""}${r.delete_blocker ? ` disabled title="${escape(`Cannot delete: ${r.delete_blocker}`)}"` : ""}>`;
+      return `<div class="job-list-row run-row" data-key="${escape(r.run_id)}"><span class="run-select">${box}</span><span class="job-identity"><a href="#run/${encode(r.run_id)}/activity" title="${escape(r.run_id)}">${name}</a>${meta ? `<span class="run-meta muted micro">${meta}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape(KINDS[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${stepsCell(r)}</span>${withReward ? `${Number.isFinite(reward(r)) ? `<span class="run-reward">${escape(chartNumber(reward(r)))}</span>` : '<span class="run-reward none">—</span>'}` : ""}<span class="run-created">${escape(age(r, state.observed_at))}</span><span>${escape(runGroup(r) === "unassigned" ? "—" : elapsedTime(r, state.observed_at))}</span></div>`;
     })
     .join("");
-  const head = `<div class="job-list-head run-row"><span class="run-select"><input type="checkbox" data-select-all-runs aria-label="Select all shown runs that can be deleted"${all ? " checked" : ""}${deletable.length ? "" : " disabled"}></span><span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Created</span><span>Elapsed</span></div>`;
+  const head = `<div class="job-list-head run-row"><span class="run-select"><input type="checkbox" data-select-all-runs aria-label="Select all shown runs that can be deleted"${all ? " checked" : ""}${deletable.length ? "" : " disabled"}></span><span>Job</span><span>Status</span><span>Training kind</span><span>Steps</span>${withReward ? "<span>Reward</span>" : ""}<span>Created</span><span>Elapsed</span></div>`;
   const notice = ui.runNotice ? `<p class="run-notice" role="status">${escape(ui.runNotice)}</p>` : "";
   const none = !state.runs.length ? empty("No runs recorded") : !shown.length ? empty("No runs match the search and status filter") : "";
   return `<h1 class="heading">Overview</h1>${error}
@@ -65,7 +84,7 @@ export function runs(state) {
       <div class="run-filters" role="group" aria-label="Filter by status">${chips}</div>
       <button type="button" class="chip run-delete" data-delete-runs${selected.length ? "" : " disabled"} title="Removes the run records and their recorded ops; workers, checkpoints and metrics files are not touched">${selected.length ? `Delete ${selected.length} run${selected.length === 1 ? "" : "s"}` : "Delete selected"}</button>
     </div>${notice}
-    <div class="job-list run-list">${shown.length ? head + rows : ""}</div>${none}`;
+    <div class="job-list run-list${withReward ? " with-reward" : ""}">${shown.length ? head + rows : ""}</div>${none}`;
 }
 
 export function scheduler(state) {
@@ -144,7 +163,9 @@ const pct = (value) => (Number.isFinite(value) ? `${(100 * value).toFixed(1)}%` 
 const shortName = (name) => name.replace(/^gsm8k_rl_(mega|rank_sweep)_/, "");
 
 function experimentCharts(run) {
-  return ["reward", "correct"].map((key) => {
+  // Reward always gets a chart, even an empty one; correctness only when the run records it.
+  const keys = ["reward", "correct"].filter((key) => key === "reward" || run.series[key]?.some(([, value]) => Number.isFinite(value)));
+  return keys.map((key) => {
     const points = run.series[key] || [], percent = key === "correct";
     return chart({
       title: percent ? "Correctness" : "Reward",
@@ -168,14 +189,16 @@ export function experiments(entry) {
   const now = Date.now() / 1000;
   const sections = [...sweeps.entries()]
     .map(([sweep, members]) => {
+      // Columns no run in this sweep records are dropped rather than shown as dashes.
+      const metrics = ["correct", "format"].filter((key) => members.some((run) => Number.isFinite(run.last[key])));
       const rows = members
         .map((run) => {
           const charts = run === selected ? `<div class="chart-grid" data-key="charts:${escape(run.path)}">${experimentCharts(run)}</div>` : "";
-          return `<a class="job-list-row experiment-row" data-key="${escape(run.path)}" href="#experiments/${encode(run.path)}"${run === selected ? ' aria-current="true"' : ""}><span class="job-identity"><span class="mono">${escape(shortName(run.name))}</span></span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span>${Number.isFinite(run.last.reward) ? escape(chartNumber(run.last.reward)) : "—"}</span><span>${escape(pct(run.last.correct))}</span><span>${escape(pct(run.last.format))}</span></a>${charts}`;
+          return `<a class="job-list-row experiment-row" data-key="${escape(run.path)}" href="#experiments/${encode(run.path)}"${run === selected ? ' aria-current="true"' : ""}><span class="job-identity"><span class="mono">${escape(shortName(run.name))}</span></span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span class="exp-reward">${Number.isFinite(run.last.reward) ? escape(chartNumber(run.last.reward)) : "—"}</span>${metrics.map((key) => `<span class="exp-${key}">${escape(pct(run.last[key]))}</span>`).join("")}</a>${charts}`;
         })
         .join("");
       return `<section class="experiment-sweep"><h2>${escape(sweep || "runs")} <span class="muted micro">${members.length} run${members.length === 1 ? "" : "s"} · updated ${duration(now - Math.max(...members.map((r) => r.updated_at)))} ago</span></h2>
-        <div class="job-list"><div class="job-list-head experiment-head"><span>Run</span><span>Model</span><span>Kind</span><span>Step</span><span>Reward</span><span>Correct</span><span>Format</span></div>${rows}</div></section>`;
+        <div class="job-list" style="--metric-columns:${2 + metrics.length}"><div class="job-list-head experiment-head"><span>Run</span><span>Model</span><span>Kind</span><span>Step</span><span>Reward</span>${metrics.map((key) => `<span>${key[0].toUpperCase() + key.slice(1)}</span>`).join("")}</div>${rows}</div></section>`;
     })
     .join("");
   return `<h1 class="heading">Experiments</h1><p class="muted">Select a run to inspect reward and correctness.</p>${entry.error ? empty(`${entry.error} · Showing previously fetched metrics`) : ""}${sections}${!data.runs.length ? empty("No run metrics found under the runs directory") : ""}`;

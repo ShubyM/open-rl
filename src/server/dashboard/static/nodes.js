@@ -33,7 +33,7 @@ function segments({ now }) {
   // A shared LoRA process can serve several runs on the same allocation.
   return found.flatMap((placement) => (placement.run_ids?.length > 1 ? placement.run_ids.map((id) => {
     const run = ui.state.runs.find((r) => r.run_id === id);
-    return { ...placement, id: `${placement.id}:${id}`, allocation_id: placement.id, run_ids: [id], label: `${(run?.model || placement.label).split("/").at(-1)} · ${id.slice(0, 8)}` };
+    return { ...placement, id: `${placement.id}:${id}`, allocation_id: placement.id, run_ids: [id], label: run?.name || `${placement.label.split("/").at(-1)} · ${id.slice(0, 8)}` };
   }) : [placement]));
 }
 
@@ -105,7 +105,7 @@ function operationActivity(placement, range) {
     return save({ intervals: mergeIntervals(intervals), ops, error: turns.error || "", errorStatus: turns.errorStatus, loading: false, exact: true });
   }
   const intervals = [];
-  let error = "", errorStatus = null, loading = !placement.allocation_id && turns.pending && !turns.data && !turns.error;
+  let error = "", errorStatus = null, loading = turns.pending && !turns.data && !turns.error;
   for (const runId of placement.run_ids || []) {
     const entry = use(holdUrl(runId), `holds:${runId}`);
     if (entry.error) { error = entry.error; errorStatus = entry.errorStatus; }
@@ -166,6 +166,11 @@ function trackBars(devices, nodeSegments, range) {
   const duration = now - start || 1;
   const span = (from, to) =>
     `left:${(Math.max(0, Math.max(start, from) - start) / duration) * 100}%;width:${(Math.max(0, Math.min(now, to) - Math.max(start, from)) / duration) * 100}%`;
+  // Turns painted inside a bar spanning [from, to]; a bar still fetching them is striped instead of looking idle.
+  const holdsWithin = (s, from, to, classes = "") => {
+    const within = (a, b) => `left:${((Math.max(a, from) - from) / (to - from || 1)) * 100}%;width:${((Math.min(b, to) - Math.max(a, from)) / (to - from || 1)) * 100}%`;
+    return operationActivity(s, range).intervals.map(([a, b]) => `<span class="hold ${classes}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`).join("");
+  };
   const sharersOf = (i) => nodeSegments.filter((s) => s.devices.includes(devices[i].id)).sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
   const shared = new Set(
     devices
@@ -182,16 +187,10 @@ function trackBars(devices, nodeSegments, range) {
       const to = Math.min(now, Math.max(...sharers.map((s) => s.end)));
       const chosen = sharers.find((s) => s.id === ui.expanded) || sharers[0];
       const open = sharers.some((s) => s.id === ui.expanded);
-      const within = (a, b) => `left:${((Math.max(a, from) - from) / (to - from || 1)) * 100}%;width:${((Math.min(b, to) - Math.max(a, from)) / (to - from || 1)) * 100}%`;
-      const holds = sharers
-        .flatMap((s) =>
-          operationActivity(s, range).intervals.map(
-            ([a, b]) => `<span class="hold ${placementColor(s)} ${s.id === ui.expanded ? "selected" : ""}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`,
-          ),
-        )
-        .join("");
-      const title = `Shared GPU operation activity: ${sharers.map((s) => `${s.label} ${s.role || ""}`.trim()).join(", ")}`;
-      return `<button type="button" class="capacity-allocation shared ${open ? "selected" : ""}" data-key="shared:${escape(devices[i].id)}" data-placement="${escape(chosen.id)}" aria-expanded="${open}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(from, to)};top:${i * height + 2}px;height:${height - 4}px">${holds}</button>`;
+      const holds = sharers.map((s) => holdsWithin(s, from, to, `${placementColor(s)} ${s.id === ui.expanded ? "selected" : ""}`)).join("");
+      const loading = sharers.some((s) => operationActivity(s, range).loading);
+      const title = `Shared GPU operation activity: ${sharers.map((s) => `${s.label} ${s.role || ""}`.trim()).join(", ")}${loading ? " · Loading GPU turns…" : ""}`;
+      return `<button type="button" class="capacity-allocation shared ${open ? "selected" : ""} ${loading ? "loading" : ""}" data-key="shared:${escape(devices[i].id)}" data-placement="${escape(chosen.id)}" aria-expanded="${open}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(from, to)};top:${i * height + 2}px;height:${height - 4}px">${holds}</button>`;
     })
     .join("");
   const solid = nodeSegments
@@ -200,9 +199,10 @@ function trackBars(devices, nodeSegments, range) {
         .map((id) => devices.findIndex((d) => d.id === id))
         .filter((i) => i >= 0 && !shared.has(i))
         .sort((a, b) => a - b);
+      const loading = operationActivity(s, range).loading;
       return deviceGroups(indexes).map((group) => {
-        const title = `${s.label}${s.role ? " · " + s.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}`;
-        return `<button type="button" class="capacity-allocation ${placementColor(s)} ${s.ended ? "ended" : ""} ${s.id === ui.expanded ? "selected" : ""}" data-key="${escape(s.id)}:${group[0]}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(s.start, s.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px"><span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`;
+        const title = `${s.label}${s.role ? " · " + s.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}${loading ? " · Loading GPU turns…" : ""}`;
+        return `<button type="button" class="capacity-allocation ${placementColor(s)} ${s.ended ? "ended" : ""} ${s.id === ui.expanded ? "selected" : ""} ${loading ? "loading" : ""}" data-key="${escape(s.id)}:${group[0]}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(s.start, s.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px">${holdsWithin(s, Math.max(start, s.start), Math.min(now, s.end))}<span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`;
       });
     })
     .join("");
@@ -264,7 +264,8 @@ function activityTimeline(placements, range, { acrossNodes = false, activeOnly =
   const path = (p, blocks) => `<path class="activity-block ${placementColor(p)}" ${!acrossNodes ? `data-placement="${escape(p.id)}"` : ""} data-selected="${!acrossNodes && p.id === ui.expanded}" data-label="${escape(acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
   const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${axisTime(range.start + ((range.now - range.start) * tick) / 4, range)}</span>`).join("");
   const activities = [...placements].sort((a, b) => (acrossNodes ? processOrder(a, b) : 0) || a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
-  const shown = activeOnly ? activities.filter((p) => p.intervals.length) : activities;
+  // A run's lane on a shared worker it never used in this window says nothing; drop it once its turns have loaded.
+  const shown = activities.filter((p) => (activeOnly ? p.intervals.length : !p.allocation_id || p.loading || p.error || p.intervals.length));
   if (!shown.length) {
     const loading = activities.some((p) => p.loading);
     const unavailable = activities.some((p) => p.warning || (p.error && p.errorStatus !== 404));
@@ -442,7 +443,7 @@ export function renderNodes() {
     content,
     `<div class="nodes-heading"><h1 class="heading">${ui.state.telemetry_sources?.mode === "local" ? "This host" : "Kubernetes nodes"}</h1>${timeControl(range)}</div>${errors.map((error) => `<p class="source-error" role="status">${escape(error)}</p>`).join("")}${!cluster.available && !errors.length ? empty("Kubernetes unavailable") : ""}
     ${unavailable ? `<div class="unavailable-selection" role="status"><span>${ui.inspectorNode ? "The selected node is no longer reported." : "The selected placement is not in retained history."}</span><button type="button" class="detail-close" data-close-details aria-label="Clear unavailable selection" title="Clear selection">×</button></div>` : ""}
-    <div class="node-time-header"><span>Node</span><div class="node-axis">${axis}</div><span class="node-duty" title="GPU claimed time over this window, not measured GPU utilization">Claimed</span></div>
+    <div class="node-time-header"><span>Node</span><div class="node-axis">${axis}</div><span class="node-duty" title="Share of GPU time allocated over this window, not measured GPU utilization">Allocated</span></div>
     ${nodes.map((node) => lane(node, all, range)).join("") || (!errors.length && cluster.available ? empty("No nodes reported by Kubernetes") : "")}`,
   );
 }

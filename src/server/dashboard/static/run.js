@@ -4,6 +4,7 @@ import { runIncidents } from "./timeline.js";
 import { escape, encode, empty, button, runStatus } from "./ui.js";
 import { chart } from "./charts.js";
 import { runActivity } from "./nodes.js";
+import { experimentsByName } from "./views.js";
 import { ui, get, nodeNow } from "./store.js";
 import { use } from "./cache.js";
 
@@ -94,8 +95,10 @@ export function runPage(id, tab = "activity") {
   const sourceError = ui.state.store_error ? `<p class="source-error" role="status">${escape(ui.state.store_error)}</p>` : "";
   if (!run) return `${back}<h1 class="heading">Run</h1>${sourceError || empty("Run not found")}`;
   if (!["activity", "metrics", "logs"].includes(tab)) tab = "activity";
-  const title = [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), { lora: "LoRA", full: "FFT", fft: "FFT" }[run.fine_tuning_type]].filter(Boolean).join(" · ");
-  const description = [run.display_name, run.recipe_name].filter((value, index, values) => value && value !== title && values.indexOf(value) === index).join(" · ");
+  const model = (run.model || "Run").split("/").at(-1);
+  const title = run.display_name || `${model} ${run.run_id.slice(0, 8)}`;
+  const kind = { lora: "LoRA", full: "FFT", fft: "FFT" }[run.fine_tuning_type];
+  const description = [run.display_name && model, kind, run.recipe_name !== run.display_name && run.recipe_name].filter(Boolean).map((part) => `<span>${escape(part)}</span>`).join("") + `<span class="mono">${escape(run.run_id)}</span>`;
   const tabs = ["activity", "logs"].map((t) => `<a href="#run/${encode(id)}/${t}" ${(tab === "metrics" ? "activity" : tab) === t ? 'aria-current="page"' : ""}>${t[0].toUpperCase() + t.slice(1)}</a>`).join("");
   const customWindow = !runView.follow || ![10, 30, 60].includes(runView.windowMinutes);
   const range = runRange();
@@ -104,7 +107,7 @@ export function runPage(id, tab = "activity") {
   return `${back}
     <div class="run-heading"><h1 class="heading" title="${escape(run.run_id)}">${escape(title)}</h1>${runStatus(run.display_status || run.status)}</div>
     ${sourceError}
-    ${description ? `<p class="run-description">${escape(description)}</p>` : ""}
+    <p class="run-description">${description}</p>
     <div class="run-toolbar" data-key="run-toolbar"><nav class="workspace-tabs" aria-label="Run views">${tabs}</nav><div class="run-time-controls"><label>Time range <select id="event-range" aria-label="Time range" title="${range.since} – ${range.until}">${ranges}</select></label>${button("Copy link", "data-copy-view")}</div></div>
     ${runIncidents(run, runView.windowMinutes, runView.windowEnd)}
     <div id="run-panel">${tab === "logs" ? logsPanel(id, run) : activityPanel(id, run, tab)}</div>
@@ -114,7 +117,16 @@ export function runPage(id, tab = "activity") {
 function activityPanel(id, run, tab) {
   const range = { start: runView.windowEnd - runView.windowMinutes * 60, now: runView.windowEnd, live: runView.follow };
   const metricsOpen = tab === "metrics" || document.querySelector(`details[data-run-metrics="${CSS.escape(id)}"]`)?.open;
-  return `${runActivity(id, range)}<details class="run-metrics" data-run-metrics="${escape(id)}" data-key="metrics:${escape(id)}:${tab === "metrics"}" ${tab === "metrics" ? "open" : ""}><summary>Metrics</summary>${metricsOpen ? metricsPanel(id, run) : ""}</details>`;
+  return `${rewardChart(run)}${runActivity(id, range)}<details class="run-metrics" data-run-metrics="${escape(id)}" data-key="metrics:${escape(id)}:${tab === "metrics"}" ${tab === "metrics" ? "open" : ""}><summary>Metrics</summary>${metricsOpen ? metricsPanel(id, run) : ""}</details>`;
+}
+
+// Shown only when the Experiments metrics have a run by this name.
+function rewardChart(run) {
+  const exp = experimentsByName().get(run.display_name);
+  const points = exp?.series.reward || [];
+  if (!points.some(([, value]) => Number.isFinite(value))) return "";
+  const progress = run.max_steps ? `step ${run.steps ?? exp.step} of ${run.max_steps}` : `step ${run.steps ?? exp.step}`;
+  return `<div class="run-reward-chart" data-key="reward:${escape(run.run_id)}">${chart({ title: `Reward, ${progress}`, points, start: 0, end: Math.max(run.max_steps || 0, points.at(-1)[0]), tone: "accent", xFormat: "step" })}</div>`;
 }
 
 function metricsPanel(id, run) {
