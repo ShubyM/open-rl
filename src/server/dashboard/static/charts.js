@@ -126,7 +126,7 @@ function showSample(plot, index) {
     `${Math.max(0, Math.min(100, ((Number(plot.dataset.max) - value) / (Number(plot.dataset.max) - Number(plot.dataset.min))) * 100))}%`;
   const tip = hover.querySelector(".chart-tip");
   const when = plot.dataset.xformat === "step" ? `step ${Math.round(at)}` : chartTime(at, true);
-  tip.textContent = `${when}: ${valueText(value, plot.dataset.unit)}`;
+  tip.textContent = `${when} · ${valueText(value, plot.dataset.unit)}`;
   tip.style.left = `${Math.max(-left, Math.min(8, box.width - left - tip.offsetWidth))}px`;
 }
 

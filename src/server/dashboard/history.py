@@ -26,10 +26,8 @@ async def record(store, placements: list[dict], now: float | None = None) -> Non
       continue
     key = KEY_PREFIX + placement["id"]
     previous = await store.get_value(key)
-    prior = json.loads(previous) if previous else {}
-    entry = {**{field: placement.get(field) for field in FIELDS}, "first_seen": prior.get("first_seen", now), "last_seen": now}
-    # A shared worker serves runs that come and go; keep every run it has served, not only the current ones.
-    entry["run_ids"] = list(dict.fromkeys([*(prior.get("run_ids") or []), *(placement.get("run_ids") or [])]))
+    first_seen = json.loads(previous)["first_seen"] if previous else now
+    entry = {**{field: placement.get(field) for field in FIELDS}, "first_seen": first_seen, "last_seen": now}
     await store.set_value(key, json.dumps(entry), ttl_seconds=RETENTION_SECONDS)
     await store.add_to_set(SET_KEY, placement["id"])
 

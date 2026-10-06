@@ -52,8 +52,8 @@ export function installActivityHover() {
     if (!interval || at < interval[0] || at > interval[1]) return;
     const [from, to] = interval, date = (time) => new Date(time * 1000).toISOString().slice(0, 10);
     fields[0].textContent = block.dataset.label || "";
-    fields[1].textContent = `${date(from)} ${chartTime(from, true)} – ${date(from) === date(to) ? "" : date(to) + " "}${chartTime(to, true)}`;
-    fields[2].textContent = `${valueText(to - from, "s")} visible${block.dataset.source ? `, from ${block.dataset.source.toLowerCase()}` : ""}`;
+    fields[1].textContent = `${date(from)} · ${chartTime(from, true)} – ${date(from) === date(to) ? "" : date(to) + " · "}${chartTime(to, true)}`;
+    fields[2].textContent = `Visible interval · ${valueText(to - from, "s")}${block.dataset.source ? " · " + block.dataset.source : ""}`;
     tooltip.hidden = false;
     tooltip.style.left = `${Math.max(8, Math.min(event.clientX + 12, innerWidth - tooltip.offsetWidth - 8))}px`;
     tooltip.style.top = `${Math.max(8, Math.min(event.clientY + 12, innerHeight - tooltip.offsetHeight - 8))}px`;

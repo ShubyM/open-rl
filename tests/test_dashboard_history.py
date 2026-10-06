@@ -28,12 +28,6 @@ class PlacementHistoryTest(unittest.TestCase):
     self.assertEqual([e["id"] for e in entries], ["w-1"])
     self.assertEqual((entries[0]["first_seen"], entries[0]["last_seen"], entries[0]["devices"]), (100.0, 130.0, ["gpu-0"]))
 
-  def test_a_shared_worker_keeps_every_run_it_served(self) -> None:
-    store = InMemoryStore()
-    asyncio.run(history.record(store, [{**PLACEMENT, "run_ids": ["a", "b"]}], now=100.0))
-    asyncio.run(history.record(store, [{**PLACEMENT, "run_ids": ["b", "c"]}], now=130.0))
-    self.assertEqual(asyncio.run(history.read(store, since=0))[0]["run_ids"], ["a", "b", "c"])
-
   def test_read_filters_by_last_seen(self) -> None:
     store = InMemoryStore()
     asyncio.run(history.record(store, [PLACEMENT], now=100.0))

@@ -4,7 +4,6 @@ import { runIncidents } from "./timeline.js";
 import { escape, encode, empty, button, runStatus } from "./ui.js";
 import { chart } from "./charts.js";
 import { runActivity } from "./nodes.js";
-import { experimentsByName } from "./views.js";
 import { ui, get, nodeNow } from "./store.js";
 import { use } from "./cache.js";
 
@@ -91,14 +90,12 @@ export function runPage(id, tab = "activity") {
   const observedAt = Date.parse(ui.state.observed_at) / 1000;
   if (runView.follow && Number.isFinite(observedAt)) runView.windowEnd = observedAt;
   const run = ui.state.runs.find((r) => r.run_id === id);
-  const back = `<p class="overview-back"><a href="${escape(runView.nodeBack || "#overview")}">${runView.origin === "nodes" ? "Nodes" : "Overview"}</a></p>`;
+  const back = `<p class="overview-back"><a href="${escape(runView.nodeBack || "#overview")}">← ${runView.origin === "nodes" ? "Nodes" : "Overview"}</a></p>`;
   const sourceError = ui.state.store_error ? `<p class="source-error" role="status">${escape(ui.state.store_error)}</p>` : "";
   if (!run) return `${back}<h1 class="heading">Run</h1>${sourceError || empty("Run not found")}`;
   if (!["activity", "metrics", "logs"].includes(tab)) tab = "activity";
-  const model = (run.model || "Run").split("/").at(-1);
-  const title = run.display_name || `${model} ${run.run_id.slice(0, 8)}`;
-  const kind = { lora: "LoRA", full: "FFT", fft: "FFT" }[run.fine_tuning_type];
-  const description = [run.display_name && model, kind, run.recipe_name !== run.display_name && run.recipe_name].filter(Boolean).map((part) => `<span>${escape(part)}</span>`).join("") + `<span class="mono">${escape(run.run_id)}</span>`;
+  const title = [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), { lora: "LoRA", full: "FFT", fft: "FFT" }[run.fine_tuning_type]].filter(Boolean).join(" · ");
+  const description = [run.display_name, run.recipe_name].filter((value, index, values) => value && value !== title && values.indexOf(value) === index).join(" · ");
   const tabs = ["activity", "logs"].map((t) => `<a href="#run/${encode(id)}/${t}" ${(tab === "metrics" ? "activity" : tab) === t ? 'aria-current="page"' : ""}>${t[0].toUpperCase() + t.slice(1)}</a>`).join("");
   const customWindow = !runView.follow || ![10, 30, 60].includes(runView.windowMinutes);
   const range = runRange();
@@ -107,26 +104,17 @@ export function runPage(id, tab = "activity") {
   return `${back}
     <div class="run-heading"><h1 class="heading" title="${escape(run.run_id)}">${escape(title)}</h1>${runStatus(run.display_status || run.status)}</div>
     ${sourceError}
-    <p class="run-description">${description}</p>
+    ${description ? `<p class="run-description">${escape(description)}</p>` : ""}
     <div class="run-toolbar" data-key="run-toolbar"><nav class="workspace-tabs" aria-label="Run views">${tabs}</nav><div class="run-time-controls"><label>Time range <select id="event-range" aria-label="Time range" title="${range.since} – ${range.until}">${ranges}</select></label>${button("Copy link", "data-copy-view")}</div></div>
     ${runIncidents(run, runView.windowMinutes, runView.windowEnd)}
     <div id="run-panel">${tab === "logs" ? logsPanel(id, run) : activityPanel(id, run, tab)}</div>
-    <p class="run-json-link"><a href="/api/v1/dashboard/runs/${encode(id)}">Agent JSON</a></p>`;
+    <p class="run-json-link"><a href="/api/v1/dashboard/runs/${encode(id)}">Agent JSON ↗</a></p>`;
 }
 
 function activityPanel(id, run, tab) {
   const range = { start: runView.windowEnd - runView.windowMinutes * 60, now: runView.windowEnd, live: runView.follow };
   const metricsOpen = tab === "metrics" || document.querySelector(`details[data-run-metrics="${CSS.escape(id)}"]`)?.open;
-  return `${rewardChart(run)}${runActivity(id, range)}<details class="run-metrics" data-run-metrics="${escape(id)}" data-key="metrics:${escape(id)}:${tab === "metrics"}" ${tab === "metrics" ? "open" : ""}><summary>Metrics</summary>${metricsOpen ? metricsPanel(id, run) : ""}</details>`;
-}
-
-// Shown only when the Experiments metrics have a run by this name.
-function rewardChart(run) {
-  const exp = experimentsByName().get(run.display_name);
-  const points = exp?.series.reward || [];
-  if (!points.some(([, value]) => Number.isFinite(value))) return "";
-  const progress = run.max_steps ? `step ${run.steps ?? exp.step} of ${run.max_steps}` : `step ${run.steps ?? exp.step}`;
-  return `<div class="run-reward-chart" data-key="reward:${escape(run.run_id)}">${chart({ title: `Reward, ${progress}`, points, start: 0, end: Math.max(run.max_steps || 0, points.at(-1)[0]), tone: "accent", xFormat: "step" })}</div>`;
+  return `${runActivity(id, range)}<details class="run-metrics" data-run-metrics="${escape(id)}" data-key="metrics:${escape(id)}:${tab === "metrics"}" ${tab === "metrics" ? "open" : ""}><summary>Metrics</summary>${metricsOpen ? metricsPanel(id, run) : ""}</details>`;
 }
 
 function metricsPanel(id, run) {
@@ -154,7 +142,7 @@ function metricsPanel(id, run) {
     ),
   ];
   const error = metrics.error || metrics.data?.error;
-  const status = error ? `${error}${samples.length ? ". Showing previously fetched metrics" : ""}` : !metrics.data ? "Loading metrics…" : metrics.pending ? "Updating…" : "";
+  const status = error ? `${error}${samples.length ? " · Showing previously fetched metrics" : ""}` : !metrics.data ? "Loading metrics…" : metrics.pending ? "Updating…" : "";
   const rows = (run.pods || [])
     .map(
       (p) =>
@@ -225,14 +213,14 @@ function logsPanel(id, run) {
   const scope =
     runView.eventAt === null
       ? ""
-      : `<div class="log-time-scope" data-key="log-scope"><span>${escape(range.since.slice(0, 10))} ${escape(range.since.slice(11, 19))}–${escape(range.until.slice(11, 19))}</span><a href="#run/${encode(id)}/logs" data-all-logs="true">All logs</a></div>`;
+      : `<div class="log-time-scope" data-key="log-scope"><span>${escape(range.since.slice(0, 10))} · ${escape(range.since.slice(11, 19))}–${escape(range.until.slice(11, 19))}</span><a href="#run/${encode(id)}/logs" data-all-logs="true">All logs</a></div>`;
   const sources = new Map((run.pods || []).map((p) => [p.name, p]));
   for (const record of logState.records) if (record.pod && !sources.has(record.pod)) sources.set(record.pod, { ...record, name: record.pod });
   if (logState.pod && !sources.has(logState.pod)) sources.set(logState.pod, { name: logState.pod });
   const pods = [...sources.values()]
     .map(
       (p) =>
-        `<option value="${escape(p.name)}" ${logState.pod === p.name ? "selected" : ""}>${escape(p.role || "Unknown")}, ${escape(p.node || p.name)} / ${escape(p.name)}</option>`,
+        `<option value="${escape(p.name)}" ${logState.pod === p.name ? "selected" : ""}>${escape(p.role || "Unknown")} · ${escape(p.node || p.name)} / ${escape(p.name)}</option>`,
     )
     .join("");
   const rows = logState.records
@@ -244,10 +232,10 @@ function logsPanel(id, run) {
     })
     .join("");
   const source = { gke: "Cloud Logging", demo: "Demo logs", kubernetes: "Kubernetes pod logs" }[logState.source] || logState.source || "Logs";
-  const status = [source, rows || !logState.error ? `${logState.records.length.toLocaleString()} ${logState.records.length === 1 ? "record" : "records"}, newest first` : "", logState.loading ? (rows ? "Updating…" : "Loading…") : logState.error ? "" : ui.state.recorded_at ? "Recorded logs" : runView.follow ? "Updates every 5s" : "Paused"].filter(Boolean).join(" · ");
+  const status = [source, rows || !logState.error ? `${logState.records.length.toLocaleString()} ${logState.records.length === 1 ? "record" : "records"} · Newest first` : "", logState.loading ? (rows ? "Updating…" : "Loading…") : logState.error ? "" : ui.state.recorded_at ? "Recorded logs" : runView.follow ? "Updates every 5s" : "Paused"].filter(Boolean).join(" · ");
   return `${run.shared_runtime ? '<p class="muted">These pods serve a shared LoRA runtime. Their logs can include other runs.</p>' : ""}${scope}
     <div class="log-toolbar" data-key="log-toolbar"><input id="log-search" type="search" value="${escape(logState.q)}" placeholder="Search logs" aria-label="Search logs"><select id="log-source" aria-label="Pod"><option value="" ${!logState.pod ? "selected" : ""}>All pods</option>${pods}</select>${ui.state.recorded_at ? "" : button(runView.follow ? "Pause updates" : "Follow logs", 'data-log-follow="true"')}</div>
-    <div id="log-status" class="log-status" role="status"><span>${escape(status)}</span>${logState.error ? `<span class="log-error">${escape(logState.error)}${rows ? ". Showing previously fetched records" : ""}</span>` : ""}</div>
+    <div id="log-status" class="log-status" role="status"><span>${escape(status)}</span>${logState.error ? `<span class="log-error">${escape(logState.error)}${rows ? " · Showing previously fetched records" : ""}</span>` : ""}</div>
     <div id="log-lines" tabindex="0" aria-label="Run logs">${rows || (logState.loading || logState.error ? "" : empty("No logs match this time range and filter"))}</div>
     <div id="log-more">${logState.cursor ? button(logState.loading ? "Loading…" : "Older logs", `data-older="true" ${logState.loading ? "disabled" : ""}`) : logState.records.length === MAX_LOGS ? '<p class="muted">2,000 records shown. Narrow the time range or search to inspect more.</p>' : ""}</div>`;
 }
