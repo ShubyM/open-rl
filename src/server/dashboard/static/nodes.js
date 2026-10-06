@@ -4,7 +4,7 @@
 
 import { escape, encode, empty, button, morph, shortNodeName } from "./ui.js";
 import { chart } from "./charts.js";
-import { ui, content, nodeNow, nodeTime, nodeLink, viewLink } from "./store.js";
+import { ui, content, nodeNow, nodeTime, nodeLink } from "./store.js";
 import { use } from "./cache.js";
 import { timeWindow, timeControl } from "./node-time.js";
 
@@ -426,44 +426,6 @@ function gpuMemory(metrics, range) {
 }
 
 // ---- page -----------------------------------------------------------------------------
-
-// The Overview's view of the fleet: every GPU of every node as one thin row,
-// painted with the ops it ran over the last 30 minutes.
-export function fleetStrip() {
-  activityCache.clear();
-  const { cluster } = ui.state;
-  const gpuNodes = cluster.nodes.filter((n) => n.gpu_capacity && n.devices?.length);
-  if (!gpuNodes.length) return "";
-  const range = { start: nodeNow() - 1800, now: nodeNow(), live: true };
-  const all = segments(range).filter((s) => s.start <= range.now && s.end >= range.start);
-  const at = (a, b) => `left:${((a - range.start) / 1800) * 100}%;width:${((b - a) / 1800) * 100}%`;
-  let busy = 0, loading = false;
-  const activities = [];
-  const occupied = new Set(ui.state.placements.map((p) => p.node));
-  const rows = [...gpuNodes].sort((a, b) => Number(occupied.has(b.name)) - Number(occupied.has(a.name))).map((node) => {
-    const lanes = node.devices.map((device) => {
-      const sharers = all.filter((s) => s.node === node.name && s.devices.includes(device.id));
-      const turns = [], spans = [];
-      for (const s of sharers) {
-        const activity = operationActivity(s, range);
-        loading ||= activity.loading;
-        activities.push(activity);
-        turns.push(...activity.intervals);
-        const ops = Object.entries(activity.ops || {}).sort(([a], [b]) => opRank(a) - opRank(b));
-        if (!ops.length) spans.push(...activity.intervals.map(([a, b]) => `<span style="${at(a, b)}"></span>`));
-        for (const [op, list] of ops) spans.push(...list.map(([a, b]) => `<span data-op="${escape(op)}" style="${at(a, b)}"></span>`));
-      }
-      busy += mergeIntervals(turns).reduce((sum, [a, b]) => sum + (b - a), 0);
-      return `<span class="fleet-gpu${sharers.length ? " claimed" : ""}">${spans.join("")}</span>`;
-    });
-    const label = `${acceleratorLabel(node)} ${shortNodeName(node.name, cluster.nodes)}`;
-    return `<a class="fleet-node" href="${escape(viewLink("nodes", { node: node.name }))}" data-key="fleet:${escape(node.name)}" title="${escape(node.name)}"><span class="fleet-name">${escape(acceleratorLabel(node))} <span class="muted">${escape(shortNodeName(node.name, cluster.nodes))}</span></span><span class="fleet-lane" aria-label="${escape(`${label}, GPU activity over the last 30 minutes`)}">${lanes.join("")}</span></a>`;
-  });
-  const capacity = gpuNodes.reduce((sum, n) => sum + n.gpu_capacity, 0);
-  const claimed = gpuNodes.reduce((sum, n) => sum + new Set(ui.state.placements.filter((p) => p.node === n.name).flatMap((p) => p.devices)).size, 0);
-  const share = loading ? "…" : `${Math.round((100 * busy) / (1800 * capacity))}%`;
-  return `<section class="fleet${loading ? " loading" : ""}" data-key="fleet" aria-label="GPU fleet"><p class="fleet-summary"><span><strong>${claimed}</strong> of ${capacity} GPUs claimed</span><span title="Share of all GPU time spent in recorded GPU turns"><strong>${share}</strong> busy over the last 30 minutes</span></p>${rows.join("")}${opLegend(activities)}</section>`;
-}
 
 export function renderNodes() {
   activityCache.clear();

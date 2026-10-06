@@ -4,7 +4,6 @@ import { escape, encode, empty, runStatus, elapsedTime, duration, shortNodeName 
 import { chart, chartNumber } from "./charts.js";
 import { route, ui } from "./store.js";
 import { use } from "./cache.js";
-import { fleetStrip } from "./nodes.js";
 
 // Status chips on the Overview, by what the cluster shows rather than the
 // recorded lifecycle: a run recorded "active" with no workers is Unassigned.
@@ -79,7 +78,7 @@ export function runs(state) {
   const head = `<div class="job-list-head run-row"><span class="run-select"><input type="checkbox" data-select-all-runs aria-label="Select all shown runs that can be deleted"${all ? " checked" : ""}${deletable.length ? "" : " disabled"}></span><span>Job</span><span>Status</span><span>Training kind</span><span>Steps</span>${withReward ? "<span>Reward</span>" : ""}<span>Created</span><span>Elapsed</span></div>`;
   const notice = ui.runNotice ? `<p class="run-notice" role="status">${escape(ui.runNotice)}</p>` : "";
   const none = !state.runs.length ? empty("No runs recorded") : !shown.length ? empty("No runs match the search and status filter") : "";
-  return `<h1 class="heading">Overview</h1>${error}${fleetStrip()}
+  return `<h1 class="heading">Overview</h1>${error}
     <div class="overview-toolbar">
       <input id="run-search" type="search" placeholder="Search by run ID, model, name, recipe, node or pod" aria-label="Search runs" value="${escape(filter.q)}" autocomplete="off">
       <div class="run-filters" role="group" aria-label="Filter by status">${chips}</div>
