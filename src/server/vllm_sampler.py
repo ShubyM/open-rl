@@ -34,6 +34,7 @@ SHUTDOWN_SENTINEL = "SHUTDOWN_SENTINEL"
 TMP_DIR = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
 READY_TTL_SECONDS = 3600
 ENGINE_POLL_SECONDS = 5
+STATS_LOG_SECONDS = 30
 
 
 def failed_response(message: str) -> dict[str, Any]:
@@ -51,7 +52,9 @@ def engine_kwargs_from_env(fft_enabled: bool) -> dict[str, Any]:
     "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", "8192")),
     **sampler_batch_limits(),
     "gpu_memory_utilization": gpu_memory_utilization(),
-    "enable_prefix_caching": False,
+    # FFT weights change in place under one name, so cached prefixes would go
+    # stale. Each LoRA version samples under its own adapter name.
+    "enable_prefix_caching": not fft_enabled,
     "enforce_eager": os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
     **text_only_engine_kwargs(),
   }
@@ -297,6 +300,7 @@ async def serve(
     if time_slicer is not None:
       await sampler.sleep()  # give the memory back before releasing the slot
   state = get_state_store()
+  stats = asyncio.create_task(log_engine_stats(sampler.engine))
   # A routed sampler also takes requests from its set's llm-d router.
   http = asyncio.create_task(serve_http(sampler, int(port))) if (port := os.getenv("OPEN_RL_SAMPLER_HTTP_PORT")) else None
   try:
@@ -333,9 +337,21 @@ async def serve(
     finally:
       await state.delete_values(f"open_rl:sampler_ready:{model_id}")
   finally:
+    stats.cancel()
     if http is not None:
       http.cancel()
     sampler.engine.shutdown()
+
+
+async def log_engine_stats(engine: AsyncLLMEngine) -> None:
+  """vLLM only logs throughput and prefix cache hit rate when asked, which its
+  own server does every 10 seconds."""
+  while True:
+    await asyncio.sleep(STATS_LOG_SECONDS)
+    try:
+      await engine.do_log_stats()
+    except Exception as exc:
+      print(f"[vLLM Worker] Could not log engine stats: {exc}")
 
 
 async def serve_time_sliced(model_id: str, store: RequestStore, make_engine: Callable[[], AsyncLLMEngine]) -> None:
