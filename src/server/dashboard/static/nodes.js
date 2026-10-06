@@ -8,7 +8,7 @@ import { ui, content, nodeNow, nodeTime, nodeLink } from "./store.js";
 import { use } from "./cache.js";
 import { timeWindow, timeControl } from "./node-time.js";
 
-const laneHeight = (devices) => (devices.length === 1 ? 30 : 22);
+const laneHeight = (devices) => (devices.length === 1 ? 34 : 28);
 const axisTime = (at, range) => `${range.now - range.start >= 86400 ? `${new Date(at * 1000).toISOString().slice(5, 10)} ` : ""}${nodeTime(at, range.now - range.start <= 120)}`;
 // ---- history -> segments -----------------------------------------------------------
 
@@ -24,17 +24,47 @@ function segments({ now }) {
     found.push({
       ...entry,
       ...(live.get(entry.id) || {}),
+      // History keeps every run a shared worker served; the live placement lists only the current ones.
+      run_ids: [...new Set([...(entry.run_ids || []), ...(live.get(entry.id)?.run_ids || [])])],
       start: entry.first_seen,
       end,
       ended: !live.has(entry.id),
     });
   }
   for (const placement of ui.state.placements) if (!seen.has(placement.id)) found.push({ ...placement, start: nodeNow(), end: now });
-  // A shared LoRA process can serve several runs on the same allocation.
-  return found.flatMap((placement) => (placement.run_ids?.length > 1 ? placement.run_ids.map((id) => {
-    const run = ui.state.runs.find((r) => r.run_id === id);
-    return { ...placement, id: `${placement.id}:${id}`, allocation_id: placement.id, run_ids: [id], label: run?.name || `${placement.label.split("/").at(-1)} ${id.slice(0, 8)}` };
-  }) : [placement]));
+  // A shared LoRA process can serve several runs on the same allocation; each
+  // run's share of it lasts only as long as the run. Stretches no known run
+  // covers (history recorded before runs were kept) stay with the worker.
+  const seconds = (at) => (typeof at === "number" ? at : Date.parse(at) / 1000);
+  const gaps = (placement, parts) => {
+    const found = [];
+    let at = placement.start;
+    for (const part of [...parts].sort((a, b) => a.start - b.start)) {
+      if (part.start > at) found.push([at, part.start]);
+      at = Math.max(at, part.end);
+    }
+    if (placement.end > at) found.push([at, placement.end]);
+    const label = `${placement.label.split("/").at(-1)} shared worker`;
+    return found.map(([start, end]) => ({ ...placement, id: `${placement.id}:${start}`, allocation_id: placement.id, run_ids: [], label, start, end }));
+  };
+  return found.flatMap((placement) => {
+    if (!(placement.run_ids?.length > 1)) return [placement];
+    const parts = placement.run_ids.map((id) => {
+      const run = ui.state.runs.find((r) => r.run_id === id);
+      const from = seconds(run?.created_at), to = seconds(run?.completed_at);
+      return {
+        ...placement,
+        id: `${placement.id}:${id}`,
+        allocation_id: placement.id,
+        run_ids: [id],
+        label: run?.name || `${placement.label.split("/").at(-1)} ${id.slice(0, 8)}`,
+        start: Number.isFinite(from) ? Math.max(placement.start, from) : placement.start,
+        end: Number.isFinite(to) ? Math.min(placement.end, to) : placement.end,
+        ended: placement.ended || Number.isFinite(to),
+      };
+    }).filter((s) => s.end > s.start);
+    return [...parts, ...gaps(placement, parts)];
+  });
 }
 
 function mergeIntervals(intervals) {
@@ -185,17 +215,46 @@ function trackBars(devices, nodeSegments, range) {
         return sharers.some((a, index) => sharers.slice(index + 1).some((b) => Math.min(a.end, b.end) > Math.max(a.start, b.start)));
       }),
   );
-  const sharedBars = [...shared]
-    .map((i) => {
-      const sharers = sharersOf(i);
-      const from = Math.max(start, Math.min(...sharers.map((s) => s.start)));
-      const to = Math.min(now, Math.max(...sharers.map((s) => s.end)));
-      const chosen = sharers.find((s) => s.id === ui.expanded) || sharers[0];
-      const open = sharers.some((s) => s.id === ui.expanded);
-      const holds = sharers.map((s) => holdsWithin(s, from, to, s.id === ui.expanded ? "selected" : "")).join("");
-      const loading = sharers.some((s) => operationActivity(s, range).loading);
-      const title = `Shared GPU operation activity: ${sharers.map((s) => `${s.label} ${s.role || ""}`.trim()).join(", ")}${loading ? ". Loading GPU turns…" : ""}`;
-      return `<button type="button" class="capacity-allocation shared ${open ? "selected" : ""} ${loading ? "loading" : ""}" data-key="shared:${escape(devices[i].id)}" data-placement="${escape(chosen.id)}" aria-expanded="${open}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(from, to)};top:${i * height + 2}px;height:${height - 4}px">${holds}</button>`;
+  // Every bar is a job block: who holds these GPUs on top, what the GPUs ran in a stripe along the bottom.
+  const count = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const block = ({ key, placement, classes, from, to, group, name, role, meta, title, holds, open }) =>
+    `<button type="button" class="capacity-allocation ${classes}" data-key="${escape(key)}" data-placement="${escape(placement)}" aria-expanded="${open}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(from, to)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px"><span class="allocation-name">${escape(name)}</span>${role ? `<span class="allocation-role">${escape(role)}</span>` : ""}<span class="allocation-count">${escape(meta)}</span><span class="activity-stripe">${holds}</span></button>`;
+  // Neighbouring GPUs time-sliced by the same jobs read as one block, like a multi-GPU allocation.
+  const sharedGroups = [];
+  for (const i of [...shared].sort((a, b) => a - b)) {
+    const key = sharersOf(i).map((s) => s.id).join("|");
+    const last = sharedGroups.at(-1);
+    if (last && last.key === key && last.group.at(-1) === i - 1) last.group.push(i);
+    else sharedGroups.push({ key, group: [i] });
+  }
+  // Jobs come and go on a time-sliced GPU, so a block covers a stretch with one set of jobs on it.
+  const stretches = (sharers, from, to) => {
+    const cuts = [...new Set([from, to, ...sharers.flatMap((s) => [s.start, s.end]).filter((t) => t > from && t < to)])].sort((x, y) => x - y);
+    const found = [];
+    for (let k = 0; k + 1 < cuts.length; k++) {
+      const active = sharers.filter((s) => s.start < cuts[k + 1] && s.end > cuts[k]);
+      const last = found.at(-1);
+      if (!active.length) continue;
+      if (last && last.to === cuts[k] && last.active.map((s) => s.id).join("|") === active.map((s) => s.id).join("|")) last.to = cuts[k + 1];
+      else found.push({ from: cuts[k], to: cuts[k + 1], active });
+    }
+    return found;
+  };
+  const sharedBars = sharedGroups
+    .flatMap(({ group }) => {
+      const all = sharersOf(group[0]);
+      return stretches(all, Math.max(start, Math.min(...all.map((s) => s.start))), Math.min(now, Math.max(...all.map((s) => s.end)))).map(({ from, to, active: sharers }) => {
+        const chosen = sharers.find((s) => s.id === ui.expanded) || sharers[0];
+        const open = sharers.some((s) => s.id === ui.expanded);
+        const holds = sharers.map((s) => holdsWithin(s, from, to, s.id === ui.expanded ? "selected" : "")).join("");
+        const loading = sharers.some((s) => operationActivity(s, range).loading);
+        const names = [...new Set(sharers.map((s) => s.label))].sort();
+        const roles = [...new Set(sharers.map((s) => s.role).filter(Boolean))];
+        const title = `${names.length > 1 ? `Time-sliced by ${count(names.length, "job")}` : names[0]}: ${sharers.map((s) => `${s.label} (${s.role || "process"})`).join(", ")}${loading ? ". Loading GPU turns…" : ""}`;
+        const classes = `shared ${sharers.every((s) => s.ended) ? "ended" : ""} ${open ? "selected" : ""} ${loading ? "loading" : ""}`;
+        const meta = names.length > 1 ? `${count(names.length, "job")}, ${count(group.length, "GPU")}` : count(group.length, "GPU");
+        return block({ key: `shared:${devices[group[0]].id}:${from}`, placement: chosen.id, classes, from, to, group, name: names.join(", "), role: roles.length === 1 ? roles[0] : "", meta, title, holds, open });
+      });
     })
     .join("");
   const solid = nodeSegments
@@ -205,9 +264,12 @@ function trackBars(devices, nodeSegments, range) {
         .filter((i) => i >= 0 && !shared.has(i))
         .sort((a, b) => a - b);
       const loading = operationActivity(s, range).loading;
+      const open = s.id === ui.expanded;
       return deviceGroups(indexes).map((group) => {
-        const title = `${s.label}: ${s.role ? `${s.role}, ` : ""}${group.length} GPU${group.length === 1 ? "" : "s"}${loading ? ". Loading GPU turns…" : ""}`;
-        return `<button type="button" class="capacity-allocation ${s.ended ? "ended" : ""} ${s.id === ui.expanded ? "selected" : ""} ${loading ? "loading" : ""}" data-key="${escape(s.id)}:${group[0]}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(s.start, s.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px">${holdsWithin(s, Math.max(start, s.start), Math.min(now, s.end))}<span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`;
+        const title = `${s.label}: ${s.role ? `${s.role}, ` : ""}${count(group.length, "GPU")}${loading ? ". Loading GPU turns…" : ""}`;
+        const classes = `${s.ended ? "ended" : ""} ${open ? "selected" : ""} ${loading ? "loading" : ""}`;
+        const holds = holdsWithin(s, Math.max(start, s.start), Math.min(now, s.end));
+        return block({ key: `${s.id}:${group[0]}`, placement: s.id, classes, from: s.start, to: s.end, group, name: s.label, role: s.role || "", meta: count(group.length, "GPU"), title, holds, open });
       });
     })
     .join("");
