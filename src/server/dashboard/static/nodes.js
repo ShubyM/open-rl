@@ -4,7 +4,7 @@
 
 import { escape, encode, empty, button, morph, shortNodeName } from "./ui.js";
 import { chart } from "./charts.js";
-import { ui, content, nodeNow, nodeTime, family, nodeLink } from "./store.js";
+import { ui, content, nodeNow, nodeTime, nodeLink } from "./store.js";
 import { use } from "./cache.js";
 import { timeWindow, timeControl } from "./node-time.js";
 
@@ -33,11 +33,9 @@ function segments({ now }) {
   // A shared LoRA process can serve several runs on the same allocation.
   return found.flatMap((placement) => (placement.run_ids?.length > 1 ? placement.run_ids.map((id) => {
     const run = ui.state.runs.find((r) => r.run_id === id);
-    return { ...placement, id: `${placement.id}:${id}`, allocation_id: placement.id, run_ids: [id], label: run?.name || `${placement.label.split("/").at(-1)} · ${id.slice(0, 8)}` };
+    return { ...placement, id: `${placement.id}:${id}`, allocation_id: placement.id, run_ids: [id], label: run?.name || `${placement.label.split("/").at(-1)} ${id.slice(0, 8)}` };
   }) : [placement]));
 }
-
-const placementColor = (placement) => family(placement.run_ids?.[0] || placement.runtime_id);
 
 function mergeIntervals(intervals) {
   const merged = [];
@@ -166,10 +164,17 @@ function trackBars(devices, nodeSegments, range) {
   const duration = now - start || 1;
   const span = (from, to) =>
     `left:${(Math.max(0, Math.max(start, from) - start) / duration) * 100}%;width:${(Math.max(0, Math.min(now, to) - Math.max(start, from)) / duration) * 100}%`;
-  // Turns painted inside a bar spanning [from, to]; a bar still fetching them is striped instead of looking idle.
+  // Turns painted inside a bar spanning [from, to], coloured by the op the GPU ran; a turn with
+  // no recorded op stays hatched. A bar still fetching turns is striped instead of looking idle.
   const holdsWithin = (s, from, to, classes = "") => {
     const within = (a, b) => `left:${((Math.max(a, from) - from) / (to - from || 1)) * 100}%;width:${((Math.min(b, to) - Math.max(a, from)) / (to - from || 1)) * 100}%`;
-    return operationActivity(s, range).intervals.map(([a, b]) => `<span class="hold ${classes}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(s.label)} · ${escape(s.role || "")}"></span>`).join("");
+    const { intervals, ops = {} } = operationActivity(s, range);
+    const who = `${s.label}${s.role ? `, ${s.role}` : ""}`;
+    const turns = intervals.map(([a, b]) => `<span class="hold ${classes}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(who)}"></span>`);
+    const work = Object.entries(ops)
+      .sort(([a], [b]) => opRank(a) - opRank(b))
+      .flatMap(([op, spans]) => spans.map(([a, b]) => `<span class="hold op ${classes}" data-op="${escape(op)}" data-placement="${escape(s.id)}" style="${within(a, b)}" title="${escape(`${opLabel(op)}: ${who}`)}"></span>`));
+    return turns.join("") + work.join("");
   };
   const sharersOf = (i) => nodeSegments.filter((s) => s.devices.includes(devices[i].id)).sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
   const shared = new Set(
@@ -187,9 +192,9 @@ function trackBars(devices, nodeSegments, range) {
       const to = Math.min(now, Math.max(...sharers.map((s) => s.end)));
       const chosen = sharers.find((s) => s.id === ui.expanded) || sharers[0];
       const open = sharers.some((s) => s.id === ui.expanded);
-      const holds = sharers.map((s) => holdsWithin(s, from, to, `${placementColor(s)} ${s.id === ui.expanded ? "selected" : ""}`)).join("");
+      const holds = sharers.map((s) => holdsWithin(s, from, to, s.id === ui.expanded ? "selected" : "")).join("");
       const loading = sharers.some((s) => operationActivity(s, range).loading);
-      const title = `Shared GPU operation activity: ${sharers.map((s) => `${s.label} ${s.role || ""}`.trim()).join(", ")}${loading ? " · Loading GPU turns…" : ""}`;
+      const title = `Shared GPU operation activity: ${sharers.map((s) => `${s.label} ${s.role || ""}`.trim()).join(", ")}${loading ? ". Loading GPU turns…" : ""}`;
       return `<button type="button" class="capacity-allocation shared ${open ? "selected" : ""} ${loading ? "loading" : ""}" data-key="shared:${escape(devices[i].id)}" data-placement="${escape(chosen.id)}" aria-expanded="${open}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(from, to)};top:${i * height + 2}px;height:${height - 4}px">${holds}</button>`;
     })
     .join("");
@@ -201,8 +206,8 @@ function trackBars(devices, nodeSegments, range) {
         .sort((a, b) => a - b);
       const loading = operationActivity(s, range).loading;
       return deviceGroups(indexes).map((group) => {
-        const title = `${s.label}${s.role ? " · " + s.role : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}${loading ? " · Loading GPU turns…" : ""}`;
-        return `<button type="button" class="capacity-allocation ${placementColor(s)} ${s.ended ? "ended" : ""} ${s.id === ui.expanded ? "selected" : ""} ${loading ? "loading" : ""}" data-key="${escape(s.id)}:${group[0]}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(s.start, s.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px">${holdsWithin(s, Math.max(start, s.start), Math.min(now, s.end))}<span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`;
+        const title = `${s.label}: ${s.role ? `${s.role}, ` : ""}${group.length} GPU${group.length === 1 ? "" : "s"}${loading ? ". Loading GPU turns…" : ""}`;
+        return `<button type="button" class="capacity-allocation ${s.ended ? "ended" : ""} ${s.id === ui.expanded ? "selected" : ""} ${loading ? "loading" : ""}" data-key="${escape(s.id)}:${group[0]}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}" aria-label="${escape(title)}" title="${escape(title)}" style="${span(s.start, s.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px">${holdsWithin(s, Math.max(start, s.start), Math.min(now, s.end))}<span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${group.length} GPU${group.length === 1 ? "" : "s"}</span></button>`;
       });
     })
     .join("");
@@ -221,13 +226,13 @@ function lane(node, all, range) {
   const unknown = unmapped
     .map(
       (s) =>
-        `<button type="button" class="capacity-allocation unknown-mapping ${placementColor(s)}" data-key="unmapped:${escape(s.id)}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}"><span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${s.device_count} GPU${s.device_count === 1 ? "" : "s"}</span></button>`,
+        `<button type="button" class="capacity-allocation unknown-mapping" data-key="unmapped:${escape(s.id)}" data-placement="${escape(s.id)}" aria-expanded="${s.id === ui.expanded}"><span class="allocation-name">${escape(s.label)}</span><span class="allocation-count">${s.device_count} GPU${s.device_count === 1 ? "" : "s"}</span></button>`,
     )
     .join("");
   const track = devices.length
     ? `<div class="gpu-capacity"><div class="gpu-lane-ids" style="grid-auto-rows:${height}px">${devices.map((d) => `<span title="${escape(d.id)}">${escape(deviceLabel(d.name))}</span>`).join("")}</div><div class="capacity-track" style="height:${devices.length * height}px;--gpu-lane-height:${height}px">${bars}</div></div>`
     : "";
-  return `<div class="node-placement-group" data-key="${escape(node.name)}"><div class="node-lane"><button type="button" class="node-lane-label" data-node-details="${escape(node.name)}" aria-expanded="${ui.inspectorNode === node.name}" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)} <span class="muted">· ${escape(shortNodeName(node.name, ui.state.cluster.nodes))}</span></span>${node.gpu_capacity ? `<span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span>` : ""}</button><div>${track}${unknown}${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : !devices.length && node.gpu_capacity ? empty("GPUs without DRA devices") : ""}</div><span class="node-duty" title="Recorded GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${node.name === ui.inspectorNode ? detail(node, range, neighbours) : ""}</div>`;
+  return `<div class="node-placement-group" data-key="${escape(node.name)}"><div class="node-lane"><button type="button" class="node-lane-label" data-node-details="${escape(node.name)}" aria-expanded="${ui.inspectorNode === node.name}" title="${escape(node.name)}"><span class="node-accelerator">${escape(accelerator)} <span class="muted">${escape(shortNodeName(node.name, ui.state.cluster.nodes))}</span></span>${node.gpu_capacity ? `<span class="claim-label">${escape(claimLabel(node, placements, range.live))}</span>` : ""}</button><div>${track}${unknown}${unmapped.length ? '<span class="muted micro">Device mapping unavailable</span>' : !devices.length && node.gpu_capacity ? empty("GPUs without DRA devices") : ""}</div><span class="node-duty" title="Recorded GPU allocation time over the selected window">${duty(node, nodeSegments, range)}</span></div>${node.name === ui.inspectorNode ? detail(node, range, neighbours) : ""}</div>`;
 }
 
 // ---- expansion ---------------------------------------------------------------------
@@ -237,8 +242,7 @@ function processLabel(placement) {
   const devices = placement.devices.map((id) => node?.devices.find((d) => d.id === id));
   const gpus = devices.length && devices.every(Boolean) ? `GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : `${placement.device_count} GPU${placement.device_count === 1 ? "" : "s"}`;
   const role = placement.role || "Process";
-  const accelerator = node && acceleratorLabel(node);
-  return [role[0].toUpperCase() + role.slice(1), accelerator === "GPU" ? null : accelerator, gpus].filter(Boolean).join(" · ");
+  return `${role[0].toUpperCase() + role.slice(1)} on ${gpus}`;
 }
 
 const processOrder = (a, b) => ({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""));
@@ -261,7 +265,7 @@ function activityTimeline(placements, range, { acrossNodes = false, activeOnly =
   const href = (p) => acrossNodes ? ui.state.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : p.run_ids?.[0] ? `#run/${encode(p.run_ids[0])}/activity` : null;
   const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
   const block = (from, to) => `M${x(from)},0 H${x(to)} V24 H${x(from)} Z`;
-  const path = (p, blocks) => `<path class="activity-block ${placementColor(p)}" ${!acrossNodes ? `data-placement="${escape(p.id)}"` : ""} data-selected="${!acrossNodes && p.id === ui.expanded}" data-label="${escape(acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
+  const path = (p, blocks) => `<path class="activity-block" ${!acrossNodes ? `data-placement="${escape(p.id)}"` : ""} data-selected="${!acrossNodes && p.id === ui.expanded}" data-label="${escape(acrossNodes ? `${p.label}: ${processLabel(p)} (${p.node})` : p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
   const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${axisTime(range.start + ((range.now - range.start) * tick) / 4, range)}</span>`).join("");
   const activities = [...placements].sort((a, b) => (acrossNodes ? processOrder(a, b) : 0) || a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
   // A run's lane on a shared worker it never used in this window says nothing; drop it once its turns have loaded.
@@ -277,16 +281,16 @@ function activityTimeline(placements, range, { acrossNodes = false, activeOnly =
     const name = acrossNodes ? processLabel(p) : p.label, meta = acrossNodes ? p.node ? shortNodeName(p.node, ui.state.cluster.nodes) : "Node unassigned" : p.role || "process";
     const tag = href(p) ? "a" : "span";
     const attrs = href(p) ? `href="${escape(href(p))}"` : 'aria-disabled="true"';
-    const label = `<${tag} class="activity-label ${placementColor(p)}" data-key="label:${escape(p.id)}" ${attrs} title="${escape(acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !href(p) ? " · Node no longer reported" : ""}` : p.label)}"><span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">${escape(name)}</span><span class="activity-meta">${escape(meta)}${p.ended ? " · Ended" : ""}${!href(p) ? acrossNodes ? " · Node no longer reported" : " · Run ID unavailable" : ""}</span></span></${tag}>`;
+    const label = `<${tag} class="activity-label" data-key="label:${escape(p.id)}" ${attrs} title="${escape(acrossNodes ? `${name} (${p.node || "node unassigned"})${p.node && !href(p) ? ". Node no longer reported" : ""}` : p.label)}"><span class="activity-label-text"><span class="activity-name">${escape(name)}</span><span class="activity-meta">${escape(meta)}${p.ended ? ", ended" : ""}${!href(p) ? acrossNodes ? ", node no longer reported" : ", run ID unavailable" : ""}</span></span></${tag}>`;
     // One path per run, with separate blocks at their exact times. Dense
     // histories stay cheap, and labels remain selectable even for tiny bursts.
     const blocks = intervals.map(([from, to]) => block(from, to)).join(" ");
-    const rowLabel = acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label;
+    const rowLabel = acrossNodes ? `${p.label}: ${processLabel(p)} (${p.node})` : p.label;
     const ops = Object.entries(p.ops || {})
       .sort(([a], [b]) => opRank(a) - opRank(b))
-      .map(([op, spans]) => `<path class="activity-block op" data-op="${escape(op)}" data-label="${escape(`${opLabel(op)} · ${rowLabel}`)}" data-source="Worker-recorded op" data-intervals="${escape(JSON.stringify(spans))}" d="${spans.map(([from, to]) => block(from, to)).join(" ")}" vector-effect="non-scaling-stroke"/>`)
+      .map(([op, spans]) => `<path class="activity-block op" data-op="${escape(op)}" data-label="${escape(`${opLabel(op)}: ${rowLabel}`)}" data-source="Worker-recorded op" data-intervals="${escape(JSON.stringify(spans))}" d="${spans.map(([from, to]) => block(from, to)).join(" ")}" vector-effect="non-scaling-stroke"/>`)
       .join("");
-    return `<div class="activity-row ${placementColor(p)}" data-key="${escape(p.id)}" data-selected="${!acrossNodes && p.id === ui.expanded}">
+    return `<div class="activity-row" data-key="${escape(p.id)}" data-selected="${!acrossNodes && p.id === ui.expanded}">
       ${label}
       <div class="activity-track" data-start="${range.start}" data-end="${range.now}"><svg viewBox="0 0 1000 24" preserveAspectRatio="none" aria-label="Recorded activity">${path(p, blocks)}${ops}</svg>${status ? `<span class="activity-status ${error ? "unavailable" : ""}" title="${escape(error || status)}">${status}</span>` : ""}</div></div>`;
   }).join("");
@@ -297,7 +301,7 @@ function activityNotes(placements, range) {
   const activities = placements.map((p) => operationActivity(p, range));
   const warnings = [...new Set(activities.flatMap((a) => [a.warning, a.errorStatus !== 404 && a.error]).filter(Boolean))];
   const source = activities.every((a) => a.exact) ? "GPU turns" : activities.some((a) => a.exact) ? "GPU turns and recorded operations" : "Recorded operations; may include GPU wait time";
-  return { warnings: warnings.length ? `<p class="source-error" role="status">${escape(warnings.join(" · "))}</p>` : "", source: activities.length ? `${source}. Gaps may include unrecorded activity.` : "" };
+  return { warnings: warnings.length ? `<p class="source-error" role="status">${escape(warnings.join("; "))}</p>` : "", source: activities.length ? `${source}. Gaps may include unrecorded activity.` : "" };
 }
 
 export function runActivity(runId, range) {
@@ -329,7 +333,7 @@ function nodeMetrics(node, placements, range) {
   const entries = [...new Set(sources.values())];
   const workers = entries.map((entry) => entry.data?.worker).filter(Boolean);
   const source = entries.map((entry) => entry.data?.source).find(Boolean);
-  return { data: { devices, workers, source, reason: !devices.length ? "GPU device mapping unavailable" : null }, error: errors.join(" · ") };
+  return { data: { devices, workers, source, reason: !devices.length ? "GPU device mapping unavailable" : null }, error: errors.join("; ") };
 }
 
 function detail(node, range, placements) {
@@ -341,18 +345,18 @@ function detail(node, range, placements) {
   const picker = (devices.length > 1 ? [button("All GPUs", `data-device="all" aria-pressed="${ui.device === "all"}"`)] : [])
     .concat(devices.map((d) => {
       const value = lastValue(metrics.data.devices.find((device) => device.id === d.id)?.utilization, range);
-      return button(`GPU ${deviceLabel(d.name)}${Number.isFinite(value) ? ` · ${Math.round(value)}%` : ""}`, `data-device="${escape(d.id)}" aria-pressed="${devices.length === 1 || ui.device === d.id}"`);
+      return button(`GPU ${deviceLabel(d.name)}${Number.isFinite(value) ? ` (${Math.round(value)}%)` : ""}`, `data-device="${escape(d.id)}" aria-pressed="${devices.length === 1 || ui.device === d.id}"`);
     })).join("");
-  const label = `${acceleratorLabel(node)} · ${shortNodeName(node.name, ui.state.cluster.nodes)}`;
+  const short = shortNodeName(node.name, ui.state.cluster.nodes);
   const notes = activityNotes(visible, range);
-  return `<section class="allocation-expansion" id="placement-detail"><div class="allocation-detail-head inspector-heading"><h2 title="${escape(node.name)}">${escape(label)}</h2><button type="button" class="detail-close" data-close-details aria-label="Close node details" title="Close (Esc)">×</button></div>
+  return `<section class="allocation-expansion" id="placement-detail"><div class="allocation-detail-head inspector-heading"><h2 title="${escape(node.name)}">${escape(acceleratorLabel(node))} <span class="muted">${escape(short)}</span></h2><button type="button" class="detail-close" data-close-details aria-label="Close node details" title="Close (Esc)">×</button></div>
     ${devices.length ? `<div class="allocation-device-picker" aria-label="GPU selection">${picker}</div>` : ""}
     <div class="node-activity" data-key="node-timeline">${activityTimeline(visible, range, { activeOnly: true })}${notes.warnings}</div>
-    ${node.gpu_capacity ? `<div class="node-gpu-detail" data-key="node-gpu-detail"><div>${gpuChart(metrics, range, label)}</div><div class="allocation-detail-footer"><span>${notes.source}</span><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div></div>` : ""}
+    ${node.gpu_capacity ? `<div class="node-gpu-detail" data-key="node-gpu-detail"><div>${gpuChart(metrics, range)}</div><div class="allocation-detail-footer"><span>${notes.source}</span><span class="allocation-memory">GPU memory <strong>${gpuMemory(metrics, range)}</strong></span></div></div>` : ""}
     ${metrics.data.workers.length ? `<div class="node-gpu-detail" data-key="node-worker-detail"><div>${workerChart(metrics, range)}</div><div class="allocation-detail-footer"><span>${escape(sourceNote(metrics.data.source))}</span><span class="allocation-memory">Worker memory <strong>${workerMemory(metrics, range)}</strong></span></div></div>` : ""}</section>`;
 }
 
-const SOURCE_NOTES = { gke: "GPU: DCGM via Cloud Monitoring · CPU/memory: GKE container metrics", prometheus: "GPU: DCGM via Prometheus · CPU/memory: GKE container metrics", local: "GPU: nvidia-smi · CPU/memory: psutil, sampled on this host" };
+const SOURCE_NOTES = { gke: "GPU: DCGM via Cloud Monitoring; CPU/memory: GKE container metrics", prometheus: "GPU: DCGM via Prometheus; CPU/memory: GKE container metrics", local: "GPU: nvidia-smi; CPU/memory: psutil, sampled on this host" };
 const sourceNote = (source) => SOURCE_NOTES[source] || "";
 
 // The OpenRL worker processes holding this node's GPUs, summed at each sample.
@@ -375,7 +379,7 @@ function workerChart(metrics, range) {
   const { workers } = metrics.data;
   const reason = workers.map((w) => w.reason).find(Boolean) || "No CPU samples for these workers";
   const points = sumSeries(workers, "cpu_cores");
-  return chart({ title: `Worker CPU · ${workers.length} process${workers.length === 1 ? "" : "es"}`, unit: "cores", points, start: range.start, end: range.now, min: 0, gapSeconds: gapFor(points, 180), empty: reason });
+  return chart({ title: `Worker CPU, ${workers.length} process${workers.length === 1 ? "" : "es"}`, unit: "cores", points, start: range.start, end: range.now, min: 0, gapSeconds: gapFor(points, 180), empty: reason });
 }
 
 function workerMemory(metrics, range) {
@@ -385,8 +389,8 @@ function workerMemory(metrics, range) {
 
 const selectedDevices = (metrics) => [...new Map((metrics.data?.devices || []).filter((d) => ui.device === "all" || ui.device === d.id).map((d) => [d.uuid || d.id, d])).values()];
 
-function gpuChart(metrics, range, label) {
-  const title = `GPU utilization · ${label}`;
+function gpuChart(metrics, range) {
+  const title = "GPU utilization";
   const selected = selectedDevices(metrics);
   const byTime = new Map();
   for (const device of selected)
@@ -411,7 +415,7 @@ function gpuChart(metrics, range, label) {
     max: 100,
     gapSeconds: gapFor(points, 60),
     empty: metrics.error || reason,
-  })}${hasSamples && failures.length ? `<p class="source-error" role="status">${escape(failures.join(" · "))}${metrics.error ? " · Showing previously fetched samples" : ""}</p>` : ""}`;
+  })}${hasSamples && failures.length ? `<p class="source-error" role="status">${escape(failures.join("; "))}${metrics.error ? ". Showing previously fetched samples" : ""}</p>` : ""}`;
 }
 
 const lastValue = (points, range) => points?.findLast(([at]) => at >= range.start && at <= range.now)?.[1];

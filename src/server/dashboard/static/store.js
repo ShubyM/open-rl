@@ -53,10 +53,3 @@ export const post = (url, body) => get(url, undefined, { method: "POST", headers
 
 export const nodeNow = () => Date.parse(ui.state?.observed_at) / 1000 || Date.now() / 1000;
 export const nodeTime = (at, seconds = false) => new Date(at * 1000).toISOString().slice(11, seconds ? 19 : 16);
-
-const PALETTE_SIZE = 8;
-// A runtime keeps its color when other jobs arrive, end, or leave history.
-export const family = (id) => {
-  const hash = Array.from(id || "").reduce((s, c) => s + c.charCodeAt(0), 0);
-  return `hue-${hash % PALETTE_SIZE}`;
-};
