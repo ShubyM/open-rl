@@ -11,6 +11,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -23,7 +24,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from server import proto_codec
+from server import llmd, proto_codec
 from server.model_metadata import (
   TrainingModelMetadata,
   extract_weight_sync_config,
@@ -520,8 +521,13 @@ async def launch_worker_and_enqueue(command: Command) -> str:
   return await enqueue(command)
 
 
+async def routed_through_llmd(model_id: str) -> bool:
+  meta = await get_model_metadata(state, model_id)
+  return meta is not None and meta.fine_tuning_type == "lora" and llmd.router_for(meta.base_model) is not None
+
+
 async def ensure_sampler_launched(model_id: str) -> None:
-  if worker_manager is not None and get_sampler_backend() == "vllm":
+  if worker_manager is not None and get_sampler_backend() == "vllm" and not await routed_through_llmd(model_id):
     try:
       await asyncio.to_thread(worker_manager.ensure, model_id, "sampler")
     except Exception:
@@ -1010,7 +1016,7 @@ async def create_sampling_session(req: CreateSamplingSessionRequest):
 
   await bind_session(req.session_id, target_model_id)
 
-  if get_sampler_backend() == "vllm" and ready_check_id:
+  if get_sampler_backend() == "vllm" and ready_check_id and not await routed_through_llmd(target_model_id):
     # Launch by model ID so the worker manager retains the training kind.
     # LoRA readiness is still reported under the shared base-model runtime.
     await ensure_sampler_launched(target_model_id)
@@ -1093,9 +1099,13 @@ async def asample(req: AsampleRequest):
   fine_tuning_type = model_meta.fine_tuning_type if model_meta else "lora"
 
   if fine_tuning_type == "lora":
+    peft_dir = os.path.join(TMP_DIR, "peft", lookup_id, lookup_id)
+    router = llmd.router_for(model_meta.base_model if model_meta else None)
+    if router:
+      await start_llmd_sample(req_id, router, model_meta.base_model, model_id, peft_dir, req, prompt)
+      return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
     weights_path = None
     lora_id = model_id
-    peft_dir = os.path.join(TMP_DIR, "peft", lookup_id, lookup_id)
     lora_path = peft_dir if os.path.exists(peft_dir) else None
     queue_id = (model_meta.runtime(lookup_id) if model_meta else None) or lookup_id
   else:
@@ -1124,6 +1134,46 @@ async def asample(req: AsampleRequest):
 
   await store.put_sampling_request(sampling_req)
   return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
+
+
+llmd_client: httpx.AsyncClient | None = None
+llmd_tasks: set[asyncio.Task] = set()
+
+
+async def start_llmd_sample(req_id: str, router: str, base_model: str, model_id: str, peft_dir: str, req: AsampleRequest, prompt: list[int]) -> None:
+  """Sample in the background and resolve the future, like a queue worker would."""
+  global llmd_client
+  if llmd_client is None:
+    # A turn can generate for minutes, and an agent batch keeps hundreds in flight.
+    llmd_client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), limits=httpx.Limits(max_connections=None))
+  name = llmd.adapter_name(model_id)
+  # Before the first save a LoRA job samples from the base model.
+  has_adapter = await asyncio.to_thread(llmd.publish_adapter, peft_dir, name, os.path.join(TMP_DIR, "llmd-adapters"))
+  params = req.sampling_params
+  body = llmd.completion_body(
+    name if has_adapter else base_model,
+    {
+      "prompt_token_ids": prompt,
+      "max_tokens": params.max_tokens,
+      "num_samples": req.num_samples,
+      "temperature": params.temperature,
+      "top_p": params.top_p,
+      "top_k": params.top_k,
+      "stop": params.stop,
+      "include_prompt_logprobs": req.prompt_logprobs,
+    },
+  )
+
+  async def run() -> None:
+    try:
+      result = await llmd.sample(llmd_client, router, body)
+    except Exception as exc:
+      result = {"type": "RequestFailedResponse", "error_message": f"llm-d sampling failed: {exc}"}
+    await store.set_future(req_id, result)
+
+  task = asyncio.create_task(run())
+  llmd_tasks.add(task)
+  task.add_done_callback(llmd_tasks.discard)
 
 
 # *** CLI endpoints ***
