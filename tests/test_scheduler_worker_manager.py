@@ -130,6 +130,18 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     # Reusing kind-dev must fetch the rebuilt worker rather than its cached predecessor.
     self.assertEqual(container["imagePullPolicy"], "Always")
 
+  def test_workers_get_the_deployment_settings(self) -> None:
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    settings = {"VLLM_MAX_MODEL_LEN": "131072", "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072", "MAX_JOBS": "4"}
+    with patch.dict(os.environ, settings), patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-lora-1", "sampler")
+      self.manager.ensure("job-lora-1", "trainer")
+
+    self.assertEqual(len(self.api.created), 2)
+    for pod in self.api.created:
+      env = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
+      self.assertEqual({k: env.get(k) for k in settings}, settings)
+
   def test_launch_is_idempotent(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.worker_manager.get_state_store", return_value=s):
@@ -225,6 +237,42 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(trainer["metadata"]["name"], "lora-job-am-0-trainer")
     self.assertEqual(trainer["spec"]["template"]["spec"]["containers"][0]["image"], "am:1")
     self.assertEqual(self.api.deleted, ["lora-job-am-0-trainer"])
+
+  def test_a_multi_gpu_automodel_trainer_is_one_torchrun_group(self) -> None:
+    meta = {"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora", "trainer_backend": "automodel", "trainer_gpus": 4}
+    s = self.store_with("job-dp", meta)
+    with patch("server.worker_manager.get_state_store", return_value=s), patch.dict(os.environ, {"OPEN_RL_AUTOMODEL_IMAGE": "am:1"}):
+      self.manager.ensure("job-dp", "trainer")
+      self.manager.ensure("job-dp", "sampler")
+
+    trainer, sampler = self.api.created
+    self.assertEqual(trainer["metadata"]["name"], "lora-job-dp-0-trainer")
+    self.assertTrue(trainer["spec"]["exclusive"])
+    one = footprint("Qwen/Qwen3-0.6B", "lora", "trainer")
+    self.assertEqual(trainer["spec"]["accelerator"], {"mode": "MultiGPU", "devices": 4, "memory": one.accelerator})
+    pod = trainer["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    self.assertEqual(container["command"][:6], ["python", "-u", "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=4"])
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    self.assertEqual(env["OPEN_RL_CONTROL_BACKEND"], "cpu:gloo,cuda:nccl")
+    self.assertEqual(env["OPEN_RL_TIME_SLICING"], "off")
+    self.assertNotIn("OPEN_RL_AUTOMODEL_CP", env)
+    self.assertIn({"name": "dshm", "mountPath": "/dev/shm"}, container["volumeMounts"])
+    self.assertEqual(container["resources"]["requests"]["memory"], f"{-(-one.host_request_bytes * 4 // 2**30)}Gi")
+    # The sampler is the usual single-GPU one, alone with this job.
+    self.assertEqual(sampler["metadata"]["name"], "lora-job-dp-0-sampler")
+    self.assertEqual(sampler["spec"]["accelerator"]["mode"], "SingleGPU")
+    self.assertTrue(sampler["spec"]["exclusive"])
+
+  def test_a_context_parallel_trainer_gets_its_cp_size(self) -> None:
+    meta = {"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora", "trainer_backend": "automodel", "trainer_gpus": 4, "trainer_cp": 4}
+    s = self.store_with("job-cp", meta)
+    with patch("server.worker_manager.get_state_store", return_value=s), patch.dict(os.environ, {"OPEN_RL_AUTOMODEL_IMAGE": "am:1"}):
+      self.manager.ensure("job-cp", "trainer")
+
+    (trainer,) = self.api.created
+    env = {e["name"]: e.get("value") for e in trainer["spec"]["template"]["spec"]["containers"][0]["env"]}
+    self.assertEqual(env["OPEN_RL_AUTOMODEL_CP"], "4")
 
   def test_a_job_that_names_an_image_runs_its_trainer_from_it(self) -> None:
     meta = {"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora", "trainer_backend": "ghcr.io/org/trainer:1"}

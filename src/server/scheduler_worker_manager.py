@@ -21,7 +21,7 @@ import dataclasses
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from kubernetes import client, config
@@ -56,6 +56,8 @@ class Worker:
   exclusive: bool
   meta: Any
   footprint: Footprint
+  # GPUs the worker drives as one torchrun group.
+  devices: int = 1
 
   # Which replica of its role this is.
   index: int = 0
@@ -82,7 +84,11 @@ def describe_worker(model_id: str, role: str) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
   exclusive = not meta.shares_gpu()
-  return Worker(role, runtime, base_model, is_lora, exclusive, meta, footprint(base_model, meta.fine_tuning_type, role))
+  devices = meta.trainer_gpus if role == "trainer" else 1
+  size = footprint(base_model, meta.fine_tuning_type, role)
+  # Each torchrun rank is its own process with its own host memory.
+  size = replace(size, host_request_bytes=size.host_request_bytes * devices, host_limit_bytes=size.host_limit_bytes * devices)
+  return Worker(role, runtime, base_model, is_lora, exclusive, meta, size, devices)
 
 
 def pod_env(worker: Worker) -> list[dict[str, Any]]:
@@ -99,8 +105,11 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
     "OPEN_RL_TIME_SLICE_JOB_ID": worker.name,
     "OPEN_RL_ACCEL_TIMESLICER_PORT": os.getenv("OPEN_RL_ACCEL_TIMESLICER_PORT", "9753"),
   }
-  if os.getenv("VLLM_GPU_MEMORY_UTILIZATION"):
-    values["VLLM_GPU_MEMORY_UTILIZATION"] = os.environ["VLLM_GPU_MEMORY_UTILIZATION"]
+  # MAX_JOBS caps FlashInfer's JIT build, which otherwise runs one ~3GB
+  # compiler per core and blows through the pod's host memory limit.
+  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
+    if os.getenv(name):
+      values[name] = os.environ[name]
   # No other worker shares an exclusive worker's GPUs, so it never parks.
   if worker.exclusive:
     values["OPEN_RL_TIME_SLICING"] = "off"
@@ -114,6 +123,9 @@ def worker_container(worker: Worker) -> tuple[str, list[str]]:
   names, runs the python on its image's PATH."""
   if worker.role == "trainer" and worker.meta.trainer_backend != "pytorch":
     image = worker.meta.trainer_image() or os.getenv("OPEN_RL_AUTOMODEL_IMAGE", "ghcr.io/gke-labs/open-rl/automodel:latest")
+    if worker.devices > 1:
+      torchrun = ["-m", "torch.distributed.run", "--standalone", f"--nproc-per-node={worker.devices}"]
+      return image, ["python", "-u", *torchrun, "-m", worker_module(worker.role)]
     return image, ["python", "-u", "-m", worker_module(worker.role)]
   image = os.getenv("OPEN_RL_WORKER_IMAGE", "ghcr.io/gke-labs/open-rl/server:latest")
   return image, ["uv", "run", "python", "-u", "-m", worker_module(worker.role)]
@@ -147,9 +159,21 @@ def pod_template(worker: Worker) -> dict[str, Any]:
     },
   }
 
+  # NCCL moves data between ranks through /dev/shm, which is 64Mi by default.
+  if worker.devices > 1:
+    template["spec"]["containers"][0]["volumeMounts"].append({"name": "dshm", "mountPath": "/dev/shm"})
+    template["spec"]["volumes"].append({"name": "dshm", "emptyDir": {"medium": "Memory"}})
+
   if pull_policy := os.getenv("OPEN_RL_WORKER_IMAGE_PULL_POLICY"):
     template["spec"]["containers"][0]["imagePullPolicy"] = pull_policy
   return template
+
+
+def accelerator_spec(worker: Worker) -> dict[str, Any]:
+  """A torchrun group asks for its devices, each sized for a whole replica."""
+  if worker.devices > 1:
+    return {"mode": "MultiGPU", "devices": worker.devices, "memory": worker.footprint.accelerator}
+  return {"mode": "SingleGPU", "memory": worker.footprint.accelerator}
 
 
 def workload_body(worker: Worker) -> dict[str, Any]:
@@ -163,7 +187,7 @@ def workload_body(worker: Worker) -> dict[str, Any]:
       "exclusive": worker.exclusive,
       "modelID": worker.runtime,
       "ownerID": worker.owner,
-      "accelerator": {"mode": "SingleGPU", "memory": worker.footprint.accelerator},
+      "accelerator": accelerator_spec(worker),
       "workerContainerName": "worker",
       "template": pod_template(worker),
     },

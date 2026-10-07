@@ -170,6 +170,12 @@ class Settings(BaseModel):
   # The trainer the model runs on. Automodel is LoRA only. An image runs its
   # own trainer, picked by the OPEN_RL_TRAINER_BACKEND it sets.
   trainer_backend: Annotated[str, AfterValidator(parse_trainer_backend)] = "pytorch"
+  # GPUs the trainer drives as one data-parallel torchrun group. More than
+  # one is Automodel only and makes the model exclusive.
+  trainer_gpus: int = Field(default=1, ge=1, le=8)
+  # Trainer GPUs that share one sequence, as context parallelism. The rest
+  # of trainer_gpus is data parallel.
+  trainer_cp: int = Field(default=1, ge=1, le=8)
 
 
 def tag_metadata(tags: list[str]) -> dict[str, str]:
@@ -434,6 +440,12 @@ async def _extract_and_persist_model_metadata(
     raise ValueError("A trainer image needs a server that launches workers as pods")
   if settings.trainer_backend == "automodel" and fine_tuning_type != "lora":
     raise ValueError("The automodel trainer supports LoRA only")
+  if settings.trainer_gpus > 1 and settings.trainer_backend != "automodel":
+    raise ValueError("openrl.trainer_gpus above 1 needs openrl.trainer_backend=automodel")
+  if settings.trainer_gpus > 1 and isinstance(worker_manager, LocalWorkerManager):
+    raise ValueError("openrl.trainer_gpus above 1 needs a server that launches workers as pods")
+  if settings.trainer_gpus % settings.trainer_cp:
+    raise ValueError(f"openrl.trainer_cp={settings.trainer_cp} must divide openrl.trainer_gpus={settings.trainer_gpus}")
   # Nothing parks an exclusive trainer, so it stays on the GPU.
   if settings.exclusive:
     full_config["cpu_offload"] = False
@@ -449,6 +461,8 @@ async def _extract_and_persist_model_metadata(
     sampler_replicas=settings.sampler_replicas,
     exclusive=settings.exclusive,
     trainer_backend=settings.trainer_backend,
+    trainer_gpus=settings.trainer_gpus,
+    trainer_cp=settings.trainer_cp,
   )
   await persist_model_metadata(state, model_id, meta_obj)
 
