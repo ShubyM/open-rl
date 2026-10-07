@@ -3,13 +3,18 @@
 The router sends each request to the replica that already holds the longest
 cached prefix, so an agent's turns keep landing where its history is cached.
 Replicas load adapters by name with vLLM's filesystem LoRA resolver, which
-looks for <cache dir>/<name>/adapter_config.json.
+looks for <cache dir>/<name>/adapter_config.json. The trainer overwrites one
+PEFT directory on every save, so each sampler version is copied out under its
+own name and deleted once a newer version is in use and it has no requests.
 """
 
 import asyncio
 import hashlib
 import json
 import os
+import shutil
+import tempfile
+from collections import defaultdict
 from typing import Any
 
 import httpx
@@ -29,25 +34,104 @@ def router_for(base_model: str | None) -> str | None:
   return routers().get(base_model or "")
 
 
+def job_of(ref: str) -> str:
+  """The training job a model id or sampling ref belongs to."""
+  return ref.split("://")[-1].split("/")[0]
+
+
 def adapter_name(model_id: str) -> str:
   """A sampling ref like tinker://<id>/sampler_weights/000031 as one path segment.
   Each saved version gets its own name, so replicas never serve a stale adapter."""
   digest = hashlib.sha256(model_id.encode()).hexdigest()[:16]
-  return f"{model_id.split('://')[-1].split('/')[0]}-{digest}"
+  return f"{job_of(model_id)}-{digest}"
 
 
-def publish_adapter(peft_dir: str, name: str, cache_dir: str) -> bool:
-  """Point <cache_dir>/<name> at the saved adapter. False before the first save."""
+def snapshot_adapter(peft_dir: str, cache_dir: str, name: str, aliases: tuple[str, ...] = ()) -> bool:
+  """Copy the saved adapter to <cache_dir>/<name>, and link each alias to it.
+  False before the first save. The copy is renamed into place, so a replica
+  never sees a partial one."""
   if not os.path.exists(os.path.join(peft_dir, "adapter_config.json")):
     return False
-  link = os.path.join(cache_dir, name)
-  if not os.path.lexists(link):
+  target = os.path.join(cache_dir, name)
+  if not os.path.exists(target):
     os.makedirs(cache_dir, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=f".{name}-", dir=cache_dir)
     try:
-      os.symlink(peft_dir, link)
-    except FileExistsError:
-      pass
+      shutil.copytree(peft_dir, staging, dirs_exist_ok=True)
+      os.rename(staging, target)
+    except OSError:
+      shutil.rmtree(staging, ignore_errors=True)
+      if not os.path.exists(target):
+        raise
+  for alias in aliases:
+    link = os.path.join(cache_dir, alias)
+    if alias != name and not os.path.lexists(link):
+      try:
+        os.symlink(name, link)
+      except FileExistsError:
+        pass
   return True
+
+
+def remove_adapter(cache_dir: str, names: list[str]) -> None:
+  for name in names:
+    path = os.path.join(cache_dir, name)
+    if os.path.islink(path):
+      os.unlink(path)
+    else:
+      shutil.rmtree(path, ignore_errors=True)
+
+
+class AdapterVersions:
+  """Each job's sampler versions in save order, and the requests in flight on
+  each. A version can go once a newer one exists and nothing samples it. Kept
+  in the gateway's memory, which assumes one gateway replica."""
+
+  def __init__(self) -> None:
+    # job -> versions in save order; a version is its names, the first one the directory.
+    self.versions: dict[str, list[list[str]]] = defaultdict(list)
+    self.in_flight: dict[str, int] = defaultdict(int)
+    self.deleted_jobs: set[str] = set()
+
+  def known(self, name: str) -> bool:
+    return any(name in version for versions in self.versions.values() for version in versions)
+
+  def add(self, job: str, names: list[str]) -> list[str]:
+    """Record a newly saved version. Returns names that can be deleted now."""
+    self.deleted_jobs.discard(job)
+    if not any(set(names) & set(version) for version in self.versions[job]):
+      self.versions[job].append(list(names))
+    return self.collect(job)
+
+  def start(self, name: str) -> None:
+    self.in_flight[name] += 1
+
+  def finish(self, job: str, name: str) -> list[str]:
+    self.in_flight[name] -= 1
+    if self.in_flight[name] <= 0:
+      del self.in_flight[name]
+    return self.collect(job)
+
+  def remove_job(self, job: str) -> list[str]:
+    """The job is deleted: every version can go once idle."""
+    self.deleted_jobs.add(job)
+    return self.collect(job)
+
+  def collect(self, job: str) -> list[str]:
+    versions = self.versions.get(job, [])
+    keep_latest = 0 if job in self.deleted_jobs else 1
+    removable, kept = [], []
+    for index, version in enumerate(versions):
+      superseded = index < len(versions) - keep_latest
+      if superseded and not any(self.in_flight.get(name) for name in version):
+        removable.extend(version[1:] + version[:1])  # links before the directory they point at
+      else:
+        kept.append(version)
+    if kept:
+      self.versions[job] = kept
+    else:
+      self.versions.pop(job, None)
+    return removable
 
 
 def completion_body(model: str, request: dict[str, Any]) -> dict[str, Any]:

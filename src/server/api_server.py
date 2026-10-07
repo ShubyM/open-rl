@@ -762,6 +762,8 @@ async def delete_model(req: ModelRequest):
     await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)), active_set_id=await _resolve_active_set_id(model_id))
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
     await asyncio.to_thread(worker_manager.release, model_id)
+  if await routed_through_llmd(model_id):
+    await asyncio.to_thread(llmd.remove_adapter, llmd_adapter_dir(), llmd_versions.remove_job(model_id))
   now = time.time()
   meta.status = "completed"
   meta.completed_at = now
@@ -847,6 +849,11 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
     return JSONResponse(status_code=400, content=result)
   if isinstance(result, dict):
+    if result.get("type") == "sampler_weights_saved":
+      refs = [ref for ref in (result.get("sampling_session_id"), result.get("path")) if ref]
+      # Before the client holds the ref, so no sample can see a later save's weights.
+      if refs and await routed_through_llmd(llmd.job_of(refs[0])):
+        await publish_llmd_version(refs)
     if proto_codec.PROTO_CONTENT_TYPE in accept:
       encoded = proto_codec.encode_future_result(result)
       if encoded is not None:
@@ -1099,13 +1106,12 @@ async def asample(req: AsampleRequest):
   fine_tuning_type = model_meta.fine_tuning_type if model_meta else "lora"
 
   if fine_tuning_type == "lora":
-    peft_dir = os.path.join(TMP_DIR, "peft", lookup_id, lookup_id)
-    router = llmd.router_for(model_meta.base_model if model_meta else None)
-    if router:
-      await start_llmd_sample(req_id, router, model_meta.base_model, model_id, peft_dir, req, prompt)
+    if router := llmd.router_for(model_meta.base_model if model_meta else None):
+      await start_llmd_sample(req_id, router, model_meta.base_model, model_id, req, prompt)
       return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
     weights_path = None
     lora_id = model_id
+    peft_dir = os.path.join(TMP_DIR, "peft", lookup_id, lookup_id)
     lora_path = peft_dir if os.path.exists(peft_dir) else None
     queue_id = (model_meta.runtime(lookup_id) if model_meta else None) or lookup_id
   else:
@@ -1138,17 +1144,36 @@ async def asample(req: AsampleRequest):
 
 llmd_client: httpx.AsyncClient | None = None
 llmd_tasks: set[asyncio.Task] = set()
+llmd_versions = llmd.AdapterVersions()
 
 
-async def start_llmd_sample(req_id: str, router: str, base_model: str, model_id: str, peft_dir: str, req: AsampleRequest, prompt: list[int]) -> None:
+def llmd_adapter_dir() -> str:
+  return os.path.join(TMP_DIR, "llmd-adapters")
+
+
+async def publish_llmd_version(refs: list[str]) -> bool:
+  """Snapshot the job's saved adapter as the version these refs name, and drop
+  versions it supersedes that nothing samples. False before the first save."""
+  job = llmd.job_of(refs[0])
+  names = [llmd.adapter_name(ref) for ref in refs]
+  peft_dir = os.path.join(TMP_DIR, "peft", job, job)
+  if not await asyncio.to_thread(llmd.snapshot_adapter, peft_dir, llmd_adapter_dir(), names[0], tuple(names[1:])):
+    return False
+  await asyncio.to_thread(llmd.remove_adapter, llmd_adapter_dir(), llmd_versions.add(job, names))
+  return True
+
+
+async def start_llmd_sample(req_id: str, router: str, base_model: str, model_id: str, req: AsampleRequest, prompt: list[int]) -> None:
   """Sample in the background and resolve the future, like a queue worker would."""
   global llmd_client
   if llmd_client is None:
     # A turn can generate for minutes, and an agent batch keeps hundreds in flight.
     llmd_client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), limits=httpx.Limits(max_connections=None))
   name = llmd.adapter_name(model_id)
-  # Before the first save a LoRA job samples from the base model.
-  has_adapter = await asyncio.to_thread(llmd.publish_adapter, peft_dir, name, os.path.join(TMP_DIR, "llmd-adapters"))
+  # Versions are snapshotted when their save is retrieved; this covers refs
+  # saved before a gateway restart. Before the first save a LoRA job samples
+  # from the base model.
+  has_adapter = llmd_versions.known(name) or await publish_llmd_version([model_id])
   params = req.sampling_params
   body = llmd.completion_body(
     name if has_adapter else base_model,
@@ -1165,10 +1190,15 @@ async def start_llmd_sample(req_id: str, router: str, base_model: str, model_id:
   )
 
   async def run() -> None:
+    if has_adapter:
+      llmd_versions.start(name)
     try:
       result = await llmd.sample(llmd_client, router, body)
     except Exception as exc:
       result = {"type": "RequestFailedResponse", "error_message": f"llm-d sampling failed: {exc}"}
+    finally:
+      if has_adapter:
+        await asyncio.to_thread(llmd.remove_adapter, llmd_adapter_dir(), llmd_versions.finish(llmd.job_of(model_id), name))
     await store.set_future(req_id, result)
 
   task = asyncio.create_task(run())
