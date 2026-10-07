@@ -115,12 +115,12 @@ class PodmanLabSandbox:
     await asyncio.to_thread(self._sandbox.stop)
 
 
-def configured_sandbox_factory(substrate_endpoint: str | None, substrate_template: str) -> SandboxFactory:
-  if not substrate_endpoint:
+def configured_sandbox_factory(sandbox_warmpool: str | None, sandbox_namespace: str) -> SandboxFactory:
+  if not sandbox_warmpool:
     return podman_sandbox_factory
-  from .substrate_sandbox import SubstrateSandboxFactory
+  from .agent_sandbox import AgentSandboxFactory
 
-  return SubstrateSandboxFactory(substrate_endpoint, substrate_template)
+  return AgentSandboxFactory(sandbox_warmpool, sandbox_namespace)
 
 
 async def podman_sandbox_factory(request: SandboxRequest) -> LabSandbox:

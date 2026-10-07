@@ -1,4 +1,4 @@
-# The Harvey LAB driver for a cluster run. Sandboxes run on Agent Substrate,
+# The Harvey LAB driver for a cluster run. Sandboxes run on Agent Sandbox,
 # so the image needs no Podman, only the client, LAB, and LAB's grading venv.
 # Build from the repository root:
 #   gcloud builds submit --config cloudbuild.yaml \
@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 WORKDIR /app
 COPY examples/pyproject.toml examples/uv.lock examples/README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --extra substrate
+    uv sync --frozen --no-install-project --extra agent-sandbox
 
 COPY examples/common ./common
 COPY examples/harvey_labs ./harvey_labs

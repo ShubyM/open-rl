@@ -1,7 +1,10 @@
-"""LAB sandboxes as Agent Substrate environments, driven through ate-env-api.
+"""LAB sandboxes on Agent Sandbox (sigs.k8s.io/agent-sandbox), driven through sandboxd.
 
-The guest image must be LAB's sandbox image plus ate-env-guest. Documents and
-the workspace are uploaded at start; deliverables are pulled back as a tar.
+Each episode claims a sandbox from a SandboxWarmPool. The guest image must be
+LAB's sandbox image running sandboxd with --root-dir=/. The client reaches
+sandboxd by pod IP, so the sandbox cluster may be a different cluster on the
+same VPC; KUBECONFIG then points at it. Documents and the workspace are
+uploaded at start; deliverables are pulled back as a tar.
 """
 
 from __future__ import annotations
@@ -12,7 +15,6 @@ import json
 import re
 import shlex
 import tarfile
-import uuid
 from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
@@ -24,7 +26,7 @@ from .sandbox import LabSandbox, SandboxRequest, add_lab_to_path
 WORKSPACE = "/workspace"
 DOCUMENTS = "/workspace/documents"
 OUTPUT = "/workspace/output"
-READY_TIMEOUT = 180
+READY_TIMEOUT = 300
 # Slack over the in-guest coreutils timeout for the gRPC round trips.
 RPC_SLACK = 30
 COLLECT_ATTEMPTS = 4
@@ -78,34 +80,19 @@ def tar_bytes(entries: list[tuple[Path, str]]) -> bytes:
   return buffer.getvalue()
 
 
-async def wait_ready(env: Any) -> None:
-  """A fresh environment fails guest calls until its actor has booted."""
-  loop = asyncio.get_running_loop()
-  deadline = loop.time() + READY_TIMEOUT
-  delay = 0.5
-  while True:
-    try:
-      async with asyncio.timeout(30):
-        if (await env.shell("true")).exit_code == 0:
-          return
-    except Exception:
-      if loop.time() > deadline:
-        raise
-    if loop.time() > deadline:
-      raise TimeoutError(f"Substrate environment {env.id} not ready after {READY_TIMEOUT}s")
-    await asyncio.sleep(delay)
-    delay = min(delay * 2, 5)
+def relative(path: str) -> str:
+  """sandboxd takes paths relative to its root, which is /."""
+  return path.lstrip("/")
 
 
-class SubstrateLabSandbox:
-  """Async LabSandbox over one ate-env environment."""
+class AgentLabSandbox:
+  """Async LabSandbox over one claimed Agent Sandbox."""
 
-  def __init__(self, client: Any, env: Any, request: SandboxRequest, loop: asyncio.AbstractEventLoop):
+  def __init__(self, sandbox: Any, request: SandboxRequest, loop: asyncio.AbstractEventLoop):
     add_lab_to_path(request.lab_root)
     from harness.tools import get_all_tool_definitions
 
-    self.client = client
-    self.env = env
+    self.sandbox = sandbox
     self.request = request
     self.loop = loop
     self.tool_definitions = get_all_tool_definitions()
@@ -113,11 +100,11 @@ class SubstrateLabSandbox:
 
   @property
   def sandbox_id(self) -> str:
-    return self.env.id
+    return self.sandbox.sandbox_id
 
   async def shell(self, command: str, timeout: int) -> SandboxResult:
     async with asyncio.timeout(timeout + RPC_SLACK):
-      result = await self.env.shell(command)
+      result = await self.sandbox.commands.run(command, timeout=timeout + RPC_SLACK)
     timed_out = result.exit_code in (124, 137)
     return SandboxResult(stdout=result.stdout, stderr=result.stderr, exit_code=result.exit_code, metrics={"timed_out": timed_out})
 
@@ -139,15 +126,14 @@ class SubstrateLabSandbox:
     )
 
   async def read_bytes(self, path: str) -> bytes:
-    from ate_env import EnvError, NotFoundError
+    from k8s_agent_sandbox.exceptions import SandboxRequestError
 
-    async with asyncio.timeout(60):
-      try:
-        return await self.env.read_file_bytes(path)
-      except NotFoundError as exc:
+    try:
+      return await self.sandbox.files.read(relative(path), timeout=60)
+    except SandboxRequestError as exc:
+      if exc.status_code == 404:
         raise FileNotFoundError(path) from exc
-      except EnvError as exc:
-        raise OSError(f"{path}: {exc}") from exc
+      raise OSError(f"{path}: {exc}") from exc
 
   async def read_file(self, path: str, max_bytes: int | None = None, timeout: int = 60) -> SandboxResult:
     data = await self.read_bytes(path)
@@ -155,8 +141,9 @@ class SubstrateLabSandbox:
 
   async def write_file(self, path: str, content: str | bytes, executable: bool = False, timeout: int = 60) -> SandboxResult:
     data = content.encode() if isinstance(content, str) else content
-    async with asyncio.timeout(timeout):
-      await self.env.write_file(path, data, mode=0o755 if executable else 0o644)
+    await self.sandbox.files.write(relative(path), data, timeout=timeout)
+    if executable:
+      return await self.shell(f"chmod +x -- {shlex.quote(path)}", timeout)
     return SandboxResult(stdout="", stderr="", exit_code=0)
 
   async def exists(self, path: str) -> bool:
@@ -166,11 +153,11 @@ class SubstrateLabSandbox:
     command = f"python3 -c {shlex.quote(SEARCH_SCRIPT)} {shlex.quote(json.dumps(args))}"
     result = await self.shell(command, 60)
     if result.exit_code != 0:
-      raise OSError(f"search failed in {self.env.id}: {result.stderr.strip()[-500:]}")
+      raise OSError(f"search failed in {self.sandbox_id}: {result.stderr.strip()[-500:]}")
     return json.loads(result.stdout)
 
   async def send_heartbeat(self, timeout: int = 30) -> None:
-    pass  # Environments only suspend when asked.
+    pass  # Claims have no idle expiry.
 
   async def execute_tool(self, name: str, arguments: str | dict[str, Any]) -> str:
     return await asyncio.to_thread(self.executor.execute, name, arguments)
@@ -197,18 +184,18 @@ class SubstrateLabSandbox:
     archive = "/tmp/lab-output.tar"
     packed = await self.shell(f"tar -C {OUTPUT} -cf {archive} .", 120)
     if packed.exit_code != 0:
-      raise RuntimeError(f"could not pack outputs in {self.env.id}: {packed.stderr.strip()}")
+      raise RuntimeError(f"could not pack outputs in {self.sandbox_id}: {packed.stderr.strip()}")
     return await self.read_bytes(archive)
 
   async def cleanup(self) -> None:
     async with asyncio.timeout(60):
-      await self.client.delete(self.env.id, atespace=self.env.atespace)
+      await self.sandbox.terminate()
 
 
 class RemoteFiles:
   """The synchronous Sandbox surface LAB's ToolExecutor calls from its worker thread."""
 
-  def __init__(self, sandbox: SubstrateLabSandbox):
+  def __init__(self, sandbox: AgentLabSandbox):
     self.sandbox = sandbox
     # Host copies, used by LAB for document metrics only.
     self.documents_dir = sandbox.request.documents_dir
@@ -225,7 +212,7 @@ class RemoteFiles:
     try:
       result = self.call(self.sandbox.exec(command, cwd, timeout or self.sandbox.request.command_timeout, env))
     except Exception as exc:
-      return ExecResult(stdout="", stderr=f"substrate exec failed: {type(exc).__name__}: {exc}", returncode=1)
+      return ExecResult(stdout="", stderr=f"sandbox exec failed: {type(exc).__name__}: {exc}", returncode=1)
     if result.metrics["timed_out"]:
       return ExecResult(stdout=result.stdout, stderr=result.stderr, returncode=None, timed_out=True)
     return ExecResult(stdout=result.stdout, stderr=result.stderr, returncode=result.exit_code)
@@ -295,36 +282,32 @@ def remote_tool_executor(files: RemoteFiles, shell_timeout: int) -> Any:
   return RemoteToolExecutor(sandbox=files, shell_timeout=shell_timeout)
 
 
-class SubstrateSandboxFactory:
-  """One ate-env client shared by every sandbox of a run."""
+class AgentSandboxFactory:
+  """One Agent Sandbox client shared by every sandbox of a run."""
 
-  def __init__(self, endpoint: str, template: str):
-    self.endpoint = endpoint
-    self.template = template
+  def __init__(self, warmpool: str, namespace: str):
+    self.warmpool = warmpool
+    self.namespace = namespace
     self.client: Any = None
 
   async def __call__(self, request: SandboxRequest) -> LabSandbox:
-    from ate_env import Client
+    from k8s_agent_sandbox import AsyncSandboxClient
+    from k8s_agent_sandbox.models import SandboxdInClusterConnectionConfig
 
     if self.client is None:
-      self.client = Client(self.endpoint)
-    env_id = f"lab-{uuid.uuid4().hex[:16]}"
-    env = None
+      self.client = AsyncSandboxClient(connection_config=SandboxdInClusterConnectionConfig(mode="pod-ip"))
+    claimed = await self.client.create_sandbox(warmpool=self.warmpool, namespace=self.namespace, sandbox_ready_timeout=READY_TIMEOUT)
     try:
-      async with asyncio.timeout(60):
-        env = await self.client.create(env_id, template_name=self.template)
-      await wait_ready(env)
-      sandbox = SubstrateLabSandbox(self.client, env, request, asyncio.get_running_loop())
+      sandbox = AgentLabSandbox(claimed, request, asyncio.get_running_loop())
       # Documents land inside the uploaded workspace, as Podman mounts them.
       archive = await asyncio.to_thread(tar_bytes, [(request.workspace_dir, "."), (request.documents_dir, "documents")])
-      await sandbox.write_file("/tmp/lab-input.tar", archive)
+      await sandbox.write_file("/tmp/lab-input.tar", archive, timeout=300)
       unpack = f"mkdir -p {OUTPUT} && tar --no-same-owner -C {WORKSPACE} -xf /tmp/lab-input.tar && rm /tmp/lab-input.tar"
       unpacked = await sandbox.shell(unpack, 300)
       if unpacked.exit_code != 0:
-        raise RuntimeError(f"could not unpack inputs in {env_id}: {unpacked.stderr.strip()}")
+        raise RuntimeError(f"could not unpack inputs in {claimed.sandbox_id}: {unpacked.stderr.strip()}")
       return sandbox
     except BaseException:
-      if env is not None:
-        async with asyncio.timeout(60):
-          await self.client.delete(env_id)
+      async with asyncio.timeout(60):
+        await claimed.terminate()
       raise

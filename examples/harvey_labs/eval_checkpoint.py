@@ -30,7 +30,7 @@ async def run(config: EvalConfig, *, sandbox_factory: SandboxFactory = podman_sa
 
 def main() -> None:
   config = chz.entrypoint(EvalConfig, allow_hyphens=True)
-  asyncio.run(run(config, sandbox_factory=configured_sandbox_factory(config.substrate_endpoint, config.substrate_template)))
+  asyncio.run(run(config, sandbox_factory=configured_sandbox_factory(config.sandbox_warmpool, config.sandbox_namespace)))
 
 
 if __name__ == "__main__":

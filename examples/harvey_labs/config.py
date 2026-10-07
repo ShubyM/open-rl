@@ -34,8 +34,8 @@ class RunConfig:
   # continue (the cookbook's LENGTH-continue), bounded by max_trajectory_tokens.
   continue_after_truncation: bool = False
   command_timeout: int = 60
-  substrate_endpoint: str | None = None  # ate-env-api host:port; runs sandboxes on Agent Substrate instead of Podman.
-  substrate_template: str = "lab-sandbox"
+  sandbox_warmpool: str | None = None  # SandboxWarmPool name; runs sandboxes on Agent Sandbox instead of Podman.
+  sandbox_namespace: str = "lab-sandboxes"
   judge_model: str = "gpt-glm-5.2"  # OpenAI-compatible GLM endpoint via OPENAI_BASE_URL / OPENAI_API_KEY.
   judge_parallel: int = 0  # Auto: 16 for GLM, 1 otherwise.
 

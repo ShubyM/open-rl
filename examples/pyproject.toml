@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-substrate = ["ate-env-client"]
+agent-sandbox = ["k8s-agent-sandbox[async,grpc]==1.0.5.post1"]
 
 [project.scripts]
 harvey-train = "harvey_labs.train:main"
@@ -50,7 +50,6 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "torch-cpu" }
-ate-env-client = { git = "https://github.com/agent-substrate/env", subdirectory = "clients/python", rev = "ab40c7bfb2049af1a7aade9e7bf9c6cac925b5ca" }
 
 [tool.uv]
 override-dependencies = [
