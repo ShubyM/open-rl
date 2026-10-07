@@ -1,6 +1,5 @@
-# LAB episode sandboxes on the sandbox cluster. Apply after Agent Sandbox
-# v1.0.5 (sandbox.yaml + extensions.yaml) is installed:
-#   kubectl apply -f sandboxes.yaml
+# LAB episode sandboxes on the sandbox cluster; README.md has the setup.
+# The pod range and image below are this deployment's: replace them.
 apiVersion: v1
 kind: Namespace
 metadata:
