@@ -15,6 +15,12 @@ spec:
       # Without the training cluster's token the sandbox client falls back to
       # KUBECONFIG, which points at the sandbox cluster.
       automountServiceAccountToken: false
+      # Accelerator pools carry this taint; tolerating it lets the driver use
+      # their spare CPU when no general-purpose pool has room.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: driver
           # Your build of examples/harvey_labs/Dockerfile.
