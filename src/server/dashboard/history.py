@@ -25,9 +25,14 @@ async def record(store, placements: list[dict], now: float | None = None) -> Non
     if not placement.get("node"):
       continue
     key = KEY_PREFIX + placement["id"]
-    previous = await store.get_value(key)
-    first_seen = json.loads(previous)["first_seen"] if previous else now
-    entry = {**{field: placement.get(field) for field in FIELDS}, "first_seen": first_seen, "last_seen": now}
+    raw = await store.get_value(key)
+    previous = json.loads(raw) if raw else {}
+    entry = {**{field: placement.get(field) for field in FIELDS}, "first_seen": previous.get("first_seen", now), "last_seen": now}
+    # A shared worker outlives the runs it served, and a finished run stops
+    # being matched to it; keep every run it served and the label that named one.
+    entry["run_ids"] = list(dict.fromkeys([*previous.get("run_ids", []), *(placement.get("run_ids") or [])]))
+    if previous.get("run_ids") and not placement.get("run_ids"):
+      entry["label"] = previous.get("label")
     await store.set_value(key, json.dumps(entry), ttl_seconds=RETENTION_SECONDS)
     await store.add_to_set(SET_KEY, placement["id"])
 

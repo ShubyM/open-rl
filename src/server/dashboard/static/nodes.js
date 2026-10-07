@@ -21,9 +21,13 @@ function segments({ now }) {
   for (const entry of ui.state.history) {
     seen.add(entry.id);
     const end = live.has(entry.id) ? now : entry.last_seen;
+    const current = live.get(entry.id) || {};
     found.push({
       ...entry,
-      ...(live.get(entry.id) || {}),
+      ...current,
+      // A live shared worker no longer lists the finished runs it served; history does.
+      run_ids: [...new Set([...(entry.run_ids || []), ...(current.run_ids || [])])],
+      label: current.run_ids?.length ? current.label : entry.label,
       start: entry.first_seen,
       end,
       ended: !live.has(entry.id),
