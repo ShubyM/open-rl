@@ -1,0 +1,14 @@
+# Prefer the replica that already caches the request's prefix unless it is
+# loaded, so an agent's next turn lands where its history is cached.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: approx-prefix-cache-producer
+- type: inflight-load-producer
+- type: prefix-cache-affinity-filter
+- type: token-load-scorer
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: prefix-cache-affinity-filter
+  - pluginRef: token-load-scorer

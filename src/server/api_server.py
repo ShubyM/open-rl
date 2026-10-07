@@ -11,6 +11,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -186,6 +187,9 @@ class Settings(BaseModel):
   fft_seed: int | None = None
   # Park trainer state in host memory between turns. Exclusive models default to off.
   fft_cpu_offload: Annotated[bool | None, BeforeValidator(parse_bool)] = None
+  # An llm-d router on the model's first sampler sends each request to the
+  # replica that caches the longest prefix of its prompt. LoRA only.
+  sampler_router: Literal["llmd"] | None = None
 
 
 def tag_metadata(tags: list[str]) -> dict[str, str]:
@@ -453,6 +457,10 @@ async def _extract_and_persist_model_metadata(
     raise ValueError("openrl.trainer_gpus above 1 needs openrl.trainer_backend=automodel")
   if settings.trainer_gpus > 1 and isinstance(worker_manager, LocalWorkerManager):
     raise ValueError("openrl.trainer_gpus above 1 needs a server that launches workers as pods")
+  if settings.sampler_router and fine_tuning_type != "lora":
+    raise ValueError("openrl.sampler_router supports LoRA only")
+  if settings.sampler_router and (worker_manager is None or isinstance(worker_manager, LocalWorkerManager)):
+    raise ValueError("openrl.sampler_router needs a server that launches workers as pods")
   if settings.trainer_gpus % settings.trainer_cp:
     raise ValueError(f"openrl.trainer_cp={settings.trainer_cp} must divide openrl.trainer_gpus={settings.trainer_gpus}")
   model_id = str(uuid.uuid4())
@@ -468,6 +476,7 @@ async def _extract_and_persist_model_metadata(
     trainer_backend=settings.trainer_backend,
     trainer_gpus=settings.trainer_gpus,
     trainer_cp=settings.trainer_cp,
+    sampler_router=settings.sampler_router,
   )
   await persist_model_metadata(state, model_id, meta_obj)
 
@@ -1124,8 +1133,51 @@ async def asample(req: AsampleRequest):
     "trace_context": carrier,
   }
 
-  await store.put_sampling_request(sampling_req)
+  if model_meta is not None and model_meta.sampler_router == "llmd" and worker_manager is not None:
+    task = asyncio.create_task(sample_through_router(lookup_id, sampling_req))
+    routed_samples.add(task)
+    task.add_done_callback(routed_samples.discard)
+  else:
+    await store.put_sampling_request(sampling_req)
   return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
+
+
+ROUTER_ATTEMPTS = 4
+router_client: httpx.AsyncClient | None = None
+router_urls: dict[str, str] = {}
+routed_samples: set[asyncio.Task] = set()
+
+
+async def sample_through_router(model_id: str, request: dict[str, Any]) -> None:
+  """Send the request to the llm-d router on the model's first sampler, which
+  picks the replica caching its prompt. The routed samplers still drain the
+  queue, so a router that cannot be reached falls back to it."""
+  global router_client
+  if router_client is None:
+    # A turn can generate for minutes, and an agent batch keeps hundreds in flight.
+    router_client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), limits=httpx.Limits(max_connections=None))
+  # The model in the body is what the router keys its prefix cache by.
+  body = {
+    "model": request["lora_id"] or request["model_id"],
+    "prompt": request["prompt_token_ids"],
+    "max_tokens": request["max_tokens"],
+    "openrl": request,
+  }
+  for attempt in range(ROUTER_ATTEMPTS):
+    url = router_urls.get(model_id) or await asyncio.to_thread(worker_manager.router_url, model_id)
+    if url:
+      router_urls[model_id] = url
+      try:
+        response = await router_client.post(f"{url}/v1/completions", json=body)
+        if response.status_code < 500:
+          await store.set_future(request["request_id"], response.json())
+          return
+      except httpx.TransportError:
+        pass
+    # The router's pod is starting or was replaced; look it up again.
+    router_urls.pop(model_id, None)
+    await asyncio.sleep(2**attempt)
+  await store.put_sampling_request(request)
 
 
 # *** CLI endpoints ***
