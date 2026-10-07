@@ -16,6 +16,14 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 class RequestStore(ABC):
   """Request queues and results, keyed by request ID."""
 
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int = 120) -> None:
+    """Append a telemetry sample, keeping the most recent limit entries."""
+    raise NotImplementedError
+
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    """Retained telemetry samples in append order."""
+    raise NotImplementedError
+
   @abstractmethod
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     """Push a request into the tenant queue and assign to an active set."""
@@ -62,6 +70,15 @@ class InMemoryStore(RequestStore):
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_cv = asyncio.Condition()
     self.sampling_queues: dict[str, asyncio.Queue] = {}
+    self.sample_store: dict[str, list[str]] = {}
+
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int = 120) -> None:
+    samples = self.sample_store.setdefault(key, [])
+    samples.append(json.dumps(sample, allow_nan=False))
+    del samples[:-limit]
+
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    return [json.loads(sample) for sample in self.sample_store.get(key, [])]
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
@@ -151,6 +168,15 @@ class RedisStore(RequestStore):
     self.active_list = "open_rl:active_tenants"
     # We also keep a set to guarantee O(1) deduplication before RPushing
     self.active_set = "open_rl:active_tenants_set"
+
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int = 120) -> None:
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.rpush(key, json.dumps(sample, allow_nan=False))
+      pipeline.ltrim(key, -limit, -1)
+      await pipeline.execute()
+
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    return [json.loads(sample) for sample in await self.redis.lrange(key, 0, -1)]
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
