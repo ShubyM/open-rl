@@ -333,18 +333,33 @@ def clean_cli_extra(extra: str) -> list[str]:
   return [token for token in shlex.split(extra) if not (token.startswith("weight_sync_strategy=") or token.startswith("jitter_sec="))]
 
 
+def set_settings(env: dict[str, str], **settings: str | None) -> None:
+  """Write openrl. settings into TINKER_TAGS, which the SDK sends with each session."""
+  tags = {tag.partition("=")[0]: tag for tag in env.get("TINKER_TAGS", "").split(",") if tag}
+  for name, value in settings.items():
+    if value is not None:
+      tags[f"openrl.{name}"] = f"openrl.{name}={value}"
+  # The server refuses FFT options on a LoRA model.
+  if tags.get("openrl.fine_tuning_type") != "openrl.fine_tuning_type=full":
+    tags.pop("openrl.weight_sync", None)
+  if tags:
+    env["TINKER_TAGS"] = ",".join(tags.values())
+  else:
+    env.pop("TINKER_TAGS", None)
+
+
 def examples_env(config: RunConfig) -> dict[str, str]:
   env = os.environ.copy()
   env["OPEN_RL_TMP_DIR"] = str(open_rl_tmp_dir(config))
   env["PYTHONUNBUFFERED"] = "1"
   env.setdefault("TINKER_API_KEY", "tml-dummy-key")
+  weight_sync = env.get("OPEN_RL_WEIGHT_SYNC_STRATEGY")
   for token in shlex.split(config.extra):
     if token.startswith("weight_sync_strategy="):
-      env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = token.split("=", 1)[1]
-  if config.weight_sync_strategy:
-    env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = config.weight_sync_strategy
-  if config.scenario.startswith("fft") or "fft" in config.scenario:
-    env["OPEN_RL_FINE_TUNING_TYPE"] = "full"
+      weight_sync = token.split("=", 1)[1]
+  weight_sync = config.weight_sync_strategy or weight_sync
+  fine_tuning_type = "full" if config.scenario.startswith("fft") or "fft" in config.scenario else None
+  set_settings(env, fine_tuning_type=fine_tuning_type, weight_sync=weight_sync)
   existing_path = env.get("PYTHONPATH", "")
   env["PYTHONPATH"] = f"examples:{existing_path}" if existing_path else "examples"
   return env
@@ -698,10 +713,7 @@ def run_gsm8k_rl_x4_mixed(config: RunConfig, base_url: str, watch: list[ManagedP
         *clean_cli_extra(config.extra),
       ]
       env = examples_env(config).copy()
-      if mode == "lora":
-        env["OPEN_RL_FINE_TUNING_TYPE"] = "lora"
-      else:
-        env["OPEN_RL_FINE_TUNING_TYPE"] = "full"
+      set_settings(env, fine_tuning_type="lora" if mode == "lora" else "full")
 
       results[job] = run_command(
         ["uv", "--project", "examples", "run", "python", "-m", module_name, *args],
@@ -759,7 +771,7 @@ def run_gsm8k_rl_x2_compare(config: RunConfig, base_url: str, watch: list[Manage
         *clean_cli_extra(config.extra),
       ]
       env = examples_env(config)
-      env["OPEN_RL_WEIGHT_SYNC_STRATEGY"] = weight_sync_strategy
+      set_settings(env, fine_tuning_type="full", weight_sync=weight_sync_strategy)
       results[job] = run_command(
         [
           "uv",
