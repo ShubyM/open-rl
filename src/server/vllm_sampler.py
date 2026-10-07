@@ -27,6 +27,7 @@ from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_fr
 from accel_timeslicer.workload import SAMPLER_CLAIM, WorkloadRef, local_workload_name
 from server.sampler_http import serve_http
 from server.store import RequestStore, StateStore, get_state_store, get_store
+from server.telemetry.ops import gpu_turn, observe_operation, record_op
 from server.vllm_options import gpu_memory_utilization, sampler_batch_limits, split_stop, text_only_engine_kwargs
 
 tracer = trace.get_tracer("vllm.inference.worker")
@@ -214,19 +215,23 @@ class Sampler:
 
 
 @asynccontextmanager
-async def holding_gpu(time_slicer: TimeSlicerClient | None, workload: WorkloadRef | None, sampler: Sampler | None = None):
+async def holding_gpu(
+  time_slicer: TimeSlicerClient | None, workload: WorkloadRef | None, store: RequestStore, model_id: str, sampler: Sampler | None = None
+):
   """Hold the time-slicer slot for the body, waking the sampler inside it. Without a slicer the GPU is ours."""
   if time_slicer is None:
     yield
     return
-  async with time_slicer.acquire(workload):
+  async with gpu_turn(time_slicer, workload, store, "sampler", model_id):
     if sampler is not None:
-      await sampler.wake()
+      with record_op("wake_up"):
+        await sampler.wake()
     try:
       yield
     finally:
       if sampler is not None:
-        await sampler.sleep()
+        with record_op("sleep"):
+          await sampler.sleep()
 
 
 async def process_batch(sampler: Sampler, store: RequestStore, requests: list[dict[str, Any]]) -> None:
@@ -234,7 +239,8 @@ async def process_batch(sampler: Sampler, store: RequestStore, requests: list[di
   for weights_path, group in groupby(requests, key=lambda req: req.get("weights_path")):
     batch = list(group)
     try:
-      await sampler.ensure_weights(weights_path)
+      with record_op("weight_sync"):
+        await sampler.ensure_weights(weights_path)
     except Exception as exc:
       for request in batch:
         await store.set_future(request["request_id"], failed_response(f"vLLM weight update failed: {exc}"))
@@ -271,7 +277,7 @@ async def fail_requests(store: RequestStore, requests: list[dict[str, Any]], err
 async def process_request(sampler: Sampler, store: RequestStore, request: dict[str, Any]) -> None:
   with tracer.start_as_current_span("process_sampling_request", context=propagate.extract(request.get("trace_context", {}))):
     try:
-      result = await sampler.generate(request)
+      result = await observe_operation(store, request, "sampler", None, lambda: sampler.generate(request))
       result["type"] = "sample"
     except Exception as exc:
       result = failed_response(f"vLLM Worker Error: {exc}")
@@ -295,7 +301,7 @@ async def serve(
   Queue and store errors are retried. A dead engine or a process the time slicer
   could not park raises, so the worker exits and is restarted.
   """
-  async with holding_gpu(time_slicer, workload):
+  async with holding_gpu(time_slicer, workload, store, model_id):
     sampler = Sampler(make_engine())
     if time_slicer is not None:
       await sampler.sleep()  # give the memory back before releasing the slot
@@ -322,7 +328,7 @@ async def serve(
           shutdown = any(req.get("request_id") == SHUTDOWN_SENTINEL for req in batch)
           requests = [req for req in batch if req.get("request_id") != SHUTDOWN_SENTINEL]
           if requests:
-            async with holding_gpu(time_slicer, workload, sampler):
+            async with holding_gpu(time_slicer, workload, store, model_id, sampler):
               started = True
               await process_batch(sampler, store, requests)
           if shutdown:
