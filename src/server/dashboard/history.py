@@ -33,6 +33,9 @@ async def record(store, placements: list[dict], now: float | None = None) -> Non
     entry["run_ids"] = list(dict.fromkeys([*previous.get("run_ids", []), *(placement.get("run_ids") or [])]))
     if previous.get("run_ids") and not placement.get("run_ids"):
       entry["label"] = previous.get("label")
+    # Teardown deletes the claim before the workload, so the last sightings have no devices.
+    if previous.get("devices") and not placement.get("devices"):
+      entry["devices"] = previous["devices"]
     await store.set_value(key, json.dumps(entry), ttl_seconds=RETENTION_SECONDS)
     await store.add_to_set(SET_KEY, placement["id"])
 

@@ -44,6 +44,12 @@ class PlacementHistoryTest(unittest.TestCase):
     asyncio.run(history.record(store, [{**PLACEMENT, "run_ids": [], "label": "Qwen/Qwen3-8B"}], now=110.0))
     self.assertEqual(asyncio.run(history.read(store, since=0))[0]["label"], "Qwen3-8B · abc")
 
+  def test_devices_survive_the_claim_being_deleted_first(self) -> None:
+    store = InMemoryStore()
+    asyncio.run(history.record(store, [PLACEMENT], now=100.0))
+    asyncio.run(history.record(store, [{**PLACEMENT, "devices": []}], now=110.0))
+    self.assertEqual(asyncio.run(history.read(store, since=0))[0]["devices"], ["gpu-0"])
+
   def test_read_filters_by_last_seen(self) -> None:
     store = InMemoryStore()
     asyncio.run(history.record(store, [PLACEMENT], now=100.0))
