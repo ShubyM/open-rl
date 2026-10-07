@@ -1169,8 +1169,12 @@ async def sample_through_router(model_id: str, request: dict[str, Any]) -> None:
       router_urls[model_id] = url
       try:
         response = await router_client.post(f"{url}/v1/completions", json=body)
-        if response.status_code < 500:
+        if response.status_code == 200:
           await store.set_future(request["request_id"], response.json())
+          return
+        if response.status_code < 500:
+          error = {"type": "RequestFailedResponse", "error_message": f"llm-d router returned {response.status_code}: {response.text[:500]}"}
+          await store.set_future(request["request_id"], error)
           return
       except httpx.TransportError:
         pass

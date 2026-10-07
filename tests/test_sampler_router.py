@@ -128,6 +128,15 @@ class GatewayRoutingTest(unittest.TestCase):
     self.assertEqual(self.sampler.requests[0]["lora_id"], "tinker://job/sampler_weights/000003")
     self.assertEqual(asyncio.run(self.store.get_sampling_requests_for_model("job")), [])
 
+  def test_a_refused_request_fails_instead_of_returning_the_error_as_a_sample(self) -> None:
+    refusing = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(429, text="too many requests")))
+    with patch.object(api_server, "worker_manager", Routers("http://router")), patch.object(api_server, "router_client", refusing):
+      body = {"model_id": "job", "prompt": {"chunks": [{"tokens": [1, 2, 3]}]}, "sampling_params": {"max_tokens": 2}}
+      promise = self.client.post("/api/v1/asample", json=body).json()
+      response = self.client.post("/api/v1/retrieve_future", json={"request_id": promise["request_id"]})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("llm-d router returned 429", response.json()["error_message"])
+
   def test_an_unreachable_router_falls_back_to_the_queue(self) -> None:
     with patch.object(api_server, "worker_manager", Routers(None)), patch.object(api_server, "ROUTER_ATTEMPTS", 1):
       body = {"model_id": "job", "prompt": {"chunks": [{"tokens": [1, 2, 3]}]}, "sampling_params": {"max_tokens": 2}}
