@@ -59,8 +59,8 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
   async def test_shared_lora_owner_outlives_the_session_that_created_it(self):
     training = (await self.post("create_session", {}))["session_id"]
     adapter = (await self.post("create_model", {"base_model": "test-base", "session_id": training}))["request_id"]
-    fft_headers = {"x-open-rl-fine-tuning-type": "full"}
-    fft_model = (await self.post("create_model", {"base_model": "fft-base", "session_id": training}, headers=fft_headers))["request_id"]
+    fft_body = {"base_model": "fft-base", "session_id": training, "user_metadata": {"openrl.fine_tuning_type": "full"}}
+    fft_model = (await self.post("create_model", fft_body))["request_id"]
     await self.state.set_value("open_rl:sampler_ready:test-base", "1")
     sampling = (await self.post("create_session", {}))["session_id"]
     await self.post("create_sampling_session", {"model_path": f"tinker://{adapter}/sampler_weights/test", "session_id": sampling})

@@ -341,6 +341,57 @@ class RestoreRoutingTest(ApiServerTest):
         self.assertEqual((metadata["base_model"], metadata["fine_tuning_type"]), ("checkpoint-base", kind))
         self.assertEqual(self.queued()[0]["payload"]["fine_tuning_type"], kind)
 
+  def test_restore_refuses_a_fine_tuning_type_the_checkpoint_does_not_have(self):
+    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
+      with open(os.path.join(directory, "metadata.json"), "w") as f:
+        json.dump({"base_model": "checkpoint-base"}, f)
+      with open(os.path.join(directory, "adapter_config.json"), "w") as f:
+        json.dump({"r": 8}, f)
+      response = self.post("create_model_from_state", {"state_path": directory, "user_metadata": {"openrl.fine_tuning_type": "full"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("does not match the lora checkpoint", response.json()["error"])
+
+
+class FineTuningSettingsTest(ApiServerTest):
+  """Full fine-tuning and its options are openrl. settings, from TINKER_TAGS or user_metadata."""
+
+  def setUp(self) -> None:
+    super().setUp()
+    self.enterContext(patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}))
+
+  def metadata(self, model_id: str) -> dict:
+    return json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+
+  def test_tags_choose_full_fine_tuning_and_its_weight_sync(self) -> None:
+    tags = ["openrl.fine_tuning_type=full", "openrl.weight_sync=full", "openrl.fft_cpu_offload=false"]
+    session_id = self.post("create_session", {"tags": tags}).json()["session_id"]
+    meta = self.metadata(self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"])
+    self.assertEqual(meta["fine_tuning_type"], "full")
+    self.assertEqual(meta["weight_sync_config"]["strategy"], "full")
+    self.assertEqual(meta["full_config"], {"seed": None, "cpu_offload": False, "weight_sync_strategy": "full"})
+
+  def test_lora_is_the_default(self) -> None:
+    meta = self.metadata(self.post("create_model", {"base_model": "m"}).json()["request_id"])
+    self.assertEqual(meta["fine_tuning_type"], "lora")
+
+  def test_full_fine_tuning_options_on_a_lora_model_are_refused(self) -> None:
+    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.weight_sync": "full"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("openrl.weight_sync applies to fine_tuning_type=full only", response.json()["error"])
+
+  def test_bad_values_are_refused(self) -> None:
+    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.fine_tuning_type": "qlora"}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("openrl.fine_tuning_type", response.json()["error"])
+
+  def test_the_removed_header_and_full_config_point_at_the_settings(self) -> None:
+    response = self.post("create_model", {"base_model": "m"}, headers={"x-open-rl-fine-tuning-type": "full"})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("set openrl.fine_tuning_type", response.json()["error"])
+    response = self.post("create_model", {"base_model": "m", "full_config": {"seed": 1}})
+    self.assertEqual(response.status_code, 400)
+    self.assertIn("openrl.fft_seed", response.json()["error"])
+
 
 class ExclusiveMetadataTest(ApiServerTest):
   """A model may ask for a workload no other workload shares; nothing parks it there."""
@@ -458,8 +509,7 @@ class TrainerBackendTest(ApiServerTest):
     with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
       response = self.post(
         "create_model",
-        {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "automodel"}},
-        headers={"x-open-rl-fine-tuning-type": "full"},
+        {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "automodel", "openrl.fine_tuning_type": "full"}},
       )
     self.assertEqual(response.status_code, 400)
     self.assertIn("LoRA only", response.json()["error"])

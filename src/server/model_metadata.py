@@ -30,19 +30,6 @@ class WeightSyncConfig:
     return cls(strategy=strategy)
 
 
-def extract_weight_sync_config(headers: Any = None) -> WeightSyncConfig:
-  """Extract and normalize WeightSyncConfig from HTTP headers with single-location defaults."""
-  if not headers:
-    return WeightSyncConfig()
-
-  get_header = headers.get if hasattr(headers, "get") else (lambda k, default=None: default)
-
-  strategy = (get_header("x-open-rl-weight-sync-strategy") or "delta").lower()
-  if strategy not in ("delta", "full"):
-    strategy = "delta"
-  return WeightSyncConfig(strategy=strategy)
-
-
 class TrainingModelMetadata(BaseModel):
   # Preserve fields written by other server versions when updating a record.
   model_config = ConfigDict(extra="allow")
