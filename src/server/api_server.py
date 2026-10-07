@@ -9,7 +9,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -26,7 +26,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from server import proto_codec
 from server.model_metadata import (
   TrainingModelMetadata,
-  extract_weight_sync_config,
+  WeightSyncConfig,
   get_model_metadata,
   persist_model_metadata,
 )
@@ -35,7 +35,7 @@ from server.store import RedisStateStore, get_state_store, get_store
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, owner_of
 from training import commands
 from training.commands import Command
-from training.types import TRAINER_BACKENDS, Datum, FFTConfig, LoraConfig
+from training.types import TRAINER_BACKENDS, Datum, FFTConfig, FineTuningType, LoraConfig
 
 store = get_store()
 state = get_state_store()
@@ -112,9 +112,10 @@ class CreateModelRequest(BaseModel):
   session_id: str | None = None
   user_metadata: dict[str, Any] | None = None
   lora_config: LoraConfig = Field(default_factory=LoraConfig)
-  full_config: FFTConfig = Field(default_factory=FFTConfig)
+  # Removed; FFT options are openrl. settings now. Kept to reject it loudly.
+  full_config: Any = None
 
-  @field_validator("lora_config", "full_config", mode="before")
+  @field_validator("lora_config", mode="before")
   @classmethod
   def default_config(cls, value):
     return {} if value is None else value
@@ -128,9 +129,10 @@ class CreateModelFromStateRequest(BaseModel):
   session_id: str | None = None
   user_metadata: dict[str, Any] | None = None
   lora_config: LoraConfig = Field(default_factory=LoraConfig)
-  full_config: FFTConfig = Field(default_factory=FFTConfig)
+  # Removed; FFT options are openrl. settings now. Kept to reject it loudly.
+  full_config: Any = None
 
-  @field_validator("lora_config", "full_config", mode="before")
+  @field_validator("lora_config", mode="before")
   @classmethod
   def default_config(cls, value):
     return {} if value is None else value
@@ -176,6 +178,14 @@ class Settings(BaseModel):
   # Trainer GPUs that share one sequence, as context parallelism. The rest
   # of trainer_gpus is data parallel.
   trainer_cp: int = Field(default=1, ge=1, le=8)
+  # LoRA unless set. A restored model takes the checkpoint's type.
+  fine_tuning_type: FineTuningType | None = None
+  # The rest apply to full fine-tuning only.
+  # How the trainer hands each step's weights to the sampler.
+  weight_sync: Literal["delta", "full"] | None = None
+  fft_seed: int | None = None
+  # Park trainer state in host memory between turns. Exclusive models default to off.
+  fft_cpu_offload: Annotated[bool | None, BeforeValidator(parse_bool)] = None
 
 
 def tag_metadata(tags: list[str]) -> dict[str, str]:
@@ -399,36 +409,35 @@ def is_sampler_weights_ref(model_id: str | None) -> bool:
 async def _extract_and_persist_model_metadata(
   req: CreateModelRequest | CreateModelFromStateRequest,
   request: Request | None = None,
-  default_fine_tuning_type: str = "lora",
+  checkpoint_kind: FineTuningType | None = None,
 ) -> tuple[str, TrainingModelMetadata]:
-  """Extract and normalize model configuration from headers and payload, persisting TrainingModelMetadata exactly once."""
+  """Resolve the model's configuration from its openrl. settings and persist TrainingModelMetadata once.
+  checkpoint_kind is the fine-tuning type of the checkpoint a restored model loads."""
   base_model = req.base_model
-  if not base_model and default_fine_tuning_type != "restored":
+  if not base_model:
     raise ValueError("base_model is required in request payload")
-
-  full_config = req.full_config.model_dump()
-  lora_config = req.lora_config.model_dump()
-
   headers = request.headers if request is not None else {}
-  weight_sync_cfg = extract_weight_sync_config(headers)
-
-  fine_tuning_type = default_fine_tuning_type
-  h_val = (headers.get("x-open-rl-fine-tuning-type") or "").lower()
-  if h_val == "full":
-    fine_tuning_type = "full"
-  elif h_val == "lora":
-    fine_tuning_type = "lora"
-
-  if fine_tuning_type == "full" and not is_fft_enabled():
-    raise ValueError("Full Fine-Tuning (FFT) is disabled on this Open-RL API server instance")
-
-  if fine_tuning_type != "full" and default_fine_tuning_type != "restored":
-    fine_tuning_type = "lora"
-
-  full_config["weight_sync_strategy"] = weight_sync_cfg.strategy
+  for header, setting in (("x-open-rl-fine-tuning-type", "fine_tuning_type"), ("x-open-rl-weight-sync-strategy", "weight_sync")):
+    if header in headers:
+      raise ValueError(f"The {header} header was removed; set {SETTINGS_PREFIX}{setting} in TINKER_TAGS or user_metadata")
+  if req.full_config is not None:
+    raise ValueError(f"full_config was removed; set {SETTINGS_PREFIX}fft_seed and {SETTINGS_PREFIX}fft_cpu_offload in TINKER_TAGS or user_metadata")
+  lora_config = req.lora_config.model_dump()
 
   # The model's own user_metadata wins over what the session was opened with.
   settings = resolve_settings(req.user_metadata or {}, await session_registry.user_metadata(req.session_id))
+  if checkpoint_kind is not None and settings.fine_tuning_type not in (None, checkpoint_kind):
+    raise ValueError(f"{SETTINGS_PREFIX}fine_tuning_type={settings.fine_tuning_type} does not match the {checkpoint_kind} checkpoint")
+  fine_tuning_type = settings.fine_tuning_type or checkpoint_kind or "lora"
+  if fine_tuning_type == "full" and not is_fft_enabled():
+    raise ValueError("Full Fine-Tuning (FFT) is disabled on this Open-RL API server instance")
+  fft_settings = {"weight_sync": settings.weight_sync, "fft_seed": settings.fft_seed, "fft_cpu_offload": settings.fft_cpu_offload}
+  if fine_tuning_type != "full" and (given := [name for name, value in fft_settings.items() if value is not None]):
+    raise ValueError(", ".join(f"{SETTINGS_PREFIX}{name}" for name in given) + " applies to fine_tuning_type=full only")
+  weight_sync_cfg = WeightSyncConfig(strategy=settings.weight_sync or "delta")
+  # Nothing parks an exclusive trainer, so it stays on the GPU.
+  cpu_offload = settings.fft_cpu_offload if settings.fft_cpu_offload is not None else not settings.exclusive
+  full_config = FFTConfig(seed=settings.fft_seed, cpu_offload=cpu_offload, weight_sync_strategy=weight_sync_cfg.strategy).model_dump()
   # Without a worker manager one static runtime serves every model.
   if settings.exclusive and worker_manager is None:
     raise ValueError("openrl.exclusive needs a server that launches workers per model")
@@ -446,10 +455,6 @@ async def _extract_and_persist_model_metadata(
     raise ValueError("openrl.trainer_gpus above 1 needs a server that launches workers as pods")
   if settings.trainer_gpus % settings.trainer_cp:
     raise ValueError(f"openrl.trainer_cp={settings.trainer_cp} must divide openrl.trainer_gpus={settings.trainer_gpus}")
-  # Nothing parks an exclusive trainer, so it stays on the GPU.
-  if settings.exclusive:
-    full_config["cpu_offload"] = False
-
   model_id = str(uuid.uuid4())
   meta_obj = TrainingModelMetadata(
     base_model=base_model,
@@ -723,7 +728,7 @@ async def session_heartbeat(req: SessionHeartbeatRequest):
 async def create_model(req: CreateModelRequest, request: Request) -> dict[str, Any]:
   """ServiceClient.create_lora_training_client_async()"""
   try:
-    model_id, meta = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type="lora")
+    model_id, meta = await _extract_and_persist_model_metadata(req, request)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -779,11 +784,8 @@ async def create_model_from_state(req: CreateModelFromStateRequest, request: Req
     kind = "lora" if checkpoint["is_lora"] else "full"
     if req.base_model is not None and req.base_model != checkpoint["base_model"]:
       raise ValueError("base_model does not match the checkpoint")
-    requested_kind = request.headers.get("x-open-rl-fine-tuning-type", "").lower()
-    if requested_kind in {"lora", "full"} and requested_kind != kind:
-      raise ValueError("fine-tuning type does not match the checkpoint")
     req = req.model_copy(update={"base_model": checkpoint["base_model"]})
-    model_id, meta = await _extract_and_persist_model_metadata(req, request, default_fine_tuning_type=kind)
+    model_id, meta = await _extract_and_persist_model_metadata(req, request, checkpoint_kind=kind)
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 

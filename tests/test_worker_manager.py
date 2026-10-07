@@ -121,7 +121,6 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
           "session_id": self.session_id,
           "state_path": "/tmp/checkpoint",
           "base_model": "restored-base",
-          "full_config": {"weight_sync_strategy": "delta"},
           "restore_optimizer": True,
         },
       )
@@ -254,31 +253,20 @@ class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
     self.enterContext(patch.object(api_server, "store", self.store))
     self.enterContext(patch.object(api_server, "state", self.store))
 
-  async def test_extract_and_persist_metadata_from_headers(self) -> None:
+  async def test_extract_and_persist_metadata_from_settings(self) -> None:
     import json
 
-    from fastapi import Request
+    user_metadata = {"openrl.fine_tuning_type": "full", "openrl.weight_sync": "full", "openrl.fft_seed": "7"}
+    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
+      model_id, _ = await api_server._extract_and_persist_model_metadata(
+        api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B", user_metadata=user_metadata)
+      )
 
-    scope = {
-      "type": "http",
-      "headers": [
-        (b"x-open-rl-weight-sync-strategy", b"delta"),
-        (b"x-open-rl-fine-tuning-type", b"lora"),
-      ],
-    }
-    request = Request(scope)
-    model_id, _ = await api_server._extract_and_persist_model_metadata(
-      api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B"),
-      request,
-      default_fine_tuning_type="full",
-    )
-
-    meta_val = self.store.kv_store.get(f"open_rl:model_meta:{model_id}")
-    self.assertIsNotNone(meta_val)
-    meta_dict = json.loads(meta_val)
+    meta_dict = json.loads(self.store.kv_store.get(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta_dict["base_model"], "Qwen/Qwen2.5-0.5B")
-    self.assertEqual(meta_dict["fine_tuning_type"], "lora")
-    self.assertEqual(meta_dict["weight_sync_config"]["strategy"], "delta")
+    self.assertEqual(meta_dict["fine_tuning_type"], "full")
+    self.assertEqual(meta_dict["weight_sync_config"]["strategy"], "full")
+    self.assertEqual(meta_dict["full_config"], {"seed": 7, "cpu_offload": True, "weight_sync_strategy": "full"})
 
 
 class ApiServerFutureTranslationTest(unittest.TestCase):

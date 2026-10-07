@@ -16,7 +16,6 @@ from typing import Any, cast
 
 import chz
 import tinker
-from common.tinker_utils import patch_tinker_default_headers
 from tinker import types
 
 BASE_URL = "http://127.0.0.1:9003"
@@ -164,8 +163,4 @@ def main(config: Config) -> None:
 
 
 if __name__ == "__main__":
-  # Turns OPEN_RL_FINE_TUNING_TYPE into the header the API server reads. Without
-  # it a "fft" scenario silently trains a LoRA adapter: the harness sets the
-  # env, but nothing puts it on the wire.
-  patch_tinker_default_headers()
   chz.nested_entrypoint(main, allow_hyphens=True)
