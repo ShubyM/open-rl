@@ -28,6 +28,8 @@ class RunConfig:
   max_trajectory_tokens: int = 128 * 1024
   max_tool_result_tokens: int = 8 * 1024
   command_timeout: int = 60
+  sandbox_warmpool: str | None = None  # SandboxWarmPool name; runs sandboxes on Agent Sandbox instead of Podman.
+  sandbox_namespace: str = "lab-sandboxes"
   judge_model: str = "gpt-glm-5.2"  # OpenAI-compatible GLM endpoint via OPENAI_BASE_URL / OPENAI_API_KEY.
   judge_parallel: int = 0  # Auto: 16 for GLM, 1 otherwise.
 
