@@ -63,17 +63,15 @@ class TrainingModelMetadata(BaseModel):
 
   def shares_gpu(self) -> bool:
     """Whether other workers may time-slice this job's GPUs. An FFT worker
-    suspends between turns. A LoRA worker cannot, so its GPUs are never shared."""
-    return self.fine_tuning_type != "lora" and not self.is_exclusive()
+    suspends between turns. A LoRA worker cannot, so its GPUs are never shared.
+    A multi-GPU trainer is a torchrun group, which cannot park either."""
+    return self.fine_tuning_type != "lora" and not self.exclusive and self.trainer_gpus == 1
 
   def shares_runtime(self) -> bool:
     """Whether this job's workers may serve other jobs too. A LoRA worker serves
-    many jobs, one adapter each. An FFT worker serves one job."""
-    return self.fine_tuning_type == "lora" and not self.is_exclusive()
-
-  def is_exclusive(self) -> bool:
-    """A multi-GPU trainer is a torchrun group, which never parks or shares."""
-    return self.exclusive or self.trainer_gpus > 1
+    many jobs, one adapter each. An FFT worker serves one job. A multi-GPU
+    trainer is sized for its job, so it serves only that job."""
+    return self.fine_tuning_type == "lora" and not self.exclusive and self.trainer_gpus == 1
 
   def trainer_image(self) -> str | None:
     """The image trainer_backend names, when it is an image and not a trainer."""
