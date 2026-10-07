@@ -18,6 +18,7 @@ class RunConfig:
   train_tasks: int = 300
   eval_tasks: int = 50
   task_split_seed: int = 0
+  train_split_seed: int | None = None  # Reorders the train pool; the reference runs used 242.
   batch_size: int = 1
   rollouts_per_example: int = 4
   eval_rollouts_per_task: int = 4
@@ -27,6 +28,11 @@ class RunConfig:
   max_tokens: int = 3072
   max_trajectory_tokens: int = 128 * 1024
   max_tool_result_tokens: int = 8 * 1024
+  # When a turn stops on the per-turn max_tokens cap: False ends the episode
+  # there, as the reference LAB harness does, and it is graded on what was
+  # produced; True keeps the truncated turn in history and lets the agent
+  # continue (the cookbook's LENGTH-continue), bounded by max_trajectory_tokens.
+  continue_after_truncation: bool = False
   command_timeout: int = 60
   judge_model: str = "gpt-glm-5.2"  # OpenAI-compatible GLM endpoint via OPENAI_BASE_URL / OPENAI_API_KEY.
   judge_parallel: int = 0  # Auto: 16 for GLM, 1 otherwise.
