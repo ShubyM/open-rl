@@ -1,0 +1,52 @@
+# llm-d router (chart llm-d-router-standalone v0.11.0) in front of the vLLM
+# pool in pool.yaml. It creates no CRDs and nothing cluster scoped: Envoy plus
+# the endpoint picker, which finds model servers by the label below.
+router:
+  epp:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        memory: 4Gi
+    # Prefer the replica that already caches the request's prefix, unless it
+    # is loaded; an agent's next turn then lands where its history is cached.
+    pluginsConfigFile: "openrl-plugins.yaml"
+    pluginsCustomConfig:
+      openrl-plugins.yaml: |
+        apiVersion: llm-d.ai/v1alpha1
+        kind: EndpointPickerConfig
+        plugins:
+        - type: approx-prefix-cache-producer
+        - type: inflight-load-producer
+        - type: prefix-cache-affinity-filter
+        - type: token-load-scorer
+        schedulingProfiles:
+        - name: default
+          plugins:
+          - pluginRef: prefix-cache-affinity-filter
+          - pluginRef: token-load-scorer
+  # Pool-less: endpoints come from the label selector, not an InferencePool CRD.
+  inferencePool:
+    create: false
+    failureMode: "FailOpen"
+  modelServers:
+    protocol: http
+    matchLabels:
+      llm-d.ai/guide: openrl-sampling
+  # The gateway calls the router on port 80.
+  extraServicePorts:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+  proxy:
+    proxyType: envoy
+    args: ["--service-node", "envoy-sidecar", "--log-level", "warn", "--concurrency", "4", "--drain-strategy", "immediate", "--drain-time-s", "60", "-c", "/etc/envoy/envoy.yaml"]
+    resources:
+      requests:
+        cpu: "1"
+        memory: 1Gi
+      limits:
+        memory: 2Gi

@@ -1,0 +1,101 @@
+# A shared vLLM pool for one base model's LoRA sampling, behind the llm-d
+# router. Replicas load each sampler version by name from the adapter
+# directory the gateway writes on the shared volume (vLLM's filesystem LoRA
+# resolver). Set the model, its flags, and replicas for your deployment.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: llmd-gpu
+  namespace: openrl-system
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          allocationMode: ExactCount
+          count: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llmd-pool
+  namespace: openrl-system
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: llmd-pool
+  template:
+    metadata:
+      labels:
+        app: llmd-pool
+        llm-d.ai/guide: openrl-sampling
+        llm-d.ai/engine-type: vllm
+    spec:
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      resourceClaims:
+      - name: gpu
+        resourceClaimTemplateName: llmd-gpu
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.30.0
+        command: ["sh", "-c"]
+        # The resolver directory must exist before vLLM starts.
+        args:
+        - >-
+          mkdir -p /mnt/shared/open-rl/llmd-adapters &&
+          exec vllm serve Qwen/Qwen3.5-9B
+          --port=8000
+          --max-model-len=196608
+          --enable-prefix-caching
+          --gpu-memory-utilization=0.9
+          --enable-lora
+          --max-loras=8
+          --max-lora-rank=64
+          --limit-mm-per-prompt='{"image":0,"video":0}'
+        env:
+        - name: HF_HOME
+          value: /mnt/shared/open-rl/huggingface
+        - name: VLLM_PLUGINS
+          value: lora_filesystem_resolver
+        - name: VLLM_LORA_RESOLVER_CACHE_DIR
+          value: /mnt/shared/open-rl/llmd-adapters
+        - name: VLLM_ALLOW_RUNTIME_LORA_UPDATING
+          value: "True"
+        # FlashInfer's JIT build runs one compiler per core otherwise.
+        - name: MAX_JOBS
+          value: "4"
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          claims:
+          - name: gpu
+          requests:
+            cpu: "8"
+            memory: 41Gi
+          limits:
+            memory: 41Gi
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 10
+        volumeMounts:
+        - name: shared
+          mountPath: /mnt/shared
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shared
+        persistentVolumeClaim:
+          claimName: open-rl-shared-pvc
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
