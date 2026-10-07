@@ -224,8 +224,9 @@ class TrainingRequestsProcessor:
     """GPU work under one time-slicer turn; saves need the device only when the worker is not offloaded."""
     if self.time_slicer is None:
       # No lease to hold, so each answer goes out as soon as it is ready.
-      for request in requests:
-        await self.process_request(request)
+      async with gpu_turn(None, None, self.store, "trainer", self.model_id):
+        for request in requests:
+          await self.process_request(request)
       return
 
     save_ops = {"save_state", "save_weights_for_sampler"}

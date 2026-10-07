@@ -3,6 +3,7 @@ run, and one of exclusive GPU turns per workload with the ops that ran inside
 each. Recording is best effort and never changes what an op returns or raises."""
 
 import asyncio
+import contextlib
 import contextvars
 import math
 import os
@@ -46,6 +47,9 @@ async def observe_operation(store, request: dict, role: str, runtime_id: str | N
   started_at, started = time.time(), time.perf_counter()
   result, status, error_type = {}, "succeeded", None
   run_id = request.get("logical_run_id") or request.get("adapter_id") or request.get("lora_id") or request.get("model_id")
+  # A sampler ref names a version of a run; its ops belong to the run.
+  if isinstance(run_id, str) and run_id.startswith("tinker://"):
+    run_id = run_id.removeprefix("tinker://").split("/")[0]
   with operation_span(request) as span:
     try:
       result = await call()
@@ -168,9 +172,14 @@ def record_op(name: str):
 async def gpu_turn(time_slicer, workload, store, role: str, runtime_id: str | None):
   """Hold the GPU through the time-slicer and record the turn: the interval the
   device was ours, which by construction never overlaps another workload's,
-  and the ops that ran inside it."""
+  and the ops that ran inside it. Without a time-slicer the device is always
+  ours, and the turn is just the work, recorded under the pod's Workload."""
   requested = time.time()
-  async with time_slicer.acquire(workload):
+  name = workload.name if workload is not None else os.getenv("OPEN_RL_TIME_SLICE_JOB_ID")
+  if not name:
+    yield
+    return
+  async with time_slicer.acquire(workload) if time_slicer is not None else contextlib.nullcontext():
     started = time.time()
     ops: list[dict] = []
     token = _turn_ops.set(ops)
@@ -183,7 +192,7 @@ async def gpu_turn(time_slicer, workload, store, role: str, runtime_id: str | No
         "started_at": started,
         "requested_at": requested,
         "operation": "gpu_turn",
-        "workload": workload.name,
+        "workload": name,
         "role": os.getenv("OPEN_RL_PROCESS_ROLE") or role,
         "runtime_id": runtime_id,
         "node": os.getenv("NODE_NAME"),
@@ -191,7 +200,7 @@ async def gpu_turn(time_slicer, workload, store, role: str, runtime_id: str | No
         "ops": ops,
       }
       try:
-        await asyncio.wait_for(store.append_sample(turn_key(workload.name), sample, SAMPLE_LIMIT), timeout=0.1)
+        await asyncio.wait_for(store.append_sample(turn_key(name), sample, SAMPLE_LIMIT), timeout=0.1)
       except Exception:
         pass
 
