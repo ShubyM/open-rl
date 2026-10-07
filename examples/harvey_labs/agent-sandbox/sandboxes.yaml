@@ -41,7 +41,7 @@ spec:
         fsGroup: 1000
       containers:
       - name: sandbox
-        image: us-central1-docker.pkg.dev/open-rl-2-sandbox-102433/open-rl/lab-sandbox-asb:v1
+        image: us-central1-docker.pkg.dev/open-rl-2-sandbox-102433/open-rl/lab-sandbox-asb:v2
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
