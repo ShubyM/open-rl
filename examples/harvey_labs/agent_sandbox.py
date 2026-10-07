@@ -1,7 +1,7 @@
 """LAB sandboxes on Agent Sandbox (sigs.k8s.io/agent-sandbox), driven through sandboxd.
 
 Each episode claims a sandbox from a SandboxWarmPool. The guest image must be
-LAB's sandbox image running sandboxd with --root-dir=/. The client reaches
+LAB's sandbox image running sandboxd rooted at /workspace. The client reaches
 sandboxd by pod IP, so the sandbox cluster may be a different cluster on the
 same VPC; KUBECONFIG then points at it. Documents and the workspace are
 uploaded at start; deliverables are pulled back as a tar.
@@ -81,8 +81,8 @@ def tar_bytes(entries: list[tuple[Path, str]]) -> bytes:
 
 
 def relative(path: str) -> str:
-  """sandboxd takes paths relative to its root, which is /."""
-  return path.lstrip("/")
+  """sandboxd takes paths relative to its root, /workspace, and serves nothing outside it."""
+  return str(Path(path).relative_to(WORKSPACE))
 
 
 class AgentLabSandbox:
@@ -181,7 +181,8 @@ class AgentLabSandbox:
       await asyncio.to_thread(tar.extractall, destination, filter="data")
 
   async def pack_outputs(self) -> bytes:
-    archive = "/tmp/lab-output.tar"
+    # Outside the output directory, so the archive does not contain itself.
+    archive = f"{WORKSPACE}/.lab-output.tar"
     packed = await self.shell(f"tar -C {OUTPUT} -cf {archive} .", 120)
     if packed.exit_code != 0:
       raise RuntimeError(f"could not pack outputs in {self.sandbox_id}: {packed.stderr.strip()}")
@@ -301,8 +302,9 @@ class AgentSandboxFactory:
       sandbox = AgentLabSandbox(claimed, request, asyncio.get_running_loop())
       # Documents land inside the uploaded workspace, as Podman mounts them.
       archive = await asyncio.to_thread(tar_bytes, [(request.workspace_dir, "."), (request.documents_dir, "documents")])
-      await sandbox.write_file("/tmp/lab-input.tar", archive, timeout=300)
-      unpack = f"mkdir -p {OUTPUT} && tar --no-same-owner -C {WORKSPACE} -xf /tmp/lab-input.tar && rm /tmp/lab-input.tar"
+      staged = f"{WORKSPACE}/.lab-input.tar"
+      await sandbox.write_file(staged, archive, timeout=300)
+      unpack = f"mkdir -p {OUTPUT} && tar --no-same-owner -C {WORKSPACE} -xf {staged} && rm {staged}"
       unpacked = await sandbox.shell(unpack, 300)
       if unpacked.exit_code != 0:
         raise RuntimeError(f"could not unpack inputs in {claimed.sandbox_id}: {unpacked.stderr.strip()}")
