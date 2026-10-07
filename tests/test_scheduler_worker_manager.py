@@ -291,6 +291,21 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       create_worker_manager()
       manager_cls.assert_called_once()
 
+  def test_sampler_replicas_are_single_gpu_workloads_released_together(self) -> None:
+    meta = {"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora", "exclusive": True, "sampler_replicas": 3}
+    s = self.store_with("job-sr", meta)
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-sr", "trainer")
+      self.manager.ensure("job-sr", "sampler")
+      self.manager.release("job-sr")
+
+    names = [w["metadata"]["name"] for w in self.api.created]
+    self.assertEqual(names, ["lora-job-sr-0-trainer", "lora-job-sr-0-sampler", "lora-job-sr-1-sampler", "lora-job-sr-2-sampler"])
+    for sampler in self.api.created[1:]:
+      self.assertEqual(sampler["spec"]["accelerator"]["mode"], "SingleGPU")
+      self.assertEqual(sampler["spec"]["ownerID"], "job-sr")
+    self.assertEqual(sorted(self.api.deleted), sorted(names))
+
 
 class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
   async def test_lora_and_fft_sessions_launch_their_own_sampler_types(self) -> None:

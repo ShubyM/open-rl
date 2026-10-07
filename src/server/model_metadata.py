@@ -53,6 +53,7 @@ class TrainingModelMetadata(BaseModel):
   weight_sync_config: WeightSyncConfig = Field(default_factory=WeightSyncConfig)
   full_config: FFTConfig = Field(default_factory=FFTConfig)
   lora_config: LoraConfig = Field(default_factory=LoraConfig)
+  sampler_replicas: int = 1
   exclusive: bool = False
   trainer_backend: str = "pytorch"
   status: str = "active"
