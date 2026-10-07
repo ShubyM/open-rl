@@ -216,7 +216,8 @@ async def holding_gpu(
 ):
   """Hold the time-slicer slot for the body, waking the sampler inside it. Without a slicer the GPU is ours."""
   if time_slicer is None:
-    yield
+    async with gpu_turn(None, None, store, "sampler", model_id):
+      yield
     return
   async with gpu_turn(time_slicer, workload, store, "sampler", model_id):
     if sampler is not None:
