@@ -1,12 +1,12 @@
-# One Harvey LAB training run as a Job beside the gateway. Sandboxes run on
-# Agent Sandbox in a separate cluster (agent-sandbox/README.md) and logs land
-# on the shared volume. Set the image, the judge endpoint, and RUN, then
-# kubectl apply -f.
+# One Harvey LAB training run as a Job. The RL loop is a client of the
+# platform, so it runs in its own namespace (default, or one of yours), not
+# in openrl-system. Sandboxes run on Agent Sandbox in a separate cluster
+# (agent-sandbox/README.md) and logs land on the namespace's shared volume.
+# Set the image, the judge endpoint, and RUN, then kubectl apply -f.
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: harvey-labs
-  namespace: openrl-system
 spec:
   backoffLimit: 0
   template:

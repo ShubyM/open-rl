@@ -87,7 +87,7 @@ users: [{name: harvey-driver, user: {token: $TOKEN}}]
 contexts: [{name: sandboxes, context: {cluster: sandboxes, user: harvey-driver, namespace: lab-sandboxes}}]
 current-context: sandboxes
 EOF
-kubectl --context <training-cluster> -n openrl-system create secret generic sandbox-cluster-kubeconfig \
+kubectl --context <training-cluster> -n <job namespace> create secret generic sandbox-cluster-kubeconfig \
   --from-file=kubeconfig=driver.kubeconfig
 ```
 
