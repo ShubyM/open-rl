@@ -12,10 +12,14 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
+import os
 import re
 import shlex
+import signal
 import tarfile
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,14 +27,17 @@ from tinker_cookbook.sandbox.sandbox_interface import SandboxResult
 
 from .sandbox import LabSandbox, SandboxRequest, add_lab_to_path
 
+logger = logging.getLogger(__name__)
+
 WORKSPACE = "/workspace"
 DOCUMENTS = "/workspace/documents"
 OUTPUT = "/workspace/output"
 READY_TIMEOUT = 300
-# The controller deletes a claim this long after it was made, in case cleanup
-# never reaches the API server. Well past the longest episode.
-CLAIM_LIFETIME_SECONDS = 6 * 3600
-DELETE_ATTEMPTS = 3
+# A claim is a lease: the controller deletes it LEASE_SECONDS after its last
+# renewal, so a driver that dies any way at all leaves nothing behind for long.
+LEASE_SECONDS = 15 * 60
+RENEW_SECONDS = 5 * 60
+CLAIM_ATTEMPTS = 3
 # Slack over the in-guest coreutils timeout for the gRPC round trips.
 RPC_SLACK = 30
 COLLECT_ATTEMPTS = 4
@@ -92,13 +99,15 @@ def relative(path: str) -> str:
 class AgentLabSandbox:
   """Async LabSandbox over one claimed Agent Sandbox."""
 
-  def __init__(self, sandbox: Any, request: SandboxRequest, loop: asyncio.AbstractEventLoop):
+  def __init__(self, sandbox: Any, request: SandboxRequest, loop: asyncio.AbstractEventLoop, live: set):
     add_lab_to_path(request.lab_root)
     from harness.tools import get_all_tool_definitions
 
     self.sandbox = sandbox
     self.request = request
     self.loop = loop
+    self.live = live
+    self.lease: asyncio.Task | None = None
     self.tool_definitions = get_all_tool_definitions()
     self.executor = remote_tool_executor(RemoteFiles(self), request.command_timeout)
 
@@ -192,7 +201,20 @@ class AgentLabSandbox:
       raise RuntimeError(f"could not pack outputs in {self.sandbox_id}: {packed.stderr.strip()}")
     return await self.read_bytes(archive)
 
+  async def keep_lease(self) -> None:
+    """Renew the claim while the episode runs. A failed renewal is retried at
+    the next one; two in a row still leave a third before the lease runs out."""
+    while True:
+      await asyncio.sleep(RENEW_SECONDS)
+      try:
+        await renew_claim(self.sandbox.claim_name, self.sandbox.namespace)
+      except Exception as exc:
+        logger.warning("could not renew the lease on %s: %s", self.sandbox.claim_name, exc)
+
   async def cleanup(self) -> None:
+    if self.lease is not None:
+      self.lease.cancel()
+    self.live.discard(self)
     await self.sandbox.close_connection()
     await delete_claim(self.sandbox.claim_name, self.sandbox.namespace)
 
@@ -287,31 +309,42 @@ def remote_tool_executor(files: RemoteFiles, shell_timeout: int) -> Any:
   return RemoteToolExecutor(sandbox=files, shell_timeout=shell_timeout)
 
 
-async def delete_claim(name: str | None, namespace: str) -> None:
-  """Delete a SandboxClaim with a request timeout, on a new connection per
-  attempt. The client's shared connections can sit idle through a whole
-  episode, and a request on a dropped one hangs with no timeout of its own."""
+async def on_claim(name: str | None, namespace: str, call: Callable[[Any, dict], Awaitable[Any]]) -> None:
+  """Run a request against a SandboxClaim with a request timeout, on a new
+  connection per attempt. The client's shared connections can sit idle through
+  a whole episode, and a request on a dropped one hangs with no timeout of its
+  own. A claim that is already gone is fine."""
   if not name:
     return
   from kubernetes_asyncio import client, config
 
-  for attempt in range(DELETE_ATTEMPTS):
+  target = {"group": "extensions.agents.x-k8s.io", "version": "v1beta1", "namespace": namespace, "plural": "sandboxclaims", "name": name}
+  for attempt in range(CLAIM_ATTEMPTS):
     try:
       await config.load_kube_config()
       async with client.ApiClient() as api:
-        await client.CustomObjectsApi(api).delete_namespaced_custom_object(
-          "extensions.agents.x-k8s.io", "v1beta1", namespace, "sandboxclaims", name, _request_timeout=30
-        )
+        await call(client.CustomObjectsApi(api), target)
       return
     except client.ApiException as exc:
       if exc.status == 404:
         return
-      if attempt == DELETE_ATTEMPTS - 1:
+      if attempt == CLAIM_ATTEMPTS - 1:
         raise
     except (OSError, TimeoutError):
-      if attempt == DELETE_ATTEMPTS - 1:
+      if attempt == CLAIM_ATTEMPTS - 1:
         raise
     await asyncio.sleep(2**attempt)
+
+
+async def delete_claim(name: str | None, namespace: str) -> None:
+  await on_claim(name, namespace, lambda api, target: api.delete_namespaced_custom_object(**target, _request_timeout=30))
+
+
+async def renew_claim(name: str | None, namespace: str) -> None:
+  shutdown = (datetime.now(UTC) + timedelta(seconds=LEASE_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+  # A JSON patch, which this client sends; every claim is created with a lifecycle.
+  body = [{"op": "replace", "path": "/spec/lifecycle/shutdownTime", "value": shutdown}]
+  await on_claim(name, namespace, lambda api, target: api.patch_namespaced_custom_object(**target, body=body, _request_timeout=30))
 
 
 class AgentSandboxFactory:
@@ -321,6 +354,20 @@ class AgentSandboxFactory:
     self.warmpool = warmpool
     self.namespace = namespace
     self.client: Any = None
+    # Sandboxes not yet cleaned up, released together if the driver is stopped.
+    self.live: set[AgentLabSandbox] = set()
+
+  def release_on_sigterm(self) -> None:
+    """A Job deletion or eviction stops the driver with SIGTERM: delete every
+    claim it holds, then exit as SIGTERM would have."""
+
+    async def release() -> None:
+      await asyncio.gather(*(delete_claim(s.sandbox.claim_name, s.sandbox.namespace) for s in list(self.live)), return_exceptions=True)
+      signal.signal(signal.SIGTERM, signal.SIG_DFL)
+      os.kill(os.getpid(), signal.SIGTERM)
+
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, lambda: loop.create_task(release()))
 
   async def __call__(self, request: SandboxRequest) -> LabSandbox:
     from k8s_agent_sandbox import AsyncSandboxClient
@@ -328,11 +375,12 @@ class AgentSandboxFactory:
 
     if self.client is None:
       self.client = AsyncSandboxClient(connection_config=SandboxdInClusterConnectionConfig(mode="pod-ip"))
+      self.release_on_sigterm()
     claimed = await self.client.create_sandbox(
-      warmpool=self.warmpool, namespace=self.namespace, sandbox_ready_timeout=READY_TIMEOUT, shutdown_after_seconds=CLAIM_LIFETIME_SECONDS
+      warmpool=self.warmpool, namespace=self.namespace, sandbox_ready_timeout=READY_TIMEOUT, shutdown_after_seconds=LEASE_SECONDS
     )
     try:
-      sandbox = AgentLabSandbox(claimed, request, asyncio.get_running_loop())
+      sandbox = AgentLabSandbox(claimed, request, asyncio.get_running_loop(), self.live)
       # Documents land inside the uploaded workspace, as Podman mounts them.
       archive = await asyncio.to_thread(tar_bytes, [(request.workspace_dir, "."), (request.documents_dir, "documents")])
       staged = f"{WORKSPACE}/.lab-input.tar"
@@ -341,6 +389,8 @@ class AgentSandboxFactory:
       unpacked = await sandbox.shell(unpack, 300)
       if unpacked.exit_code != 0:
         raise RuntimeError(f"could not unpack inputs in {claimed.sandbox_id}: {unpacked.stderr.strip()}")
+      self.live.add(sandbox)
+      sandbox.lease = asyncio.create_task(sandbox.keep_lease())
       return sandbox
     except BaseException:
       await claimed.close_connection()
