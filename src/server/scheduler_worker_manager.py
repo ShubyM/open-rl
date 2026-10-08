@@ -45,6 +45,7 @@ ROUTER_PORT = 8081
 SAMPLER_SET_LABEL = "openrl.io/sampler-set"
 ROUTER_LABEL = "openrl.io/sampler-router"
 ROUTER_CONFIG = "openrl-llmd-router"
+ROUTER_LOOKUP_TIMEOUT = 10
 
 
 def workload_name(role: str, owner: str, is_lora: bool, index: int = 0) -> str:
@@ -290,7 +291,10 @@ class SchedulerWorkerManager:
     _, runtime, _ = runtime_of(model_id)
     if self.core_api is None:
       self.core_api = client.CoreV1Api()
-    pods = self.core_api.list_namespaced_pod(self.namespace, label_selector=f"{ROUTER_LABEL}={sampler_set(runtime)}").items
+    # Bounded, so a stale API connection cannot hang the gateway's sample path.
+    pods = self.core_api.list_namespaced_pod(
+      self.namespace, label_selector=f"{ROUTER_LABEL}={sampler_set(runtime)}", _request_timeout=ROUTER_LOOKUP_TIMEOUT
+    ).items
     for pod in pods:
       if pod.status.phase == "Running" and pod.status.pod_ip and not pod.metadata.deletion_timestamp:
         return f"http://{pod.status.pod_ip}:{ROUTER_PORT}"

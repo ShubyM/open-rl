@@ -10,7 +10,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from server import api_server, sampler_http
-from server.scheduler_worker_manager import ROUTER_LABEL, ROUTER_PORT, SAMPLER_SET_LABEL, SchedulerWorkerManager, sampler_set
+from server.scheduler_worker_manager import ROUTER_LABEL, ROUTER_LOOKUP_TIMEOUT, ROUTER_PORT, SAMPLER_SET_LABEL, SchedulerWorkerManager, sampler_set
 from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import LocalWorkerManager
 from tests.test_scheduler_worker_manager import FakeCustomObjectsApi
@@ -72,15 +72,15 @@ class RouterLookupTest(unittest.TestCase):
     selectors = []
 
     class Pods:
-      def list_namespaced_pod(self, namespace: str, label_selector: str) -> SimpleNamespace:
-        selectors.append(label_selector)
+      def list_namespaced_pod(self, namespace: str, label_selector: str, _request_timeout: float | None = None) -> SimpleNamespace:
+        selectors.append((label_selector, _request_timeout))
         return SimpleNamespace(items=[pod("Running", "10.0.0.1", deleting=True), pod("Pending", ""), pod("Running", "10.0.0.2")])
 
     with patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}):
       manager = SchedulerWorkerManager(custom_api=FakeCustomObjectsApi(), core_api=Pods())
     with patch("server.worker_manager.get_state_store", return_value=state_with("job", ROUTED)):
       self.assertEqual(manager.router_url("job"), f"http://10.0.0.2:{ROUTER_PORT}")
-    self.assertEqual(selectors, [f"{ROUTER_LABEL}={sampler_set('job')}"])
+    self.assertEqual(selectors, [(f"{ROUTER_LABEL}={sampler_set('job')}", ROUTER_LOOKUP_TIMEOUT)])
 
 
 class EchoSampler:
@@ -102,6 +102,11 @@ class Routers:
 
   def router_url(self, model_id: str) -> str | None:
     return self.url
+
+
+class FailingRouters:
+  def router_url(self, model_id: str) -> str | None:
+    raise TimeoutError("read timed out")
 
 
 class GatewayRoutingTest(unittest.TestCase):
@@ -138,7 +143,13 @@ class GatewayRoutingTest(unittest.TestCase):
     self.assertIn("llm-d router returned 429", response.json()["error_message"])
 
   def test_an_unreachable_router_falls_back_to_the_queue(self) -> None:
-    with patch.object(api_server, "worker_manager", Routers(None)), patch.object(api_server, "ROUTER_ATTEMPTS", 1):
+    self.assert_queued_through(Routers(None))
+
+  def test_a_failed_router_lookup_falls_back_to_the_queue(self) -> None:
+    self.assert_queued_through(FailingRouters())
+
+  def assert_queued_through(self, routers) -> None:
+    with patch.object(api_server, "worker_manager", routers), patch.object(api_server, "ROUTER_ATTEMPTS", 1):
       body = {"model_id": "job", "prompt": {"chunks": [{"tokens": [1, 2, 3]}]}, "sampling_params": {"max_tokens": 2}}
       self.client.post("/api/v1/asample", json=body)
       # One attempt, a one-second backoff, then the queue.

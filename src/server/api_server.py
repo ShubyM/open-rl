@@ -1164,7 +1164,12 @@ async def sample_through_router(model_id: str, request: dict[str, Any]) -> None:
     "openrl": request,
   }
   for attempt in range(ROUTER_ATTEMPTS):
-    url = router_urls.get(model_id) or await asyncio.to_thread(worker_manager.router_url, model_id)
+    url = router_urls.get(model_id)
+    if url is None:
+      try:
+        url = await asyncio.to_thread(worker_manager.router_url, model_id)
+      except Exception as exc:
+        print(f"[API_SERVER] llm-d router lookup for {model_id} failed: {exc}")
     if url:
       router_urls[model_id] = url
       try:
