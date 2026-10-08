@@ -87,10 +87,23 @@ users: [{name: harvey-driver, user: {token: $TOKEN}}]
 contexts: [{name: sandboxes, context: {cluster: sandboxes, user: harvey-driver, namespace: lab-sandboxes}}]
 current-context: sandboxes
 EOF
-kubectl --context <training-cluster> -n openrl-system create secret generic sandbox-cluster-kubeconfig \
+kubectl --context <training-cluster> -n <job namespace> create secret generic sandbox-cluster-kubeconfig \
   --from-file=kubeconfig=driver.kubeconfig
 ```
 
 Run the driver with `KUBECONFIG` pointing at it and
 `automountServiceAccountToken: false`, so the sandbox client does not pick up
 the training cluster's credentials.
+
+## Running
+
+Build the driver image from the repository root, set it, the judge endpoint
+and `RUN` in `../cluster-job.yaml`, then apply it:
+
+```sh
+gcloud builds submit --config cloudbuild.yaml \
+  --substitutions=_IMAGE=<registry>/harvey-labs-client,_DOCKERFILE=examples/harvey_labs/Dockerfile,_TAG=<tag> .
+kubectl apply -f examples/harvey_labs/cluster-job.yaml
+```
+
+Without `sandbox_warmpool`, the recipe runs sandboxes in local Podman as before.
