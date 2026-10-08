@@ -1,6 +1,11 @@
+import copy
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from server.dashboard import snapshot
+from fastapi import HTTPException
+
+from server.dashboard import router, snapshot
 
 STATE = {
   "available": True,
@@ -94,3 +99,61 @@ class SnapshotJoinTest(unittest.TestCase):
     self.assertEqual((runs["r0"]["pods"], runs["r0"]["workloads"], runs["r0"]["display_status"]), ([], [], "Completed"))
     placements = snapshot.placements_of(STATE, list(runs.values()))
     self.assertEqual(sorted(placements[0]["run_ids"]), ["r1", "r3"])
+
+  def test_scheduler_outage_is_not_an_unassigned_run(self) -> None:
+    state = {**STATE, "scheduler": {"available": False, "workloads": []}}
+    run = snapshot.join_runs(METADATA, state)[0]
+    self.assertEqual(run["display_status"], "Unknown")
+    self.assertIsNotNone(run["delete_blocker"])
+
+
+class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
+  async def asyncSetUp(self) -> None:
+    self.snapshot = snapshot.Snapshot()
+    self.store = SimpleNamespace(list_jobs_metadata=AsyncMock(return_value=copy.deepcopy(METADATA)), get_model_metadata=AsyncMock(return_value=None))
+    self.enterContext(patch.object(snapshot.backends, "current", return_value=SimpleNamespace(inventory=lambda: STATE)))
+    self.history = self.enterContext(patch.object(snapshot.history, "read", new=AsyncMock(return_value=[{"id": "past"}])))
+    self.enterContext(patch.object(router, "snapshot", self.snapshot))
+    self.enterContext(patch.object(router, "get_store", return_value=self.store))
+
+  async def test_temporary_source_errors_retain_records_and_report_staleness(self) -> None:
+    first = await self.snapshot.current(self.store)
+    self.store.list_jobs_metadata.side_effect = TimeoutError()
+    self.history.side_effect = TimeoutError()
+    self.snapshot.updated = 0
+    stale = await self.snapshot.current(self.store)
+    self.assertEqual([r["run_id"] for r in first["runs"]], [r["run_id"] for r in stale["runs"]])
+    self.assertTrue(all(r["delete_blocker"] for r in stale["runs"]))
+    self.assertTrue(stale["store_error"])
+    self.assertEqual(stale["history"], first["history"])
+    self.assertTrue(stale["history_error"])
+    self.store.list_jobs_metadata.side_effect = None
+    self.store.list_jobs_metadata.return_value = []
+    self.history.side_effect = None
+    self.history.return_value = []
+    self.snapshot.updated = 0
+    recovered = await self.snapshot.current(self.store)
+    self.assertEqual(recovered["runs"], [])
+    self.assertIsNone(recovered["store_error"])
+    self.assertIsNone(recovered["history_error"])
+
+  async def test_new_run_resolves_before_snapshot_cache_expires(self) -> None:
+    await self.snapshot.current(self.store)
+    self.store.get_model_metadata.return_value = {**METADATA[0], "model_id": "new-run"}
+    _, run = await router.run_of("new-run")
+    self.assertEqual(run["run_id"], "new-run")
+    self.assertCountEqual(run["runtime_run_ids"], ["new-run", "r1", "r3"])
+    detail = await router.run_detail("new-run")
+    self.assertEqual(len(detail["placements"]), 1)
+    self.assertIn("new-run", detail["placements"][0]["run_ids"])
+
+  async def test_store_failure_is_not_a_missing_run(self) -> None:
+    self.store.list_jobs_metadata.side_effect = TimeoutError()
+    with self.assertRaises(HTTPException) as error:
+      await router.run_of("missing")
+    self.assertEqual(error.exception.status_code, 503)
+
+  async def test_truly_missing_run_returns_404(self) -> None:
+    with self.assertRaises(HTTPException) as error:
+      await router.run_of("missing")
+    self.assertEqual(error.exception.status_code, 404)

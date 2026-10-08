@@ -26,6 +26,10 @@ The gateway serves `/dashboard`. The UI and agents read the same read-only JSON 
 
 Nothing lives only in the gateway's memory. Replacing the gateway pod loses no history.
 
+Temporary Redis failures retain the last readable run list and placement history, with an explicit source error; a failed read is not an empty cluster. A new run's detail endpoint checks its metadata directly if the cached snapshot predates its creation. Deleted run records are not linked from historical allocation lanes.
+
+`Ended` means all known client sessions stopped heartbeating, rather than an explicit completion. Training and sampling clients can have different sessions; either keeps that run active. Heartbeat recovery reverses an inferred end on the next settlement pass. Explicit `Completed` and `Failed` states stay terminal. Historical allocation labels describe the allocation disappearing, not the run ending. Runs created before session membership tracking retain their original session; other clients are tracked when they next bind to the run.
+
 ## Run and device identity
 
 FFT workloads use the logical run ID. LoRA workloads use a shared base-model runtime, so several runs refer to one trainer and one sampler; the UI and API say so with `shared_runtime` and `runtime_run_ids`. Run membership uses Workload ownership, never a pod-name prefix. GPUs are identified by DRA device IDs from ResourceSlices and by their UUID for metrics; a GPU index is never inferred.
@@ -74,3 +78,42 @@ Time and log filters work within the captured rows. Pagination covers only those
 ## Front end
 
 Plain ES modules, no build step. `app.js` routes and polls; `store.js` holds the snapshot and selection; `navigation.js` restores and shares inspection URLs; `cache.js` fetches anything else and re-renders when it lands. Every page is a function from state to markup, patched into the document by `morph` so a refresh keeps scroll, focus and open panels. Charts are markup too: an SVG stretched to its box with HTML axes, so nothing is measured.
+
+### Browser regression checks
+
+The browser suite uses the recorded fixture and synthetic API failures, without GPUs or cluster credentials. It covers responsive pages at 320–1280px, run deep links, retries, bulk selection/deletion, operation clicks, source failures, preserved device mapping, time selection, navigation and late log responses. Install the development tools once:
+
+```sh
+npm --prefix dev/dashboard ci
+npm --prefix dev/dashboard exec -- playwright install chromium
+make dashboard-test
+```
+
+The fixture target uses the project's Python environment. The browser suite starts its own fixture on port 9018; the benchmark uses 9019. `DASHBOARD_CHROMIUM=/path/to/chromium` selects an existing browser. Redis integration tests in `make test` need Redis 6.2+ for `LMOVE`; `OPEN_RL_TEST_REDIS_URL` can point at a **disposable** instance (the suite clears its database).
+
+### UI framework evaluation
+
+`dev/dashboard/overview.preact.js` is an executable Preact 10.29.3 + HTM 3.1.1 prototype of the Overview, including filters, selection, disabled controls and notices. Its browser test uses the production event handlers and CSS. It is development-only; production assets and deployment still need no Node build or runtime framework.
+
+```sh
+make dashboard-benchmark
+```
+
+The benchmark compares the branch baseline (`5b42aeac`), the corrected renderer and the prototype on identical run records. `DASHBOARD_BASELINE` overrides the baseline commit. Results are written to `dev/dashboard/test-results/benchmark.json`. It uses 15 warmup updates and 50 measured updates, including synchronous layout. These are local Chromium CPU measurements, not network, first-load, GPU-training or end-to-end latency measurements. Synthetic larger lists repeat the recorded runs with unique IDs. No virtualization is used.
+
+Measured with headless Chromium 151.0.7922.34 on this development host:
+
+| Rows / action | Baseline median | Corrected median | Preact median | Corrected / Preact p95 |
+|---|---:|---:|---:|---:|
+| 12 / poll update | 0.3 ms | 0.3 ms | 0.1 ms | 0.4 / 0.3 ms |
+| 12 / filter | 0.8 ms | 0.8 ms | 0.5 ms | 1.0 / 0.8 ms |
+| 100 / poll update | 1.1 ms | 1.1 ms | 0.7 ms | 1.3 / 1.6 ms |
+| 100 / filter | 3.9 ms | 3.5 ms | 3.4 ms | 4.3 / 4.2 ms |
+| 1,000 / poll update | 11.6 ms | 9.1 ms | 7.1 ms | 12.2 / 9.0 ms |
+| 1,000 / filter | 31.9 ms | 32.5 ms | 34.5 ms | 38.2 / 45.6 ms |
+
+The Preact + HTM runtime is 5,071 bytes gzipped in the benchmark bundle. The prototype plus runtime is 6,918 bytes gzipped, excluding shared production imports. Authored Overview source is approximately 5.7 KB today versus 5.6 KB for the prototype. After Prettier formatting, the current Overview section is 96 lines, the shared custom DOM patcher 67 lines, and the prototype 158 lines. These line counts have different scopes: the prototype imports the existing filter function, and an Overview-only migration cannot remove the DOM patcher used by the other pages. Template formatting also affects line counts. This experiment does **not** demonstrate a meaningful reduction in maintained code.
+
+Preact is a credible option for a future component migration: it owns keyed reconciliation and escaping, and improved polling updates in this test. Filtering was slightly slower for the larger lists. Adopting it for only one page would add a second rendering system. Keep the current fixes and regression suite; migrate all views together only if that work removes enough custom rendering/state code to justify the change. A renderer change cannot fix run identity or session lifecycle errors in the API.
+
+Other options considered from their official documentation, without performance claims: [Alpine's Morph plugin](https://alpinejs.dev/plugins/morph) preserves state while replacing HTML but keeps the string-rendering approach; [Svelte](https://svelte.dev/docs/svelte/overview) compiles declarative components and would add a production compilation step. [Preact with HTM](https://preactjs.com/guide/v10/getting-started/#alternatives-to-jsx) supports ordinary JavaScript templates, which made it the smallest workflow change to prototype. Only Preact was implemented and timed here.

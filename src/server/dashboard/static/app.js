@@ -11,7 +11,7 @@ import { renderNodes } from "./nodes.js";
 import { installNodeTime, cancelNodeGesture, timeWindow } from "./node-time.js";
 import { runPage, ensureLogs, loadLogs, runView, resetRunWindow, syncRunRoute, setLogFilter, setLogEvent, toggleLogFollow } from "./run.js";
 import { restoreView, syncViewURL, currentView, copyView, viewReady } from "./navigation.js";
-import { use, beginRender, endRender } from "./cache.js";
+import { use, retry, beginRender, endRender } from "./cache.js";
 
 const pageOf = (page) => (!page || ["run", "runs"].includes(page) ? "overview" : page);
 let scrollToSelection = false;
@@ -32,6 +32,8 @@ function render() {
   } finally {
     endRender();
   }
+  const selectAll = content.querySelector("[data-select-all-runs]");
+  if (selectAll) selectAll.indeterminate = selectAll.dataset.indeterminate === "true";
   const current = page === "run" ? runView.origin : pageOf(page);
   root.querySelectorAll(".appbar nav a").forEach((link) => {
     if (route(link.hash)[0] === current) link.setAttribute("aria-current", "page");
@@ -89,6 +91,8 @@ root.addEventListener("click", (event) => {
   const target = event.target.closest("button");
   if (!target) return;
   if (target.hasAttribute("data-copy-view")) return void copyView(target);
+  if (target.hasAttribute("data-retry-data")) { retry(target.dataset.retryData); return render(); }
+  if (target.hasAttribute("data-retry-logs")) return void loadLogs(route()[1]);
   if (target.hasAttribute("data-close-details")) return closeDetails();
   if (target.dataset.runFilter) {
     ui.runFilter = { ...ui.runFilter, status: target.dataset.runFilter };
@@ -125,19 +129,24 @@ root.addEventListener("click", (event) => {
 });
 
 async function deleteRuns(button) {
+  if (ui.deletingRuns || ui.state.recorded_at) return;
   const ids = filterRuns(ui.state).filter((r) => !r.delete_blocker && ui.selectedRuns.has(r.run_id)).map((r) => r.run_id);
   const noun = (n) => `${n} run${n === 1 ? "" : "s"}`;
   if (!ids.length || !confirm(`Delete ${noun(ids.length)}?\n\nThis removes their records and recorded ops from the dashboard. Workers, checkpoints and metrics files are not touched.`)) return;
   button.disabled = true;
+  ui.deletingRuns = true;
+  render();
   try {
     const result = await post("/api/v1/dashboard/runs/delete", { run_ids: ids });
     const gone = new Set(result.deleted);
     ui.state = { ...ui.state, runs: ui.state.runs.filter((r) => !gone.has(r.run_id)) };
-    ui.selectedRuns.clear();
+    for (const id of gone) ui.selectedRuns.delete(id);
     const reasons = [...new Set(result.kept.map((k) => k.reason))].join("; ");
     ui.runNotice = `Deleted ${noun(gone.size)}.${result.kept.length ? ` Kept ${noun(result.kept.length)}: ${reasons}.` : ""}`;
   } catch (error) {
     ui.runNotice = `Delete failed: ${error.message}`;
+  } finally {
+    ui.deletingRuns = false;
   }
   render();
   refresh();
@@ -214,7 +223,7 @@ root.addEventListener("change", (event) => {
     render();
   }
   if (target.dataset.timeEnd !== undefined) {
-    if (!target.validity.valid) return;
+    if (!target.validity.valid) { target.reportValidity(); return; }
     const end = target.value ? Date.parse(`${target.value}Z`) / 1000 : null;
     ui.nodeSelection = { ...ui.nodeSelection, end: Number.isFinite(end) ? Math.min(end, nodeNow()) : null };
     render();
@@ -236,7 +245,9 @@ document.addEventListener("click", (event) => {
   });
 });
 
-window.addEventListener("hashchange", () => {
+window.addEventListener("hashchange", (event) => {
+  const previous = route(new URL(event.oldURL).hash), next = route();
+  if (previous[0] !== next[0] || previous[1] !== next[1]) window.scrollTo(0, 0);
   cancelNodeGesture(false);
   root.style.removeProperty("min-height");
   clearTimeout(searchTimer);

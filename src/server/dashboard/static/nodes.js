@@ -28,9 +28,10 @@ function segments({ now }) {
       // A live shared worker no longer lists the finished runs it served; history does.
       run_ids: [...new Set([...(entry.run_ids || []), ...(current.run_ids || [])])],
       label: current.run_ids?.length ? current.label : entry.label,
+      devices: current.devices?.length ? current.devices : entry.devices || [],
       start: entry.first_seen,
       end,
-      ended: !live.has(entry.id),
+      ended: !live.has(entry.id) && ui.state.cluster.available && ui.state.cluster.scheduler?.available !== false,
     });
   }
   for (const placement of ui.state.placements) if (!seen.has(placement.id)) found.push({ ...placement, start: nodeNow(), end: now });
@@ -262,13 +263,13 @@ function opLegend(activities) {
 }
 
 function activityTimeline(placements, range, { acrossNodes = false, activeOnly = false } = {}) {
-  const href = (p) => acrossNodes ? ui.state.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : p.run_ids?.[0] ? `#run/${encode(p.run_ids[0])}/activity` : null;
+  const href = (p) => acrossNodes ? ui.state.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : ui.state.runs.some((r) => r.run_id === p.run_ids?.[0]) ? `#run/${encode(p.run_ids[0])}/activity` : null;
   const x = (at) => ((at - range.start) / (range.now - range.start)) * 1000;
   const block = (from, to) => `M${x(from)},0 H${x(to)} V24 H${x(from)} Z`;
   const path = (p, blocks) => `<path class="activity-block ${placementColor(p)}" ${!acrossNodes ? `data-placement="${escape(p.id)}"` : ""} data-selected="${!acrossNodes && p.id === ui.expanded}" data-label="${escape(acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label)}" data-source="${p.exact ? "GPU turns" : "Recorded operations"}" data-intervals="${escape(JSON.stringify(p.intervals))}" d="${blocks}" vector-effect="non-scaling-stroke"/>`;
   const axis = [0, 1, 2, 3, 4].map((tick) => `<span>${axisTime(range.start + ((range.now - range.start) * tick) / 4, range)}</span>`).join("");
   const activities = [...placements].sort((a, b) => (acrossNodes ? processOrder(a, b) : 0) || a.start - b.start || a.id.localeCompare(b.id)).map((p) => ({ ...p, ...operationActivity(p, range) }));
-  const shown = activeOnly ? activities.filter((p) => p.intervals.length) : activities;
+  const shown = activeOnly ? activities.filter((p) => p.intervals.length || p.loading || p.error || p.warning) : activities;
   if (!shown.length) {
     const loading = activities.some((p) => p.loading);
     const unavailable = activities.some((p) => p.warning || (p.error && p.errorStatus !== 404));
@@ -280,14 +281,14 @@ function activityTimeline(placements, range, { acrossNodes = false, activeOnly =
     const name = acrossNodes ? processLabel(p) : p.label, meta = acrossNodes ? p.node ? shortNodeName(p.node, ui.state.cluster.nodes) : "Node unassigned" : p.role || "process";
     const tag = href(p) ? "a" : "span";
     const attrs = href(p) ? `href="${escape(href(p))}"` : 'aria-disabled="true"';
-    const label = `<${tag} class="activity-label ${placementColor(p)}" data-key="label:${escape(p.id)}" ${attrs} title="${escape(acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !href(p) ? " · Node no longer reported" : ""}` : p.label)}"><span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">${escape(name)}</span><span class="activity-meta">${escape(meta)}${p.ended ? " · Ended" : ""}${!href(p) ? acrossNodes ? " · Node no longer reported" : " · Run ID unavailable" : ""}</span></span></${tag}>`;
+    const label = `<${tag} class="activity-label ${placementColor(p)}" data-key="label:${escape(p.id)}" ${attrs} title="${escape(acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !href(p) ? " · Node no longer reported" : ""}` : p.label)}"><span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">${escape(name)}</span><span class="activity-meta">${escape(meta)}${p.ended ? " · Allocation no longer reported" : ""}${!href(p) ? acrossNodes ? " · Node no longer reported" : p.run_ids?.length ? " · Run record unavailable" : " · No linked run" : ""}</span></span></${tag}>`;
     // One path per run, with separate blocks at their exact times. Dense
     // histories stay cheap, and labels remain selectable even for tiny bursts.
     const blocks = intervals.map(([from, to]) => block(from, to)).join(" ");
     const rowLabel = acrossNodes ? `${p.label} · ${processLabel(p)} · ${p.node}` : p.label;
     const ops = Object.entries(p.ops || {})
       .sort(([a], [b]) => opRank(a) - opRank(b))
-      .map(([op, spans]) => `<path class="activity-block op" data-op="${escape(op)}" data-label="${escape(`${opLabel(op)} · ${rowLabel}`)}" data-source="Worker-recorded op" data-intervals="${escape(JSON.stringify(spans))}" d="${spans.map(([from, to]) => block(from, to)).join(" ")}" vector-effect="non-scaling-stroke"/>`)
+      .map(([op, spans]) => `<path class="activity-block op" ${!acrossNodes ? `data-placement="${escape(p.id)}"` : ""} data-op="${escape(op)}" data-label="${escape(`${opLabel(op)} · ${rowLabel}`)}" data-source="Worker-recorded op" data-intervals="${escape(JSON.stringify(spans))}" d="${spans.map(([from, to]) => block(from, to)).join(" ")}" vector-effect="non-scaling-stroke"/>`)
       .join("");
     return `<div class="activity-row ${placementColor(p)}" data-key="${escape(p.id)}" data-selected="${!acrossNodes && p.id === ui.expanded}">
       ${label}

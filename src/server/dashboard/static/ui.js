@@ -99,8 +99,9 @@ function morphNode(node, next) {
   for (const { name } of Array.from(node.attributes)) if (!preserve(name) && !next.hasAttribute(name)) node.removeAttribute(name);
   for (const { name, value } of Array.from(next.attributes)) if (!preserve(name) && node.getAttribute(name) !== value) node.setAttribute(name, value);
   morphChildren(node, next);
-  // Patch options too; skipping SELECT left time ranges and pod lists stale.
-  if (["INPUT", "SELECT"].includes(node.tagName) && node !== document.activeElement && node.value !== value) node.value = value;
+  // Option changes can move a native select's dirty selection to another value.
+  // Reconcile even while focused; only text inputs preserve uncommitted edits.
+  if ((node.tagName === "SELECT" || (node.tagName === "INPUT" && node !== document.activeElement)) && node.value !== value) node.value = value;
   // A ticked checkbox stops following its checked attribute; set the property.
   if (node.tagName === "INPUT" && node.type === "checkbox") node.checked = next.hasAttribute("checked");
   return node;

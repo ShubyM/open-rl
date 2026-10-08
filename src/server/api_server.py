@@ -47,6 +47,7 @@ owner_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 async def bind_session(session_id: str | None, model_id: str) -> None:
   if not session_id:
     return
+  await session_registry.heartbeat(session_id)
   await remember_session(store, model_id, session_id)
   if worker_manager is not None:
     owner = await asyncio.to_thread(owner_of, model_id)
@@ -55,25 +56,30 @@ async def bind_session(session_id: str | None, model_id: str) -> None:
 
 
 async def remember_session(job_store, model_id: str, session_id: str) -> None:
-  """A run belongs to the first session that touched it; that session's death ends the run."""
+  """Keep the original session for compatibility and track every client using this run."""
   raw = await job_store.get_value(f"open_rl:model_meta:{model_id}")
-  if raw and not json.loads(raw).get("session_id"):
+  if not raw:
+    return
+  await job_store.add_to_set(f"open_rl:run_sessions:{model_id}", session_id)
+  if not json.loads(raw).get("session_id"):
     await job_store.update_job_metadata(model_id, {"session_id": session_id})
 
 
-TERMINAL_STATUSES = {"completed", "failed", "ended"}
-
-
 async def settle_runs(job_store, registry) -> list[str]:
-  """Mark runs whose owning session stopped heartbeating. The gateway cannot
-  tell a clean exit from a crash, so the status is "ended", not completed."""
+  """Infer abandonment only after every associated client stops heartbeating.
+  Unlike explicit completion/failure, this inference can recover after an outage."""
   settled = []
   now = time.time()
   for row in await job_store.list_jobs_metadata():
     session_id = row.get("session_id")
-    if not session_id or str(row.get("status", "")).lower() in TERMINAL_STATUSES:
+    status = str(row.get("status", "")).lower()
+    if not session_id or status in {"completed", "failed"}:
       continue
-    if await registry.live(session_id):
+    if await registry.run_in_use(row["model_id"], session_id):
+      if status == "ended":
+        await job_store.update_job_metadata(row["model_id"], {"status": "active", "completed_at": None, "updated_at": now})
+      continue
+    if status == "ended":
       continue
     await job_store.update_job_metadata(row["model_id"], {"status": "ended", "completed_at": now, "updated_at": now})
     settled.append(row["model_id"])

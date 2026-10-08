@@ -13,6 +13,10 @@ let generation = 0;
 let repaint = 0;
 
 export const beginRender = () => generation++;
+export function retry(scope) {
+  entries.get(scope)?.controller?.abort();
+  entries.delete(scope);
+}
 export function endRender() {
   for (const [scope, entry] of entries) {
     if (entries.size <= MAX_ENTRIES) break;

@@ -18,6 +18,31 @@ class RunSettlementTest(unittest.TestCase):
     asyncio.run(gateway.remember_session(store, "r1", "sess-a"))
     asyncio.run(gateway.remember_session(store, "r1", "sess-b"))
     self.assertEqual(json.loads(asyncio.run(store.get_value("open_rl:model_meta:r1")))["session_id"], "sess-a")
+    self.assertEqual(asyncio.run(store.set_members("open_rl:run_sessions:r1")), {"sess-a", "sess-b"})
+
+  def test_sampling_client_keeps_run_live_after_training_client_exits(self) -> None:
+    store = InMemoryStore()
+    registry = SessionRegistry(store)
+    seed(store, "shared", session_id="training")
+    seed(store, "other", session_id="training")
+    asyncio.run(gateway.remember_session(store, "shared", "sampling"))
+    asyncio.run(registry.heartbeat("sampling"))
+    self.assertEqual(asyncio.run(gateway.settle_runs(store, registry)), ["other"])
+    self.assertEqual(asyncio.run(store.get_model_metadata("shared"))["status"], "active")
+
+  def test_heartbeat_recovery_revives_inferred_end_but_not_explicit_completion(self) -> None:
+    store = InMemoryStore()
+    registry = SessionRegistry(store)
+    seed(store, "recover", session_id="s")
+    self.assertEqual(asyncio.run(gateway.settle_runs(store, registry)), ["recover"])
+    seed(store, "done", session_id="s", status="completed", completed_at=5)
+    seed(store, "failed", session_id="s", status="failed", completed_at=5)
+    asyncio.run(registry.heartbeat("s"))
+    self.assertEqual(asyncio.run(gateway.settle_runs(store, registry)), [])
+    rows = {r["model_id"]: r for r in asyncio.run(store.list_jobs_metadata())}
+    self.assertEqual((rows["recover"]["status"], rows["recover"]["completed_at"]), ("active", None))
+    self.assertEqual((rows["done"]["status"], rows["done"]["completed_at"]), ("completed", 5))
+    self.assertEqual((rows["failed"]["status"], rows["failed"]["completed_at"]), ("failed", 5))
 
   def test_runs_of_dead_sessions_end_and_live_or_terminal_runs_do_not(self) -> None:
     store = InMemoryStore()

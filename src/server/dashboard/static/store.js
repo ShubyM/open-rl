@@ -16,6 +16,7 @@ export const ui = {
   runFilter: { q: "", status: "all" }, // Overview search and status chip
   selectedRuns: new Set(), // run IDs ticked on the Overview
   runNotice: null, // outcome of the last delete
+  deletingRuns: false,
   // Installed by app.js once the page is wired up.
   render: () => {},
 };

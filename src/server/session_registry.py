@@ -33,6 +33,17 @@ class SessionRegistry:
   async def live(self, session_id: str) -> bool:
     return await self.store.get_value(f"open_rl:session:{session_id}") is not None
 
+  async def run_in_use(self, model_id: str, first_session: str | None = None) -> bool:
+    """A run can be used by separate training and sampling clients. Include
+    the original metadata session for runs created before membership tracking."""
+    sessions = await self.store.set_members(f"open_rl:run_sessions:{model_id}")
+    if first_session:
+      sessions.add(first_session)
+    for session_id in sessions:
+      if await self.live(session_id):
+        return True
+    return False
+
   async def attach(self, session_id: str, owner: str) -> None:
     """The session is using this owner's workers from now on."""
     await self.heartbeat(session_id)

@@ -89,10 +89,13 @@ export function runPage(id, tab = "activity") {
   // A snapshot advances time once; cache completions never create new windows.
   const observedAt = Date.parse(ui.state.observed_at) / 1000;
   if (runView.follow && Number.isFinite(observedAt)) runView.windowEnd = observedAt;
-  const run = ui.state.runs.find((r) => r.run_id === id);
+  const detailUrl = `/api/v1/dashboard/runs/${encode(id)}`;
+  const detail = !ui.state.runs.some((r) => r.run_id === id) && id ? use(detailUrl) : null;
+  const run = ui.state.runs.find((r) => r.run_id === id) || (detail?.errorStatus !== 404 ? detail?.data : null);
   const back = `<p class="overview-back"><a href="${escape(runView.nodeBack || "#overview")}">← ${runView.origin === "nodes" ? "Nodes" : "Overview"}</a></p>`;
-  const sourceError = ui.state.store_error ? `<p class="source-error" role="status">${escape(ui.state.store_error)}</p>` : "";
-  if (!run) return `${back}<h1 class="heading">Run</h1>${sourceError || empty("Run not found")}`;
+  const error = ui.state.store_error || detail?.error;
+  const sourceError = error ? `<p class="source-error" role="status">${escape(error)}</p>` : "";
+  if (!run) return `${back}<h1 class="heading">Run</h1>${sourceError || empty(id ? "Loading run…" : "Choose a run from Overview")}${detail?.error ? button("Retry", `data-retry-data="${escape(detailUrl)}"`) : ""}`;
   if (!["activity", "metrics", "logs"].includes(tab)) tab = "activity";
   const title = [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), { lora: "LoRA", full: "FFT", fft: "FFT" }[run.fine_tuning_type]].filter(Boolean).join(" · ");
   const description = [run.display_name, run.recipe_name].filter((value, index, values) => value && value !== title && values.indexOf(value) === index).join(" · ");
@@ -235,7 +238,7 @@ function logsPanel(id, run) {
   const status = [source, rows || !logState.error ? `${logState.records.length.toLocaleString()} ${logState.records.length === 1 ? "record" : "records"} · Newest first` : "", logState.loading ? (rows ? "Updating…" : "Loading…") : logState.error ? "" : ui.state.recorded_at ? "Recorded logs" : runView.follow ? "Updates every 5s" : "Paused"].filter(Boolean).join(" · ");
   return `${run.shared_runtime ? '<p class="muted">These pods serve a shared LoRA runtime. Their logs can include other runs.</p>' : ""}${scope}
     <div class="log-toolbar" data-key="log-toolbar"><input id="log-search" type="search" value="${escape(logState.q)}" placeholder="Search logs" aria-label="Search logs"><select id="log-source" aria-label="Pod"><option value="" ${!logState.pod ? "selected" : ""}>All pods</option>${pods}</select>${ui.state.recorded_at ? "" : button(runView.follow ? "Pause updates" : "Follow logs", 'data-log-follow="true"')}</div>
-    <div id="log-status" class="log-status" role="status"><span>${escape(status)}</span>${logState.error ? `<span class="log-error">${escape(logState.error)}${rows ? " · Showing previously fetched records" : ""}</span>` : ""}</div>
+    <div id="log-status" class="log-status" role="status"><span>${escape(status)}</span>${logState.error ? `<span class="log-error">${escape(logState.error)}${rows ? " · Showing previously fetched records" : ""}</span><span>${button("Retry logs", `data-retry-logs ${logState.loading ? "disabled" : ""}`)}</span>` : ""}</div>
     <div id="log-lines" tabindex="0" aria-label="Run logs">${rows || (logState.loading || logState.error ? "" : empty("No logs match this time range and filter"))}</div>
     <div id="log-more">${logState.cursor ? button(logState.loading ? "Loading…" : "Older logs", `data-older="true" ${logState.loading ? "disabled" : ""}`) : logState.records.length === MAX_LOGS ? '<p class="muted">2,000 records shown. Narrow the time range or search to inspect more.</p>' : ""}</div>`;
 }

@@ -21,7 +21,7 @@ export function restoreView() {
   appliedHash = location.hash;
   const [page, id] = route(), params = viewParams();
   if (page === "nodes") restoreNodes(params);
-  if (OVERVIEW.includes(page)) ui.runFilter = { q: params.get("q") || "", status: params.get("status") || "all" };
+  if (OVERVIEW.includes(page)) ui.runFilter = { q: params.get("q") || "", status: ["active", "unassigned", "finished", "failed"].includes(params.get("status")) ? params.get("status") : "all" };
   if (page === "run") {
     openRun(id);
     const window = windowFrom(params), back = params.get("back");

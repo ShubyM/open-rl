@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from server.dashboard import experiments, metrics
-from server.dashboard.snapshot import TERMINAL_STATUSES, snapshot
+from server.dashboard.snapshot import join_runs, placements_of, snapshot
 from server.session_registry import SessionRegistry
 from server.store import get_store
 from server.telemetry import backends, gke, kubernetes, ops
@@ -75,10 +75,22 @@ async def experiment_metrics():
 
 
 async def run_of(run_id: str) -> tuple[dict, dict]:
-  state = await snapshot.current(get_store())
+  store = get_store()
+  state = await snapshot.current(store)
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
   if run is None:
-    raise HTTPException(404, "Run not found")
+    # A just-created run may not yet be in the five-second snapshot cache.
+    try:
+      metadata = await store.get_model_metadata(run_id)
+    except Exception as exc:
+      raise HTTPException(503, "Run store unavailable. Try again shortly.") from exc
+    if metadata:
+      rows = [row for row in snapshot.metadata if row["model_id"] != run_id]
+      runs = join_runs([*rows, {**metadata, "model_id": run_id}], state["cluster"])
+      state = {**state, "runs": runs, "placements": placements_of(state["cluster"], runs)}
+      run = next(r for r in runs if r["run_id"] == run_id)
+    else:
+      raise HTTPException(503 if state.get("store_error") else 404, "Run store unavailable" if state.get("store_error") else "Run record not found")
   return state, run
 
 
@@ -98,20 +110,23 @@ async def delete_runs(body: DeleteRuns):
   Workers, checkpoints and metrics files are not touched. A run that still has
   workers or a live client session is kept and reported with the reason."""
   store = get_store()
-  runs = {r["run_id"]: r for r in (await snapshot.current(store))["runs"]}
+  state = await snapshot.current(store)
+  runs = {r["run_id"]: r for r in state["runs"]}
+  if state.get("store_error"):
+    raise HTTPException(503, "Run store unavailable. Try again shortly.")
   sessions = SessionRegistry(store)
   deleted, kept = [], []
   for run_id in dict.fromkeys(body.run_ids):
     run = runs.get(run_id)
     reason = "Run not found" if run is None else run["delete_blocker"]
-    if reason is None and str(run["status"]).lower() not in TERMINAL_STATUSES:
+    if reason is None and str(run["status"]).lower() not in {"completed", "failed"}:
       session_id = ((await store.get_model_metadata(run_id)) or {}).get("session_id")
-      if session_id and await sessions.live(session_id):
+      if await sessions.run_in_use(run_id, session_id):
         reason = "The run's client session is still live"
     if reason:
       kept.append({"run_id": run_id, "reason": reason})
       continue
-    await store.delete_values(f"open_rl:model_meta:{run_id}", ops.key(run_id))
+    await store.delete_values(f"open_rl:model_meta:{run_id}", f"open_rl:run_sessions:{run_id}", ops.key(run_id))
     deleted.append(run_id)
   if deleted:
     snapshot.invalidate()

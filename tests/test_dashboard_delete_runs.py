@@ -100,6 +100,15 @@ class DeleteRunsTest(unittest.TestCase):
     self.assertIsNotNone(snapshot.delete_blocker(run, available=False))
     self.assertIsNone(snapshot.delete_blocker({**run, "status": "completed"}, available=False))
 
+  def test_an_inferred_end_cannot_be_deleted_after_a_client_recovers(self) -> None:
+    asyncio.run(self.store.add_to_set("open_rl:run_sessions:ended", "sess-1"))
+    self.assertEqual(self.delete("ended")["deleted"], [])
+
+  def test_deleting_a_run_removes_its_session_memberships(self) -> None:
+    asyncio.run(self.store.add_to_set("open_rl:run_sessions:abandoned", "expired"))
+    self.assertEqual(self.delete("abandoned")["deleted"], ["abandoned"])
+    self.assertEqual(asyncio.run(self.store.set_members("open_rl:run_sessions:abandoned")), set())
+
 
 if __name__ == "__main__":
   unittest.main()

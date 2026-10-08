@@ -729,7 +729,7 @@ body {
   pointer-events: none;
 }
 #orl-design-lab .allocation-expansion {
-  --activity-label-width: 240px;
+  --activity-label-width: clamp(160px, 25vw, 240px);
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 12px;
@@ -935,7 +935,7 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 14px;
-  margin: 8px 0 0 var(--activity-label-width, 0);
+  margin: 8px 0 0 calc(var(--activity-label-width, 0px) + 12px);
   font-size: 12px;
   color: var(--muted, inherit);
 }
@@ -954,7 +954,7 @@ body {
   background: color-mix(in srgb, currentColor 25%, transparent);
 }
 #orl-design-lab .cross-node-activity {
-  --activity-label-width: 240px;
+  --activity-label-width: clamp(160px, 25vw, 240px);
   border-top: 1px solid var(--line);
   padding-top: 16px;
 }
@@ -1426,46 +1426,65 @@ body {
     );
 }
 
+/* Keep the identity readable before switching to compact rows. */
+@media (min-width: 761px) and (max-width: 1100px) {
+  #orl-design-lab :is(.job-list-head, .job-list-row).run-row {
+    grid-template-columns: 16px minmax(0, 1fr) 128px 68px 76px 76px 68px;
+    gap: 12px;
+  }
+}
 @media (max-width: 760px) {
-  #orl-design-lab .job-list-head {
+  #orl-design-lab :is(.job-list-head, .job-list-row).run-row {
+    grid-template-columns: 16px minmax(0, 1fr) minmax(100px, auto);
+    gap: 6px 12px;
+  }
+  #orl-design-lab .job-list-head.run-row > :nth-child(n + 4) {
     display: none;
   }
-  #orl-design-lab .job-list-row {
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 8px 12px;
-  }
-  #orl-design-lab .job-list-row > :nth-child(2) {
+  #orl-design-lab .run-row > :nth-child(3) {
     justify-self: end;
   }
-  #orl-design-lab .job-list-row > :nth-child(3) {
-    grid-column: 1;
-    color: var(--dim);
-  }
-  #orl-design-lab .job-list-row:not(.experiment-row) > :nth-child(4)::after {
-    content: " steps";
-    color: var(--dim);
-  }
-  #orl-design-lab .job-list-row:not(.experiment-row) > :last-child {
-    grid-column: 1 / -1;
-    text-align: left;
+  #orl-design-lab .run-row > :nth-child(n + 4) {
     color: var(--dim);
     font-size: 12px;
   }
-  #orl-design-lab .job-list-row:not(.experiment-row) > :last-child::before {
+  #orl-design-lab .run-row > :is(:nth-child(4), :nth-child(6)) {
+    grid-column: 2;
+    text-align: left;
+  }
+  #orl-design-lab .run-row > :is(:nth-child(5), :nth-child(7)) {
+    grid-column: 3;
+    text-align: right;
+  }
+  #orl-design-lab .job-list-row.run-row > :nth-child(5)::after {
+    content: " steps";
+  }
+  #orl-design-lab .job-list-row.run-row > :nth-child(6)::before {
+    content: "Created ";
+  }
+  #orl-design-lab .job-list-row.run-row > :nth-child(7)::before {
     content: "Elapsed ";
   }
-  #orl-design-lab .experiment-row > :nth-child(5)::before {
-    content: "Reward ";
+  #orl-design-lab .experiment-head {
+    display: none;
   }
-  #orl-design-lab .experiment-row > :nth-child(6)::before {
-    content: "Correct ";
+  #orl-design-lab .experiment-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 6px 16px;
   }
-  #orl-design-lab .experiment-row > :nth-child(7)::before {
-    content: "Format ";
+  #orl-design-lab .experiment-row > :first-child {
+    grid-column: 1 / -1;
   }
-  #orl-design-lab .experiment-row > :nth-child(n + 5) {
+  #orl-design-lab .experiment-row > :nth-child(n + 2) {
     text-align: left;
     color: var(--dim);
+  }
+  #orl-design-lab .experiment-row > :nth-child(4)::before { content: "Step "; }
+  #orl-design-lab .experiment-row > :nth-child(5)::before { content: "Reward "; }
+  #orl-design-lab .experiment-row > :nth-child(6)::before { content: "Correct "; }
+  #orl-design-lab .experiment-row > :nth-child(7)::before { content: "Format "; }
+  #orl-design-lab .run-delete {
+    margin-left: 0;
   }
 }
 @media (max-width: 580px) {
@@ -1489,6 +1508,9 @@ body {
     overflow-x: auto;
     white-space: nowrap;
     font-size: 12px;
+  }
+  #orl-design-lab #run-search {
+    max-width: none;
   }
   #orl-design-lab .pad {
     padding-block: 16px;
@@ -1546,6 +1568,9 @@ body {
   #orl-design-lab .activity-track {
     height: 34px;
   }
+  #orl-design-lab .op-legend {
+    margin-left: 0;
+  }
   #orl-design-lab .activity-axis span:not(:first-child):not(:last-child) {
     display: none;
   }
@@ -1575,38 +1600,5 @@ body {
   #orl-design-lab .scheduler-reservation {
     grid-template-columns: 1fr;
     gap: 8px;
-  }
-}
-
-/* Overview rows on narrow screens: checkbox, run and status on one line, details below. */
-@media (max-width: 760px) {
-  #orl-design-lab .job-list-row.run-row {
-    grid-template-columns: 16px minmax(0, 1fr) auto;
-  }
-  #orl-design-lab .job-list-row.run-row > :nth-child(2) {
-    justify-self: stretch;
-  }
-  #orl-design-lab .job-list-row.run-row > :nth-child(3) {
-    grid-column: auto;
-    justify-self: end;
-    color: inherit;
-  }
-  #orl-design-lab .job-list-row.run-row > :nth-child(n + 4) {
-    grid-column: 2 / -1;
-    text-align: left;
-    color: var(--dim);
-    font-size: 12px;
-  }
-  #orl-design-lab .job-list-row.run-row > :nth-child(4)::after {
-    content: none;
-  }
-  #orl-design-lab .job-list-row.run-row > :nth-child(5)::after {
-    content: " steps";
-  }
-  #orl-design-lab .job-list-row.run-row > :nth-child(6)::before {
-    content: "Created ";
-  }
-  #orl-design-lab .run-delete {
-    margin-left: 0;
   }
 }

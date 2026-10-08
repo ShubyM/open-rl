@@ -370,4 +370,11 @@ forward:
 dashboard-capture:
 	python3 dev/capture_dashboard_fixture.py --base http://127.0.0.1:$(FORWARD_PORT) --out dev/fixtures/dashboard
 dashboard-fixture:
-	python3 dev/dashboard_fixture.py --port 9017
+	uv run --frozen python dev/dashboard_fixture.py --port 9017
+
+.PHONY: dashboard-test dashboard-benchmark
+dashboard-test:
+	npm --prefix dev/dashboard test
+
+dashboard-benchmark:
+	npm --prefix dev/dashboard run benchmark

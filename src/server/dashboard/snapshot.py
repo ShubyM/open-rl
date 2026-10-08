@@ -80,7 +80,7 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
         "runtime_id": runtime,
         "shared_runtime": lora,
         "status": row.get("status", "unknown"),
-        "display_status": observed_status(row, matched, pods, state["available"]),
+        "display_status": observed_status(row, matched, pods, state["available"] and state["scheduler"].get("available", True)),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "completed_at": row.get("completed_at"),
@@ -93,7 +93,7 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
     )
   for run in runs:
     run["runtime_run_ids"] = [r["run_id"] for r in runs if r["runtime_id"] == run["runtime_id"]]
-    run["delete_blocker"] = delete_blocker(run, state["available"])
+    run["delete_blocker"] = delete_blocker(run, state["available"] and state["scheduler"].get("available", True))
   return sorted(runs, key=lambda r: str(r.get("created_at") or ""), reverse=True)
 
 
@@ -131,6 +131,7 @@ class Snapshot:
     self.lock = asyncio.Lock()
     self.latest: dict | None = None
     self.updated = 0.0
+    self.metadata: list[dict] = []
 
   async def current(self, store) -> dict:
     async with self.lock:
@@ -139,16 +140,21 @@ class Snapshot:
       state = await asyncio.to_thread(lambda: backends.current().inventory())
       store_error = None
       try:
-        metadata = await asyncio.wait_for(store.list_jobs_metadata(), timeout=5)
+        self.metadata = await asyncio.wait_for(store.list_jobs_metadata(), timeout=5)
       except Exception:
-        metadata, store_error = [], "Run store unavailable"
-      runs = join_runs(metadata, state)
+        store_error = "Run store unavailable; showing last known run records" if self.metadata else "Run store unavailable"
+      runs = join_runs(self.metadata, state)
+      if store_error:
+        for run in runs:
+          run["delete_blocker"] = "Run store unavailable"
       placements = placements_of(state, runs)
       now = time.time()
+      history_error = None
       try:
         past = await history.read(store, now - HISTORY_WINDOW_SECONDS)
       except Exception:
-        past = []
+        past = self.latest["history"] if self.latest else []
+        history_error = "Placement history unavailable; showing last known placements" if past else "Placement history unavailable"
       self.latest = {
         "schema_version": 2,
         "observed_at": iso(now),
@@ -157,6 +163,7 @@ class Snapshot:
         "store_error": store_error,
         "placements": placements,
         "history": past,
+        "history_error": history_error,
       }
       self.updated = time.monotonic()
       return self.latest

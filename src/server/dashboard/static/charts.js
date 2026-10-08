@@ -2,21 +2,15 @@
 // inspection use the same samples, with no chart instances or resize observers.
 import { escape } from "./ui.js";
 
-export const chartNumber = (value) =>
-  new Intl.NumberFormat(undefined, {
-    maximumSignificantDigits: 4,
-    notation: Math.abs(value) >= 10000 ? "compact" : "standard",
-  }).format(value);
-export const chartTime = (value, seconds = false) =>
-  new Date(value * 1000).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    ...(seconds ? { second: "2-digit" } : {}),
-    hour12: false,
-    timeZone: "UTC",
-  });
+const numbers = ["standard", "compact"].map((notation) => new Intl.NumberFormat(undefined, { maximumSignificantDigits: 4, notation }));
+const percent = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
+const times = [false, true].map((seconds) => new Intl.DateTimeFormat(undefined, {
+  hour: "2-digit", minute: "2-digit", ...(seconds ? { second: "2-digit" } : {}), hour12: false, timeZone: "UTC",
+}));
+export const chartNumber = (value) => numbers[Number(Math.abs(value) >= 10000)].format(value);
+export const chartTime = (value, seconds = false) => times[Number(seconds)].format(new Date(value * 1000));
 export const valueText = (value, unit) =>
-  unit === "%" ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(value)}%` : `${chartNumber(value)}${unit ? ` ${unit}` : ""}`;
+  unit === "%" ? `${percent.format(value)}%` : `${chartNumber(value)}${unit ? ` ${unit}` : ""}`;
 
 const SCALE = 1000;
 

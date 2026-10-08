@@ -5,6 +5,9 @@ ENV/
 env/
 **/.venv/
 **/venv/
+node_modules/
+dev/dashboard/test-results/
+dev/dashboard/playwright-report/
 
 # Training Logs & Plots
 scratch/

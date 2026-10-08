@@ -45,25 +45,26 @@ export function runs(state) {
     return `<button type="button" class="chip" data-run-filter="${key}" title="${escape(title)}" aria-pressed="${filter.status === key}">${escape(label)} <span class="run-filter-count">${count}</span></button>`;
   }).join("");
   const shown = filterRuns(state);
-  const deletable = shown.filter((r) => !r.delete_blocker);
+  const deletable = state.recorded_at ? [] : shown.filter((r) => !r.delete_blocker);
   const selected = deletable.filter((r) => ui.selectedRuns.has(r.run_id));
   const all = deletable.length > 0 && selected.length === deletable.length;
   const rows = shown
     .map((r) => {
       const label = [r.display_name, r.recipe_name].filter((v, i, a) => v && a.indexOf(v) === i).join(" · ");
       const short = `${(r.model || "Run").split("/").at(-1)} · ${r.run_id.slice(0, 8)}`;
-      const box = `<input type="checkbox" data-select-run="${escape(r.run_id)}" aria-label="Select ${escape(short)}"${ui.selectedRuns.has(r.run_id) && !r.delete_blocker ? " checked" : ""}${r.delete_blocker ? ` disabled title="${escape(`Cannot delete: ${r.delete_blocker}`)}"` : ""}>`;
+      const blocker = state.recorded_at ? "Recorded runs cannot be deleted" : ui.deletingRuns ? "Deletion in progress" : r.delete_blocker;
+      const box = `<input type="checkbox" data-select-run="${escape(r.run_id)}" aria-label="Select ${escape(short)}"${ui.selectedRuns.has(r.run_id) && !r.delete_blocker ? " checked" : ""}${blocker ? ` disabled title="${escape(blocker)}"` : ""}>`;
       return `<div class="job-list-row run-row" data-key="${escape(r.run_id)}"><span class="run-select">${box}</span><span class="job-identity"><a href="#run/${encode(r.run_id)}/activity" title="${escape(r.run_id)}">${escape((r.model || "Run").split("/").at(-1))} · <span class="mono">${escape(r.run_id.slice(0, 8))}</span></a>${label ? `<span class="muted micro">${escape(label)}</span>` : ""}</span><span>${runStatus(r.display_status || r.status)}</span><span>${escape(KINDS[r.fine_tuning_type] || r.fine_tuning_type || "—")}</span><span>${escape(r.steps ?? "—")}</span><span>${escape(age(r, state.observed_at))}</span><span>${escape(runGroup(r) === "unassigned" ? "—" : elapsedTime(r, state.observed_at))}</span></div>`;
     })
     .join("");
-  const head = `<div class="job-list-head run-row"><span class="run-select"><input type="checkbox" data-select-all-runs aria-label="Select all shown runs that can be deleted"${all ? " checked" : ""}${deletable.length ? "" : " disabled"}></span><span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Created</span><span>Elapsed</span></div>`;
+  const head = `<div class="job-list-head run-row"><span class="run-select"><input type="checkbox" data-select-all-runs aria-label="Select all shown runs that can be deleted" data-indeterminate="${selected.length > 0 && !all}"${all ? " checked" : ""}${deletable.length && !ui.deletingRuns ? "" : " disabled"}></span><span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Created</span><span>Elapsed</span></div>`;
   const notice = ui.runNotice ? `<p class="run-notice" role="status">${escape(ui.runNotice)}</p>` : "";
   const none = !state.runs.length ? empty("No runs recorded") : !shown.length ? empty("No runs match the search and status filter") : "";
   return `<h1 class="heading">Overview</h1>${error}
     <div class="overview-toolbar">
       <input id="run-search" type="search" placeholder="Search by run ID, model, name, recipe, node or pod" aria-label="Search runs" value="${escape(filter.q)}" autocomplete="off">
       <div class="run-filters" role="group" aria-label="Filter by status">${chips}</div>
-      <button type="button" class="chip run-delete" data-delete-runs${selected.length ? "" : " disabled"} title="Removes the run records and their recorded ops; workers, checkpoints and metrics files are not touched">${selected.length ? `Delete ${selected.length} run${selected.length === 1 ? "" : "s"}` : "Delete selected"}</button>
+      ${state.recorded_at ? "" : `<button type="button" class="chip run-delete" data-delete-runs${selected.length && !ui.deletingRuns ? "" : " disabled"} title="Removes the run records and their recorded ops; workers, checkpoints and metrics files are not touched">${ui.deletingRuns ? "Deleting…" : selected.length ? `Delete ${selected.length} run${selected.length === 1 ? "" : "s"}` : "Delete selected"}</button>`}
     </div>${notice}
     <div class="job-list run-list">${shown.length ? head + rows : ""}</div>${none}`;
 }
@@ -165,7 +166,7 @@ export function experiments(entry) {
   const selected = ordered.find((run) => run.path === route()[1]) || ordered.find((run) => ["reward", "correct"].some((key) => run.series[key]?.filter(([, value]) => Number.isFinite(value)).length > 1)) || ordered[0];
   const sweeps = new Map();
   for (const run of ordered) sweeps.set(run.sweep, [...(sweeps.get(run.sweep) || []), run]);
-  const now = Date.now() / 1000;
+  const now = Date.parse(ui.state?.recorded_at || ui.state?.observed_at) / 1000 || Date.now() / 1000;
   const sections = [...sweeps.entries()]
     .map(([sweep, members]) => {
       const rows = members
@@ -174,7 +175,7 @@ export function experiments(entry) {
           return `<a class="job-list-row experiment-row" data-key="${escape(run.path)}" href="#experiments/${encode(run.path)}"${run === selected ? ' aria-current="true"' : ""}><span class="job-identity"><span class="mono">${escape(shortName(run.name))}</span></span><span>${escape((run.config.model_name || "").split("/").at(-1))}</span><span>${escape(kindLabel(run))}</span><span>${run.step}${run.config.max_steps ? ` / ${run.config.max_steps}` : ""}</span><span>${Number.isFinite(run.last.reward) ? escape(chartNumber(run.last.reward)) : "—"}</span><span>${escape(pct(run.last.correct))}</span><span>${escape(pct(run.last.format))}</span></a>${charts}`;
         })
         .join("");
-      return `<section class="experiment-sweep"><h2>${escape(sweep || "runs")} <span class="muted micro">${members.length} run${members.length === 1 ? "" : "s"} · updated ${duration(now - Math.max(...members.map((r) => r.updated_at)))} ago</span></h2>
+      return `<section class="experiment-sweep"><h2>${escape(sweep || "runs")} <span class="muted micro">${members.length} run${members.length === 1 ? "" : "s"} · updated ${duration(Math.max(0, now - Math.max(...members.map((r) => r.updated_at))))} ago</span></h2>
         <div class="job-list"><div class="job-list-head experiment-head"><span>Run</span><span>Model</span><span>Kind</span><span>Step</span><span>Reward</span><span>Correct</span><span>Format</span></div>${rows}</div></section>`;
     })
     .join("");
