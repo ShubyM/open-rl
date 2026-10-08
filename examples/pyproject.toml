@@ -29,6 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 agent-sandbox = ["k8s-agent-sandbox[async,grpc]==1.0.5.post1"]
+wandb = ["wandb"]
 
 [project.scripts]
 harvey-train = "harvey_labs.train:main"

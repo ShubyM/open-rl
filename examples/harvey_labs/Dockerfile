@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 WORKDIR /app
 COPY examples/pyproject.toml examples/uv.lock examples/README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --extra agent-sandbox
+    uv sync --frozen --no-install-project --extra agent-sandbox --extra wandb
 
 COPY examples/common ./common
 COPY examples/harvey_labs ./harvey_labs

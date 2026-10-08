@@ -15,6 +15,9 @@ class RunConfig:
   base_url: str | None = None
   lab_root: Path = chz.field(default=Path(__file__).resolve().parent / "harvey-labs", munger=lambda _, path: Path(path).expanduser().resolve())
   log_path: str = "artifacts/harvey-labs"
+  # Log metrics to Weights & Biases when set; needs WANDB_API_KEY.
+  wandb_project: str | None = None
+  wandb_name: str | None = None
 
   task: str | None = None  # A single training task; otherwise use the seeded split.
   train_tasks: int = 300
