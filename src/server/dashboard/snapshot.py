@@ -48,6 +48,13 @@ def delete_blocker(run: dict, available: bool) -> str | None:
   return None
 
 
+def shared_runtime(row: dict) -> str:
+  """The runtime a shared LoRA run's workers serve, named as the API server names it."""
+  base = row.get("base_model") or ""
+  backend = row.get("trainer_backend") or "pytorch"
+  return base if backend == "pytorch" else f"{backend}-{base}"
+
+
 def join_runs(metadata: list[dict], state: dict) -> list[dict]:
   """LoRA workers serve a base-model runtime shared by every unfinished LoRA
   run on it; an FFT worker's modelID is the run itself."""
@@ -57,16 +64,21 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
   for row in metadata:
     run_id = row["model_id"]
     lora = row.get("fine_tuning_type", "lora") == "lora"
-    runtime = row.get("base_model") if lora else run_id
     finished = str(row.get("status", "")).lower() in TERMINAL_STATUSES
     kind = "lora" if lora else "fft"
-    matched = [] if lora and finished else [w for w in workloads if w.get("model_id") == runtime and w.get("training_kind") == kind]
+    # Workloads keyed by the run itself are its own: FFT, and LoRA runs that are
+    # exclusive or train on several GPUs. Otherwise a LoRA run shares the
+    # runtime the API server names after its base model and trainer.
+    own = [w for w in workloads if w.get("model_id") == run_id and w.get("training_kind") == kind]
+    shared = lora and not own
+    runtime = shared_runtime(row) if shared else run_id
+    matched = own or ([] if finished else [w for w in workloads if w.get("model_id") == runtime and w.get("training_kind") == kind])
     pods = []
     for pod in state["pods"]:
       owned = [w for w in matched if w["uid"] in pod["owner_uids"] or (w.get("pod_name") == pod["name"] and pod.get("worker") == w["name"])]
       if owned:
         pod = copy.deepcopy(pod)
-        pod.update(role=owned[0].get("role"), shared_runtime=lora, runtime_id=runtime)
+        pod.update(role=owned[0].get("role"), shared_runtime=shared, runtime_id=runtime)
         pod["devices"] = sorted({device for w in owned for device in claims.get(w.get("claim_name"), [])})
         pods.append(pod)
     runs.append(
@@ -78,7 +90,7 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
         "recipe_name": row.get("recipe_name"),
         "fine_tuning_type": row.get("fine_tuning_type"),
         "runtime_id": runtime,
-        "shared_runtime": lora,
+        "shared_runtime": shared,
         "status": row.get("status", "unknown"),
         "display_status": observed_status(row, matched, pods, state["available"] and state["scheduler"].get("available", True)),
         "created_at": row.get("created_at"),

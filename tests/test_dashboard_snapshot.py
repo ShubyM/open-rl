@@ -84,6 +84,23 @@ class SnapshotJoinTest(unittest.TestCase):
     self.assertEqual(runs["r2"]["display_status"], "Needs attention")
     self.assertEqual([w["uid"] for w in runs["r2"]["workloads"]], ["w2"])
 
+  def test_a_lora_run_with_its_own_workers_is_not_put_on_the_shared_runtime(self) -> None:
+    # An exclusive or multi-GPU LoRA run's workloads are keyed by the run itself.
+    state = copy.deepcopy(STATE)
+    own = {**state["scheduler"]["workloads"][0], "uid": "w3", "name": "lora-r4-0-trainer", "model_id": "r4", "pod_name": "orw-r4"}
+    state["scheduler"]["workloads"].append(own)
+    state["pods"].append({**state["pods"][0], "name": "orw-r4", "uid": "p4", "worker": "lora-r4-0-trainer", "owner_uids": ["w3"]})
+    r4 = {"model_id": "r4", "base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "lora", "trainer_backend": "automodel", "status": "active"}
+    meta = [*METADATA, r4]
+    runs = {r["run_id"]: r for r in snapshot.join_runs(meta, state)}
+    self.assertEqual((runs["r4"]["runtime_id"], runs["r4"]["shared_runtime"], runs["r4"]["display_status"]), ("r4", False, "Running"))
+    self.assertEqual([w["uid"] for w in runs["r4"]["workloads"]], ["w3"])
+    self.assertNotIn("r4", runs["r1"]["runtime_run_ids"])
+
+  def test_a_shared_automodel_run_finds_its_named_runtime(self) -> None:
+    self.assertEqual(snapshot.shared_runtime({"base_model": "Qwen/Qwen3-8B", "trainer_backend": "automodel"}), "automodel-Qwen/Qwen3-8B")
+    self.assertEqual(snapshot.shared_runtime({"base_model": "Qwen/Qwen3-8B"}), "Qwen/Qwen3-8B")
+
   def test_only_placed_workloads_become_placements_and_carry_their_runs(self) -> None:
     runs = snapshot.join_runs(METADATA, STATE)
     placements = snapshot.placements_of(STATE, runs)
