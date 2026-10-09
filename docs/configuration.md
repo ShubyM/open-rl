@@ -90,17 +90,46 @@ and install the router resources with `kubectl apply -k k8s/deploy/llmd-router`.
 Jobs sharing a sampler runtime must use the same router setting; use
 `openrl.exclusive=true` for a separate pool.
 
+Each routed sampler set has one Redis Stream and one CPU dispatcher pod
+(the dispatcher, Envoy and the llm-d endpoint picker). The API stores each
+request in the set's stream before returning its ID. The dispatcher pulls work
+when it has a free slot and sends it through the router, which picks the
+sampler. A request stays pending until one final result is saved, so accepted
+work survives restarts of the API server, the dispatcher pod and the samplers.
+A lost response can make a sampler generate a request twice; only one result is
+kept. Only the holder of the set's Redis lease dispatches.
+
+Requests must name fixed weights: a saved `sampler_weights` reference, or the
+base model of a job that has not trained yet. Sampling a training job's live
+adapter is refused, so a retry can never pick up newer weights.
+
 | API server env var | Default | What it does |
 | --- | --- | --- |
-| `OPEN_RL_ROUTER_TIMEOUT_SECONDS` | `1800` | Deadline for discovery and generation combined. |
-| `OPEN_RL_ROUTER_MAX_INFLIGHT` | `256` | Maximum accepted routed requests at once. Further submissions receive HTTP 429. |
+| `OPEN_RL_SAMPLE_UNFINISHED_LIMIT` | `4096` | Unfinished requests per set. Further submissions receive HTTP 429. |
+| `OPEN_RL_SAMPLE_DEADLINE_SECONDS` | `7200` | Total time a request may take, including queueing and retries. |
+| `OPEN_RL_SAMPLE_MAX_SAMPLES` | `64` | Largest `num_samples` per request. |
+| `OPEN_RL_SAMPLE_MAX_PAYLOAD_BYTES` | `16777216` | Largest stored request. |
+| `OPEN_RL_SAMPLE_RESULT_TTL` | `1800` | How long a saved result stays readable. |
+| `OPEN_RL_SAMPLE_GUARD_TTL` | `7200` | How long a finished request keeps refusing late attempts. |
+| `OPEN_RL_DISPATCHER_IMAGE` | worker image | Image for the dispatcher container; the API server image is enough. |
 
-Each accepted request gets one HTTP dispatch and an expiring Redis receipt.
-Failures are returned through `retrieve_future`; requests are never replayed
-through HTTP or the sampling queue. Resolved receipts remain available for five
-minutes. After an API restart, pending receipts report interrupted work whose
-execution status is unknown. This relies on the existing single API replica
-deployment; it does not resume interrupted generation.
+The API server passes every `OPEN_RL_DISPATCH_*` variable to the dispatchers:
+
+| Dispatcher env var | Default | What it does |
+| --- | --- | --- |
+| `OPEN_RL_DISPATCH_ACTIVE` | `256` | Requests one dispatcher owns at once, including those waiting to retry. |
+| `OPEN_RL_DISPATCH_MAX_ATTEMPTS` | `4` | Attempts per request. |
+| `OPEN_RL_DISPATCH_ATTEMPT_TIMEOUT` | `1800` | Longest single attempt, cut short by the request deadline. |
+| `OPEN_RL_DISPATCH_BACKOFF_BASE` / `_CAP` | `1` / `60` | Retry delay, doubled per attempt with jitter, up to the cap. |
+| `OPEN_RL_DISPATCH_LEASE_TTL` | `30` | Lease length; renewed every `OPEN_RL_DISPATCH_RENEW_INTERVAL` (`10`). |
+| `OPEN_RL_DISPATCH_RECLAIM_IDLE` | `60` | How long an unrenewed claim waits before another dispatcher takes it. |
+| `OPEN_RL_DISPATCH_SHUTDOWN_GRACE` | `60` | Time active calls get to finish when the pod stops. |
+
+Removing a set closes it to new requests and cancels its unfinished ones before
+its dispatcher is deleted. Redis holds the only copy of accepted work: run it
+with persistence (for example an append-only file) and keep its eviction policy
+from removing these keys. An append-only file flushed every second can lose the
+last second of accepted requests in a crash.
 
 LoRA `save_weights_for_sampler` freezes weights before returning its references.
 Save names and sequence IDs must be unique: overwriting them would invalidate

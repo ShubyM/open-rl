@@ -66,6 +66,8 @@ vllm = [
 # Kubernetes cluster mode: the k8s API client used to launch FFT worker pods.
 cluster = [
     "kubernetes>=29",
+    # Sampler set dispatchers serve their metrics with it.
+    "prometheus-client>=0.20",
     # Kept in step with the snapshot-agent image deployed in
     # docs/setup/gke-fft-timeslice.md: both come from this upstream release.
     "timeslice @ git+https://github.com/llm-d-incubation/llm-d-rl-time-slicing.git@v0.1.0#subdirectory=pkg/client/python",

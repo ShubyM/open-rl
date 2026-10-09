@@ -18,16 +18,18 @@ The Workload name is what the pod label and the time-slicer call job_id.
 """
 
 import dataclasses
-import hashlib
 import logging
 import os
 import time
 from dataclasses import dataclass, replace
 from typing import Any
 
+import redis as sync_redis
 from kubernetes import client, config
 
+from server import sampling_streams
 from server.estimator import Footprint, footprint
+from server.sampling_streams import sampler_set
 from server.worker_manager import base_model_of, owner_id, runtime_of, worker_args, worker_env, worker_module
 
 logger = logging.getLogger(__name__)
@@ -37,15 +39,18 @@ VERSION = "v1alpha1"
 PLURAL = "workloads"
 
 # With openrl.sampler_router=llmd every sampler of a set serves HTTP on
-# SAMPLER_HTTP_PORT, and the set's first sampler also runs the llm-d router:
-# Envoy on ROUTER_PORT, asking the endpoint picker beside it which replica
-# should serve each request. The picker finds the set by SAMPLER_SET_LABEL.
+# SAMPLER_HTTP_PORT and carries SAMPLER_SET_LABEL. The set also gets one CPU
+# Deployment: the dispatcher that pulls the set's stream, Envoy on ROUTER_PORT,
+# and the endpoint picker that finds the set's samplers by that label.
 SAMPLER_HTTP_PORT = 8000
 ROUTER_PORT = 8081
 SAMPLER_SET_LABEL = "openrl.io/sampler-set"
-ROUTER_LABEL = "openrl.io/sampler-router"
 ROUTER_CONFIG = "openrl-llmd-router"
-ROUTER_LOOKUP_TIMEOUT = 10
+DISPATCHER_PREFIX = "openrl-dispatch-"
+# The dispatcher pod names its set with a different label, so the picker never
+# mistakes it for a sampler.
+DISPATCH_SET_LABEL = "openrl.io/dispatch-set"
+OWNER_LABEL = "openrl.io/owner"
 
 
 def workload_name(role: str, owner: str, is_lora: bool, index: int = 0) -> str:
@@ -85,11 +90,6 @@ class Worker:
   @property
   def routed(self) -> bool:
     return self.role == "sampler" and self.meta.sampler_router == "llmd"
-
-
-def sampler_set(runtime: str) -> str:
-  """A label-safe name for a runtime's samplers."""
-  return "set-" + hashlib.sha256(runtime.encode()).hexdigest()[:16]
 
 
 def replicas_of(model_id: str, role: str) -> int:
@@ -188,63 +188,101 @@ def pod_template(worker: Worker) -> dict[str, Any]:
     template["spec"]["volumes"].append({"name": "dshm", "emptyDir": {"medium": "Memory"}})
 
   if worker.routed:
-    add_router(template, worker)
+    join_set(template, worker)
 
   if pull_policy := os.getenv("OPEN_RL_WORKER_IMAGE_PULL_POLICY"):
     template["spec"]["containers"][0]["imagePullPolicy"] = pull_policy
   return template
 
 
-def add_router(template: dict[str, Any], worker: Worker) -> None:
-  """Label the sampler into its set and open its HTTP port; the set's first
-  sampler also gets the router. The router's config and its permission to
-  watch pods come from k8s/deploy/llmd-router."""
-  name = sampler_set(worker.runtime)
-  labels = {SAMPLER_SET_LABEL: name}
-  sampler = template["spec"]["containers"][0]
-  sampler["ports"] = [{"name": "http", "containerPort": SAMPLER_HTTP_PORT}]
-  sampler["readinessProbe"] = {"httpGet": {"path": "/health", "port": SAMPLER_HTTP_PORT}, "periodSeconds": 10}
-  if worker.index == 0:
-    labels[ROUTER_LABEL] = name
-    pod_identity = [
-      {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
-      {"name": "NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
-    ]
-    template["spec"]["serviceAccountName"] = ROUTER_CONFIG
-    template["spec"]["containers"] += [
-      {
-        "name": "router-proxy",
-        "image": os.getenv("OPEN_RL_LLMD_PROXY_IMAGE", "docker.io/envoyproxy/envoy:distroless-v1.33.2"),
-        "args": ["--service-node", "envoy-sidecar", "--log-level", "warn", "--concurrency", "4", "-c", "/etc/envoy/envoy.yaml"],
-        "ports": [{"name": "router", "containerPort": ROUTER_PORT}],
-        "readinessProbe": {"httpGet": {"path": "/ready", "port": 19001}, "periodSeconds": 5},
-        "volumeMounts": [{"name": "router-config", "mountPath": "/etc/envoy", "readOnly": True}],
-        "resources": {"requests": {"cpu": "500m", "memory": "512Mi"}, "limits": {"memory": "1Gi"}},
+def join_set(template: dict[str, Any], worker: Worker) -> None:
+  """Label the sampler into its set and gate it on its HTTP health. No replica
+  has a special role; the set's router runs in its dispatcher pod."""
+  template["spec"]["containers"][0]["readinessProbe"] = {"httpGet": {"path": "/health", "port": SAMPLER_HTTP_PORT}, "periodSeconds": 10}
+  template["metadata"] = {"labels": {SAMPLER_SET_LABEL: sampler_set(worker.runtime)}}
+
+
+def dispatcher_body(set_id: str, owner: str) -> dict[str, Any]:
+  """The set's CPU pod: the dispatcher calls Envoy on localhost, and Envoy asks
+  the picker which sampler gets each request. The router's config and its
+  permission to watch pods come from k8s/deploy/llmd-router."""
+  labels = {"app": "openrl-sampler-dispatch", DISPATCH_SET_LABEL: set_id, OWNER_LABEL: owner, "app.kubernetes.io/managed-by": "open-rl-api-server"}
+  image = os.getenv("OPEN_RL_DISPATCHER_IMAGE") or os.getenv("OPEN_RL_WORKER_IMAGE", "ghcr.io/gke-labs/open-rl/server:latest")
+  pod_identity = [
+    {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
+    {"name": "NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
+  ]
+  dispatch_env = [
+    {"name": "REDIS_URL", "value": os.environ["REDIS_URL"]},
+    {"name": "OPEN_RL_SAMPLER_SET", "value": set_id},
+    {"name": "OPEN_RL_ROUTER_URL", "value": f"http://127.0.0.1:{ROUTER_PORT}"},
+    {"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
+    *(
+      {"name": name, "value": os.environ[name]}
+      for name in sorted(os.environ)
+      if name.startswith("OPEN_RL_DISPATCH_") or name.startswith("OPEN_RL_SAMPLE_")
+    ),
+  ]
+  containers = [
+    {
+      "name": "dispatcher",
+      "image": image,
+      "command": ["uv", "run", "python", "-u", "-m", "server.sampling_dispatcher"],
+      "env": dispatch_env,
+      "ports": [{"name": "metrics", "containerPort": 9100}],
+      "resources": {"requests": {"cpu": "500m", "memory": "512Mi"}, "limits": {"memory": "2Gi"}},
+    },
+    {
+      "name": "router-proxy",
+      "image": os.getenv("OPEN_RL_LLMD_PROXY_IMAGE", "docker.io/envoyproxy/envoy:distroless-v1.33.2"),
+      "args": ["--service-node", "envoy-sidecar", "--log-level", "warn", "--concurrency", "4", "-c", "/etc/envoy/envoy.yaml"],
+      "ports": [{"name": "router", "containerPort": ROUTER_PORT}],
+      "readinessProbe": {"httpGet": {"path": "/ready", "port": 19001}, "periodSeconds": 5},
+      "volumeMounts": [{"name": "router-config", "mountPath": "/etc/envoy", "readOnly": True}],
+      "resources": {"requests": {"cpu": "500m", "memory": "512Mi"}, "limits": {"memory": "1Gi"}},
+    },
+    {
+      "name": "router-picker",
+      "image": os.getenv("OPEN_RL_LLMD_PICKER_IMAGE", "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0"),
+      "args": [
+        "--endpoint-selector",
+        f"{SAMPLER_SET_LABEL}={set_id}",
+        "--endpoint-target-ports",
+        str(SAMPLER_HTTP_PORT),
+        "--config-file",
+        "/etc/router/plugins.yaml",
+        "--grpc-health-port",
+        "9003",
+        "--zap-encoder",
+        "json",
+        "--tracing=false",
+      ],
+      "env": pod_identity,
+      "readinessProbe": {"grpc": {"port": 9003, "service": "inference-extension"}, "periodSeconds": 2},
+      "volumeMounts": [{"name": "router-config", "mountPath": "/etc/router", "readOnly": True}],
+      "resources": {"requests": {"cpu": "500m", "memory": "1Gi"}, "limits": {"memory": "2Gi"}},
+    },
+  ]
+  return {
+    "apiVersion": "apps/v1",
+    "kind": "Deployment",
+    "metadata": {"name": DISPATCHER_PREFIX + set_id, "labels": labels},
+    "spec": {
+      "replicas": 1,
+      # The lease, not the Deployment, keeps one dispatcher active during a rollout.
+      "selector": {"matchLabels": {DISPATCH_SET_LABEL: set_id}},
+      "template": {
+        "metadata": {"labels": labels},
+        "spec": {
+          "serviceAccountName": ROUTER_CONFIG,
+          # Active calls finish within the dispatcher's shutdown grace period.
+          "terminationGracePeriodSeconds": 90,
+          "containers": containers,
+          "volumes": [{"name": "router-config", "configMap": {"name": ROUTER_CONFIG}}],
+        },
       },
-      {
-        "name": "router-picker",
-        "image": os.getenv("OPEN_RL_LLMD_PICKER_IMAGE", "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0"),
-        "args": [
-          "--endpoint-selector",
-          f"{SAMPLER_SET_LABEL}={name}",
-          "--endpoint-target-ports",
-          str(SAMPLER_HTTP_PORT),
-          "--config-file",
-          "/etc/router/plugins.yaml",
-          "--grpc-health-port",
-          "9003",
-          "--zap-encoder",
-          "json",
-          "--tracing=false",
-        ],
-        "env": pod_identity,
-        "readinessProbe": {"grpc": {"port": 9003, "service": "inference-extension"}, "periodSeconds": 2},
-        "volumeMounts": [{"name": "router-config", "mountPath": "/etc/router", "readOnly": True}],
-        "resources": {"requests": {"cpu": "500m", "memory": "1Gi"}, "limits": {"memory": "2Gi"}},
-      },
-    ]
-    template["spec"]["volumes"].append({"name": "router-config", "configMap": {"name": ROUTER_CONFIG}})
-  template["metadata"] = {"labels": labels}
+    },
+  }
 
 
 def accelerator_spec(worker: Worker) -> dict[str, Any]:
@@ -275,7 +313,7 @@ def workload_body(worker: Worker) -> dict[str, Any]:
 class SchedulerWorkerManager:
   """Runs trainer and sampler workers by creating Workload objects."""
 
-  def __init__(self, custom_api: Any = None, core_api: Any = None):
+  def __init__(self, custom_api: Any = None, apps_api: Any = None, redis_client: Any = None):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("OPEN_RL_ENABLE_FFT=true requires REDIS_URL so launched workers can share queues and futures")
     self.namespace = os.getenv("OPEN_RL_WORKER_NAMESPACE", "openrl-system")
@@ -283,31 +321,50 @@ class SchedulerWorkerManager:
       config.load_incluster_config()
       custom_api = client.CustomObjectsApi()
     self.custom_api = custom_api
-    # Only routed samplers need pods; the config loaded above serves it too.
-    self.core_api = core_api
+    # Only routed sampler sets need these; the config loaded above serves them too.
+    self.apps_api = apps_api
+    self.redis = redis_client
 
-  def router_url(self, model_id: str) -> str | None:
-    """The llm-d router on the model's first sampler, once its containers are ready."""
-    _, runtime, _ = runtime_of(model_id)
-    if self.core_api is None:
-      self.core_api = client.CoreV1Api()
-    # Bounded, so a stale API connection cannot hang the gateway's sample path.
-    pods = self.core_api.list_namespaced_pod(
-      self.namespace, label_selector=f"{ROUTER_LABEL}={sampler_set(runtime)}", _request_timeout=ROUTER_LOOKUP_TIMEOUT
-    ).items
-    for pod in pods:
-      if (
-        pod.status.phase == "Running"
-        and pod.status.pod_ip
-        and not pod.metadata.deletion_timestamp
-        and any(c.type == "Ready" and c.status == "True" for c in pod.status.conditions or [])
-      ):
-        return f"http://{pod.status.pod_ip}:{ROUTER_PORT}"
-    return None
+  def apps(self) -> Any:
+    if self.apps_api is None:
+      self.apps_api = client.AppsV1Api()
+    return self.apps_api
+
+  def streams_client(self) -> Any:
+    if self.redis is None:
+      self.redis = sync_redis.Redis.from_url(os.environ["REDIS_URL"])
+    return self.redis
 
   def ensure(self, model_id: str, role: str) -> None:
     for index in range(replicas_of(model_id, role)):
-      self.ensure_workload(dataclasses.replace(describe_worker(model_id, role), index=index))
+      worker = dataclasses.replace(describe_worker(model_id, role), index=index)
+      self.ensure_workload(worker)
+    if role == "sampler" and worker.routed:
+      self.ensure_dispatcher(sampler_set(worker.runtime), worker.owner)
+
+  def ensure_dispatcher(self, set_id: str, owner: str) -> None:
+    """Create the set's dispatcher pod and open the set for requests."""
+    deadline = time.monotonic() + 180
+    while True:
+      try:
+        self.apps().create_namespaced_deployment(self.namespace, dispatcher_body(set_id, owner))
+        logger.info("requested dispatcher for sampler set %s (owner %s)", set_id, owner)
+        break
+      except Exception as exc:
+        if getattr(exc, "status", None) != 409:
+          raise
+      try:
+        existing = self.apps().read_namespaced_deployment(DISPATCHER_PREFIX + set_id, self.namespace)
+      except Exception as exc:
+        if getattr(exc, "status", None) == 404:
+          continue
+        raise
+      if not existing.metadata.deletion_timestamp:
+        break
+      if time.monotonic() > deadline:
+        raise RuntimeError(f"dispatcher for {set_id} has been terminating for over three minutes")
+      time.sleep(2)
+    sampling_streams.open_set(self.streams_client(), set_id)
 
   def ensure_workload(self, worker: Worker) -> None:
     role = worker.role
@@ -352,13 +409,28 @@ class SchedulerWorkerManager:
     self.release_owner(owner_id(runtime))
 
   def release_owner(self, owner: str) -> set[str]:
-    """Delete the owner's workloads. The scheduler's finalizer frees the seats."""
+    """Delete the owner's workloads. The scheduler's finalizer frees the seats.
+    A routed set first stops taking requests and cancels its unfinished ones,
+    then loses its dispatcher."""
+    self.release_sets(owner)
     selector = "app.kubernetes.io/managed-by=open-rl-api-server"
     found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
     ours = [item for item in found["items"] if item["spec"]["ownerID"] == owner]
     for item in ours:
       self.delete_workload(item["metadata"]["name"])
     return {item["spec"]["modelID"] for item in ours}
+
+  def release_sets(self, owner: str) -> None:
+    found = self.apps().list_namespaced_deployment(self.namespace, label_selector=f"{OWNER_LABEL}={owner},app=openrl-sampler-dispatch")
+    for deployment in found.items:
+      set_id = deployment.metadata.labels[DISPATCH_SET_LABEL]
+      cancelled = sampling_streams.close_and_cancel(self.streams_client(), set_id, f"Sampler set {set_id} was removed before this request finished")
+      logger.info("closed sampler set %s, cancelled %d unfinished requests", set_id, cancelled)
+      try:
+        self.apps().delete_namespaced_deployment(deployment.metadata.name, self.namespace)
+      except Exception as exc:
+        if getattr(exc, "status", None) != 404:
+          raise
 
   def close(self) -> None:
     pass  # Workloads outlive the API server; the scheduler owns them from here

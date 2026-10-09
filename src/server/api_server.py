@@ -11,6 +11,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
+import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -23,13 +24,15 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from server import proto_codec, sampler_router
+from server import proto_codec, sampling_streams
+from server.lora_snapshots import resolve_lora_path, snapshot_path
 from server.model_metadata import (
   TrainingModelMetadata,
   WeightSyncConfig,
   get_model_metadata,
   persist_model_metadata,
 )
+from server.sampling_streams import sampler_set
 from server.session_registry import SessionRegistry
 from server.store import RedisStateStore, get_state_store, get_store
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, owner_of
@@ -40,7 +43,7 @@ from training.types import TRAINER_BACKENDS, Datum, FFTConfig, FineTuningType, L
 store = get_store()
 state = get_state_store()
 worker_manager: WorkerManager | None = None
-router: sampler_router.SamplerRouter | None = None
+streams: sampling_streams.SamplingStreams | None = None
 
 session_registry = SessionRegistry(state)
 SESSION_REAP_INTERVAL_SEC = 30
@@ -607,12 +610,13 @@ async def reap_dead_sessions():
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-  global worker_manager, router
-  router = sampler_router.SamplerRouter(
-    state,
-    timeout=float(os.getenv("OPEN_RL_ROUTER_TIMEOUT_SECONDS", "1800")),
-    capacity=int(os.getenv("OPEN_RL_ROUTER_MAX_INFLIGHT", "256")),
-  )
+  global worker_manager, streams
+  if os.getenv("REDIS_URL"):
+    streams = sampling_streams.SamplingStreams(
+      aioredis.from_url(os.environ["REDIS_URL"]),
+      result_ttl=float(os.getenv("OPEN_RL_SAMPLE_RESULT_TTL", "1800")),
+      guard_ttl=float(os.getenv("OPEN_RL_SAMPLE_GUARD_TTL", "7200")),
+    )
   task = None
   if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER"):
     worker_manager = create_worker_manager()
@@ -637,8 +641,9 @@ async def lifespan(_: FastAPI):
   try:
     yield
   finally:
-    await router.close()
-    router = None
+    if streams is not None:
+      await streams.client.aclose()
+      streams = None
     if reap_task is not None:
       reap_task.cancel()
     if task is not None:
@@ -853,10 +858,10 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
   pending, failed, and every other result stay JSON.
   """
   request_id = req.request_id
-  if request_id.startswith(sampler_router.PREFIX):
-    if router is None:
-      raise HTTPException(status_code=503, detail="Sampler router is unavailable")
-    result = await router.result(request_id)
+  if sampling_streams.set_of(request_id):
+    if streams is None:
+      raise HTTPException(status_code=503, detail="Stream sampling is unavailable")
+    result = await stream_result(request_id)
   else:
     result = await store.get_future(request_id, timeout=60.0)
   if result is None:
@@ -1111,7 +1116,8 @@ async def asample(req: AsampleRequest):
   # vLLM backend
   model_meta = await get_model_metadata(state, lookup_id)
   routed = model_meta is not None and model_meta.sampler_router == "llmd"
-  req_id = (sampler_router.PREFIX if routed else "") + new_request_id()
+  set_id = sampler_set(model_meta.runtime(lookup_id) or lookup_id) if routed else None
+  req_id = sampling_streams.new_request_id(set_id) if set_id else new_request_id()
   carrier = await open_future(req_id)
   fine_tuning_type = model_meta.fine_tuning_type if model_meta else "lora"
 
@@ -1145,16 +1151,66 @@ async def asample(req: AsampleRequest):
     "trace_context": carrier,
   }
 
-  if routed:
-    if worker_manager is None or router is None:
-      raise HTTPException(status_code=503, detail="Sampler router is unavailable")
+  if set_id:
+    if streams is None:
+      raise HTTPException(status_code=503, detail="Stream sampling is unavailable")
+    stored = stream_input(sampling_req, model_id, lookup_id)
     try:
-      await router.submit(worker_manager.router_url, lookup_id, sampling_req)
-    except sampler_router.RouterBusy as exc:
+      await streams.accept(set_id, stored, limit=SAMPLE_UNFINISHED_LIMIT, deadline_seconds=SAMPLE_DEADLINE_SECONDS, request_id=req_id)
+    except sampling_streams.SetClosed as exc:
+      raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except sampling_streams.SetFull as exc:
       raise HTTPException(status_code=429, detail=str(exc)) from exc
   else:
     await store.put_sampling_request(sampling_req)
   return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
+
+
+SAMPLE_UNFINISHED_LIMIT = int(os.getenv("OPEN_RL_SAMPLE_UNFINISHED_LIMIT", "4096"))
+SAMPLE_DEADLINE_SECONDS = float(os.getenv("OPEN_RL_SAMPLE_DEADLINE_SECONDS", "7200"))
+SAMPLE_MAX_SAMPLES = int(os.getenv("OPEN_RL_SAMPLE_MAX_SAMPLES", "64"))
+SAMPLE_MAX_PAYLOAD_BYTES = int(os.getenv("OPEN_RL_SAMPLE_MAX_PAYLOAD_BYTES", str(16 << 20)))
+
+
+def stream_input(request: dict[str, Any], model_id: str, lookup_id: str) -> dict[str, Any]:
+  """The immutable input a stream request keeps through every attempt. Weights
+  are fixed here: a saved reference names its frozen snapshot, and a training
+  model's live adapter is refused because retries must not pick up newer weights."""
+  window = int(os.getenv("VLLM_MAX_MODEL_LEN", "0"))
+  problems = []
+  if not 1 <= request["num_samples"] <= SAMPLE_MAX_SAMPLES:
+    problems.append(f"num_samples must be between 1 and {SAMPLE_MAX_SAMPLES}")
+  if request["max_tokens"] is None or request["max_tokens"] < 1:
+    problems.append("max_tokens must be at least 1")
+  elif window and len(request["prompt_token_ids"]) + request["max_tokens"] > window:
+    problems.append(f"prompt ({len(request['prompt_token_ids'])} tokens) plus max_tokens ({request['max_tokens']}) exceeds the {window}-token window")
+  if problems:
+    raise HTTPException(status_code=400, detail="; ".join(problems))
+  stored = {key: value for key, value in request.items() if key != "request_id"}
+  if snapshot_path(model_id):
+    try:
+      stored["lora_path"] = resolve_lora_path(model_id, None)
+    except FileNotFoundError as exc:
+      raise HTTPException(status_code=400, detail=str(exc)) from exc
+  elif stored["lora_path"]:
+    raise HTTPException(
+      status_code=400, detail=f"{lookup_id} has a live adapter; sample from a saved sampler_weights reference so retries use fixed weights"
+    )
+  else:
+    stored["lora_id"] = None  # base model only
+  if len(json.dumps(stored)) > SAMPLE_MAX_PAYLOAD_BYTES:
+    raise HTTPException(status_code=400, detail=f"Sampling request is larger than {SAMPLE_MAX_PAYLOAD_BYTES} bytes")
+  return stored
+
+
+async def stream_result(request_id: str, wait: float = 30) -> dict[str, Any]:
+  """Hold the poll briefly so clients see a result soon after it is saved."""
+  deadline = time.monotonic() + wait
+  while True:
+    result = await streams.result(request_id)
+    if result.get("type") != "try_again" or time.monotonic() > deadline:
+      return result
+    await asyncio.sleep(0.25)
 
 
 # *** CLI endpoints ***

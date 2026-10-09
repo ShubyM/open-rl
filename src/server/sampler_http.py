@@ -2,6 +2,7 @@
 instead of the queue, served from the sampler's own engine."""
 
 import asyncio
+import time
 from typing import Any, Protocol
 
 import uvicorn
@@ -9,6 +10,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 ENGINE_POLL_SECONDS = 5
+# A request the sampler can never serve. Anything else is worth another attempt.
+PERMANENT_ERRORS = (ValueError, TypeError, KeyError, FileNotFoundError)
 
 
 class Engine(Protocol):
@@ -21,8 +24,12 @@ class Generator(Protocol):
   async def generate(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
 
-def failed(message: str) -> dict[str, Any]:
-  return {"type": "RequestFailedResponse", "error_message": message}
+class EngineDead(RuntimeError):
+  pass
+
+
+def failed(message: str, category: str = "server") -> dict[str, Any]:
+  return {"type": "RequestFailedResponse", "error_message": message, "category": category}
 
 
 def http_app(sampler: Generator) -> FastAPI:
@@ -33,27 +40,42 @@ def http_app(sampler: Generator) -> FastAPI:
 
   @app.post("/v1/completions")
   async def completions(request: Request) -> JSONResponse:
+    """200 with the sample; 400 when the request can never succeed here; 503 or
+    500 when another attempt may. Leaving the call cancels the engine request,
+    and so does the attempt's deadline."""
     if sampler.engine.errored:
       return JSONResponse(failed("vLLM engine is dead"), status_code=503)
     task = None
+    status = 200
     try:
       body = await request.json()
-      task = asyncio.create_task(sampler.generate(body["openrl"]))
+      openrl = body["openrl"]
+      deadline = openrl.get("deadline")
+      task = asyncio.create_task(sampler.generate(openrl))
       while not task.done():
-        await asyncio.wait({task}, timeout=ENGINE_POLL_SECONDS)
+        remaining = deadline - time.time() if deadline else ENGINE_POLL_SECONDS
+        if remaining <= 0:
+          raise TimeoutError("attempt deadline passed during generation")
+        await asyncio.wait({task}, timeout=min(ENGINE_POLL_SECONDS, remaining))
         if sampler.engine.errored:
-          raise RuntimeError("vLLM engine is dead")
+          raise EngineDead("vLLM engine is dead")
         if await request.is_disconnected():
           raise RuntimeError("Sampling client disconnected")
       result = task.result()
       result["type"] = "sample"
+    except EngineDead as exc:
+      status, result = 503, failed(str(exc))
+    except TimeoutError as exc:
+      status, result = 504, failed(str(exc))
+    except PERMANENT_ERRORS as exc:
+      status, result = 400, failed(f"Invalid sampling request: {type(exc).__name__}: {exc}", "user")
     except Exception as exc:
-      result = failed(f"vLLM Worker Error: {exc}")
+      status, result = 500, failed(f"vLLM Worker Error: {exc}")
     finally:
       if task is not None:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-    return JSONResponse(result)
+    return JSONResponse(result, status_code=status)
 
   @app.get("/health")
   async def health() -> Response:

@@ -1,4 +1,5 @@
-# The router on a sampler set's first sampler watches the set's pods.
+# Each sampler set's dispatcher pod runs the llm-d router, which watches the
+# set's sampler pods; the dispatcher reads them to know when a sampler is ready.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -25,15 +26,24 @@ roleRef:
   name: openrl-llmd-router
   apiGroup: rbac.authorization.k8s.io
 ---
-# The API server finds each set's router pod to send it requests.
+# The API server creates and removes each set's dispatcher Deployment.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openrl-sampler-dispatch-manager
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "create", "delete"]
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: openrl-llmd-router-gateway
+  name: openrl-sampler-dispatch-manager
 subjects:
 - kind: ServiceAccount
   name: open-rl-sa
 roleRef:
   kind: Role
-  name: openrl-llmd-router
+  name: openrl-sampler-dispatch-manager
   apiGroup: rbac.authorization.k8s.io
