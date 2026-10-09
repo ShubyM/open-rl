@@ -26,7 +26,10 @@
    "bars": false,
    "dashLength": 10,
    "dashes": false,
-   "datasource": "prometheus",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
    "fill": 1,
    "fillGradient": 0,
    "gridPos": {
@@ -64,11 +67,15 @@
    "steppedLine": false,
    "targets": [
     {
-     "expr": "DCGM_FI_DEV_GPU_TEMP{instance=~\"${instance}\", gpu=~\"${gpu}\"}",
+     "expr": "label_replace(DCGM_FI_DEV_GPU_TEMP{instance=~\"${instance}\", gpu=~\"${gpu}\"}, \"host\", \"$1\", \"node\", \".*-([a-z0-9]+)$\")",
      "instant": false,
      "interval": "",
-     "legendFormat": "GPU {{gpu}}",
-     "refId": "A"
+     "legendFormat": "{{host}} GPU {{gpu}}",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
     }
    ],
    "thresholds": [],
@@ -113,7 +120,10 @@
    }
   },
   {
-   "datasource": "prometheus",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
    "gridPos": {
     "h": 8,
     "w": 6,
@@ -124,7 +134,7 @@
    "options": {
     "fieldOptions": {
      "calcs": [
-      "mean"
+      "lastNotNull"
      ],
      "defaults": {
       "color": {
@@ -165,7 +175,11 @@
      "expr": "avg(DCGM_FI_DEV_GPU_TEMP{instance=~\"${instance}\", gpu=~\"${gpu}\"})",
      "interval": "",
      "legendFormat": "",
-     "refId": "A"
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
     }
    ],
    "timeFrom": null,
@@ -178,7 +192,10 @@
    "bars": false,
    "dashLength": 10,
    "dashes": false,
-   "datasource": "prometheus",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
    "fill": 1,
    "fillGradient": 0,
    "gridPos": {
@@ -217,10 +234,14 @@
    "steppedLine": false,
    "targets": [
     {
-     "expr": "DCGM_FI_DEV_POWER_USAGE{instance=~\"${instance}\", gpu=~\"${gpu}\"}",
+     "expr": "label_replace(DCGM_FI_DEV_POWER_USAGE{instance=~\"${instance}\", gpu=~\"${gpu}\"}, \"host\", \"$1\", \"node\", \".*-([a-z0-9]+)$\")",
      "interval": "",
-     "legendFormat": "GPU {{gpu}}",
-     "refId": "A"
+     "legendFormat": "{{host}} GPU {{gpu}}",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
     }
    ],
    "thresholds": [],
@@ -266,7 +287,10 @@
   },
   {
    "cacheTimeout": null,
-   "datasource": "prometheus",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
    "gridPos": {
     "h": 8,
     "w": 6,
@@ -278,14 +302,14 @@
    "options": {
     "fieldOptions": {
      "calcs": [
-      "sum"
+      "lastNotNull"
      ],
      "defaults": {
       "color": {
        "mode": "thresholds"
       },
       "mappings": [],
-      "max": 2400,
+      "max": 8000,
       "min": 0,
       "nullValueMode": "connected",
       "thresholds": {
@@ -297,11 +321,11 @@
         },
         {
          "color": "#EAB839",
-         "value": 1800
+         "value": 6000
         },
         {
          "color": "red",
-         "value": 2200
+         "value": 7200
         }
        ]
       },
@@ -320,7 +344,11 @@
      "expr": "sum(DCGM_FI_DEV_POWER_USAGE{instance=~\"${instance}\", gpu=~\"${gpu}\"})",
      "interval": "",
      "legendFormat": "",
-     "refId": "A"
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
     }
    ],
    "timeFrom": null,
@@ -333,7 +361,10 @@
    "bars": false,
    "dashLength": 10,
    "dashes": false,
-   "datasource": "prometheus",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
    "fill": 1,
    "fillGradient": 0,
    "gridPos": {
@@ -373,12 +404,16 @@
    "steppedLine": false,
    "targets": [
     {
-     "expr": "DCGM_FI_DEV_SM_CLOCK{instance=~\"${instance}\", gpu=~\"${gpu}\"} * 1000000",
+     "expr": "label_replace(DCGM_FI_DEV_SM_CLOCK{instance=~\"${instance}\", gpu=~\"${gpu}\"} * 1000000, \"host\", \"$1\", \"node\", \".*-([a-z0-9]+)$\")",
      "format": "time_series",
      "interval": "",
      "intervalFactor": 1,
-     "legendFormat": "GPU {{gpu}}",
-     "refId": "A"
+     "legendFormat": "{{host}} GPU {{gpu}}",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
     }
    ],
    "thresholds": [],
@@ -428,7 +463,10 @@
    "bars": false,
    "dashLength": 10,
    "dashes": false,
-   "datasource": "prometheus",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
    "fill": 1,
    "fillGradient": 0,
    "gridPos": {
@@ -466,10 +504,14 @@
    "steppedLine": false,
    "targets": [
     {
-     "expr": "DCGM_FI_DEV_GPU_UTIL{instance=~\"${instance}\", gpu=~\"${gpu}\"}",
+     "expr": "label_replace(DCGM_FI_DEV_GPU_UTIL{instance=~\"${instance}\", gpu=~\"${gpu}\"}, \"host\", \"$1\", \"node\", \".*-([a-z0-9]+)$\")",
      "interval": "",
-     "legendFormat": "GPU {{gpu}}",
-     "refId": "A"
+     "legendFormat": "{{host}} GPU {{gpu}}",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
     }
    ],
    "thresholds": [],
@@ -518,7 +560,10 @@
    "bars": false,
    "dashLength": 10,
    "dashes": false,
-   "datasource": "prometheus",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
    "fill": 1,
    "fillGradient": 0,
    "gridPos": {
@@ -555,10 +600,14 @@
    "steppedLine": false,
    "targets": [
     {
-     "expr": "DCGM_FI_DEV_FB_USED{instance=~\"${instance}\", gpu=~\"${gpu}\"}",
+     "expr": "label_replace(DCGM_FI_DEV_FB_USED{instance=~\"${instance}\", gpu=~\"${gpu}\"}, \"host\", \"$1\", \"node\", \".*-([a-z0-9]+)$\")",
      "interval": "",
-     "legendFormat": "GPU {{gpu}}",
-     "refId": "A"
+     "legendFormat": "{{host}} GPU {{gpu}}",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
     }
    ],
    "thresholds": [],
@@ -601,96 +650,6 @@
     "align": false,
     "alignLevel": null
    }
-  },
-  {
-   "aliasColors": {},
-   "bars": false,
-   "dashLength": 10,
-   "dashes": false,
-   "datasource": "prometheus",
-   "fill": 1,
-   "fillGradient": 0,
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 24
-   },
-   "hiddenSeries": false,
-   "id": 4,
-   "legend": {
-    "alignAsTable": true,
-    "avg": true,
-    "current": true,
-    "max": true,
-    "min": false,
-    "rightSide": true,
-    "show": true,
-    "total": false,
-    "values": true
-   },
-   "lines": true,
-   "linewidth": 2,
-   "nullPointMode": "null",
-   "options": {
-    "dataLinks": []
-   },
-   "percentage": false,
-   "pointradius": 2,
-   "points": false,
-   "renderer": "flot",
-   "seriesOverrides": [],
-   "spaceLength": 10,
-   "stack": false,
-   "steppedLine": false,
-   "targets": [
-    {
-     "expr": "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE{instance=~\"${instance}\", gpu=~\"${gpu}\"}",
-     "interval": "",
-     "legendFormat": "GPU {{gpu}}",
-     "refId": "A"
-    }
-   ],
-   "thresholds": [],
-   "timeFrom": null,
-   "timeRegions": [],
-   "timeShift": null,
-   "title": "Tensor Core Utilization",
-   "tooltip": {
-    "shared": true,
-    "sort": 0,
-    "value_type": "cumulative"
-   },
-   "type": "graph",
-   "xaxis": {
-    "buckets": null,
-    "mode": "time",
-    "name": null,
-    "show": true,
-    "values": []
-   },
-   "yaxes": [
-    {
-     "format": "percentunit",
-     "label": null,
-     "logBase": 1,
-     "max": "1",
-     "min": "0",
-     "show": true
-    },
-    {
-     "format": "short",
-     "label": null,
-     "logBase": 1,
-     "max": null,
-     "min": null,
-     "show": true
-    }
-   ],
-   "yaxis": {
-    "align": false,
-    "alignLevel": null
-   }
   }
  ],
  "refresh": false,
@@ -700,17 +659,26 @@
  "templating": {
   "list": [
    {
-    "allValue": null,
-    "current": {},
-    "datasource": "prometheus",
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
+    },
     "definition": "label_values(DCGM_FI_DEV_GPU_TEMP, instance)",
     "hide": 0,
-    "includeAll": false,
+    "includeAll": true,
     "label": null,
     "multi": true,
     "name": "instance",
     "options": [],
-    "query": "label_values(DCGM_FI_DEV_GPU_TEMP, instance)",
+    "query": {
+     "query": "label_values(DCGM_FI_DEV_GPU_TEMP, instance)",
+     "refId": "instance"
+    },
     "refresh": 1,
     "regex": "",
     "skipUrlSync": false,
@@ -722,10 +690,16 @@
     "useTags": false
    },
    {
-    "allValue": null,
-    "current": {},
-    "datasource": "prometheus",
-    "definition": "label_values(gpu)",
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
+    },
+    "definition": "label_values(DCGM_FI_DEV_GPU_TEMP, gpu)",
     "hide": 0,
     "includeAll": true,
     "index": -1,
@@ -733,7 +707,10 @@
     "multi": true,
     "name": "gpu",
     "options": [],
-    "query": "label_values(gpu)",
+    "query": {
+     "query": "label_values(DCGM_FI_DEV_GPU_TEMP, gpu)",
+     "refId": "gpu"
+    },
     "refresh": 1,
     "regex": "",
     "skipUrlSync": false,

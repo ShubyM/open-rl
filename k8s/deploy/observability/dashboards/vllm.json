@@ -184,10 +184,10 @@
       "uid": "${DS_PROMETHEUS}"
      },
      "editorMode": "code",
-     "expr": "rate(vllm:e2e_request_latency_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])\n/\nrate(vllm:e2e_request_latency_seconds_count{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:e2e_request_latency_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])\n/\nrate(vllm:e2e_request_latency_seconds_count{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "hide": false,
      "instant": false,
-     "legendFormat": "Average",
+     "legendFormat": "r{{replica}} Average",
      "range": true,
      "refId": "E"
     }
@@ -283,11 +283,11 @@
      },
      "disableTextWrap": false,
      "editorMode": "builder",
-     "expr": "rate(vllm:prompt_tokens_total{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:prompt_tokens_total{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "fullMetaSearch": false,
      "includeNullMetadata": false,
      "instant": false,
-     "legendFormat": "Prompt Tokens/Sec",
+     "legendFormat": "r{{replica}} Prompt Tokens/Sec",
      "range": true,
      "refId": "A",
      "useBackend": false
@@ -299,12 +299,12 @@
      },
      "disableTextWrap": false,
      "editorMode": "builder",
-     "expr": "rate(vllm:generation_tokens_total{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:generation_tokens_total{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "fullMetaSearch": false,
      "hide": false,
      "includeNullMetadata": false,
      "instant": false,
-     "legendFormat": "Generation Tokens/Sec",
+     "legendFormat": "r{{replica}} Generation Tokens/Sec",
      "range": true,
      "refId": "B",
      "useBackend": false
@@ -468,10 +468,10 @@
       "uid": "${DS_PROMETHEUS}"
      },
      "editorMode": "code",
-     "expr": "rate(vllm:inter_token_latency_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])\n/\nrate(vllm:inter_token_latency_seconds_count{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:inter_token_latency_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])\n/\nrate(vllm:inter_token_latency_seconds_count{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "hide": false,
      "instant": false,
-     "legendFormat": "Mean",
+     "legendFormat": "r{{replica}} Mean",
      "range": true,
      "refId": "E"
     }
@@ -634,10 +634,10 @@
       "uid": "${DS_PROMETHEUS}"
      },
      "editorMode": "code",
-     "expr": "rate(vllm:request_time_per_output_token_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])\n/\nrate(vllm:request_time_per_output_token_seconds_count{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:request_time_per_output_token_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])\n/\nrate(vllm:request_time_per_output_token_seconds_count{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "hide": false,
      "instant": false,
-     "legendFormat": "Mean",
+     "legendFormat": "r{{replica}} Mean",
      "range": true,
      "refId": "E"
     }
@@ -734,11 +734,11 @@
      },
      "disableTextWrap": false,
      "editorMode": "builder",
-     "expr": "vllm:num_requests_running{model_name=~\"$model_name\", pod=~\"$pod\"}",
+     "expr": "label_replace(vllm:num_requests_running{model_name=~\"$model_name\", pod=~\"$pod\"}, \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "fullMetaSearch": false,
      "includeNullMetadata": true,
      "instant": false,
-     "legendFormat": "Num Running",
+     "legendFormat": "r{{replica}} Num Running",
      "range": true,
      "refId": "A",
      "useBackend": false
@@ -750,12 +750,12 @@
      },
      "disableTextWrap": false,
      "editorMode": "builder",
-     "expr": "vllm:num_requests_waiting{model_name=~\"$model_name\", pod=~\"$pod\"}",
+     "expr": "label_replace(vllm:num_requests_waiting{model_name=~\"$model_name\", pod=~\"$pod\"}, \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "fullMetaSearch": false,
      "hide": false,
      "includeNullMetadata": true,
      "instant": false,
-     "legendFormat": "Num Waiting",
+     "legendFormat": "r{{replica}} Num Waiting",
      "range": true,
      "refId": "C",
      "useBackend": false
@@ -919,10 +919,10 @@
       "uid": "${DS_PROMETHEUS}"
      },
      "editorMode": "code",
-     "expr": "rate(vllm:time_to_first_token_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])\n/\nrate(vllm:time_to_first_token_seconds_count{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:time_to_first_token_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])\n/\nrate(vllm:time_to_first_token_seconds_count{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "hide": false,
      "instant": false,
-     "legendFormat": "Average",
+     "legendFormat": "r{{replica}} Average",
      "range": true,
      "refId": "E"
     }
@@ -1018,9 +1018,9 @@
       "uid": "${DS_PROMETHEUS}"
      },
      "editorMode": "code",
-     "expr": "vllm:kv_cache_usage_perc{model_name=~\"$model_name\", pod=~\"$pod\"}",
+     "expr": "label_replace(vllm:kv_cache_usage_perc{model_name=~\"$model_name\", pod=~\"$pod\"}, \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "instant": false,
-     "legendFormat": "GPU Cache Usage",
+     "legendFormat": "r{{replica}} GPU Cache Usage",
      "range": true,
      "refId": "A"
     }
@@ -1400,11 +1400,11 @@
      },
      "disableTextWrap": false,
      "editorMode": "code",
-     "expr": "rate(vllm:request_queue_time_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:request_queue_time_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "fullMetaSearch": false,
      "includeNullMetadata": true,
      "instant": false,
-     "legendFormat": "__auto",
+     "legendFormat": "r{{replica}} __auto",
      "range": true,
      "refId": "A",
      "useBackend": false
@@ -1500,11 +1500,11 @@
      },
      "disableTextWrap": false,
      "editorMode": "code",
-     "expr": "rate(vllm:request_prefill_time_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:request_prefill_time_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "fullMetaSearch": false,
      "includeNullMetadata": true,
      "instant": false,
-     "legendFormat": "Prefill",
+     "legendFormat": "r{{replica}} Prefill",
      "range": true,
      "refId": "A",
      "useBackend": false
@@ -1515,10 +1515,10 @@
       "uid": "${DS_PROMETHEUS}"
      },
      "editorMode": "code",
-     "expr": "rate(vllm:request_decode_time_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:request_decode_time_seconds_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "hide": false,
      "instant": false,
-     "legendFormat": "Decode",
+     "legendFormat": "r{{replica}} Decode",
      "range": true,
      "refId": "B"
     }
@@ -1613,11 +1613,11 @@
      },
      "disableTextWrap": false,
      "editorMode": "code",
-     "expr": "rate(vllm:request_max_num_generation_tokens_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval])",
+     "expr": "label_replace(rate(vllm:request_max_num_generation_tokens_sum{model_name=~\"$model_name\", pod=~\"$pod\"}[$__rate_interval]), \"replica\", \"$1\", \"pod\", \".*-([0-9]+)-sampler\")",
      "fullMetaSearch": false,
      "includeNullMetadata": true,
      "instant": false,
-     "legendFormat": "Tokens",
+     "legendFormat": "r{{replica}} Tokens",
      "range": true,
      "refId": "A",
      "useBackend": false
