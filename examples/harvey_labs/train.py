@@ -13,6 +13,7 @@ from tinker_cookbook.rl import train as rl_train
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator
 from tinker_cookbook.stores.storage import LocalStorage
 from tinker_cookbook.stores.training_store import TrainingRunStore
+from tinker_cookbook.utils import ml_log
 
 from .config import RunConfig
 from .env import LabDatasetBuilder
@@ -20,6 +21,16 @@ from .plot_run import write_report
 from .results import eval_result, format_eval, format_summary, read_results
 from .reward import preflight_grading
 from .sandbox import SandboxFactory, configured_sandbox_factory, podman_sandbox_factory
+
+
+def log_and_commit(self: ml_log.WandbLogger, metrics: dict, step: int | None = None) -> None:
+  """W&B holds a row logged with an explicit step until a later step arrives, so
+  each step reached the charts only when the next one finished. Commit it now."""
+  if self.run:
+    self.run.log(metrics, step=step, commit=True)
+
+
+ml_log.WandbLogger.log_metrics = log_and_commit
 
 
 def build_train_config(config: RunConfig, sandbox_factory: SandboxFactory = podman_sandbox_factory) -> rl_train.Config:
