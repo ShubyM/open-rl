@@ -1205,8 +1205,9 @@ def stream_input(request: dict[str, Any], model_id: str, lookup_id: str) -> dict
   return stored
 
 
-async def stream_result(request_id: str, wait: float = 30) -> dict[str, Any]:
-  """Hold the poll briefly so clients see a result soon after it is saved."""
+async def stream_result(request_id: str, wait: float = 50) -> dict[str, Any]:
+  """Hold the poll until the result is saved, or for most of the SDK's 60 s
+  request timeout; each early answer is a try_again the SDK logs as a warning."""
   deadline = time.monotonic() + wait
   while True:
     result = await streams.result(request_id)
