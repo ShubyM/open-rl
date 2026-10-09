@@ -109,7 +109,10 @@ function operationActivity(placement, range) {
     for (const name of Object.keys(ops)) ops[name] = mergeIntervals(ops[name]);
     return save({ intervals: mergeIntervals(intervals), ops, error: turns.error || "", errorStatus: turns.errorStatus, loading: false, exact: true });
   }
+  // Workers with GPUs of their own record no turns: draw their recorded ops,
+  // still one interval list per op name so the blocks keep their names.
   const intervals = [];
+  const ops = {};
   let error = "", errorStatus = null, loading = !placement.allocation_id && turns.pending && !turns.data && !turns.error;
   for (const runId of placement.run_ids || []) {
     const entry = use(holdUrl(runId), `holds:${runId}`);
@@ -118,13 +121,19 @@ function operationActivity(placement, range) {
     for (const sample of entry.data?.samples || []) {
       if (sample.run_id && sample.run_id !== runId) continue;
       if (sample.role !== placement.role || (sample.node && sample.node !== placement.node) || (sample.runtime_id && sample.runtime_id !== placement.runtime_id)) continue;
+      // Replicas of a role share a node; the pod tells their ops apart when recorded.
+      if (sample.pod && placement.pod && sample.pod !== placement.pod) continue;
       const from = Math.max(range.start, placement.start, sample.started_at ?? sample.at - (sample.elapsed_seconds || 0));
       const to = Math.min(range.now, placement.end, sample.at);
-      if (to > from) intervals.push([from, to]);
+      if (to > from) {
+        intervals.push([from, to]);
+        (ops[sample.operation || "operation"] ||= []).push([from, to]);
+      }
     }
   }
+  for (const name of Object.keys(ops)) ops[name] = mergeIntervals(ops[name]);
   const warning = turns.error && turns.errorStatus !== 404 ? `GPU turns unavailable: ${turns.error}` : "";
-  return save({ intervals: mergeIntervals(intervals), error, errorStatus, loading, warning, exact: false });
+  return save({ intervals: mergeIntervals(intervals), ops, error, errorStatus, loading, warning, exact: false });
 }
 
 // ---- lane markup ------------------------------------------------------------------
