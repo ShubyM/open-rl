@@ -230,7 +230,7 @@ def dispatcher_body(set_id: str, owner: str) -> dict[str, Any]:
       "command": ["uv", "run", "python", "-u", "-m", "server.sampling_dispatcher"],
       "env": dispatch_env,
       "ports": [{"name": "metrics", "containerPort": 9100}],
-      "resources": {"requests": {"cpu": "500m", "memory": "512Mi"}, "limits": {"memory": "2Gi"}},
+      "resources": {"requests": {"cpu": "250m", "memory": "512Mi"}, "limits": {"memory": "2Gi"}},
     },
     {
       "name": "router-proxy",
@@ -239,7 +239,7 @@ def dispatcher_body(set_id: str, owner: str) -> dict[str, Any]:
       "ports": [{"name": "router", "containerPort": ROUTER_PORT}],
       "readinessProbe": {"httpGet": {"path": "/ready", "port": 19001}, "periodSeconds": 5},
       "volumeMounts": [{"name": "router-config", "mountPath": "/etc/envoy", "readOnly": True}],
-      "resources": {"requests": {"cpu": "500m", "memory": "512Mi"}, "limits": {"memory": "1Gi"}},
+      "resources": {"requests": {"cpu": "250m", "memory": "256Mi"}, "limits": {"memory": "1Gi"}},
     },
     {
       "name": "router-picker",
@@ -260,7 +260,7 @@ def dispatcher_body(set_id: str, owner: str) -> dict[str, Any]:
       "env": pod_identity,
       "readinessProbe": {"grpc": {"port": 9003, "service": "inference-extension"}, "periodSeconds": 2},
       "volumeMounts": [{"name": "router-config", "mountPath": "/etc/router", "readOnly": True}],
-      "resources": {"requests": {"cpu": "500m", "memory": "1Gi"}, "limits": {"memory": "2Gi"}},
+      "resources": {"requests": {"cpu": "250m", "memory": "512Mi"}, "limits": {"memory": "2Gi"}},
     },
   ]
   return {
@@ -277,6 +277,8 @@ def dispatcher_body(set_id: str, owner: str) -> dict[str, Any]:
           "serviceAccountName": ROUTER_CONFIG,
           # Active calls finish within the dispatcher's shutdown grace period.
           "terminationGracePeriodSeconds": 90,
+          # It needs no GPU, but may run beside its samplers on a GPU node's spare CPU.
+          "tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}],
           "containers": containers,
           "volumes": [{"name": "router-config", "configMap": {"name": ROUTER_CONFIG}}],
         },

@@ -350,6 +350,8 @@ async def main() -> None:
   from server.scheduler_worker_manager import SAMPLER_SET_LABEL
 
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+  # One line per sample request is noise; failures are logged by the dispatcher.
+  logging.getLogger("httpx").setLevel(logging.WARNING)
   set_id = os.environ["OPEN_RL_SAMPLER_SET"]
   config = DispatchConfig.from_env()
   client = redis.from_url(os.environ["REDIS_URL"])
