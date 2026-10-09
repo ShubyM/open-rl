@@ -8,6 +8,7 @@ import time
 
 from server.dashboard import history
 from server.telemetry import backends
+from server.worker_manager import owner_id
 
 CACHE_SECONDS = 5
 HISTORY_WINDOW_SECONDS = 24 * 3600
@@ -34,6 +35,17 @@ def observed_status(metadata: dict, workloads: list[dict], pods: list[dict], ava
   if workloads:
     return "Queued"
   return "Unassigned"
+
+
+async def mark_ended(store, runs: list[dict]) -> None:
+  """A run with no workers whose owner has no live client session has ended,
+  even when its API server never recorded it finished."""
+  for run in runs:
+    if run["display_status"] != "Unassigned":
+      continue
+    sessions = await store.set_members(f"open_rl:owner:{owner_id(run['runtime_id'])}")
+    if not [s for s in sessions if await store.get_value(f"open_rl:session:{s}") is not None]:
+      run["display_status"] = "Ended"
 
 
 def delete_blocker(run: dict, available: bool) -> str | None:
@@ -156,6 +168,11 @@ class Snapshot:
       except Exception:
         store_error = "Run store unavailable; showing last known run records" if self.metadata else "Run store unavailable"
       runs = join_runs(self.metadata, state)
+      if not store_error:
+        try:
+          await asyncio.wait_for(mark_ended(store, runs), timeout=5)
+        except Exception:
+          pass  # the statuses from the cluster alone still stand
       if store_error:
         for run in runs:
           run["delete_blocker"] = "Run store unavailable"
