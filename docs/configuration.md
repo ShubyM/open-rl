@@ -83,6 +83,21 @@ backend by default for physical checkpoint/restore.
 | `VLLM_ARCHITECTURE_OVERRIDE` | unset | Optional architecture override passed to the in-repo vLLM worker. Gemma 4 examples use `Gemma4ForCausalLM`. |
 | `VLLM_ENABLE_MULTIMODAL` | `0` | By default the samplers pass `limit_mm_per_prompt={"image": 0, "video": 0}`. Text checkpoints published as `*ForConditionalGeneration` otherwise make vLLM reserve a multi-GiB encoder cache during startup that no OpenRL code path can use, which can OOM engine init. Set to `1` to restore stock vLLM behaviour. |
 
+## LoRA sampler snapshots
+
+LoRA `save_weights_for_sampler` freezes the adapter into its own directory on
+the shared volume before returning the reference, and samplers load that
+snapshot by the reference. A reference therefore always names the same weights,
+however long a request waits or however often it is retried, and vLLM can cache
+prompt prefixes per adapter (prefix caching is on for LoRA samplers, off for
+full fine-tuning, whose weights change in place under one name).
+
+Save names and sequence IDs must be unique: overwriting a reference would
+invalidate vLLM's adapter and prefix caches. A missing snapshot is an error.
+References created before snapshots need to be saved again under a new name.
+Snapshots are retained like checkpoints; clean them up when the saved clients
+are no longer used.
+
 ## Client variables
 
 | Env var | Default | What it does |
