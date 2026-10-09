@@ -19,6 +19,7 @@ import shlex
 import signal
 import tarfile
 from collections.abc import Awaitable, Callable, Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -94,6 +95,15 @@ def tar_bytes(entries: list[tuple[Path, str]]) -> bytes:
 def relative(path: str) -> str:
   """sandboxd takes paths relative to its root, /workspace, and serves nothing outside it."""
   return str(Path(path).relative_to(WORKSPACE))
+
+
+# LAB's tool calls run on threads of their own. Each one blocks its thread until
+# a sandbox request finishes on the event loop, and the sandbox client moves file
+# bytes with asyncio.to_thread. On the shared default pool, every episode calling
+# a tool at once holds every thread, the file transfers queue behind them, and
+# nothing moves until tool timeouts fire; claim renewals stall the same way.
+# Sized well above the episodes one driver runs at once.
+TOOL_THREADS = ThreadPoolExecutor(max_workers=256, thread_name_prefix="lab-tool")
 
 
 class AgentLabSandbox:
@@ -173,7 +183,7 @@ class AgentLabSandbox:
     pass  # Claims have no idle expiry.
 
   async def execute_tool(self, name: str, arguments: str | dict[str, Any]) -> str:
-    return await asyncio.to_thread(self.executor.execute, name, arguments)
+    return await asyncio.get_running_loop().run_in_executor(TOOL_THREADS, self.executor.execute, name, arguments)
 
   def tool_metrics(self) -> dict[str, Any]:
     return self.executor.get_metrics()
