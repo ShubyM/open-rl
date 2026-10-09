@@ -23,9 +23,11 @@ def load_eval_data(data_path: str | None, examples: int) -> list[dict[str, Any]]
     with Path(data_path).open(encoding="utf-8") as f:
       return json.load(f)
 
-  from datasets import load_dataset
+  # GSM8K's test split straight from the Hub; the worker image has no datasets.
+  import pyarrow.parquet as pq
+  from huggingface_hub import hf_hub_download
 
-  dataset = load_dataset("openai/gsm8k", "main", split=f"test[:{examples}]")
+  dataset = pq.read_table(hf_hub_download("openai/gsm8k", "main/test-00000-of-00001.parquet", repo_type="dataset")).to_pylist()[:examples]
   return [
     {
       "prompt": f"Question: {item['question']}\nAnswer:",

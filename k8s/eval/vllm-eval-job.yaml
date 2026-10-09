@@ -40,7 +40,7 @@ spec:
       - name: eval
         image: ghcr.io/gke-labs/open-rl/server:latest
         imagePullPolicy: Always
-        command: ["uv", "run", "python", "-m", "server.scripts.run_vllm_eval"]
+        command: ["python3", "-m", "server.scripts.run_vllm_eval"]
         env:
         - name: MODEL_PATH
           value: "EVAL-MODEL-PATH"

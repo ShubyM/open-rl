@@ -158,7 +158,8 @@ def worker_container(worker: Worker) -> tuple[str, list[str]]:
       return image, ["python", "-u", *torchrun, "-m", worker_module(worker.role)]
     return image, ["python", "-u", "-m", worker_module(worker.role)]
   image = os.getenv("OPEN_RL_WORKER_IMAGE", "ghcr.io/gke-labs/open-rl/server:latest")
-  return image, ["uv", "run", "python", "-u", "-m", worker_module(worker.role)]
+  # The image's own python: the worker image installs OpenRL into vLLM's environment.
+  return image, ["python3", "-u", "-m", worker_module(worker.role)]
 
 
 def pod_template(worker: Worker) -> dict[str, Any]:
