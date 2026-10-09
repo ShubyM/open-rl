@@ -1878,9 +1878,8 @@
   "list": [
    {
     "current": {
-     "selected": false,
-     "text": "prometheus",
-     "value": "d3d7e79a-f83c-46ad-8326-cdd0108978b3"
+     "text": "Prometheus",
+     "value": "prometheus"
     },
     "hide": 0,
     "includeAll": false,

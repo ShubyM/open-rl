@@ -1634,9 +1634,8 @@
   "list": [
    {
     "current": {
-     "selected": false,
-     "text": "prometheus",
-     "value": "edx8memhpd9tsa"
+     "text": "Prometheus",
+     "value": "prometheus"
     },
     "hide": 0,
     "includeAll": false,
@@ -1653,15 +1652,14 @@
    },
    {
     "current": {
-     "selected": false,
-     "text": "/share/datasets/public_models/Meta-Llama-3-8B-Instruct",
-     "value": "/share/datasets/public_models/Meta-Llama-3-8B-Instruct"
+     "text": "All",
+     "value": "$__all"
     },
     "datasource": {
      "type": "prometheus",
      "uid": "${DS_PROMETHEUS}"
     },
-    "definition": "label_values(model_name)",
+    "definition": "label_values(vllm:num_requests_running, model_name)",
     "hide": 0,
     "includeAll": true,
     "label": "model_name",
@@ -1669,8 +1667,8 @@
     "name": "model_name",
     "options": [],
     "query": {
-     "query": "label_values(model_name)",
-     "refId": "StandardVariableQuery"
+     "query": "label_values(vllm:num_requests_running, model_name)",
+     "refId": "model_name"
     },
     "refresh": 1,
     "regex": "",
@@ -1681,26 +1679,14 @@
    },
    {
     "name": "pod",
-    "label": "Pod",
-    "type": "query",
-    "datasource": {
-     "type": "prometheus",
-     "uid": "${DS_PROMETHEUS}"
-    },
-    "query": {
-     "query": "label_values(vllm:num_requests_running, pod)",
-     "refId": "pod"
-    },
-    "definition": "label_values(vllm:num_requests_running, pod)",
-    "multi": true,
-    "includeAll": true,
-    "allValue": ".*",
+    "label": "Pod regex",
+    "type": "textbox",
+    "query": ".*",
     "current": {
-     "text": "All",
-     "value": "$__all"
+     "text": ".*",
+     "value": ".*"
     },
-    "refresh": 2,
-    "sort": 1
+    "hide": 0
    }
   ]
  },
