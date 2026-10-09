@@ -171,7 +171,7 @@ const SAMPLER_PANELS = [
 
 function samplerPanels(run, start, end) {
   if (!ui.state.grafana) return "";
-  const params = new URLSearchParams({ orgId: "1", "var-pod": `.*${run.run_id}.*-sampler`, from: String(Math.round(start * 1000)), to: String(Math.round(end * 1000)), theme: "light" });
+  const params = new URLSearchParams({ orgId: "1", "var-pod": `.*${run.run_id}.*-sampler`, from: String(Math.round(start * 1000)), to: String(Math.round(end * 1000)), theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light" });
   const frames = SAMPLER_PANELS.map(
     ([id, title]) => `<iframe class="grafana-panel" title="${escape(title)}" loading="lazy" src="/grafana/d-solo/vllm/vllm?${params}&panelId=${id}"></iframe>`,
   ).join("");
