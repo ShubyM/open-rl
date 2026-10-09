@@ -1,11 +1,14 @@
 """The HTTP side of a routed sampler: what its set's llm-d router calls
 instead of the queue, served from the sampler's own engine."""
 
+import asyncio
 from typing import Any, Protocol
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+
+ENGINE_POLL_SECONDS = 5
 
 
 class Engine(Protocol):
@@ -32,12 +35,24 @@ def http_app(sampler: Generator) -> FastAPI:
   async def completions(request: Request) -> JSONResponse:
     if sampler.engine.errored:
       return JSONResponse(failed("vLLM engine is dead"), status_code=503)
-    body = await request.json()
+    task = None
     try:
-      result = await sampler.generate(body["openrl"])
+      body = await request.json()
+      task = asyncio.create_task(sampler.generate(body["openrl"]))
+      while not task.done():
+        await asyncio.wait({task}, timeout=ENGINE_POLL_SECONDS)
+        if sampler.engine.errored:
+          raise RuntimeError("vLLM engine is dead")
+        if await request.is_disconnected():
+          raise RuntimeError("Sampling client disconnected")
+      result = task.result()
       result["type"] = "sample"
     except Exception as exc:
       result = failed(f"vLLM Worker Error: {exc}")
+    finally:
+      if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     return JSONResponse(result)
 
   @app.get("/health")

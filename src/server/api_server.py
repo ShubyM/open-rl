@@ -11,7 +11,6 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
-import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -24,7 +23,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from server import proto_codec
+from server import proto_codec, sampler_router
 from server.model_metadata import (
   TrainingModelMetadata,
   WeightSyncConfig,
@@ -41,6 +40,7 @@ from training.types import TRAINER_BACKENDS, Datum, FFTConfig, FineTuningType, L
 store = get_store()
 state = get_state_store()
 worker_manager: WorkerManager | None = None
+router: sampler_router.SamplerRouter | None = None
 
 session_registry = SessionRegistry(state)
 SESSION_REAP_INTERVAL_SEC = 30
@@ -538,8 +538,8 @@ async def ensure_sampler_launched(model_id: str) -> None:
   if worker_manager is not None and get_sampler_backend() == "vllm":
     try:
       await asyncio.to_thread(worker_manager.ensure, model_id, "sampler")
-    except Exception:
-      traceback.print_exc()
+    except Exception as exc:
+      raise HTTPException(status_code=503, detail=f"Cannot launch sampler: {exc}") from exc
 
 
 def check_single_process_backend() -> None:
@@ -607,7 +607,12 @@ async def reap_dead_sessions():
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-  global worker_manager
+  global worker_manager, router
+  router = sampler_router.SamplerRouter(
+    state,
+    timeout=float(os.getenv("OPEN_RL_ROUTER_TIMEOUT_SECONDS", "1800")),
+    capacity=int(os.getenv("OPEN_RL_ROUTER_MAX_INFLIGHT", "256")),
+  )
   task = None
   if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER"):
     worker_manager = create_worker_manager()
@@ -632,6 +637,8 @@ async def lifespan(_: FastAPI):
   try:
     yield
   finally:
+    await router.close()
+    router = None
     if reap_task is not None:
       reap_task.cancel()
     if task is not None:
@@ -846,7 +853,12 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
   pending, failed, and every other result stay JSON.
   """
   request_id = req.request_id
-  result = await store.get_future(request_id, timeout=60.0)
+  if request_id.startswith(sampler_router.PREFIX):
+    if router is None:
+      raise HTTPException(status_code=503, detail="Sampler router is unavailable")
+    result = await router.result(request_id)
+  else:
+    result = await store.get_future(request_id, timeout=60.0)
   if result is None:
     return JSONResponse(status_code=400, content={"type": "RequestFailedResponse", "error_message": "Future not found"})
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
@@ -1097,10 +1109,10 @@ async def asample(req: AsampleRequest):
     return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
   # vLLM backend
-  req_id = str(uuid.uuid4())
-  carrier = await open_future(req_id)
-
   model_meta = await get_model_metadata(state, lookup_id)
+  routed = model_meta is not None and model_meta.sampler_router == "llmd"
+  req_id = (sampler_router.PREFIX if routed else "") + new_request_id()
+  carrier = await open_future(req_id)
   fine_tuning_type = model_meta.fine_tuning_type if model_meta else "lora"
 
   if fine_tuning_type == "lora":
@@ -1133,60 +1145,16 @@ async def asample(req: AsampleRequest):
     "trace_context": carrier,
   }
 
-  if model_meta is not None and model_meta.sampler_router == "llmd" and worker_manager is not None:
-    task = asyncio.create_task(sample_through_router(lookup_id, sampling_req))
-    routed_samples.add(task)
-    task.add_done_callback(routed_samples.discard)
+  if routed:
+    if worker_manager is None or router is None:
+      raise HTTPException(status_code=503, detail="Sampler router is unavailable")
+    try:
+      await router.submit(worker_manager.router_url, lookup_id, sampling_req)
+    except sampler_router.RouterBusy as exc:
+      raise HTTPException(status_code=429, detail=str(exc)) from exc
   else:
     await store.put_sampling_request(sampling_req)
   return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
-
-
-ROUTER_ATTEMPTS = 4
-router_client: httpx.AsyncClient | None = None
-router_urls: dict[str, str] = {}
-routed_samples: set[asyncio.Task] = set()
-
-
-async def sample_through_router(model_id: str, request: dict[str, Any]) -> None:
-  """Send the request to the llm-d router on the model's first sampler, which
-  picks the replica caching its prompt. The routed samplers still drain the
-  queue, so a router that cannot be reached falls back to it."""
-  global router_client
-  if router_client is None:
-    # A turn can generate for minutes, and an agent batch keeps hundreds in flight.
-    router_client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), limits=httpx.Limits(max_connections=None))
-  # The model in the body is what the router keys its prefix cache by.
-  body = {
-    "model": request["lora_id"] or request["model_id"],
-    "prompt": request["prompt_token_ids"],
-    "max_tokens": request["max_tokens"],
-    "openrl": request,
-  }
-  for attempt in range(ROUTER_ATTEMPTS):
-    url = router_urls.get(model_id)
-    if url is None:
-      try:
-        url = await asyncio.to_thread(worker_manager.router_url, model_id)
-      except Exception as exc:
-        print(f"[API_SERVER] llm-d router lookup for {model_id} failed: {exc}")
-    if url:
-      router_urls[model_id] = url
-      try:
-        response = await router_client.post(f"{url}/v1/completions", json=body)
-        if response.status_code == 200:
-          await store.set_future(request["request_id"], response.json())
-          return
-        if response.status_code < 500:
-          error = {"type": "RequestFailedResponse", "error_message": f"llm-d router returned {response.status_code}: {response.text[:500]}"}
-          await store.set_future(request["request_id"], error)
-          return
-      except httpx.TransportError:
-        pass
-    # The router's pod is starting or was replaced; look it up again.
-    router_urls.pop(model_id, None)
-    await asyncio.sleep(2**attempt)
-  await store.put_sampling_request(request)
 
 
 # *** CLI endpoints ***

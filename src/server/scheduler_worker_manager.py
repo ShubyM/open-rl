@@ -287,7 +287,7 @@ class SchedulerWorkerManager:
     self.core_api = core_api
 
   def router_url(self, model_id: str) -> str | None:
-    """The llm-d router on the model's first sampler, once it is running."""
+    """The llm-d router on the model's first sampler, once its containers are ready."""
     _, runtime, _ = runtime_of(model_id)
     if self.core_api is None:
       self.core_api = client.CoreV1Api()
@@ -296,7 +296,12 @@ class SchedulerWorkerManager:
       self.namespace, label_selector=f"{ROUTER_LABEL}={sampler_set(runtime)}", _request_timeout=ROUTER_LOOKUP_TIMEOUT
     ).items
     for pod in pods:
-      if pod.status.phase == "Running" and pod.status.pod_ip and not pod.metadata.deletion_timestamp:
+      if (
+        pod.status.phase == "Running"
+        and pod.status.pod_ip
+        and not pod.metadata.deletion_timestamp
+        and any(c.type == "Ready" and c.status == "True" for c in pod.status.conditions or [])
+      ):
         return f"http://{pod.status.pod_ip}:{ROUTER_PORT}"
     return None
 
@@ -316,20 +321,25 @@ class SchedulerWorkerManager:
         if getattr(exc, "status", None) != 409:
           raise
       # AlreadyExists is the reuse, unless the old one is still being deleted.
-      if not self.still_deleting(worker.name):
+      if self.can_reuse(worker):
         return
       if time.monotonic() > deadline:
         raise RuntimeError(f"workload {worker.name} has been terminating for over three minutes")
       time.sleep(2)
 
-  def still_deleting(self, name: str) -> bool:
+  def can_reuse(self, worker: Worker) -> bool:
     try:
-      workload = self.custom_api.get_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, name)
+      workload = self.custom_api.get_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, worker.name)
     except Exception as exc:
       if getattr(exc, "status", None) == 404:
-        return True  # gone since the create failed, so the next create will go through
+        return False  # gone since the create failed, so the next create will go through
       raise
-    return bool(workload["metadata"].get("deletionTimestamp"))
+    if workload["metadata"].get("deletionTimestamp"):
+      return False
+    labels = workload["spec"]["template"].get("metadata", {}).get("labels", {})
+    if worker.role == "sampler" and (SAMPLER_SET_LABEL in labels) != worker.routed:
+      raise ValueError(f"Shared sampler {worker.name} has a different sampler_router setting; use matching settings or openrl.exclusive=true")
+    return True
 
   def release(self, model_id: str) -> None:
     try:
