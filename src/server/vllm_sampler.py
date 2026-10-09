@@ -28,6 +28,7 @@ from accel_timeslicer.workload import SAMPLER_CLAIM, WorkloadRef, local_workload
 from server.lora_snapshots import resolve_lora_path
 from server.sampler_http import serve_http
 from server.store import RequestStore, StateStore, get_state_store, get_store
+from server.telemetry.ops import observe_operation
 from server.vllm_options import gpu_memory_utilization, sampler_batch_limits, split_stop, text_only_engine_kwargs
 
 tracer = trace.get_tracer("vllm.inference.worker")
@@ -245,7 +246,7 @@ async def fail_requests(store: RequestStore, requests: list[dict[str, Any]], err
 async def process_request(sampler: Sampler, store: RequestStore, request: dict[str, Any]) -> None:
   with tracer.start_as_current_span("process_sampling_request", context=propagate.extract(request.get("trace_context", {}))):
     try:
-      result = await sampler.generate(request)
+      result = await observe_operation(store, request, "sampler", request.get("model_id"), lambda: sampler.generate(request))
       result["type"] = "sample"
     except Exception as exc:
       result = failed_response(f"vLLM Worker Error: {exc}")
@@ -276,7 +277,7 @@ async def serve(
   state = get_state_store()
   stats = asyncio.create_task(log_engine_stats(sampler.engine))
   # A routed sampler also takes requests from its set's llm-d router.
-  http = asyncio.create_task(serve_http(sampler, int(port))) if (port := os.getenv("OPEN_RL_SAMPLER_HTTP_PORT")) else None
+  http = asyncio.create_task(serve_http(sampler, int(port), store)) if (port := os.getenv("OPEN_RL_SAMPLER_HTTP_PORT")) else None
   try:
     try:
       ready_at = float("-inf")

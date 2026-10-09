@@ -8,6 +8,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from server import training_requests_processor as trp
 from server.store import InMemoryStore
+from server.telemetry import ops
 from training import commands
 from training.types import Datum, LoraConfig, TensorData
 
@@ -71,6 +72,16 @@ class DeleteModelTest(unittest.IsolatedAsyncioTestCase):
       await self.run_commands(processor, *self.train("b", 1), commands.DeleteModel(request_id="delete-b", model_id="b"))
       self.assertEqual(worker.adapter_states, {})
       await self.run_commands(processor, self.create("c"), *self.train("c", 0))
+
+  async def test_each_runs_operations_are_recorded_for_the_dashboard(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"OPEN_RL_TMP_DIR": tmp}):
+      store = InMemoryStore()
+      processor = trp.TrainingRequestsProcessor(store, tiny_lora_worker())
+      await self.run_commands(processor, self.create("a"), *self.train("a", 0))
+      recorded = await store.read_samples(ops.key("a"))
+      self.assertEqual([op["operation"] for op in recorded][0], "create_model")
+      self.assertTrue({"forward_backward", "optim_step"} <= {op["operation"] for op in recorded})
+      self.assertTrue(all(op["role"] == "trainer" and op["status"] == "succeeded" for op in recorded))
 
   async def test_deleting_an_unknown_job_is_a_no_op(self) -> None:
     worker = tiny_lora_worker()

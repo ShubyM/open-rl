@@ -1148,6 +1148,8 @@ async def asample(req: AsampleRequest):
     "weights_path": weights_path,
     "include_prompt_logprobs": req.prompt_logprobs,
     "model_id": queue_id,
+    # The run this request belongs to, so recorded operations land on its dashboard page.
+    "logical_run_id": lookup_id,
     "trace_context": carrier,
   }
 

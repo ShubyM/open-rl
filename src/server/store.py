@@ -51,6 +51,16 @@ class RequestStore(ABC):
     """Block until the future resolves or the timeout is reached."""
     pass
 
+  @abstractmethod
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int = 120) -> None:
+    """Atomically append a sample and retain the most recent limit entries."""
+    pass
+
+  @abstractmethod
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    """Read retained samples in append order."""
+    pass
+
 
 class InMemoryStore(RequestStore):
   def __init__(self):
@@ -62,6 +72,7 @@ class InMemoryStore(RequestStore):
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_cv = asyncio.Condition()
     self.sampling_queues: dict[str, asyncio.Queue] = {}
+    self.sample_store: dict[str, list[str]] = {}
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
@@ -143,6 +154,16 @@ class InMemoryStore(RequestStore):
       except TimeoutError:
         return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
       return self.futures_store[req_id]
+
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int = 120) -> None:
+    if limit < 1:
+      raise ValueError("Sample limit must be positive")
+    samples = self.sample_store.setdefault(key, [])
+    samples.append(json.dumps(sample, allow_nan=False))
+    del samples[:-limit]
+
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    return [json.loads(sample) for sample in self.sample_store.get(key, [])]
 
 
 class RedisStore(RequestStore):
@@ -285,6 +306,17 @@ class RedisStore(RequestStore):
         return payload
 
       await asyncio.sleep(0.1)
+
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int = 120) -> None:
+    if limit < 1:
+      raise ValueError("Sample limit must be positive")
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.rpush(key, json.dumps(sample, allow_nan=False))
+      pipeline.ltrim(key, -limit, -1)
+      await pipeline.execute()
+
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    return [json.loads(sample) for sample in await self.redis.lrange(key, 0, -1)]
 
 
 class StateStore(ABC):

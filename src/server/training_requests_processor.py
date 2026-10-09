@@ -21,6 +21,7 @@ from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
 from server.store import RequestStore, get_state_store, get_store
+from server.telemetry.ops import observe_operation
 from training import commands
 from training.commands import parse_command
 from training.distributed import broadcast_object, is_distributed, is_primary, local_rank
@@ -266,7 +267,7 @@ class TrainingRequestsProcessor:
       ctx = propagate.extract(command.trace_context) if command.trace_context else None
       token = otel_context.attach(ctx) if ctx else None
 
-      result = await self.dispatch_operation(command)
+      result = await observe_operation(self.store, raw_request, "trainer", command.model_id, lambda: self.dispatch_operation(command))
       return request_id, result
     except Exception as exc:
       traceback.print_exc()

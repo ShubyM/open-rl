@@ -9,6 +9,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from server.telemetry.ops import observe_operation
+
 ENGINE_POLL_SECONDS = 5
 # A request the sampler can never serve. Anything else is worth another attempt.
 PERMANENT_ERRORS = (ValueError, TypeError, KeyError, FileNotFoundError)
@@ -32,7 +34,7 @@ def failed(message: str, category: str = "server") -> dict[str, Any]:
   return {"type": "RequestFailedResponse", "error_message": message, "category": category}
 
 
-def http_app(sampler: Generator) -> FastAPI:
+def http_app(sampler: Generator, store: Any = None) -> FastAPI:
   """The body is OpenAI shaped so the router can read the prompt and model;
   its `openrl` field is the request the queue would have carried, and the
   answer is the same result."""
@@ -51,7 +53,13 @@ def http_app(sampler: Generator) -> FastAPI:
       body = await request.json()
       openrl = body["openrl"]
       deadline = openrl.get("deadline")
-      task = asyncio.create_task(sampler.generate(openrl))
+      # Recorded like a queued request, so the dashboard shows routed sampling too.
+      work = (
+        (lambda: observe_operation(store, openrl, "sampler", openrl.get("model_id"), lambda: sampler.generate(openrl)))
+        if store
+        else (lambda: sampler.generate(openrl))
+      )
+      task = asyncio.create_task(work())
       while not task.done():
         remaining = deadline - time.time() if deadline else ENGINE_POLL_SECONDS
         if remaining <= 0:
@@ -91,6 +99,6 @@ def http_app(sampler: Generator) -> FastAPI:
   return app
 
 
-async def serve_http(sampler: Generator, port: int) -> None:
-  server = uvicorn.Server(uvicorn.Config(http_app(sampler), host="0.0.0.0", port=port, log_level="warning"))
+async def serve_http(sampler: Generator, port: int, store: Any = None) -> None:
+  server = uvicorn.Server(uvicorn.Config(http_app(sampler, store), host="0.0.0.0", port=port, log_level="warning"))
   await server.serve()

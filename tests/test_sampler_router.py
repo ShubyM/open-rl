@@ -22,6 +22,7 @@ from server.sampling_dispatcher import DispatchConfig, Dispatcher
 from server.sampling_streams import SamplingStreams, sampler_set
 from server.scheduler_worker_manager import DISPATCH_SET_LABEL, DISPATCHER_PREFIX, SAMPLER_SET_LABEL, SchedulerWorkerManager
 from server.store import InMemoryStateStore, InMemoryStore
+from server.telemetry import ops
 from server.worker_manager import LocalWorkerManager
 from tests.redis_server import RedisServer, needs_redis
 from tests.test_scheduler_worker_manager import FakeAppsApi, FakeCustomObjectsApi
@@ -253,6 +254,42 @@ class StreamSamplingApiTest(unittest.IsolatedAsyncioTestCase):
       self.assertEqual((await self.sample()).status_code, 429)
     await self.api_streams.close(self.set_id)
     self.assertEqual((await self.sample()).status_code, 503)
+
+
+class RoutedSampleRecordingTest(unittest.IsolatedAsyncioTestCase):
+  """Routed samples are recorded per run, like queued ones, for the dashboard."""
+
+  async def asyncSetUp(self) -> None:
+    self.store = InMemoryStore()
+
+  async def post(self, sampler, openrl: dict) -> httpx.Response:
+    app = httpx.AsyncClient(transport=httpx.ASGITransport(app=sampler_http.http_app(sampler, self.store)), base_url="http://sampler")
+    async with app:
+      return await app.post("/v1/completions", json={"model": SAVED, "prompt": [1, 2, 3], "max_tokens": 2, "openrl": openrl})
+
+  async def test_a_routed_sample_is_recorded_under_its_run(self) -> None:
+    openrl = {
+      "request_id": "sampled:set:abc#1",
+      "logical_run_id": "job",
+      "lora_id": SAVED,
+      "model_id": "job",
+      "prompt_token_ids": [1, 2, 3],
+      "max_tokens": 2,
+      "num_samples": 1,
+    }
+    self.assertEqual((await self.post(EchoSampler(), openrl)).status_code, 200)
+    [op] = await self.store.read_samples(ops.key("job"))
+    self.assertEqual((op["operation"], op["role"], op["status"], op["request_id"]), ("sample", "sampler", "succeeded", "sampled:set:abc#1"))
+
+  async def test_a_rejected_sample_is_recorded_as_failed(self) -> None:
+    class Rejecting(EchoSampler):
+      async def generate(self, request: dict) -> dict:
+        raise ValueError("prompt too long")
+
+    openrl = {"request_id": "r#1", "logical_run_id": "job", "model_id": "job", "prompt_token_ids": [1], "max_tokens": 2, "num_samples": 1}
+    self.assertEqual((await self.post(Rejecting(), openrl)).status_code, 400)
+    [op] = await self.store.read_samples(ops.key("job"))
+    self.assertEqual((op["status"], op["error_type"]), ("failed", "ValueError"))
 
 
 class SamplerRouterSettingTest(unittest.TestCase):
