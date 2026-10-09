@@ -154,8 +154,28 @@ function metricsPanel(id, run) {
     .join("");
   return `<div class="run-metric-summary" data-key="metric-summary"><span>Completed steps <strong>${escape(run.steps)}</strong></span>${status ? `<span class="${error ? "source-error" : "muted"}" role="status">${escape(status)}</span>` : ""}</div>
     <div class="chart-grid" data-key="run-charts">${samples.length ? charts.join("") : metrics.data && !error && !metrics.pending ? empty("No operations recorded in this time range") : ""}</div>
+    ${samplerPanels(run, start, end)}
     <h2 class="scheduler-title">Processes</h2>${run.shared_runtime ? '<p class="muted">Shared LoRA runtime</p>' : ""}
     <div class="table-scroll" data-key="run-processes"><table class="run-table"><thead><tr><th>Process</th><th>Kind</th><th>Node</th><th>State</th><th>Restarts</th></tr></thead><tbody>${rows}</tbody></table></div>${!run.pods?.length ? empty(ui.state.cluster.available ? "No current pods" : ui.state.cluster.error || "Process information unavailable") : ""}`;
+}
+
+// vLLM panels from Grafana's stock dashboard, filtered to this run's sampler pods.
+// Pod names carry the run id, so finished runs match too.
+const SAMPLER_PANELS = [
+  [8, "Token throughput"],
+  [3, "Running and waiting requests"],
+  [4, "KV cache use"],
+  [5, "Time to first token"],
+  [9, "End-to-end request latency"],
+];
+
+function samplerPanels(run, start, end) {
+  if (!ui.state.grafana) return "";
+  const params = new URLSearchParams({ orgId: "1", "var-pod": `.*${run.run_id}.*-sampler`, from: String(Math.round(start * 1000)), to: String(Math.round(end * 1000)), theme: "light" });
+  const frames = SAMPLER_PANELS.map(
+    ([id, title]) => `<iframe class="grafana-panel" title="${escape(title)}" loading="lazy" src="/grafana/d-solo/vllm/vllm?${params}&panelId=${id}"></iframe>`,
+  ).join("");
+  return `<h2 class="scheduler-title">Samplers</h2><p class="muted"><a href="/grafana/d/vllm/vllm?${params}" target="_blank" rel="noopener">Open in Grafana ↗</a></p><div class="grafana-grid" data-key="grafana:${escape(run.run_id)}:${Math.round(start)}:${Math.round(end)}">${frames}</div>`;
 }
 
 // ---- logs -----------------------------------------------------------------------------

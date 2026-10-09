@@ -2,11 +2,13 @@
 read-only except deleting the records of finished or abandoned runs."""
 
 import asyncio
+import os
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+import httpx
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from server.dashboard import experiments, metrics
@@ -17,6 +19,11 @@ from server.telemetry import backends, gke, kubernetes, ops
 
 router = APIRouter()
 STATIC = Path(__file__).parent / "static"
+# Grafana served under /grafana, proxied so the UI can embed its panels from one address.
+GRAFANA_URL = os.getenv("OPEN_RL_GRAFANA_URL", "").rstrip("/")
+# Headers that describe the hop rather than the content; httpx also decodes bodies.
+HOP_HEADERS = {"host", "connection", "content-length", "content-encoding", "transfer-encoding", "keep-alive"}
+grafana_client: httpx.AsyncClient | None = None
 
 
 @router.get("/dashboard", include_in_schema=False)
@@ -65,7 +72,24 @@ async def inspection_index():
 async def snapshot_view():
   await gke.discover()
   state = await snapshot.current(get_store())
-  return {**state, "telemetry_sources": await asyncio.to_thread(backends.current().describe)}
+  return {**state, "telemetry_sources": await asyncio.to_thread(backends.current().describe), "grafana": bool(GRAFANA_URL)}
+
+
+@router.api_route("/grafana/{path:path}", methods=["GET", "POST"], include_in_schema=False)
+async def grafana(path: str, request: Request):
+  global grafana_client
+  if not GRAFANA_URL:
+    raise HTTPException(404, "Grafana is not configured; set OPEN_RL_GRAFANA_URL")
+  if grafana_client is None:
+    grafana_client = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=5))
+  headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_HEADERS}
+  try:
+    upstream = await grafana_client.request(
+      request.method, f"{GRAFANA_URL}/grafana/{path}", params=request.query_params, content=await request.body(), headers=headers
+    )
+  except httpx.HTTPError as exc:
+    raise HTTPException(502, f"Grafana unreachable: {exc}") from exc
+  return Response(upstream.content, upstream.status_code, {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_HEADERS})
 
 
 @router.get("/api/v1/dashboard/experiments")

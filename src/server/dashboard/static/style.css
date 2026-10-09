@@ -1602,3 +1602,17 @@ body {
     gap: 8px;
   }
 }
+
+#orl-design-lab .grafana-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  gap: 12px;
+}
+
+#orl-design-lab .grafana-panel {
+  width: 100%;
+  height: 260px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
