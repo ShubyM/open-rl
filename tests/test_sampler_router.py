@@ -91,6 +91,8 @@ class SetTemplateTest(unittest.TestCase):
       self.assertEqual([c["name"] for c in template["spec"]["containers"]], ["worker"])
       self.assertEqual(template["spec"]["containers"][0]["readinessProbe"]["httpGet"]["path"], "/health")
       self.assertEqual(template["spec"]["containers"][0]["ports"], [{"name": "http", "containerPort": 8000}])
+      identity = {e["name"]: e["valueFrom"]["fieldRef"]["fieldPath"] for e in template["spec"]["containers"][0]["env"] if "valueFrom" in e}
+      self.assertEqual((identity["POD_NAME"], identity["POD_UID"], identity["NODE_NAME"]), ("metadata.name", "metadata.uid", "spec.nodeName"))
     self.assertNotIn("metadata", templates["lora-job-0-trainer"])
 
   def test_the_set_gets_one_dispatcher_pod_that_is_not_a_sampler(self) -> None:
@@ -277,9 +279,12 @@ class RoutedSampleRecordingTest(unittest.IsolatedAsyncioTestCase):
       "max_tokens": 2,
       "num_samples": 1,
     }
-    self.assertEqual((await self.post(EchoSampler(), openrl)).status_code, 200)
+    with patch.dict(os.environ, {"POD_NAME": "orw-lora-job-1-sampler"}):
+      self.assertEqual((await self.post(EchoSampler(), openrl)).status_code, 200)
     [op] = await self.store.read_samples(ops.key("job"))
     self.assertEqual((op["operation"], op["role"], op["status"], op["request_id"]), ("sample", "sampler", "succeeded", "sampled:set:abc#1"))
+    # Replicas share a node, so the pod is what tells their operations apart.
+    self.assertEqual(op["pod"], "orw-lora-job-1-sampler")
 
   async def test_a_rejected_sample_is_recorded_as_failed(self) -> None:
     class Rejecting(EchoSampler):

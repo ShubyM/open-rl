@@ -85,7 +85,7 @@ async def observe_operation(store, request: dict, role: str, runtime_id: str | N
         if isinstance(queued, int | float) and not isinstance(queued, bool) and math.isfinite(queued) and 0 < queued <= started_at:
           sample["enqueued_at"] = queued
           sample["queue_seconds"] = started_at - queued
-        for field, env in (("pod_uid", "POD_UID"), ("node", "NODE_NAME")):
+        for field, env in (("pod", "POD_NAME"), ("pod_uid", "POD_UID"), ("node", "NODE_NAME")):
           if value := os.getenv(env):
             sample[field] = value
         span_context = span.get_span_context()
