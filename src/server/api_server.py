@@ -35,6 +35,8 @@ from server.model_metadata import (
 from server.sampling_streams import sampler_set
 from server.session_registry import SessionRegistry
 from server.store import RedisStateStore, get_state_store, get_store
+from server.telemetry import ops
+from server.telemetry import trace_export as trace_export_module
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, owner_of
 from training import commands
 from training.commands import Command
@@ -54,6 +56,9 @@ owner_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 async def bind_session(session_id: str | None, model_id: str) -> None:
+  if session_id:
+    # The runs a session used, for its trace export.
+    await state.add_to_set(f"open_rl:session_runs:{session_id}", model_id)
   if worker_manager is not None and session_id:
     owner = await asyncio.to_thread(owner_of, model_id)
     async with owner_locks[owner]:
@@ -700,6 +705,31 @@ async def forward_backward_body(request: Request) -> ForwardBackwardRequest:
 
 
 # *** ServiceClient endpoints ***
+TRACE_TTL_SECONDS = 3600
+
+
+@app.get("/api/v1/sessions/{session_id}/trace_export")
+async def trace_export(session_id: str, request: Request):
+  """RestClient.export_session_trace(): a Perfetto trace of the session's recorded
+  trainer and sampler operations, behind a download URL that expires in an hour.
+  Each run keeps its last operations only, so a long run's trace is its recent past."""
+  runs = await state.set_members(f"open_rl:session_runs:{session_id}")
+  if not runs:
+    return {"status": "failed", "error": f"No runs are recorded for session {session_id}"}
+  recorded = {run: await store.read_samples(ops.key(run)) for run in runs}
+  token = uuid.uuid4().hex
+  await state.set_value(f"open_rl:trace_file:{token}", json.dumps(trace_export_module.chrome_trace(recorded)), ttl_seconds=TRACE_TTL_SECONDS)
+  return {"status": "ready", "url": f"{str(request.base_url).rstrip('/')}/api/v1/trace_files/{token}"}
+
+
+@app.get("/api/v1/trace_files/{token}")
+async def trace_file(token: str):
+  trace = await state.get_value(f"open_rl:trace_file:{token}")
+  if trace is None:
+    raise HTTPException(status_code=404, detail="Trace expired; export it again for a fresh URL")
+  return Response(content=trace, media_type="application/json")
+
+
 @app.get("/api/v1/healthz")
 async def health_check():
   return {"status": "ok"}
