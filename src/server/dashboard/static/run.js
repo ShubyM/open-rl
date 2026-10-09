@@ -171,11 +171,16 @@ const SAMPLER_PANELS = [
 
 function samplerPanels(run, start, end) {
   if (!ui.state.grafana) return "";
-  const params = new URLSearchParams({ orgId: "1", "var-pod": `.*${run.run_id}.*-sampler`, from: String(Math.round(start * 1000)), to: String(Math.round(end * 1000)), theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light" });
+  // Following live time, Grafana refreshes itself over a relative window, so the
+  // frame's URL stays the same between polls and the panel never reloads.
+  const window = runView.follow
+    ? { from: `now-${runView.windowMinutes}m`, to: "now", refresh: "30s" }
+    : { from: String(Math.round(start * 1000)), to: String(Math.round(end * 1000)) };
+  const params = new URLSearchParams({ orgId: "1", "var-pod": `.*${run.run_id}.*-sampler`, ...window, theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light" });
   const frames = SAMPLER_PANELS.map(
     ([id, title]) => `<iframe class="grafana-panel" title="${escape(title)}" loading="lazy" src="/grafana/d-solo/vllm/vllm?${params}&panelId=${id}"></iframe>`,
   ).join("");
-  return `<h2 class="scheduler-title">Samplers</h2><p class="muted"><a href="/grafana/d/vllm/vllm?${params}" target="_blank" rel="noopener">Open in Grafana ↗</a></p><div class="grafana-grid" data-key="grafana:${escape(run.run_id)}:${Math.round(start)}:${Math.round(end)}">${frames}</div>`;
+  return `<h2 class="scheduler-title">Samplers</h2><p class="muted"><a href="/grafana/d/vllm/vllm?${params}" target="_blank" rel="noopener">Open in Grafana ↗</a></p><div class="grafana-grid" data-key="grafana:${escape(run.run_id)}:${params}">${frames}</div>`;
 }
 
 // ---- logs -----------------------------------------------------------------------------
