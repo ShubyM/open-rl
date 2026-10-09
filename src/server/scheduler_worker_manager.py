@@ -126,7 +126,9 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
     "OPEN_RL_TIME_SLICE_JOB_ID": worker.name,
     "OPEN_RL_ACCEL_TIMESLICER_PORT": os.getenv("OPEN_RL_ACCEL_TIMESLICER_PORT", "9753"),
   }
-  if worker.routed:
+  if worker.role == "sampler":
+    # Every sampler serves HTTP so Prometheus can scrape vLLM's /metrics;
+    # only routed ones are also sent completions on it.
     values["OPEN_RL_SAMPLER_HTTP_PORT"] = str(SAMPLER_HTTP_PORT)
   # MAX_JOBS caps FlashInfer's JIT build, which otherwise runs one ~3GB
   # compiler per core and blows through the pod's host memory limit.
@@ -187,6 +189,8 @@ def pod_template(worker: Worker) -> dict[str, Any]:
     template["spec"]["containers"][0]["volumeMounts"].append({"name": "dshm", "mountPath": "/dev/shm"})
     template["spec"]["volumes"].append({"name": "dshm", "emptyDir": {"medium": "Memory"}})
 
+  if worker.role == "sampler":
+    template["spec"]["containers"][0]["ports"] = [{"name": "http", "containerPort": SAMPLER_HTTP_PORT}]
   if worker.routed:
     add_router(template, worker)
 
@@ -196,13 +200,12 @@ def pod_template(worker: Worker) -> dict[str, Any]:
 
 
 def add_router(template: dict[str, Any], worker: Worker) -> None:
-  """Label the sampler into its set and open its HTTP port; the set's first
+  """Label the sampler into its set and gate it on its HTTP health; the set's first
   sampler also gets the router. The router's config and its permission to
   watch pods come from k8s/deploy/llmd-router."""
   name = sampler_set(worker.runtime)
   labels = {SAMPLER_SET_LABEL: name}
   sampler = template["spec"]["containers"][0]
-  sampler["ports"] = [{"name": "http", "containerPort": SAMPLER_HTTP_PORT}]
   sampler["readinessProbe"] = {"httpGet": {"path": "/health", "port": SAMPLER_HTTP_PORT}, "periodSeconds": 10}
   if worker.index == 0:
     labels[ROUTER_LABEL] = name
@@ -236,6 +239,8 @@ def add_router(template: dict[str, Any], worker: Worker) -> None:
           "--zap-encoder",
           "json",
           "--tracing=false",
+          # Plain /metrics so Managed Prometheus can scrape the picker without a token.
+          "--metrics-endpoint-auth=false",
         ],
         "env": pod_identity,
         "readinessProbe": {"grpc": {"port": 9003, "service": "inference-extension"}, "periodSeconds": 2},

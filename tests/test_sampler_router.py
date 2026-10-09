@@ -53,11 +53,20 @@ class RoutedSamplerTemplateTest(unittest.TestCase):
       env = {e["name"]: e.get("value") for e in template["spec"]["containers"][0]["env"]}
       self.assertEqual(env["OPEN_RL_SAMPLER_HTTP_PORT"], "8000")
 
-  def test_trainers_and_unrouted_samplers_are_unchanged(self) -> None:
+  def test_unrouted_samplers_serve_metrics_without_a_router(self) -> None:
     templates = self.workloads({**ROUTED, "sampler_router": None})
-    for template in templates.values():
+    for name, template in templates.items():
       self.assertNotIn("metadata", template)
-      self.assertEqual([c["name"] for c in template["spec"]["containers"]], ["worker"])
+      worker = template["spec"]["containers"]
+      self.assertEqual([c["name"] for c in worker], ["worker"])
+      env = {e["name"]: e.get("value") for e in worker[0]["env"]}
+      if name.endswith("-sampler"):
+        self.assertEqual(worker[0]["ports"], [{"name": "http", "containerPort": 8000}])
+        self.assertEqual(env["OPEN_RL_SAMPLER_HTTP_PORT"], "8000")
+        self.assertNotIn("readinessProbe", worker[0])
+      else:
+        self.assertNotIn("ports", worker[0])
+        self.assertNotIn("OPEN_RL_SAMPLER_HTTP_PORT", env)
     self.api.created.clear()
     self.api.existing.clear()
     trainer = self.workloads(ROUTED)["lora-job-0-trainer"]

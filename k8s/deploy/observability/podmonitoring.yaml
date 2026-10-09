@@ -1,0 +1,26 @@
+# Managed Prometheus scrapes vLLM's /metrics on every sampler, and the llm-d
+# endpoint picker on the first sampler of a routed set.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: openrl-samplers
+spec:
+  selector:
+    matchLabels:
+      app: open-rl-sampler-worker
+  endpoints:
+  - port: http
+    interval: 15s
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: openrl-sampler-router
+spec:
+  selector:
+    matchExpressions:
+    - key: openrl.io/sampler-router
+      operator: Exists
+  endpoints:
+  - port: 9090
+    interval: 15s

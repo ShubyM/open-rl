@@ -1,0 +1,18 @@
+# Metrics for samplers and the llm-d router, and a Grafana that shows them.
+# Apply with kubectl apply -k. The dashboard proxies Grafana under /grafana.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: openrl-system
+resources:
+- podmonitoring.yaml
+- grafana.yaml
+configMapGenerator:
+- name: grafana-provisioning
+  files:
+  - datasources.yaml
+  - dashboards.yaml
+- name: grafana-dashboards
+  files:
+  - dashboards/vllm.json
+  - dashboards/llmd-gateway.json
+  - dashboards/dcgm.json
