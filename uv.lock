@@ -1964,6 +1964,7 @@ dependencies = [
 [package.optional-dependencies]
 cluster = [
     { name = "kubernetes" },
+    { name = "prometheus-client" },
     { name = "timeslice" },
 ]
 cpu = [
@@ -2028,6 +2029,7 @@ requires-dist = [
     { name = "peft", marker = "extra == 'cpu'" },
     { name = "peft", marker = "extra == 'gpu'" },
     { name = "pillow", marker = "extra == 'cpu'" },
+    { name = "prometheus-client", marker = "extra == 'cluster'", specifier = ">=0.20" },
     { name = "protobuf", specifier = ">=5" },
     { name = "pybase64", marker = "extra == 'cpu'" },
     { name = "pydantic" },
