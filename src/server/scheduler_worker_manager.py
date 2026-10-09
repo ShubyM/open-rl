@@ -198,7 +198,10 @@ def pod_template(worker: Worker) -> dict[str, Any]:
 def join_set(template: dict[str, Any], worker: Worker) -> None:
   """Label the sampler into its set and gate it on its HTTP health. No replica
   has a special role; the set's router runs in its dispatcher pod."""
-  template["spec"]["containers"][0]["readinessProbe"] = {"httpGet": {"path": "/health", "port": SAMPLER_HTTP_PORT}, "periodSeconds": 10}
+  sampler = template["spec"]["containers"][0]
+  # Named, so the picker's target port and Prometheus's scrape both find it.
+  sampler["ports"] = [{"name": "http", "containerPort": SAMPLER_HTTP_PORT}]
+  sampler["readinessProbe"] = {"httpGet": {"path": "/health", "port": SAMPLER_HTTP_PORT}, "periodSeconds": 10}
   template["metadata"] = {"labels": {SAMPLER_SET_LABEL: sampler_set(worker.runtime)}}
 
 
@@ -256,6 +259,8 @@ def dispatcher_body(set_id: str, owner: str) -> dict[str, Any]:
         "--zap-encoder",
         "json",
         "--tracing=false",
+        # Plain /metrics so Managed Prometheus can scrape the picker without a token.
+        "--metrics-endpoint-auth=false",
       ],
       "env": pod_identity,
       "readinessProbe": {"grpc": {"port": 9003, "service": "inference-extension"}, "periodSeconds": 2},

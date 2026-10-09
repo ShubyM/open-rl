@@ -89,6 +89,7 @@ class SetTemplateTest(unittest.TestCase):
       self.assertEqual(template["metadata"], {"labels": {SAMPLER_SET_LABEL: name}})
       self.assertEqual([c["name"] for c in template["spec"]["containers"]], ["worker"])
       self.assertEqual(template["spec"]["containers"][0]["readinessProbe"]["httpGet"]["path"], "/health")
+      self.assertEqual(template["spec"]["containers"][0]["ports"], [{"name": "http", "containerPort": 8000}])
     self.assertNotIn("metadata", templates["lora-job-0-trainer"])
 
   def test_the_set_gets_one_dispatcher_pod_that_is_not_a_sampler(self) -> None:
