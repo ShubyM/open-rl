@@ -83,6 +83,53 @@ backend by default for physical checkpoint/restore.
 | `VLLM_ARCHITECTURE_OVERRIDE` | unset | Optional architecture override passed to the in-repo vLLM worker. Gemma 4 examples use `Gemma4ForCausalLM`. |
 | `VLLM_ENABLE_MULTIMODAL` | `0` | By default the samplers pass `limit_mm_per_prompt={"image": 0, "video": 0}`. Text checkpoints published as `*ForConditionalGeneration` otherwise make vLLM reserve a multi-GiB encoder cache during startup that no OpenRL code path can use, which can OOM engine init. Set to `1` to restore stock vLLM behaviour. |
 
+## llm-d sampler routing
+
+For Kubernetes LoRA workers, set `openrl.sampler_router` in model metadata and
+install the router resources with `kubectl apply -k k8s/deploy/llmd-router`.
+Each routed sampler set gets one CPU pod with Envoy and the llm-d endpoint
+picker, which picks the sampler by load and cached prefix. The set's samplers
+run stock `vllm serve` and load saved adapters by name through vLLM's filesystem
+LoRA resolver, so requests must name fixed weights: a saved `sampler_weights`
+reference, or the base model before the first save. Jobs sharing a sampler
+runtime must use the same setting; use `openrl.exclusive=true` for a separate
+pool.
+
+- `llmd`: the API server sends each sample through the set's router and keeps
+  it in memory until the result is saved. If the API server restarts first,
+  `retrieve_future` answers 410 and the tinker client sends the sample again.
+- `llmd-stream`: the API server stores each request in the set's Redis Stream,
+  and a dispatcher in the router pod sends it. Accepted work survives restarts
+  of the API server, the dispatcher and the samplers.
+
+A lost response can make a sampler generate a request twice; only one result is
+kept.
+
+| API server env var | Default | What it does |
+| --- | --- | --- |
+| `OPEN_RL_SAMPLE_UNFINISHED_LIMIT` | `4096` | Unfinished `llmd` samples per API server. Further submissions receive HTTP 429. |
+| `OPEN_RL_SAMPLE_DEADLINE_SECONDS` | `7200` | Total time a request may take, including retries. |
+| `OPEN_RL_SAMPLE_ATTEMPT_TIMEOUT` | `1800` | Longest single attempt, cut short by the deadline. |
+| `OPEN_RL_SAMPLE_DRAIN_SECONDS` | `25` | How long a stopping API server lets its `llmd` samples finish. Keep it below the pod's termination grace period. |
+| `OPEN_RL_SAMPLE_RESULT_TTL` | `1800` | How long a saved stream result stays readable. |
+| `OPEN_RL_DISPATCHER_IMAGE` | worker image | Image for the dispatcher container; the API server image is enough. |
+| `OPEN_RL_VLLM_IMAGE` | `vllm/vllm-openai:v0.30.0` | Image for routed samplers. |
+
+Routed samplers get `VLLM_MAX_MODEL_LEN`, `VLLM_GPU_MEMORY_UTILIZATION`,
+`VLLM_MAX_NUM_SEQS` and `VLLM_MAX_NUM_BATCHED_TOKENS` from the API server as
+`vllm serve` flags when set.
+
+The API server passes every `OPEN_RL_SAMPLE_*` and `OPEN_RL_DISPATCH_*`
+variable to the dispatchers. `OPEN_RL_DISPATCH_ACTIVE` (default `256`) caps the
+requests one dispatcher works on at once, including those waiting to retry.
+
+Removing a set drops its unfinished stream requests; their IDs then read as not
+found. With `llmd-stream`, Redis holds the only copy of accepted work: run it
+with persistence (for example an append-only file) and keep its eviction policy
+from removing these keys.
+
+See docs/design/sampler-routing.md for the design.
+
 ## LoRA sampler snapshots
 
 LoRA `save_weights_for_sampler` freezes the adapter into its own directory on

@@ -1,0 +1,52 @@
+# Each sampler set's router pod runs the llm-d endpoint picker, which watches
+# the set's sampler pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openrl-llmd-router
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openrl-llmd-router
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openrl-llmd-router
+subjects:
+- kind: ServiceAccount
+  name: openrl-llmd-router
+roleRef:
+  kind: Role
+  name: openrl-llmd-router
+  apiGroup: rbac.authorization.k8s.io
+---
+# The API server creates and removes each set's router Deployment and Service.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openrl-sampler-router-manager
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openrl-sampler-router-manager
+subjects:
+- kind: ServiceAccount
+  name: open-rl-sa
+roleRef:
+  kind: Role
+  name: openrl-sampler-router-manager
+  apiGroup: rbac.authorization.k8s.io
