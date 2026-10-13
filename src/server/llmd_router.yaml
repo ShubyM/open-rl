@@ -1,0 +1,47 @@
+# A sampler set's router: Envoy asks the llm-d endpoint picker which of the set's
+# samplers gets each request. SET_ID and OWNER are filled in per set. The config
+# and the permission to watch pods come from k8s/deploy/llmd-router.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openrl-router-SET_ID
+  labels: {app: openrl-sampler-router, openrl.io/router-set: SET_ID, openrl.io/owner: OWNER, app.kubernetes.io/managed-by: open-rl-api-server}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {openrl.io/router-set: SET_ID}
+  template:
+    metadata:
+      # A label of its own, so the picker never mistakes this pod for a sampler.
+      labels: {app: openrl-sampler-router, openrl.io/router-set: SET_ID, openrl.io/owner: OWNER}
+    spec:
+      serviceAccountName: openrl-llmd-router
+      # It needs no GPU, but may run beside its samplers on a GPU node's spare CPU.
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      volumes: [{name: config, configMap: {name: openrl-llmd-router}}]
+      containers:
+      - name: envoy
+        image: docker.io/envoyproxy/envoy:distroless-v1.33.2
+        args: [--service-node, envoy-sidecar, --log-level, warn, --concurrency, "4", -c, /etc/router/envoy.yaml]
+        ports: [{name: router, containerPort: 8081}]
+        readinessProbe: {httpGet: {path: /ready, port: 19001}, periodSeconds: 5}
+        volumeMounts: [{name: config, mountPath: /etc/router, readOnly: true}]
+        resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {memory: 1Gi}}
+      - name: picker
+        image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0
+        args: [--endpoint-selector, openrl.io/sampler-set=SET_ID, --endpoint-target-ports, "8000", --config-file, /etc/router/plugins.yaml,
+               --grpc-health-port, "9003", --zap-encoder, json, --tracing=false]
+        env:
+        - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        - {name: NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+        readinessProbe: {grpc: {port: 9003, service: inference-extension}, periodSeconds: 2}
+        volumeMounts: [{name: config, mountPath: /etc/router, readOnly: true}]
+        resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 2Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openrl-router-SET_ID
+spec:
+  selector: {openrl.io/router-set: SET_ID}
+  ports: [{name: router, port: 8081, targetPort: router}]

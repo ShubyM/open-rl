@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -54,11 +55,56 @@ class FakeCustomObjectsApi:
     return {"items": items}
 
 
+class FakeAppsApi:
+  """Deployments, which only routed sampler sets create."""
+
+  def __init__(self):
+    self.existing: dict[str, dict] = {}
+
+  def create_namespaced_deployment(self, namespace: str, body: dict) -> dict:
+    name = body["metadata"]["name"]
+    if name in self.existing:
+      raise ApiError(409)
+    self.existing[name] = body
+    return body
+
+  def read_namespaced_deployment(self, name: str, namespace: str) -> SimpleNamespace:
+    if name not in self.existing:
+      raise ApiError(404)
+    return SimpleNamespace(metadata=SimpleNamespace(name=name, deletion_timestamp=None))
+
+  def list_namespaced_deployment(self, namespace: str, label_selector: str = "") -> SimpleNamespace:
+    wanted = dict(term.split("=", 1) for term in label_selector.split(",") if term)
+    found = [name for name, body in self.existing.items() if all(body["metadata"]["labels"].get(k) == v for k, v in wanted.items())]
+    return SimpleNamespace(items=[self.read_namespaced_deployment(name, namespace) for name in found])
+
+  def delete_namespaced_deployment(self, name: str, namespace: str) -> None:
+    if self.existing.pop(name, None) is None:
+      raise ApiError(404)
+
+
+class FakeCoreApi:
+  """Services, which only routed sampler sets create."""
+
+  def __init__(self):
+    self.existing: dict[str, dict] = {}
+
+  def create_namespaced_service(self, namespace: str, body: dict) -> dict:
+    if body["metadata"]["name"] in self.existing:
+      raise ApiError(409)
+    self.existing[body["metadata"]["name"]] = body
+    return body
+
+  def delete_namespaced_service(self, name: str, namespace: str) -> None:
+    if self.existing.pop(name, None) is None:
+      raise ApiError(404)
+
+
 class SchedulerWorkerManagerTest(unittest.TestCase):
   def setUp(self) -> None:
     self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}))
     self.api = FakeCustomObjectsApi()
-    self.manager = SchedulerWorkerManager(custom_api=self.api)
+    self.manager = SchedulerWorkerManager(custom_api=self.api, apps_api=FakeAppsApi())
 
   def store_with(self, model_id: str, meta: dict) -> InMemoryStore:
     s = InMemoryStateStore()
@@ -368,7 +414,7 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
       patch.object(api_server, "store", store),
       patch.object(api_server, "state", state),
       patch.object(api_server, "get_store", return_value=store),
-      patch.object(api_server, "worker_manager", SchedulerWorkerManager(custom_api=api)),
+      patch.object(api_server, "worker_manager", SchedulerWorkerManager(custom_api=api, apps_api=FakeAppsApi())),
     ):
       async with asgi_client() as client:
         for model_id in ("lora-a", "fft-a", "lora-b"):

@@ -11,6 +11,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -23,13 +24,15 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from server import proto_codec
+from server import proto_codec, sampler_routing
+from server.lora_snapshots import snapshot_path
 from server.model_metadata import (
   TrainingModelMetadata,
   WeightSyncConfig,
   get_model_metadata,
   persist_model_metadata,
 )
+from server.sampler_routing import ROUTER_PORT, ROUTER_PREFIX, sampler_set
 from server.session_registry import SessionRegistry
 from server.store import RedisStateStore, get_state_store, get_store
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, owner_of
@@ -40,6 +43,10 @@ from training.types import TRAINER_BACKENDS, Datum, FFTConfig, FineTuningType, L
 store = get_store()
 state = get_state_store()
 worker_manager: WorkerManager | None = None
+# openrl.sampler_router=llmd: the samples this process is sending. A result is saved
+# before its request leaves the map, so a routed ID in neither was lost to a restart.
+routed: dict[str, asyncio.Task] = {}
+router_http = httpx.AsyncClient(limits=httpx.Limits(max_connections=None))
 
 session_registry = SessionRegistry(state)
 SESSION_REAP_INTERVAL_SEC = 30
@@ -186,6 +193,9 @@ class Settings(BaseModel):
   fft_seed: int | None = None
   # Park trainer state in host memory between turns. Exclusive models default to off.
   fft_cpu_offload: Annotated[bool | None, BeforeValidator(parse_bool)] = None
+  # Send the job's samples through its sampler set's llm-d router, which picks
+  # the replica by load and cached prefix. LoRA only.
+  sampler_router: Literal["llmd"] | None = None
 
 
 def tag_metadata(tags: list[str]) -> dict[str, str]:
@@ -453,6 +463,10 @@ async def _extract_and_persist_model_metadata(
     raise ValueError("openrl.trainer_gpus above 1 needs openrl.trainer_backend=automodel")
   if settings.trainer_gpus > 1 and isinstance(worker_manager, LocalWorkerManager):
     raise ValueError("openrl.trainer_gpus above 1 needs a server that launches workers as pods")
+  if settings.sampler_router and fine_tuning_type != "lora":
+    raise ValueError("openrl.sampler_router supports LoRA only")
+  if settings.sampler_router and (worker_manager is None or isinstance(worker_manager, LocalWorkerManager)):
+    raise ValueError("openrl.sampler_router needs a server that launches workers as pods")
   if settings.trainer_gpus % settings.trainer_cp:
     raise ValueError(f"openrl.trainer_cp={settings.trainer_cp} must divide openrl.trainer_gpus={settings.trainer_gpus}")
   model_id = str(uuid.uuid4())
@@ -468,6 +482,7 @@ async def _extract_and_persist_model_metadata(
     trainer_backend=settings.trainer_backend,
     trainer_gpus=settings.trainer_gpus,
     trainer_cp=settings.trainer_cp,
+    sampler_router=settings.sampler_router,
   )
   await persist_model_metadata(state, model_id, meta_obj)
 
@@ -837,7 +852,15 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
   pending, failed, and every other result stay JSON.
   """
   request_id = req.request_id
-  result = await store.get_future(request_id, timeout=60.0)
+  if request_id.startswith("routed-") and request_id not in routed:
+    # Not running here: it finished, or this process restarted after taking it.
+    # 410 makes the client send the sample again.
+    result = await store.get_future(request_id, timeout=1.0)
+    if result is None or result.get("type") == "try_again":
+      lost = {"type": "RequestFailedResponse", "error_message": "The API server restarted before this sample finished"}
+      return JSONResponse(status_code=410, content=lost)
+  else:
+    result = await store.get_future(request_id, timeout=60.0)
   if result is None:
     return JSONResponse(status_code=400, content={"type": "RequestFailedResponse", "error_message": "Future not found"})
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
@@ -1016,7 +1039,8 @@ async def create_sampling_session(req: CreateSamplingSessionRequest):
     # Launch by model ID so the worker manager retains the training kind.
     # LoRA readiness is still reported under the shared base-model runtime.
     await ensure_sampler_launched(target_model_id)
-    if isinstance(state, RedisStateStore):
+    # Routed samplers are stock vLLM; the router waits for them instead.
+    if isinstance(state, RedisStateStore) and not (model_meta and model_meta.sampler_router):
       print(f"[API_SERVER] Waiting for dynamic vLLM sampler worker to be ready for model {ready_check_id}...")
       start_time = time.monotonic()
       while True:
@@ -1124,8 +1148,41 @@ async def asample(req: AsampleRequest):
     "trace_context": carrier,
   }
 
-  await store.put_sampling_request(sampling_req)
+  if model_meta and model_meta.sampler_router:
+    if len(routed) >= SAMPLE_UNFINISHED_LIMIT:
+      raise HTTPException(status_code=429, detail=f"{SAMPLE_UNFINISHED_LIMIT} routed samples are unfinished; try again later")
+    sampling_req["model"] = routed_model(model_id, lookup_id, lora_path, model_meta.base_model)
+    req_id = sampling_req["request_id"] = f"routed-{req_id}"
+    routed[req_id] = task = asyncio.create_task(route_and_save(sampler_set(queue_id), sampling_req))
+    # A callback, so the request leaves even if the task is cancelled before it starts.
+    task.add_done_callback(lambda _: routed.pop(req_id, None))
+  else:
+    await store.put_sampling_request(sampling_req)
   return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
+
+
+SAMPLE_UNFINISHED_LIMIT = int(os.getenv("OPEN_RL_SAMPLE_UNFINISHED_LIMIT", "4096"))
+SAMPLE_DEADLINE_SECONDS = float(os.getenv("OPEN_RL_SAMPLE_DEADLINE_SECONDS", "7200"))
+
+
+def routed_model(model_id: str, lookup_id: str, lora_path: str | None, base_model: str) -> str:
+  """The vLLM model a routed request names: a saved reference's snapshot directory,
+  which the samplers' filesystem LoRA resolver loads, or the base model before the
+  first save. A live adapter has no fixed name, and a retry must not pick up newer
+  weights, so it is refused."""
+  if snapshot := snapshot_path(model_id):
+    if not (snapshot / "adapter_config.json").is_file():
+      raise HTTPException(status_code=400, detail=f"Saved LoRA sampler weights are unavailable: {model_id}")
+    return snapshot.name
+  if lora_path:
+    raise HTTPException(status_code=400, detail=f"{lookup_id} has a live adapter; sample from a saved sampler_weights reference")
+  return base_model
+
+
+async def route_and_save(set_id: str, request: dict[str, Any]) -> None:
+  url = f"http://{ROUTER_PREFIX}{set_id}.{os.getenv('OPEN_RL_WORKER_NAMESPACE', 'openrl-system')}:{ROUTER_PORT}"
+  result = await sampler_routing.route(router_http, url, request["request_id"], request, time.time() + SAMPLE_DEADLINE_SECONDS)
+  await store.set_future(request["request_id"], result)
 
 
 # *** CLI endpoints ***

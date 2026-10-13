@@ -1,0 +1,27 @@
+# Each sampler set's router pod runs the llm-d endpoint picker, which watches
+# the set's sampler pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openrl-llmd-router
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openrl-llmd-router
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openrl-llmd-router
+subjects:
+- kind: ServiceAccount
+  name: openrl-llmd-router
+roleRef:
+  kind: Role
+  name: openrl-llmd-router
+  apiGroup: rbac.authorization.k8s.io

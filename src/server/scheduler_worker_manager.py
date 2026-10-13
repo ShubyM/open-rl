@@ -22,11 +22,14 @@ import logging
 import os
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
+import yaml
 from kubernetes import client, config
 
 from server.estimator import Footprint, footprint
+from server.sampler_routing import SAMPLER_SET_LABEL, sampler_set
 from server.worker_manager import base_model_of, owner_id, runtime_of, worker_args, worker_env, worker_module
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,18 @@ logger = logging.getLogger(__name__)
 GROUP = "openrl.io"
 VERSION = "v1alpha1"
 PLURAL = "workloads"
+
+# With openrl.sampler_router=llmd every sampler of a set is stock `vllm serve` on
+# SAMPLER_PORT, labelled into its set, and the set gets a router from ROUTER_TEMPLATE.
+SAMPLER_PORT = 8000
+ROUTER_TEMPLATE = Path(__file__).with_name("llmd_router.yaml")
+# The API server's vLLM settings, passed to routed samplers as flags.
+VLLM_FLAGS = {
+  "VLLM_MAX_MODEL_LEN": "--max-model-len",
+  "VLLM_GPU_MEMORY_UTILIZATION": "--gpu-memory-utilization",
+  "VLLM_MAX_NUM_SEQS": "--max-num-seqs",
+  "VLLM_MAX_NUM_BATCHED_TOKENS": "--max-num-batched-tokens",
+}
 
 
 def workload_name(role: str, owner: str, is_lora: bool, index: int = 0) -> str:
@@ -164,9 +179,46 @@ def pod_template(worker: Worker) -> dict[str, Any]:
     template["spec"]["containers"][0]["volumeMounts"].append({"name": "dshm", "mountPath": "/dev/shm"})
     template["spec"]["volumes"].append({"name": "dshm", "emptyDir": {"medium": "Memory"}})
 
+  if worker.role == "sampler" and worker.meta.sampler_router:
+    join_set(template, worker)
+
   if pull_policy := os.getenv("OPEN_RL_WORKER_IMAGE_PULL_POLICY"):
     template["spec"]["containers"][0]["imagePullPolicy"] = pull_policy
   return template
+
+
+def join_set(template: dict[str, Any], worker: Worker) -> None:
+  """Run the sampler as stock `vllm serve`, labelled into its set. Requests name a
+  saved adapter by its snapshot directory, which vLLM's filesystem resolver loads
+  on first use."""
+  sampler = template["spec"]["containers"][0]
+  sampler["image"] = os.getenv("OPEN_RL_VLLM_IMAGE", "vllm/vllm-openai:v0.30.0")
+  sampler["command"] = ["vllm", "serve"]
+  sampler["args"] = [
+    worker.base_model,
+    f"--port={SAMPLER_PORT}",
+    "--enable-lora",
+    "--max-lora-rank=64",
+    "--max-loras=8",
+    # Sample as the queue's samplers do, without the model's generation defaults.
+    "--generation-config=vllm",
+    '--limit-mm-per-prompt={"image": 0, "video": 0}',
+    *(f"{flag}={os.environ[name]}" for name, flag in VLLM_FLAGS.items() if os.getenv(name)),
+  ]
+  tmp_dir = os.getenv("OPEN_RL_TMP_DIR", "/mnt/shared/open-rl")
+  sampler["env"] += [
+    {"name": "VLLM_ALLOW_RUNTIME_LORA_UPDATING", "value": "true"},
+    {"name": "VLLM_LORA_RESOLVER_CACHE_DIR", "value": f"{tmp_dir}/sampler_lora"},
+  ]
+  # Named, so the picker's target port and Prometheus's scrape both find it.
+  sampler["ports"] = [{"name": "http", "containerPort": SAMPLER_PORT}]
+  sampler["readinessProbe"] = {"httpGet": {"path": "/health", "port": SAMPLER_PORT}, "periodSeconds": 10}
+  template["metadata"] = {"labels": {SAMPLER_SET_LABEL: sampler_set(worker.runtime)}}
+
+
+def router_objects(set_id: str, owner: str) -> list[dict[str, Any]]:
+  """The set's router Deployment and Service."""
+  return list(yaml.safe_load_all(ROUTER_TEMPLATE.read_text().replace("SET_ID", set_id).replace("OWNER", owner)))
 
 
 def accelerator_spec(worker: Worker) -> dict[str, Any]:
@@ -197,7 +249,7 @@ def workload_body(worker: Worker) -> dict[str, Any]:
 class SchedulerWorkerManager:
   """Runs trainer and sampler workers by creating Workload objects."""
 
-  def __init__(self, custom_api: Any = None):
+  def __init__(self, custom_api: Any = None, apps_api: Any = None, core_api: Any = None):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("OPEN_RL_ENABLE_FFT=true requires REDIS_URL so launched workers can share queues and futures")
     self.namespace = os.getenv("OPEN_RL_WORKER_NAMESPACE", "openrl-system")
@@ -205,10 +257,53 @@ class SchedulerWorkerManager:
       config.load_incluster_config()
       custom_api = client.CustomObjectsApi()
     self.custom_api = custom_api
+    # Only routed sampler sets need these; the config loaded above serves them too.
+    self.apps_api = apps_api
+    self.core_api = core_api
+
+  def apps(self) -> Any:
+    if self.apps_api is None:
+      self.apps_api = client.AppsV1Api()
+    return self.apps_api
+
+  def core(self) -> Any:
+    if self.core_api is None:
+      self.core_api = client.CoreV1Api()
+    return self.core_api
 
   def ensure(self, model_id: str, role: str) -> None:
+    worker = describe_worker(model_id, role)
     for index in range(replicas_of(model_id, role)):
-      self.ensure_workload(dataclasses.replace(describe_worker(model_id, role), index=index))
+      self.ensure_workload(dataclasses.replace(worker, index=index))
+    if role == "sampler" and worker.meta.sampler_router:
+      self.ensure_router(sampler_set(worker.runtime), worker.owner)
+
+  def ensure_router(self, set_id: str, owner: str) -> None:
+    """Create the set's router and its Service, waiting out a router still being deleted."""
+    deployment, service = router_objects(set_id, owner)
+    deadline = time.monotonic() + 180
+    while True:
+      try:
+        self.apps().create_namespaced_deployment(self.namespace, deployment)
+        break
+      except Exception as exc:
+        if getattr(exc, "status", None) != 409:
+          raise
+      try:
+        if not self.apps().read_namespaced_deployment(deployment["metadata"]["name"], self.namespace).metadata.deletion_timestamp:
+          break
+      except Exception as exc:
+        if getattr(exc, "status", None) != 404:
+          raise
+        continue
+      if time.monotonic() > deadline:
+        raise RuntimeError(f"router for {set_id} has been terminating for over three minutes")
+      time.sleep(2)
+    try:
+      self.core().create_namespaced_service(self.namespace, service)
+    except Exception as exc:
+      if getattr(exc, "status", None) != 409:
+        raise
 
   def ensure_workload(self, worker: Worker) -> None:
     role = worker.role
@@ -248,7 +343,15 @@ class SchedulerWorkerManager:
     self.release_owner(owner_id(runtime))
 
   def release_owner(self, owner: str) -> set[str]:
-    """Delete the owner's workloads. The scheduler's finalizer frees the seats."""
+    """Delete the owner's workloads and routers. The scheduler's finalizer frees the seats."""
+    found = self.apps().list_namespaced_deployment(self.namespace, label_selector=f"openrl.io/owner={owner},app=openrl-sampler-router")
+    for deployment in found.items:
+      for delete in (self.apps().delete_namespaced_deployment, self.core().delete_namespaced_service):
+        try:
+          delete(deployment.metadata.name, self.namespace)
+        except Exception as exc:
+          if getattr(exc, "status", None) != 404:
+            raise
     selector = "app.kubernetes.io/managed-by=open-rl-api-server"
     found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
     ours = [item for item in found["items"] if item["spec"]["ownerID"] == owner]

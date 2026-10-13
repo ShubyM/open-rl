@@ -83,6 +83,30 @@ backend by default for physical checkpoint/restore.
 | `VLLM_ARCHITECTURE_OVERRIDE` | unset | Optional architecture override passed to the in-repo vLLM worker. Gemma 4 examples use `Gemma4ForCausalLM`. |
 | `VLLM_ENABLE_MULTIMODAL` | `0` | By default the samplers pass `limit_mm_per_prompt={"image": 0, "video": 0}`. Text checkpoints published as `*ForConditionalGeneration` otherwise make vLLM reserve a multi-GiB encoder cache during startup that no OpenRL code path can use, which can OOM engine init. Set to `1` to restore stock vLLM behaviour. |
 
+## llm-d sampler routing
+
+For Kubernetes LoRA jobs, `openrl.sampler_router=llmd` sends the job's samples
+through an llm-d router, which picks the sampler by load and cached prefix.
+Install the router config once with `kubectl apply -k k8s/deploy/llmd-router`.
+Each sampler set then gets a CPU router pod (Envoy and the endpoint picker) and
+a Service, and its samplers run stock `vllm serve`.
+
+Requests must name fixed weights: a saved `sampler_weights` reference, which
+vLLM loads by its snapshot directory, or the base model before the first save.
+If the API server restarts while a sample is running, `retrieve_future` answers
+410 and the tinker client sends the sample again.
+
+| API server env var | Default | What it does |
+| --- | --- | --- |
+| `OPEN_RL_SAMPLE_UNFINISHED_LIMIT` | `4096` | Unfinished routed samples per API server. Further submissions receive HTTP 429. |
+| `OPEN_RL_SAMPLE_DEADLINE_SECONDS` | `7200` | Total time a sample may take, including retries. |
+| `OPEN_RL_SAMPLE_ATTEMPT_TIMEOUT` | `1800` | Longest single attempt. |
+| `OPEN_RL_VLLM_IMAGE` | `vllm/vllm-openai:v0.30.0` | Image for routed samplers. |
+
+Routed samplers get `VLLM_MAX_MODEL_LEN`, `VLLM_GPU_MEMORY_UTILIZATION`,
+`VLLM_MAX_NUM_SEQS` and `VLLM_MAX_NUM_BATCHED_TOKENS` from the API server as
+`vllm serve` flags when set. See docs/design/sampler-routing.md.
+
 ## LoRA sampler snapshots
 
 LoRA `save_weights_for_sampler` freezes the adapter into its own directory on
