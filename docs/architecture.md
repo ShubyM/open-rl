@@ -12,6 +12,11 @@ backend capacity evolve independently.
 
 ## System Architecture
 
+The proposed [sampling pool design](designs/sampler-router.md)
+specifies dedicated FFT sampler GPUs, shared multi-LoRA serving, durable sampling
+requests, and dispatch outside the gateway. It is a proposed replacement for the
+sampling execution path; the overview below describes the broader system.
+
 Here is an architecture diagram:
 
 ```mermaid
