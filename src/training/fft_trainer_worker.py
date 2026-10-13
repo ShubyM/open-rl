@@ -65,6 +65,9 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if param in self._param_shadow:
       self._param_shadow[param][1].view(-1)[indices.to(torch.int64).cpu()] = values
 
+  def is_ready(self) -> bool:
+    return self.model is not None
+
   def load_base_model(self, base_model_name: str) -> None:
     """Load one full model for one fine-tuning job process."""
     if self.model is not None and self.base_model_name == base_model_name:

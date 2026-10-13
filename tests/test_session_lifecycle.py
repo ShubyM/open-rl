@@ -7,6 +7,7 @@ from unittest.mock import patch
 from server import api_server
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStateStore, InMemoryStore
+from server.worker_manager import owner_of, runtime_of
 from tests.api_client import asgi_client, post_json
 
 
@@ -25,6 +26,23 @@ class RuntimeManager:
   def release_owner(self, owner):
     self.released.append(owner)
     return {"test-base"} if owner == "test-base" else set()
+
+  def inspect_owner(self, owner):
+    # What the model view sees: one entry per (model, role) ensured so far,
+    # under the owner and runtime id the real launchers would use.
+    return [
+      {
+        "role": role,
+        "model_id": runtime_of(model_id)[1],
+        "state": "ready",
+        "detail": f"fake-{model_id}-{role} on node-a",
+        "workload": f"fake-{model_id}-{role}",
+        "node": "node-a",
+        "age_seconds": 5.0,
+      }
+      for model_id, role in self.ensured
+      if owner_of(model_id) == owner
+    ]
 
 
 class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):

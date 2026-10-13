@@ -96,6 +96,10 @@ def main(config: Config) -> None:
     train_unembed=False,
   )
 
+  # Progress and diagnosis live on the server. While a call below blocks, this
+  # tells you what the cluster is doing for this model.
+  print(f"[tiny-rl] model_id={trainer.model_id}")
+  print(f"[tiny-rl] status: curl -s {config.base_url}/api/v1/openrl/models/{trainer.model_id} | jq .summary")
   try:
     tokenizer = trainer.get_tokenizer()
     # The API server names this tokenizer; a wrong one turns every sample below into token soup.

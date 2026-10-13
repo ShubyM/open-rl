@@ -48,6 +48,10 @@ class TrainingModelMetadata(BaseModel):
   status: str = "active"
   updated_at: float = 0.0
   completed_at: float | None = None
+  # Sessions that created, restored or sampled this model, in order. The model
+  # view reads them to say whether the model's own session is still live; a
+  # shared runtime's other sessions do not count.
+  session_ids: list[str] = Field(default_factory=list)
 
   def shares_gpu(self) -> bool:
     """Whether other workers may time-slice this job's GPUs. An FFT worker

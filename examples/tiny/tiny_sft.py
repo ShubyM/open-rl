@@ -99,6 +99,10 @@ def main(config: Config) -> None:
     # PEFT warning and vLLM cannot load lm_head adapter weights at all.
     train_unembed=False,
   )
+  # Progress and diagnosis live on the server. While a call below blocks, this
+  # tells you what the cluster is doing for this model.
+  print(f"[tiny-sft] model_id={trainer.model_id}")
+  print(f"[tiny-sft] status: curl -s {config.base_url}/api/v1/openrl/models/{trainer.model_id} | jq .summary")
   tokenizer = trainer.get_tokenizer()
   datum, active_tokens = build_datum(tokenizer, config.prompt, config.completion)
 
@@ -135,7 +139,7 @@ def main(config: Config) -> None:
     raise RuntimeError(f"Expected loss_drop >= {config.min_loss_drop:.1%}, got {loss_drop:.1%}")
 
   if config.sample_after_train:
-    sampler = trainer.save_weights_and_get_sampling_client(name="tiny-sft-sampler")
+    sampler = trainer.save_weights_and_get_sampling_client()
     result = sampler.sample(
       prompt=types.ModelInput.from_ints(tokenizer.encode(config.prompt, add_special_tokens=False)),
       num_samples=1,

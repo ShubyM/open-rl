@@ -18,6 +18,7 @@ The Workload name is what the pod label and the time-slicer call job_id.
 """
 
 import dataclasses
+import datetime
 import logging
 import os
 import time
@@ -27,7 +28,19 @@ from typing import Any
 from kubernetes import client, config
 
 from server.estimator import Footprint, footprint
-from server.worker_manager import base_model_of, owner_id, runtime_of, worker_args, worker_env, worker_module
+from server.worker_manager import (
+  FAILED,
+  READY,
+  STARTING,
+  STOPPED,
+  WAITING_FOR_PLACEMENT,
+  base_model_of,
+  owner_id,
+  runtime_of,
+  worker_args,
+  worker_env,
+  worker_module,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +218,9 @@ class SchedulerWorkerManager:
       config.load_incluster_config()
       custom_api = client.CustomObjectsApi()
     self.custom_api = custom_api
+    # The model view may be polled; one read per few seconds is plenty.
+    self._workers_cache: tuple[float, list[dict[str, Any]]] | None = None
+    self.view_cache_seconds = 5.0
 
   def ensure(self, model_id: str, role: str) -> None:
     for index in range(replicas_of(model_id, role)):
@@ -265,3 +281,74 @@ class SchedulerWorkerManager:
     except Exception as exc:
       if getattr(exc, "status", None) != 404:
         raise
+
+  # -- the read-only model view (design 016, section 5.2) ---------------------
+
+  def inspect_owner(self, owner: str) -> list[dict[str, Any]]:
+    return [worker for worker in self.workers() if worker["owner"] == owner]
+
+  def workers(self) -> list[dict[str, Any]]:
+    now = time.monotonic()
+    if self._workers_cache is not None and now - self._workers_cache[0] < self.view_cache_seconds:
+      return self._workers_cache[1]
+    workers = self.load_workers()
+    self._workers_cache = (now, workers)
+    return workers
+
+  def load_workers(self) -> list[dict[str, Any]]:
+    """Our Workloads, one entry per worker, in the client vocabulary. The pod
+    is the scheduler's; what the API server knows about it is what the
+    scheduler wrote into Workload status."""
+    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
+    found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
+    now = time.time()
+    workers = []
+    for item in found["items"]:
+      spec, status, meta = item["spec"], item.get("status") or {}, item["metadata"]
+      state, detail = worker_state(
+        phase=status.get("phase") or "Pending",
+        reason=status.get("reason") or "",
+        node=status.get("nodeName"),
+        deleting=bool(meta.get("deletionTimestamp")),
+      )
+      workers.append(
+        {
+          "workload": meta["name"],
+          "role": spec["role"],
+          "owner": spec.get("ownerID"),
+          "model_id": spec["modelID"],
+          "state": state,
+          "detail": detail,
+          "node": status.get("nodeName"),
+          "age_seconds": age_seconds(meta.get("creationTimestamp"), now),
+        }
+      )
+    return workers
+
+
+def worker_state(phase: str, reason: str, node: str | None, deleting: bool) -> tuple[str, str]:
+  """Map a Workload's status onto the client vocabulary. The raw facts go
+  into `detail`, for a human; `state` is what a client branches on. A node
+  assignment is the placement boundary; phase Running is the readiness
+  boundary (the model view refines it for samplers)."""
+  facts = phase + (f" ({reason})" if reason else "")
+  if node:
+    facts += f" on {node}"
+  if deleting:
+    return STOPPED, f"being released; {facts}"
+  if phase == "Succeeded":
+    return STOPPED, facts
+  if phase == "Failed":
+    return FAILED, facts
+  if not node:
+    return WAITING_FOR_PLACEMENT, facts
+  if phase == "Running":
+    return READY, facts
+  return STARTING, facts
+
+
+def age_seconds(timestamp: str | None, now: float) -> float | None:
+  if not timestamp:
+    return None
+  created = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+  return max(0.0, now - created)

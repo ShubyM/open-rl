@@ -42,6 +42,8 @@ steps:
       - buildx
       - build
       - --file=${_DOCKERFILE}
+      # The API server reports this tag as its version.
+      - --build-arg=OPEN_RL_VERSION=${_TAG}
       - --tag=${_IMAGE}:${_TAG}
       - --tag=${_IMAGE}:latest
       - --cache-from=type=registry,ref=${_IMAGE}:buildcache

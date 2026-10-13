@@ -288,6 +288,9 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       use_triton=False,
     )
 
+  def is_ready(self) -> bool:
+    return self.model is not None
+
   def load_base_model(self, base_model_name: str) -> None:
     """The processor preloads BASE_MODEL before any create_model arrives. Automodel
     applies LoRA at load, so the load itself waits for the client's LoraConfig;

@@ -35,6 +35,12 @@ class BaseTrainerWorker:
     else:
       self.device = torch.device("cpu")
 
+  def is_ready(self) -> bool:
+    """Whether a model is loaded and the worker can serve requests. The
+    request processor announces this to the API server, which shows it to
+    clients as the worker's state."""
+    return False
+
   def forward_backward(
     self,
     model: PreTrainedModel,

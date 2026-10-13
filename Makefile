@@ -19,7 +19,7 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_api_server_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_diffing_backends tests.test_sampler_weight_rotation tests.test_commands tests.test_weight_sync_config tests.test_exclusive_trainer tests.test_delete_model tests.test_automodel_worker tests.test_worker_thread_device tests.test_trainer_data_parallel tests.test_sampler_batch_limits
+UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_api_server_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_diffing_backends tests.test_sampler_weight_rotation tests.test_commands tests.test_weight_sync_config tests.test_exclusive_trainer tests.test_delete_model tests.test_automodel_worker tests.test_worker_thread_device tests.test_trainer_data_parallel tests.test_sampler_batch_limits tests.test_openrl_status tests.test_skill_docs tests.test_trainer_ready
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -137,7 +137,7 @@ require-gcp-project:
 
 build-images: require-gcp-project
 	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-server:$(IMAGE_TAG) -f src/server/Dockerfile .
-	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-api-server:$(IMAGE_TAG) -f src/server/Dockerfile.api_server .
+	DOCKER_BUILDKIT=1 docker build --build-arg OPEN_RL_VERSION=$(IMAGE_TAG) -t $(CLOUD_REGISTRY)/open-rl-api-server:$(IMAGE_TAG) -f src/server/Dockerfile.api_server .
 	DOCKER_BUILDKIT=1 docker build -t $(CLOUD_REGISTRY)/open-rl-client:$(IMAGE_TAG) -f src/server/Dockerfile.client .
 
 push-images: require-gcp-project
@@ -340,7 +340,17 @@ release-bundle:
 	@rm -rf $(DIST_DIR) && mkdir -p $(DIST_DIR)
 	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/lora VERSION=$(VERSION) > $(DIST_DIR)/openrl-lora.yaml
 	@$(MAKE) --no-print-directory render OVERLAY=k8s/deploy/fft VERSION=$(VERSION) > $(DIST_DIR)/openrl-fft.yaml
-	@cd $(DIST_DIR) && { command -v sha256sum >/dev/null && sha256sum *.yaml || shasum -a 256 *.yaml; } > checksums.sha256
+	@$(MAKE) --no-print-directory skill-bundle VERSION=$(VERSION)
+	@cd $(DIST_DIR) && { command -v sha256sum >/dev/null && sha256sum *.yaml *.tar.gz || shasum -a 256 *.yaml *.tar.gz; } > checksums.sha256
+
+# The agent skill, stamped with the release it describes. Unpacks to openrl/,
+# ready for a skills directory. The server points at this asset as skill_url.
+skill-bundle:
+	@test -n "$(VERSION)" || { echo "Set VERSION=<tag>, e.g. VERSION=v0.0.1"; exit 2; }
+	@mkdir -p $(DIST_DIR) && rm -rf $(DIST_DIR)/skill && mkdir -p $(DIST_DIR)/skill
+	@cp -R skills/openrl $(DIST_DIR)/skill/openrl
+	@sed -i.bak 's/^OpenRL release: .*/OpenRL release: $(VERSION)/' $(DIST_DIR)/skill/openrl/SKILL.md && rm -f $(DIST_DIR)/skill/openrl/SKILL.md.bak
+	@tar -C $(DIST_DIR)/skill -czf $(DIST_DIR)/openrl-skill.tar.gz openrl && rm -rf $(DIST_DIR)/skill
 
 # ---------------------------------------------------------------------------
 # Misc

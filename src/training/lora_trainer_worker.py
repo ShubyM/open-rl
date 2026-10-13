@@ -36,6 +36,9 @@ class LoraTrainingWorker(BaseTrainerWorker):
     self.adapter_states: dict[str, dict[str, Any]] = {}
     self.lora_target_modules: dict[tuple[bool, bool, bool], list[str]] = {}
 
+  def is_ready(self) -> bool:
+    return self.base_model is not None
+
   def load_base_model(self, base_model_name: str) -> None:
     """Eagerly load the massive base model tensors into VRAM."""
     if self.base_model is not None and self.base_model_name == base_model_name:

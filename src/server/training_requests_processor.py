@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -19,7 +20,7 @@ from opentelemetry import propagate, trace
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, time_slicing_enabled, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.model_metadata import get_model_metadata
-from server.store import RequestStore, get_state_store, get_store
+from server.store import RequestStore, StateStore, get_state_store, get_store
 from training import commands
 from training.commands import parse_command
 from training.distributed import broadcast_object, is_distributed, is_primary, local_rank
@@ -32,6 +33,11 @@ tracer = trace.get_tracer(__name__)
 
 
 TrainingWorker = FFTTrainingWorker | LoraTrainingWorker
+
+# The trainer's readiness key, the counterpart of the sampler's. A long-lived
+# shared LoRA trainer outlives the TTL, so the loop refreshes it.
+READY_TTL_SECONDS = 3600
+READY_REFRESH_SECONDS = 60
 
 
 def pin_worker_threads_to_this_rank() -> None:
@@ -108,6 +114,8 @@ class TrainingRequestsProcessor:
     self.time_slicer = time_slicer
     self.workload = workload_from_env(os.getpid(), name=local_workload_name("trainer", model_id), claim=TRAINER_CLAIM) if time_slicer else None
     self.snapshot_registered = False
+    self.state: StateStore | None = None  # opened on first use; tests inject one
+    self.ready_announced_at = float("-inf")
 
   async def run(self) -> None:
     print(f"[WORKER] Training requests processor started (model={self.model_id} active_set={self.active_tenant_set_id}).")
@@ -117,6 +125,7 @@ class TrainingRequestsProcessor:
         self.snapshot_registered = True
       while True:
         try:
+          await self.announce_readiness()
           await self.run_once()
         except asyncio.CancelledError:
           break
@@ -126,6 +135,7 @@ class TrainingRequestsProcessor:
           await asyncio.sleep(1)
     finally:
       try:
+        await self.withdraw_readiness()
         if self.time_slicer is not None:
           try:
             if self.snapshot_registered:
@@ -134,6 +144,29 @@ class TrainingRequestsProcessor:
             await self.time_slicer.close()
       finally:
         close_distributed()
+
+  def ready_key(self) -> str | None:
+    return f"open_rl:trainer_ready:{self.model_id}" if self.model_id and is_primary() else None
+
+  async def announce_readiness(self) -> None:
+    """Tell the API server this trainer has a model loaded and is draining its
+    queue; the model view shows the worker as `ready` from then on. The key
+    carries a TTL and is refreshed each minute, so a dead process stops
+    looking ready on its own."""
+    key = self.ready_key()
+    if key is None or not self.worker.is_ready():
+      return
+    if time.monotonic() - self.ready_announced_at < READY_REFRESH_SECONDS:
+      return
+    if self.state is None:
+      self.state = get_state_store()
+    await self.state.set_value(key, "1", ttl_seconds=READY_TTL_SECONDS)
+    self.ready_announced_at = time.monotonic()
+
+  async def withdraw_readiness(self) -> None:
+    key = self.ready_key()
+    if key is not None and self.state is not None:
+      await self.state.delete_values(key)
 
   async def exit_gracefully(self, unregister: bool = True) -> None:
     print(f"[WORKER] Initiating immediate exit for model {self.model_id} trainer worker...")
