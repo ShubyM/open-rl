@@ -4,19 +4,20 @@ set's Envoy and endpoint picker."""
 
 import asyncio
 import unittest
+import uuid
 from types import SimpleNamespace
 
 import httpx
 import redis as sync_redis
 import redis.asyncio as redis
 
-from server import sampler_http, sampling_streams
-from server.sampling_dispatcher import DispatchConfig, Dispatcher
-from server.sampling_streams import SamplingStreams
+from server import sampling_dispatcher, vllm_sampler
+from server.sampling_dispatcher import DispatchConfig, Dispatcher, enqueue_to_set, open_set, unfinished_count
+from server.store import RedisStore
 from tests.redis_server import RedisServer, needs_redis
 
 SET = "set-dispatch"
-FAST = DispatchConfig(active=8, attempt_timeout=5, backoff_base=0.05, backoff_cap=0.2, touch_interval=0.2, reclaim_idle=0.6, shutdown_grace=0)
+FAST = DispatchConfig(active=8, attempt_timeout=5, backoff_base=0.05, backoff_cap=0.2, shutdown_grace=0)
 
 
 class Engine:
@@ -63,8 +64,10 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self) -> None:
     self.client = redis.from_url(self.server.url)
     await self.client.flushdb()
-    self.streams = SamplingStreams(self.client, result_ttl=60)
-    await self.streams.open(SET)
+    self.store = RedisStore(self.client)
+    sync = sync_redis.Redis.from_url(self.server.url)
+    open_set(sync, SET)
+    sync.close()
     self.running: list[tuple[Dispatcher, asyncio.Task]] = []
 
   async def asyncTearDown(self) -> None:
@@ -74,14 +77,24 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
     await self.client.aclose()
 
   def start(self, engine: Engine, config: DispatchConfig = FAST) -> Dispatcher:
-    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=sampler_http.http_app(engine)))
-    dispatcher = Dispatcher(self.streams, SET, "http://router", client, config)
+    http = httpx.AsyncClient(transport=httpx.ASGITransport(app=vllm_sampler.http_app(engine)))
+    dispatcher = Dispatcher(self.client, SET, "http://router", http, config, self.store)
     self.running.append((dispatcher, asyncio.create_task(dispatcher.run())))
     return dispatcher
 
   async def accept(self, n: int = 1, deadline: float = 30) -> list[str]:
-    request = {"prompt_token_ids": [1, 2, 3], "max_tokens": 2, "num_samples": 1, "lora_id": None, "model_id": "m"}
-    return [await self.streams.accept(SET, request, limit=100, deadline_seconds=deadline) for _ in range(n)]
+    ids = []
+    for _ in range(n):
+      request = {
+        "request_id": str(uuid.uuid4()),
+        "prompt_token_ids": [1, 2, 3],
+        "max_tokens": 2,
+        "num_samples": 1,
+        "lora_id": None,
+        "model_id": "m",
+      }
+      ids.append(await enqueue_to_set(self.client, self.store, SET, request, limit=100, deadline_seconds=deadline))
+    return ids
 
   async def until(self, condition, timeout: float = 5) -> None:
     loop = asyncio.get_running_loop()
@@ -91,20 +104,14 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
       await asyncio.sleep(0.02)
 
   async def results(self, request_ids: list[str], timeout: float = 10) -> list[dict]:
-    loop = asyncio.get_running_loop()
-    end = loop.time() + timeout
-    while True:
-      found = [await self.streams.result(r) for r in request_ids]
-      if all(f["type"] != "try_again" for f in found) or loop.time() > end:
-        return found
-      await asyncio.sleep(0.05)
+    return [await self.store.get_future(r, timeout=timeout) for r in request_ids]
 
   async def test_accepted_requests_get_one_saved_result_each(self) -> None:
     self.start(Engine())
     found = await self.results(await self.accept(3))
     self.assertEqual([f["type"] for f in found], ["sample"] * 3)
     self.assertEqual(found[0]["sequences"][0]["tokens"], [3])
-    self.assertEqual(await self.streams.unfinished(SET), 0)
+    self.assertEqual(await unfinished_count(self.client, SET), 0)
 
   async def test_a_temporary_failure_is_retried_with_a_new_engine_request(self) -> None:
     engine = Engine(fail_first=1)
@@ -130,7 +137,7 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
     [found] = await self.results(await self.accept(deadline=0.8))
     self.assertIn("deadline passed", found["error_message"])
     self.assertGreater(len(engine.calls), 1)
-    self.assertEqual(await self.streams.unfinished(SET), 0)
+    self.assertEqual(await unfinished_count(self.client, SET), 0)
 
   async def test_active_work_is_bounded(self) -> None:
     engine = Engine(block=True)
@@ -151,21 +158,19 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
     await self.until(lambda: engine.running == 1)
     sync = sync_redis.Redis.from_url(self.server.url)
     try:
-      sampling_streams.close_and_cancel(sync, SET, "set removed")
+      sampling_dispatcher.close_and_cancel(sync, SET, "set removed")
     finally:
       sync.close()
-    # The running attempt finishes, but its result is discarded.
     engine.release.set()
     await self.until(lambda: engine.running == 0)
     await asyncio.sleep(0.2)
-    self.assertEqual((await self.streams.result(request_id))["error_message"], "set removed")
+    self.assertEqual((await self.store.get_future(request_id, timeout=1))["error_message"], "set removed")
 
   async def test_a_new_dispatcher_recovers_work_from_one_that_died(self) -> None:
     stuck = Engine(block=True)
     first = self.start(stuck)
     [request_id] = await self.accept()
     await self.until(lambda: stuck.running == 1)
-    # The first dispatcher dies mid-attempt: it stops touching its entry.
     first.stop()
     await self.until(lambda: stuck.running == 0)
     healthy = Engine()
@@ -173,7 +178,7 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
     [found] = await self.results([request_id])
     self.assertEqual(found["type"], "sample")
     self.assertEqual(len(healthy.calls), 1)
-    self.assertEqual(await self.streams.unfinished(SET), 0)
+    self.assertEqual(await unfinished_count(self.client, SET), 0)
 
 
 if __name__ == "__main__":

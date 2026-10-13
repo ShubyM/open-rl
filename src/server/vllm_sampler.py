@@ -10,23 +10,30 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from itertools import groupby
-from typing import Any
+from typing import Any, Protocol
 
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
 from opentelemetry import propagate, trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from vllm import SamplingParams
-from vllm.config.weight_transfer import WeightTransferConfig
-from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.async_llm_engine import AsyncLLMEngine
-from vllm.lora.request import LoRARequest
-from vllm.sampling_params import RequestOutputKind
+
+try:
+  from vllm import SamplingParams
+  from vllm.config.weight_transfer import WeightTransferConfig
+  from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
+  from vllm.engine.arg_utils import AsyncEngineArgs
+  from vllm.engine.async_llm_engine import AsyncLLMEngine
+  from vllm.lora.request import LoRARequest
+  from vllm.sampling_params import RequestOutputKind
+except ImportError:
+  SamplingParams = WeightTransferConfig = WeightTransferUpdateRequest = None  # type: ignore[assignment]
+  AsyncEngineArgs = AsyncLLMEngine = LoRARequest = RequestOutputKind = None  # type: ignore[assignment]
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, time_slicing_enabled, workload_from_env
 from accel_timeslicer.workload import SAMPLER_CLAIM, WorkloadRef, local_workload_name
 from server.lora_snapshots import resolve_lora_path
-from server.sampler_http import serve_http
 from server.store import RequestStore, StateStore, get_state_store, get_store
 from server.vllm_options import gpu_memory_utilization, sampler_batch_limits, split_stop, text_only_engine_kwargs
 
@@ -35,10 +42,25 @@ SHUTDOWN_SENTINEL = "SHUTDOWN_SENTINEL"
 READY_TTL_SECONDS = 3600
 ENGINE_POLL_SECONDS = 5
 STATS_LOG_SECONDS = 30
+PERMANENT_ERRORS = (ValueError, TypeError, KeyError, FileNotFoundError)
 
 
-def failed_response(message: str) -> dict[str, Any]:
-  return {"type": "RequestFailedResponse", "error_message": message}
+class Engine(Protocol):
+  errored: bool
+
+
+class Generator(Protocol):
+  engine: Engine
+
+  async def generate(self, request: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class EngineDead(RuntimeError):
+  pass
+
+
+def failed_response(message: str, category: str = "server") -> dict[str, Any]:
+  return {"type": "RequestFailedResponse", "error_message": message, "category": category}
 
 
 def engine_kwargs_from_env(fft_enabled: bool) -> dict[str, Any]:
@@ -275,10 +297,12 @@ async def serve(
       await sampler.sleep()  # give the memory back before releasing the slot
   state = get_state_store()
   stats = asyncio.create_task(log_engine_stats(sampler.engine))
-  # A sampler in a routed set also takes requests over HTTP from its set's router.
-  http = asyncio.create_task(serve_http(sampler, int(port))) if (port := os.getenv("OPEN_RL_SAMPLER_HTTP_PORT")) else None
   try:
     try:
+      if port := os.getenv("OPEN_RL_SAMPLER_HTTP_PORT"):
+        await mark_ready(state, model_id)
+        await serve_http(sampler, int(port))
+        return
       ready_at = float("-inf")
       while True:
         if time_slicer is not None and time_slicer.faulted:
@@ -312,9 +336,64 @@ async def serve(
       await state.delete_values(f"open_rl:sampler_ready:{model_id}")
   finally:
     stats.cancel()
-    if http is not None:
-      http.cancel()
     sampler.engine.shutdown()
+
+
+def http_app(sampler: Generator) -> FastAPI:
+  app = FastAPI()
+
+  @app.post("/v1/completions")
+  async def completions(request: Request) -> JSONResponse:
+    if sampler.engine.errored:
+      return JSONResponse(failed_response("vLLM engine is dead"), status_code=503)
+    task = None
+    status = 200
+    try:
+      body = await request.json()
+      openrl = body["openrl"]
+      deadline = openrl.get("deadline")
+      task = asyncio.create_task(sampler.generate(openrl))
+      while not task.done():
+        remaining = deadline - time.time() if deadline else ENGINE_POLL_SECONDS
+        if remaining <= 0:
+          raise TimeoutError("attempt deadline passed during generation")
+        await asyncio.wait({task}, timeout=min(ENGINE_POLL_SECONDS, remaining))
+        if sampler.engine.errored:
+          raise EngineDead("vLLM engine is dead")
+        if await request.is_disconnected():
+          raise RuntimeError("Sampling client disconnected")
+      result = task.result()
+      result["type"] = "sample"
+    except EngineDead as exc:
+      status, result = 503, failed_response(str(exc))
+    except TimeoutError as exc:
+      status, result = 504, failed_response(str(exc))
+    except PERMANENT_ERRORS as exc:
+      status, result = 400, failed_response(f"Invalid sampling request: {type(exc).__name__}: {exc}", "user")
+    except Exception as exc:
+      status, result = 500, failed_response(f"vLLM Worker Error: {exc}")
+    finally:
+      if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    return JSONResponse(result, status_code=status)
+
+  @app.get("/health")
+  async def health() -> Response:
+    return Response(status_code=503 if sampler.engine.errored else 200)
+
+  @app.get("/metrics")
+  async def metrics() -> Response:
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+  return app
+
+
+async def serve_http(sampler: Generator, port: int) -> None:
+  server = uvicorn.Server(uvicorn.Config(http_app(sampler), host="0.0.0.0", port=port, log_level="warning"))
+  await server.serve()
 
 
 async def log_engine_stats(engine: AsyncLLMEngine) -> None:

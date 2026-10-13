@@ -1,5 +1,5 @@
 """Routed sampler sets: the pods each set gets, the set's lifecycle, and the API
-path from asample through the set's stream and dispatcher to retrieve_future.
+path from asample through the set's queue and dispatcher to retrieve_future.
 Redis is real; only vLLM's generate is replaced."""
 
 import asyncio
@@ -16,19 +16,18 @@ import redis as sync_redis
 import redis.asyncio as redis
 from fastapi.testclient import TestClient
 
-from server import api_server, sampler_http, sampling_streams
+from server import api_server, sampling_dispatcher, vllm_sampler
 from server.lora_snapshots import snapshot_path
-from server.sampling_dispatcher import DispatchConfig, Dispatcher
-from server.sampling_streams import SamplingStreams, sampler_set
+from server.sampling_dispatcher import DispatchConfig, Dispatcher, SetClosed, enqueue_to_set, sampler_set, unfinished_count
 from server.scheduler_worker_manager import DISPATCH_SET_LABEL, DISPATCHER_PREFIX, SAMPLER_SET_LABEL, SchedulerWorkerManager
-from server.store import InMemoryStateStore, InMemoryStore
+from server.store import InMemoryStateStore, InMemoryStore, RedisStore
 from server.worker_manager import LocalWorkerManager
 from tests.redis_server import RedisServer, needs_redis
 from tests.test_scheduler_worker_manager import FakeAppsApi, FakeCustomObjectsApi
 
 ROUTED = {"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora", "exclusive": True, "sampler_replicas": 2, "sampler_router": "llmd"}
 SAVED = "tinker://job/sampler_weights/000003"
-FAST = DispatchConfig(active=8, attempt_timeout=5, backoff_base=0.05, backoff_cap=0.2, touch_interval=0.2, reclaim_idle=0.6, shutdown_grace=0)
+FAST = DispatchConfig(active=8, attempt_timeout=5, backoff_base=0.05, backoff_cap=0.2, shutdown_grace=0)
 
 
 def state_with(model_id: str, meta: dict) -> InMemoryStateStore:
@@ -86,7 +85,7 @@ class SetTemplateTest(unittest.TestCase):
     [deployment] = self.apps.existing.values()
     name = sampler_set("job")
     self.assertEqual(deployment["metadata"]["name"], DISPATCHER_PREFIX + name)
-    self.assertEqual(self.opened, [sampling_streams.admission_key(name)])
+    self.assertEqual(self.opened, [sampling_dispatcher.admission_key(name)])
     pod = deployment["spec"]["template"]
     self.assertNotIn(SAMPLER_SET_LABEL, pod["metadata"]["labels"])
     self.assertEqual(pod["metadata"]["labels"][DISPATCH_SET_LABEL], name)
@@ -119,7 +118,7 @@ class SetLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.enterContext(patch.dict(os.environ, {"REDIS_URL": self.server.url}))
     self.client = redis.from_url(self.server.url)
     await self.client.flushdb()
-    self.streams = SamplingStreams(self.client)
+    self.store = RedisStore(self.client)
     self.apps = FakeAppsApi()
     self.sync = sync_redis.Redis.from_url(self.server.url)
     self.manager = SchedulerWorkerManager(custom_api=FakeCustomObjectsApi(), apps_api=self.apps, redis_client=self.sync)
@@ -130,21 +129,21 @@ class SetLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_a_set_opens_with_its_dispatcher_and_drains_before_removal(self) -> None:
     name = sampler_set("job")
-    with self.assertRaises(sampling_streams.SetClosed):
-      await self.streams.accept(name, {"num_samples": 1}, limit=10, deadline_seconds=60)
+    with self.assertRaises(SetClosed):
+      await enqueue_to_set(self.client, self.store, name, {"request_id": "r1", "num_samples": 1}, limit=10, deadline_seconds=60)
     with patch("server.worker_manager.get_state_store", return_value=state_with("job", ROUTED)):
       await asyncio.to_thread(self.manager.ensure, "job", "sampler")
-      request_id = await self.streams.accept(name, {"num_samples": 1}, limit=10, deadline_seconds=60)
+      request_id = await enqueue_to_set(self.client, self.store, name, {"request_id": "r1", "num_samples": 1}, limit=10, deadline_seconds=60)
       await asyncio.to_thread(self.manager.release_owner, "job")
     self.assertEqual(self.apps.deleted, [DISPATCHER_PREFIX + name])
-    self.assertIn("was removed", (await self.streams.result(request_id))["error_message"])
-    self.assertEqual(await self.streams.unfinished(name), 0)
-    with self.assertRaises(sampling_streams.SetClosed):
-      await self.streams.accept(name, {"num_samples": 1}, limit=10, deadline_seconds=60)
+    self.assertIn("was removed", (await self.store.get_future(request_id, timeout=1))["error_message"])
+    self.assertEqual(await unfinished_count(self.client, name), 0)
+    with self.assertRaises(SetClosed):
+      await enqueue_to_set(self.client, self.store, name, {"request_id": "r2", "num_samples": 1}, limit=10, deadline_seconds=60)
 
 
 @needs_redis
-class StreamSamplingApiTest(unittest.IsolatedAsyncioTestCase):
+class RoutedSamplingApiTest(unittest.IsolatedAsyncioTestCase):
   server: RedisServer
 
   @classmethod
@@ -164,28 +163,31 @@ class StreamSamplingApiTest(unittest.IsolatedAsyncioTestCase):
     self.client = redis.from_url(self.server.url)
     await self.client.flushdb()
     self.set_id = sampler_set("job")
-    self.api_streams = SamplingStreams(self.client)
-    await self.api_streams.open(self.set_id)
-    self.enterContext(patch.object(api_server, "streams", self.api_streams))
-    self.enterContext(patch.object(api_server, "store", InMemoryStore()))
+    self.sync = sync_redis.Redis.from_url(self.server.url)
+    sampling_dispatcher.open_set(self.sync, self.set_id)
+    self.redis_store = RedisStore(self.client)
+    self.enterContext(patch.object(api_server, "redis_client", self.client))
+    self.enterContext(patch.object(api_server, "store", self.redis_store))
     self.enterContext(patch.object(api_server, "state", state_with("job", ROUTED)))
     self.enterContext(patch.object(api_server, "get_sampler_backend", return_value="vllm"))
     self.enterContext(patch.object(api_server, "TMP_DIR", self.tmp))
     self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=api_server.app), base_url="http://api")
-    self.dispatchers: list[tuple[Dispatcher, asyncio.Task]] = []
+    self.dispatchers: list[tuple[Dispatcher, asyncio.Task, redis.Redis]] = []
 
   async def asyncTearDown(self) -> None:
-    for dispatcher, task in self.dispatchers:
+    for dispatcher, task, conn in self.dispatchers:
       dispatcher.stop()
       await asyncio.wait_for(task, 5)
-      await dispatcher.streams.client.aclose()
+      await conn.aclose()
     await self.http.aclose()
     await self.client.aclose()
+    self.sync.close()
 
   def start_dispatcher(self, sampler: EchoSampler) -> None:
-    app = httpx.AsyncClient(transport=httpx.ASGITransport(app=sampler_http.http_app(sampler)))
-    dispatcher = Dispatcher(SamplingStreams(redis.from_url(self.server.url)), self.set_id, "http://router", app, FAST)
-    self.dispatchers.append((dispatcher, asyncio.create_task(dispatcher.run())))
+    conn = redis.from_url(self.server.url)
+    app = httpx.AsyncClient(transport=httpx.ASGITransport(app=vllm_sampler.http_app(sampler)))
+    dispatcher = Dispatcher(conn, self.set_id, "http://router", app, FAST)
+    self.dispatchers.append((dispatcher, asyncio.create_task(dispatcher.run()), conn))
 
   async def sample(self, model_id: str = SAVED, **overrides) -> httpx.Response:
     body = {"model_id": model_id, "prompt": {"chunks": [{"tokens": [1, 2, 3]}]}, "sampling_params": {"max_tokens": 2}, "num_samples": 1, **overrides}
@@ -194,27 +196,28 @@ class StreamSamplingApiTest(unittest.IsolatedAsyncioTestCase):
   async def retrieve(self, request_id: str) -> httpx.Response:
     return await self.http.post("/api/v1/retrieve_future", json={"request_id": request_id})
 
-  async def test_a_sample_goes_through_the_stream_and_dispatcher(self) -> None:
+  async def test_a_sample_goes_through_the_queue_and_dispatcher(self) -> None:
     sampler = EchoSampler()
     self.start_dispatcher(sampler)
     accepted = (await self.sample()).json()
-    self.assertEqual(sampling_streams.parse(accepted["request_id"])[0], self.set_id)
     response = await self.retrieve(accepted["request_id"])
     self.assertEqual(response.status_code, 200)
     self.assertEqual(response.json()["sequences"][0]["tokens"], [2, 3])
     [sent] = sampler.requests
     self.assertEqual(sent["lora_id"], SAVED)
     self.assertEqual(sent["lora_path"], str(snapshot_in(self.tmp, SAVED)))
-    self.assertEqual(await self.api_streams.unfinished(self.set_id), 0)
+    self.assertEqual(await unfinished_count(self.client, self.set_id), 0)
 
   async def test_accepted_work_outlives_the_api_process(self) -> None:
     accepted = (await self.sample()).json()
-    # A new API process has its own connection; the dispatcher starts later still.
-    restarted = SamplingStreams(redis.from_url(self.server.url))
-    with patch.object(api_server, "streams", restarted):
+    restarted_client = redis.from_url(self.server.url)
+    with (
+      patch.object(api_server, "redis_client", restarted_client),
+      patch.object(api_server, "store", RedisStore(restarted_client)),
+    ):
       self.start_dispatcher(EchoSampler())
       response = await self.retrieve(accepted["request_id"])
-    await restarted.client.aclose()
+    await restarted_client.aclose()
     self.assertEqual(response.json()["sequences"][0]["tokens"], [2, 3])
 
   async def test_requests_beyond_the_limits_are_refused_before_acceptance(self) -> None:
@@ -223,7 +226,7 @@ class StreamSamplingApiTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual((too_many.status_code, too_long.status_code), (400, 400))
     self.assertIn("num_samples", too_many.text)
     self.assertIn("window", too_long.text)
-    self.assertEqual(await self.api_streams.unfinished(self.set_id), 0)
+    self.assertEqual(await unfinished_count(self.client, self.set_id), 0)
 
   async def test_a_live_adapter_is_refused_so_retries_keep_fixed_weights(self) -> None:
     live = Path(self.tmp, "peft", "job", "job")
@@ -237,7 +240,7 @@ class StreamSamplingApiTest(unittest.IsolatedAsyncioTestCase):
     with patch.object(api_server, "SAMPLE_UNFINISHED_LIMIT", 1):
       self.assertEqual((await self.sample()).status_code, 200)
       self.assertEqual((await self.sample()).status_code, 429)
-    await self.api_streams.close(self.set_id)
+    sampling_dispatcher.close_and_cancel(self.sync, self.set_id, "closed")
     self.assertEqual((await self.sample()).status_code, 503)
 
 
@@ -246,7 +249,6 @@ class SamplerRouterSettingTest(unittest.TestCase):
     self.enterContext(patch.object(api_server, "store", InMemoryStore()))
     self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
     self.enterContext(patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}))
-    # No lifespan: with FFT enabled it would build a worker manager of its own.
     self.client = TestClient(api_server.app)
 
   def create(self, metadata: dict) -> httpx.Response:

@@ -27,9 +27,9 @@ from typing import Any
 import redis as sync_redis
 from kubernetes import client, config
 
-from server import sampling_streams
+from server import sampling_dispatcher
 from server.estimator import Footprint, footprint
-from server.sampling_streams import SAMPLER_SET_LABEL, sampler_set
+from server.sampling_dispatcher import SAMPLER_SET_LABEL, sampler_set
 from server.worker_manager import base_model_of, owner_id, runtime_of, worker_args, worker_env, worker_module
 
 logger = logging.getLogger(__name__)
@@ -368,7 +368,7 @@ class SchedulerWorkerManager:
       if time.monotonic() > deadline:
         raise RuntimeError(f"dispatcher for {set_id} has been terminating for over three minutes")
       time.sleep(2)
-    sampling_streams.open_set(self.streams_client(), set_id)
+    sampling_dispatcher.open_set(self.streams_client(), set_id)
 
   def ensure_workload(self, worker: Worker) -> None:
     role = worker.role
@@ -428,7 +428,9 @@ class SchedulerWorkerManager:
     found = self.apps().list_namespaced_deployment(self.namespace, label_selector=f"{OWNER_LABEL}={owner},app=openrl-sampler-dispatch")
     for deployment in found.items:
       set_id = deployment.metadata.labels[DISPATCH_SET_LABEL]
-      cancelled = sampling_streams.close_and_cancel(self.streams_client(), set_id, f"Sampler set {set_id} was removed before this request finished")
+      cancelled = sampling_dispatcher.close_and_cancel(
+        self.streams_client(), set_id, f"Sampler set {set_id} was removed before this request finished"
+      )
       logger.info("closed sampler set %s, cancelled %d unfinished requests", set_id, cancelled)
       try:
         self.apps().delete_namespaced_deployment(deployment.metadata.name, self.namespace)

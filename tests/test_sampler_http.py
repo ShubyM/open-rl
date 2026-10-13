@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import httpx
 
-from server import sampler_http
+from server import vllm_sampler
 
 
 class Engine:
@@ -34,7 +34,7 @@ class Engine:
 class SamplerHttpTest(unittest.IsolatedAsyncioTestCase):
   async def post(self, engine: Engine, **openrl) -> httpx.Response:
     request = {"request_id": "r#1", "prompt_token_ids": [1, 2, 3], "max_tokens": 2, "num_samples": 1, **openrl}
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=sampler_http.http_app(engine)), base_url="http://sampler") as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=vllm_sampler.http_app(engine)), base_url="http://sampler") as client:
       return await client.post("/v1/completions", json={"model": "m", "prompt": [1, 2, 3], "max_tokens": 2, "openrl": request})
 
   async def test_a_sample_is_returned_with_its_type(self) -> None:
