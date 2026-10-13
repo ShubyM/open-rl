@@ -34,7 +34,8 @@ what can run. **llm-d** decides where it runs. The GPU replicas become usual
 vLLM inference servers.
 
 A **sampling pool** is one CPU pod and N GPU pods. One pool serves one FFT
-training lineage, or a set of LoRA adapters on one base model.
+training lineage, one exclusive LoRA job, or compatible jobs sharing a multi-LoRA
+deployment.
 
 ```mermaid
 flowchart TB
@@ -153,9 +154,32 @@ shared. Each sampling pool deploys separately:
 | One CPU pod, three containers | Dispatcher, Envoy and EPP. Limits concurrency and has one administrative owner. |
 | N GPU sampler pods | Native vLLM and the local guard. Serves HTTP, metrics, KV events and authenticated administration. |
 
+**Names and discovery.** Use the sampler deployment's name as the pool name:
+`sampler-<existing job ID>` for FFT and exclusive LoRA, or a configured readable
+name for a shared LoRA deployment. Names must satisfy Kubernetes deployment and
+label-value rules, be at most 63 characters, and be unique within the namespace.
+Validate them without hashing or truncation. Replica counts and weight
+revisions do not change the name.
+
+Each GPU pod has labels `app.kubernetes.io/component=sampler` and
+`app.kubernetes.io/instance=<deployment name>`. Configure EPP with the namespace,
+both labels, and inference port. Its native Kubernetes watcher maintains the
+individual pod addresses as replicas scale or restart. Use
+[`--endpoint-selector` and `--endpoint-target-ports`](https://github.com/llm-d/llm-d-router/blob/v0.11.0/cmd/epp/runner/runner.go#L372);
+this mode needs no `InferencePool` resource or Redis discovery registry.
+
+The dispatcher discovers all pods with the same selector, including unready
+ones, for `prepare` and `drain`. EPP routes only to ready replicas. A new FFT
+replica stays unready until it loads the selected revision. Readiness updates
+can lag, so the local pool/revision admission guard remains authoritative.
+
+A Kubernetes Service gives the router a stable address for inference. EPP
+selects individual sampler pod addresses, so no additional load balancer sits
+between its choice and the replica's KV cache.
+
 **Isolation.** Each pool has a namespace, a unique pool selector and a router
-endpoint. An `InferencePool` finds only the replicas of that pool.
-NetworkPolicies let only the CPU pod of the pool send traffic to its samplers.
+endpoint. Labels establish membership; NetworkPolicies let only the CPU pod of
+the pool send traffic to its samplers.
 Only the dispatcher gets the administrative credentials. The three CPU containers
 share one network trust boundary. Each pool authenticates pool and model access
 locally. Request keys, result keys and artifact access are limited to authorized
@@ -163,8 +187,12 @@ tenants and jobs.
 
 **FFT pools.** FFT pools have exclusive GPUs and no sampler time slicing. Set the
 scheduler's [`spec.exclusive: true`](../../scheduler/docs/design.md). This
-prevents later sharing until the integration is removed. Expose each replica
-directly to the EPP, so the EPP can tell their KV caches apart.
+keeps the GPUs exclusive after removing sampler time-slicer integration.
+
+**Exclusive LoRA pools.** Each exclusive LoRA job owns a separate replica group
+and router, even when another job uses the same base model. GPU exclusivity alone
+does not establish job isolation: these engines serve only their owning job.
+Adapter saves and replica scaling keep the same pool identity.
 
 **Multi-LoRA pools.** All replicas in a multi-LoRA pool use one exact,
 compatible base revision. Adapters have immutable names and use native vLLM
@@ -199,7 +227,7 @@ Envoy and the EPP forward and select requests. Metrics and KV events let the EPP
 make cache-aware decisions. The file gives HTTP membership only. Precise routing
 also needs KV-event subscriptions. Our deployment tools update the membership
 when endpoints change. The dispatcher controls the FFT weight changes. On
-Kubernetes, use automatic `InferencePool` discovery instead. Refer to the
+Kubernetes, use the label-based discovery above. Refer to the
 [static deployment guide](https://github.com/llm-d/llm-d/blob/v0.9.0/guides/no-kubernetes-deployment/README.md).
 
 **Tests before rollout.** Test the selected llm-d release with vLLM 0.30.0 for:
