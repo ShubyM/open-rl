@@ -1,24 +1,24 @@
 ---
-title: "OpenRL in October"
+title: "OpenRL: Full Fine-Tuning, Multi-GPU, Agentic RL and More"
 date: 2026-10-14T12:00:00Z
-authors: ["Sunil Arora"]
+authors: ["Sunil Arora (on behalf of OpenRL Team)"]
 summary: "A look at what we built in OpenRL over the last two months: full fine-tuning with delta weight sync, multi-GPU training with context parallelism, hero runs on dedicated GPUs, custom trainer images, the Harvey LAB recipe, and agent-friendly skills and observability."
 tags: ["release"]
 draft: false
 ---
 
-Over the last two months, most of our work on OpenRL has come from running larger models and longer-horizon RL jobs on real clusters, and fixing the bottlenecks we hit along the way.
+Over the last two months, most of our work on OpenRL has come from running long context and longer-horizon RL jobs on real clusters, and fixing the bottlenecks we hit along the way.
 
-Each of the topics below deserves its own deep dive, and we will publish dedicated posts on them over the next month. For now, here is an overview of what is available in our latest release and how to use it.
+Each of the topics below deserves its own deep dive, and we will publish dedicated posts on them over the next month. For now, here is an overview of what is available in our latest release.
 
 ## Summary
 
-- **Full fine-tuning and delta weight sync.** Alongside LoRA, OpenRL supports full-parameter fine-tuning, using GPU time-slicing and in-place delta weight sync so only the weights that changed in a step move from trainer to sampler.
-- **Multi-GPU training and context parallelism.** A trainer can now span multiple GPUs with FSDP2 and context parallelism—fitting models like Gemma 4 4B with very long context and Gemma 4 31B with medium or long context—and you can scale out multiple vLLM sampler replicas alongside it.
+- **Full fine-tuning and delta weight sync.** Alongside LoRA, OpenRL now supports full-parameter fine-tuning, using GPU time-slicing and in-place delta weight sync so only the weights that changed in a step move from trainer to sampler.
+- **Multi-GPU training.** A trainer/sampler can now span multiple GPUs. This enables medium scale RL post training e.g. long context training for Gemma 4 4B /Qwen3.5-9B, Gemma 4 31B with medium context.
 - **Hero runs on dedicated GPUs.** A single flag gives a long-running hero run its own trainer and sampler GPUs with no sharing or time-slicing.
 - **Custom trainer images.** A job can specify its own container image for the trainer worker when you need a custom training stack or different accelerator libraries.
-- **Harvey LAB recipe.** An end-to-end agentic RL recipe for Harvey's Legal Agent Benchmark, using isolated sandbox workspaces, is now included in the repository.
-- **Agent skill and run observability.** We now ship an OpenRL skill for your favorite coding agent, a new status API to observe and debug active RL runs without `kubectl`, and built-in capability and settings discovery.
+- **Harvey LAB recipe.** An end-to-end agentic RL recipe for Harvey's Legal Agent Benchmark, using isolated sandbox, is now included in the repository.
+- **Agent skill and run observability.** We now ship an OpenRL skill for your favorite coding agent, a new status API to observe and debug active RL runs.
 
 All of these are configured through job settings passed via `TINKER_TAGS` or `user_metadata`, so you can switch between them without editing your training script.
 
@@ -34,13 +34,13 @@ Full fine-tuning introduces two systems challenges that LoRA avoids: GPU memory 
 
 First, because a full fine-tuning job modifies the base weights, each job gets its own trainer and sampler workers. To run on smaller clusters without requiring dedicated GPUs for every worker, OpenRL coordinates the trainer and sampler through an accelerator time-slicer built with [`llm-d`](https://llm-d.ai/blog/increase-researcher-velocity-rl-llm-d-time-slicing): the trainer and sampler take turns on the GPU, offloading state when parked so a full fine-tuning RL loop can run even on a single GPU. (See our [case study on `llm-d` blog](https://llm-d.ai/blog/increase-researcher-velocity-rl-llm-d-time-slicing) for how this increases researcher velocity.)
 
-Second, at the end of every RL step, updated weights have to move from the trainer to the sampler. Writing and loading a full checkpoint after every step quickly dominates step time. OpenRL now runs on vLLM 0.30 and uses its in-place weight-patching support: instead of writing a full checkpoint, the trainer computes only the tensor elements that changed during the step, and the sampler patches them directly in memory.
+Second, at the end of every RL step, updated weights have to move from the trainer to the sampler. Writing and loading a full checkpoint after every step quickly dominates step time. OpenRL now support delta weight sync: instead of writing a full checkpoint, the trainer computes only the tensor elements that changed during the step, and the sampler patches them directly in memory.
 
-In our measurements on an 8B model, only about 12% of weights changed on step 1, dropping to under 3% by step 25. Sending only the delta shrank the transfer from a 16 GB checkpoint to ~1.2 GB and cut sampler weight-update time from ~35 seconds to ~5 seconds. Upgrading to vLLM 0.30 also allowed us to unify the sampler worker so the same sampler serves both LoRA adapters and full fine-tuning jobs. Delta sync is enabled by default; you can switch to full checkpoint copies with `openrl.weight_sync=full`.
+In our measurements on an 8B model, only about 12% of weights changed on step 1, dropping to under 3% by step 25. Sending only the delta shrank the transfer from a 16 GB checkpoint to ~1.2 GB and cut sampler weight-update time from ~35 seconds to ~5 seconds.
 
 ## Multi-GPU training and context parallelism
 
-Originally, an OpenRL trainer was a single process on a single GPU. On an L4, that meant models topped out around 8B parameters, and long contexts ran out of memory for activations well before the weights filled the card.
+Originally, an OpenRL trainer was a single process on a single GPU. On an Nvidia L4, that meant models topped out around 8B parameters, and long contexts ran out of memory for activations well before the weights filled the card.
 
 We added a multi-GPU trainer backend built on [NVIDIA NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel) that shards a job across multiple GPUs using FSDP2:
 
@@ -131,9 +131,13 @@ More of our users now rely on coding agents to launch, monitor, and debug their 
 
 Next up on our roadmap:
 - **Multi-GPU full fine-tuning** on the Automodel trainer backend, followed by GPU time-slicing for multi-GPU workloads.
-- **Custom sampler images and task-aware routing** across sampler replicas.
+- **Custom sampler images and prefix-aware routing** across sampler replicas.
 
 We will share deeper posts on each of the capabilities above over the coming weeks. In the meantime, if you want to try them out, see the [getting-started guide](https://github.com/gke-labs/open-rl/blob/main/docs/getting-started.md) or browse the [v0.0.6](https://github.com/gke-labs/open-rl/releases/tag/v0.0.6) and [v0.0.7](https://github.com/gke-labs/open-rl/releases/tag/v0.0.7) release notes on GitHub. If you hit any issues, please [let us know](https://github.com/gke-labs/open-rl/issues).
+
+## Acknowledgements
+
+Huge thanks to [Shuby](https://github.com/ShubyM), [Hoda](https://github.com/hodaaaaaaaaaa) and [Aishu](https://github.com/aishukamal) for making these releases happen.
 
 ---
 
