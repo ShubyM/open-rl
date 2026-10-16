@@ -282,12 +282,32 @@ class StateStore(ABC):
   async def set_members(self, key: str) -> set[str]:
     pass
 
+  @abstractmethod
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    """Every live value whose key starts with prefix."""
+    pass
+
+  @abstractmethod
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float) -> None:
+    """Append to a list that keeps the newest `limit` samples and expires ttl_seconds after the last append."""
+    pass
+
+  @abstractmethod
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    pass
+
+  @abstractmethod
+  async def increment(self, key: str, ttl_seconds: float) -> int:
+    """Atomically count up from zero; the counter expires ttl_seconds after the last increment."""
+    pass
+
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
     self.kv_store: dict[str, str] = {}
     self.expiries: dict[str, float] = {}
     self.sets: dict[str, set[str]] = {}
+    self.samples: dict[str, list[str]] = {}
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
@@ -309,6 +329,7 @@ class InMemoryStateStore(StateStore):
       self.kv_store.pop(k, None)
       self.expiries.pop(k, None)
       self.sets.pop(k, None)
+      self.samples.pop(k, None)
 
   async def add_to_set(self, key: str, member: str) -> None:
     self.sets.setdefault(key, set()).add(member)
@@ -318,6 +339,22 @@ class InMemoryStateStore(StateStore):
 
   async def set_members(self, key: str) -> set[str]:
     return set(self.sets.get(key, set()))
+
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    return {key: value for key in list(self.kv_store) if key.startswith(prefix) and (value := self.get_value_sync(key)) is not None}
+
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float) -> None:
+    samples = self.samples.setdefault(key, [])
+    samples.append(json.dumps(sample, allow_nan=False))
+    del samples[:-limit]
+
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    return [json.loads(sample) for sample in self.samples.get(key, [])]
+
+  async def increment(self, key: str, ttl_seconds: float) -> int:
+    value = int(self.get_value_sync(key) or 0) + 1
+    await self.set_value(key, str(value), ttl_seconds)
+    return value
 
 
 class RedisStateStore(StateStore):
@@ -346,6 +383,27 @@ class RedisStateStore(StateStore):
 
   async def set_members(self, key: str) -> set[str]:
     return set(await self.redis.smembers(key))
+
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    keys = [key async for key in self.redis.scan_iter(match=prefix + "*", count=1000)]
+    return {key: value for key, value in zip(keys, await self.redis.mget(keys)) if value is not None} if keys else {}
+
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float) -> None:
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.rpush(key, json.dumps(sample, allow_nan=False))
+      pipeline.ltrim(key, -limit, -1)
+      pipeline.expire(key, int(ttl_seconds))
+      await pipeline.execute()
+
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    return [json.loads(sample) for sample in await self.redis.lrange(key, 0, -1)]
+
+  async def increment(self, key: str, ttl_seconds: float) -> int:
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.incr(key)
+      pipeline.expire(key, int(ttl_seconds))
+      value, _ = await pipeline.execute()
+    return value
 
 
 @cache

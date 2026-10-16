@@ -251,7 +251,7 @@ def base_env(config: RunConfig) -> dict[str, str]:
   return {
     **os.environ,
     "BASE_MODEL": config.base_model,
-    "ENABLE_GCP_TRACE": "0",
+    "OTEL_TRACES_EXPORTER": "none",
     "OPEN_RL_TMP_DIR": str(open_rl_tmp_dir(config)),
     "OPEN_RL_TRAIN_TOKEN_BUDGET": str(config.train_token_budget),
     "PYTHONUNBUFFERED": "1",

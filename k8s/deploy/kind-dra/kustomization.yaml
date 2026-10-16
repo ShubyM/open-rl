@@ -29,7 +29,7 @@ configMapGenerator:
     behavior: merge
     literals:
       # No Cloud Trace exporter on a local cluster.
-      - ENABLE_GCP_TRACE="0"
+      - OTEL_TRACES_EXPORTER="none"
 
 patches:
   - path: pvc-local.yaml

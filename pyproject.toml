@@ -153,3 +153,6 @@ exclude = [
     "scratch",
     "scratch/**",
 ]
+
+[tool.setuptools.package-data]
+"server.dashboard" = ["static/*"]

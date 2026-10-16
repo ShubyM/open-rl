@@ -144,9 +144,21 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   }
   # MAX_JOBS caps FlashInfer's JIT build, which otherwise runs one ~3GB
   # compiler per core and blows through the pod's host memory limit.
-  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
+  for name in (
+    "VLLM_GPU_MEMORY_UTILIZATION",
+    "VLLM_MAX_MODEL_LEN",
+    "VLLM_ENFORCE_EAGER",
+    "VLLM_MAX_NUM_SEQS",
+    "VLLM_MAX_NUM_BATCHED_TOKENS",
+    "OPEN_RL_TRAIN_TOKEN_BUDGET",
+    "MAX_JOBS",
+  ):
     if os.getenv(name):
       values[name] = os.environ[name]
+  # OpenTelemetry settings, so workers export traces like the API server.
+  for name, value in os.environ.items():
+    if name.startswith("OTEL_"):
+      values[name] = value
   # No other worker shares an exclusive worker's GPUs, so it never parks.
   if worker.exclusive:
     values["OPEN_RL_TIME_SLICING"] = "off"
@@ -154,6 +166,9 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   env.append(downward("OPEN_RL_ACCEL_TIMESLICER_HOST", "status.hostIP"))
   if worker.pool:
     env.append(downward("POD_IP", "status.podIP"))
+  # The pod identity a worker stamps on the ops it records, for the dashboard.
+  for name, field in (("POD_NAME", "metadata.name"), ("POD_UID", "metadata.uid"), ("NODE_NAME", "spec.nodeName")):
+    env.append(downward(name, field))
   return env
 
 
@@ -472,28 +487,28 @@ class SchedulerWorkerManager:
     selector = "app.kubernetes.io/managed-by=open-rl-api-server"
     found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
     now = time.time()
-    workers = []
-    for item in found["items"]:
-      spec, status, meta = item["spec"], item.get("status") or {}, item["metadata"]
-      state, detail = worker_state(
-        phase=status.get("phase") or "Pending",
-        reason=status.get("reason") or "",
-        node=status.get("nodeName"),
-        deleting=bool(meta.get("deletionTimestamp")),
-      )
-      workers.append(
-        {
-          "workload": meta["name"],
-          "role": spec["role"],
-          "owner": spec.get("ownerID"),
-          "model_id": spec["modelID"],
-          "state": state,
-          "detail": detail,
-          "node": status.get("nodeName"),
-          "age_seconds": age_seconds(meta.get("creationTimestamp"), now),
-        }
-      )
-    return workers
+    return [workload_worker(item, now) for item in found["items"]]
+
+
+def workload_worker(item: dict[str, Any], now: float) -> dict[str, Any]:
+  """One Workload as a worker entry in the client vocabulary."""
+  spec, status, meta = item["spec"], item.get("status") or {}, item["metadata"]
+  state, detail = worker_state(
+    phase=status.get("phase") or "Pending",
+    reason=status.get("reason") or "",
+    node=status.get("nodeName"),
+    deleting=bool(meta.get("deletionTimestamp")),
+  )
+  return {
+    "workload": meta["name"],
+    "role": spec["role"],
+    "owner": spec.get("ownerID"),
+    "model_id": spec["modelID"],
+    "state": state,
+    "detail": detail,
+    "node": status.get("nodeName"),
+    "age_seconds": age_seconds(meta.get("creationTimestamp"), now),
+  }
 
 
 def worker_state(phase: str, reason: str, node: str | None, deleting: bool) -> tuple[str, str]:

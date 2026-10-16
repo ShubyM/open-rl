@@ -24,7 +24,7 @@ configMapGenerator:
     behavior: merge
     literals:
       - BASE_MODEL="Qwen/Qwen2.5-0.5B"
-      - ENABLE_GCP_TRACE="1"
+      - OTEL_TRACES_EXPORTER="gcp_trace"
       - OPEN_RL_WEIGHT_SYNC_STRATEGY="delta"
 
 images:

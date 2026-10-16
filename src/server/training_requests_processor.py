@@ -22,6 +22,8 @@ from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
 from server.sampling_store import SamplingStore
 from server.store import RedisStore, RequestStore, StateStore, get_state_store, get_store
+from server.telemetry.ops import gpu_turn, observe_operation, record_op
+from server.telemetry.tracing import configure_tracing
 from training import commands
 from training.commands import parse_command
 from training.distributed import broadcast_object, is_distributed, is_primary, local_rank
@@ -268,13 +270,15 @@ class TrainingRequestsProcessor:
     save_reqs = [r for r in requests if r.get("op") in save_ops]
 
     if gpu_reqs:
-      async with self.time_slicer.acquire(self.workload):
-        await asyncio.to_thread(self.worker.wake_up)
+      async with gpu_turn(self.time_slicer, self.workload, "trainer", self.model_id):
+        with record_op("wake_up"):
+          await asyncio.to_thread(self.worker.wake_up)
         try:
           for request in gpu_reqs:
             results.append(await self.handle_request(request))
         finally:
-          await asyncio.to_thread(self.worker.sleep)
+          with record_op("sleep"):
+            await asyncio.to_thread(self.worker.sleep)
 
     if not save_reqs:
       return
@@ -282,7 +286,7 @@ class TrainingRequestsProcessor:
       for request in save_reqs:
         results.append(await self.handle_request(request))
     else:
-      async with self.time_slicer.acquire(self.workload):
+      async with gpu_turn(self.time_slicer, self.workload, "trainer", self.model_id):
         for request in save_reqs:
           results.append(await self.handle_request(request))
 
@@ -301,8 +305,12 @@ class TrainingRequestsProcessor:
       ctx = propagate.extract(command.trace_context) if command.trace_context else None
       token = otel_context.attach(ctx) if ctx else None
 
-      result = await self.dispatch_operation(command)
-      return request_id, result
+      with tracer.start_as_current_span("process_training_request"):
+        if is_primary():
+          result = await observe_operation(raw_request, "trainer", self.model_id, lambda: self.dispatch_operation(command))
+        else:
+          result = await self.dispatch_operation(command)
+        return request_id, result
     except Exception as exc:
       traceback.print_exc()
       if request_id is None:
@@ -477,6 +485,7 @@ def start_request_processing_loop() -> None:
   parser.add_argument("--active-tenant-set-id", help="Active tenant rotation set ID for LoRA workers (e.g. Qwen/Qwen3-0.6B-1).")
   args = parser.parse_args()
   initialize_distributed()
+  provider = configure_tracing("open-rl-trainer")
 
   print("\n" + "=" * 50)
   print("      Open-RL PyTorch Training Worker")
@@ -484,7 +493,10 @@ def start_request_processing_loop() -> None:
   cuda_devs = os.getenv("CUDA_VISIBLE_DEVICES", "ALL")
   print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
 
-  asyncio.run(main_async(args))
+  try:
+    asyncio.run(main_async(args))
+  finally:
+    provider.shutdown()
 
 
 if __name__ == "__main__":

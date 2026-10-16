@@ -151,7 +151,15 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
 
   def test_workers_get_the_deployment_settings(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
-    settings = {"VLLM_MAX_MODEL_LEN": "131072", "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072", "MAX_JOBS": "4"}
+    settings = {
+      "VLLM_MAX_MODEL_LEN": "2048",
+      "VLLM_ENFORCE_EAGER": "1",
+      "VLLM_MAX_NUM_SEQS": "4",
+      "VLLM_MAX_NUM_BATCHED_TOKENS": "2048",
+      "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072",
+      "MAX_JOBS": "4",
+      "OTEL_TRACES_EXPORTER": "gcp_trace",
+    }
     with patch.dict(os.environ, settings), patch("server.worker_manager.get_state_store", return_value=s):
       self.manager.ensure("job-lora-1", "sampler")
       self.manager.ensure("job-lora-1", "trainer")

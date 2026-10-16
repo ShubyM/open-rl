@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -33,6 +34,10 @@ class ApiServerTest(unittest.TestCase):
 
 
 class GetInfoTest(ApiServerTest):
+  def test_default_gateway_does_not_expose_fleet_inspection(self) -> None:
+    self.assertEqual(self.client.get("/api/v1/inspect/inventory").status_code, 404)
+    self.assertFalse(any(path.startswith("/api/v1/inspect/") for path in self.client.get("/openapi.json").json()["paths"]))
+
   def test_get_info_uses_base_model_env(self) -> None:
     with patch.dict(os.environ, {"BASE_MODEL": "env-model"}, clear=True):
       info = self.post("get_info", {"model_id": "model-a"}).json()
@@ -80,6 +85,21 @@ class GetInfoTest(ApiServerTest):
     self.assertEqual(queued[0]["payload"]["base_model"], "my-model")
     meta = json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "my-model")
+
+  def test_create_persists_only_bounded_display_labels(self) -> None:
+    # The registry uses the API's configured state; this test replaces it with
+    # the same isolated store as the request handlers.
+    with patch.object(api_server.session_registry, "state", api_server.state):
+      asyncio.run(api_server.session_registry.update_metadata("session", {"name": "session name", "recipe_name": "recipe", "private": "secret"}))
+      response = self.post(
+        "create_model",
+        {"base_model": "my-model", "session_id": "session", "user_metadata": {"name": "  run name  ", "git_rev": "x" * 2000, "private": "secret"}},
+      )
+    model_id = response.json()["request_id"]
+    metadata = json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    self.assertEqual((metadata["name"], metadata["recipe_name"]), ("run name", "recipe"))
+    self.assertEqual(len(metadata["git_rev"]), 1024)
+    self.assertNotIn("private", metadata)
 
 
 class ErrorShapeTest(ApiServerTest):
@@ -295,6 +315,14 @@ class SampleSequenceIdsTest(ApiServerTest):
     with patch.object(api_server, "get_sampler_backend", return_value="torch"):
       promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)
+
+  def test_shared_sampler_keeps_the_logical_run_separate_from_its_runtime_queue(self) -> None:
+    asyncio.run(api_server.state.set_value("open_rl:model_meta:run-a", json.dumps({"base_model": "base", "fine_tuning_type": "lora"})))
+    with patch.object(api_server, "get_sampler_backend", return_value="vllm"):
+      response = self.post("asample", {"sampling_session_id": "tinker://run-a/sampler_weights/step-1", "prompt": {"chunks": [{"tokens": [1]}]}})
+    self.assertEqual(response.status_code, 200)
+    request = asyncio.run(api_server.store.get_sampling_requests_for_model("base"))[0]
+    self.assertEqual((request["model_id"], request["logical_run_id"]), ("base", "run-a"))
 
 
 if __name__ == "__main__":
@@ -569,6 +597,28 @@ class TrainerBackendTest(ApiServerTest):
       response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.sampler_replicas": "4"}})
     self.assertEqual(response.status_code, 400)
     self.assertIn("openrl.sampler_replicas above 1", response.json()["error"])
+
+
+class TelemetryTest(ApiServerTest):
+  def test_each_sdk_event_becomes_one_json_line(self) -> None:
+    body = {
+      "session_id": "sess-123",
+      "platform": "linux",
+      "sdk_version": "0.29.0",
+      "process_uuid": "uuid-456",
+      "events": [
+        {"event": "SESSION_START", "severity": "INFO", "timestamp": "2024-01-01"},
+        {"event": "GENERIC_EVENT", "event_name": "custom_event", "severity": "DEBUG"},
+      ],
+    }
+    with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+      response = self.client.post("/api/v1/telemetry", json=body)
+
+    self.assertEqual(response.json(), {"status": "accepted"})
+    lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    rows = [(line["severity"], line["message"], line["session_id"]) for line in lines]
+    self.assertEqual(rows, [("INFO", "tinker SESSION_START", "sess-123"), ("DEBUG", "tinker custom_event", "sess-123")])
+    self.assertEqual(lines[0]["event"]["timestamp"], "2024-01-01")
 
 
 if __name__ == "__main__":

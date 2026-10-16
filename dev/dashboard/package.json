@@ -1,0 +1,13 @@
+{
+  "name": "openrl-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test *.test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "svelte": "5.57.2"
+  }
+}

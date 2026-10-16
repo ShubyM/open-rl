@@ -51,6 +51,7 @@ REDIS_URL=redis://127.0.0.1:6379/0 VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM 
 | `SAMPLING_BACKEND` | `torch` in one process, `vllm` when `REDIS_URL` is set | Sampling backend selector. `torch` samples in the training process. `vllm` queues sampling requests for a vLLM sampler worker and needs `REDIS_URL`. |
 | `REDIS_URL` | unset | Enables distributed mode by switching the request store to Redis. Leave unset for a single-machine run. |
 | `OPEN_RL_FUTURE_TTL_S` | `300` | How long resolved request results stay readable by `retrieve_future` after a worker resolves them. |
+| `OTEL_TRACES_EXPORTER` | unset | Where the API server, trainers and samplers send OpenTelemetry traces: `gcp_trace` for Cloud Trace, `console` to print spans, or any installed exporter's name. Comma-separate several. Unset exports nothing. The scheduler passes every `OTEL_*` variable on to worker pods. |
 
 ## Server paths
 
@@ -81,7 +82,23 @@ backend by default for physical checkpoint/restore.
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `VLLM_ARCHITECTURE_OVERRIDE` | unset | Optional architecture override passed to the in-repo vLLM worker. Gemma 4 examples use `Gemma4ForCausalLM`. |
+| `VLLM_ENFORCE_EAGER` | `0` | Set to `1` to skip vLLM graph compilation and CUDA graph capture, trading steady-state throughput for faster startup. Passed from the API server to newly created worker pods. |
+| `VLLM_MAX_NUM_SEQS` / `VLLM_MAX_NUM_BATCHED_TOKENS` | GPU-dependent | Override sampler batch limits, including in scheduler-created pods. Small demos can use smaller limits; size them for the intended workload. |
 | `VLLM_ENABLE_MULTIMODAL` | `0` | By default the samplers pass `limit_mm_per_prompt={"image": 0, "video": 0}`. Text checkpoints published as `*ForConditionalGeneration` otherwise make vLLM reserve a multi-GiB encoder cache during startup that no OpenRL code path can use, which can OOM engine init. Set to `1` to restore stock vLLM behaviour. |
+
+For a live demo, prepare the trainer and sampler before the interactive session
+and exercise a small sample, forward/backward and optimizer step. Shared LoRA
+runtimes remain loaded between runs on the same base model and trainer backend;
+exclusive, multi-GPU and full fine-tuning runs own their runtimes instead. Keep a
+prepared full fine-tuning run's client session alive if it will be used in the demo.
+Warmup training changes weights and optimizer state: use a disposable LoRA run,
+or restore a clean checkpoint before presenting a prepared full fine-tuning run.
+Readiness alone does not establish first-step latency. Measure from the user action
+to the first completed sample and training step on the target hardware.
+
+Eager mode still loads weights and initializes kernels; it does not guarantee a
+seconds-long cold start. GPU capacity, cached images and model files, initialization,
+and the demo's token budget all affect latency. See [vLLM startup tuning](https://docs.vllm.ai/en/stable/configuration/optimization/#faster-startup).
 
 ## Client variables
 
@@ -124,3 +141,17 @@ On one machine the local worker manager starts one `vllm serve` on
 | `OPEN_RL_SAMPLER_ROUTER` | `http://127.0.0.1:8081` | Where a pool's dispatcher sends requests on Kubernetes, Envoy in its own pod. |
 | `OPEN_RL_SAMPLER_ENDPOINTS` | unset | Comma-separated replica URLs for a dispatcher with no router. The local worker manager sets it. |
 | `OPEN_RL_DISPATCHER_IMAGE` | the worker image | Image for each pool's dispatcher container. The release sets it to the API-server image, which carries the dispatcher without the GPU stack and pulls in seconds. |
+
+## Run telemetry
+
+The Tinker SDK reports session starts and ends, unhandled client exceptions, and
+any event a script logs with `get_telemetry().log(name, data, severity)` on its
+service, training or sampling client. The API server prints each event as one
+JSON line, so on Kubernetes it reaches Cloud Logging with the event's severity.
+Find a session's events with `jsonPayload.session_id="<id>"`. Clients turn
+this off with `TINKER_TELEMETRY=0`.
+
+With `OTEL_TRACES_EXPORTER` set, the trainer and sampler continue each request's
+trace. A client that traces its own HTTP calls, as
+`examples/autoresearch/telemetry.py` does, gets one trace from the client
+through the workers.
