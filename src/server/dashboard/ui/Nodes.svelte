@@ -3,12 +3,13 @@
   import Chart from "./Chart.svelte";
   import Activity from "./Activity.svelte";
   import CopyLink from "./CopyLink.svelte";
+  import TimeControl from "./TimeControl.svelte";
   import { createQuery, inspectUrl, now, viewLink, crosshair, crosshairOffset, timeAt } from "./state.svelte.js";
-  import { WINDOWS, nodeTime } from "./node-time.js";
-  import { axisTime, chartTime, deviceLabel, acceleratorLabel, shortNodeName, placementColor, clipPlacements, duty, claimLabel, capacityBars, activitySource, deviceSeries, sumSeries, gapFor, lastValue } from "./visualization.js";
+  import { nodeTime } from "./node-time.js";
+  import { axisTime, deviceLabel, acceleratorLabel, shortNodeName, placementColor, clipPlacements, duty, claimLabel, capacityBars, activitySource, deviceSeries, sumSeries, gapFor, lastValue } from "./visualization.js";
 
   let { inventory, view } = $props();
-  let element, picker, frozen = $state(null);
+  let element, frozen = $state(null);
   const observed = $derived(now(inventory));
   const range = $derived.by(() => {
     const duration = Math.max(60, Math.min(86400, Math.round(view.duration || 1800)));
@@ -36,10 +37,6 @@
   const nodes = $derived([...inventory.cluster.nodes].sort((a, b) => Number(inventory.placements.some((p) => p.node === b.name)) - Number(inventory.placements.some((p) => p.node === a.name)) || Number(b.gpu_capacity > 0) - Number(a.gpu_capacity > 0)));
   const unavailable = $derived(!node && (view.node || (view.placement && history.data)));
   const duration = $derived(range.now - range.start);
-  const custom = $derived([[Math.floor(duration / 3600), "h"], [Math.floor(duration / 60) % 60, "m"], [duration % 60, "s"]].filter(([n]) => n).map(([n, unit]) => `${n}${unit}`).join(" "));
-  const options = $derived(WINDOWS.some(([n]) => n === duration) ? WINDOWS : [[duration, `${custom} (custom)`], ...WINDOWS]);
-  const local = (at) => new Date(at * 1000).toISOString().slice(0, duration <= 120 ? 19 : 16);
-  const timeLabel = $derived(range.live ? `Last ${WINDOWS.find(([n]) => n === duration)?.[1] || custom}` : `${local(range.start).slice(5, 10)} · ${chartTime(range.start, duration <= 120)} – ${local(range.start).slice(0, 10) === local(range.now).slice(0, 10) ? "" : `${local(range.now).slice(5, 10)} · `}${chartTime(range.now, duration <= 120)}`);
   const back = $derived(viewLink("nodes", { duration, end: range.now, node: view.node, placement: view.placement, gpu: view.node && view.gpu !== "all" ? view.gpu : null }));
   const sourceNote = $derived({ gke: "GPU: DCGM via Cloud Monitoring · CPU/memory: GKE container metrics", prometheus: "GPU: DCGM via Prometheus · CPU/memory: GKE container metrics" }[metrics.source] || "");
   const cursor = $derived(crosshairOffset(range));
@@ -79,32 +76,17 @@
     element.closest("#app").style.removeProperty("min-height");
     view.node = name; view.placement = null; view.gpu = "all";
   }
-  function shift(sign) { const end = range.now + sign * duration; view.end = end >= observed ? null : end; }
-  function until(event) {
-    if (!event.currentTarget.validity.valid) { event.currentTarget.reportValidity(); return; }
-    const end = event.currentTarget.value ? Date.parse(`${event.currentTarget.value}Z`) / 1000 : null;
-    view.end = Number.isFinite(end) ? Math.min(end, observed) : null;
-  }
   function escapeKey(event) {
     if (event.key !== "Escape" || event.defaultPrevented) return;
-    if (picker?.open) { picker.open = false; picker.querySelector("summary").focus(); event.preventDefault(); }
-    else if (view.node || view.placement) close();
+    if (view.node || view.placement) close();
   }
   onDestroy(() => element?.closest("#app")?.style.removeProperty("min-height"));
 </script>
-<svelte:window onhashchange={() => scrollSelection = true} onkeydown={escapeKey} onclick={(event) => { if (picker?.open && !picker.contains(event.target)) picker.open = false; }} />
+<svelte:window onhashchange={() => scrollSelection = true} onkeydown={escapeKey} />
 <div bind:this={element} use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => frozen = value }} data-crosshair={cursor !== null ? "" : undefined} style:--crosshair={`${cursor ?? 0}%`}>
   <div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>
     <div class="time-control" aria-label="Node time range">
-      <button type="button" class="time-shift" data-time-shift="-1" aria-label="Previous time window" disabled={range.start <= observed - 86400} onclick={() => shift(-1)}><svg class="time-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 5.5 5 5 5-5" transform="rotate(90 8 8)" /></svg></button>
-      <details class="time-picker" data-key="node-time-picker" bind:this={picker}><summary class="time-summary" title={timeLabel}><span>{timeLabel}</span><svg class="time-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 5.5 5 5 5-5" /></svg></summary>
-        <div class="time-popover"><label>Window <select data-time-duration value={duration} onchange={(event) => { view.duration = Number(event.currentTarget.value); if (view.end !== null) view.end = range.now; }}>{#each options as [n, text] (n)}<option value={n}>{text}</option>{/each}</select></label>
-          <label>Until (UTC)<input type="datetime-local" data-time-end value={range.live ? "" : local(range.now)} min={local(observed - 86400 + duration)} max={local(observed)} step="any" onchange={until}></label>
-          {#if range.live}<span class="muted">Following current time</span>{:else}<button type="button" class="chip" data-time-live="true" onclick={() => view.end = null}>Return to live</button>{/if}
-          <span class="muted">W/S zoom · A/D pan</span>
-        </div>
-      </details>
-      <button type="button" class="time-shift" data-time-shift="1" aria-label="Next time window" disabled={range.now >= observed} onclick={() => shift(1)}><svg class="time-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 5.5 5 5 5-5" transform="rotate(-90 8 8)" /></svg></button><CopyLink />
+      <TimeControl {view} {range} {observed} /><CopyLink />
     </div>
   </div>
   {#each errors as error}<p class="source-error" role="status">{error}</p>{/each}

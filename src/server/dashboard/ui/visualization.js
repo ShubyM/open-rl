@@ -22,7 +22,8 @@ export function activitySource(placements) {
 }
 export function processLabel(p, nodes) {
   const node = nodes.find((n) => n.name === p.node), devices = p.devices.map((id) => node?.devices.find((d) => d.id === id));
-  const gpus = devices.length && devices.every(Boolean) ? `GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : `${p.device_count} GPU${p.device_count === 1 ? "" : "s"}`;
+  // A lane rebuilt from recorded ops has no known GPUs, which is not zero GPUs.
+  const gpus = devices.length && devices.every(Boolean) ? `GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : p.device_count ? `${p.device_count} GPU${p.device_count === 1 ? "" : "s"}` : null;
   const role = p.role || "Process", accelerator = node && acceleratorLabel(node);
   return [role[0].toUpperCase() + role.slice(1), accelerator === "GPU" ? null : accelerator, gpus].filter(Boolean).join(" · ");
 }

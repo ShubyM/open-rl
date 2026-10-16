@@ -125,8 +125,38 @@ def matches(sample: dict, placement: dict) -> bool:
 
 def activity(state: dict, start: float, end: float, operations: dict, run_id=None, node_id=None) -> dict:
   """GPU turns and recorded ops for each lane in the window. Never utilization."""
-  lanes = [p for p in segments(state, run_id, node_id) if p["start"] <= end and p["end"] >= start]
-  return {"placements": [lane_activity(p, start, end, operations) for p in lanes]}
+  lanes = segments(state, run_id, node_id)
+  if run_id and not node_id:
+    lanes += recorded_lanes(run_id, lanes, operations.get(run_id, {}).get("samples", []))
+  return {"placements": [lane_activity(p, start, end, operations) for p in lanes if p["start"] <= end and p["end"] >= start]}
+
+
+def recorded_lanes(run_id: str, lanes: list[dict], samples: list[dict]) -> list[dict]:
+  """A vllm serve replica keeps no process record, so once its pod is gone its lane
+  comes from the ops the run recorded there, which name the pod."""
+  shown, pods = {p.get("pod") for p in lanes}, {}
+  for sample in samples:
+    if sample.get("role") == "sampler" and sample.get("pod") and sample["pod"] not in shown:
+      pods.setdefault(sample["pod"], []).append(sample)
+  return [
+    {
+      "id": f"recorded:{pod}",
+      "name": pod,
+      "label": pod,
+      "pod": pod,
+      "role": ops[0].get("role"),
+      "node": "",  # not recorded for a replica
+      "run_ids": [run_id],
+      "runtime_id": None,
+      "shared_runtime": True,
+      "devices": [],
+      "device_count": 0,
+      "start": min(o.get("started_at") or o["at"] for o in ops),
+      "end": max(o["at"] for o in ops),
+      "ended": True,
+    }
+    for pod, ops in pods.items()
+  ]
 
 
 def lane_activity(lane: dict, start: float, end: float, operations: dict) -> dict:

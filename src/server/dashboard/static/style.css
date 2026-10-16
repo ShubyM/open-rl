@@ -1256,13 +1256,11 @@ body {
   font-size: 11px;
 }
 #app .run-metrics {
-  margin-top: 20px;
-  border-top: 1px solid var(--line);
+  margin-top: 8px;
 }
-#app .run-metrics > summary {
-  padding: 14px 0;
-  cursor: pointer;
-  font-size: 13px;
+#app .time-control.run-time-controls {
+  grid-template-columns: 32px minmax(0, 1fr) 32px auto auto;
+  width: 520px;
 }
 #app .log-toolbar {
   display: flex;

@@ -175,6 +175,16 @@ class InspectionActivityTest(unittest.TestCase):
     (lane,) = inspection.activity(state(live=[], processes=[shared], runs=runs), 100, 220, operations, run_id="r1")["placements"]
     self.assertEqual(lane["allocation_id"], "p1")
 
+  def test_a_released_samplers_lane_comes_from_the_runs_recorded_samples(self):
+    samples = [
+      operation(110, 120, role="sampler", pod="pool-0-sampler", operation="sample"),
+      operation(150, 160, role="sampler", pod="pool-0-sampler", operation="sample"),
+    ]
+    lanes = inspection.activity(state(live=[]), 100, 220, {"r1": {"samples": [operation(130, 140), *samples]}}, run_id="r1")["placements"]
+    recorded = next(p for p in lanes if p["pod"] == "pool-0-sampler")
+    self.assertEqual((recorded["role"], recorded["ended"], recorded["ops"]), ("sampler", True, {"sample": [[110, 120], [150, 160]]}))
+    self.assertEqual([p["pod"] for p in lanes].count("trainer-0"), 1)
+
   def test_a_dedicated_lane_shows_gpu_turns_inside_the_window(self):
     record = {**PROCESS, "turns": [[10, 20], [110, 150]]}
     result = inspection.activity(state(processes=[record]), 120, 190, {})["placements"][0]

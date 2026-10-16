@@ -40,12 +40,12 @@
       <div class="activity-header"><h3>{acrossNodes ? "Process" : "Run"}</h3><div class="activity-axis">{#each [0, 1, 2, 3, 4] as tick}<span>{axisTime(range.start + (range.now - range.start) * tick / 4, range)}</span>{/each}</div></div>
       {#each shown as p (p.id)}
         {@const name = acrossNodes ? processLabel(p, inventory.cluster.nodes) : p.label}
-        {@const meta = acrossNodes ? p.node ? shortNodeName(p.node, inventory.cluster.nodes) : "Node unassigned" : p.role || "process"}
+        {@const meta = acrossNodes ? p.node ? shortNodeName(p.node, inventory.cluster.nodes) : p.ended && p.pod ? p.pod : "Node unassigned" : p.role || "process"}
         {@const link = href(p)}
         {@const status = p.error ? "Ops unavailable" : !p.intervals.length ? "No recorded activity" : ""}
         <div class={`activity-row ${placementColor(p)}`} data-key={p.id} data-selected={!acrossNodes && p.id === selected}>
           <svelte:element this={link ? "a" : "span"} class={`activity-label ${placementColor(p)}`} data-key={`label:${p.id}`} href={link || undefined} aria-disabled={!link ? "true" : undefined} title={acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !link ? " · Node no longer reported" : ""}` : p.label}>
-            <span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">{name}</span><span class="activity-meta">{meta}{p.ended ? " · Process ended" : p.phase && p.phase !== "ready" ? ` · ${p.phase.replace("_", " ")}` : ""}{!link ? acrossNodes ? " · Node no longer reported" : p.run_ids?.length ? " · Run record unavailable" : " · No linked run" : ""}</span></span>
+            <span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">{name}</span><span class="activity-meta">{meta}{p.ended ? " · Process ended" : p.phase && p.phase !== "ready" ? ` · ${p.phase.replace("_", " ")}` : ""}{!link ? acrossNodes ? p.node ? " · Node no longer reported" : "" : p.run_ids?.length ? " · Run record unavailable" : " · No linked run" : ""}</span></span>
           </svelte:element>
           <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events (Pointer location follows the shared time axis. Incident links and the Logs tab reach the same logs by keyboard.) -->
           <div class="activity-track" onpointermove={trackMove} onclick={onpick && ((event) => onpick(Math.round(timeAt(event, range))))}>

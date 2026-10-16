@@ -1,5 +1,7 @@
 <script>
-  import { createQuery, inspectUrl, rangeOf, viewLink, saved } from "./state.svelte.js";
+  import { createQuery, inspectUrl, now, viewLink, saved } from "./state.svelte.js";
+  import { nodeTime } from "./node-time.js";
+  import TimeControl from "./TimeControl.svelte";
   import Status from "./Status.svelte";
   import Chart from "./Chart.svelte";
   import Activity from "./Activity.svelte";
@@ -8,11 +10,19 @@
   import Configuration from "./Configuration.svelte";
   import { duration, shortNodeName, KINDS, runDescription } from "./format.js";
   let { inventory, view } = $props();
-  const range = $derived(rangeOf(inventory, view));
+  // The same window and gestures as the Nodes page; the query window holds still while a gesture runs.
+  let frozen = $state(null);
+  const observed = $derived(now(inventory));
+  const range = $derived.by(() => {
+    const duration = Math.max(60, Math.min(86400, Math.round(view.duration || 1800)));
+    const end = Math.max(observed - 86400 + duration, Math.min(observed, view.end ?? observed));
+    return { start: end - duration, now: end, live: view.end === null };
+  });
+  const queryRange = $derived(frozen || range);
   const validEvent = $derived(view.event === null || (view.event >= range.start && view.event <= range.now));
   $effect(() => { if (!validEvent) view.event = null; });
-  const url = $derived(inspectUrl("activity", { since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString(), run_id: view.id }));
-  const detail = createQuery(() => url, { poll: 15000, pollWhen: () => view.end === null, key: () => `${view.id} ${view.duration} ${view.end}` });
+  const url = $derived(inspectUrl("activity", { since: new Date(queryRange.start * 1000).toISOString(), until: new Date(queryRange.now * 1000).toISOString(), run_id: view.id }));
+  const detail = createQuery(() => url, { poll: 15000, pollWhen: () => view.end === null && !frozen, key: () => `${view.id} ${view.duration} ${view.end} ${frozen?.start ?? ""}` });
   const run = $derived((detail.status !== 404 ? detail.data?.run : null) || inventory.runs.find((r) => r.run_id === view.id));
   const error = $derived(inventory.store_error || inventory.processes_error || detail.error);
   const title = $derived(run ? [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), KINDS[run.fine_tuning_type]].filter(Boolean).join(" · ") : "Run");
@@ -21,7 +31,6 @@
   const roles = $derived([...new Set(samples.map((s) => s.role || "process"))]);
   const names = $derived([...new Set(samples.flatMap((s) => Object.entries(s.metrics || {}).filter(([, v]) => Number.isFinite(v)).map(([k]) => k)))].slice(0, 12));
   const metricStatus = $derived(detail.error ? `${detail.error}${samples.length ? " · Showing previously fetched metrics" : ""}` : detail.pending ? "Updating…" : "");
-  const custom = $derived(view.end !== null || ![600, 1800, 3600].includes(view.duration));
   const metricsOpen = () => view.tab === "metrics" && `${view.id} ${view.duration} ${view.end}`;
   // A shared pool's load is every run's, so it is charted on Nodes rather than here.
   const vllm = createQuery(() => run?.shared_runtime ? null : inspectUrl("series", { run_id: view.id, since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() }), { poll: 15000, pollWhen: () => view.end === null, key: metricsOpen });
@@ -59,27 +68,22 @@
     {:else if !run.workers_error}<p class="muted">No workers reported</p>{/if}
     <Configuration settings={run.settings} />
   </section>
+  <div use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => frozen = value }}>
   <div class="run-toolbar">
     <nav class="workspace-tabs" aria-label="Run views">
-      <a href={link(view.tab === "metrics" ? "metrics" : "activity")} aria-current={view.tab !== "logs" ? "page" : undefined}>Activity</a>
+      <a href={link("activity")} aria-current={view.tab === "activity" ? "page" : undefined}>Activity</a>
+      <a href={link("metrics")} aria-current={view.tab === "metrics" ? "page" : undefined}>Metrics</a>
       <a href={link("logs")} aria-current={view.tab === "logs" ? "page" : undefined}>Logs</a>
     </nav>
-    <div class="run-time-controls"><label>Time range
-      <select id="event-range" aria-label="Time range" title={`${new Date(range.start * 1000).toISOString()} – ${new Date(range.now * 1000).toISOString()}`}
-        value={view.duration / 60} onchange={(e) => { view.duration = Number(e.currentTarget.value) * 60; view.end = view.event = null; }}>
-        {#if custom}<option value={view.duration / 60}>{view.back ? "Selected node window" : "Selected time window"}</option>{/if}
-        {#each [10, 30, 60] as minutes}<option value={minutes}>Last {minutes} minutes</option>{/each}
-      </select></label><CopyLink /><a href={url}>Agent JSON ↗</a>
-    </div>
+    <div class="time-control run-time-controls" aria-label="Run time range"><TimeControl {view} {range} {observed} /><CopyLink /><a href={url}>Agent JSON ↗</a></div>
   </div>
   <div id="run-panel">
     {#if view.tab === "logs"}
       {#if validEvent}<Logs {run} {view} {range} allLogs={link("logs", { event: null, end: null })} />{/if}
-    {:else}
+    {:else if view.tab !== "metrics"}
       <div class="run-activity"><Activity placements={detail.data?.placements || []} {range} {inventory} acrossNodes={true} error={detail.error} status={detail.status} pending={detail.pending} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
-      <details class="run-metrics" data-run-metrics={view.id} bind:open={() => view.tab === "metrics", (open) => view.tab = open ? "metrics" : "activity"}>
-        <summary>Metrics</summary>
-        {#if view.tab === "metrics"}
+    {:else}
+      <div class="run-metrics" data-run-metrics={view.id}>
           <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span>{#if metricStatus}<span class={detail.error ? "source-error" : "muted"} role="status">{metricStatus}</span>{/if}</div>
           <div class="chart-grid">
             {#each roles as role (role)}<Chart title={`${{ trainer: "Trainer", sampler: "Sampler", process: "Process" }[role] || role} operation duration`} unit="s" points={samples.filter((s) => (s.role || "process") === role).map((s) => [s.at, s.elapsed_seconds])} start={range.start} end={range.now} min={0} tone="accent" />{/each}
@@ -94,9 +98,9 @@
           {:else}<div class="chart-grid">
             {#each SAMPLER_CHARTS as [key, title, unit, scale = 1] (key)}<Chart {title} {unit} points={(vllm.data.samplers[key] || []).map(([at, value]) => [at, value * scale])} start={range.start} end={range.now} min={0} />{/each}
           </div>{/if}
-        {/if}
-      </details>
+      </div>
     {/if}
+  </div>
   </div>
   {#if detail.data?.incidents?.length}
     <section class="run-incidents" aria-label="Significant events">
