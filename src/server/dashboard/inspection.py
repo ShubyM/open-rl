@@ -116,9 +116,11 @@ def merge(intervals: list) -> list:
 
 
 def matches(sample: dict, placement: dict) -> bool:
-  return all(
-    not sample.get(key) or not placement.get(key) or sample[key] == placement[key] for key in ("role", "node", "runtime_id", "pod", "pod_uid")
-  )
+  # A plain loop: activity calls this once per record per lane.
+  for key in ("role", "node", "runtime_id", "pod", "pod_uid"):
+    if (mine := sample.get(key)) and (theirs := placement.get(key)) and mine != theirs:
+      return False
+  return True
 
 
 def activity(state: dict, start: float, end: float, operations: dict, run_id=None, node_id=None) -> dict:

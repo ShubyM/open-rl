@@ -8,11 +8,14 @@ import argparse
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
 
 from server.dashboard.router import router
 
 app = FastAPI(title="Open-RL Inspection API")
+# Snapshots run to megabytes of JSON, and a port-forward carries them slowly.
+app.add_middleware(GZipMiddleware, minimum_size=4096)
 app.include_router(router)
 
 

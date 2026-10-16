@@ -85,7 +85,12 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
       records = await asyncio.wait_for(store.read_samples(key), timeout=1)
       if not isinstance(records, list):
         raise ValueError("Expected telemetry records")
+      return records
     except Exception:
+      return None
+
+  def validated(records):
+    if records is None:
       return {"samples": [], "error": "Operation records unavailable"}
     samples, invalid = [], 0
     for record in records:
@@ -95,8 +100,12 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
         invalid += 1
     return {"samples": samples, **({"partial": f"Skipped {invalid} invalid operation records"} if invalid else {})}
 
-  records = dict(zip(keys, await asyncio.gather(*(read(ops.key(k)) for k in keys))))
-  result = inspection.activity(state, low, high, records, run_id, node_id)
+  def summarize(raw):
+    records = {key: validated(r) for key, r in zip(keys, raw)}
+    return records, inspection.activity(state, low, high, records, run_id, node_id)
+
+  # Tens of thousands of records take seconds to check and join; a thread keeps other requests moving meanwhile.
+  records, result = await asyncio.to_thread(summarize, await asyncio.gather(*(read(ops.key(k)) for k in keys)))
   result.update(since=start, until=end, observed_at=state["observed_at"])
   result["coverage"] = (
     f"At most {ops.SAMPLE_LIMIT} completed records per run/worker, best effort. "

@@ -409,7 +409,9 @@ class RedisStateStore(StateStore):
       await pipeline.execute()
 
   async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
-    return [json.loads(sample) for sample in await self.redis.lrange(key, -(last or 0), -1)]
+    raw = await self.redis.lrange(key, -(last or 0), -1)
+    # Decoded off the event loop: a dashboard read can be thousands of samples.
+    return await asyncio.to_thread(lambda: [json.loads(sample) for sample in raw])
 
   async def list_length(self, key: str) -> int | None:
     return await self.redis.llen(key)
