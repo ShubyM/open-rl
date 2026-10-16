@@ -1169,11 +1169,16 @@ body {
   margin-left: 10px;
   font-weight: 400;
 }
-#app .run-settings pre {
-  max-width: 100%;
-  overflow: auto;
-  padding: 12px;
-  background: var(--paper);
+#app .run-state .table-scroll {
+  margin: 12px 0 4px;
+}
+#app .worker-table :is(th, td) {
+  padding-top: 6px;
+  padding-bottom: 6px;
+  vertical-align: middle;
+}
+#app .worker-table .micro {
+  margin-left: 6px;
 }
 #app .run-settings dl {
   display: grid;

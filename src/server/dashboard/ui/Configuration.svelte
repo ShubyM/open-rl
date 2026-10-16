@@ -16,6 +16,5 @@
   {#if rows.length}
     <p class="muted micro">Saved model settings. Worker environment and per-step parameters are separate.</p>
     <dl>{#each rows as [name, v]}{@const key = name.replace(/^openrl\./, "")}<dt title={name}>{Object.hasOwn(labels, key) ? labels[key] : name}</dt><dd>{value(v)}</dd>{/each}</dl>
-    <details><summary>Raw JSON</summary><pre>{JSON.stringify(settings, null, 2)}</pre></details>
   {:else}<p class="muted">No configuration recorded for this run.</p>{/if}
 </details>

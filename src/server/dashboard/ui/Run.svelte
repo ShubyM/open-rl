@@ -49,10 +49,11 @@
     <p class="muted">Model session: {run.session_live == null ? "Unknown" : run.session_live ? "Live" : "No live session"}{run.shared_runtime ? " · Shared runtime" : ""}</p>
     {#if run.workers_error}<p class="source-error" role="status">Workers: {run.workers_error}</p>{/if}
     {#if run.workers?.length}
-      <div class="table-scroll"><table class="run-table" aria-label="Workers"><thead><tr><th>Worker</th><th>State</th><th>Node</th><th>Age</th></tr></thead><tbody>
+      <div class="table-scroll"><table class="run-table worker-table" aria-label="Workers"><thead><tr><th>Worker</th><th>State</th><th>Node</th><th>Restarts</th><th>Age</th></tr></thead><tbody>
         {#each run.workers as worker}
-          <tr><td>{worker.role}<div class="muted micro">{worker.workload || ""}</div></td><td title={worker.detail}><Status value={worker.state} /></td>
-            <td title={worker.node}>{worker.node ? shortNodeName(worker.node, inventory.cluster.nodes) : "—"}</td><td>{worker.age_seconds == null ? "—" : duration(worker.age_seconds)}</td></tr>
+          {@const pod = (run.pods || []).find((p) => p.worker === worker.workload)}
+          <tr><td>{worker.role} <span class="muted micro">{worker.workload || ""}</span></td><td title={worker.detail}><Status value={worker.state} /></td>
+            <td title={worker.node}>{worker.node ? shortNodeName(worker.node, inventory.cluster.nodes) : "—"}</td><td>{pod?.restarts ?? "—"}</td><td>{worker.age_seconds == null ? "—" : duration(worker.age_seconds)}</td></tr>
         {/each}
       </tbody></table></div>
     {:else if !run.workers_error}<p class="muted">No workers reported</p>{/if}
@@ -93,12 +94,6 @@
           {:else}<div class="chart-grid">
             {#each SAMPLER_CHARTS as [key, title, unit, scale = 1] (key)}<Chart {title} {unit} points={(vllm.data.samplers[key] || []).map(([at, value]) => [at, value * scale])} start={range.start} end={range.now} min={0} />{/each}
           </div>{/if}
-          <h2 class="scheduler-title">Processes</h2>
-          {#if run.shared_runtime}<p class="muted">Shared LoRA runtime</p>{/if}
-          <div class="table-scroll"><table class="run-table"><thead><tr><th>Process</th><th>Kind</th><th>Node</th><th>State</th><th>Restarts</th></tr></thead>
-            <tbody>{#each run.pods || [] as p (p.uid || p.name)}<tr><td>{p.name}</td><td>{p.role ? p.role[0].toUpperCase() + p.role.slice(1) : "Unknown"}</td><td>{p.node ?? "—"}</td><td title={p.problem}><Status value={p.problem?.split(":")[0] || p.phase} /></td><td>{p.restarts ?? "—"}</td></tr>{/each}</tbody>
-          </table></div>
-          {#if !run.pods?.length}<p class="empty-state">{inventory.cluster.available ? "No current pods" : inventory.cluster.error || "Process information unavailable"}</p>{/if}
         {/if}
       </details>
     {/if}
