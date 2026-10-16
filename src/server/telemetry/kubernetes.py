@@ -13,7 +13,6 @@ from typing import Any
 REQUEST_TIMEOUT = 6
 SCHEDULER_GROUP, SCHEDULER_VERSION = "openrl.io", "v1alpha1"
 MAX_POD_EVENTS = 10
-FAILED_TERMINATIONS = {"OOMKilled", "Error", "ContainerCannotRun"}
 _clients: tuple[Any, Any] | None = None
 
 
@@ -68,7 +67,8 @@ def container_summary(name: str, image: str | None, state=None, restarts: int = 
 
 
 def pod_problem(pod: Any) -> str | None:
-  """The one line that explains a pod that is not simply running."""
+  """The one line that explains a pod that is not simply running. A container
+  running again after a restart is not one; its restart count and incident say so."""
   phase = pod.status.phase or "Unknown"
   if phase == "Failed":
     detail = ": ".join(part for part in (pod.status.reason, pod.status.message) if part)
@@ -80,9 +80,6 @@ def pod_problem(pod: Any) -> str | None:
     ended = cs.state.terminated if cs.state else None
     if ended and (ended.exit_code or ended.reason not in (None, "Completed")):
       return f"{ended.reason or 'Terminated'}: exit code {ended.exit_code}{f' — {ended.message}' if ended.message else ''}"
-    previous = cs.last_state.terminated if cs.last_state else None
-    if previous and (cs.restart_count or 0) and previous.reason in FAILED_TERMINATIONS:
-      return f"{previous.reason}: {cs.name} exited {previous.exit_code} and restarted"
   if phase == "Pending":
     for cond in pod.status.conditions or []:
       if cond.type == "PodScheduled" and cond.status != "True":

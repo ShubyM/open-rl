@@ -87,6 +87,19 @@ class KubernetesInventoryTest(unittest.TestCase):
       ],
     )
 
+  def test_a_container_running_again_after_a_crash_is_not_a_problem(self):
+    at = datetime(2026, 1, 1, tzinfo=UTC)
+    crashed = client.V1ContainerState(terminated=client.V1ContainerStateTerminated(exit_code=1, reason="Error", finished_at=at))
+    running = client.V1ContainerState(running=client.V1ContainerStateRunning(started_at=at))
+    status = client.V1ContainerStatus(name="dispatcher", image="i", image_id="", ready=True, restart_count=1, state=running, last_state=crashed)
+    pod = client.V1Pod(
+      metadata=client.V1ObjectMeta(name="p", uid="uid"),
+      spec=client.V1PodSpec(containers=[client.V1Container(name="dispatcher")]),
+      status=client.V1PodStatus(phase="Running", container_statuses=[status]),
+    )
+    row = kubernetes.pod_summary(pod)
+    self.assertEqual((row["problem"], row["restarts"]), (None, 1))
+
   def test_a_probe_traceback_event_keeps_only_its_first_and_last_lines(self):
     probe = 'Readiness probe failed: Traceback (most recent call last):\n  File "<string>", line 2\nURLError: [Errno 111]\n'
     self.assertEqual(kubernetes.event_message(probe), "Readiness probe failed: Traceback (most recent call last): … URLError: [Errno 111]")
