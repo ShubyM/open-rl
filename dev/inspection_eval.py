@@ -80,6 +80,7 @@ def fixture(case):
     "created_at": NOW - 3600,
     "completed_at": None,
     "runtime_id": runtime,
+    "pool": f"sampler-{run_id}",
     "shared_runtime": shared,
     "status": "active",
     "display_status": "Queued" if queued else "Ready",
@@ -213,7 +214,7 @@ def fixture(case):
       {**operation, "pod_uid": process["uid"], "started_at": NOW - 110, "at": NOW - 100, "elapsed_seconds": 10},
     ]
     data["logs"] = [log_record(pod, "ERROR", "Previous worker OOMKilled, exit 137", NOW - 650)]
-  queue = {"trainer": int(queued), "sampler": 0}
+  queue = {"trainer": int(queued)}
   for item in state["runs"]:
     item["nodes"] = [] if queued else ["node-1"]
     recent = data["samples"].get(ops.key(item["run_id"]), [])

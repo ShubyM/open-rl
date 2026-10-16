@@ -128,6 +128,17 @@ class SnapshotJoinTest(unittest.TestCase):
     self.assertEqual(placements[0]["label"], "Qwen/Qwen3-8B")
     self.assertEqual(placements[0]["devices"], ["gpu.nvidia.com/n1/gpu-0"])
 
+  def test_the_pool_dispatcher_pod_belongs_to_the_runs_it_samples_for(self) -> None:
+    state = copy.deepcopy(STATE)
+    pool = TrainingModelMetadata.model_validate(RECORDS["r1"]).pool("r1")
+    state["pods"].append(
+      {**STATE["pods"][0], "name": "dispatcher", "uid": "p3", "owner_uids": [], "worker": None, "component": "dispatcher", "pool": pool}
+    )
+    runs = {r["run_id"]: r for r in snapshot.join_runs(METADATA, state)}
+    self.assertEqual(runs["r1"]["pool"], pool)
+    self.assertEqual({p["name"]: p["role"] for p in runs["r1"]["pods"]}, {"orw-lora-trainer": "trainer", "dispatcher": "dispatcher"})
+    self.assertNotIn("dispatcher", [p["name"] for p in runs["r2"]["pods"]])
+
   def test_a_finished_lora_run_lets_go_of_the_shared_runtime(self) -> None:
     done = {**METADATA[0], "model_id": "r0", "status": "completed", "created_at": 0}
     runs = {r["run_id"]: r for r in snapshot.join_runs([*METADATA, done], STATE)}
@@ -136,7 +147,7 @@ class SnapshotJoinTest(unittest.TestCase):
     self.assertEqual(sorted(placements[0]["run_ids"]), ["r1", "r3"])
 
 
-RUN = {"run_id": "r1", "runtime_id": "base", "created_at": 1}
+RUN = {"run_id": "r1", "runtime_id": "base", "pool": "sampler-base", "created_at": 1}
 NOW = 10_000
 
 
@@ -152,8 +163,8 @@ def steps(*ats):
 class ProgressTest(unittest.TestCase):
   """Progress comes from what completes and what is still waiting, not from which processes are up."""
 
-  def verdict(self, processes=(), recent=(), queued=None):
-    return snapshot.progress(RUN, list(processes), list(recent), queued or {"trainer": 0, "sampler": 0}, NOW)
+  def verdict(self, processes=(), recent=(), queued=None, backlog=(0, None)):
+    return snapshot.progress(RUN, list(processes), list(recent), queued or {"trainer": 0}, NOW, backlog)
 
   def test_completing_requests_are_ok(self):
     result = self.verdict([process(("forward_backward", "r1", NOW - 60))], steps(NOW - 300, NOW - 200, NOW - 100))
@@ -174,14 +185,29 @@ class ProgressTest(unittest.TestCase):
     self.assertIn("forward_backward", result["reason"])
 
   def test_queued_requests_with_nothing_completing_are_stalled(self):
-    result = self.verdict(recent=steps(NOW - 3600), queued={"trainer": 0, "sampler": 4})
+    result = self.verdict(recent=steps(NOW - 3600), queued={"trainer": 4})
     self.assertEqual(result["state"], "STALLED")
     self.assertIn("4 request(s) queued", result["reason"])
 
   def test_nothing_queued_or_outstanding_for_long_is_idle(self):
     self.assertEqual(self.verdict(recent=steps(NOW - 3600))["state"], "IDLE")
     self.assertEqual(self.verdict(recent=steps(NOW - 60))["state"], "OK")
-    self.assertEqual(self.verdict(queued={"trainer": None, "sampler": None})["state"], "IDLE")
+    self.assertEqual(self.verdict(queued={"trainer": None})["state"], "IDLE")
+
+  def test_samples_waiting_in_the_pool_are_judged_by_their_dispatcher(self):
+    dispatcher = {"id": "d", "pod": "sampler-base-0", "role": "dispatcher", "pool": "sampler-base", "phase": "ready", "heartbeat_at": NOW}
+    recent = steps(NOW - 30)
+    result = self.verdict([dispatcher], recent, backlog=(3, NOW - 60))
+    self.assertEqual((result["state"], result["outstanding"][0]["count"], result["dispatcher"]["pod"]), ("OK", 3, "sampler-base-0"))
+    loading = {**dispatcher, "last_error": "loading /ckpt/7 on sampler-0: HTTPStatusError"}
+    result = self.verdict([loading], recent, backlog=(3, NOW - 1200))
+    self.assertEqual(result["state"], "STALLED")
+    self.assertIn("waiting in pool sampler-base", result["reason"])
+    self.assertIn("loading /ckpt/7", result["reason"])
+    self.assertEqual(self.verdict([{**dispatcher, "heartbeat_at": NOW - 120}], recent, backlog=(3, NOW - 60))["state"], "DEAD")
+    # A pool whose dispatcher has not reported yet is waiting, not dead.
+    result = self.verdict([], recent, backlog=(3, NOW - 60))
+    self.assertEqual((result["state"], result["outstanding"][0]["process_alive"]), ("OK", None))
 
   def test_only_this_runs_requests_on_a_shared_runtime_count(self):
     other = process(("sample", "r2", NOW - 5000), heartbeat_at=0)

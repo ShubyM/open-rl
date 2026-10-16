@@ -402,12 +402,15 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(dispatcher["image"], "ghcr.io/gke-labs/open-rl/server:latest")  # the worker image unless a dispatcher image is set
     with patch.dict(os.environ, {"OPEN_RL_DISPATCHER_IMAGE": "registry/api-server:v1"}):
       self.assertEqual(dispatcher_body("sampler-fft-job")["spec"]["template"]["spec"]["containers"][0]["image"], "registry/api-server:v1")
+    identity = {e["name"]: e["valueFrom"]["fieldRef"]["fieldPath"] for e in dispatcher["env"] if e["name"] in ("POD_NAME", "POD_UID", "NODE_NAME")}
+    self.assertEqual(identity, {"POD_NAME": "metadata.name", "POD_UID": "metadata.uid", "NODE_NAME": "spec.nodeName"})
     selector = "app.kubernetes.io/component=sampler,app.kubernetes.io/instance=sampler-fft-job"
     self.assertEqual(
       epp["args"][:6], ["--endpoint-selector", selector, "--endpoint-target-ports", "8000", "--config-file", "/etc/sampler-router/epp.yaml"]
     )
     policy = k8s.objects[("network_policy", "sampler-fft-job")]["spec"]
     self.assertEqual((policy["podSelector"]["matchLabels"], policy["ingress"][0]["ports"]), (labels, [{"port": 8000}, {"port": 5557}]))
+    self.assertEqual(policy["ingress"][1]["from"][0]["namespaceSelector"]["matchLabels"], {"kubernetes.io/metadata.name": "gmp-system"})
     self.assertEqual(manager.release_owner("fft-job"), {"fft-job"})
     self.assertEqual((k8s.objects, self.api.existing), ({}, {}))
 

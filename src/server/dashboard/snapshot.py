@@ -11,8 +11,9 @@ from datetime import UTC, datetime
 
 from server import openrl_status
 from server.model_metadata import decode_model_metadata
+from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
-from server.store import StateStore, request_queue, sampling_queue
+from server.store import StateStore, request_queue
 from server.telemetry import kubernetes, ops
 from server.worker_manager import FAILED, READY, STARTING, STOPPED, WAITING_FOR_PLACEMENT
 
@@ -96,14 +97,16 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
     meta = decode_model_metadata(json.dumps(row))
     kind = "lora" if meta.fine_tuning_type == "lora" else "fft"
     runtime = meta.runtime(run_id)
-    shared = runtime != run_id
+    shared, pool = runtime != run_id, meta.pool(run_id)
     matched = [w for w in workloads if w.get("model_id") == runtime and w.get("training_kind") == kind and not (meta.status != "active" and shared)]
     pods = []
     for pod in state["pods"]:
       owned = [w for w in matched if w["uid"] in pod["owner_uids"] or (w.get("pod_name") == pod["name"] and pod.get("worker") == w["name"])]
-      if owned:
+      # The pool's CPU pod (dispatcher, Envoy, EPP) is a Deployment, not a Workload; its label names the pool.
+      dispatcher = pod.get("component") == "dispatcher" and pod.get("pool") == pool
+      if owned or dispatcher:
         pod = pod.copy()
-        pod.update(role=owned[0].get("role"), shared_runtime=shared, runtime_id=runtime)
+        pod.update(role=owned[0].get("role") if owned else "dispatcher", shared_runtime=shared, runtime_id=runtime)
         pod["devices"] = sorted({device for w in owned for device in claims.get(w.get("claim_name"), [])})
         pods.append(pod)
     runs.append(
@@ -116,6 +119,7 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
         "git_rev": row.get("git_rev"),
         "fine_tuning_type": meta.fine_tuning_type,
         "runtime_id": runtime,
+        "pool": pool,
         "shared_runtime": shared,
         "status": meta.status,
         "created_at": meta.created_at,
@@ -135,13 +139,14 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
   return sorted(runs, key=lambda r: r["created_at"], reverse=True)
 
 
-def progress(run: dict, processes: list[dict], recent: list, queued: dict, now: float) -> dict:
+def progress(run: dict, processes: list[dict], recent: list, queued: dict, now: float, backlog: tuple = (0, None)) -> dict:
   """Whether an active run is moving, judged by what completes rather than by which processes are up.
 
-  DEAD: a process that popped the run's requests stopped reporting, so nothing will answer them.
-  STALLED: a request has been on a worker, or requests have sat queued, for longer than
-  three median steps (at least STALL_SECONDS). IDLE: nothing is queued or running and nothing
-  completed for that long, so the client is not sending work. OK otherwise."""
+  DEAD: requests are held by a process that stopped reporting: a trainer that popped them, or the
+  dispatcher of the pool whose stream they wait in. STALLED: a request has been on a trainer, waited
+  in the sampling pool, or sat in the trainer queue for longer than three median steps (at least
+  STALL_SECONDS). IDLE: nothing is queued or running and nothing completed for that long, so the
+  client is not sending work. OK otherwise."""
   outstanding = [
     {
       **group,
@@ -149,12 +154,33 @@ def progress(run: dict, processes: list[dict], recent: list, queued: dict, now: 
       "phase": process.get("phase"),
       "process_alive": ops.alive(process, now),
       "age_seconds": now - group["since"],
+      "where": f"on {process.get('pod') or process['id']} ({process.get('phase')})",
     }
     for process in processes
-    if process.get("runtime_id") == run["runtime_id"]
+    if process.get("runtime_id") == run["runtime_id"] and process.get("role") != "dispatcher"
     for group in process.get("outstanding", [])
     if group.get("run_id") == run["run_id"]
   ]
+  # The pool's stream holds every sample not yet answered; its dispatcher is what answers them.
+  dispatchers = [p for p in processes if p.get("role") == "dispatcher" and p.get("pool") == run["pool"]]
+  dispatcher = max(dispatchers, key=lambda p: p.get("heartbeat_at", 0), default=None)
+  count, since = backlog
+  if count:
+    pod, phase = (dispatcher.get("pod") or dispatcher["id"], dispatcher.get("phase")) if dispatcher else ("no dispatcher", None)
+    error = f"; last error: {dispatcher['last_error']}" if dispatcher and dispatcher.get("last_error") else ""
+    outstanding.append(
+      {
+        "op": "sample",
+        "pool": run["pool"],
+        "count": count,
+        "since": since,
+        "pod": pod,
+        "phase": phase,
+        "process_alive": ops.alive(dispatcher, now) if dispatcher else None,
+        "age_seconds": now - since,
+        "where": f"waiting in pool {run['pool']} for dispatcher {pod} ({phase}{error})",
+      }
+    )
   done = [sample for sample in recent if isinstance(sample, dict) and isinstance(sample.get("at"), int | float)]
   last = max((sample["at"] for sample in done), default=None)
   steps = sorted(sample["at"] for sample in done if sample.get("operation") == "optim_step" and sample.get("status") == "succeeded")
@@ -162,11 +188,12 @@ def progress(run: dict, processes: list[dict], recent: list, queued: dict, now: 
   patience = max(STALL_SECONDS, 3 * (step_seconds or 0))
   quiet = now - (last if last is not None else run["created_at"] or now)
   waiting = sum(count for count in queued.values() if count)
-  lost = [o for o in outstanding if not o["process_alive"]]
+  lost = [o for o in outstanding if o["process_alive"] is False]
   oldest = max(outstanding, key=lambda o: o["age_seconds"], default=None)
-  held = oldest and f"{oldest['op']} has been on {oldest['pod']} ({oldest['phase']}) for {oldest['age_seconds'] / 60:.0f} min"
+  held = oldest and f"{oldest['op']} has been {oldest['where']} for {oldest['age_seconds'] / 60:.0f} min"
   if lost:
-    state, reason = "DEAD", f"{sum(o['count'] for o in lost)} {lost[0]['op']} request(s) were taken by {lost[0]['pod']}, which stopped reporting"
+    holder = f"waiting in pool {lost[0]['pool']} for dispatcher" if lost[0]["op"] == "sample" else "held by"
+    state, reason = "DEAD", f"{lost[0]['count']} {lost[0]['op']} request(s) {holder} {lost[0]['pod']}, which stopped reporting"
   elif oldest and oldest["age_seconds"] > patience:
     state, reason = "STALLED", held
   elif waiting and quiet > patience:
@@ -175,21 +202,25 @@ def progress(run: dict, processes: list[dict], recent: list, queued: dict, now: 
     state, reason = "IDLE", f"nothing queued or running, and nothing completed for {quiet / 60:.0f} min: the client is not sending work"
   else:
     state, reason = "OK", held or (f"last op completed {quiet / 60:.0f} min ago" if last is not None else "no ops yet")
-  return {"state": state, "reason": reason, "last_completed_at": last, "step_seconds": step_seconds, "outstanding": outstanding, "queued": queued}
+  result = {"state": state, "reason": reason, "last_completed_at": last, "step_seconds": step_seconds, "outstanding": outstanding, "queued": queued}
+  if dispatcher:
+    result["dispatcher"] = {key: value for key, value in dispatcher.items() if key not in ("turns", "outstanding")}
+  return result
+
+
+async def pool_backlog(store: StateStore, pool: str) -> tuple[int, float | None]:
+  redis = getattr(store, "redis", None)  # pools need Redis; the in-memory store has none
+  return await SamplingStore(redis).backlog(pool) if redis is not None else (0, None)
 
 
 async def add_progress(store: StateStore, run: dict, processes: list[dict], now: float) -> None:
-  reads = (
-    store.read_samples(ops.key(run["run_id"]), last=50),
-    store.list_length(request_queue(run["run_id"])),
-    store.list_length(sampling_queue(run["runtime_id"])),
-  )
+  reads = (store.read_samples(ops.key(run["run_id"]), last=50), store.list_length(request_queue(run["run_id"])), pool_backlog(store, run["pool"]))
   try:
-    recent, trainer, sampler = await asyncio.wait_for(asyncio.gather(*reads), timeout=5)
+    recent, trainer, backlog = await asyncio.wait_for(asyncio.gather(*reads), timeout=5)
   except Exception as exc:
     run["progress"] = {"state": "UNKNOWN", "reason": f"progress unavailable: {type(exc).__name__}"}
     return
-  run["progress"] = progress(run, processes, recent, {"trainer": trainer, "sampler": sampler}, now)
+  run["progress"] = progress(run, processes, recent, {"trainer": trainer}, now, backlog)
   if run["progress"]["state"] in ("DEAD", "STALLED") and run["display_status"] in ("Ready", "Active"):
     run["display_status"] = "Stalled"
 

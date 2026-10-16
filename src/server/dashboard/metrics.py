@@ -1,4 +1,4 @@
-"""Physical GPU and worker series, independent of allocation lookup."""
+"""Physical GPU, worker and vLLM sampler series, independent of allocation lookup."""
 
 import asyncio
 import os
@@ -21,11 +21,13 @@ def hardware() -> tuple[PromQL | None, str | None]:
   return None, "No GPU metrics source: not on GKE and OPEN_RL_PROMETHEUS_URL is unset"
 
 
-async def series(state: dict, node_id=None, since=None, until=None) -> dict:
+async def series(state: dict, node_id=None, since=None, until=None, run_id=None) -> dict:
+  """A node's devices and workers, idle GPUs included; or a run's, with its samplers' vLLM series."""
   start, end = gke.time_range(since, until)
   low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
-  placements = [p for p in segments(state, node_id=node_id) if p["start"] <= high and p["end"] >= low]
-  current = {d["id"]: d.get("uuid") for n in state["cluster"]["nodes"] if not node_id or n.get("name") == node_id for d in n["devices"]}
+  placements = [p for p in segments(state, run_id=run_id, node_id=node_id) if p["start"] <= high and p["end"] >= low]
+  nodes = [n for n in state["cluster"]["nodes"] if not node_id or n.get("name") == node_id]
+  current = {d["id"]: d.get("uuid") for n in nodes for d in n["devices"]}
   devices, workers = {}, {}
   for placement in placements:
     for identity in placement["devices"]:
@@ -40,7 +42,8 @@ async def series(state: dict, node_id=None, since=None, until=None) -> dict:
   known = {identity for identity, _ in devices}
   # The browser serializes snapshot timestamps to milliseconds.
   live_window = high >= datetime.fromisoformat(state["observed_at"]).timestamp() - 0.001
-  devices.update({(identity, uuid): None for identity, uuid in current.items() if live_window or identity not in known})
+  if not run_id:
+    devices.update({(identity, uuid): None for identity, uuid in current.items() if live_window or identity not in known})
   backend, reason = hardware()
 
   async def query(method, rows, key, fields):
@@ -61,9 +64,19 @@ async def series(state: dict, node_id=None, since=None, until=None) -> dict:
       )
     return rows, error
 
-  (gpu, gpu_error), (cpu, cpu_error) = await asyncio.gather(
+  async def samplers():
+    pods = sorted({p["pod"] for p in placements if p.get("role") == "sampler" and p.get("pod")})
+    if not run_id or backend is None or not pods:
+      return {}, None if not run_id or pods else "No sampler pods for this run in this window"
+    try:
+      return await backend.samplers(pods, low, high), None
+    except Exception:
+      return {}, "vLLM sampler metrics unavailable"
+
+  (gpu, gpu_error), (cpu, cpu_error), (vllm, vllm_error) = await asyncio.gather(
     query("devices", [{"id": identity, "uuid": uuid} for identity, uuid in devices], "uuid", ("utilization", "memory_mib")),
     query("workers_series", list(workers.values()), "pod", ("cpu_cores", "memory_bytes")),
+    samplers(),
   )
   result = {
     "source": backend.name if backend else None,
@@ -72,6 +85,7 @@ async def series(state: dict, node_id=None, since=None, until=None) -> dict:
     "until": end,
     "devices": gpu,
     "workers": cpu,
+    **({"samplers": vllm, "samplers_reason": vllm_error or reason} if run_id else {}),
   }
   result["available"] = any(d["utilization"] or d["memory_mib"] for d in result["devices"]) or any(
     w["cpu_cores"] or w["memory_bytes"] for w in result["workers"]

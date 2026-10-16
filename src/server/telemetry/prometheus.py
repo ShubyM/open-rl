@@ -7,6 +7,7 @@ gmp-frontend, or Cloud Monitoring's PromQL endpoint directly.
 Answers two questions, keyed the way the inventory names things, over [start, end]:
   devices(uuids, start, end)        -> {uuid: {"utilization": [[t, %]], "memory_mib": [[t, MiB]]}}
   workers_series(pods, start, end)  -> {pod: {"cpu_cores": [[t, cores]], "memory_bytes": [[t, B]]}}
+  samplers(pods, start, end)        -> {name: [[t, value]]}, summed over a run's vLLM replicas
 """
 
 import asyncio
@@ -17,6 +18,17 @@ from collections.abc import Callable
 import httpx
 
 GPU_METRICS = {"utilization": "DCGM_FI_DEV_GPU_UTIL", "memory_mib": "DCGM_FI_DEV_FB_USED"}
+# From vLLM's and llm-d's published Grafana dashboards; M is the replica matcher.
+SAMPLER_QUERIES = {
+  "generation_tokens_per_second": "sum(rate(vllm:generation_tokens_total{M}[2m]))",
+  "prompt_tokens_per_second": "sum(rate(vllm:prompt_tokens_total{M}[2m]))",
+  "requests_running": "sum(vllm:num_requests_running{M})",
+  "requests_waiting": "sum(vllm:num_requests_waiting{M})",
+  "kv_cache_usage": "max(vllm:kv_cache_usage_perc{M})",
+  "preemptions_per_second": "sum(rate(vllm:num_preemptions_total{M}[2m]))",
+  "time_to_first_token_p99_seconds": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{M}[2m])))",
+  "request_latency_p99_seconds": "histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{M}[2m])))",
+}
 MAX_POINTS = 600
 MIN_STEP_SECONDS = 15
 
@@ -75,3 +87,8 @@ class PromQL:
       self.query_range(f'sum by (pod_name) (kubernetes_io:container_memory_used_bytes{{{match},memory_type="non-evictable"}})', start, end),
     )
     return {pod: {"cpu_cores": cpu.get(pod, []), "memory_bytes": memory.get(pod, [])} for pod in pods}
+
+  async def samplers(self, pods: list[str], start: float, end: float) -> dict[str, list[list[float]]]:
+    match = f"{{namespace={json.dumps(self.namespace)},pod=~{any_of(pods)}{self.scope('cluster')}}}"
+    results = await asyncio.gather(*(self.query_range(query.replace("{M}", match), start, end) for query in SAMPLER_QUERIES.values()))
+    return {name: found.get("", []) for name, found in zip(SAMPLER_QUERIES, results, strict=True)}

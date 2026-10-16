@@ -64,6 +64,8 @@ class PoolAcceptTest(RedisTestCase):
     freeze_adapter(model_id, self.base, ref)
     self.assertEqual((await self.sample(1, refused["session"]))["status"], 200)
     self.assertEqual(await self.pending(meta.pool(model_id), "model"), [snapshot_name(ref)])
+    # The pool is shared by every LoRA run on the base model; the record names the run it samples for.
+    self.assertEqual(await self.pending(meta.pool(model_id), "run_id"), [model_id])
 
   async def test_pool_names_are_valid_kubernetes_names(self) -> None:
     pools = {default_metadata("Qwen/Qwen3.5-9B").pool("Qwen/Qwen3.5-9B"), TrainingModelMetadata(base_model="Qwen/Qwen3-8B").pool("job")}

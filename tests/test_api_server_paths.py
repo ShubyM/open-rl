@@ -316,14 +316,6 @@ class SampleSequenceIdsTest(ApiServerTest):
       promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)
 
-  def test_shared_sampler_keeps_the_logical_run_separate_from_its_runtime_queue(self) -> None:
-    asyncio.run(api_server.state.set_value("open_rl:model_meta:run-a", json.dumps({"base_model": "base", "fine_tuning_type": "lora"})))
-    with patch.object(api_server, "get_sampler_backend", return_value="vllm"):
-      response = self.post("asample", {"sampling_session_id": "tinker://run-a/sampler_weights/step-1", "prompt": {"chunks": [{"tokens": [1]}]}})
-    self.assertEqual(response.status_code, 200)
-    request = asyncio.run(api_server.store.get_sampling_requests_for_model("base"))[0]
-    self.assertEqual((request["model_id"], request["logical_run_id"]), ("base", "run-a"))
-
 
 if __name__ == "__main__":
   unittest.main()

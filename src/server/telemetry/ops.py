@@ -109,10 +109,11 @@ class Worker:
 
 
 @asynccontextmanager
-async def serving(role: str, runtime_id: str | None):
+async def serving(role: str, runtime_id: str | None, **fields):
   """Keep this process's record fresh while the body runs; a clean exit says so."""
   global current
   current = worker = Worker(role, runtime_id)
+  worker.record.update(fields)
 
   async def save():
     with suppress(Exception):
@@ -132,6 +133,12 @@ async def serving(role: str, runtime_id: str | None):
     set_phase("exited")
     await save()
     current = None
+
+
+def note(**fields) -> None:
+  """Add what this process knows about its own state to its record."""
+  if current is not None:
+    current.record.update(fields)
 
 
 def set_phase(phase: str) -> None:
@@ -198,8 +205,11 @@ async def observe_operation(request: dict, role: str, runtime_id: str | None, ca
       record(request, role, runtime_id, started_at, status, error_type, result)
 
 
-def record(request: dict, role: str, runtime_id: str | None, started_at: float, status: str, error_type: str | None, result: dict) -> None:
-  # No request payloads, outputs or exception messages are recorded.
+def record(
+  request: dict, role: str, runtime_id: str | None, started_at: float, status: str, error_type: str | None, result: dict, where: dict | None = None
+) -> None:
+  """`where` names the pod the op ran on, when that is not this process's own pod.
+  No request payloads, outputs or exception messages are recorded."""
   run_id = run_of(request)
   if not run_id:
     return
@@ -216,7 +226,7 @@ def record(request: dict, role: str, runtime_id: str | None, started_at: float, 
     "status": status,
     "error_type": error_type,
     "elapsed_seconds": at - started_at,
-    **worker_identity(),
+    **(worker_identity() if where is None else where),
     "metrics": {name: value for name, value in metrics.items() if math.isfinite(value)},
   }
   # JSON has no NaN or infinity; name them so a NaN grad norm is not just missing.

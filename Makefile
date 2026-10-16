@@ -368,12 +368,9 @@ pull-vm:
 	rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' --exclude 'scratch' $(REMOTE_HOST):~/open-rl/ ./
 
 # Native dashboard assets are built once; Python serves the resulting static files.
-.PHONY: dashboard-build dashboard-test dashboard
+.PHONY: dashboard-build dashboard
 dashboard-build:
 	npm --prefix dev/dashboard run build
-
-dashboard-test:
-	npm --prefix dev/dashboard test
 
 dashboard: dashboard-build
 	uv run --extra cluster python -m server.dashboard --port 8080

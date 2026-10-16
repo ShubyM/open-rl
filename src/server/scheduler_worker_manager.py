@@ -254,6 +254,10 @@ def dispatcher_body(pool: str) -> dict[str, Any]:
     {"name": "OPEN_RL_TMP_DIR", "value": os.getenv("OPEN_RL_TMP_DIR", "/mnt/shared/open-rl")},
     {"name": "OPEN_RL_SAMPLER_POOL", "value": pool},
     downward("OPEN_RL_WORKER_NAMESPACE", "metadata.namespace"),
+    # The pod identity the dispatcher's record carries, so progress names its pod.
+    downward("POD_NAME", "metadata.name"),
+    downward("POD_UID", "metadata.uid"),
+    downward("NODE_NAME", "spec.nodeName"),
   ]
   if concurrency := os.getenv("OPEN_RL_DISPATCH_CONCURRENCY"):
     env.append({"name": "OPEN_RL_DISPATCH_CONCURRENCY", "value": concurrency})
@@ -312,7 +316,8 @@ def dispatcher_body(pool: str) -> dict[str, Any]:
 
 
 def network_policy_body(pool: str) -> dict[str, Any]:
-  """Only the pool's CPU pod reaches its samplers, for inference and KV events."""
+  """Only the pool's CPU pod reaches its samplers, for inference and KV events, and
+  Managed Service for Prometheus scrapes their metrics."""
   return {
     "apiVersion": "networking.k8s.io/v1",
     "kind": "NetworkPolicy",
@@ -320,7 +325,10 @@ def network_policy_body(pool: str) -> dict[str, Any]:
     "spec": {
       "podSelector": {"matchLabels": pool_labels("sampler", pool)},
       "policyTypes": ["Ingress"],
-      "ingress": [{"from": [{"podSelector": {"matchLabels": pool_labels("dispatcher", pool)}}], "ports": [{"port": 8000}, {"port": 5557}]}],
+      "ingress": [
+        {"from": [{"podSelector": {"matchLabels": pool_labels("dispatcher", pool)}}], "ports": [{"port": 8000}, {"port": 5557}]},
+        {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "gmp-system"}}}], "ports": [{"port": 8000}]},
+      ],
     },
   }
 

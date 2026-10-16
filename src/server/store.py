@@ -121,10 +121,6 @@ def request_queue(model_id: str) -> str:
   return f"open_rl:queue:{model_id}"
 
 
-def sampling_queue(model_id: str) -> str:
-  return f"open_rl:sampler_queue:{model_id}"
-
-
 class RedisStore(RequestStore):
   def __init__(self, client: redis.Redis):
     self.redis = client

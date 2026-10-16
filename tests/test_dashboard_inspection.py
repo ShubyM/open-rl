@@ -125,6 +125,10 @@ class InspectionActivityTest(unittest.TestCase):
         self.assertEqual((lane["end"], lane["ended"]), (record["heartbeat_at"], True))
         self.assertEqual((lane["devices"], lane["device_uuids"], lane["device_count"]), (["gpu-0"], {"gpu-0": "GPU-1"}, 1))
 
+  def test_a_pool_dispatcher_is_not_a_gpu_lane(self):
+    dispatcher = {**PROCESS, "id": "d", "role": "dispatcher", "runtime_id": None, "gpus": [], "pool": "sampler-r1"}
+    self.assertEqual([lane["id"] for lane in inspection.segments(state(processes=[PROCESS, dispatcher]))], ["p1"])
+
   def test_a_placed_workload_is_a_lane_before_its_process_reports(self):
     (lane,) = inspection.segments(state(processes=[]))
     self.assertEqual((lane["id"], lane["start"], lane["end"], lane["ended"]), ("w1", 90, 200, False))
@@ -147,6 +151,12 @@ class InspectionActivityTest(unittest.TestCase):
     self.assertEqual(result["intervals"], [[120, 145], [170, 190]])
     self.assertEqual(result["ops"], {"train": [[120, 145], [170, 190]]})
     self.assertFalse(result["exact"])
+
+  def test_dispatcher_sample_ops_land_on_the_replica_that_answered(self):
+    sampler = {**PLACEMENT, "id": "s1", "name": "sampler", "role": "sampler", "pod": "sampler-0", "pod_uid": "u-s"}
+    sample = {"run_id": "r1", "role": "sampler", "pod": "sampler-0", "operation": "sample", "started_at": 120, "at": 150}
+    (lane,) = inspection.activity(state(live=[sampler], processes=[]), 100, 200, {"r1": {"samples": [sample]}})["placements"]
+    self.assertEqual((lane["intervals"], list(lane["ops"])), ([[120, 150]], ["sample"]))
 
   def test_ops_from_a_previous_pod_with_the_same_name_stay_off_the_lane(self):
     operations = {"r1": {"samples": [operation(160, 180, pod_uid="previous-pod"), operation(180, 190)]}}

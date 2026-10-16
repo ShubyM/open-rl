@@ -151,7 +151,6 @@ JSON line, so on Kubernetes it reaches Cloud Logging with the event's severity.
 Find a session's events with `jsonPayload.session_id="<id>"`. Clients turn
 this off with `TINKER_TELEMETRY=0`.
 
-With `OTEL_TRACES_EXPORTER` set, the trainer and sampler continue each request's
-trace. A client that traces its own HTTP calls, as
+With `OTEL_TRACES_EXPORTER` set, the trainer continues each request's trace. A client that traces its own HTTP calls, as
 `examples/autoresearch/telemetry.py` does, gets one trace from the client
 through the workers.

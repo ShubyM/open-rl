@@ -15,20 +15,24 @@ diagnose a run.
 |---|---|
 | `/api/v1/inspect/inventory` | Find the run: `runs[]` has `progress`, `display_status`, `summary`, `workers`, `workers_error`, `session_live`, `settings`, `steps`, `pods` and `workloads`. Also `placements`, `cluster` (nodes, pods, scheduler) and `*_error` fields for unavailable sources |
 | `/api/v1/inspect/activity?run_id=…` or `?node_id=…` | What ran where and when: one lane per worker process in `placements[]`, with `intervals`, `ops`, `phase` and `ended`. With `run_id`, also `run`, op `samples` and pod `incidents` |
-| `/api/v1/inspect/series?node_id=…` | Physical GPU utilization and memory (`devices`), worker CPU and memory (`workers`) |
+| `/api/v1/inspect/series?node_id=…` or `?run_id=…` | Physical GPU utilization and memory (`devices`), worker CPU and memory (`workers`). With `run_id`, the run's vLLM `samplers`: throughput, running and waiting requests, KV cache, preemptions, p99 latencies |
 | `/api/v1/inspect/logs?run_id=…` | The run's Cloud Logging `records`, with `q`, `pod` and `severity` filters. Pass `next_cursor` back as `cursor` for older records |
 | `/api/v1/inspect/pods/{pod}/logs` | Kubelet output when run logs are unavailable; `previous=true` returns the output from before the last restart |
 
 Start with inventory and anchor the investigation to its `observed_at`. For a run that is
 stuck, slow or not advancing, read `runs[].progress` first:
 
-- `DEAD`: a worker took the run's requests and stopped reporting. `outstanding` names the
-  pod; nothing will answer those requests, so the client will wait until it times out.
-  Look for the pod's restart or OOM in `incidents` and its previous logs.
+- `DEAD`: a process holding the run's requests stopped reporting: a trainer that popped
+  them, or the dispatcher of the pool its samples wait in. `outstanding` names the pod.
+  Look for its restart or OOM in `incidents` and its previous logs. A trainer's requests
+  will not be answered; samples stay in the pool until a dispatcher runs again.
 - `STALLED`: `outstanding` shows which op has been on which worker, for how long and in
   which `phase`. `waiting_gpu` means the time slicer has not granted the GPU; `on_gpu`
   means the op itself is slow or hung; `starting` means the process never finished
   loading. Requests in `queued` with nothing outstanding mean no worker is taking them.
+  For samples waiting in a pool, read `progress.dispatcher`: a replica whose weight
+  version is not the `revision`, a replica in `loading`, and `last_error` say why
+  nothing is being sent. Then check the samplers' `requests_waiting` and KV cache.
 - `IDLE`: nothing is queued or running. The server is waiting for the client, so look at
   the client (its loop, its batch arithmetic, a stopped process) before the cluster.
 - `OK` with a slow run: compare `step_seconds` with what the run expects, then use activity.

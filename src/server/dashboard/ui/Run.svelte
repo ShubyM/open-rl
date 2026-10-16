@@ -6,7 +6,7 @@
   import Logs from "./Logs.svelte";
   import CopyLink from "./CopyLink.svelte";
   import Configuration from "./Configuration.svelte";
-  import { duration, shortNodeName, samplerPodPattern, KINDS, runDescription } from "./format.js";
+  import { duration, shortNodeName, KINDS, runDescription } from "./format.js";
   let { inventory, view } = $props();
   const range = $derived(rangeOf(inventory, view));
   const validEvent = $derived(view.event === null || (view.event >= range.start && view.event <= range.now));
@@ -22,11 +22,11 @@
   const names = $derived([...new Set(samples.flatMap((s) => Object.entries(s.metrics || {}).filter(([, v]) => Number.isFinite(v)).map(([k]) => k)))].slice(0, 12));
   const metricStatus = $derived(detail.error ? `${detail.error}${samples.length ? " · Showing previously fetched metrics" : ""}` : detail.pending ? "Updating…" : "");
   const custom = $derived(view.end !== null || ![600, 1800, 3600].includes(view.duration));
-  const samplerPods = $derived(samplerPodPattern(run, detail.data?.placements));
-  const grafana = $derived(new URLSearchParams({ orgId: "1", "var-pod": samplerPods || "",
-    ...(range.live ? { from: `now-${view.duration / 60}m`, to: "now", refresh: "30s" } : { from: String(Math.round(range.start * 1000)), to: String(Math.round(range.now * 1000)) }),
-    theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light" }).toString());
-  const panels = [[8, "Token throughput"], [3, "Running and waiting requests"], [4, "KV cache use"], [5, "Time to first token"], [9, "End-to-end request latency"]];
+  const metricsOpen = () => view.tab === "metrics" && `${view.id} ${view.duration} ${view.end}`;
+  const vllm = createQuery(() => inspectUrl("series", { run_id: view.id, since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() }), { poll: 15000, pollWhen: () => view.end === null, key: metricsOpen });
+  // The vLLM series the inspection API returns for a run's samplers, as vLLM's and llm-d's dashboards chart them.
+  const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
+    ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
   const link = (tab, changes = {}) => viewLink(`run/${encodeURIComponent(view.id)}/${tab}`, { duration: view.duration, end: view.end, back: view.back, event: view.event, q: view.q, pod: view.pod, ...changes });
 </script>
 
@@ -99,13 +99,14 @@
             {#each names as name (name)}<Chart title={name} points={samples.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]])} start={range.start} end={range.now} tone="accent" />{/each}
             {#if !samples.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">No operations recorded in this time range</p>{/if}
           </div>
-          {#if inventory.grafana}
-            {#if samplerPods}
-            <h2 class="scheduler-title">Samplers</h2><p class="muted"><a href={`/grafana/d/vllm/vllm?${grafana}`} target="_blank" rel="noopener">Open in Grafana ↗</a></p>
-            {#if run.shared_runtime}<p class="muted">Shared sampler metrics include other runs using this runtime.</p>{/if}
-            <div class="grafana-grid">{#each panels as [id, label] (id)}<iframe class="grafana-panel" title={label} loading="lazy" src={`/grafana/d-solo/vllm/vllm?${grafana}&panelId=${id}`}></iframe>{/each}</div>
-            {:else}<p class="muted">No sampler pods identified for this run.</p>{/if}
-          {/if}
+          <h2 class="scheduler-title">Samplers</h2>
+          {#if run.shared_runtime}<p class="muted">The pool's samplers also serve other runs on this base model.</p>{/if}
+          {#if vllm.error}<p class="source-error" role="status">{vllm.error}</p>
+          {:else if !vllm.data}<p class="muted">Loading…</p>
+          {:else if !Object.values(vllm.data.samplers || {}).some((points) => points.length)}<p class="muted">{vllm.data.samplers_reason || "No sampler samples in this time range"}</p>
+          {:else}<div class="chart-grid">
+            {#each SAMPLER_CHARTS as [key, title, unit, scale = 1] (key)}<Chart {title} {unit} points={(vllm.data.samplers[key] || []).map(([at, value]) => [at, value * scale])} start={range.start} end={range.now} min={0} />{/each}
+          </div>{/if}
           <h2 class="scheduler-title">Processes</h2>
           {#if run.shared_runtime}<p class="muted">Shared LoRA runtime</p>{/if}
           <div class="table-scroll"><table class="run-table"><thead><tr><th>Process</th><th>Kind</th><th>Node</th><th>State</th><th>Restarts</th></tr></thead>

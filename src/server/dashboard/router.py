@@ -1,14 +1,12 @@
 """The operator UI and the same read-only JSON API for agents."""
 
 import asyncio
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
-import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
 from server.dashboard import inspection, metrics
@@ -19,11 +17,6 @@ from server.telemetry import gke, kubernetes, ops
 
 router = APIRouter(tags=["inspection"])
 STATIC = Path(__file__).parent / "static"
-# Grafana served under /grafana, proxied so the UI can embed its panels from one address.
-GRAFANA_URL = os.getenv("OPEN_RL_GRAFANA_URL", "").rstrip("/")
-# Headers that describe the hop rather than the content; httpx also decodes bodies.
-HOP_HEADERS = {"host", "connection", "content-length", "content-encoding", "transfer-encoding", "keep-alive"}
-grafana_client: httpx.AsyncClient | None = None
 TimeBound = Annotated[
   str | None,
   Query(
@@ -72,7 +65,7 @@ async def inventory():
   """Current runs, placements, nodes and scheduler state, with an error field per unavailable source."""
   await gke.discover()
   state = await snapshot.current(get_state_store())
-  return {**{key: value for key, value in state.items() if key != "processes"}, "grafana": bool(GRAFANA_URL)}
+  return {key: value for key, value in state.items() if key != "processes"}
 
 
 @router.get("/api/v1/inspect/activity", operation_id="activity", response_model=Activity, response_model_exclude_unset=True)
@@ -121,30 +114,14 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
 
 
 @router.get("/api/v1/inspect/series", operation_id="series", response_model=Series, response_model_exclude_unset=True)
-async def series(node_id: str | None = None, since: TimeBound = None, until: TimeBound = None):
-  """GPU utilization/memory and worker CPU/memory over time, including idle devices and past placements."""
+async def series(node_id: str | None = None, run_id: str | None = None, since: TimeBound = None, until: TimeBound = None):
+  """GPU utilization/memory and worker CPU/memory over time, including idle devices and past placements.
+  With run_id, the run's own GPUs and workers, plus throughput, queue, KV cache and latency of its vLLM samplers."""
   validate_bounds(since, until)
   await gke.discover()
   state = await snapshot.current(get_state_store())
   start, end, _, _ = time_range(since, until or state["observed_at"])
-  return await metrics.series(state, node_id=node_id, since=start, until=end)
-
-
-@router.api_route("/grafana/{path:path}", methods=["GET", "POST"], include_in_schema=False)
-async def grafana(path: str, request: Request):
-  global grafana_client
-  if not GRAFANA_URL:
-    raise HTTPException(404, "Grafana is not configured; set OPEN_RL_GRAFANA_URL")
-  if grafana_client is None:
-    grafana_client = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=5))
-  headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_HEADERS}
-  try:
-    upstream = await grafana_client.request(
-      request.method, f"{GRAFANA_URL}/grafana/{path}", params=request.query_params, content=await request.body(), headers=headers
-    )
-  except httpx.HTTPError as exc:
-    raise HTTPException(502, f"Grafana unreachable: {exc}") from exc
-  return Response(upstream.content, upstream.status_code, {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_HEADERS})
+  return await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id)
 
 
 async def run_of(run_id: str) -> tuple[dict, dict]:

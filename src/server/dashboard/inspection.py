@@ -58,6 +58,8 @@ def segments(state: dict, run_id=None, node_id=None) -> list[dict]:
   placed = {p["pod_uid"]: p for p in state["placements"] if p.get("pod_uid")}
   found = []
   for record in state["processes"]:
+    if record.get("role") == "dispatcher":
+      continue  # a pool's CPU process: it shows in progress, not as a GPU lane
     placement = placed.pop(record.get("pod_uid"), {})
     live = alive(record, observed)
     end = observed if live else record["heartbeat_at"]

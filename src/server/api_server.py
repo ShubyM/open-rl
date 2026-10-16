@@ -1208,6 +1208,7 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
   return await SamplingStore(store.redis).accept(
     {
       "request_id": request_id,
+      "run_id": lookup_id,
       "pool": pool,
       "revision": revision,
       "model": model,

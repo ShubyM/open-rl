@@ -8,7 +8,7 @@ from kubernetes import client
 
 from server.dashboard import metrics
 from server.scheduler_worker_manager import SchedulerWorkerManager
-from server.telemetry import kubernetes
+from server.telemetry import kubernetes, prometheus
 from server.telemetry.prometheus import PromQL
 
 GPU = "GPU-375ff71c-7c41-a89e-3843-c62c7476bc2b"
@@ -109,6 +109,21 @@ class PromQLTest(unittest.TestCase):
     self.assertIn("GPU\\\\-375ff71c", queries[0])  # regex-escaped inside a PromQL string
     self.assertEqual(result[GPU]["utilization"], [[1.0, 7.0]])
     self.assertEqual(result["GPU-other"], {"utilization": [], "memory_mib": []})
+
+  def test_sampler_series_use_vllm_metrics_summed_over_the_runs_replicas(self) -> None:
+    backend = PromQL("gke", "https://example", None, "open-rl-fft-test", "openrl-system")
+    queries = []
+
+    async def fake(query, start, end):
+      queries.append(query)
+      return {"": [[1.0, 2.0]]}
+
+    with mock.patch.object(backend, "query_range", side_effect=fake):
+      result = asyncio.run(backend.samplers(["sampler-0", "sampler-1"], 0, 60))
+    self.assertEqual(set(result), set(prometheus.SAMPLER_QUERIES))
+    match = f'namespace="openrl-system",pod=~{prometheus.any_of(["sampler-0", "sampler-1"])},cluster="open-rl-fft-test"'
+    self.assertTrue(all("vllm:" in q and match in q for q in queries), queries)
+    self.assertEqual(result["requests_waiting"], [[1.0, 2.0]])
 
   def test_worker_series_use_gke_container_metrics_by_pod(self) -> None:
     backend = PromQL("gke", "https://example", None, None, "openrl-system")

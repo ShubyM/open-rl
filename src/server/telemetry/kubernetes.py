@@ -102,6 +102,9 @@ def pod_summary(pod: Any) -> dict:
     "phase": pod.status.phase or "Unknown",
     "node": pod.spec.node_name,
     "worker": (pod.metadata.labels or {}).get("openrl.io/worker"),
+    # Sampling pool pods: their role in the pool and the pool's name.
+    "component": (pod.metadata.labels or {}).get("app.kubernetes.io/component"),
+    "pool": (pod.metadata.labels or {}).get("app.kubernetes.io/instance"),
     "owner_uids": [str(owner.uid) for owner in pod.metadata.owner_references or []],
     "restarts": sum(cs.restart_count or 0 for cs in statuses),
     "created_at": stamp(pod.metadata.creation_timestamp),

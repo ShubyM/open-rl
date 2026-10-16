@@ -17,6 +17,7 @@ from starlette.routing import Route
 
 from server.sampling_dispatcher import Dispatcher, redis_client, revision_file
 from server.sampling_store import SamplingStore, future_key
+from server.telemetry import ops
 from tests.redis_server import RedisTestCase
 
 SAMPLE = {"type": "sample", "sequences": [{"tokens": [100, 101], "logprobs": [-0.5, -0.25], "stop_reason": "length"}]}
@@ -95,8 +96,8 @@ class SamplingDispatcherTest(RedisTestCase):
     (self.tmp / name / "metadata.json").write_text(json.dumps(metadata))
     return str(self.tmp / name)
 
-  async def accepted(self, revision: str = "") -> dict:
-    identity = {"request_id": str(uuid.uuid4()), "pool": self.pool, "revision": revision, "model": "base", "idempotency_key": None}
+  async def accepted(self, revision: str = "", run_id: str | None = None) -> dict:
+    identity = {"request_id": str(uuid.uuid4()), "run_id": run_id, "pool": self.pool, "revision": revision, "model": "base", "idempotency_key": None}
     r = {**identity, "prompt_token_ids": [1, 2, 3], "sampling_params": {"n": 1, "max_tokens": 2}, "include_prompt_logprobs": False}
     await self.store.accept(r)
     return r
@@ -157,6 +158,23 @@ class SamplingDispatcherTest(RedisTestCase):
     r = await self.accepted()  # waits out the pause; the dispatcher's reads time out meanwhile
     self.assertEqual(await self.committed(r["request_id"]), [SAMPLE])
     self.assertFalse(run.done())
+
+  async def test_the_dispatcher_records_its_state_and_each_send_for_the_run(self):
+    replicas = await self.replicas("default")
+    worker = ops.Worker("dispatcher", None)
+    self.enterContext(patch.object(ops, "current", worker))
+    sends = self.enterContext(patch.object(ops, "record"))
+    r = await self.accepted(run_id="run-a")
+    await self.dispatcher(replicas)
+    await self.committed(r["request_id"])
+    await until(lambda: sends.called)
+    (request, role, runtime, _, status, retry, _), kwargs = sends.call_args
+    self.assertEqual(
+      (request["logical_run_id"], request["op"], role, runtime, status, retry), ("run-a", "sample", "sampler", None, "succeeded", None)
+    )
+    self.assertEqual(kwargs["where"], {"pod": replicas[0].url})
+    self.assertEqual((worker.record["revision"], worker.record["replicas"]), ("default", {replicas[0].url: "default"}))
+    self.assertIn("last_commit_at", worker.record)
 
   async def test_a_replica_that_is_still_starting_fails_nothing(self):
     (replica,) = replicas = await self.replicas("default")

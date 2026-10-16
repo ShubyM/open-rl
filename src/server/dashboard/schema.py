@@ -47,30 +47,39 @@ class Pod(Record):
 class Outstanding(Record):
   op: str
   run_id: str | None = None
+  pool: str | None = Field(None, description="For sample: the pool's whole backlog, shared by every run on the pool")
   count: int
-  since: float = Field(description="When the oldest of these was popped, Unix seconds")
+  since: float = Field(description="When the oldest of these was popped or accepted, Unix seconds")
   age_seconds: float
-  pod: str
-  phase: str | None = Field(None, description="starting, ready, waiting_gpu, on_gpu or exited")
-  process_alive: bool = Field(description="False: the process stopped rewriting its record, so nothing will answer these requests")
+  pod: str = Field(description="The trainer holding these, or the dispatcher of the pool they wait in")
+  phase: str | None = Field(None, description="That process's phase: starting, ready, waiting_gpu, on_gpu or exited")
+  process_alive: bool | None = Field(None, description="False: it stopped rewriting its record, so nothing will answer these. Null: no record yet")
+  where: str
 
 
 class Progress(Record):
   state: str = Field(
-    description="OK; STALLED: a request on a worker, or queued, for longer than three median steps (at least 10 minutes); "
-    "DEAD: requests taken by a process that stopped reporting; IDLE: nothing queued or running, so the client is not sending work; UNKNOWN"
+    description="OK; STALLED: a request on a trainer, waiting in its sampling pool, or queued for longer than three median steps "
+    "(at least 10 minutes); DEAD: requests held by a process that stopped reporting; IDLE: nothing queued or running, so the client "
+    "is not sending work; UNKNOWN"
   )
   reason: str
   last_completed_at: float | None = Field(None, description="Newest completed op, Unix seconds")
   step_seconds: float | None = Field(None, description="Median time between successful optim_steps")
-  outstanding: list[Outstanding] = Field(default_factory=list, description="Requests a worker popped and has not answered")
-  queued: dict[str, int | None] = Field(default_factory=dict, description="Requests waiting in the trainer and sampler queues; null when unknown")
+  outstanding: list[Outstanding] = Field(default_factory=list, description="Requests not yet answered, by where they are")
+  queued: dict[str, int | None] = Field(default_factory=dict, description="Requests waiting in the trainer queue; null when unknown")
+  dispatcher: dict[str, JsonValue] | None = Field(
+    None,
+    description="The pool dispatcher's own record: revision, each replica's weight version, replicas loading weights, "
+    "in_flight, last_commit_at, last_error",
+  )
 
 
 class Run(Record):
   run_id: str
   model: str | None = None
   runtime_id: str | None = None
+  pool: str | None = Field(None, description="The sampling pool that serves this run's samples")
   shared_runtime: bool | None = Field(None, description="Workers may serve other logical runs; device utilization is not per-run utilization")
   status: str | None = None
   display_status: str | None = None
@@ -141,7 +150,6 @@ class Inventory(Record):
   placements: list[Placement]
   store_error: str | None = None
   processes_error: str | None = None
-  grafana: bool
 
 
 class PlacementActivity(Placement):
@@ -228,6 +236,12 @@ class Series(Record):
   until: str
   devices: list[DeviceSeries]
   workers: list[WorkerSeries]
+  samplers: dict[str, list[tuple[float, float]]] | None = Field(
+    None,
+    description="With run_id: the run's vLLM replicas, summed (latency is p99, kv_cache_usage the fullest replica, 0-1). "
+    "A shared pool includes other runs",
+  )
+  samplers_reason: str | None = None
 
 
 class LogRecord(Record):
