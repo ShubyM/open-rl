@@ -49,7 +49,8 @@ def display_status(run: dict, launcher: str) -> str:
     return run["status"].capitalize()
   if run["workers_error"]:
     return "Unknown"
-  if any(pod["problem"] for pod in run["pods"]):
+  # A pod that is only pending is starting, not sick; the worker states below say which.
+  if any(pod["problem"] and pod["problem"] != "Pending" for pod in run["pods"]):
     return "Unhealthy"
   if launcher == "single_process":
     return "Active"

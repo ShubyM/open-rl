@@ -244,6 +244,10 @@ class StatusTest(unittest.IsolatedAsyncioTestCase):
       self.assertEqual({key: run[key] for key in expected}, expected)
       self.assertEqual(run["display_status"], label)
 
+  async def test_a_pod_still_pulling_its_image_is_starting_not_unhealthy(self) -> None:
+    self.state["pods"][0].update(phase="Pending", problem="Pending")
+    self.assertEqual((await self.runs())["r1"]["display_status"], "Starting")
+
   async def test_a_failing_pod_is_unhealthy_while_its_workload_still_reports_running(self) -> None:
     await self.store.set_value("open_rl:trainer_ready:Qwen/Qwen3-8B", "1")
     self.state["pods"][0]["problem"] = "CrashLoopBackOff"
