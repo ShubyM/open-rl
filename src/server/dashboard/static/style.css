@@ -1278,6 +1278,19 @@ body {
 #app .log-toolbar select {
   max-width: min(100%, 340px);
 }
+#app .log-toolbar .log-scope {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim);
+  font-size: 12px;
+  white-space: nowrap;
+}
+#app .log-toolbar .log-scope input {
+  flex: none;
+  min-width: 0;
+  margin: 0;
+}
 /* Fits "Jump to latest", so pausing by scrolling doesn't shift the toolbar. */
 #app .log-toolbar button {
   min-width: 8.75em;

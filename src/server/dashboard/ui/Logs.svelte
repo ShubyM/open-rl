@@ -99,7 +99,6 @@
   const severity = (record) => ["ERROR", "CRITICAL", "ALERT", "EMERGENCY"].includes(record.severity) ? "error" : record.severity === "WARNING" ? "warning" : undefined;
 </script>
 
-{#if run.shared_runtime}<p class="muted">These pods also serve other runs on this base model. <label><input type="checkbox" bind:checked={everything} /> Show lines that do not name this run</label></p>{/if}
 {#if view.event !== null}
   <div class="log-time-scope"><span>{logRange.since.slice(0, 10)} · {logRange.since.slice(11, 19)}–{logRange.until.slice(11, 19)}</span><a href={allLogs}>All logs</a></div>
 {/if}
@@ -108,6 +107,7 @@
   <select id="log-source" aria-label="Pod" bind:value={view.pod}><option value="">All pods</option>
     {#each sources as pod (pod.name)}<option value={pod.name}>{pod.name.slice(cut) || pod.name}</option>{/each}
   </select>
+  {#if run.shared_runtime}<label class="log-scope" title="These pods also serve other runs on this base model. Lines that do not name this run are hidden unless this is on."><input type="checkbox" bind:checked={everything} />Include other runs' lines</label>{/if}
   <button type="button" class="chip" onclick={() => view.end === null ? pause() : follow()}>{view.end === null ? "Pause" : "Jump to latest"}</button>
 </div>
 <div id="log-status" class="log-status" role="status"><span>{status}</span>
