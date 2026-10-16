@@ -78,6 +78,7 @@
     stop();
     // Event-clipped `until` can be earlier than the inspected window end.
     view.end = successfulEnd ?? range.now;
+    if (successfulParams) loaded = queryKey;
   }
   function follow() {
     view.event = view.end = null;

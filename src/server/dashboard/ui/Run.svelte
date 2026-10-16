@@ -70,23 +70,8 @@
       </select></label><CopyLink /><a href={url}>Agent JSON ↗</a>
     </div>
   </div>
-  {#if detail.data?.incidents?.length}
-    <section class="run-incidents" aria-label="Significant events">
-      {#each detail.data.incidents.slice(0, 3) as event}
-        {@const at = new Date(event.at * 1000).toISOString()}
-        {@const label = event.reason === "WorkerRestarted" ? "Worker restarted" : event.reason}
-        <div class={`run-incident incident-${event.tone}`}>
-          <time class="incident-time" datetime={at} title={at}>{at.slice(11, 19)}</time><span class="incident-label">{label}</span>
-          <span class="incident-context" title={event.message}>{event.pod}{event.container ? ` / ${event.container}` : ""}{event.restart_count ? ` · ${event.restart_count} total restarts` : event.count > 1 ? ` · ${event.count} reported occurrences` : ""}</span>
-          <a href={link("logs", { event: event.at, end: range.now })} aria-label={`View logs near ${label} on ${event.pod}`}>View logs</a>
-        </div>
-      {/each}
-    </section>
-  {/if}
   <div id="run-panel">
-    <!-- Wait for the activity response: its incidents and timeline would otherwise push this panel's content down. -->
-    {#if !detail.data && !detail.error}<p class="empty-state">Loading…</p>
-    {:else if view.tab === "logs"}
+    {#if view.tab === "logs"}
       {#if validEvent}<Logs {run} {view} {range} allLogs={link("logs", { event: null, end: null })} />{/if}
     {:else}
       <div class="run-activity"><Activity placements={detail.data?.placements || []} {range} {inventory} acrossNodes={true} error={detail.error} status={detail.status} pending={detail.pending} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
@@ -117,4 +102,17 @@
       </details>
     {/if}
   </div>
+  {#if detail.data?.incidents?.length}
+    <section class="run-incidents" aria-label="Significant events">
+      {#each detail.data.incidents.slice(0, 3) as event}
+        {@const at = new Date(event.at * 1000).toISOString()}
+        {@const label = event.reason === "WorkerRestarted" ? "Worker restarted" : event.reason}
+        <div class={`run-incident incident-${event.tone}`}>
+          <time class="incident-time" datetime={at} title={at}>{at.slice(11, 19)}</time><span class="incident-label">{label}</span>
+          <span class="incident-context" title={event.message}>{event.pod}{event.container ? ` / ${event.container}` : ""}{event.restart_count ? ` · ${event.restart_count} total restarts` : event.count > 1 ? ` · ${event.count} reported occurrences` : ""}</span>
+          <a href={link("logs", { event: event.at, end: range.now })} aria-label={`View logs near ${label} on ${event.pod}`}>View logs</a>
+        </div>
+      {/each}
+    </section>
+  {/if}
 {/if}

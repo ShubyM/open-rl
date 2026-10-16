@@ -22,6 +22,8 @@ The inspection API lists every run in the fleet, while the client-facing API ser
 - **Nodes**: which worker process held which GPUs and when, per-GPU activity, and GPU and CPU charts. On the timelines and charts, drag or press A/D to pan; use Ctrl/⌘ + wheel, pinch, or W/S to zoom.
 - **Health**: pod and node problems, and unavailable sources.
 
+Recent query responses are kept in a bounded, in-memory cache and shown while refreshing. Reloading clears this cache. Logs load alongside activity; incidents appear below the panel so their arrival does not move the log controls.
+
 ## API
 
 | Route under `/api/v1/inspect` | Returns |
@@ -63,7 +65,7 @@ Kubernetes queries use `OPEN_RL_WORKER_NAMESPACE`, then `POD_NAMESPACE`, then `o
 
 The [openrl-inspect skill](../skills/openrl-inspect/SKILL.md) shows agents how to diagnose runs with this API.
 
-For local regression checks, run `make test`.
+For local regression checks, run `make test`; query lifecycle checks run with `node --test dev/dashboard/query.test.mjs` after installing the dashboard dependencies.
 
 `uv run --extra cluster python dev/inspection_eval.py --port 9042` serves ten deterministic cases through the real inspection routes without cluster access. Give an agent only a printed case URL, run ID, symptom, and the skill; the fixture source contains the answer key. Score diagnosis, cited evidence, uncertainty, next check, and whether it obeyed instructions embedded in logs.
 

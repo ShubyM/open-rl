@@ -5,7 +5,7 @@ export const viewLink = (path, params = {}) => `#${path}${queryString(params) ? 
 export const inspectUrl = (resource, params = {}) => `/api/v1/inspect/${resource}${queryString(params) ? `?${queryString(params)}` : ""}`;
 export const nodeLink = (placement, range) => viewLink("nodes", { placement, duration: range.now - range.start, end: range.now });
 export const now = (inventory) => Date.parse(inventory?.observed_at) / 1000 || Date.now() / 1000;
-export const app = $state({ inventory: null });
+const cache = new Map();
 export const saved = $state({ overview: "#overview", nodes: "#nodes" });
 const number = (params, key, fallback) => params.get(key)?.trim() && Number.isFinite(Number(params.get(key))) ? Number(params.get(key)) : fallback;
 export function parseView(hash = location.hash) {
@@ -36,8 +36,8 @@ export const crosshairOffset = (range) => crosshair.at === null || crosshair.at 
 export function currentView(freeze = false, tab = view.tab) {
   const { page, id, duration, end, back, event, q, pod, node, placement, gpu, status } = view;
   if (page === "overview") return viewLink(page, { q, status: status === "all" ? null : status });
-  if (page === "run") return viewLink(`run/${encodeURIComponent(id)}/${tab || "activity"}`, { duration, end: freeze ? end ?? now(app.inventory) : end, back, event, q, pod });
-  if (page === "nodes") return viewLink(page, { duration, end: freeze ? end ?? now(app.inventory) : end, node, placement, gpu: node && gpu !== "all" ? gpu : null });
+  if (page === "run") return viewLink(`run/${encodeURIComponent(id)}/${tab || "activity"}`, { duration, end: freeze ? end ?? now(cache.get(inspectUrl("inventory"))) : end, back, event, q, pod });
+  if (page === "nodes") return viewLink(page, { duration, end: freeze ? end ?? now(cache.get(inspectUrl("inventory"))) : end, node, placement, gpu: node && gpu !== "all" ? gpu : null });
   return viewLink(page + (id ? `/${encodeURIComponent(id)}` : ""));
 }
 export async function get(url, signal) {
@@ -58,36 +58,38 @@ export async function get(url, signal) {
   return response.json().catch(() => { throw new Error("The dashboard returned an invalid response. Try again."); });
 }
 
-// Svelte owns query lifetime: changing the key or unmounting aborts old work. The key defaults to the URL;
-// a live view keys on the user's selection, so its moving window is read at each poll instead of restarting it.
+// Reuse recent responses across navigation; changing the key or unmounting aborts old work.
+// A live view keys on the user's selection, so its moving window is read at each poll instead of restarting it.
 export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () => true, key = url } = {}) {
-  let revision = $state(0), previousScope;
-  const target = $derived(key()), identity = $derived(scope());
-  const result = $state({ data: null, error: null, status: null, pending: false, retry: () => revision++ });
+  let previousScope;
+  const result = $state({ data: null, error: null, status: null, pending: false, retry: () => {} });
   $effect(() => {
-    const requestedKey = target, requestedScope = identity;
-    revision;
+    const requestedKey = key(), requestedScope = scope();
     return untrack(() => {
       if (!requestedKey || !url()) return;
       if (requestedScope !== previousScope) { result.data = result.error = result.status = null; }
       previousScope = requestedScope;
-      let controller, disposed = false;
-      const load = async () => {
-        if (controller) return;
-        controller = new AbortController();
+      result.data = cache.get(url()) ?? result.data;
+      const controller = new AbortController();
+      const load = result.retry = async () => {
+        const requested = url();
+        if (!requested || result.pending) return;
         result.pending = true;
         try {
-          const data = await get(url(), controller.signal);
-          if (disposed) return;
-          result.error = data.error || null;
-          result.status = null;
+          const data = await get(requested, controller.signal);
+          if (controller.signal.aborted) return;
+          Object.assign(result, { error: data.error || null, status: null });
           if (!result.error || !result.data) result.data = data;
-        } catch (error) { if (!disposed) { result.error = error.message; result.status = error.status || null; } }
-        finally { if (!disposed) { controller = null; result.pending = false; } }
+          if (!result.error) {
+            cache.set(requested, data);
+            if (cache.size > 24) cache.delete([...cache.keys()].find((key) => key !== inspectUrl("inventory")));
+          }
+        } catch (error) { if (!controller.signal.aborted) { result.error = error.message; result.status = error.status || null; } }
+        finally { if (!controller.signal.aborted) { result.pending = false; } }
       };
       load();
       const timer = poll ? setInterval(() => { if (!document.hidden && pollWhen()) load(); }, poll) : null;
-      return () => { disposed = true; controller?.abort(); clearInterval(timer); result.pending = false; };
+      return () => { controller.abort(); clearInterval(timer); result.pending = false; };
     });
   });
   return result;
