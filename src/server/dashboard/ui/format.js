@@ -13,11 +13,14 @@ export function shortNodeName(name, nodes = []) {
   }
   return full;
 }
+export const KINDS = { lora: "LoRA", full: "FFT", fft: "FFT" };
+export const runDescription = (run, title = run.name) => [run.display_name, run.recipe_name].filter((v, i, values) => v && v !== title && values.indexOf(v) === i).join(" · ");
+export const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 export const family = (id) => `hue-${Array.from(id || "").reduce((sum, c) => sum + c.charCodeAt(0), 0) % 8}`;
 export function samplerPodPattern(run, placements = []) {
   const names = [...(run?.pods || []).filter((p) => p.role === "sampler").map((p) => p.name),
     ...(run?.workloads || []).filter((w) => w.role === "sampler").map((w) => w.pod_name),
     ...placements.filter((p) => p.role === "sampler" && p.run_ids?.includes(run?.run_id)).map((p) => p.pod)];
   const pods = [...new Set(names.filter((name) => typeof name === "string" && name.length))].sort();
-  return pods.length ? `^(${pods.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})$` : null;
+  return pods.length ? `^(${pods.map(escapeRegExp).join("|")})$` : null;
 }

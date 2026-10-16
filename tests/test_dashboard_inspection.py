@@ -33,7 +33,7 @@ class InspectionIncidentsTest(unittest.TestCase):
     self.assertEqual((result[0]["restart_count"], result[1]["count"], result[2]["container"]), (2, 5, "worker"))
     self.assertEqual(result[2]["message"], "worker exited with code 137")
 
-  def test_latest_three_distinct_incidents_are_selected_after_time_filtering(self):
+  def test_distinct_incidents_are_selected_newest_first_after_time_filtering(self):
     events = [
       {"reason": reason, "last_seen_at": f"1970-01-01T00:00:{second}Z"}
       for reason, second in [
@@ -46,8 +46,8 @@ class InspectionIncidentsTest(unittest.TestCase):
       ]
     ]
     run = {"pods": [{"name": "trainer", "events": [*events, {"reason": "OOMKilled"}, {"reason": "OOMKilled", "last_seen_at": "invalid"}]}]}
-    self.assertEqual([event["at"] for event in inspection.incidents(run, 20, 30)], [25, 23, 22])
-    self.assertEqual([event["at"] for event in inspection.incidents(run, 20, 24)], [24, 23, 22])
+    self.assertEqual([event["at"] for event in inspection.incidents(run, 20, 30)], [25, 23, 22, 21])
+    self.assertEqual([event["at"] for event in inspection.incidents(run, 20, 24)], [24, 23, 22, 21])
     self.assertEqual(inspection.incidents({"pods": [{"name": "trainer", "problem": "CrashLoopBackOff", "restarts": 5}]}, 0, 30), [])
 
   def test_backoff_requires_a_timestamped_warning_about_a_restarting_worker(self):
@@ -70,7 +70,7 @@ PLACEMENT = {
   "name": "trainer",
   "label": "Run one",
   "run_ids": ["r1"],
-  "runtime_id": "base",
+  "runtime_id": "r1",
   "node": "n1",
   "pod": "trainer-0",
   "pod_uid": "p1",
@@ -78,16 +78,33 @@ PLACEMENT = {
   "devices": ["gpu-0"],
   "device_uuids": {"gpu-0": "GPU-1"},
   "device_count": 1,
+  "created_at": "1970-01-01T00:01:30+00:00",
 }
+# The record the trainer process keeps about itself.
+PROCESS = {
+  "id": "p1",
+  "pod": "trainer-0",
+  "pod_uid": "p1",
+  "node": "n1",
+  "role": "trainer",
+  "runtime_id": "r1",
+  "gpus": ["GPU-1"],
+  "started_at": 100,
+  "heartbeat_at": 200,
+  "phase": "ready",
+  "turns": [],
+  "outstanding": [],
+}
+RUN = {"run_id": "r1", "name": "Run one", "model": "Qwen/base", "runtime_id": "r1", "created_at": 0, "completed_at": None, "shared_runtime": False}
 
 
-def state(live=None, past=None, runs=None):
+def state(live=None, processes=None, runs=None):
   return {
     "observed_at": "1970-01-01T00:03:20+00:00",
-    "cluster": {"available": True, "scheduler": {"available": True}},
+    "cluster": {"available": True, "scheduler": {"available": True}, "nodes": [{"name": "n1", "devices": [{"id": "gpu-0", "uuid": "GPU-1"}]}]},
     "placements": [PLACEMENT] if live is None else live,
-    "history": [{**PLACEMENT, "first_seen": 100, "last_seen": 180}] if past is None else past,
-    "runs": [{"run_id": "r1", "model": "Qwen/base"}] if runs is None else runs,
+    "processes": [PROCESS] if processes is None else processes,
+    "runs": [RUN] if runs is None else runs,
   }
 
 
@@ -96,103 +113,72 @@ def operation(start, end, **fields):
 
 
 class InspectionActivityTest(unittest.TestCase):
-  def test_claim_teardown_keeps_recorded_devices_and_run_label(self):
-    source = state(live=[{**PLACEMENT, "run_ids": [], "label": "base", "devices": [], "device_uuids": {}}])
-    result = inspection.segments(source)[0]
-    self.assertEqual((result["start"], result["end"], result["ended"]), (100, 200, False))
-    self.assertEqual((result["run_ids"], result["label"]), (["r1"], "Run one"))
-    self.assertEqual((result["devices"], result["device_uuids"]), (["gpu-0"], {"gpu-0": "GPU-1"}))
+  def test_a_reporting_process_is_one_lane_joined_to_its_placement(self):
+    (lane,) = inspection.segments(state())
+    self.assertEqual((lane["id"], lane["name"], lane["label"], lane["run_ids"]), ("p1", "trainer", "Run one", ["r1"]))
+    self.assertEqual((lane["start"], lane["end"], lane["ended"], lane["devices"]), (100, 200, False, ["gpu-0"]))
 
-  def test_scheduler_outage_does_not_report_allocation_ended(self):
-    source = state(live=[])
-    self.assertTrue(inspection.segments(source)[0]["ended"])
-    source["cluster"]["scheduler"]["available"] = False
-    result = inspection.segments(source)[0]
-    self.assertFalse(result["ended"])
-    self.assertEqual(result["end"], 180)
+  def test_a_process_that_exits_or_stops_reporting_ends_at_its_last_heartbeat(self):
+    for record in ({**PROCESS, "heartbeat_at": 150}, {**PROCESS, "phase": "exited"}):
+      with self.subTest(phase=record["phase"]):
+        (lane,) = inspection.segments(state(live=[], processes=[record]))
+        self.assertEqual((lane["end"], lane["ended"]), (record["heartbeat_at"], True))
+        self.assertEqual((lane["devices"], lane["device_uuids"], lane["device_count"]), (["gpu-0"], {"gpu-0": "GPU-1"}, 1))
 
-  def test_replacement_before_recorder_tick_preserves_both_intervals(self):
-    source = state(live=[{**PLACEMENT, "pod_uid": "p2", "node": "n2"}])
-    old, current = inspection.segments(source)
-    self.assertEqual((old["pod_uid"], old["node"], old["start"], old["end"]), ("p1", "n1", 100, 180))
-    self.assertEqual((current["pod_uid"], current["node"], current["start"], current["end"]), ("p2", "n2", 200, 200))
-    self.assertNotEqual(old["id"], current["id"])
+  def test_a_placed_workload_is_a_lane_before_its_process_reports(self):
+    (lane,) = inspection.segments(state(processes=[]))
+    self.assertEqual((lane["id"], lane["start"], lane["end"], lane["ended"]), ("w1", 90, 200, False))
+
+  def test_a_replaced_pod_keeps_both_processes(self):
+    old = {**PROCESS, "id": "p0", "pod_uid": "p0", "started_at": 20, "heartbeat_at": 90}
+    current, previous = inspection.segments(state(processes=[PROCESS, old]))
+    self.assertEqual((previous["id"], previous["start"], previous["end"], previous["ended"]), ("p0", 20, 90, True))
+    self.assertEqual((current["id"], current["ended"]), ("p1", False))
+
+  def test_a_container_restarted_in_place_keeps_both_processes(self):
+    restarted = {**PROCESS, "id": "second", "started_at": 160}
+    current, previous = inspection.segments(state(processes=[restarted, {**PROCESS, "id": "first", "heartbeat_at": 150}]))
+    self.assertEqual((previous["id"], previous["end"], previous["ended"]), ("first", 150, True))
+    self.assertEqual((current["id"], current["start"], current["ended"]), ("second", 160, False))
 
   def test_operations_overlapping_window_edges_are_clipped_and_merged(self):
-    operations = {"r1": {"samples": [operation(110, 130), operation(125, 145), operation(170, 210), operation(150, 160, run_id="r2")]}}
-    result = inspection.activity(state(), 120, 190, operations, {})["placements"][0]
+    operations = {"r1": {"samples": [operation(110, 130), operation(125, 145), operation(170, 210)]}}
+    result = inspection.activity(state(), 120, 190, operations)["placements"][0]
     self.assertEqual(result["intervals"], [[120, 145], [170, 190]])
     self.assertEqual(result["ops"], {"train": [[120, 145], [170, 190]]})
     self.assertFalse(result["exact"])
 
-  def test_reused_pod_name_does_not_mix_operations_or_turns(self):
-    source = state(past=[{**PLACEMENT, "first_seen": 150, "last_seen": 180}])
+  def test_ops_from_a_previous_pod_with_the_same_name_stay_off_the_lane(self):
     operations = {"r1": {"samples": [operation(160, 180, pod_uid="previous-pod"), operation(180, 190)]}}
-    turns = {"trainer": {"samples": [{"pod_uid": "previous-pod", "started_at": 150, "at": 200}]}}
-    result = inspection.activity(source, 150, 200, operations, turns)["placements"][0]
+    result = inspection.activity(state(), 150, 200, operations)["placements"][0]
     self.assertEqual(result["intervals"], [[180, 190]])
-    self.assertFalse(result["exact"])
 
-  def test_shared_runtime_attributes_only_tagged_ops_even_with_one_visible_run(self):
-    turn = {
-      "started_at": 100,
-      "at": 200,
-      "pod_uid": "p1",
-      "ops": [
-        {"name": "train", "run_id": "r1", "start": 90, "end": 140},
-        {"name": "train", "run_id": "r2", "start": 160, "end": 210},
-        {"name": "wake", "start": 140, "end": 160},
-      ],
-    }
-    for ids in (["r1"], ["r1", "r2"]):
-      with self.subTest(ids=ids):
-        placement = {**PLACEMENT, "run_ids": ids}
-        source = state(
-          live=[placement],
-          past=[{**placement, "first_seen": 100, "last_seen": 180}],
-          runs=[{"run_id": identity, "shared_runtime": True} for identity in ids],
-        )
-        results = inspection.activity(source, 100, 220, {}, {"trainer": {"samples": [turn]}}, run_id="r1")["placements"]
-        self.assertEqual(len(results), 1)
-        self.assertEqual((results[0]["intervals"], results[0]["ops"]), ([[100, 140]], {"train": [[100, 140]]}))
-        self.assertTrue(results[0]["exact"])
-        if len(ids) == 1:
-          self.assertEqual(results[0]["id"], "w1")
-
-  def test_dedicated_runtime_preserves_unlabelled_gpu_grants(self):
-    result = inspection.activity(state(), 120, 190, {}, {"trainer": {"samples": [{"started_at": 100, "at": 200}]}})["placements"][0]
-    self.assertEqual((result["intervals"], result["ops"], result["exact"]), ([[120, 190]], {}, True))
-
-  def test_turns_outside_the_query_do_not_suppress_operation_fallback(self):
-    operations = {"r1": {"samples": [operation(120, 130)]}}
-    turns = {"trainer": {"samples": [{"started_at": 10, "at": 20}]}}
-    result = inspection.activity(state(), 100, 200, operations, turns)["placements"][0]
-    self.assertEqual((result["intervals"], result["exact"]), ([[120, 130]], False))
-
-  def test_deleted_shared_run_retains_attribution_and_epoch_zero_start(self):
-    source = state(
-      runs=[],
-      live=[{**PLACEMENT, "run_ids": [], "shared_runtime": None}],
-      past=[{**PLACEMENT, "shared_runtime": True, "first_seen": 0, "last_seen": 180}],
+  def test_a_shared_runtime_splits_by_run_and_shows_only_each_runs_ops(self):
+    shared = {**PROCESS, "runtime_id": "base", "turns": [[100, 200]]}
+    runs = [{**RUN, "run_id": identity, "runtime_id": "base", "shared_runtime": True} for identity in ("r1", "r2")]
+    operations = {"r1": {"samples": [operation(110, 140)]}, "r2": {"samples": [operation(160, 170, run_id="r2")]}}
+    lanes = inspection.activity(state(live=[], processes=[shared], runs=runs), 100, 220, operations)["placements"]
+    self.assertEqual(
+      [(p["id"], p["run_ids"], p["intervals"], p["exact"]) for p in lanes],
+      [("p1:r1", ["r1"], [[110, 140]], False), ("p1:r2", ["r2"], [[160, 170]], False)],
     )
-    turns = {
-      "trainer": {
-        "samples": [
-          {
-            "started_at": 100,
-            "at": 180,
-            "ops": [
-              {"name": "train", "run_id": "r1", "start": 120, "end": 130},
-              {"name": "train", "run_id": "r2", "start": 140, "end": 150},
-            ],
-          }
-        ]
-      }
-    }
-    result = inspection.activity(source, 100, 200, {}, turns)["placements"][0]
-    self.assertEqual((result["intervals"], result["start"], result["shared_runtime"]), ([[120, 130]], 0, True))
+    (lane,) = inspection.activity(state(live=[], processes=[shared], runs=runs), 100, 220, operations, run_id="r1")["placements"]
+    self.assertEqual(lane["allocation_id"], "p1")
 
-  def test_seeded_interval_fuzz_preserves_clipping_and_run_pod_attribution(self):
+  def test_a_dedicated_lane_shows_gpu_turns_inside_the_window(self):
+    record = {**PROCESS, "turns": [[10, 20], [110, 150]]}
+    result = inspection.activity(state(processes=[record]), 120, 190, {})["placements"][0]
+    self.assertEqual((result["intervals"], result["ops"], result["exact"]), ([[120, 150]], {}, True))
+    self.assertNotIn("turns", result)
+    result = inspection.activity(state(processes=[record]), 160, 190, {"r1": {"samples": [operation(170, 180)]}})["placements"][0]
+    self.assertEqual((result["intervals"], result["exact"]), ([[170, 180]], False))
+
+  def test_source_errors_and_partial_records_stay_distinct(self):
+    operations = {"r1": {"samples": [operation(120, 130)], "partial": "Skipped 1 invalid operation records"}}
+    result = inspection.activity(state(), 100, 200, operations)["placements"][0]
+    self.assertEqual((result["intervals"], result["error"], result["partial"]), ([[120, 130]], None, operations["r1"]["partial"]))
+
+  def test_seeded_interval_fuzz_preserves_clipping_and_pod_attribution(self):
     import random
 
     rng = random.Random(20261015)
@@ -200,14 +186,13 @@ class InspectionActivityTest(unittest.TestCase):
       records, expected = [], set()
       for _ in range(rng.randrange(25)):
         low, high = sorted(rng.sample(range(80, 230), 2))
-        identity, uid = rng.choice(["r1", "r2"]), rng.choice(["p1", "old-pod"])
-        records.append(operation(low, high, run_id=identity, pod_uid=uid))
-        if identity == "r1" and uid == "p1":
+        uid = rng.choice(["p1", "old-pod"])
+        records.append(operation(low, high, pod_uid=uid))
+        if uid == "p1":
           expected.update(range(max(low, 120), min(high, 190)))
       rng.shuffle(records)
-      lane = inspection.activity(state(), 120, 190, {"r1": {"samples": records}}, {})["placements"][0]
+      lane = inspection.activity(state(), 120, 190, {"r1": {"samples": records}})["placements"][0]
       actual = {tick for low, high in lane["intervals"] for tick in range(low, high)}
       self.assertEqual(actual, expected, f"case {case}")
       self.assertTrue(all(120 <= low < high <= 190 for low, high in lane["intervals"]))
       self.assertTrue(all(a[1] < b[0] for a, b in zip(lane["intervals"], lane["intervals"][1:])))
-      self.assertFalse(lane["exact"])

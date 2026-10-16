@@ -1,5 +1,5 @@
 <script>
-  import { chartNumber, chartTime, valueText } from "./visualization.js";
+  import { axisTime, chartNumber, chartTime, valueText } from "./visualization.js";
   import { crosshair, crosshairOffset } from "./state.svelte.js";
   let { title, unit = "", points = [], start, end, min, max, tone = "neutral", gapSeconds = Infinity, empty = "No samples in this time range", note = "", navigating = false } = $props();
   let plot = $state(null), svg = $state(null), tip = $state(null);
@@ -35,7 +35,7 @@
   const x = (at) => ((at - start) / (end - start || 1) * 1000).toFixed(1);
   const y = (value) => (1000 - (Math.max(scale.low, Math.min(scale.high, value)) - scale.low) / (scale.high - scale.low) * 1000).toFixed(1);
   const path = (segment) => segment.map(([at, value], i) => `${i ? "L" : "M"}${x(at)},${y(value)}`).join(" ");
-  const label = (at) => `${end - start >= 86400 ? new Date(at * 1000).toISOString().slice(5, 10) + " " : ""}${chartTime(at, end - start <= 120)}`;
+  const label = (at) => axisTime(at, { start, now: end });
   const crosshairX = $derived(crosshairOffset({ start, now: end }));
   $effect(() => { points; start; end; min; max; navigating; hover = null; });
   function inspect(index) {

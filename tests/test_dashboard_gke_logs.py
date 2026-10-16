@@ -91,39 +91,29 @@ class GkeLogHelpersTest(unittest.TestCase):
       self.assertEqual(request.await_count, 1)
       self.assertEqual(gke._refused_until, 700)
 
-  def test_pod_sources_cover_live_pods_and_recorded_placements(self) -> None:
+  def test_pod_sources_cover_live_pods_and_the_runs_processes(self) -> None:
     run = {"run_id": "run-1", "pods": [{"name": "orw-live", "node": "n1", "role": "sampler", "created_at": "2026-09-10T10:00:00Z"}]}
-    past = [
-      {"pod": "orw-gone", "node": "n2", "role": "trainer", "run_ids": ["run-1"], "first_seen": 1789000000.0, "last_seen": 1789003600.0},
-      {"pod": "orw-other", "node": "n3", "role": "trainer", "run_ids": ["run-2"], "first_seen": 1789000000.0, "last_seen": 1789003600.0},
-    ]
-    sources = {s["pod"]: s for s in gke.pod_sources(run, past, "2026-09-10T11:00:00Z")}
+    lanes = [{"pod": "orw-gone", "node": "n2", "role": "trainer", "start": 1789000000.0, "end": 1789003600.0}]
+    sources = {s["pod"]: s for s in gke.pod_sources(run, lanes, "2026-09-10T11:00:00Z")}
     self.assertEqual(set(sources), {"orw-live", "orw-gone"})
     self.assertEqual(sources["orw-live"]["until"], "2026-09-10T11:00:00.000000+00:00")
     self.assertEqual(sources["orw-gone"]["role"], "trainer")
-    self.assertGreater(sources["orw-gone"]["until"], sources["orw-gone"]["created_at"])
+    self.assertEqual(sources["orw-gone"]["until"], gke.timestamp(1789003660.0))
 
   def test_same_name_pod_replacements_keep_separate_log_lifetimes(self) -> None:
-    past = [
-      {"pod": "worker", "pod_uid": "new", "node": "n2", "run_ids": ["r1"], "first_seen": 300, "last_seen": 400},
-      {"pod": "worker", "pod_uid": "old", "node": "n1", "run_ids": ["r1"], "first_seen": 100, "last_seen": 150},
+    lanes = [
+      {"pod": "worker", "pod_uid": "new", "node": "n2", "start": 300, "end": 400},
+      {"pod": "worker", "pod_uid": "old", "node": "n1", "start": 100, "end": 150},
     ]
     run = {"run_id": "r1", "pods": []}
-    sources = gke.pod_sources(run, past, gke.timestamp(500))
+    sources = gke.pod_sources(run, lanes, gke.timestamp(500))
     self.assertEqual(len(sources), 2)
     for at, node in ((120, "n1"), (350, "n2")):
       self.assertEqual(gke.entry_record(entry("worker", gke.timestamp(at)), sources, "r1")["node"], node)
     self.assertIsNone(gke.entry_record(entry("worker", gke.timestamp(250)), sources, "r1"))
     run["pods"] = [{"name": "worker", "uid": "new", "node": "n2", "created_at": gke.timestamp(290)}]
-    live = gke.pod_sources(run, past, gke.timestamp(500))
-    self.assertEqual(len(live), 2)
+    live = gke.pod_sources(run, lanes, gke.timestamp(500))
     self.assertEqual(
       [(s["node"], s["created_at"], s["until"]) for s in live],
       [("n2", gke.timestamp(290), gke.timestamp(500)), ("n1", gke.timestamp(100), gke.timestamp(210))],
     )
-
-  def test_device_moves_of_one_pod_keep_its_entire_recorded_lifetime(self) -> None:
-    old = {"pod": "worker", "pod_uid": "same", "run_ids": ["r1"], "first_seen": 100, "last_seen": 150}
-    sources = gke.pod_sources({"run_id": "r1"}, [{**old, "first_seen": 200, "last_seen": 250}, old], gke.timestamp(300))
-    self.assertEqual(len(sources), 1)
-    self.assertEqual((sources[0]["created_at"], sources[0]["until"]), (gke.timestamp(100), gke.timestamp(310)))

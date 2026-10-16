@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import ValidationError
 
 from server.dashboard import inspection, metrics
-from server.dashboard.schema import Activity, Inventory, Logs, Operation, PodLogs, Series, Turn
+from server.dashboard.schema import Activity, Inventory, Logs, Operation, PodLogs, Series
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.store import get_state_store
 from server.telemetry import gke, kubernetes, ops
@@ -72,52 +72,49 @@ async def inventory():
   """Current runs, placements, nodes and scheduler state, with an error field per unavailable source."""
   await gke.discover()
   state = await snapshot.current(get_state_store())
-  return {**{key: value for key, value in state.items() if key != "history"}, "grafana": bool(GRAFANA_URL)}
+  return {**{key: value for key, value in state.items() if key != "processes"}, "grafana": bool(GRAFANA_URL)}
 
 
 @router.get("/api/v1/inspect/activity", operation_id="activity", response_model=Activity, response_model_exclude_unset=True)
 async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str | None = None, node_id: str | None = None):
-  """Per-placement GPU turns, or completed-op intervals where no turns were recorded, in Unix seconds.
+  """Per-process GPU turns and completed-op intervals, in Unix seconds.
   With run_id, also the run, its recorded ops and recent pod incidents."""
   validate_bounds(since, until)
   store = get_state_store()
   state, run = await run_of(run_id) if run_id else (await snapshot.current(store), None)
   start, end, low, high = time_range(since, until or state["observed_at"])
   selected = [p for p in inspection.segments(state, run_id, node_id) if p["start"] <= high and p["end"] >= low]
-  runs = sorted({r for p in selected for r in p["run_ids"]} | ({run_id} if run_id else set()))
-  workers = sorted({p["name"] for p in selected})
+  # Each lane's runs, and its runtime for the worker-level ops recorded there.
+  keys = sorted({k for p in selected for k in [*p["run_ids"], p.get("runtime_id")] if k} | ({run_id} if run_id else set()))
 
-  async def read(key, what, model):
+  async def read(key):
     try:
       records = await asyncio.wait_for(store.read_samples(key), timeout=1)
       if not isinstance(records, list):
         raise ValueError("Expected telemetry records")
     except Exception:
-      return {"samples": [], "error": f"{what} unavailable"}
+      return {"samples": [], "error": "Operation records unavailable"}
     samples, invalid = [], 0
     for record in records:
       try:
-        samples.append(model.model_validate(record, strict=True).model_dump(exclude_unset=True))
+        samples.append(Operation.model_validate(record, strict=True).model_dump(exclude_unset=True))
       except ValidationError:
         invalid += 1
-    return {"samples": samples, **({"error": f"{what}: skipped {invalid} invalid records; partial data"} if invalid else {})}
+    return {"samples": samples, **({"partial": f"Skipped {invalid} invalid operation records"} if invalid else {})}
 
-  records, turns = await asyncio.gather(
-    asyncio.gather(*(read(ops.key(r), "Operation telemetry", Operation) for r in runs)),
-    asyncio.gather(*(read(ops.turn_key(w), "GPU turn telemetry", Turn) for w in workers)),
-  )
-  records = dict(zip(runs, records))
-  result = inspection.activity(state, low, high, records, dict(zip(workers, turns)), run_id, node_id)
+  records = dict(zip(keys, await asyncio.gather(*(read(ops.key(k)) for k in keys))))
+  result = inspection.activity(state, low, high, records, run_id, node_id)
   result.update(since=start, until=end, observed_at=state["observed_at"])
   result["coverage"] = (
     f"At most {ops.SAMPLE_LIMIT} completed records per run/worker, best effort. "
-    "Missing records do not prove no requests arrived or that workers were idle. Client logs and queued/in-flight requests are not included."
+    "Missing records do not prove no requests arrived or that workers were idle. Queued and in-flight requests are in inventory runs[].progress."
   )
   if run_id:
     result.update(
       run=run,
       samples=[s for s in records[run_id]["samples"] if low <= s["at"] <= high],
       error=records[run_id].get("error"),
+      partial=records[run_id].get("partial"),
       incidents=inspection.incidents(run, low, high),
     )
   return result
@@ -187,7 +184,7 @@ async def run_logs(
   await gke.discover()
   state, run = await run_of(run_id)
   since, until, _, _ = time_range(since, until or state["observed_at"])
-  sources = gke.pod_sources(run, state["history"], state["observed_at"])
+  sources = gke.pod_sources(run, inspection.segments(state, run_id), state["observed_at"])
   try:
     result = await gke.run_logs(run_id, sources, since=since, until=until, cursor=cursor, limit=limit, q=q, pod=pod, node=node, severity=severity)
   except ValueError as exc:

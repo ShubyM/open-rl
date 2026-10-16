@@ -1,4 +1,3 @@
-import copy
 import unittest
 from unittest import mock
 
@@ -6,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from server.dashboard import router
 from server.dashboard.__main__ import app
-from tests.test_dashboard_inspection import PLACEMENT, operation, state
+from tests.test_dashboard_inspection import PLACEMENT, PROCESS, RUN, operation, state
 
 WINDOW = {"since": "1970-01-01T00:02:00Z", "until": "1970-01-01T00:03:10Z"}
 
@@ -15,7 +14,6 @@ class InspectionApiTest(unittest.TestCase):
   def setUp(self):
     self.client = TestClient(app)
     self.state = state()
-    self.state["cluster"]["nodes"] = []
     self.state["runs"][0].update(shared_runtime=False)
     self.store = mock.Mock(read_samples=mock.AsyncMock(return_value=[]))
     patches = [
@@ -32,18 +30,19 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual(response.status_code, 200)
     inventory = response.json()
     self.assertEqual(inventory["placements"][0]["devices"], PLACEMENT["devices"])
-    self.assertNotIn("history", inventory)
+    self.assertNotIn("processes", inventory)
     paths = self.client.get("/openapi.json").json()["paths"]
     self.assertIn("/api/v1/inspect/activity", paths)
     self.assertTrue(all(set(methods) == {"get"} for methods in paths.values()))
 
-  def test_activity_batches_shared_workers_and_keeps_partial_source_errors(self):
-    self.state["placements"][0] = {**PLACEMENT, "run_ids": ["r1", "r2"]}
-    old = {**copy.deepcopy(PLACEMENT), "id": "expired", "name": "expired", "first_seen": 1, "last_seen": 10}
-    self.state["history"].append(old)
+  def test_activity_reads_each_runs_ops_once_and_keeps_per_lane_errors(self):
+    self.state.update(
+      placements=[], processes=[{**PROCESS, "runtime_id": "base"}, {**PROCESS, "id": "old", "pod_uid": "old", "started_at": 1, "heartbeat_at": 10}]
+    )
+    self.state["runs"] = [{**RUN, "run_id": identity, "runtime_id": "base", "shared_runtime": True} for identity in ("r1", "r2")]
 
     async def read_samples(key):
-      if key == router.ops.turn_key("trainer"):
+      if key == router.ops.key("r2"):
         raise RuntimeError("offline")
       return [operation(110, 130)]
 
@@ -51,11 +50,11 @@ class InspectionApiTest(unittest.TestCase):
     response = self.client.get("/api/v1/inspect/activity", params=WINDOW)
     self.assertEqual(response.status_code, 200)
     keys = sorted(call.args[0] for call in self.store.read_samples.await_args_list)
-    self.assertEqual(keys, sorted([router.ops.key("r1"), router.ops.key("r2"), router.ops.turn_key("trainer")]))
-    lane = next(p for p in response.json()["placements"] if p["id"] == "w1:r1")
-    self.assertEqual(lane["intervals"], [[120, 130]])
-    self.assertFalse(lane["exact"])
-    self.assertIn("unavailable", lane["warning"])
+    self.assertEqual(keys, sorted(router.ops.key(k) for k in ("r1", "r2", "base")))
+    lanes = {p["id"]: p for p in response.json()["placements"]}
+    self.assertEqual(set(lanes), {"p1:r1", "p1:r2"})
+    self.assertEqual((lanes["p1:r1"]["intervals"], lanes["p1:r1"].get("error")), ([[120, 130]], None))
+    self.assertEqual((lanes["p1:r2"]["intervals"], lanes["p1:r2"]["error"]), ([], "Operation records unavailable"))
 
   def test_queries_validate_windows_without_touching_sources(self):
     for path in ("activity", "series"):
@@ -64,7 +63,7 @@ class InspectionApiTest(unittest.TestCase):
     self.store.read_samples.assert_not_awaited()
 
   def test_run_activity_keeps_metrics_and_incidents_without_placement_history(self):
-    self.state.update(placements=[], history=[])
+    self.state.update(placements=[], processes=[])
     self.state["runs"][0]["pods"] = [{"name": "p", "events": [{"reason": "OOMKilled", "last_seen_at": "1970-01-01T00:02:30Z", "message": "OOM"}]}]
     self.store.read_samples.return_value = [operation(125, 140), operation(150, 200)]
     response = self.client.get("/api/v1/inspect/activity", params={**WINDOW, "run_id": "r1"})
@@ -110,9 +109,10 @@ class InspectionApiTest(unittest.TestCase):
       self.assertTrue(model["properties"], path)
     models = spec["components"]["schemas"]
     for name, fields in {
-      "Run": ["display_status", "session_live", "workers", "workers_error", "settings", "shared_runtime"],
+      "Run": ["display_status", "session_live", "workers", "workers_error", "settings", "shared_runtime", "progress"],
+      "Progress": ["state", "reason", "outstanding", "queued"],
       "Workload": ["placed_message", "placed_reason", "requested_memory"],
-      "PlacementActivity": ["exact", "warning", "error", "intervals"],
+      "PlacementActivity": ["exact", "partial", "error", "intervals", "phase"],
       "Series": ["reason", "available"],
       "Logs": ["next_cursor", "error"],
       "PodLogs": ["previous", "text"],
@@ -131,7 +131,7 @@ class InspectionApiTest(unittest.TestCase):
       data = self.client.get("/api/v1/inspect/inventory").json()
       self.assertEqual(data["runs"], self.state["runs"])
       self.assertEqual(data["cluster"], self.state["cluster"])
-      self.assertNotIn("history", data)
+      self.assertNotIn("processes", data)
 
   def test_fuzz_invalid_query_parameters_never_read_sources(self):
     import random
@@ -165,7 +165,8 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual(response.status_code, 200)
     result = response.json()
     self.assertEqual([s["at"] for s in result["samples"]], [140])
-    self.assertIn("invalid", result["error"].lower())
+    self.assertIn("invalid", result["partial"].lower())
+    self.assertIsNone(result["error"])
     self.assertEqual(result["placements"][0]["intervals"], [[125, 140]])
 
   def test_pod_logs_preserve_previous_and_unknown_diagnostics(self):
@@ -184,17 +185,16 @@ class InspectionApiTest(unittest.TestCase):
       self.assertEqual(data["placements"][0]["intervals"], [[125, 140]])
       self.assertEqual(len(data["samples"]), 1)
 
-  def test_random_corrupt_ops_and_turns_preserve_good_samples(self):
+  def test_random_corrupt_ops_preserve_good_samples(self):
     import random
 
     rng = random.Random(1739)
     invalid = [None, False, "bad", [], {}, float("nan"), float("inf")]
     for case in range(200):
-      bad_op, bad_turn = operation(125, 140), {"started_at": 120, "at": 150, "ops": []}
-      bad_op[rng.choice(["at", "started_at", "operation", "metrics"])] = rng.choice(invalid)
-      bad_turn[rng.choice(["at", "started_at", "ops"])] = rng.choice(invalid[:-2])
-      # Some mutations (empty metrics / ops) are valid; all must remain serializable.
-      records = {router.ops.key("r1"): [bad_op, operation(155, 165)], router.ops.turn_key("trainer"): [bad_turn]}
+      bad_op = operation(125, 140)
+      bad_op[rng.choice(["at", "started_at", "operation", "metrics", "nonfinite"])] = rng.choice(invalid)
+      # Some mutations (empty metrics) are valid; all must remain serializable.
+      records = {router.ops.key("r1"): [bad_op, operation(155, 165)]}
       self.store.read_samples.side_effect = records.__getitem__
       response = self.client.get("/api/v1/inspect/activity", params={**WINDOW, "run_id": "r1"})
       self.assertEqual(response.status_code, 200, case)

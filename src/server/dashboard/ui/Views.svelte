@@ -1,7 +1,7 @@
 <script>
   import Status from "./Status.svelte";
   import { inspectUrl, now, viewLink } from "./state.svelte.js";
-  import { duration, elapsedTime } from "./format.js";
+  import { duration, elapsedTime, KINDS, runDescription } from "./format.js";
 
   let { inventory, view = $bindable() } = $props();
   const GROUPS = { unassigned: ["Unassigned"], finished: ["Completed", "Ended"] };
@@ -11,7 +11,6 @@
     ["unassigned", "Unassigned", "Recorded as active, but no workers are assigned; usually a client that exited without finishing"],
     ["finished", "Finished", "Completed or ended"],
   ];
-  const KINDS = { lora: "LoRA", full: "FFT", fft: "FFT" };
   const group = (run) => Object.keys(GROUPS).find((key) => GROUPS[key].includes(run.display_status)) || "active";
   const runLink = (run, tab = "activity") => viewLink(`run/${encodeURIComponent(run.run_id)}/${tab}`);
   const shown = $derived.by(() => {
@@ -32,7 +31,7 @@
     const reason = String(pod.problem || "").split(":", 1)[0];
     return pod.phase === "Failed" || failing || reason === "Failed" || FAILED_WAITING.has(reason) ? "error" : "warning";
   }
-  const errors = $derived([...new Set([inventory.store_error, inventory.history_error, inventory.cluster.error, inventory.cluster.nodes_error, inventory.cluster.events_error, inventory.cluster.devices?.error, inventory.cluster.scheduler?.error].filter(Boolean))]);
+  const errors = $derived([...new Set([inventory.store_error, inventory.processes_error, inventory.cluster.error, inventory.cluster.nodes_error, inventory.cluster.events_error, inventory.cluster.devices?.error, inventory.cluster.scheduler?.error].filter(Boolean))]);
   const issues = $derived.by(() => {
     const pods = (inventory.cluster.pods || []).filter((pod) => pod.problem).map((pod) => {
       const run = inventory.runs.find((r) => r.pods.some((p) => p.uid === pod.uid));
@@ -67,7 +66,7 @@
           <span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Created</span><span>Elapsed</span>
         </div>
         {#each shown as run (run.run_id)}
-          {@const label = [run.display_name, run.recipe_name].filter((value, i, values) => value && values.indexOf(value) === i).join(" · ")}
+          {@const label = runDescription(run, null)}
           {@const model = (run.model || "Run").split("/").at(-1)}
           <div class="job-list-row run-row" data-key={run.run_id}>
             <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span></a>{#if label}<span class="muted micro">{label}</span>{/if}</span>

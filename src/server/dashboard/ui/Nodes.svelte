@@ -17,12 +17,13 @@
   });
   const queryRange = $derived(frozen || range);
   const bounds = $derived({ since: new Date(queryRange.start * 1000).toISOString(), until: new Date(queryRange.now * 1000).toISOString() });
-  const history = createQuery(() => inspectUrl("activity", bounds), { poll: 15000, pollWhen: () => !frozen });
+  const selection = () => `${view.duration} ${view.end} ${frozen?.start ?? ""} ${frozen?.now ?? ""}`;
+  const history = createQuery(() => inspectUrl("activity", bounds), { poll: 15000, pollWhen: () => !frozen, key: selection });
   // Lanes wait for the first history response so they render once, complete, instead of filling in and shifting.
   const loading = $derived(!history.data && !history.error);
   const all = $derived(clipPlacements(history.data?.placements || [], range, history.error, history.status));
   const node = $derived(inventory.cluster.nodes.find((n) => n.name === view.node));
-  const series = createQuery(() => node ? inspectUrl("series", { node_id: node.name, ...bounds }) : null, { scope: () => node?.name, poll: 15000, pollWhen: () => !frozen });
+  const series = createQuery(() => node ? inspectUrl("series", { node_id: node.name, ...bounds }) : null, { scope: () => node?.name, poll: 15000, pollWhen: () => !frozen, key: () => node && `${node.name} ${selection()}` });
   const metrics = $derived(series.data || { devices: [], workers: [], reason: series.error || "Loading…" });
   const selectedDevices = $derived([...new Map((metrics.devices || []).filter((d) => view.gpu === "all" || view.gpu === d.id).map((d) => [d.uuid || d.id, d])).values()]);
   const gpuPoints = $derived(deviceSeries(selectedDevices, "utilization"));
@@ -31,7 +32,7 @@
   const workerMemory = $derived(lastValue(sumSeries(metrics.workers || [], "memory_bytes"), range));
   const failures = $derived([...new Set([series.error, ...selectedDevices.map((d) => d.reason)].filter(Boolean))]);
   const visible = $derived(all.filter((p) => p.node === node?.name && (view.gpu === "all" || p.devices.includes(view.gpu)) && p.start <= range.now && p.end >= range.start));
-  const errors = $derived([...new Set([inventory.cluster.error, inventory.cluster.nodes_error, inventory.cluster.devices?.error, inventory.cluster.scheduler?.error, inventory.history_error, history.error].filter(Boolean))]);
+  const errors = $derived([...new Set([inventory.cluster.error, inventory.cluster.nodes_error, inventory.cluster.devices?.error, inventory.cluster.scheduler?.error, inventory.processes_error, history.error].filter(Boolean))]);
   const nodes = $derived([...inventory.cluster.nodes].sort((a, b) => Number(inventory.placements.some((p) => p.node === b.name)) - Number(inventory.placements.some((p) => p.node === a.name)) || Number(b.gpu_capacity > 0) - Number(a.gpu_capacity > 0)));
   const unavailable = $derived(!node && (view.node || (view.placement && history.data)));
   const duration = $derived(range.now - range.start);
@@ -110,7 +111,7 @@
   {#if history.error}<button type="button" class="chip" data-retry-data="activity:nodes" onclick={history.retry}>Retry activity</button>{/if}
   {#if !inventory.cluster.available && !errors.length}<p class="empty-state">Kubernetes unavailable</p>{/if}
   {#if unavailable}<div class="unavailable-selection" role="status"><span>{view.node ? "The selected node is no longer reported." : "The selected placement is not in retained history."}</span><button type="button" class="detail-close" data-close-details aria-label="Clear unavailable selection" title="Clear selection" onclick={close}>×</button></div>{/if}
-  <div class="node-time-header"><span>Node</span><div class="node-axis">{#each [0, 1, 2, 3] as tick}<span>{axisTime(range.start + (range.now - range.start) * tick / 3, range)}</span>{/each}</div><span class="node-duty" title="GPU claimed time over this window, not measured GPU utilization">Claimed</span></div>
+  <div class="node-time-header"><span>Node</span><div class="node-axis">{#each [0, 1, 2, 3] as step}<span>{axisTime(range.start + (range.now - range.start) * step / 3, range)}</span>{/each}</div><span class="node-duty" title="GPU claimed time over this window, not measured GPU utilization">Claimed</span></div>
   {#each loading ? [] : nodes as item (item.name)}
     {@const devices = item.devices || []}
     {@const height = devices.length === 1 ? 30 : 22}

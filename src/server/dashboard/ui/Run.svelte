@@ -6,17 +6,17 @@
   import Logs from "./Logs.svelte";
   import CopyLink from "./CopyLink.svelte";
   import Configuration from "./Configuration.svelte";
-  import { duration, shortNodeName, samplerPodPattern } from "./format.js";
+  import { duration, shortNodeName, samplerPodPattern, KINDS, runDescription } from "./format.js";
   let { inventory, view } = $props();
   const range = $derived(rangeOf(inventory, view));
   const validEvent = $derived(view.event === null || (view.event >= range.start && view.event <= range.now));
   $effect(() => { if (!validEvent) view.event = null; });
   const url = $derived(inspectUrl("activity", { since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString(), run_id: view.id }));
-  const detail = createQuery(() => url, { poll: 15000, pollWhen: () => view.end === null });
+  const detail = createQuery(() => url, { poll: 15000, pollWhen: () => view.end === null, key: () => `${view.id} ${view.duration} ${view.end}` });
   const run = $derived((detail.status !== 404 ? detail.data?.run : null) || inventory.runs.find((r) => r.run_id === view.id));
-  const error = $derived(inventory.store_error || detail.error);
-  const title = $derived(run ? [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), { lora: "LoRA", full: "FFT", fft: "FFT" }[run.fine_tuning_type]].filter(Boolean).join(" · ") : "Run");
-  const description = $derived(run ? [run.display_name, run.recipe_name].filter((v, i, values) => v && v !== title && values.indexOf(v) === i).join(" · ") : "");
+  const error = $derived(inventory.store_error || inventory.processes_error || detail.error);
+  const title = $derived(run ? [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), KINDS[run.fine_tuning_type]].filter(Boolean).join(" · ") : "Run");
+  const description = $derived(run ? runDescription(run, title) : "");
   const samples = $derived((detail.data?.samples || []).filter((s) => s.at >= range.start && s.at <= range.now));
   const roles = $derived([...new Set(samples.map((s) => s.role || "process"))]);
   const names = $derived([...new Set(samples.flatMap((s) => Object.entries(s.metrics || {}).filter(([, v]) => Number.isFinite(v)).map(([k]) => k)))].slice(0, 12));
@@ -44,6 +44,7 @@
     {#if run.workers?.length}
       {#each (run.pods || []).filter((p) => p.problem) as pod}<p class="source-error" role="status">{pod.name}: {pod.problem}</p>{/each}
     {:else}<p>{run.summary || "Run state unavailable"}</p>{/if}
+    {#if run.progress}<p class={run.progress.state === "OK" ? "muted" : "source-error"} role="status">Progress: {run.progress.state} · {run.progress.reason}</p>{/if}
     <p class="muted">Model session: {run.session_live == null ? "Unknown" : run.session_live ? "Live" : "No live session"}{run.shared_runtime ? " · Shared runtime" : ""}</p>
     {#if run.workers_error}<p class="source-error" role="status">Workers: {run.workers_error}</p>{/if}
     {#if run.workers?.length}
@@ -71,7 +72,7 @@
   </div>
   {#if detail.data?.incidents?.length}
     <section class="run-incidents" aria-label="Significant events">
-      {#each detail.data.incidents as event}
+      {#each detail.data.incidents.slice(0, 3) as event}
         {@const at = new Date(event.at * 1000).toISOString()}
         {@const label = event.reason === "WorkerRestarted" ? "Worker restarted" : event.reason}
         <div class={`run-incident incident-${event.tone}`}>

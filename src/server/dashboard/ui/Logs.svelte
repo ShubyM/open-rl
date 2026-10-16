@@ -1,15 +1,17 @@
 <script>
   import { untrack, tick } from "svelte";
   import { get, inspectUrl } from "./state.svelte.js";
+  import { escapeRegExp } from "./format.js";
   let { run, view, range, allLogs } = $props();
-  let records = $state([]), lifetimes = $state([]), cursor = $state(null), pending = $state(true), error = $state(null), source = $state(null);
+  let records = $state([]), lifetimes = $state([]), cursor = $state(null), pending = $state(true), error = $state(null), source = $state(null), note = $state(null);
   let controller, request = 0, loaded = "", filters = "", successfulParams, successfulEnd, failedPage, lines, fromBottom = 0;
   const logRange = $derived({
     since: new Date(Math.max(range.start, view.event === null ? range.start : view.event - 120) * 1000).toISOString(),
     until: new Date(Math.min(range.now, view.event === null ? range.now : view.event + 120) * 1000).toISOString(),
   });
   const params = $derived({ run_id: view.id, q: view.q, limit: "200", ...logRange, ...(view.pod ? { pod: view.pod } : {}) });
-  const queryKey = $derived(JSON.stringify(params));
+  // The user's selection, not the live window, which moves with every snapshot and is read at each load.
+  const queryKey = $derived(JSON.stringify([view.id, view.q, view.pod, view.event, view.duration, view.end]));
   const filterKey = $derived(JSON.stringify([view.id, view.q, view.pod, view.event, view.duration]));
   const sources = $derived.by(() => {
     const pods = new Map((run.pods || []).map((p) => [p.name, p]));
@@ -26,7 +28,7 @@
   });
   const hues = $derived(new Map(sources.map((p, i) => [p.name, `hue-${i % 8}`])));
   const tagWidth = $derived(Math.min(20, Math.max(0, ...sources.map((p) => p.name.length - cut))));
-  const match = $derived(view.q ? new RegExp(`(${RegExp.escape(view.q)})`, "i") : null);
+  const match = $derived(view.q ? new RegExp(`(${escapeRegExp(view.q)})`, "i") : null);
   // The API pages newest first; a tail reads down to the newest line.
   const shown = $derived(records.toReversed());
   const paging = $derived(pending && view.end !== null);
@@ -41,7 +43,6 @@
     const version = request, windowEnd = range.now;
     controller = new AbortController();
     pending = true;
-    error = null;
     try {
       const data = await get(inspectUrl("logs", { ...query, ...(page ? { cursor: page } : {}) }), controller.signal);
       if (version !== request) return;
@@ -51,21 +52,23 @@
       lifetimes = data.sources || [];
       cursor = records.length < 2000 ? data.next_cursor : null;
       source = data.source;
+      note = data.note || null;
+      error = null;
       successfulParams = query;
       successfulEnd = windowEnd;
-      loaded = JSON.stringify(query);
+      loaded = queryKey;
       failedPage = null;
     } catch (failure) {
       if (version === request) { error = failure.message; failedPage = { query, page }; }
     } finally { if (version === request) { pending = false; controller = null; } }
   }
   $effect(() => {
-    const key = queryKey, query = JSON.parse(key), follow = view.end === null, scope = filterKey;
+    const key = queryKey, follow = view.end === null, scope = filterKey;
     return untrack(() => {
       const changed = scope !== filters, searched = changed && filters && JSON.parse(scope)[1] !== JSON.parse(filters)[1];
-      if (changed) { records = []; cursor = source = error = null; loaded = ""; successfulParams = successfulEnd = undefined; filters = scope; }
-      const start = key !== loaded ? setTimeout(() => load(query), searched ? 250 : 0) : null;
-      const timer = follow ? setInterval(() => { if (!document.hidden && !pending) load(query); }, 5000) : null;
+      if (changed) { records = []; cursor = source = error = note = null; loaded = ""; successfulParams = successfulEnd = undefined; filters = scope; }
+      const start = key !== loaded ? setTimeout(() => load(params), searched ? 250 : 0) : null;
+      const timer = follow ? setInterval(() => { if (!document.hidden && !pending) load(params); }, 5000) : null;
       return () => { clearTimeout(start); clearInterval(timer); stop(); };
     });
   });
@@ -115,5 +118,5 @@
     <div class="workspace-logrow" data-key={record.id} data-severity={severity(record)}>
       <time class="log-time" datetime={at} title={at || "No timestamp"}>{at ? at.slice(11, 23) : "—"}</time><span class={`log-pod ${hues.get(record.pod) || ""}`} title={record.pod}>{record.pod?.slice(cut)}</span><pre class="log-message">{#each match ? record.message.split(match) : [record.message] as part, i}{#if i % 2}<mark>{part}</mark>{:else}{part}{/if}{/each}{#if record.message_truncated}<span class="muted">{"\n[Message truncated by source]"}</span>{/if}</pre>
     </div>
-  {:else}{#if !pending && !error}<p class="empty-state">No logs match this time range and filter</p>{/if}{/each}
+  {:else}{#if !pending && !error}<p class="empty-state">{note || "No logs match this time range and filter"}</p>{/if}{/each}
 </div>

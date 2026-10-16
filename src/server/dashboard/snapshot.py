@@ -1,24 +1,26 @@
 """The one view of the cluster the pages and agents read: runs joined to their
-workers, current placements on GPUs, nodes with their devices, and the
-placement history that outlives them."""
+workers and their progress, current placements on GPUs, nodes with their
+devices, and the records worker processes keep about themselves."""
 
 import asyncio
 import json
+import statistics
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
 from server import openrl_status
-from server.dashboard import history
 from server.model_metadata import decode_model_metadata
 from server.session_registry import SessionRegistry
-from server.store import StateStore
+from server.store import StateStore, request_queue, sampling_queue
 from server.telemetry import kubernetes, ops
 from server.worker_manager import FAILED, READY, STARTING, STOPPED, WAITING_FOR_PLACEMENT
 
 CACHE_SECONDS = 5
 HISTORY_WINDOW_SECONDS = 24 * 3600
 METADATA_PREFIX = "open_rl:model_meta:"
+# A request on a worker longer than this, or three median steps, is stalled.
+STALL_SECONDS = 600
 
 
 class InventoryWorkers:
@@ -111,6 +113,7 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
         "model": meta.base_model,
         "display_name": row.get("name") or row.get("run_name"),
         "recipe_name": row.get("recipe_name"),
+        "git_rev": row.get("git_rev"),
         "fine_tuning_type": meta.fine_tuning_type,
         "runtime_id": runtime,
         "shared_runtime": shared,
@@ -132,10 +135,73 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
   return sorted(runs, key=lambda r: r["created_at"], reverse=True)
 
 
+def progress(run: dict, processes: list[dict], recent: list, queued: dict, now: float) -> dict:
+  """Whether an active run is moving, judged by what completes rather than by which processes are up.
+
+  DEAD: a process that popped the run's requests stopped reporting, so nothing will answer them.
+  STALLED: a request has been on a worker, or requests have sat queued, for longer than
+  three median steps (at least STALL_SECONDS). IDLE: nothing is queued or running and nothing
+  completed for that long, so the client is not sending work. OK otherwise."""
+  outstanding = [
+    {
+      **group,
+      "pod": process.get("pod") or process["id"],
+      "phase": process.get("phase"),
+      "process_alive": ops.alive(process, now),
+      "age_seconds": now - group["since"],
+    }
+    for process in processes
+    if process.get("runtime_id") == run["runtime_id"]
+    for group in process.get("outstanding", [])
+    if group.get("run_id") == run["run_id"]
+  ]
+  done = [sample for sample in recent if isinstance(sample, dict) and isinstance(sample.get("at"), int | float)]
+  last = max((sample["at"] for sample in done), default=None)
+  steps = sorted(sample["at"] for sample in done if sample.get("operation") == "optim_step" and sample.get("status") == "succeeded")
+  step_seconds = statistics.median(b - a for a, b in zip(steps, steps[1:])) if len(steps) > 2 else None
+  patience = max(STALL_SECONDS, 3 * (step_seconds or 0))
+  quiet = now - (last if last is not None else run["created_at"] or now)
+  waiting = sum(count for count in queued.values() if count)
+  lost = [o for o in outstanding if not o["process_alive"]]
+  oldest = max(outstanding, key=lambda o: o["age_seconds"], default=None)
+  held = oldest and f"{oldest['op']} has been on {oldest['pod']} ({oldest['phase']}) for {oldest['age_seconds'] / 60:.0f} min"
+  if lost:
+    state, reason = "DEAD", f"{sum(o['count'] for o in lost)} {lost[0]['op']} request(s) were taken by {lost[0]['pod']}, which stopped reporting"
+  elif oldest and oldest["age_seconds"] > patience:
+    state, reason = "STALLED", held
+  elif waiting and quiet > patience:
+    state, reason = "STALLED", f"{waiting} request(s) queued and nothing completed for {quiet / 60:.0f} min"
+  elif not outstanding and not waiting and quiet > patience:
+    state, reason = "IDLE", f"nothing queued or running, and nothing completed for {quiet / 60:.0f} min: the client is not sending work"
+  else:
+    state, reason = "OK", held or (f"last op completed {quiet / 60:.0f} min ago" if last is not None else "no ops yet")
+  return {"state": state, "reason": reason, "last_completed_at": last, "step_seconds": step_seconds, "outstanding": outstanding, "queued": queued}
+
+
+async def add_progress(store: StateStore, run: dict, processes: list[dict], now: float) -> None:
+  reads = (
+    store.read_samples(ops.key(run["run_id"]), last=50),
+    store.list_length(request_queue(run["run_id"])),
+    store.list_length(sampling_queue(run["runtime_id"])),
+  )
+  try:
+    recent, trainer, sampler = await asyncio.wait_for(asyncio.gather(*reads), timeout=5)
+  except Exception as exc:
+    run["progress"] = {"state": "UNKNOWN", "reason": f"progress unavailable: {type(exc).__name__}"}
+    return
+  run["progress"] = progress(run, processes, recent, {"trainer": trainer, "sampler": sampler}, now)
+  if run["progress"]["state"] in ("DEAD", "STALLED") and run["display_status"] in ("Ready", "Active"):
+    run["display_status"] = "Stalled"
+
+
+async def processes_of(store: StateStore, since: float) -> list[dict]:
+  records = [json.loads(raw) for raw in (await store.scan_values(ops.worker_key(""))).values()]
+  return [record for record in records if record.get("heartbeat_at", 0) >= since]
+
+
 def placements_of(state: dict, runs: list[dict]) -> list[dict]:
   """Every placed workload as one allocation: who, where, on which devices."""
   claims = state["devices"]["claims"]
-  devices = {d["id"]: d["uuid"] for node in state["devices"].get("nodes", {}).values() for d in node if d.get("uuid")}
   pods = {pod["name"]: pod for pod in state["pods"]}
   placements = []
   for workload in state["scheduler"]["workloads"]:
@@ -159,7 +225,6 @@ def placements_of(state: dict, runs: list[dict]) -> list[dict]:
         "phase": workload.get("phase"),
         "device_count": workload.get("device_count", 0),
         "devices": claims.get(workload.get("claim_name"), []),
-        "device_uuids": {device: devices[device] for device in claims.get(workload.get("claim_name"), []) if device in devices},
       }
     )
   return placements
@@ -190,20 +255,21 @@ class Snapshot:
       ctx = self.status_context(store, cluster)
       await asyncio.gather(*(add_status(ctx, run) for run in runs))
       now = time.time()
-      history_error = None
+      processes_error = None
       try:
-        past = await asyncio.wait_for(history.read(store, now - HISTORY_WINDOW_SECONDS), timeout=5)
+        processes = await asyncio.wait_for(processes_of(store, now - HISTORY_WINDOW_SECONDS), timeout=5)
       except Exception:
-        past = self.latest["history"] if self.latest else []
-        history_error = "Placement history unavailable; showing last known placements" if past else "Placement history unavailable"
+        processes = self.latest["processes"] if self.latest else []
+        processes_error = "Worker process records unavailable; showing last known" if processes else "Worker process records unavailable"
+      await asyncio.gather(*(add_progress(store, run, processes, now) for run in runs if run["status"] == "active"))
       self.latest = {
         "observed_at": datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds"),
         "cluster": cluster,
         "runs": runs,
         "store_error": store_error,
         "placements": placements_of(cluster, runs),
-        "history": past,
-        "history_error": history_error,
+        "processes": processes,
+        "processes_error": processes_error,
       }
       self.updated = time.monotonic()
       return self.latest

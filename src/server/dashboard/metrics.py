@@ -25,16 +25,13 @@ async def series(state: dict, node_id=None, since=None, until=None) -> dict:
   start, end = gke.time_range(since, until)
   low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
   placements = [p for p in segments(state, node_id=node_id) if p["start"] <= high and p["end"] >= low]
-  live = {p["id"] for p in state["placements"]}
   current = {d["id"]: d.get("uuid") for n in state["cluster"]["nodes"] if not node_id or n.get("name") == node_id for d in n["devices"]}
   devices, workers = {}, {}
   for placement in placements:
     for identity in placement["devices"]:
-      uuid = (placement.get("device_uuids") or {}).get(identity) or (
-        current.get(identity) if placement.get("allocation_id", placement["id"]) in live else None
-      )
+      uuid = (placement.get("device_uuids") or {}).get(identity) or (None if placement["ended"] else current.get(identity))
       devices[identity, uuid] = None
-    identity, pod = placement.get("worker_id") or placement.get("allocation_id") or placement["id"], placement.get("pod")
+    identity, pod = placement.get("allocation_id") or placement["id"], placement.get("pod")
     uid = placement.get("pod_uid")
     if pod:
       worker = workers.setdefault((identity, uid, pod), {"id": identity, "pod": pod, "pod_uid": uid, "first_seen": high, "last_seen": low})

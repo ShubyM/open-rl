@@ -58,16 +58,17 @@ export async function get(url, signal) {
   return response.json().catch(() => { throw new Error("The dashboard returned an invalid response. Try again."); });
 }
 
-// Svelte owns query lifetime: changing the URL or unmounting aborts old work.
-export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () => true } = {}) {
+// Svelte owns query lifetime: changing the key or unmounting aborts old work. The key defaults to the URL;
+// a live view keys on the user's selection, so its moving window is read at each poll instead of restarting it.
+export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () => true, key = url } = {}) {
   let revision = $state(0), previousScope;
-  const target = $derived(url()), identity = $derived(scope());
+  const target = $derived(key()), identity = $derived(scope());
   const result = $state({ data: null, error: null, status: null, pending: false, retry: () => revision++ });
   $effect(() => {
-    const requested = target, requestedScope = identity;
+    const requestedKey = target, requestedScope = identity;
     revision;
     return untrack(() => {
-      if (!requested) return;
+      if (!requestedKey || !url()) return;
       if (requestedScope !== previousScope) { result.data = result.error = result.status = null; }
       previousScope = requestedScope;
       let controller, disposed = false;
@@ -76,7 +77,7 @@ export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () =
         controller = new AbortController();
         result.pending = true;
         try {
-          const data = await get(requested, controller.signal);
+          const data = await get(url(), controller.signal);
           if (disposed) return;
           result.error = data.error || null;
           result.status = null;

@@ -44,6 +44,29 @@ class Pod(Record):
   events: list[dict[str, JsonValue]] = Field(default_factory=list)
 
 
+class Outstanding(Record):
+  op: str
+  run_id: str | None = None
+  count: int
+  since: float = Field(description="When the oldest of these was popped, Unix seconds")
+  age_seconds: float
+  pod: str
+  phase: str | None = Field(None, description="starting, ready, waiting_gpu, on_gpu or exited")
+  process_alive: bool = Field(description="False: the process stopped rewriting its record, so nothing will answer these requests")
+
+
+class Progress(Record):
+  state: str = Field(
+    description="OK; STALLED: a request on a worker, or queued, for longer than three median steps (at least 10 minutes); "
+    "DEAD: requests taken by a process that stopped reporting; IDLE: nothing queued or running, so the client is not sending work; UNKNOWN"
+  )
+  reason: str
+  last_completed_at: float | None = Field(None, description="Newest completed op, Unix seconds")
+  step_seconds: float | None = Field(None, description="Median time between successful optim_steps")
+  outstanding: list[Outstanding] = Field(default_factory=list, description="Requests a worker popped and has not answered")
+  queued: dict[str, int | None] = Field(default_factory=dict, description="Requests waiting in the trainer and sampler queues; null when unknown")
+
+
 class Run(Record):
   run_id: str
   model: str | None = None
@@ -55,6 +78,8 @@ class Run(Record):
   session_live: bool | None = Field(None, description="Null means unknown, false means no live session")
   settings: dict[str, JsonValue] | None = Field(None, description="Saved model settings; excludes worker environment and per-step parameters")
   steps: int | None = Field(None, description="Best-effort observed completed optimizer steps, not an authoritative total")
+  progress: Progress | None = Field(None, description="Active runs only. Read this first for a run that is not advancing")
+  git_rev: str | None = None
   workers: list[Worker] = Field(default_factory=list)
   workers_error: str | None = None
   pods: list[Pod] = Field(default_factory=list)
@@ -115,21 +140,22 @@ class Inventory(Record):
   runs: list[Run]
   placements: list[Placement]
   store_error: str | None = None
-  history_error: str | None = None
+  processes_error: str | None = None
   grafana: bool
 
 
 class PlacementActivity(Placement):
-  start: float = Field(description="First observation or creation time, Unix seconds")
-  end: float = Field(description="Last observation or current snapshot time, Unix seconds")
-  ended: bool
+  start: float = Field(description="Process start, or workload creation before the process reports; Unix seconds")
+  end: float = Field(description="The process's last heartbeat, or the snapshot time while it runs; Unix seconds")
+  ended: bool = Field(description="The process exited or stopped reporting")
   intervals: list[tuple[float, float]]
   ops: dict[str, list[tuple[float, float]]]
   exact: bool = Field(
-    description="True: recorded GPU turns. False: completed-op intervals, which may include waiting. Missing intervals do not prove idleness"
+    description="True: intervals include GPU turns. False: completed ops only, which may include waiting. Gaps do not prove idleness"
   )
-  error: str | None = None
-  warning: str | None = None
+  phase: str | None = Field(None, description="The process's own phase; see Outstanding.phase")
+  error: str | None = Field(None, description="Operation records unavailable")
+  partial: str | None = Field(None, description="Some operation records were invalid and skipped")
 
 
 class TimedRecord(Record):
@@ -153,24 +179,7 @@ class Operation(TimedRecord):
   error_type: str | None = None
   elapsed_seconds: float = Field(0, ge=0)
   metrics: dict[str, float] = Field(default_factory=dict)
-
-
-class TurnOp(Record):
-  name: str
-  start: float
-  end: float
-  run_id: str | None = None
-
-  @model_validator(mode="after")
-  def ordered(self):
-    if self.start > self.end:
-      raise ValueError("Operation ends before it starts")
-    return self
-
-
-class Turn(TimedRecord):
-  started_at: float
-  ops: list[TurnOp] = Field(default_factory=list)
+  nonfinite: list[str] = Field(default_factory=list, description="Metrics the op returned as NaN or infinity")
 
 
 class Incident(Record):
@@ -193,6 +202,7 @@ class Activity(Record):
   samples: list[Operation] = Field(default_factory=list)
   incidents: list[Incident] = Field(default_factory=list)
   error: str | None = None
+  partial: str | None = None
 
 
 class DeviceSeries(Device):
@@ -236,6 +246,7 @@ class Logs(Source):
   next_cursor: str | None = Field(description="Pass back as cursor with the same filters for older records")
   shared_runtime: bool
   sources: list[dict[str, JsonValue]] = Field(default_factory=list)
+  note: str | None = Field(None, description="Why an available result is empty")
 
 
 class PodLogs(Record):

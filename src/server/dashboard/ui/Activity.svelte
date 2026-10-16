@@ -5,10 +5,10 @@
   let tooltip = $state(null), tip;
   const cursor = $derived(crosshairOffset(range));
   const activities = $derived(clipPlacements(placements, range, error, status).sort((a, b) => (acrossNodes ? (({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""))) : 0) || a.start - b.start || a.id.localeCompare(b.id)));
-  const shown = $derived(activeOnly ? activities.filter((p) => p.intervals.length || p.error || p.warning) : activities);
-  const warnings = $derived([...new Set(activities.flatMap((p) => [p.warning, p.errorStatus !== 404 && p.error]).filter(Boolean))]);
+  const shown = $derived(activeOnly ? activities.filter((p) => p.intervals.length || p.error) : activities);
+  const warnings = $derived([...new Set(activities.flatMap((p) => [p.partial, p.errorStatus !== 404 && p.error]).filter(Boolean))]);
   const ops = $derived([...new Set(shown.flatMap((p) => Object.keys(p.ops || {})))].sort((a, b) => opRank(a) - opRank(b) || a.localeCompare(b)));
-  const empty = $derived(error ? `Activity unavailable: ${error}` : pending ? "Loading activity…" : warnings.length ? "Activity unavailable" : acrossNodes && !activities.length ? "No placement history for this run" : "No recorded activity in this window");
+  const empty = $derived(error ? `Activity unavailable: ${error}` : pending ? "Loading activity…" : acrossNodes && !activities.length ? "No worker processes for this run in this window" : "No recorded activity in this window");
   const href = (p) => acrossNodes ? inventory.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : inventory.runs.some((r) => r.run_id === p.run_ids?.[0]) ? viewLink(`run/${encodeURIComponent(p.run_ids[0])}/activity`, { duration: range.now - range.start, end: range.now, back }) : null;
   const blocks = (spans) => spans.map(([a, b]) => `M${1000 * (a - range.start) / (range.now - range.start)},0 H${1000 * (b - range.start) / (range.now - range.start)} V24 H${1000 * (a - range.start) / (range.now - range.start)} Z`).join(" ");
   const rowLabel = (p) => acrossNodes ? `${p.label} · ${processLabel(p, inventory.cluster.nodes)} · ${p.node}` : p.label;
@@ -42,10 +42,10 @@
         {@const name = acrossNodes ? processLabel(p, inventory.cluster.nodes) : p.label}
         {@const meta = acrossNodes ? p.node ? shortNodeName(p.node, inventory.cluster.nodes) : "Node unassigned" : p.role || "process"}
         {@const link = href(p)}
-        {@const status = p.error ? p.intervals.length ? "Stale" : p.error.includes("not recorded") ? "Not recorded" : "Unavailable" : !p.intervals.length ? "No recorded activity" : ""}
+        {@const status = p.error ? "Ops unavailable" : !p.intervals.length ? "No recorded activity" : ""}
         <div class={`activity-row ${placementColor(p)}`} data-key={p.id} data-selected={!acrossNodes && p.id === selected}>
           <svelte:element this={link ? "a" : "span"} class={`activity-label ${placementColor(p)}`} data-key={`label:${p.id}`} href={link || undefined} aria-disabled={!link ? "true" : undefined} title={acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !link ? " · Node no longer reported" : ""}` : p.label}>
-            <span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">{name}</span><span class="activity-meta">{meta}{p.ended ? " · Allocation no longer reported" : ""}{!link ? acrossNodes ? " · Node no longer reported" : p.run_ids?.length ? " · Run record unavailable" : " · No linked run" : ""}</span></span>
+            <span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">{name}</span><span class="activity-meta">{meta}{p.ended ? " · Process ended" : p.phase && p.phase !== "ready" ? ` · ${p.phase.replace("_", " ")}` : ""}{!link ? acrossNodes ? " · Node no longer reported" : p.run_ids?.length ? " · Run record unavailable" : " · No linked run" : ""}</span></span>
           </svelte:element>
           <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events (Pointer location follows the shared time axis. Incident links and the Logs tab reach the same logs by keyboard.) -->
           <div class="activity-track" onpointermove={trackMove} onclick={onpick && ((event) => onpick(Math.round(timeAt(event, range))))}>
@@ -64,7 +64,7 @@
       {#if ops.length}<div class="op-legend" aria-label="GPU ops">{#each ops as op}<span data-op={op}><span class="op-swatch"></span>{opLabel(op)}</span>{/each}<span><span class="op-swatch turn"></span>held, unlabelled</span></div>{/if}
     </div>
   {/if}
-  {#if error && shown.length}<p class="source-error" role="status">Placement history unavailable: {error}</p>{/if}
+  {#if error && shown.length}<p class="source-error" role="status">Activity unavailable: {error}</p>{/if}
   {#if warnings.length}<p class="source-error" role="status">{warnings.join(" · ")}</p>{/if}
   {#if showSource && activities.length}<p class="activity-source">{activitySource(activities)}</p>{/if}
   <div class="activity-tooltip" bind:this={tip} role="tooltip" hidden={!tooltip} style:left={`${tooltip?.left || 0}px`} style:top={`${tooltip?.top || 0}px`}><strong class="activity-tooltip-label">{tooltip?.label || ""}</strong><div class="activity-tooltip-time">{tooltip?.time || ""}</div><div class="activity-tooltip-detail">{tooltip?.detail || ""}</div></div>

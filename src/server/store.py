@@ -117,6 +117,14 @@ class InMemoryStore(RequestStore):
       return self.futures_store[req_id]
 
 
+def request_queue(model_id: str) -> str:
+  return f"open_rl:queue:{model_id}"
+
+
+def sampling_queue(model_id: str) -> str:
+  return f"open_rl:sampler_queue:{model_id}"
+
+
 class RedisStore(RequestStore):
   def __init__(self, client: redis.Redis):
     self.redis = client
@@ -126,7 +134,7 @@ class RedisStore(RequestStore):
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
-    queue_key = f"open_rl:queue:{model_id}"
+    queue_key = request_queue(model_id)
 
     active_set = f"open_rl:active_tenants_set:{active_set_id}" if active_set_id else self.active_set
     active_list = f"open_rl:active_tenants:{active_set_id}" if active_set_id else self.active_list
@@ -157,7 +165,7 @@ class RedisStore(RequestStore):
       else:
         model_id = model_id_bytes.decode() if isinstance(model_id_bytes, bytes) else str(model_id_bytes)
 
-      queue_key = f"open_rl:queue:{model_id}"
+      queue_key = request_queue(model_id)
       # Snapshot the depth before draining: requests this tenant enqueues while
       # we drain belong to its next turn, otherwise a producer that outruns the
       # consumer keeps the drain loop alive and never yields the head slot.
@@ -182,7 +190,7 @@ class RedisStore(RequestStore):
         return batch
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    queue_key = f"open_rl:queue:{model_id}"
+    queue_key = request_queue(model_id)
     try:
       result = await self.redis.blpop(queue_key, timeout=5)
     except RedisTimeoutError:
@@ -293,7 +301,13 @@ class StateStore(ABC):
     pass
 
   @abstractmethod
-  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
+    """The samples in order, or only the newest `last`."""
+    pass
+
+  @abstractmethod
+  async def list_length(self, key: str) -> int | None:
+    """Items in a list, such as a request queue; None where this store holds no queues."""
     pass
 
   @abstractmethod
@@ -348,8 +362,11 @@ class InMemoryStateStore(StateStore):
     samples.append(json.dumps(sample, allow_nan=False))
     del samples[:-limit]
 
-  async def read_samples(self, key: str) -> list[dict[str, Any]]:
-    return [json.loads(sample) for sample in self.samples.get(key, [])]
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
+    return [json.loads(sample) for sample in self.samples.get(key, [])[-(last or 0) :]]
+
+  async def list_length(self, key: str) -> int | None:
+    return None  # the in-memory queues live in InMemoryStore
 
   async def increment(self, key: str, ttl_seconds: float) -> int:
     value = int(self.get_value_sync(key) or 0) + 1
@@ -395,8 +412,11 @@ class RedisStateStore(StateStore):
       pipeline.expire(key, int(ttl_seconds))
       await pipeline.execute()
 
-  async def read_samples(self, key: str) -> list[dict[str, Any]]:
-    return [json.loads(sample) for sample in await self.redis.lrange(key, 0, -1)]
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
+    return [json.loads(sample) for sample in await self.redis.lrange(key, -(last or 0), -1)]
+
+  async def list_length(self, key: str) -> int | None:
+    return await self.redis.llen(key)
 
   async def increment(self, key: str, ttl_seconds: float) -> int:
     async with self.redis.pipeline(transaction=True) as pipeline:

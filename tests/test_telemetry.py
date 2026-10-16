@@ -52,7 +52,7 @@ class KubernetesInventoryTest(unittest.TestCase):
     ]
     for state, phase, reason, code, started, finished in cases:
       with self.subTest(phase=phase):
-        row = kubernetes.container_summary("worker", state, 2, previous)
+        row = kubernetes.container_summary("worker", "image:v1", state, 2, previous)
         self.assertEqual(
           (row["name"], row["state"], row["reason"], row["exit_code"], row["started_at"], row["finished_at"]),
           ("worker", phase, reason, code, started, finished),
@@ -65,7 +65,7 @@ class KubernetesInventoryTest(unittest.TestCase):
   def test_unstarted_pod_has_the_same_container_shape(self):
     pod = client.V1Pod(
       metadata=client.V1ObjectMeta(name="p", uid="uid"),
-      spec=client.V1PodSpec(containers=[client.V1Container(name="worker")]),
+      spec=client.V1PodSpec(containers=[client.V1Container(name="worker", image="trainer:v1")]),
       status=client.V1PodStatus(phase="Pending"),
     )
     row = kubernetes.pod_summary(pod)
@@ -75,6 +75,7 @@ class KubernetesInventoryTest(unittest.TestCase):
       [
         {
           "name": "worker",
+          "image": "trainer:v1",
           "state": "unknown",
           "reason": None,
           "exit_code": None,
@@ -168,23 +169,11 @@ class HardwareSeriesTest(unittest.TestCase):
       "runs": [],
       "cluster": {"available": True, "scheduler": {}, "nodes": [{"name": "node", "devices": [{"id": "idle", "uuid": "GPU-idle"}]}]},
       "placements": [],
-      "history": [
-        {
-          "id": f"interval-{i}",
-          "label": "worker",
-          "run_ids": [],
-          "first_seen": 0,
-          "last_seen": 10,
-          "worker_id": "worker",
-          "pod_uid": "uid",
-          "node": "node",
-          "pod": "old-pod",
-          "devices": ["gone"],
-          "device_uuids": {"gone": GPU},
-        }
-        for i in range(2)
+      "processes": [
+        {"id": "worker", "pod_uid": "uid", "node": "node", "pod": "old-pod", "runtime_id": None, "gpus": [GPU], "started_at": 0, "heartbeat_at": 10}
       ],
     }
+    state["cluster"]["nodes"][0]["devices"].append({"id": "gone", "uuid": GPU})
     backend = mock.Mock(name="source")
     backend.name = "fake"
     backend.devices = mock.AsyncMock(return_value={GPU: {"utilization": [[1, 80]], "memory_mib": []}})
@@ -203,7 +192,7 @@ class HardwareSeriesTest(unittest.TestCase):
       "runs": [],
       "cluster": {"available": True, "scheduler": {}, "nodes": [{"name": "node", "devices": [{"id": "d0", "uuid": GPU}]}]},
       "placements": [{"id": "w", "label": "worker", "run_ids": [], "devices": ["d0"], "pod": "p", "node": "node", "created_at": WINDOW["since"]}],
-      "history": [],
+      "processes": [],
     }
     backend = mock.Mock()
     backend.name = "fake"
@@ -224,7 +213,7 @@ class HardwareSeriesTest(unittest.TestCase):
       "placements": [
         {"id": "w1", "label": "worker", "run_ids": [], "node": "node", "devices": ["d0", "d1"], "pod": "orw-trainer", "created_at": WINDOW["since"]}
       ],
-      "history": [],
+      "processes": [],
     }
 
     class Backend:
@@ -244,7 +233,7 @@ class HardwareSeriesTest(unittest.TestCase):
     self.assertEqual(result["devices"][1]["reason"], "GPU UUID unavailable")
     self.assertEqual((result["workers"][0]["pod"], result["workers"][0]["cpu_cores"][0][1]), ("orw-trainer", 4.0))
 
-  def test_historical_slot_keeps_its_uuid_and_live_query_includes_idle_replacement(self) -> None:
+  def test_a_previous_process_keeps_its_own_gpu_after_the_slot_changes(self) -> None:
     state = {
       "observed_at": "1970-01-01T00:00:20+00:00",
       "runs": [],
@@ -259,21 +248,21 @@ class HardwareSeriesTest(unittest.TestCase):
           "pod_uid": "new",
           "devices": ["d0"],
           "device_uuids": {"d0": "GPU-new"},
+          "created_at": "1970-01-01T00:00:15+00:00",
         }
       ],
-      "history": [
+      # The previous pod of the same name ran on the slot's earlier GPU.
+      "processes": [
         {
           "id": "old",
-          "label": "worker",
-          "run_ids": [],
-          "worker_id": "w",
           "node": "node",
           "pod": "reused-name",
           "pod_uid": "old",
-          "devices": ["d0"],
-          "device_uuids": {"d0": GPU},
-          "first_seen": 2,
-          "last_seen": 8,
+          "runtime_id": None,
+          "gpus": [GPU],
+          "started_at": 2,
+          "heartbeat_at": 8,
+          "phase": "exited",
         }
       ],
     }
@@ -283,12 +272,13 @@ class HardwareSeriesTest(unittest.TestCase):
     backend.workers_series = mock.AsyncMock(return_value={"reused-name": {"cpu_cores": [[1, 1], [3, 2], [9, 3]], "memory_bytes": []}})
     with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
       result = asyncio.run(metrics.series(state, node_id="node", **WINDOW))
-    self.assertEqual(backend.devices.await_args.args[0], [GPU])
+    self.assertCountEqual(backend.devices.await_args.args[0], [GPU, "GPU-new"])
+    self.assertEqual(next(d for d in result["devices"] if d["uuid"] == GPU)["utilization"], [[3, 50]])
     self.assertEqual(result["workers"][0]["pod_uid"], "old")
     self.assertEqual(result["workers"][0]["cpu_cores"], [[3, 2]])
     state["placements"] = []
     with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
       result = asyncio.run(metrics.series(state, node_id="node", since=WINDOW["since"], until="1970-01-01T00:00:19.999Z"))
     self.assertCountEqual(backend.devices.await_args.args[0], [GPU, "GPU-new"])
-    self.assertCountEqual([(d["id"], d["uuid"]) for d in result["devices"]], [("d0", GPU), ("d0", "GPU-new")])
+    self.assertCountEqual([(d["id"], d["uuid"]) for d in result["devices"]], [(GPU, GPU), ("d0", "GPU-new")])
     self.assertEqual([w["pod_uid"] for w in result["workers"]], ["old"])

@@ -1,12 +1,12 @@
-"""Joins of placements, GPU turns, ops and pod events behind the activity view."""
+"""Joins of worker records, placements, ops and pod events behind the activity view."""
 
 from datetime import datetime
 
-from server.dashboard.history import reconcile
+from server.telemetry.ops import alive
 
 
 def incidents(run: dict, start: float, end: float) -> list[dict]:
-  """Latest distinct timestamped failures/restarts; current conditions are not events."""
+  """Distinct timestamped failures/restarts, newest first; current conditions are not events."""
   errors = ("OOMKilled", "CrashLoopBackOff", "Evicted")
   warnings = ("WorkerRestarted", "FailedScheduling", "Unschedulable", "FailedMount", "FailedAttachVolume")
   events = []
@@ -46,43 +46,61 @@ def incidents(run: dict, start: float, end: float) -> list[dict]:
     ):
       continue
     unique.setdefault((event["pod"], event.get("container"), event["reason"]), event)
-  return list(unique.values())[:3]
+  return list(unique.values())
 
 
 def segments(state: dict, run_id=None, node_id=None) -> list[dict]:
-  live = {p["id"]: p for p in state["placements"]}
-  runs = {r["run_id"]: r for r in state["runs"]}
+  """One lane per worker process from the record it keeps, plus placed workloads whose
+  process has not reported yet. A lane on a shared runtime splits into one per run."""
   observed = datetime.fromisoformat(state["observed_at"]).timestamp()
-  available = state["cluster"]["available"] and state["cluster"]["scheduler"].get("available", True)
+  runs = state["runs"]
+  uuids = {d["uuid"]: d["id"] for node in state["cluster"]["nodes"] for d in node["devices"] if d.get("uuid")}
+  placed = {p["pod_uid"]: p for p in state["placements"] if p.get("pod_uid")}
   found = []
-  past = {p["id"]: p for p in state["history"]}
-  for identity, current in live.items():
-    past.update((p["id"], p) for p in reconcile(past.pop(identity, {}), current))
-  for entry in past.values():
-    started = entry.get("first_seen")
-    if started is None:
-      started = datetime.fromisoformat(entry["created_at"]).timestamp() if entry.get("created_at") else observed
-    placement = {
-      **entry,
-      "start": started,
-      "end": observed if entry["id"] in live else entry.get("last_seen", observed),
-      "ended": entry["id"] not in live and available,
-    }
-    if len(placement["run_ids"]) > 1:
-      for member in placement["run_ids"]:
-        model = runs.get(member, {}).get("model") or placement["label"]
-        found.append(
+  for record in state["processes"]:
+    placement = placed.pop(record.get("pod_uid"), {})
+    live = alive(record, observed)
+    end = observed if live else record["heartbeat_at"]
+    members = [
+      r for r in runs if r["runtime_id"] == record["runtime_id"] and r["created_at"] <= end and (r["completed_at"] or end) >= record["started_at"]
+    ]
+    ids, gpus = [r["run_id"] for r in members], record.get("gpus") or []
+    # A GPU no current device slot reports keeps its UUID as its identity, so its series stay queryable.
+    found.append(
+      {
+        **record,
+        "name": placement.get("name") or record.get("pod") or record["id"],
+        "label": members[0]["name"] if len(members) == 1 else record["runtime_id"] or record["id"],
+        "run_ids": ids,
+        "shared_runtime": record["runtime_id"] not in ids if ids else None,
+        "devices": placement.get("devices") or [uuids.get(uuid, uuid) for uuid in gpus],
+        "device_uuids": {uuids.get(uuid, uuid): uuid for uuid in gpus},
+        "device_count": placement.get("device_count") or len(gpus),
+        "start": record["started_at"],
+        "end": end,
+        "ended": not live,
+      }
+    )
+  for placement in [*placed.values(), *(p for p in state["placements"] if not p.get("pod_uid"))]:
+    started = datetime.fromisoformat(placement["created_at"]).timestamp() if placement.get("created_at") else observed
+    found.append({**placement, "start": started, "end": observed, "ended": False})
+  lanes = []
+  for lane in found:
+    if lane.get("shared_runtime") and lane["run_ids"]:
+      for member in lane["run_ids"]:
+        model = next((r["model"] for r in runs if r["run_id"] == member), None) or lane["label"]
+        lanes.append(
           {
-            **placement,
-            "id": f"{entry['id']}:{member}",
-            "allocation_id": entry["id"],
+            **lane,
+            "id": f"{lane['id']}:{member}",
+            "allocation_id": lane["id"],
             "run_ids": [member],
             "label": f"{model.split('/')[-1]} · {member[:8]}",
           }
         )
     else:
-      found.append(placement)
-  return [p for p in found if (not run_id or run_id in p["run_ids"]) and (not node_id or p["node"] == node_id)]
+      lanes.append(lane)
+  return [p for p in lanes if (not run_id or run_id in p["run_ids"]) and (not node_id or p["node"] == node_id)]
 
 
 def merge(intervals: list) -> list:
@@ -101,55 +119,39 @@ def matches(sample: dict, placement: dict) -> bool:
   )
 
 
-def activity(state: dict, start: float, end: float, operations: dict, turns: dict, run_id=None, node_id=None) -> dict:
-  """Actual GPU grants when recorded; completed operations otherwise. Never utilization."""
-  shared_runs = {r["run_id"] for r in state["runs"] if r.get("shared_runtime")}
-  return {
-    "placements": [
-      placement_activity(
-        p, start, end, operations, turns, p.get("allocation_id") or p.get("shared_runtime") or bool(shared_runs.intersection(p["run_ids"]))
-      )
-      for p in segments(state, run_id, node_id)
-    ]
-  }
+def activity(state: dict, start: float, end: float, operations: dict, run_id=None, node_id=None) -> dict:
+  """GPU turns and recorded ops for each lane in the window. Never utilization."""
+  lanes = [p for p in segments(state, run_id, node_id) if p["start"] <= end and p["end"] >= start]
+  return {"placements": [lane_activity(p, start, end, operations) for p in lanes]}
 
 
-def placement_activity(placement, start, end, operations, turns, shared):
-  held = turns.get(placement["name"], {})
-  samples = [
-    t
-    for t in held.get("samples", [])
-    if matches(t, placement) and t["started_at"] < min(end, placement["end"]) and t["at"] > max(start, placement["start"])
-  ]
-  intervals, named = [], {}
+def lane_activity(lane: dict, start: float, end: float, operations: dict) -> dict:
+  """A shared lane shows only its run's ops; a dedicated one also its GPU turns and worker-level ops."""
+  shared = bool(lane.get("shared_runtime"))
+  intervals, named, errors, partial = [], {}, [], []
 
   def add(name, low, high):
-    span = [max(start, placement["start"], low), min(end, placement["end"], high)]
+    span = [max(start, lane["start"], low), min(end, lane["end"], high)]
     if span[1] > span[0]:
       intervals.append(span)
       if name:
         named.setdefault(name, []).append(span)
 
-  error = None
-  if samples:
-    for turn in samples:
-      if not shared:
-        add(None, turn["started_at"], turn["at"])
-      for op in turn.get("ops", []):
-        if not shared or op.get("run_id") in placement["run_ids"]:
-          add(op["name"], max(op["start"], turn["started_at"]), min(op["end"], turn["at"]))
-  else:
-    for identity in placement["run_ids"]:
-      result = operations.get(identity, {})
-      error = result.get("error") or error
-      for sample in result.get("samples", []):
-        if sample.get("run_id", identity) == identity and sample.get("role") == placement.get("role") and matches(sample, placement):
-          add(sample.get("operation", "operation"), sample.get("started_at", sample["at"] - sample.get("elapsed_seconds", 0)), sample["at"])
+  turns = [] if shared else [t for t in lane.get("turns") or [] if t[0] < min(end, lane["end"]) and t[1] > max(start, lane["start"])]
+  for low, high in turns:
+    add(None, low, high)
+  for identity in lane["run_ids"] if shared else {*lane["run_ids"], lane.get("runtime_id")} - {None}:
+    result = operations.get(identity, {})
+    errors.append(result.get("error"))
+    partial.append(result.get("partial"))
+    for sample in result.get("samples", []):
+      if sample.get("role") == lane.get("role") and matches(sample, lane):
+        add(sample["operation"], sample.get("started_at") or sample["at"] - sample.get("elapsed_seconds", 0), sample["at"])
   return {
-    **placement,
+    **{k: v for k, v in lane.items() if k not in ("turns", "outstanding")},
     "intervals": merge(intervals),
     "ops": {name: merge(spans) for name, spans in named.items()},
-    "exact": bool(samples),
-    "error": error,
-    "warning": held.get("error"),
+    "exact": bool(turns),
+    "error": next(filter(None, errors), None),
+    "partial": next(filter(None, partial), None),
   }

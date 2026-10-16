@@ -1,6 +1,6 @@
 // Presentation geometry only: identity and attribution come from the inspection API.
 import { family } from "./format.js";
-export { shortNodeName, family } from "./format.js";
+export { shortNodeName } from "./format.js";
 const numbers = ["standard", "compact"].map((notation) => new Intl.NumberFormat(undefined, { maximumSignificantDigits: 4, notation }));
 const percent = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
 export const chartNumber = (value) => numbers[Number(Math.abs(value) >= 10000)].format(value);
@@ -12,7 +12,8 @@ export const deviceLabel = (name) => /(\d+)$/.exec(String(name ?? ""))?.[1] ?? S
 export const acceleratorLabel = (node) => node.accelerator ? node.accelerator.replace(/^nvidia[- ]/i, "").replace(/-\d+gb$/i, "").replace(/-/g, " ").toUpperCase() : node.gpu_capacity ? "GPU" : "CPU";
 export function clipPlacements(placements = [], range, error = null, status = null) {
   const clip = (spans = []) => spans.map(([a, b]) => [Math.max(range.start, a), Math.min(range.now, b)]).filter(([a, b]) => b > a);
-  return placements.map((p) => ({ ...p, intervals: clip(p.intervals), ops: Object.fromEntries(Object.entries(p.ops || {}).map(([name, spans]) => [name, clip(spans)])), error: error || p.error, errorStatus: status || p.errorStatus }));
+  // A request failure belongs to every lane; a lane's own error is only about its ops.
+  return placements.map((p) => ({ ...p, intervals: clip(p.intervals), ops: Object.fromEntries(Object.entries(p.ops || {}).map(([name, spans]) => [name, clip(spans)])), error: status ? error : p.error, errorStatus: status || p.errorStatus }));
 }
 export function activitySource(placements) {
   if (!placements.length) return "";
@@ -45,6 +46,7 @@ export function duty(node, placements, range) {
 export function claimLabel(node, placements, live) {
   if (live && !node.ready) return "Offline";
   if (!node.gpu_capacity) return "CPU";
+  if (node.openrl_enabled === false) return "Not enabled";
   if (!placements.every((p) => p.devices.length === p.device_count && p.devices.every((id) => node.devices.some((d) => d.id === id)))) return "— claimed";
   return `${new Set(placements.flatMap((p) => p.devices)).size}/${node.gpu_capacity} claimed`;
 }

@@ -22,7 +22,7 @@ from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
 from server.sampling_store import SamplingStore
 from server.store import RedisStore, RequestStore, StateStore, get_state_store, get_store
-from server.telemetry.ops import gpu_turn, observe_operation, record_op
+from server.telemetry.ops import Answering, gpu_turn, observe_operation, popped, record_op, serving, set_phase
 from server.telemetry.tracing import configure_tracing
 from training import commands
 from training.commands import parse_command
@@ -128,6 +128,7 @@ class TrainingRequestsProcessor:
       if self.time_slicer is not None:
         await self.time_slicer.register(self.workload)
         self.snapshot_registered = True
+      set_phase("ready")
       while True:
         try:
           await self.announce_readiness()
@@ -216,6 +217,7 @@ class TrainingRequestsProcessor:
 
     shutdown = any(req.get("op") == "shutdown_workers" for req in batch)
     work = [req for req in batch if req.get("op") != "shutdown_workers"]
+    popped(work)
     model_id = batch[0].get("model_id", "default")
 
     results: list[tuple[str | None, dict[str, Any]]] = []
@@ -270,7 +272,7 @@ class TrainingRequestsProcessor:
     save_reqs = [r for r in requests if r.get("op") in save_ops]
 
     if gpu_reqs:
-      async with gpu_turn(self.time_slicer, self.workload, "trainer", self.model_id):
+      async with gpu_turn(self.time_slicer, self.workload):
         with record_op("wake_up"):
           await asyncio.to_thread(self.worker.wake_up)
         try:
@@ -286,7 +288,7 @@ class TrainingRequestsProcessor:
       for request in save_reqs:
         results.append(await self.handle_request(request))
     else:
-      async with gpu_turn(self.time_slicer, self.workload, "trainer", self.model_id):
+      async with gpu_turn(self.time_slicer, self.workload):
         for request in save_reqs:
           results.append(await self.handle_request(request))
 
@@ -416,7 +418,7 @@ async def run_training_requests_processor(
   *,
   store: RequestStore | None = None,
 ) -> None:
-  store = get_store() if store is None else store
+  store = Answering(get_store() if store is None else store)
   pin_worker_threads_to_this_rank()
   if isinstance(worker, FFTTrainingWorker) and time_slicing_enabled():
     time_slicer = time_slicer or time_slicer_client_from_env()
@@ -479,6 +481,13 @@ async def main_async(args: argparse.Namespace) -> None:
   )
 
 
+async def serve_trainer(args: argparse.Namespace) -> None:
+  if not is_primary():
+    return await main_async(args)
+  async with serving("trainer", os.getenv("OPEN_RL_MODEL_ID") or args.model_id):
+    await main_async(args)
+
+
 def start_request_processing_loop() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated trainer worker drains.")
@@ -494,7 +503,7 @@ def start_request_processing_loop() -> None:
   print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
 
   try:
-    asyncio.run(main_async(args))
+    asyncio.run(serve_trainer(args))
   finally:
     provider.shutdown()
 

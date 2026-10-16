@@ -54,11 +54,12 @@ def termination(state: Any) -> dict | None:
   return {"reason": state.reason, "exit_code": state.exit_code, "finished_at": stamp(state.finished_at), "started_at": stamp(state.started_at)}
 
 
-def container_summary(name: str, state=None, restarts: int = 0, last_state=None) -> dict:
+def container_summary(name: str, image: str | None, state=None, restarts: int = 0, last_state=None) -> dict:
   states = state.to_dict() if state else {}
   phase, values = next(((key, states[key]) for key in ("running", "waiting", "terminated") if states.get(key) is not None), ("unknown", {}))
   return {
     "name": name,
+    "image": image,
     "state": phase,
     **{field: stamp(values.get(field)) for field in ("reason", "exit_code", "started_at", "finished_at")},
     "restart_count": restarts or 0,
@@ -92,8 +93,8 @@ def pod_problem(pod: Any) -> str | None:
 
 def pod_summary(pod: Any) -> dict:
   statuses = pod.status.container_statuses or []
-  containers = [container_summary(cs.name, cs.state, cs.restart_count, cs.last_state) for cs in statuses] or [
-    container_summary(c.name) for c in pod.spec.containers or []
+  containers = [container_summary(cs.name, cs.image, cs.state, cs.restart_count, cs.last_state) for cs in statuses] or [
+    container_summary(c.name, c.image) for c in pod.spec.containers or []
   ]
   return {
     "name": pod.metadata.name,
@@ -136,6 +137,9 @@ def node_summary(node: Any) -> dict:
     "ready": any(c.type == "Ready" and c.status == "True" for c in node.status.conditions or []),
     "accelerator": labels.get("cloud.google.com/gke-accelerator") or labels.get("nvidia.com/gpu.product"),
     "gpu_capacity": int((node.status.capacity or {}).get("nvidia.com/gpu", 0)),
+    # The scheduler places workers only on nodes labelled openrl.io/enabled=true.
+    "openrl_enabled": labels.get("openrl.io/enabled") == "true",
+    "openrl_labels": {key: value for key, value in labels.items() if key.startswith("openrl.io/")},
     "devices": [],
   }
 
@@ -295,9 +299,7 @@ def read() -> dict:
 
   with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
     nodes_f = pool.submit(attempt, core.list_node, _request_timeout=REQUEST_TIMEOUT)
-    events_f = pool.submit(
-      attempt, core.list_namespaced_event, ns, field_selector="involvedObject.kind=Pod", limit=200, _request_timeout=REQUEST_TIMEOUT
-    )
+    events_f = pool.submit(attempt, core.list_namespaced_event, ns, field_selector="involvedObject.kind=Pod", _request_timeout=REQUEST_TIMEOUT)
     scheduler_f = pool.submit(scheduler_state, custom, ns)
     devices_f = pool.submit(device_inventory, custom, ns)
     node_list, nodes_error = nodes_f.result()

@@ -1,33 +1,18 @@
 """The dashboard as its own process: `python -m server.dashboard`.
 
 It serves fleet inspection separately from the client API, without its queues
-or worker manager, and records placement history while it runs.
+or worker manager.
 """
 
 import argparse
-import asyncio
-from contextlib import asynccontextmanager, suppress
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
-from server.dashboard import history
 from server.dashboard.router import router
-from server.dashboard.snapshot import snapshot
-from server.store import get_state_store
 
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-  recorder = asyncio.create_task(history.recorder(get_state_store(), snapshot))
-  yield
-  recorder.cancel()
-  with suppress(asyncio.CancelledError):
-    await recorder
-
-
-app = FastAPI(title="Open-RL Inspection API", lifespan=lifespan)
+app = FastAPI(title="Open-RL Inspection API")
 app.include_router(router)
 
 

@@ -115,12 +115,9 @@ class SnapshotJoinTest(unittest.TestCase):
         run = snapshot.join_runs([row], state)[0]
         self.assertEqual((run["runtime_id"], run["shared_runtime"]), (model.runtime("r1"), model.shares_runtime()))
 
-  def test_placements_record_pod_identity_and_physical_devices(self) -> None:
-    state = copy.deepcopy(STATE)
-    state["devices"]["nodes"] = {"n1": [{"id": "gpu.nvidia.com/n1/gpu-0", "uuid": "GPU-1"}]}
-    placement = snapshot.placements_of(state, snapshot.join_runs(METADATA, state))[0]
+  def test_placements_record_pod_identity(self) -> None:
+    placement = snapshot.placements_of(STATE, snapshot.join_runs(METADATA, STATE))[0]
     self.assertEqual(placement["pod_uid"], "p1")
-    self.assertEqual(placement["device_uuids"], {"gpu.nvidia.com/n1/gpu-0": "GPU-1"})
 
   def test_only_placed_workloads_become_placements_and_carry_their_runs(self) -> None:
     runs = snapshot.join_runs(METADATA, STATE)
@@ -137,6 +134,60 @@ class SnapshotJoinTest(unittest.TestCase):
     self.assertEqual((runs["r0"]["pods"], runs["r0"]["workloads"]), ([], []))
     placements = snapshot.placements_of(STATE, list(runs.values()))
     self.assertEqual(sorted(placements[0]["run_ids"]), ["r1", "r3"])
+
+
+RUN = {"run_id": "r1", "runtime_id": "base", "created_at": 1}
+NOW = 10_000
+
+
+def process(*groups, heartbeat_at=NOW, phase="ready"):
+  outstanding = [{"op": op, "run_id": run_id, "count": 1, "since": at} for op, run_id, at in groups]
+  return {"id": "p", "pod": "trainer-0", "runtime_id": "base", "heartbeat_at": heartbeat_at, "phase": phase, "outstanding": outstanding}
+
+
+def steps(*ats):
+  return [{"at": at, "operation": "optim_step", "status": "succeeded"} for at in ats]
+
+
+class ProgressTest(unittest.TestCase):
+  """Progress comes from what completes and what is still waiting, not from which processes are up."""
+
+  def verdict(self, processes=(), recent=(), queued=None):
+    return snapshot.progress(RUN, list(processes), list(recent), queued or {"trainer": 0, "sampler": 0}, NOW)
+
+  def test_completing_requests_are_ok(self):
+    result = self.verdict([process(("forward_backward", "r1", NOW - 60))], steps(NOW - 300, NOW - 200, NOW - 100))
+    self.assertEqual((result["state"], result["step_seconds"], result["last_completed_at"]), ("OK", 100, NOW - 100))
+    self.assertEqual(result["outstanding"][0]["age_seconds"], 60)
+
+  def test_requests_taken_by_a_process_that_stopped_reporting_are_dead(self):
+    for gone in (process(("optim_step", "r1", NOW - 60), heartbeat_at=NOW - 120), process(("optim_step", "r1", NOW - 60), phase="exited")):
+      result = self.verdict([gone], steps(NOW - 30))
+      self.assertEqual(result["state"], "DEAD")
+      self.assertIn("trainer-0", result["reason"])
+
+  def test_a_request_on_a_worker_longer_than_three_steps_is_stalled(self):
+    recent = steps(*range(NOW - 10_000, NOW - 4_000, 300))  # 300 s steps: patience 900 s
+    self.assertEqual(self.verdict([process(("forward_backward", "r1", NOW - 600))], recent)["state"], "OK")
+    result = self.verdict([process(("forward_backward", "r1", NOW - 1000))], recent)
+    self.assertEqual(result["state"], "STALLED")
+    self.assertIn("forward_backward", result["reason"])
+
+  def test_queued_requests_with_nothing_completing_are_stalled(self):
+    result = self.verdict(recent=steps(NOW - 3600), queued={"trainer": 0, "sampler": 4})
+    self.assertEqual(result["state"], "STALLED")
+    self.assertIn("4 request(s) queued", result["reason"])
+
+  def test_nothing_queued_or_outstanding_for_long_is_idle(self):
+    self.assertEqual(self.verdict(recent=steps(NOW - 3600))["state"], "IDLE")
+    self.assertEqual(self.verdict(recent=steps(NOW - 60))["state"], "OK")
+    self.assertEqual(self.verdict(queued={"trainer": None, "sampler": None})["state"], "IDLE")
+
+  def test_only_this_runs_requests_on_a_shared_runtime_count(self):
+    other = process(("sample", "r2", NOW - 5000), heartbeat_at=0)
+    elsewhere = {**process(("sample", "r1", NOW - 5000)), "runtime_id": "other"}
+    result = self.verdict([other, elsewhere], steps(NOW - 30))
+    self.assertEqual((result["state"], result["outstanding"]), ("OK", []))
 
 
 class StatusTest(unittest.IsolatedAsyncioTestCase):
@@ -191,23 +242,23 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.store = InMemoryStateStore()
     self.metadata = self.enterContext(patch.object(snapshot, "metadata_of", AsyncMock(return_value=copy.deepcopy(METADATA))))
     self.enterContext(patch.object(snapshot.kubernetes, "read", return_value=STATE))
-    self.history = self.enterContext(patch.object(snapshot.history, "read", AsyncMock(return_value=[{"id": "past"}])))
+    self.processes = self.enterContext(patch.object(snapshot, "processes_of", AsyncMock(return_value=[{"id": "past"}])))
     self.enterContext(patch.object(router, "snapshot", self.snapshot))
     self.enterContext(patch.object(router, "get_state_store", return_value=self.store))
 
   async def test_temporary_source_errors_keep_the_last_records_and_say_so(self) -> None:
     first = await self.snapshot.current(self.store)
-    self.metadata.side_effect = self.history.side_effect = TimeoutError()
+    self.metadata.side_effect = self.processes.side_effect = TimeoutError()
     self.snapshot.invalidate()
     stale = await self.snapshot.current(self.store)
     self.assertEqual([r["run_id"] for r in stale["runs"]], [r["run_id"] for r in first["runs"]])
-    self.assertEqual(stale["history"], first["history"])
-    self.assertTrue(stale["store_error"] and stale["history_error"])
-    self.metadata.side_effect = self.history.side_effect = None
-    self.metadata.return_value = self.history.return_value = []
+    self.assertEqual(stale["processes"], first["processes"])
+    self.assertTrue(stale["store_error"] and stale["processes_error"])
+    self.metadata.side_effect = self.processes.side_effect = None
+    self.metadata.return_value = self.processes.return_value = []
     self.snapshot.invalidate()
     recovered = await self.snapshot.current(self.store)
-    self.assertEqual((recovered["runs"], recovered["store_error"], recovered["history_error"]), ([], None, None))
+    self.assertEqual((recovered["runs"], recovered["store_error"], recovered["processes_error"]), ([], None, None))
 
   async def test_a_run_created_since_the_cached_snapshot_is_found(self) -> None:
     await self.snapshot.current(self.store)

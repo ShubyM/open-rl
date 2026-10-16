@@ -126,22 +126,19 @@ def time_range(since=None, until=None) -> tuple[str, str]:
   return start.isoformat(timespec="microseconds"), end.isoformat(timespec="microseconds")
 
 
-def pod_sources(run: dict | None, past: list[dict], observed_at: str) -> list[dict]:
-  """The pods a run's logs can come from: live ones until now, and any recorded
-  placement of the run until it was last seen. Names bound to lifetimes, since
-  Cloud Logging labels carry pod names and not UIDs."""
+def pod_sources(run: dict | None, lanes: list[dict], observed_at: str) -> list[dict]:
+  """The pods a run's logs can come from: live ones until now, and each worker
+  process of the run for its lifetime. Names bound to lifetimes, since Cloud
+  Logging labels carry pod names and not UIDs."""
   sources: dict[tuple, dict] = {}
-  run_id = run["run_id"] if run else None
-  for entry in past:
-    if run_id in (entry.get("run_ids") or []) and entry.get("pod"):
-      identity = (entry["pod"], entry.get("pod_uid") or entry["first_seen"])
-      previous = sources.get(identity, {})
-      sources[identity] = {
-        "pod": entry["pod"],
-        "node": entry.get("node"),
-        "role": entry.get("role") or "unknown",
-        "created_at": min(previous.get("created_at", timestamp(entry["first_seen"])), timestamp(entry["first_seen"])),
-        "until": max(previous.get("until", timestamp(entry["last_seen"] + 60)), timestamp(entry["last_seen"] + 60)),
+  for lane in lanes:
+    if lane.get("pod"):
+      sources[lane["pod"], lane.get("pod_uid") or lane["start"]] = {
+        "pod": lane["pod"],
+        "node": lane.get("node"),
+        "role": lane.get("role") or "unknown",
+        "created_at": timestamp(lane["start"]),
+        "until": timestamp(lane["end"] + 60),
       }
   for pod in (run or {}).get("pods", []):
     if pod.get("created_at"):
@@ -240,9 +237,9 @@ async def run_logs(
     return {**result, "error": REFUSED}
   selected = [s for s in sources if (pod is None or s["pod"] == pod) and (node is None or s.get("node") == node)]
   if not selected:
-    return {**result, "error": "No pod lifetimes match this run and filter"}
+    return {**result, "available": True, "note": "No pod lifetimes match this run and filter"}
   if len(selected) > MAX_SOURCES:
-    return {**result, "error": f"Select a pod to narrow this query to at most {MAX_SOURCES} pod lifetimes"}
+    raise ValueError(f"Select a pod to narrow this query to at most {MAX_SOURCES} pod lifetimes")
   start, end = time_range(since, until)
   body = {
     "resourceNames": [f"projects/{configuration()['project']}"],
