@@ -5,14 +5,17 @@
   let { run, view, range, allLogs } = $props();
   let records = $state([]), lifetimes = $state([]), cursor = $state(null), pending = $state(true), error = $state(null), source = $state(null), note = $state(null);
   let controller, request = 0, loaded = "", filters = "", successfulParams, successfulEnd, failedPage, lines, fromBottom = 0;
+  // A shared runtime's pods also log for other runs, so by default the run sees only the lines that name it.
+  let everything = $state(false);
+  const scope = $derived(view.q || (run.shared_runtime && !everything ? run.run_id : ""));
   const logRange = $derived({
     since: new Date(Math.max(range.start, view.event === null ? range.start : view.event - 120) * 1000).toISOString(),
     until: new Date(Math.min(range.now, view.event === null ? range.now : view.event + 120) * 1000).toISOString(),
   });
-  const params = $derived({ run_id: view.id, q: view.q, limit: "200", ...logRange, ...(view.pod ? { pod: view.pod } : {}) });
+  const params = $derived({ run_id: view.id, q: scope, limit: "200", ...logRange, ...(view.pod ? { pod: view.pod } : {}) });
   // The user's selection, not the live window, which moves with every snapshot and is read at each load.
-  const queryKey = $derived(JSON.stringify([view.id, view.q, view.pod, view.event, view.duration, view.end]));
-  const filterKey = $derived(JSON.stringify([view.id, view.q, view.pod, view.event, view.duration]));
+  const queryKey = $derived(JSON.stringify([view.id, scope, view.pod, view.event, view.duration, view.end]));
+  const filterKey = $derived(JSON.stringify([view.id, scope, view.pod, view.event, view.duration]));
   const sources = $derived.by(() => {
     const pods = new Map((run.pods || []).map((p) => [p.name, p]));
     for (const record of [...lifetimes, ...records]) if (record.pod && !pods.has(record.pod)) pods.set(record.pod, { ...record, name: record.pod });
@@ -96,7 +99,7 @@
   const severity = (record) => ["ERROR", "CRITICAL", "ALERT", "EMERGENCY"].includes(record.severity) ? "error" : record.severity === "WARNING" ? "warning" : undefined;
 </script>
 
-{#if run.shared_runtime}<p class="muted">These pods serve a shared LoRA runtime. Their logs can include other runs.</p>{/if}
+{#if run.shared_runtime}<p class="muted">These pods also serve other runs on this base model. <label><input type="checkbox" bind:checked={everything} /> Show lines that do not name this run</label></p>{/if}
 {#if view.event !== null}
   <div class="log-time-scope"><span>{logRange.since.slice(0, 10)} · {logRange.since.slice(11, 19)}–{logRange.until.slice(11, 19)}</span><a href={allLogs}>All logs</a></div>
 {/if}

@@ -23,7 +23,8 @@
   const metricStatus = $derived(detail.error ? `${detail.error}${samples.length ? " · Showing previously fetched metrics" : ""}` : detail.pending ? "Updating…" : "");
   const custom = $derived(view.end !== null || ![600, 1800, 3600].includes(view.duration));
   const metricsOpen = () => view.tab === "metrics" && `${view.id} ${view.duration} ${view.end}`;
-  const vllm = createQuery(() => inspectUrl("series", { run_id: view.id, since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() }), { poll: 15000, pollWhen: () => view.end === null, key: metricsOpen });
+  // A shared pool's load is every run's, so it is charted on Nodes rather than here.
+  const vllm = createQuery(() => run?.shared_runtime ? null : inspectUrl("series", { run_id: view.id, since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() }), { poll: 15000, pollWhen: () => view.end === null, key: metricsOpen });
   // The vLLM series the inspection API returns for a run's samplers, as vLLM's and llm-d's dashboards chart them.
   const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
     ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
@@ -85,8 +86,8 @@
             {#if !samples.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">No operations recorded in this time range</p>{/if}
           </div>
           <h2 class="scheduler-title">Samplers</h2>
-          {#if run.shared_runtime}<p class="muted">The pool's samplers also serve other runs on this base model.</p>{/if}
-          {#if vllm.error}<p class="source-error" role="status">{vllm.error}</p>
+          {#if run.shared_runtime}<p class="muted">The pool's samplers serve every run on this base model; see their load on <a href={viewLink("nodes")}>Nodes</a>.</p>
+          {:else if vllm.error}<p class="source-error" role="status">{vllm.error}</p>
           {:else if !vllm.data}<p class="muted">Loading…</p>
           {:else if !Object.values(vllm.data.samplers || {}).some((points) => points.length)}<p class="muted">{vllm.data.samplers_reason || "No sampler samples in this time range"}</p>
           {:else}<div class="chart-grid">
