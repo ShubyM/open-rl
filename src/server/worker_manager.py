@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -13,10 +14,12 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
-from accel_timeslicer.workload import SAMPLER_TIME_SLICE_GROUP, TRAINER_TIME_SLICE_GROUP, workload_job_id
+from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.estimator import footprint
+from server.lora_snapshots import snapshot_root
 from server.model_metadata import TrainingModelMetadata, decode_model_metadata
 from server.store import get_state_store
+from server.vllm_options import serve_args
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
@@ -108,16 +111,24 @@ def worker_env(meta: TrainingModelMetadata, base_model: str, runtime: str, is_lo
     if meta.trainer_cp > 1:
       env["OPEN_RL_AUTOMODEL_CP"] = str(meta.trainer_cp)
   else:
-    env["OPEN_RL_MODEL_ID"] = runtime
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+    # torch.compile artifacts and Triton kernels persist on the shared volume, so
+    # only a model's first replica compiles (about a minute for a 0.6B model).
+    cache = Path(os.getenv("OPEN_RL_TMP_DIR", "/mnt/shared/open-rl"), "cache")
+    env["VLLM_CACHE_ROOT"] = str(cache / "vllm")
+    env["TRITON_CACHE_DIR"] = str(cache / "triton")
+    if is_lora:
+      # vLLM loads each frozen adapter snapshot by name from this directory.
+      env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "true"
+      env["VLLM_LORA_RESOLVER_CACHE_DIR"] = str(snapshot_root())
     if not is_lora and ("gemma-4" in base_model.lower() or "gemma4" in base_model.lower()):
       env["VLLM_ARCHITECTURE_OVERRIDE"] = "Gemma4ForCausalLM"
   return env
 
 
 def worker_module(role: str) -> str:
-  return "server.training_requests_processor" if role == "trainer" else "server.vllm_sampler"
+  return "server.training_requests_processor"
 
 
 def worker_args(runtime: str, role: str, is_lora: bool) -> list[str]:
@@ -177,20 +188,30 @@ class LocalWorkerManager:
         return
       base_model = base_model_of(meta, runtime)
       env = {**os.environ, **worker_env(meta, base_model, runtime, is_lora, role)}
-      env["OPEN_RL_TIME_SLICE_JOB_ID"] = workload_job_id(role, runtime)
-      env["OPEN_RL_TIME_SLICE_GROUP"] = TRAINER_TIME_SLICE_GROUP if role == "trainer" else SAMPLER_TIME_SLICE_GROUP
       gpus = os.getenv("TRAINER_CUDA_VISIBLE_DEVICES" if role == "trainer" else "SAMPLER_CUDA_VISIBLE_DEVICES")
       if gpus:
         env["CUDA_VISIBLE_DEVICES"] = gpus
-      extras = ["gpu"] if role == "trainer" else ["gpu", "vllm"]
-      command = python_command(extras, worker_module(role), worker_args(runtime, role, is_lora))
-      log_dir = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp"))
-      log_dir.mkdir(parents=True, exist_ok=True)
-      with open(log_dir / f"{role}_{runtime.replace('/', '_')}.log", "a") as log:
-        self.processes[(role, runtime)] = subprocess.Popen(
-          command, cwd=self.project_dir, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
-        )
-        self.started[(role, runtime)] = time.time()
+      if role == "trainer":
+        env["OPEN_RL_TIME_SLICE_JOB_ID"] = workload_job_id(role, runtime)
+        env["OPEN_RL_TIME_SLICE_GROUP"] = TRAINER_TIME_SLICE_GROUP
+        self.spawn(role, runtime, python_command(["gpu"], worker_module(role), worker_args(runtime, role, is_lora)), env)
+        return
+      # A local pool is one vllm serve replica and the dispatcher that sends to it directly.
+      with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+      vllm = ["uv", "run", "--extra", "gpu", "--extra", "vllm", "vllm"] if shutil.which("uv") else [str(Path(sys.executable).with_name("vllm"))]
+      self.spawn(role, runtime, [*vllm, "serve", *serve_args(base_model, is_lora, env, port)], env)
+      dispatcher_env = {**os.environ, "OPEN_RL_SAMPLER_POOL": meta.pool(runtime), "OPEN_RL_SAMPLER_ENDPOINTS": f"http://127.0.0.1:{port}"}
+      self.spawn("dispatcher", runtime, python_command([], "server.sampling_dispatcher", []), dispatcher_env)
+
+  def spawn(self, role: str, runtime: str, command: list[str], env: dict[str, str]) -> None:
+    log_dir = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with open(log_dir / f"{role}_{runtime.replace('/', '_')}.log", "a") as log:
+      process = subprocess.Popen(command, cwd=self.project_dir, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    self.processes[(role, runtime)] = process
+    self.started[(role, runtime)] = time.time()
 
   def release(self, model_id: str) -> None:
     try:
