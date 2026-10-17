@@ -292,8 +292,8 @@ class StateStore(ABC):
     pass
 
   @abstractmethod
-  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float) -> None:
-    """Append to a list that keeps the newest `limit` samples and expires ttl_seconds after the last append."""
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float | None) -> None:
+    """Append to a list that keeps the newest `limit` samples and expires ttl_seconds after the last append, or never."""
     pass
 
   @abstractmethod
@@ -307,8 +307,8 @@ class StateStore(ABC):
     pass
 
   @abstractmethod
-  async def increment(self, key: str, ttl_seconds: float) -> int:
-    """Atomically count up from zero; the counter expires ttl_seconds after the last increment."""
+  async def increment(self, key: str, ttl_seconds: float | None) -> int:
+    """Atomically count up from zero; the counter expires ttl_seconds after the last increment, or never."""
     pass
 
 
@@ -353,7 +353,7 @@ class InMemoryStateStore(StateStore):
   async def scan_values(self, prefix: str) -> dict[str, str]:
     return {key: value for key in list(self.kv_store) if key.startswith(prefix) and (value := self.get_value_sync(key)) is not None}
 
-  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float) -> None:
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float | None) -> None:
     samples = self.samples.setdefault(key, [])
     samples.append(json.dumps(sample, allow_nan=False))
     del samples[:-limit]
@@ -364,7 +364,7 @@ class InMemoryStateStore(StateStore):
   async def list_length(self, key: str) -> int | None:
     return None  # the in-memory queues live in InMemoryStore
 
-  async def increment(self, key: str, ttl_seconds: float) -> int:
+  async def increment(self, key: str, ttl_seconds: float | None) -> int:
     value = int(self.get_value_sync(key) or 0) + 1
     await self.set_value(key, str(value), ttl_seconds)
     return value
@@ -401,11 +401,14 @@ class RedisStateStore(StateStore):
     keys = [key async for key in self.redis.scan_iter(match=prefix + "*", count=1000)]
     return {key: value for key, value in zip(keys, await self.redis.mget(keys)) if value is not None} if keys else {}
 
-  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float) -> None:
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float | None) -> None:
     async with self.redis.pipeline(transaction=True) as pipeline:
       pipeline.rpush(key, json.dumps(sample, allow_nan=False))
       pipeline.ltrim(key, -limit, -1)
-      pipeline.expire(key, int(ttl_seconds))
+      if ttl_seconds:
+        pipeline.expire(key, int(ttl_seconds))
+      else:
+        pipeline.persist(key)
       await pipeline.execute()
 
   async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
@@ -416,10 +419,13 @@ class RedisStateStore(StateStore):
   async def list_length(self, key: str) -> int | None:
     return await self.redis.llen(key)
 
-  async def increment(self, key: str, ttl_seconds: float) -> int:
+  async def increment(self, key: str, ttl_seconds: float | None) -> int:
     async with self.redis.pipeline(transaction=True) as pipeline:
       pipeline.incr(key)
-      pipeline.expire(key, int(ttl_seconds))
+      if ttl_seconds:
+        pipeline.expire(key, int(ttl_seconds))
+      else:
+        pipeline.persist(key)
       value, _ = await pipeline.execute()
     return value
 

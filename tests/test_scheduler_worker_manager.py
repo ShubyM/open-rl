@@ -159,6 +159,8 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072",
       "MAX_JOBS": "4",
       "OTEL_TRACES_EXPORTER": "gcp_trace",
+      "OPEN_RL_OPS_TTL_DAYS": "0",
+      "OPEN_RL_OPS_SAMPLE_LIMIT": "200000",
     }
     with patch.dict(os.environ, settings), patch("server.worker_manager.get_state_store", return_value=s):
       self.manager.ensure("job-lora-1", "sampler")
@@ -168,6 +170,14 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     for pod in self.api.created:
       env = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
       self.assertEqual({k: env.get(k) for k in settings}, settings)
+
+  def test_the_dispatcher_keeps_op_records_like_the_workers(self) -> None:
+    settings = {"OPEN_RL_OPS_TTL_DAYS": "0", "OPEN_RL_OPS_SAMPLE_LIMIT": "200000"}
+    with patch.dict(os.environ, {"REDIS_URL": "redis://redis:6379", **settings}):
+      body = dispatcher_body("sampler-pool")
+    (dispatcher,) = [c for c in body["spec"]["template"]["spec"]["containers"] if c["name"] == "dispatcher"]
+    env = {e["name"]: e.get("value") for e in dispatcher["env"]}
+    self.assertEqual({k: env.get(k) for k in settings}, settings)
 
   def test_launch_is_idempotent(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})

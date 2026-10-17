@@ -18,7 +18,8 @@ from server.telemetry import kubernetes, ops
 from server.worker_manager import FAILED, READY, STARTING, STOPPED, WAITING_FOR_PLACEMENT
 
 CACHE_SECONDS = 5
-HISTORY_WINDOW_SECONDS = 24 * 3600
+# The longest window the dashboard shows, matching the logs API's seven-day limit.
+HISTORY_WINDOW_SECONDS = 7 * 86400
 METADATA_PREFIX = "open_rl:model_meta:"
 # A request on a worker longer than this, or three median steps, is stalled.
 STALL_SECONDS = 600

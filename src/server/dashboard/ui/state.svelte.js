@@ -6,12 +6,14 @@ export const inspectUrl = (resource, params = {}) => `/api/v1/inspect/${resource
 export const nodeLink = (placement, range) => viewLink("nodes", { placement, duration: range.now - range.start, end: range.now });
 export const now = (inventory) => Date.parse(inventory?.observed_at) / 1000 || Date.now() / 1000;
 const cache = new Map();
+// The longest window the pages show, matching the inspection API's seven-day limit.
+export const MAX_WINDOW = 7 * 86400;
 export const saved = $state({ overview: "#overview", nodes: "#nodes" });
 const number = (params, key, fallback) => params.get(key)?.trim() && Number.isFinite(Number(params.get(key))) ? Number(params.get(key)) : fallback;
 export function parseView(hash = location.hash) {
   const [path, search = ""] = hash.slice(1).split("?");
   const [page, id = "", tab = "activity"] = path.split("/").map((part) => { try { return decodeURIComponent(part); } catch { return part; } });
-  const params = new URLSearchParams(search), duration = Math.max(60, Math.min(86400, Math.round(number(params, "duration", 1800))));
+  const params = new URLSearchParams(search), duration = Math.max(60, Math.min(MAX_WINDOW, Math.round(number(params, "duration", 1800))));
   const end = number(params, "end", null), event = number(params, "event", null), back = params.get("back");
   return { page: ["nodes", "run", "health"].includes(page) ? page : "overview", id, tab,
     duration, end: end !== null && end >= duration && end <= 8.64e12 ? end : null,

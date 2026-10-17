@@ -77,6 +77,14 @@ class GkeLogHelpersTest(unittest.TestCase):
       result = asyncio.run(gke.run_logs("r", [SOURCE], since="2026-09-10T10:00:00Z", until="2026-09-10T11:00:00Z", severity="ERROR"))
     self.assertEqual([record["message"] for record in result["records"]], ["Traceback (most recent call last):"])
 
+  def test_logs_come_from_the_configured_views_or_else_the_project(self) -> None:
+    window = {"since": "2026-09-10T10:00:00Z", "until": "2026-09-10T11:00:00Z"}
+    view = "projects/proj/locations/global/buckets/openrl-runs/views/_AllLogs"
+    for env, expected in (({}, ["projects/proj"]), ({"OPEN_RL_LOG_VIEWS": view}, [view])):
+      with self.subTest(env=env), patch.dict("os.environ", env), patch.object(gke, "request", AsyncMock(return_value={"entries": []})) as request:
+        asyncio.run(gke.run_logs("r", [SOURCE], **window))
+        self.assertEqual(request.await_args.kwargs["json"]["resourceNames"], expected)
+
   def test_refused_credentials_back_off_without_repeating_the_request(self) -> None:
     response = httpx.Response(403, request=httpx.Request("POST", "https://logging.googleapis.com"))
     error = httpx.HTTPStatusError("denied", request=response.request, response=response)

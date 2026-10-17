@@ -1,6 +1,6 @@
-import { crosshair } from "./state.svelte.js";
+import { crosshair, MAX_WINDOW } from "./state.svelte.js";
 
-export const WINDOWS = [[60, "1 minute"], [600, "10 minutes"], [1800, "30 minutes"], [3600, "1 hour"], [10800, "3 hours"], [21600, "6 hours"], [86400, "24 hours"]];
+export const WINDOWS = [[60, "1 minute"], [600, "10 minutes"], [1800, "30 minutes"], [3600, "1 hour"], [10800, "3 hours"], [21600, "6 hours"], [86400, "24 hours"], [259200, "3 days"], [MAX_WINDOW, "7 days"]];
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 const SURFACES = ".capacity-track, .node-axis, .activity-track, .activity-axis, #placement-detail .chart-plot svg, #placement-detail .chart-empty";
 
@@ -18,9 +18,9 @@ export function nodeTime(element, { view, getRange, getNow, onGesture }) {
     root?.classList.add("node-navigating");
   }
   function select(duration, end) {
-    duration = clamp(Math.round(duration), 60, 86400);
+    duration = clamp(Math.round(duration), 60, MAX_WINDOW);
     view.duration = duration;
-    view.end = clamp(end, getNow() - 86400 + duration, getNow());
+    view.end = clamp(end, getNow() - MAX_WINDOW + duration, getNow());
   }
   function finish(cancel = false) {
     clearTimeout(settle);
@@ -52,7 +52,7 @@ export function nodeTime(element, { view, getRange, getNow, onGesture }) {
     begin("wheel");
     const range = getRange(), at = fraction(event.clientX, track.getBoundingClientRect());
     const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? track.clientHeight : 1);
-    const duration = clamp(Math.round((range.now - range.start) * Math.exp(clamp(delta * 0.002, -1, 1))), 60, 86400);
+    const duration = clamp(Math.round((range.now - range.start) * Math.exp(clamp(delta * 0.002, -1, 1))), 60, MAX_WINDOW);
     select(duration, range.start + at * (range.now - range.start) + (1 - at) * duration);
     clearTimeout(settle);
     settle = setTimeout(() => finish(), 200);
@@ -86,7 +86,7 @@ export function nodeTime(element, { view, getRange, getNow, onGesture }) {
     if (pinch && event.touches.length === 2) {
       event.preventDefault();
       const [a, b] = event.touches, x = (a.clientX + b.clientX) / 2;
-      const duration = clamp(Math.round((pinch.range.now - pinch.range.start) * pinch.distance / (Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1)), 60, 86400);
+      const duration = clamp(Math.round((pinch.range.now - pinch.range.start) * pinch.distance / (Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1)), 60, MAX_WINDOW);
       const anchor = pinch.range.start + fraction(pinch.x, pinch.box) * (pinch.range.now - pinch.range.start);
       select(duration, anchor + (1 - fraction(x, pinch.box)) * duration);
     } else if (drag && event.touches.length === 1 && moveDrag(event.touches[0].clientX, event.touches[0].clientY, true)) event.preventDefault();
@@ -111,7 +111,7 @@ export function nodeTime(element, { view, getRange, getNow, onGesture }) {
       // Keep the crosshair under the pointer, which did not move.
       if (crosshair.at !== null) crosshair.at += view.end - range.now;
     } else {
-      const duration = clamp(Math.round(span * (key === "w" ? 0.8 : 1.25)), 60, 86400);
+      const duration = clamp(Math.round(span * (key === "w" ? 0.8 : 1.25)), 60, MAX_WINDOW);
       const at = crosshair.at === null ? 0.5 : clamp((crosshair.at - range.start) / span, 0, 1);
       select(duration, range.start + at * span + (1 - at) * duration);
     }

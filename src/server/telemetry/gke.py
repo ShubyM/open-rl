@@ -46,6 +46,13 @@ _WARNING = re.compile(r"Warning\b|warnings\.warn\(")
 # ---- identity -------------------------------------------------------------------
 
 
+def log_views() -> list[str]:
+  """Where run logs are read: the log views in OPEN_RL_LOG_VIEWS, such as a long-retention
+  bucket's _AllLogs view, or else the project's default buckets."""
+  views = [view.strip() for view in os.getenv("OPEN_RL_LOG_VIEWS", "").split(",") if view.strip()]
+  return views or [f"projects/{configuration()['project']}"]
+
+
 def configuration() -> dict:
   mode = os.getenv("OPEN_RL_GKE_TELEMETRY", "auto").strip().lower()
   fields = {
@@ -242,7 +249,7 @@ async def run_logs(
     raise ValueError(f"Select a pod to narrow this query to at most {MAX_SOURCES} pod lifetimes")
   start, end = time_range(since, until)
   body = {
-    "resourceNames": [f"projects/{configuration()['project']}"],
+    "resourceNames": log_views(),
     "filter": logs_filter(selected, start, end, severity, q),
     "orderBy": "timestamp desc",
     "pageSize": limit,

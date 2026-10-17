@@ -4,7 +4,7 @@
   import Activity from "./Activity.svelte";
   import CopyLink from "./CopyLink.svelte";
   import TimeControl from "./TimeControl.svelte";
-  import { createQuery, inspectUrl, now, viewLink, crosshair, crosshairOffset, timeAt } from "./state.svelte.js";
+  import { createQuery, inspectUrl, now, viewLink, crosshair, crosshairOffset, timeAt, MAX_WINDOW } from "./state.svelte.js";
   import { nodeTime } from "./node-time.js";
   import { axisTime, deviceLabel, acceleratorLabel, shortNodeName, placementColor, clipPlacements, duty, claimLabel, capacityBars, activitySource, deviceSeries, sumSeries, gapFor, lastValue } from "./visualization.js";
 
@@ -12,8 +12,8 @@
   let element, frozen = $state(null);
   const observed = $derived(now(inventory));
   const range = $derived.by(() => {
-    const duration = Math.max(60, Math.min(86400, Math.round(view.duration || 1800)));
-    const end = Math.max(observed - 86400 + duration, Math.min(observed, view.end ?? observed));
+    const duration = Math.max(60, Math.min(MAX_WINDOW, Math.round(view.duration || 1800)));
+    const end = Math.max(observed - MAX_WINDOW + duration, Math.min(observed, view.end ?? observed));
     return { start: end - duration, now: end, live: view.end === null };
   });
   const queryRange = $derived(frozen || range);

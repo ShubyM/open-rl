@@ -24,8 +24,9 @@ from opentelemetry import trace
 
 from server.store import get_state_store
 
-SAMPLE_LIMIT = 2000
-TTL_SECONDS = 7 * 86400
+SAMPLE_LIMIT = int(os.getenv("OPEN_RL_OPS_SAMPLE_LIMIT", "2000"))
+# How long a run's op records and a worker's record outlive their last write; 0 keeps them.
+TTL_SECONDS = float(os.getenv("OPEN_RL_OPS_TTL_DAYS", "7")) * 86400 or None
 HEARTBEAT_SECONDS = 5
 # A record not rewritten for this long belongs to a process that is gone.
 STALE_SECONDS = 6 * HEARTBEAT_SECONDS

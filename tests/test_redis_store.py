@@ -84,6 +84,13 @@ class RedisFutureTest(SampleStoreContract, unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self) -> None:
     await self.store.redis.flushdb()
 
+  async def test_samples_with_no_ttl_stop_expiring(self) -> None:
+    await self.state.append_sample("ops", {"n": 1}, 10, 60)
+    self.assertGreater(await self.store.redis.ttl("ops"), 0)
+    await self.state.append_sample("ops", {"n": 2}, 10, None)
+    self.assertEqual(await self.store.redis.ttl("ops"), -1)
+    self.assertEqual([s["n"] for s in await self.state.read_samples("ops")], [1, 2])
+
   async def asyncTearDown(self) -> None:
     await self.store.redis.aclose()
     self.state.sync_redis.close()

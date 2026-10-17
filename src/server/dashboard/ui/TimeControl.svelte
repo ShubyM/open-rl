@@ -1,5 +1,6 @@
 <script>
   import { WINDOWS } from "./node-time.js";
+  import { MAX_WINDOW } from "./state.svelte.js";
   import { chartTime } from "./visualization.js";
   // The time window shared by the Nodes and run pages: back and forward, a window and
   // end picker, and the W/S A/D keys that node-time.js handles on the page.
@@ -21,10 +22,10 @@
   }
 </script>
 <svelte:window onkeydown={escapeKey} onclick={(event) => { if (picker?.open && !picker.contains(event.target)) picker.open = false; }} />
-<button type="button" class="time-shift" data-time-shift="-1" aria-label="Previous time window" disabled={range.start <= observed - 86400} onclick={() => shift(-1)}><svg class="time-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 5.5 5 5 5-5" transform="rotate(90 8 8)" /></svg></button>
+<button type="button" class="time-shift" data-time-shift="-1" aria-label="Previous time window" disabled={range.start <= observed - MAX_WINDOW} onclick={() => shift(-1)}><svg class="time-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 5.5 5 5 5-5" transform="rotate(90 8 8)" /></svg></button>
 <details class="time-picker" data-key="node-time-picker" bind:this={picker}><summary class="time-summary" title={timeLabel}><span>{timeLabel}</span><svg class="time-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 5.5 5 5 5-5" /></svg></summary>
   <div class="time-popover"><label>Window <select data-time-duration value={duration} onchange={(event) => { view.duration = Number(event.currentTarget.value); if (view.end !== null) view.end = range.now; }}>{#each options as [n, text] (n)}<option value={n}>{text}</option>{/each}</select></label>
-    <label>Until (UTC)<input type="datetime-local" data-time-end value={range.live ? "" : local(range.now)} min={local(observed - 86400 + duration)} max={local(observed)} step="any" onchange={until}></label>
+    <label>Until (UTC)<input type="datetime-local" data-time-end value={range.live ? "" : local(range.now)} min={local(observed - MAX_WINDOW + duration)} max={local(observed)} step="any" onchange={until}></label>
     {#if range.live}<span class="muted">Following current time</span>{:else}<button type="button" class="chip" data-time-live="true" onclick={() => view.end = null}>Return to live</button>{/if}
     <span class="muted">W/S zoom · A/D pan</span>
   </div>

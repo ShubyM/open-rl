@@ -54,6 +54,7 @@ PLURAL = "workloads"
 EPP_IMAGE = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0"
 ENVOY_IMAGE = "docker.io/envoyproxy/envoy:distroless-v1.33.2"
 ROUTER_CONFIG = "/etc/sampler-router"
+OPS_SETTINGS = ("OPEN_RL_OPS_TTL_DAYS", "OPEN_RL_OPS_SAMPLE_LIMIT")
 
 
 def workload_name(role: str, owner: str, is_lora: bool, index: int = 0) -> str:
@@ -152,6 +153,8 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
     "VLLM_MAX_NUM_BATCHED_TOKENS",
     "OPEN_RL_TRAIN_TOKEN_BUDGET",
     "MAX_JOBS",
+    # How long and how many op records a worker keeps for the dashboard.
+    *OPS_SETTINGS,
   ):
     if os.getenv(name):
       values[name] = os.environ[name]
@@ -261,6 +264,7 @@ def dispatcher_body(pool: str) -> dict[str, Any]:
   ]
   if concurrency := os.getenv("OPEN_RL_DISPATCH_CONCURRENCY"):
     env.append({"name": "OPEN_RL_DISPATCH_CONCURRENCY", "value": concurrency})
+  env += [{"name": name, "value": os.environ[name]} for name in OPS_SETTINGS if os.getenv(name)]
   dispatcher = {
     "name": "dispatcher",
     # The dispatcher is a small CPU process; the API-server image carries it without the GPU stack.

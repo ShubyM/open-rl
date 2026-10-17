@@ -61,6 +61,8 @@ Each active run in inventory has a `progress` verdict, judged by what completes 
 
 Kubernetes queries use `OPEN_RL_WORKER_NAMESPACE`, then `POD_NAMESPACE`, then `openrl-system`. On GKE the project, cluster and location come from the metadata server. Override them with `OPEN_RL_GKE_PROJECT`, `OPEN_RL_GKE_CLUSTER` and `OPEN_RL_GKE_LOCATION`, or disable discovery with `OPEN_RL_GKE_TELEMETRY=false`. Application Default Credentials need logging and monitoring read access. A source that cannot be read is reported as an error, never shown as an empty cluster.
 
+Logs come from the project's default buckets, which usually keep 30 days. To keep runs longer, route the namespace's container logs to a bucket with longer retention and set `OPEN_RL_LOG_VIEWS` to its view, for example `projects/<project>/locations/global/buckets/openrl-runs/views/_AllLogs`; the reader then needs `roles/logging.viewAccessor` on it. Each run's op records and each worker's record expire `OPEN_RL_OPS_TTL_DAYS` (default 7) after their last write, and `0` keeps them. A run keeps its newest `OPEN_RL_OPS_SAMPLE_LIMIT` op records (default 2000); a long RL run records about one per sample request. Pages and the API show windows of up to seven days.
+
 ## Agents
 
 The [openrl-inspect skill](../skills/openrl-inspect/SKILL.md) shows agents how to diagnose runs with this API.
