@@ -17,6 +17,7 @@ import httpx
 import redis.asyncio as redis
 
 from server.sampling_store import SamplingStore
+from server.telemetry import ops
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class Dispatcher:
     self.in_flight: dict[str, asyncio.Task] = {}
     self.loading: dict[str, asyncio.Task] = {}
     self.paused: dict[str, float] = {}  # when each replica last paused to load weights
+    self.pods: dict[str, str] = {}  # replica URL -> pod name, for the ops it serves
 
   async def run(self) -> None:
     self.write_revision()
@@ -65,9 +67,10 @@ class Dispatcher:
       while True:
         try:
           await self.store.wait_for_new(self.pool, await self.dispatch(), RETRY_MS)
-        except Exception:
+        except Exception as exc:
           # A Redis or Kubernetes hiccup must not end the pool's dispatching.
           logger.exception("Dispatching pool %s failed; retrying", self.pool)
+          ops.note(last_error=f"{type(exc).__name__} in dispatch")
           await asyncio.sleep(RETRY_MS / 1000)
     finally:
       for task in [*self.in_flight.values(), *self.loading.values()]:
@@ -87,6 +90,8 @@ class Dispatcher:
     target = self.revision or "default"
     urls = await self.list_replicas()
     versions = await asyncio.gather(*(self.weight_version(url) for url in urls), return_exceptions=True)
+    states = {self.pods.get(u, u): v if isinstance(v, str) else f"unreachable: {type(v).__name__}" for u, v in zip(urls, versions, strict=True)}
+    ops.note(revision=target, replicas=states, loading=[self.pods.get(u, u) for u in self.loading], in_flight=len(self.in_flight))
     for url, version in zip(urls, versions, strict=True):
       # A replica still starting does not answer yet, and a pool on base weights never loads any.
       if self.revision and isinstance(version, str) and version != target and url not in self.loading:
@@ -108,17 +113,18 @@ class Dispatcher:
     await self.commit(r, failed(f"No sampler answered in {waited:.0f}s; pool {self.pool} serves {self.revision or 'base weights'}"))
     return True
 
-  async def commit(self, r: dict[str, Any], result: dict[str, Any]) -> None:
-    await self.store.commit(r, result)
+  async def commit(self, r: dict[str, Any], result: dict[str, Any]) -> bool:
+    committed = await self.store.commit(r, result)
     self.records.pop(r["entry_id"], None)
+    return committed
 
   async def send(self, r: dict[str, Any]) -> None:
-    target, sent = self.revision or "default", time.monotonic()
+    target, sent, started = self.revision or "default", time.monotonic(), time.time()
     params = {**r["sampling_params"], "logprobs": 0, "prompt_logprobs": 0 if r["include_prompt_logprobs"] else None}
     attempt_id = f"{r['request_id']}-{uuid.uuid4().hex[:8]}"
     body = {"request_id": attempt_id, "token_ids": r["prompt_token_ids"], "model": r["model"], "sampling_params": params}
     url = self.router or random.choice(self.urls)
-    result = None
+    replica, result, retry = url, None, None
     try:
       response = await self.http.post(f"{url}/inference/v1/generate", json=body, timeout=None)
       if response.status_code in (400, 404, 422):
@@ -131,10 +137,21 @@ class Dispatcher:
             result = to_result(response.json(), r)
           except (KeyError, TypeError, ValueError) as exc:
             result = failed(f"Sampler response broke the contract: {exc!r}")
+        else:
+          retry = "WrongWeights"
+      else:
+        retry = f"HTTP{response.status_code}"
     except httpx.HTTPError as exc:
       logger.info("Retrying %s after %r", r["request_id"], exc)
-    if result:
-      await self.commit(r, result)
+      retry = type(exc).__name__
+    if result and await self.commit(r, result):
+      ops.note(last_commit_at=time.time())
+    elif retry:
+      ops.note(last_error=f"{retry} from {self.pods.get(replica, replica)}")
+    status = "retried" if retry else "failed" if result.get("type") == "RequestFailedResponse" else "succeeded"
+    # No runtime: the pool name is not the sampler Workload's runtime, and the replica pod is what joins the op to its lane.
+    request = {"op": "sample", "logical_run_id": r.get("run_id"), "request_id": r["request_id"]}
+    ops.record(request, "sampler", None, started, status, retry, {}, where={"pod": self.pods.get(replica, replica)})
 
   async def load_weights(self, url: str, revision: str) -> None:
     """vLLM's pause lets the requests the replica is running finish first."""
@@ -158,6 +175,7 @@ class Dispatcher:
       await self.post(url, "/resume")
     except Exception as exc:
       logger.warning("Loading %r on %s failed: %r", revision, url, exc)  # the next dispatch tries again
+      ops.note(last_error=f"loading {revision} on {self.pods.get(url, url)}: {exc!r}"[:500])
     finally:
       self.loading.pop(url)
 
@@ -177,7 +195,8 @@ class Dispatcher:
     selector = f"app.kubernetes.io/component=sampler,app.kubernetes.io/instance={self.pool}"
     namespace = os.getenv("OPEN_RL_WORKER_NAMESPACE", "openrl-system")
     pods = await asyncio.to_thread(self.k8s.list_namespaced_pod, namespace, label_selector=selector, _request_timeout=10)
-    return [f"http://{p.status.pod_ip}:8000" for p in pods.items if p.status.pod_ip and p.status.phase == "Running"]
+    self.pods = {f"http://{p.status.pod_ip}:8000": p.metadata.name for p in pods.items if p.status.pod_ip and p.status.phase == "Running"}
+    return list(self.pods)
 
   async def weight_version(self, url: str) -> str:
     response = await self.http.get(f"{url}/weight_info", timeout=5)
@@ -203,9 +222,10 @@ async def main() -> None:
   # A run on one machine lists its replicas. A pool on Kubernetes sends through its Envoy.
   urls = [url for url in os.getenv("OPEN_RL_SAMPLER_ENDPOINTS", "").split(",") if url]
   router = None if urls else os.getenv("OPEN_RL_SAMPLER_ROUTER", "http://127.0.0.1:8081")
-  store = SamplingStore(redis_client(os.environ["REDIS_URL"]))
-  async with httpx.AsyncClient(limits=httpx.Limits(max_connections=None)) as http:
-    dispatcher = Dispatcher(store, os.environ["OPEN_RL_SAMPLER_POOL"], http, router, urls, int(os.getenv("OPEN_RL_DISPATCH_CONCURRENCY", "256")))
+  store, pool = SamplingStore(redis_client(os.environ["REDIS_URL"])), os.environ["OPEN_RL_SAMPLER_POOL"]
+  async with httpx.AsyncClient(limits=httpx.Limits(max_connections=None)) as http, ops.serving("dispatcher", None, pool=pool):
+    dispatcher = Dispatcher(store, pool, http, router, urls, int(os.getenv("OPEN_RL_DISPATCH_CONCURRENCY", "256")))
+    ops.set_phase("ready")
     task = asyncio.create_task(dispatcher.run())
     for sig in (signal.SIGTERM, signal.SIGINT):
       asyncio.get_running_loop().add_signal_handler(sig, task.cancel)

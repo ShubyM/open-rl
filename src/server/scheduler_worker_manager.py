@@ -54,6 +54,7 @@ PLURAL = "workloads"
 EPP_IMAGE = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0"
 ENVOY_IMAGE = "docker.io/envoyproxy/envoy:distroless-v1.33.2"
 ROUTER_CONFIG = "/etc/sampler-router"
+OPS_SETTINGS = ("OPEN_RL_OPS_TTL_DAYS", "OPEN_RL_OPS_SAMPLE_LIMIT")
 
 
 def workload_name(role: str, owner: str, is_lora: bool, index: int = 0) -> str:
@@ -144,9 +145,23 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   }
   # MAX_JOBS caps FlashInfer's JIT build, which otherwise runs one ~3GB
   # compiler per core and blows through the pod's host memory limit.
-  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
+  for name in (
+    "VLLM_GPU_MEMORY_UTILIZATION",
+    "VLLM_MAX_MODEL_LEN",
+    "VLLM_ENFORCE_EAGER",
+    "VLLM_MAX_NUM_SEQS",
+    "VLLM_MAX_NUM_BATCHED_TOKENS",
+    "OPEN_RL_TRAIN_TOKEN_BUDGET",
+    "MAX_JOBS",
+    # How long and how many op records a worker keeps for the dashboard.
+    *OPS_SETTINGS,
+  ):
     if os.getenv(name):
       values[name] = os.environ[name]
+  # OpenTelemetry settings, so workers export traces like the API server.
+  for name, value in os.environ.items():
+    if name.startswith("OTEL_"):
+      values[name] = value
   # No other worker shares an exclusive worker's GPUs, so it never parks.
   if worker.exclusive:
     values["OPEN_RL_TIME_SLICING"] = "off"
@@ -154,6 +169,9 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   env.append(downward("OPEN_RL_ACCEL_TIMESLICER_HOST", "status.hostIP"))
   if worker.pool:
     env.append(downward("POD_IP", "status.podIP"))
+  # The pod identity a worker stamps on the ops it records, for the dashboard.
+  for name, field in (("POD_NAME", "metadata.name"), ("POD_UID", "metadata.uid"), ("NODE_NAME", "spec.nodeName")):
+    env.append(downward(name, field))
   return env
 
 
@@ -239,9 +257,14 @@ def dispatcher_body(pool: str) -> dict[str, Any]:
     {"name": "OPEN_RL_TMP_DIR", "value": os.getenv("OPEN_RL_TMP_DIR", "/mnt/shared/open-rl")},
     {"name": "OPEN_RL_SAMPLER_POOL", "value": pool},
     downward("OPEN_RL_WORKER_NAMESPACE", "metadata.namespace"),
+    # The pod identity the dispatcher's record carries, so progress names its pod.
+    downward("POD_NAME", "metadata.name"),
+    downward("POD_UID", "metadata.uid"),
+    downward("NODE_NAME", "spec.nodeName"),
   ]
   if concurrency := os.getenv("OPEN_RL_DISPATCH_CONCURRENCY"):
     env.append({"name": "OPEN_RL_DISPATCH_CONCURRENCY", "value": concurrency})
+  env += [{"name": name, "value": os.environ[name]} for name in OPS_SETTINGS if os.getenv(name)]
   dispatcher = {
     "name": "dispatcher",
     # The dispatcher is a small CPU process; the API-server image carries it without the GPU stack.
@@ -297,7 +320,8 @@ def dispatcher_body(pool: str) -> dict[str, Any]:
 
 
 def network_policy_body(pool: str) -> dict[str, Any]:
-  """Only the pool's CPU pod reaches its samplers, for inference and KV events."""
+  """Only the pool's CPU pod reaches its samplers, for inference and KV events, and
+  Managed Service for Prometheus scrapes their metrics."""
   return {
     "apiVersion": "networking.k8s.io/v1",
     "kind": "NetworkPolicy",
@@ -305,7 +329,10 @@ def network_policy_body(pool: str) -> dict[str, Any]:
     "spec": {
       "podSelector": {"matchLabels": pool_labels("sampler", pool)},
       "policyTypes": ["Ingress"],
-      "ingress": [{"from": [{"podSelector": {"matchLabels": pool_labels("dispatcher", pool)}}], "ports": [{"port": 8000}, {"port": 5557}]}],
+      "ingress": [
+        {"from": [{"podSelector": {"matchLabels": pool_labels("dispatcher", pool)}}], "ports": [{"port": 8000}, {"port": 5557}]},
+        {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "gmp-system"}}}], "ports": [{"port": 8000}]},
+      ],
     },
   }
 
@@ -472,28 +499,28 @@ class SchedulerWorkerManager:
     selector = "app.kubernetes.io/managed-by=open-rl-api-server"
     found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
     now = time.time()
-    workers = []
-    for item in found["items"]:
-      spec, status, meta = item["spec"], item.get("status") or {}, item["metadata"]
-      state, detail = worker_state(
-        phase=status.get("phase") or "Pending",
-        reason=status.get("reason") or "",
-        node=status.get("nodeName"),
-        deleting=bool(meta.get("deletionTimestamp")),
-      )
-      workers.append(
-        {
-          "workload": meta["name"],
-          "role": spec["role"],
-          "owner": spec.get("ownerID"),
-          "model_id": spec["modelID"],
-          "state": state,
-          "detail": detail,
-          "node": status.get("nodeName"),
-          "age_seconds": age_seconds(meta.get("creationTimestamp"), now),
-        }
-      )
-    return workers
+    return [workload_worker(item, now) for item in found["items"]]
+
+
+def workload_worker(item: dict[str, Any], now: float) -> dict[str, Any]:
+  """One Workload as a worker entry in the client vocabulary."""
+  spec, status, meta = item["spec"], item.get("status") or {}, item["metadata"]
+  state, detail = worker_state(
+    phase=status.get("phase") or "Pending",
+    reason=status.get("reason") or "",
+    node=status.get("nodeName"),
+    deleting=bool(meta.get("deletionTimestamp")),
+  )
+  return {
+    "workload": meta["name"],
+    "role": spec["role"],
+    "owner": spec.get("ownerID"),
+    "model_id": spec["modelID"],
+    "state": state,
+    "detail": detail,
+    "node": status.get("nodeName"),
+    "age_seconds": age_seconds(meta.get("creationTimestamp"), now),
+  }
 
 
 def worker_state(phase: str, reason: str, node: str | None, deleting: bool) -> tuple[str, str]:

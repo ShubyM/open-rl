@@ -29,7 +29,7 @@ configMapGenerator:
     behavior: merge
     literals:
       # No Cloud Trace exporter on a local cluster.
-      - ENABLE_GCP_TRACE="0"
+      - OTEL_TRACES_EXPORTER="none"
 
 patches:
   - path: pvc-local.yaml
@@ -61,6 +61,24 @@ patches:
       kind: PodMonitoring
       metadata:
         name: nvidia-dcgm-exporter-scraper
+  - target:
+      kind: PodMonitoring
+      name: open-rl-samplers
+    patch: |
+      $patch: delete
+      apiVersion: monitoring.googleapis.com/v1
+      kind: PodMonitoring
+      metadata:
+        name: open-rl-samplers
+  - target:
+      kind: PodMonitoring
+      name: open-rl-sampler-routers
+    patch: |
+      $patch: delete
+      apiVersion: monitoring.googleapis.com/v1
+      kind: PodMonitoring
+      metadata:
+        name: open-rl-sampler-routers
 
   # The vendored llm-d chart mounts COS's driver bundle,
   # /home/kubernetes/bin/nvidia, and reads its libraries through

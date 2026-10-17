@@ -44,7 +44,7 @@ def openrl_server(
     **os.environ,
     "BASE_MODEL": base_model,
     "PYTHONUNBUFFERED": "1",
-    "ENABLE_GCP_TRACE": "0",
+    "OTEL_TRACES_EXPORTER": "none",
     "OPEN_RL_TMP_DIR": tmp_dir.name,
     "SAMPLING_BACKEND": sampling_backend,
     "TINKER_API_KEY": "tml-dummy-key",

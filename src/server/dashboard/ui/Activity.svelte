@@ -1,0 +1,71 @@
+<script>
+  import { nodeLink, viewLink, crosshair, crosshairOffset, timeAt } from "./state.svelte.js";
+  import { axisTime, chartTime, valueText, placementColor, processLabel, shortNodeName, opRank, opLabel, clipPlacements, activitySource } from "./visualization.js";
+  let { placements = [], range, inventory, acrossNodes = false, activeOnly = false, selected = null, onselect, error = null, status = null, pending = false, showSource = true, back = null, navigating = false, onpick = null } = $props();
+  let tooltip = $state(null), tip;
+  const cursor = $derived(crosshairOffset(range));
+  const activities = $derived(clipPlacements(placements, range, error, status).sort((a, b) => (acrossNodes ? (({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""))) : 0) || a.start - b.start || a.id.localeCompare(b.id)));
+  const shown = $derived(activeOnly ? activities.filter((p) => p.intervals.length || p.error) : activities);
+  const warnings = $derived([...new Set(activities.flatMap((p) => [p.partial, p.errorStatus !== 404 && p.error]).filter(Boolean))]);
+  const ops = $derived([...new Set(shown.flatMap((p) => Object.keys(p.ops || {})))].sort((a, b) => opRank(a) - opRank(b) || a.localeCompare(b)));
+  const empty = $derived(error ? `Activity unavailable: ${error}` : pending ? "Loading activity…" : acrossNodes && !activities.length ? "No worker processes for this run in this window" : "No recorded activity in this window");
+  const href = (p) => acrossNodes ? inventory.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : inventory.runs.some((r) => r.run_id === p.run_ids?.[0]) ? viewLink(`run/${encodeURIComponent(p.run_ids[0])}/activity`, { duration: range.now - range.start, end: range.now, back }) : null;
+  const blocks = (spans) => spans.map(([a, b]) => `M${1000 * (a - range.start) / (range.now - range.start)},0 H${1000 * (b - range.start) / (range.now - range.start)} V24 H${1000 * (a - range.start) / (range.now - range.start)} Z`).join(" ");
+  const rowLabel = (p) => acrossNodes ? `${p.label} · ${processLabel(p, inventory.cluster.nodes)} · ${p.node}` : p.label;
+  $effect(() => { placements; range; navigating; tooltip = null; });
+  function trackMove(event) {
+    if (navigating || event.buttons) { tooltip = crosshair.at = null; return; }
+    crosshair.at = timeAt(event, range);
+    if (!event.target.closest(".activity-block")) tooltip = null;
+  }
+  function inspect(event, spans, label, source) {
+    if (navigating || event.buttons) return;
+    const box = event.currentTarget.ownerSVGElement.getBoundingClientRect();
+    const at = range.start + (event.clientX - box.left) / box.width * (range.now - range.start);
+    const interval = spans.find(([a, b]) => at >= a && at <= b);
+    if (!interval) { tooltip = null; return; }
+    const [a, b] = interval, date = (value) => new Date(value * 1000).toISOString().slice(0, 10);
+    tooltip = { label, time: `${date(a)} · ${chartTime(a, true)} – ${date(a) === date(b) ? "" : date(b) + " · "}${chartTime(b, true)}`, detail: `Visible interval · ${valueText(b - a, "s")}${source ? ` · ${source}` : ""}${onpick ? " · Click for logs" : ""}`, left: Math.max(8, Math.min(event.clientX + 12, innerWidth - (tip?.offsetWidth || 300) - 8)), top: Math.max(8, Math.min(event.clientY + 12, innerHeight - (tip?.offsetHeight || 85) - 8)) };
+  }
+  function select(event, placement) {
+    if (onselect && (!event.key || ["Enter", " "].includes(event.key))) { event.preventDefault(); onselect(placement); }
+  }
+</script>
+<svelte:window onscroll={() => tooltip = crosshair.at = null} onresize={() => tooltip = crosshair.at = null} />
+<!-- svelte-ignore a11y_no_static_element_interactions (The timeline delegates pointer inspection to its tracks.) -->
+<section class:cross-node-activity={acrossNodes} class:run-activity={acrossNodes} aria-label={acrossNodes ? "Run process activity" : "Node process activity"} data-crosshair={cursor !== null ? "" : undefined} style:--crosshair={`${cursor ?? 0}%`} onpointerleave={() => tooltip = crosshair.at = null} onpointerdown={() => tooltip = crosshair.at = null}>
+  {#if !shown.length}<p class="empty-state">{empty}</p>
+  {:else}
+    <div class="activity-timeline" aria-label="Recorded run activity">
+      <div class="activity-header"><h3>{acrossNodes ? "Process" : "Run"}</h3><div class="activity-axis">{#each [0, 1, 2, 3, 4] as tick}<span>{axisTime(range.start + (range.now - range.start) * tick / 4, range)}</span>{/each}</div></div>
+      {#each shown as p (p.id)}
+        {@const name = acrossNodes ? processLabel(p, inventory.cluster.nodes) : p.label}
+        {@const meta = acrossNodes ? p.node ? shortNodeName(p.node, inventory.cluster.nodes) : p.ended && p.pod ? p.pod : "Node unassigned" : p.role || "process"}
+        {@const link = href(p)}
+        {@const status = p.error ? "Ops unavailable" : !p.intervals.length ? "No recorded activity" : ""}
+        <div class={`activity-row ${placementColor(p)}`} data-key={p.id} data-selected={!acrossNodes && p.id === selected}>
+          <svelte:element this={link ? "a" : "span"} class={`activity-label ${placementColor(p)}`} data-key={`label:${p.id}`} href={link || undefined} aria-disabled={!link ? "true" : undefined} title={acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !link ? " · Node no longer reported" : ""}` : p.label}>
+            <span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">{name}</span><span class="activity-meta">{meta}{p.ended ? " · Process ended" : p.phase && p.phase !== "ready" ? ` · ${p.phase.replace("_", " ")}` : ""}{!link ? acrossNodes ? p.node ? " · Node no longer reported" : "" : p.run_ids?.length ? " · Run record unavailable" : " · No linked run" : ""}</span></span>
+          </svelte:element>
+          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events (Pointer location follows the shared time axis. Incident links and the Logs tab reach the same logs by keyboard.) -->
+          <div class="activity-track" onpointermove={trackMove} onclick={onpick && ((event) => onpick(Math.round(timeAt(event, range))))}>
+            <svg viewBox="0 0 1000 24" preserveAspectRatio="none" role="img" aria-label="Recorded activity">
+              <!-- svelte-ignore a11y_no_static_element_interactions, a11y_no_noninteractive_tabindex (Keyboard activation selects this placement.) -->
+              <path class={`activity-block ${placementColor(p)}`} role={onselect ? "button" : undefined} tabindex={onselect ? 0 : undefined} aria-label={rowLabel(p)} data-placement={!acrossNodes ? p.id : undefined} data-selected={!acrossNodes && p.id === selected} d={blocks(p.intervals)} vector-effect="non-scaling-stroke" onclick={(event) => select(event, p)} onkeydown={(event) => select(event, p)} onpointermove={(event) => inspect(event, p.intervals, rowLabel(p), p.exact ? "GPU turns" : "Recorded operations")} />
+              {#each Object.entries(p.ops).sort(([a], [b]) => opRank(a) - opRank(b)) as [op, spans] (op)}
+                <!-- svelte-ignore a11y_no_static_element_interactions, a11y_no_noninteractive_tabindex (Keyboard activation selects this placement.) -->
+                <path class="activity-block op" role={onselect ? "button" : undefined} tabindex={onselect ? 0 : undefined} aria-label={`${opLabel(op)} · ${rowLabel(p)}`} data-placement={!acrossNodes ? p.id : undefined} data-op={op} d={blocks(spans)} vector-effect="non-scaling-stroke" onclick={(event) => select(event, p)} onkeydown={(event) => select(event, p)} onpointermove={(event) => inspect(event, spans, `${opLabel(op)} · ${rowLabel(p)}`, "Worker-recorded op")} />
+              {/each}
+            </svg>
+            {#if status}<span class="activity-status" class:unavailable={!!p.error} title={p.error || status}>{status}</span>{/if}
+          </div>
+        </div>
+      {/each}
+      {#if ops.length}<div class="op-legend" aria-label="GPU ops">{#each ops as op}<span data-op={op}><span class="op-swatch"></span>{opLabel(op)}</span>{/each}<span><span class="op-swatch turn"></span>held, unlabelled</span></div>{/if}
+    </div>
+  {/if}
+  {#if error && shown.length}<p class="source-error" role="status">Activity unavailable: {error}</p>{/if}
+  {#if warnings.length}<p class="source-error" role="status">{warnings.join(" · ")}</p>{/if}
+  {#if showSource && activities.length}<p class="activity-source">{activitySource(activities)}</p>{/if}
+  <div class="activity-tooltip" bind:this={tip} role="tooltip" hidden={!tooltip} style:left={`${tooltip?.left || 0}px`} style:top={`${tooltip?.top || 0}px`}><strong class="activity-tooltip-label">{tooltip?.label || ""}</strong><div class="activity-tooltip-time">{tooltip?.time || ""}</div><div class="activity-tooltip-detail">{tooltip?.detail || ""}</div></div>
+</section>

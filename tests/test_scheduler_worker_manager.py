@@ -151,7 +151,17 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
 
   def test_workers_get_the_deployment_settings(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
-    settings = {"VLLM_MAX_MODEL_LEN": "131072", "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072", "MAX_JOBS": "4"}
+    settings = {
+      "VLLM_MAX_MODEL_LEN": "2048",
+      "VLLM_ENFORCE_EAGER": "1",
+      "VLLM_MAX_NUM_SEQS": "4",
+      "VLLM_MAX_NUM_BATCHED_TOKENS": "2048",
+      "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072",
+      "MAX_JOBS": "4",
+      "OTEL_TRACES_EXPORTER": "gcp_trace",
+      "OPEN_RL_OPS_TTL_DAYS": "0",
+      "OPEN_RL_OPS_SAMPLE_LIMIT": "200000",
+    }
     with patch.dict(os.environ, settings), patch("server.worker_manager.get_state_store", return_value=s):
       self.manager.ensure("job-lora-1", "sampler")
       self.manager.ensure("job-lora-1", "trainer")
@@ -160,6 +170,14 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     for pod in self.api.created:
       env = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
       self.assertEqual({k: env.get(k) for k in settings}, settings)
+
+  def test_the_dispatcher_keeps_op_records_like_the_workers(self) -> None:
+    settings = {"OPEN_RL_OPS_TTL_DAYS": "0", "OPEN_RL_OPS_SAMPLE_LIMIT": "200000"}
+    with patch.dict(os.environ, {"REDIS_URL": "redis://redis:6379", **settings}):
+      body = dispatcher_body("sampler-pool")
+    (dispatcher,) = [c for c in body["spec"]["template"]["spec"]["containers"] if c["name"] == "dispatcher"]
+    env = {e["name"]: e.get("value") for e in dispatcher["env"]}
+    self.assertEqual({k: env.get(k) for k in settings}, settings)
 
   def test_launch_is_idempotent(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
@@ -394,12 +412,15 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(dispatcher["image"], "ghcr.io/gke-labs/open-rl/server:latest")  # the worker image unless a dispatcher image is set
     with patch.dict(os.environ, {"OPEN_RL_DISPATCHER_IMAGE": "registry/api-server:v1"}):
       self.assertEqual(dispatcher_body("sampler-fft-job")["spec"]["template"]["spec"]["containers"][0]["image"], "registry/api-server:v1")
+    identity = {e["name"]: e["valueFrom"]["fieldRef"]["fieldPath"] for e in dispatcher["env"] if e["name"] in ("POD_NAME", "POD_UID", "NODE_NAME")}
+    self.assertEqual(identity, {"POD_NAME": "metadata.name", "POD_UID": "metadata.uid", "NODE_NAME": "spec.nodeName"})
     selector = "app.kubernetes.io/component=sampler,app.kubernetes.io/instance=sampler-fft-job"
     self.assertEqual(
       epp["args"][:6], ["--endpoint-selector", selector, "--endpoint-target-ports", "8000", "--config-file", "/etc/sampler-router/epp.yaml"]
     )
     policy = k8s.objects[("network_policy", "sampler-fft-job")]["spec"]
     self.assertEqual((policy["podSelector"]["matchLabels"], policy["ingress"][0]["ports"]), (labels, [{"port": 8000}, {"port": 5557}]))
+    self.assertEqual(policy["ingress"][1]["from"][0]["namespaceSelector"]["matchLabels"], {"kubernetes.io/metadata.name": "gmp-system"})
     self.assertEqual(manager.release_owner("fft-job"), {"fft-job"})
     self.assertEqual((k8s.objects, self.api.existing), ({}, {}))
 

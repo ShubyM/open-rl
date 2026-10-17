@@ -26,8 +26,26 @@ def free_port() -> int:
     return sock.getsockname()[1]
 
 
+class SampleStoreContract:
+  async def test_sample_lists_keep_the_newest(self) -> None:
+    for step in range(3):
+      await self.state.append_sample("samples", {"step": step}, limit=2, ttl_seconds=60)
+    self.assertEqual(await self.state.read_samples("samples"), [{"step": 1}, {"step": 2}])
+    await self.state.delete_values("samples")
+    self.assertEqual(await self.state.read_samples("samples"), [])
+
+  async def test_prefix_scan_and_atomic_counter(self) -> None:
+    await self.state.set_value("model:live", "metadata")
+    await self.state.set_value("model:expired", "old", ttl_seconds=0.01)
+    await self.state.set_value("other", "unrelated")
+    counts = await asyncio.gather(*(self.state.increment("steps", ttl_seconds=60) for _ in range(40)))
+    await asyncio.sleep(0.02)
+    self.assertEqual(await self.state.scan_values("model:"), {"model:live": "metadata"})
+    self.assertEqual(sorted(counts), list(range(1, 41)))
+
+
 @unittest.skipUnless(TEST_REDIS_URL or REDIS_SERVER, "needs OPEN_RL_TEST_REDIS_URL or redis-server on PATH")
-class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
+class RedisFutureTest(SampleStoreContract, unittest.IsolatedAsyncioTestCase):
   server: subprocess.Popen | None = None
   redis_url: str
 
@@ -65,6 +83,13 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
 
   async def asyncSetUp(self) -> None:
     await self.store.redis.flushdb()
+
+  async def test_samples_with_no_ttl_stop_expiring(self) -> None:
+    await self.state.append_sample("ops", {"n": 1}, 10, 60)
+    self.assertGreater(await self.store.redis.ttl("ops"), 0)
+    await self.state.append_sample("ops", {"n": 2}, 10, None)
+    self.assertEqual(await self.store.redis.ttl("ops"), -1)
+    self.assertEqual([s["n"] for s in await self.state.read_samples("ops")], [1, 2])
 
   async def asyncTearDown(self) -> None:
     await self.store.redis.aclose()
@@ -152,7 +177,7 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(await self.state.set_members("missing"), set())
 
 
-class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
+class InMemoryStoreTest(SampleStoreContract, unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     from server.store import InMemoryStore
 

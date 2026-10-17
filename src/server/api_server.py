@@ -18,10 +18,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
 from fastapi.utils import is_body_allowed_for_status_code
-from opentelemetry import propagate, trace
+from opentelemetry import propagate
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -30,12 +28,14 @@ from server.lora_snapshots import snapshot_name, snapshot_root
 from server.model_metadata import (
   TrainingModelMetadata,
   WeightSyncConfig,
+  display_metadata,
   get_model_metadata,
   persist_model_metadata,
 )
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import get_state_store, get_store
+from server.telemetry.tracing import configure_tracing
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
 from training import commands
@@ -79,20 +79,7 @@ async def reap_owner(owner: str) -> None:
     await session_registry.forget(owner)
 
 
-provider = TracerProvider()
-trace.set_tracer_provider(provider)
-
-if os.getenv("ENABLE_GCP_TRACE", "0") == "1":
-  try:
-    from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
-
-    exporter = CloudTraceSpanExporter()
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    print("OpenTelemetry: Configured GCP CloudTraceSpanExporter")
-  except ImportError:
-    print("OpenTelemetry: opentelemetry-exporter-gcp-trace is not installed")
-else:
-  print("OpenTelemetry: No exporter configured (ENABLE_GCP_TRACE=0)")
+configure_tracing("open-rl-api-server")
 
 
 class FilterNoisyEndpoints(logging.Filter):
@@ -471,7 +458,8 @@ async def _extract_and_persist_model_metadata(
   lora_config = req.lora_config.model_dump()
 
   # The model's own user_metadata wins over what the session was opened with.
-  settings = resolve_settings(req.user_metadata or {}, await session_registry.user_metadata(req.session_id))
+  session_meta = await session_registry.user_metadata(req.session_id)
+  settings = resolve_settings(req.user_metadata or {}, session_meta)
   if checkpoint_kind is not None and settings.fine_tuning_type not in (None, checkpoint_kind):
     raise ValueError(f"{SETTINGS_PREFIX}fine_tuning_type={settings.fine_tuning_type} does not match the {checkpoint_kind} checkpoint")
   fine_tuning_type = settings.fine_tuning_type or checkpoint_kind or "lora"
@@ -514,6 +502,7 @@ async def _extract_and_persist_model_metadata(
     trainer_backend=settings.trainer_backend,
     trainer_gpus=settings.trainer_gpus,
     trainer_cp=settings.trainer_cp,
+    **display_metadata({**session_meta, **(req.user_metadata or {})}),
   )
   await persist_model_metadata(state, model_id, meta_obj)
 
@@ -713,6 +702,13 @@ def openapi_with_settings() -> dict[str, Any]:
 
 
 app.openapi = openapi_with_settings
+# Fleet inspection belongs on the operator dashboard, not the model-capability API.
+if os.getenv("OPEN_RL_INSPECTION_API", "").lower() == "true":
+  from server.dashboard.router import router as dashboard_router
+  from server.dashboard.snapshot import snapshot as dashboard_snapshot
+
+  dashboard_snapshot.status_context = lambda *_: openrl_status.StatusContext(state, session_registry, worker_manager, worker_launcher_mode())
+  app.include_router(dashboard_router)
 FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
 
 
@@ -1212,6 +1208,7 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
   return await SamplingStore(store.redis).accept(
     {
       "request_id": request_id,
+      "run_id": lookup_id,
       "pool": pool,
       "revision": revision,
       "model": model,
@@ -1283,5 +1280,10 @@ async def list_adapters():
 
 
 @app.post("/api/v1/telemetry")
-async def telemetry(_: dict):
+async def telemetry(body: dict):
+  # One JSON line per SDK event: on GKE, Cloud Logging indexes it with the event's severity.
+  context = {key: body.get(key) for key in ("session_id", "process_uuid", "sdk_version", "platform")}
+  for event in body.get("events", []):
+    message = f"tinker {event.get('event_name') or event.get('event')}"
+    print(json.dumps({"severity": event.get("severity", "INFO"), "message": message, **context, "event": event}), flush=True)
   return {"status": "accepted"}

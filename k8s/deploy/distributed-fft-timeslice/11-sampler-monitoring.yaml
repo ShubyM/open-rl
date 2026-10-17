@@ -1,0 +1,27 @@
+# vLLM replica metrics and each pool router's EPP metrics, for the dashboard's
+# sampler charts. Managed Service for Prometheus scrapes them by these labels,
+# which the API server puts on every pool's pods.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: open-rl-samplers
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: sampler
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: open-rl-sampler-routers
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: dispatcher
+  endpoints:
+  - port: metrics
+    interval: 15s
