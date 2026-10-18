@@ -37,6 +37,15 @@
   // The vLLM series the inspection API returns for a run's samplers, as vLLM's and llm-d's dashboards chart them.
   const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
     ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
+  // What the run's training client reported per step, such as reward and eval pass rate, charted by step.
+  const reported = createQuery(() => inspectUrl("run_metrics", { run_id: view.id }), { poll: 30000, pollWhen: () => view.end === null, key: () => view.tab === "metrics" && view.id });
+  const reportedRows = $derived(reported.data?.rows || []);
+  const reportedNames = $derived([...new Set(reportedRows.flatMap((row) => Object.keys(row.metrics)))]);
+  const REPORTED_CHARTS = [["env/all/reward/total", "Reward"], ["test/env/all/reward/total", "Held-out reward"], ["env/all/lab/criteria_pass_fraction", "Criteria pass rate"],
+    ["test/env/all/lab/criteria_pass_fraction", "Held-out criteria pass rate"], ["env/all/lab/no_output", "Episodes without output"], ["test/env/all/lab/no_output", "Held-out episodes without output"],
+    ["optim/entropy", "Entropy"], ["optim/kl_sample_train_v2", "Sampler-trainer KL"], ["loss_per_token", "Loss per token"], ["train_mean_nll", "Train NLL"], ["time/total", "Step time", "s"]];
+  let reportedFilter = $state("");
+  const reportedShown = $derived(reportedFilter ? reportedNames.filter((name) => name.includes(reportedFilter)).slice(0, 12).map((name) => [name, name]) : REPORTED_CHARTS.filter(([name]) => reportedNames.includes(name)));
   const link = (tab, changes = {}) => viewLink(`run/${encodeURIComponent(view.id)}/${tab}`, { duration: view.duration, end: view.end, back: view.back, event: view.event, q: view.q, pod: view.pod, ...changes });
 </script>
 
@@ -90,6 +99,17 @@
             {#each names as name (name)}<Chart title={name} points={samples.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]])} start={range.start} end={range.now} tone="accent" />{/each}
             {#if !samples.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">No operations recorded in this time range</p>{/if}
           </div>
+          <h2 class="scheduler-title">Training</h2>
+          {#if reported.error}<p class="source-error" role="status">{reported.error}</p>
+          {:else if !reported.data}<p class="muted">Loading…</p>
+          {:else if !reportedRows.length}<p class="muted">The run's training client has not sent metrics. <code>python -m server.scripts.forward_metrics LOG_PATH</code> sends a cookbook run's.</p>
+          {:else}
+            <div class="log-toolbar"><input type="search" bind:value={reportedFilter} placeholder={`Filter ${reportedNames.length} metrics, e.g. reward`} aria-label="Filter training metrics" /></div>
+            <div class="chart-grid">
+              {#each reportedShown as [key, title, unit = ""] (key)}<Chart {title} {unit} steps points={reportedRows.filter((row) => Number.isFinite(row.metrics[key])).map((row) => [row.step, row.metrics[key]])} start={reportedRows[0].step} end={reportedRows.at(-1).step} empty="No values" />{/each}
+              {#if !reportedShown.length}<p class="empty-state">No metric matches</p>{/if}
+            </div>
+          {/if}
           <h2 class="scheduler-title">Samplers</h2>
           {#if run.shared_runtime}<p class="muted">The pool's samplers serve every run on this base model; see their load on <a href={viewLink("nodes")}>Nodes</a>.</p>
           {:else if vllm.error}<p class="source-error" role="status">{vllm.error}</p>

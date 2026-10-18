@@ -46,6 +46,11 @@ def steps_key(run_id: str) -> str:
   return f"open_rl:steps:{run_id}"
 
 
+def metrics_key(run_id: str) -> str:
+  """A run's own per-step metrics, as its training client reported them."""
+  return f"open_rl:run_metrics:{run_id}"
+
+
 def worker_key(worker_id: str) -> str:
   return f"open_rl:worker:{worker_id}"
 

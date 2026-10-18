@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
 from server.dashboard import inspection, metrics
-from server.dashboard.schema import Activity, Inventory, Logs, Operation, PodLogs, Series
+from server.dashboard.schema import Activity, Inventory, Logs, Operation, PodLogs, RunMetrics, RunMetricsRow, Series
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.store import get_state_store
 from server.telemetry import gke, kubernetes, ops
@@ -185,3 +185,21 @@ async def pod_logs(pod: str, container: str | None = None, previous: bool = Fals
     return await asyncio.to_thread(kubernetes.pod_logs, pod, container, tail, previous)
   except Exception as exc:
     raise HTTPException(503, "Pod logs unavailable in the configured namespace") from exc
+
+
+@router.get("/api/v1/inspect/run_metrics", operation_id="run_metrics", response_model=RunMetrics, response_model_exclude_unset=True)
+async def run_metrics(run_id: str):
+  """The run's own per-step metrics, such as rewards, eval pass rates and losses, when its
+  training client sends them to the gateway; empty for a run that never did."""
+  try:
+    records = await asyncio.wait_for(get_state_store().read_samples(ops.metrics_key(run_id)), timeout=2)
+  except Exception:
+    return RunMetrics(available=False, error="Run metrics unavailable", run_id=run_id, rows=[])
+  latest: dict[int, RunMetricsRow] = {}
+  for record in records:
+    try:
+      row = RunMetricsRow.model_validate(record)
+    except ValidationError:
+      continue
+    latest[row.step] = row
+  return RunMetrics(available=True, run_id=run_id, rows=[latest[step] for step in sorted(latest)])

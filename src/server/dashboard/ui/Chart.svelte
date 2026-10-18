@@ -1,7 +1,8 @@
 <script>
   import { axisTime, chartNumber, chartTime, valueText } from "./visualization.js";
   import { crosshair, crosshairOffset } from "./state.svelte.js";
-  let { title, unit = "", points = [], start, end, min, max, tone = "neutral", gapSeconds = Infinity, empty = "No samples in this time range", note = "", navigating = false } = $props();
+  let { title, unit = "", points = [], start, end, min, max, tone = "neutral", gapSeconds = Infinity, empty = "No samples in this time range", note = "", navigating = false, steps = false } = $props();
+  // With steps, x is a training step rather than a time, so the chart stays out of the shared time crosshair.
   let plot = $state(null), svg = $state(null), tip = $state(null);
   let hover = $state(null);
   const samples = $derived(points.filter(([at]) => Number.isFinite(at) && at >= start && at <= end).sort((a, b) => a[0] - b[0]));
@@ -35,20 +36,20 @@
   const x = (at) => ((at - start) / (end - start || 1) * 1000).toFixed(1);
   const y = (value) => (1000 - (Math.max(scale.low, Math.min(scale.high, value)) - scale.low) / (scale.high - scale.low) * 1000).toFixed(1);
   const path = (segment) => segment.map(([at, value], i) => `${i ? "L" : "M"}${x(at)},${y(value)}`).join(" ");
-  const label = (at) => axisTime(at, { start, now: end });
-  const crosshairX = $derived(crosshairOffset({ start, now: end }));
+  const label = (at) => steps ? chartNumber(Math.round(at)) : axisTime(at, { start, now: end });
+  const crosshairX = $derived(steps ? null : crosshairOffset({ start, now: end }));
   $effect(() => { points; start; end; min; max; navigating; hover = null; });
   function inspect(index) {
     if (!data.length || navigating) return;
     index = Math.max(0, Math.min(data.length - 1, index));
     const [at, value] = data[index], box = svg.getBoundingClientRect();
     const left = (at - start) / (end - start || 1) * box.width;
-    hover = { index, left: box.left - plot.getBoundingClientRect().left + left, top: Math.max(0, Math.min(100, (scale.high - value) / (scale.high - scale.low) * 100)), tipLeft: Math.max(-left, Math.min(8, box.width - left - (tip?.offsetWidth || 160))), text: `${chartTime(at, true)} · ${valueText(value, unit)}` };
+    hover = { index, left: box.left - plot.getBoundingClientRect().left + left, top: Math.max(0, Math.min(100, (scale.high - value) / (scale.high - scale.low) * 100)), tipLeft: Math.max(-left, Math.min(8, box.width - left - (tip?.offsetWidth || 160))), text: `${steps ? `Step ${at}` : chartTime(at, true)} · ${valueText(value, unit)}` };
   }
   function pointer(event) {
     const box = svg.getBoundingClientRect(), at = start + (event.clientX - box.left) / (box.width || 1) * (end - start);
     const outside = event.clientX < box.left || event.clientX > box.right;
-    crosshair.at = navigating || event.buttons || outside ? null : at;
+    crosshair.at = steps || navigating || event.buttons || outside ? null : at;
     if (!data.length || navigating || event.buttons) { hover = null; return; }
     let left = 0, right = data.length - 1;
     while (left < right) { const middle = Math.floor((left + right) / 2); if (data[middle][0] < at) left = middle + 1; else right = middle; }
@@ -67,7 +68,7 @@
 </script>
 <svelte:window onresize={() => hover = null} />
 <figure class="chart" data-key={title} data-tone={tone}>
-  <figcaption class="chart-head"><h2>{title}</h2>{#if data.length}<span class="chart-latest" title={new Date(data.at(-1)[0] * 1000).toISOString()}><span>Latest</span> <strong>{valueText(data.at(-1)[1], unit)}</strong></span>{/if}</figcaption>
+  <figcaption class="chart-head"><h2>{title}</h2>{#if data.length}<span class="chart-latest" title={steps ? `Step ${data.at(-1)[0]}` : new Date(data.at(-1)[0] * 1000).toISOString()}><span>Latest</span> <strong>{valueText(data.at(-1)[1], unit)}</strong></span>{/if}</figcaption>
   {#if !data.length}<p class="chart-empty">{empty}</p>
   {:else}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions (Arrow keys inspect the chart samples.) -->

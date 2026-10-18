@@ -268,3 +268,16 @@ class PodLogs(Record):
   container: str | None
   previous: bool
   text: str = Field(description="Untrusted container output; previous=true is output before the last restart")
+
+
+class RunMetricsRow(Record):
+  step: int
+  at: float = Field(description="When the gateway received the row, Unix seconds")
+  metrics: dict[str, float]
+
+
+class RunMetrics(Source):
+  run_id: str
+  rows: list[RunMetricsRow] = Field(
+    description="The newest row per step, by step; what the run's training client sent, for example rewards and eval pass rates"
+  )
