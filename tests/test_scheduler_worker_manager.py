@@ -1,12 +1,16 @@
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 from server import api_server
 from server.estimator import footprint
-from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager, dispatcher_body
+from server.sampling_dispatcher import revision_file
+from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager, describe_worker, dispatcher_body, pod_template
 from server.store import InMemoryStateStore, InMemoryStore
 from tests.api_client import asgi_client, post_json
 
@@ -75,7 +79,9 @@ class FakeApi:
 
 class SchedulerWorkerManagerTest(unittest.TestCase):
   def setUp(self) -> None:
-    self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}))
+    # The API server Deployment sets OPEN_RL_TMP_DIR to the shared volume every worker pod mounts. A temp dir stands in for it.
+    self.tmp = self.enterContext(tempfile.TemporaryDirectory())
+    self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_TMP_DIR": self.tmp}))
     self.api, self.k8s = FakeCustomObjectsApi(), FakeApi()
     self.manager = SchedulerWorkerManager(custom_api=self.api, apps_api=self.k8s, networking_api=self.k8s)
 
@@ -348,6 +354,26 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(sleep.call_count, 1)
     self.assertEqual(len(self.api.created), 2)
 
+  def test_ensure_says_why_it_waits_for_a_released_pools_dispatcher(self) -> None:
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    self.k8s.objects[("deployment", "sampler-fft-job")] = {"metadata": {"name": "sampler-fft-job"}}
+    terminating = SimpleNamespace(metadata=SimpleNamespace(deletion_timestamp="2026-10-18T00:00:00Z"))
+    self.k8s.read_namespaced_deployment = lambda name, namespace: terminating
+
+    def old_pod_gone(_seconds: float) -> None:
+      self.k8s.objects.pop(("deployment", "sampler-fft-job"))
+
+    with (
+      patch("server.worker_manager.get_state_store", return_value=s),
+      patch("server.scheduler_worker_manager.time.sleep", side_effect=old_pod_gone),
+      self.assertLogs("server.scheduler_worker_manager", "WARNING") as logs,
+    ):
+      self.manager.ensure("fft-job", "sampler")
+
+    self.assertIn("sampler-fft-job of a released pool is still terminating", logs.output[0])
+    self.assertIn("Waited", logs.output[1])
+    self.assertEqual(self.k8s.objects[("deployment", "sampler-fft-job")]["kind"], "Deployment")
+
   def test_create_worker_manager_selects_scheduler_mode(self) -> None:
     from server.worker_manager import create_worker_manager
 
@@ -373,6 +399,41 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       self.assertEqual(sampler["spec"]["ownerID"], "job-sr")
     self.assertEqual(sorted(self.api.deleted), sorted(names))
 
+  def test_a_lora_pool_has_its_snapshot_directory_before_any_replica_is_requested(self) -> None:
+    # vLLM's filesystem LoRA resolver exits at startup without it, and no trainer may have frozen an adapter yet.
+    snapshots, create = Path(self.tmp, "sampler_lora"), self.api.create_namespaced_custom_object
+    seen = []
+    self.api.create_namespaced_custom_object = lambda *args: (seen.append(snapshots.is_dir()), create(*args))[1]
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-lora-1", "sampler")
+    (sampler,) = self.api.created
+    env = {e["name"]: e.get("value") for e in sampler["spec"]["template"]["spec"]["containers"][0]["env"]}
+    self.assertEqual((seen, env["VLLM_LORA_RESOLVER_CACHE_DIR"]), ([True], str(snapshots)))
+
+  def test_a_pool_replica_takes_ninety_percent_of_its_gpu_unless_the_env_says_otherwise(self) -> None:
+    # vLLM's own 0.92 has run FFT delta applies out of memory on an L4. Its batch limits follow the device it lands on.
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    with patch("server.worker_manager.get_state_store", return_value=s), patch.dict(os.environ):
+      os.environ.pop("VLLM_GPU_MEMORY_UTILIZATION", None)
+      default = pod_template(describe_worker("fft-job", "sampler"))["spec"]["containers"][0]["args"]
+      os.environ["VLLM_GPU_MEMORY_UTILIZATION"] = "0.7"
+      explicit = pod_template(describe_worker("fft-job", "sampler"))["spec"]["containers"][0]["args"]
+    fractions = [float(args[args.index("--gpu-memory-utilization") + 1]) for args in (default, explicit)]
+    self.assertEqual((fractions, "--max-num-seqs" in default), ([0.90, 0.7], False))
+
+  def test_without_open_rl_tmp_dir_the_probe_reads_the_revision_file_the_dispatcher_writes(self) -> None:
+    # The API server renders the probe's path itself, and the dispatcher writes under the OPEN_RL_TMP_DIR its pod gets.
+    os.environ.pop("OPEN_RL_TMP_DIR")
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      worker = describe_worker("fft-job", "sampler")
+    probe = pod_template(worker)["spec"]["containers"][0]["readinessProbe"]["exec"]["command"][2]
+    dispatcher = dispatcher_body(worker.pool)["spec"]["template"]["spec"]["containers"][0]
+    with patch.dict(os.environ, {e["name"]: e["value"] for e in dispatcher["env"] if e["name"] == "OPEN_RL_TMP_DIR"}):
+      written = revision_file(worker.pool)
+    self.assertIn(f"open({str(written)!r})", probe)
+
   def test_a_pool_is_vllm_samplers_ready_on_the_expected_version_behind_one_routed_cpu_pod_until_released(self) -> None:
     s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
     k8s = FakeApi()
@@ -385,12 +446,13 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertNotIn("--middleware", container["args"])
     probe = container["readinessProbe"]["exec"]["command"]
     self.assertEqual(
-      (probe[:2], "/weight_info" in probe[2], "/mnt/shared/open-rl/sampling/sampler-fft-job/revision" in probe[2]),
+      (probe[:2], "/weight_info" in probe[2], f"{self.tmp}/sampling/sampler-fft-job/revision" in probe[2]),
       (["/app/.venv/bin/python", "-c"], True, True),
     )
     self.assertEqual(sorted(k8s.objects), [("deployment", "sampler-fft-job"), ("network_policy", "sampler-fft-job")])
     dispatcher, _, epp = k8s.objects[("deployment", "sampler-fft-job")]["spec"]["template"]["spec"]["containers"]
     self.assertEqual(dispatcher["volumeMounts"], [{"name": "shared-storage", "mountPath": "/mnt/shared"}])
+    self.assertIn({"name": "OPEN_RL_TMP_DIR", "value": self.tmp}, dispatcher["env"])  # so it writes the file the probe reads
     self.assertEqual(dispatcher["image"], "ghcr.io/gke-labs/open-rl/server:latest")  # the worker image unless a dispatcher image is set
     with patch.dict(os.environ, {"OPEN_RL_DISPATCHER_IMAGE": "registry/api-server:v1"}):
       self.assertEqual(dispatcher_body("sampler-fft-job")["spec"]["template"]["spec"]["containers"][0]["image"], "registry/api-server:v1")
@@ -410,9 +472,10 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
     state = InMemoryStateStore()
     for model_id, kind in (("lora-a", "lora"), ("lora-b", "lora"), ("fft-a", "full")):
       await state.set_value(f"open_rl:model_meta:{model_id}", json.dumps({"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": kind}))
-    api = FakeCustomObjectsApi()
+    api, tmp = FakeCustomObjectsApi(), self.enterContext(tempfile.TemporaryDirectory())
+    env = {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm", "OPEN_RL_TMP_DIR": tmp}
     with (
-      patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}),
+      patch.dict(os.environ, env),
       patch("server.worker_manager.get_state_store", return_value=state),
       patch.object(api_server, "store", store),
       patch.object(api_server, "state", state),

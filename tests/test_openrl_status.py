@@ -10,13 +10,15 @@ import unittest
 from collections import defaultdict
 from unittest.mock import patch
 
+from kubernetes import client
+
 from server import api_server
 from server.scheduler_worker_manager import SchedulerWorkerManager, worker_state
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import WORKER_STATES
 from tests.api_client import asgi_client, post_json
-from tests.test_scheduler_worker_manager import FakeCustomObjectsApi
+from tests.test_scheduler_worker_manager import ApiError, FakeCustomObjectsApi
 from tests.test_session_lifecycle import RuntimeManager
 
 
@@ -231,8 +233,28 @@ def workload(name: str, role: str, owner: str, model_id: str, status: dict, crea
   return {"metadata": metadata, "spec": {"role": role, "ownerID": owner, "modelID": model_id}, "status": status}
 
 
+class FakeCoreApi:
+  def __init__(self, *pods):
+    self.pods, self.selectors = list(pods), []
+
+  def list_namespaced_pod(self, namespace: str, label_selector: str = "", _request_timeout=None):
+    self.selectors.append(label_selector)
+    return client.V1PodList(items=self.pods)
+
+
+def sampler_pod(name: str, ready: bool, waiting: str | None = None, restarts: int = 0):
+  if waiting:
+    state = client.V1ContainerState(waiting=client.V1ContainerStateWaiting(reason=waiting))
+  else:
+    state = client.V1ContainerState(running=client.V1ContainerStateRunning())
+  container = client.V1ContainerStatus(name="worker", image="server", image_id="", ready=ready, restart_count=restarts, state=state)
+  condition = client.V1PodCondition(type="Ready", status="True" if ready else "False")
+  status = client.V1PodStatus(phase="Running", conditions=[condition], container_statuses=[container])
+  return client.V1Pod(metadata=client.V1ObjectMeta(name=name), status=status)
+
+
 class SchedulerViewTest(unittest.TestCase):
-  """The cluster side of the model view: Workloads only. The pod is the scheduler's."""
+  """The cluster side of the model view, from Workloads and a running sampler's pod readiness."""
 
   def setUp(self):
     self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://test"}))
@@ -269,6 +291,57 @@ class SchedulerViewTest(unittest.TestCase):
     self.assertEqual(self.manager.inspect_owner("base"), first)
     self.manager.view_cache_seconds = 0
     self.assertEqual(self.manager.inspect_owner("base"), [])
+
+  def test_a_running_sampler_is_ready_only_once_its_pod_is_ready(self):
+    # The Workload reads Running while vLLM loads and while the container crash-loops.
+    running = {"phase": "Running", "podName": "orw-s", "nodeName": "node-b"}
+    self.custom.existing["lora-base-0-sampler"] = workload("lora-base-0-sampler", "sampler", "base", "base", running)
+    crash_looping = sampler_pod("orw-s", ready=False, waiting="CrashLoopBackOff", restarts=4)
+    cases = [
+      ([sampler_pod("orw-s", ready=False)], "starting", "Running on node-b, loading the model"),
+      ([crash_looping], "starting", "Running on node-b, CrashLoopBackOff, restart count 4"),
+      ([sampler_pod("orw-s", ready=True)], "ready", "Running on node-b"),
+      ([], "starting", "Running on node-b, loading the model"),
+    ]
+    for pods, state, detail in cases:
+      with self.subTest(detail=detail):
+        core = FakeCoreApi(*pods)
+        manager = SchedulerWorkerManager(custom_api=self.custom, core_api=core)
+        by_role = {w["role"]: w for w in manager.inspect_owner("base")}
+        self.assertEqual((by_role["sampler"]["state"], by_role["sampler"]["detail"]), (state, detail))
+        # One pod list per view, and the trainer is still read from its Workload alone.
+        self.assertEqual(core.selectors, ["app.kubernetes.io/component=sampler"])
+        self.assertEqual(by_role["trainer"]["state"], "ready")
+
+  def test_a_ready_pool_sampler_is_starting_while_its_pools_dispatcher_has_no_available_pod(self):
+    # Its readiness probe compares vLLM's version with the revision file, which outlives a dead or OOM-killed
+    # dispatcher, and without the dispatcher no sample is sent.
+    running = {"phase": "Running", "podName": "orw-s", "nodeName": "node-b"}
+    for index in range(2):
+      sampler = workload(f"lora-base-{index}-sampler", "sampler", "base", "base", running)
+      sampler["metadata"]["labels"]["app.kubernetes.io/instance"] = "sampler-base"
+      self.custom.existing[sampler["metadata"]["name"]] = sampler
+    no_pod = "Running on node-b, dispatcher sampler-base has no available pod"
+    cases = [({}, "starting", no_pod), ({"sampler-base": 0}, "starting", no_pod), ({"sampler-base": 1}, "ready", "Running on node-b")]
+    for dispatchers, state, detail in cases:
+      with self.subTest(dispatchers=dispatchers):
+        apps = FakeAppsApi(dispatchers)
+        manager = SchedulerWorkerManager(custom_api=self.custom, core_api=FakeCoreApi(sampler_pod("orw-s", ready=True)), apps_api=apps)
+        samplers = [(w["state"], w["detail"]) for w in manager.inspect_owner("base") if w["role"] == "sampler"]
+        self.assertEqual((samplers, apps.reads), ([(state, detail)] * 2, ["sampler-base"]))
+
+
+class FakeAppsApi:
+  """Each pool's dispatcher Deployment by name, with its available pod count. A missing one is a 404."""
+
+  def __init__(self, available: dict[str, int]):
+    self.available, self.reads = available, []
+
+  def read_namespaced_deployment(self, name: str, namespace: str):
+    self.reads.append(name)
+    if name not in self.available:
+      raise ApiError(404)
+    return client.V1Deployment(status=client.V1DeploymentStatus(available_replicas=self.available[name]))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@
 # on the replicas that hold its prefix (precise matching from each pod's KV events)
 # until their in-flight load would cost more time to first token than a cold replica,
 # llm-d's "sticky until saturated". Prefix weighting alone piles long decodes onto one
-# replica, and the slowest decode sets an RL step's time.
+# replica, and the slowest decode sets an RL step's time. No token producer is declared
+# because the dispatcher sends token IDs to vLLM's /inference/v1/generate, and the one
+# the EPP creates by default passes them through unchanged, so a vLLM renderer adds nothing.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -37,13 +39,10 @@ data:
                       - name: envoy.filters.http.ext_proc
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
-                          failure_mode_allow: false
                           grpc_service:
                             envoy_grpc: {cluster_name: epp, authority: localhost:9002}
                             timeout: 10s
                           processing_mode:
-                            request_header_mode: SEND
-                            response_header_mode: SEND
                             request_body_mode: FULL_DUPLEX_STREAMED
                             response_body_mode: FULL_DUPLEX_STREAMED
                             request_trailer_mode: SEND
@@ -58,7 +57,6 @@ data:
           connect_timeout: 10s
           original_dst_lb_config: {use_http_header: true, http_header_name: x-gateway-destination-endpoint}
         - name: epp
-          type: STATIC
           connect_timeout: 10s
           transport_socket:
             name: envoy.transport_sockets.tls
@@ -78,13 +76,6 @@ data:
     plugins:
       - type: endpoint-notification-source
       - type: precise-prefix-cache-producer
-        parameters:
-          tokenProcessorConfig: {blockSizeTokens: 16}
-          kvEventsConfig:
-            topicFilter: kv@
-            concurrency: 4
-            discoverPods: true
-            podDiscoveryConfig: {socketPort: 5557}
       - type: inflight-load-producer
         parameters: {prefixMatchInfoProducerName: precise-prefix-cache-producer}
       - type: prefix-cache-affinity-filter
@@ -94,8 +85,3 @@ data:
       sources:
         - pluginRef: endpoint-notification-source
           extractors: [{pluginRef: precise-prefix-cache-producer}]
-    schedulingProfiles:
-      - name: default
-        plugins:
-          - {pluginRef: prefix-cache-affinity-filter}
-          - {pluginRef: token-load-scorer}
