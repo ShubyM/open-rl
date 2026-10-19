@@ -27,9 +27,15 @@ SAMPLE_DEADLINE_SECONDS = 3600
 UNKNOWN_WEIGHTS = "unknown"
 
 
+def tmp_root() -> str:
+  """OPEN_RL_TMP_DIR, or the documented default. The API server renders the readiness probe's path
+  from it and hands the same value to the dispatcher and the replicas, so they all agree."""
+  return os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+
+
 def revision_file(pool: str) -> Path:
   """The readiness probe compares vLLM's weight version with the revision in this file."""
-  return Path(os.getenv("OPEN_RL_TMP_DIR", "/mnt/shared/open-rl"), "sampling", pool, "revision")
+  return Path(tmp_root(), "sampling", pool, "revision")
 
 
 def accepted_at(r: dict[str, Any]) -> float:
@@ -125,7 +131,8 @@ class Dispatcher:
     target, sent = self.revision or "default", time.monotonic()
     params = {**r["sampling_params"], "logprobs": 0, "prompt_logprobs": 0 if r["include_prompt_logprobs"] else None}
     attempt_id = f"{r['request_id']}-{uuid.uuid4().hex[:8]}"
-    body = {"request_id": attempt_id, "token_ids": r["prompt_token_ids"], "model": r["model"], "sampling_params": params}
+    # The store hands prompts back as array('I'), which JSON cannot encode.
+    body = {"request_id": attempt_id, "token_ids": list(r["prompt_token_ids"]), "model": r["model"], "sampling_params": params}
     url = self.router or random.choice(self.urls)
     try:
       # A replica that never answers must not hold the send past its record's deadline.
