@@ -61,7 +61,7 @@ class PromQL:
   async def _load_headers(self) -> dict:
     headers = {}
     if self.token is not None:
-      headers["Authorization"] = f"Bearer {await asyncio.to_thread(self.token)}"
+      headers["Authorization"] = f"Bearer {await asyncio.wait_for(asyncio.to_thread(self.token), timeout=10)}"
     if self.extra_headers is not None:
       headers.update(self.extra_headers())
     return headers

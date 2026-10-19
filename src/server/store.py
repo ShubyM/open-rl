@@ -367,11 +367,13 @@ class InMemoryStateStore(StateStore):
       return
     self.get_value_sync(key)  # Expire previous rows before merging.
     values = self.step_rows.setdefault(key, {})
-    values.update({row["step"]: json.dumps(row, allow_nan=False) for row in rows})
-    for step in sorted(values)[:-limit]:
-      del values[step]
-    self.kv_store["latest:" + key] = values[max(values)]
-    self.kv_store["revision:" + key] = secrets.token_hex(16)
+    unchanged = all(row["step"] in values and without_receipt(json.loads(values[row["step"]])) == without_receipt(row) for row in rows)
+    if not unchanged:  # A replay of what is stored keeps its revision, and only renews its lifetime.
+      values.update({row["step"]: json.dumps(row, allow_nan=False) for row in rows})
+      for step in sorted(values)[:-limit]:
+        del values[step]
+      self.kv_store["latest:" + key] = values[max(values)]
+      self.kv_store["revision:" + key] = secrets.token_hex(16)
     expires = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
     for stored in (key, "latest:" + key, "revision:" + key):
       self.expiries.pop(stored, None)
@@ -395,17 +397,33 @@ class InMemoryStateStore(StateStore):
     return value
 
 
+def without_receipt(row: dict) -> dict:
+  """A step row without its receipt time, which a replay changes."""
+  return {k: v for k, v in row.items() if k != "at"}
+
+
 class RedisStateStore(StateStore):
   # One transaction per batch. Retries replace fields before retention is applied,
   # and an old replay cannot replace the latest step exposed to Prometheus.
   PUT_STEPS = """
     local ttl = tonumber(ARGV[2])
-    redis.call('HSET', KEYS[1], unpack(ARGV, 4))
-    local steps = redis.call('HKEYS', KEYS[1])
-    table.sort(steps, function(a, b) return tonumber(a) < tonumber(b) end)
-    for i = 1, #steps - tonumber(ARGV[1]) do redis.call('HDEL', KEYS[1], steps[i]) end
-    redis.call('SET', KEYS[2], redis.call('HGET', KEYS[1], steps[#steps]))
-    redis.call('SET', KEYS[3], ARGV[3])
+    -- A replayed batch carries a fresh receipt time; only a changed step makes a new revision.
+    local changed = false
+    for i = 4, #ARGV, 2 do
+      local old = redis.call('HGET', KEYS[1], ARGV[i])
+      if not old or string.gsub(old, '"at": [^,}]+', '') ~= string.gsub(ARGV[i + 1], '"at": [^,}]+', '') then
+        changed = true
+        break
+      end
+    end
+    if changed then
+      redis.call('HSET', KEYS[1], unpack(ARGV, 4))
+      local steps = redis.call('HKEYS', KEYS[1])
+      table.sort(steps, function(a, b) return tonumber(a) < tonumber(b) end)
+      for i = 1, #steps - tonumber(ARGV[1]) do redis.call('HDEL', KEYS[1], steps[i]) end
+      redis.call('SET', KEYS[2], redis.call('HGET', KEYS[1], steps[#steps]))
+      redis.call('SET', KEYS[3], ARGV[3])
+    end
     for _, key in ipairs(KEYS) do
       if ttl >= 0 then redis.call('PEXPIRE', key, ttl) else redis.call('PERSIST', key) end
     end

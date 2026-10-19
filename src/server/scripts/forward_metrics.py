@@ -22,7 +22,7 @@ from pathlib import Path
 
 import httpx
 
-from server.telemetry.run_metrics import finite_metrics
+from server.telemetry.metric_values import finite_metrics
 
 TINKER_PATH = re.compile(r"tinker://([^/\"]+)/")
 BATCH = 200

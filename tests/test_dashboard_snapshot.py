@@ -282,11 +282,16 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.metadata.side_effect = self.processes.side_effect = TimeoutError()
     self.snapshot.invalidate()
     stale = await self.snapshot.current(self.store)
+    # A brief outage keeps the last records and says nothing; everything else still refreshes.
     self.assertEqual([r["run_id"] for r in stale["runs"]], [r["run_id"] for r in first["runs"]])
     self.assertEqual(stale["processes"], first["processes"])
-    self.assertTrue(stale["store_error"] and stale["processes_error"])
-    self.assertEqual(stale["observed_at"], first["observed_at"])
-    self.assertIs(stale["runs"], first["runs"])
+    self.assertEqual((stale["store_error"], stale["processes_error"], stale["error"]), (None, None, None))
+    self.assertGreater(stale["observed_at"], first["observed_at"])
+    with patch.object(snapshot, "GRACE_SECONDS", 0):
+      self.snapshot.invalidate()
+      lasting = await self.snapshot.current(self.store)
+    self.assertTrue(lasting["store_error"] and lasting["processes_error"] and lasting["error"])
+    self.assertEqual([r["run_id"] for r in lasting["runs"]], [r["run_id"] for r in first["runs"]])
     self.metadata.side_effect = self.processes.side_effect = None
     self.metadata.return_value = self.processes.return_value = []
     self.snapshot.invalidate()
@@ -311,10 +316,15 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.snapshot.invalidate()
     with patch.object(snapshot.time, "time", return_value=1100):
       stale = await self.snapshot.current(self.store)
-    self.assertEqual(stale["observed_at"], first["observed_at"])
-    self.assertTrue(stale["processes_error"])
-    self.assertEqual(stale["runs"], first["runs"])
-    self.assertTrue(all(r.get("progress", {}).get("state") != "DEAD" for r in stale["runs"]))
+    # The last records are aged as of their read, so live work stays live while the read is failing.
+    self.assertGreater(stale["observed_at"], first["observed_at"])
+    self.assertIsNone(stale["processes_error"])
+    self.assertEqual([r.get("progress", {}).get("state") for r in stale["runs"]], [r.get("progress", {}).get("state") for r in first["runs"]])
+    with patch.object(snapshot.time, "time", return_value=1200), patch.object(snapshot, "GRACE_SECONDS", 0):
+      self.snapshot.invalidate()
+      lasting = await self.snapshot.current(self.store)
+    self.assertTrue(lasting["processes_error"])
+    self.assertTrue(all(r.get("progress", {}).get("state") != "DEAD" for r in [*stale["runs"], *lasting["runs"]]))
 
   async def test_status_reuses_the_metadata_already_read_by_the_snapshot(self) -> None:
     with patch.object(self.store, "get_value", wraps=self.store.get_value) as read:
@@ -327,11 +337,15 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.cluster.return_value = snapshot.kubernetes.unavailable("openrl-system", "Kubernetes offline")
     self.snapshot.invalidate()
     stale = await self.snapshot.current(self.store)
-    self.assertEqual(stale["observed_at"], first["observed_at"])
+    self.assertGreater(stale["observed_at"], first["observed_at"])
     self.assertEqual(stale["placements"], first["placements"])
     self.assertEqual(stale["cluster"]["pods"], first["cluster"]["pods"])
-    self.assertIs(stale["cluster"], first["cluster"])
-    self.assertIn("Kubernetes offline", stale["error"])
+    self.assertIsNone(stale["error"])
+    with patch.object(snapshot, "GRACE_SECONDS", 0):
+      self.snapshot.invalidate()
+      lasting = await self.snapshot.current(self.store)
+    self.assertEqual(lasting["placements"], first["placements"])
+    self.assertIn("Kubernetes offline", lasting["error"])
     self.cluster.return_value = STATE
     self.snapshot.invalidate()
     self.assertIsNone((await self.snapshot.current(self.store))["cluster"].get("error"))
@@ -346,8 +360,12 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.snapshot.invalidate()
     stale = await self.snapshot.current(self.store)
     self.assertEqual(stale["cluster"]["nodes"], first["cluster"]["nodes"])
-    self.assertEqual(stale["observed_at"], first["observed_at"])
-    self.assertIn("DRA read failed", stale["error"])
+    self.assertGreater(stale["observed_at"], first["observed_at"])
+    with patch.object(snapshot, "GRACE_SECONDS", 0):
+      self.snapshot.invalidate()
+      lasting = await self.snapshot.current(self.store)
+    self.assertEqual(lasting["cluster"]["nodes"], first["cluster"]["nodes"])
+    self.assertIn("DRA read failed", lasting["error"])
 
   async def test_cancelled_request_does_not_restart_the_shared_source_read(self) -> None:
     entered, release = asyncio.Event(), asyncio.Event()

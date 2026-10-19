@@ -11,6 +11,7 @@ from server.dashboard import router
 from server.dashboard.__main__ import app as dashboard_app
 from server.scripts import forward_metrics
 from server.store import InMemoryStateStore
+from server.telemetry import run_metrics
 from tests.api_client import asgi_client
 
 
@@ -55,9 +56,33 @@ class RunMetricsTest(unittest.IsolatedAsyncioTestCase):
     self.assertNotIn('step="', scrape.text)
 
   async def test_unavailable_metric_store_returns_a_failed_scrape(self) -> None:
-    with patch.object(self.state, "scan_values", side_effect=RuntimeError("store unavailable")):
+    with patch.object(self.state, "set_members", side_effect=RuntimeError("store unavailable")):
       response = await self.dashboard.get("/metrics")
     self.assertEqual(response.status_code, 503)
+
+  async def test_history_sent_to_an_earlier_gateway_still_reads(self) -> None:
+    # Earlier gateways kept a capped list per run; a step sent twice keeps its newer row.
+    for row in (
+      {"step": 0, "at": 1.0, "metrics": {"reward": 0.1}},
+      {"step": 1, "at": 2.0, "metrics": {"reward": 0.2}},
+      {"step": 0, "at": 3.0, "metrics": {"reward": 0.3}},
+    ):
+      await self.state.append_sample(run_metrics.LEGACY_PREFIX + "old-run", row, 100, None)
+    rows = await self.rows("old-run")
+    self.assertEqual([(row["step"], row["metrics"]["reward"]) for row in rows], [(0, 0.3), (1, 0.2)])
+
+  async def test_a_scrape_exports_recent_runs_and_forgets_expired_ones(self) -> None:
+    async with asgi_client() as gateway:
+      for run in ("recent", "quiet", "gone"):
+        await gateway.post(f"/api/v1/runs/{run}/metrics", json={"rows": [{"step": 1, "metrics": {"reward": 0.5}}]})
+    quiet = json.loads(await self.state.get_value("latest:" + run_metrics.PREFIX + "quiet"))
+    await self.state.set_value("latest:" + run_metrics.PREFIX + "quiet", json.dumps({**quiet, "at": quiet["at"] - run_metrics.EXPORT_SECONDS - 1}))
+    await self.state.delete_values("latest:" + run_metrics.PREFIX + "gone")
+    scrape = (await self.dashboard.get("/metrics")).text
+    self.assertIn('run_id="recent"', scrape)
+    self.assertNotIn('run_id="quiet"', scrape)
+    self.assertNotIn('run_id="gone"', scrape)
+    self.assertEqual(await self.state.set_members(run_metrics.INDEX), {"recent", "quiet"})
 
   async def test_conditional_history_reuses_unchanged_rows_and_invalidates_old_step_corrections(self) -> None:
     url = "/api/v1/inspect/run_metrics?run_id=run-1"

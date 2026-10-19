@@ -22,7 +22,7 @@
   const url = $derived(inspectUrl("activity", bounds));
   const selection = () => !navigating && `${view.id} ${view.duration} ${view.end}`;
   const inventoryRun = $derived(inventory.runs.find((r) => r.run_id === view.id));
-  const detail = createQuery(() => url, { poll: 15000, pollWhen: () => view.end === null && view.tab !== "logs", key: () => (view.tab !== "logs" || !inventoryRun) && selection() });
+  const detail = createQuery(() => url, { poll: 15000, remember: () => view.end !== null, pollWhen: () => view.end === null && view.tab !== "logs", key: () => (view.tab !== "logs" || !inventoryRun) && selection() });
   const run = $derived(inventoryRun || (detail.status !== 404 ? detail.data?.run : null));
   const error = $derived(inventory.store_error || inventory.processes_error || detail.error);
   const title = $derived(run ? [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), KINDS[run.fine_tuning_type]].filter(Boolean).join(" · ") : "Run");
@@ -32,7 +32,7 @@
   const names = $derived([...new Set(samples.flatMap((s) => Object.entries(s.metrics || {}).filter(([, v]) => Number.isFinite(v)).map(([k]) => k)))].slice(0, 12));
   const metricStatus = $derived(detail.error ? `${detail.error}${samples.length ? " · Showing previously fetched metrics" : ""}` : detail.pending ? "Updating…" : "");
   // A shared pool's load is every run's, so it is charted on Nodes rather than here.
-  const vllm = createQuery(() => inspectUrl("series", { ...bounds, kind: "samplers" }), { scope: () => view.id, merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, key: () => view.tab === "metrics" && run && !run.shared_runtime && selection() });
+  const vllm = createQuery(() => inspectUrl("series", { ...bounds, kind: "samplers" }), { scope: () => view.id, merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: () => view.tab === "metrics" && run && !run.shared_runtime && selection() });
   // The vLLM series the inspection API returns for a run's samplers, as vLLM's and llm-d's dashboards chart them.
   const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
     ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
@@ -57,6 +57,8 @@
     view.duration = Math.max(1800, Math.min(MAX_WINDOW, Math.round(span * 1.05)));
     view.end = Math.min(observed, Math.round(stop + Math.max(60, span * 0.025)));
   });
+  // Clipped once per response or window change, not on every render of a long run's lanes.
+  const clipped = $derived(clipPlacements(detail.data?.placements || [], range, detail.error, detail.status));
   const link = (tab, changes = {}) => viewLink(`run/${encodeURIComponent(view.id)}/${tab}`, { duration: view.duration, end: view.end, back: view.back, event: view.event, q: view.q, pod: view.pod, ...changes });
 </script>
 
@@ -101,7 +103,7 @@
     {#if view.tab === "logs"}
       {#if validEvent}<Logs {run} {view} {range} {navigating} allLogs={link("logs", { event: null, end: null })} />{/if}
     {:else if view.tab !== "metrics"}
-      <div class="run-activity"><Activity placements={clipPlacements(detail.data?.placements || [], range, detail.error, detail.status)} {range} {inventory} acrossNodes={true} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
+      <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {:else}
       <div class="run-metrics" data-run-metrics={view.id}>
           <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span>{#if metricStatus}<span class={detail.error ? "source-error" : "muted"} role="status">{metricStatus}</span>{/if}</div>

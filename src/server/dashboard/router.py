@@ -1,6 +1,8 @@
 """The operator UI and the same read-only JSON API for agents."""
 
 import asyncio
+import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -18,6 +20,16 @@ from server.telemetry import gke, kubernetes, ops
 from server.telemetry import run_metrics as client_metrics
 
 REQUEST_SECONDS = 12
+# A long run holds tens of thousands of operation records; reading them needs more than a
+# few seconds over a port-forward.
+OPERATIONS_READ_SECONDS = 15
+# One read and check of a run's or worker's records serves every page asking within this
+# long, and a retry after a timeout joins the read still running instead of starting another.
+# A finished run's records no longer change, so they, and its activity, are kept longer.
+OPERATIONS_SECONDS = 10
+FINISHED_SECONDS = 300
+operations: OrderedDict[str, tuple[float, asyncio.Task]] = OrderedDict()
+finished_activity: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
 
 
 class InspectionRoute(APIRoute):
@@ -87,9 +99,28 @@ async def inventory():
   return {key: value for key, value in state.items() if key != "processes"}
 
 
-async def read_operations(identity: str) -> dict:
+def is_finished(run: dict | None) -> bool:
+  return bool(run) and (run.get("status") != "active" or run.get("display_status") in ("Ended", "Stopped"))
+
+
+async def read_operations(identity: str, finished: bool = False) -> dict:
+  now = time.monotonic()
+  entry = operations.get(identity)
+  if entry is None or (entry[0] <= now and entry[1].done()):
+    task = asyncio.create_task(load_operations(identity))
+    operations[identity] = entry = (now + (FINISHED_SECONDS if finished else OPERATIONS_SECONDS), task)
+    operations.move_to_end(identity)
+    while len(operations) > 64:
+      operations.popitem(last=False)
+  result = await asyncio.shield(entry[1])
+  if result.get("error") and operations.get(identity) is entry:
+    operations.pop(identity)
+  return result
+
+
+async def load_operations(identity: str) -> dict:
   try:
-    records = await asyncio.wait_for(get_state_store().read_samples(ops.key(identity)), timeout=5)
+    records = await asyncio.wait_for(get_state_store().read_samples(ops.key(identity)), timeout=OPERATIONS_READ_SECONDS)
     if not isinstance(records, list):
       raise ValueError("Expected telemetry records")
   except Exception:
@@ -116,11 +147,15 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
   store = get_state_store()
   state, run = await run_of(run_id) if run_id else (await snapshot.current(store), None)
   start, end, low, high = time_range(since, until or state["observed_at"])
+  finished = is_finished(run)
+  cached = finished_activity.get((run_id, node_id, start, end)) if finished else None
+  if cached and cached[0] > time.monotonic():
+    return {**cached[1], "run": run, "observed_at": state["observed_at"]}
   selected = [p for p in inspection.segments(state, run_id, node_id) if p["start"] <= high and p["end"] >= low]
   # Each lane's runs, and its runtime for the worker-level ops recorded there.
   keys = sorted({k for p in selected for k in [*p["run_ids"], p.get("runtime_id")] if k} | ({run_id} if run_id else set()))
 
-  records = dict(zip(keys, await asyncio.gather(*(read_operations(k) for k in keys))))
+  records = dict(zip(keys, await asyncio.gather(*(read_operations(k, finished) for k in keys))))
   result = await asyncio.to_thread(inspection.activity, state, low, high, records, run_id, node_id)
   result.update(since=start, until=end, observed_at=state["observed_at"])
   result["coverage"] = (
@@ -135,6 +170,10 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
       partial=records[run_id].get("partial"),
       incidents=inspection.incidents(run, low, high),
     )
+  if finished and not result.get("error"):
+    finished_activity[(run_id, node_id, start, end)] = (time.monotonic() + FINISHED_SECONDS, result)
+    while len(finished_activity) > 16:
+      finished_activity.popitem(last=False)
   return result
 
 
@@ -154,10 +193,13 @@ async def series(
   await gke.discover()
   state = await snapshot.current(get_state_store())
   start, end, _, _ = time_range(since, until or state["observed_at"])
-  records = await read_operations(run_id) if run_id else {"samples": []}
-  if records.get("error"):
-    raise HTTPException(503, records["error"])
-  return await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id, kind=kind, samples=records["samples"])
+  run = next((r for r in state["runs"] if r["run_id"] == run_id), None) if run_id else None
+  records = await read_operations(run_id, is_finished(run)) if run_id else {"samples": []}
+  result = await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id, kind=kind, samples=records["samples"])
+  # Without its sampler records a run still has its current pods' series; say what is missing.
+  if records.get("error") and run_id:
+    result["samplers_reason"] = result.get("samplers_reason") or f"{records['error']}; samplers that are gone are not shown"
+  return result
 
 
 async def run_of(run_id: str) -> tuple[dict, dict]:
@@ -198,14 +240,16 @@ async def run_logs(
   sources, shared_runtime = [], False
   if not cursor:
     state, run = await run_of(run_id)
-    records = await read_operations(run_id)
-    if records.get("error"):
-      raise HTTPException(503, records["error"])
+    records = await read_operations(run_id, is_finished(run))
     since, until, _, _ = time_range(since, until or state["observed_at"])
     sources = gke.pod_sources(run, inspection.sources(state, run_id, samples=records["samples"]), state["observed_at"])
     shared_runtime = run["shared_runtime"]
+    # Without its records a run's logs still cover the pods it is known to have had.
+    note = f"{records['error']}; logs of pods known only from those records are not shown" if records.get("error") else None
+  else:
+    note = None
   try:
-    return await gke.run_logs(
+    result = await gke.run_logs(
       run_id,
       sources,
       since=since,
@@ -220,6 +264,9 @@ async def run_logs(
     )
   except ValueError as exc:
     raise HTTPException(400, str(exc)) from exc
+  if note and not result.get("note"):
+    result["note"] = note
+  return result
 
 
 @router.get("/api/v1/inspect/pods/{pod}/logs", operation_id="pods_pod_logs", response_model=PodLogs, response_model_exclude_unset=True)
@@ -239,7 +286,8 @@ async def run_metrics(run_id: str, response: Response, if_none_match: Annotated[
   tags = [tag.strip().removeprefix("W/") for tag in (if_none_match or "").split(",")]
   known = tuple(tag[1:-1] for tag in tags if tag.startswith('"') and tag.endswith('"')) + (("*",) if "*" in tags else ())
   try:
-    revision, rows = await asyncio.wait_for(get_state_store().read_steps(client_metrics.PREFIX + run_id, known), timeout=2)
+    # Opened with the run page, this read shares the process with that page's activity work.
+    revision, rows = await asyncio.wait_for(client_metrics.read(get_state_store(), run_id, known), timeout=15)
   except Exception:
     return {"available": False, "error": "Run metrics unavailable", "run_id": run_id, "rows": []}
   if revision:

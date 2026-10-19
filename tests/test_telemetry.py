@@ -168,24 +168,29 @@ class PromQLTest(unittest.TestCase):
         (url + "/other", params, headers),
       ]
       connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-      with mock.patch.object(httpx, "AsyncClient", return_value=connection), mock.patch.object(http, "MAX_INFLIGHT", 1):
+      with (
+        mock.patch.object(httpx, "AsyncClient", return_value=connection),
+        mock.patch.object(http, "MAX_INFLIGHT", 1),
+        mock.patch.object(http, "RETRY_SECONDS", 0),
+      ):
         async with http.lifespan():
           tasks = [asyncio.create_task(http.get_json(u, params=p, headers=h)) for u, p, h in requests]
           await asyncio.wait_for(entered.wait(), timeout=1)
           release.set()
           errors = await asyncio.gather(*tasks, return_exceptions=True)
           self.assertTrue(all(isinstance(error, httpx.HTTPStatusError) for error in errors))
-          self.assertEqual(calls, 6)
+          # Six distinct requests, each retried once after its 503.
+          self.assertEqual(calls, 12)
           with self.assertRaises(httpx.HTTPStatusError):
             await http.get_json(url, params=params, headers=headers)
-          self.assertEqual(calls, 7)
+          self.assertEqual(calls, 14)
           release.clear()
           with mock.patch.object(http, "REQUEST_SECONDS", 0.01), self.assertRaises(TimeoutError):
             await http.get_json(url, params=params, headers=headers)
 
     asyncio.run(exercise())
 
-  def test_partial_failure_keeps_successful_fields_without_retrying(self):
+  def test_partial_failure_keeps_successful_fields_after_one_retry(self):
     calls = []
 
     async def respond(request):
@@ -207,19 +212,19 @@ class PromQLTest(unittest.TestCase):
             self.assertIs(http.client(), connection)
             return await backend.devices([GPU], 0, 60)
 
-        with mock.patch.object(httpx, "AsyncClient", return_value=connection) as factory:
+        with mock.patch.object(httpx, "AsyncClient", return_value=connection) as factory, mock.patch.object(http, "RETRY_SECONDS", 0):
           found, errors = asyncio.run(query())
         self.assertEqual(found, {} if denied else {"utilization": {GPU: [[1.0, 80.0]]}})
         expected = (
           dict.fromkeys(prometheus.GPU_METRICS, "Metrics query unavailable") if denied else {"memory_mib": "Metrics source returned HTTP 503"}
         )
         self.assertEqual(errors, expected)
-        self.assertEqual(len(calls), 0 if denied else 2)
+        # The failed query is retried once; denied credentials make no request at all.
+        self.assertEqual(len(calls), 0 if denied else 3)
         token.assert_called_once()
         factory.assert_called_once()
         self.assertTrue(connection.is_closed)
-        with self.assertRaises(RuntimeError):
-          http.client()
+        self.assertIsNone(http._client)
 
   def test_a_sampler_timeout_does_not_discard_other_charts(self):
     backend = PromQL("prometheus", "https://example", None, None, "openrl-system")

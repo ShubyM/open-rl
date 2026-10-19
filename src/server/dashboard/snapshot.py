@@ -18,6 +18,9 @@ from server.telemetry import kubernetes, ops
 from server.worker_manager import FAILED, READY, STARTING, STOPPED, WAITING_FOR_PLACEMENT
 
 CACHE_SECONDS = 5
+# A source that fails briefly, say over a dropped tunnel, is ridden out on its last good
+# section; its error is reported only once it has failed for longer than this.
+GRACE_SECONDS = 30
 # The longest window the dashboard shows, matching the logs API's seven-day limit.
 HISTORY_WINDOW_SECONDS = 7 * 86400
 METADATA_PREFIX = "open_rl:model_meta:"
@@ -270,6 +273,9 @@ class Snapshot:
     self.refresh: asyncio.Task | None = None
     self.latest: dict | None = None
     self.updated = 0.0
+    self.metadata: list[dict] | None = None
+    self.processes_at = 0.0
+    self.failing: dict[str, float] = {}
     # The gateway mount swaps in its own worker manager's context.
     self.status_context: Callable[[StateStore, dict], openrl_status.StatusContext] = cluster_status_context
 
@@ -292,27 +298,29 @@ class Snapshot:
     )
     if isinstance(cluster, Exception):
       cluster = kubernetes.unavailable(kubernetes.namespace(), "Cluster inventory unavailable")
-    store_error = "Run store unavailable" if isinstance(metadata, Exception) else None
-    processes_error = "Worker process records unavailable" if isinstance(processes, Exception) else None
-    if self.latest:
-      previous = self.latest["cluster"]
-      errors = [store_error, processes_error, cluster.get("error"), cluster.get("nodes_error")]
-      if previous["scheduler"]["workloads"]:
-        errors.append(cluster["scheduler"].get("error"))
-      if any(node.get("devices") for node in previous.get("nodes", [])):
-        errors.append(cluster["devices"].get("error"))
-      if any(errors):
-        # Keep the entire observation intact; report the failed refresh separately.
-        self.latest = {
-          **self.latest,
-          "store_error": store_error,
-          "processes_error": processes_error,
-          "error": "; ".join(dict.fromkeys(error for error in errors if error)),
-        }
-        self.updated = time.monotonic()
-        return self.latest
-    runs = join_runs([] if store_error else metadata, cluster)
-    processes = [] if processes_error else processes
+    # Each failed source falls back to its own last good section; the rest refreshes.
+    cluster = self.merge(cluster, self.latest["cluster"] if self.latest else None)
+    if isinstance(metadata, Exception):
+      metadata, store_error = self.metadata or [], self.lasting("store", "Run store unavailable", self.metadata is None)
+    else:
+      self.metadata, store_error = metadata, self.lasting("store", None)
+    if isinstance(processes, Exception):
+      previous = self.latest["processes"] if self.latest else None
+      # The last records, aged as of when they were read: a failed read must not make live work look dead.
+      shift = now - self.processes_at
+      processes = [{**record, "heartbeat_at": record["heartbeat_at"] + shift} if "heartbeat_at" in record else record for record in previous or []]
+      processes_error = self.lasting("processes", "Worker process records unavailable", previous is None)
+    else:
+      self.processes_at, processes_error = now, self.lasting("processes", None)
+    errors = [
+      store_error,
+      processes_error,
+      cluster.get("error"),
+      cluster.get("nodes_error"),
+      cluster["scheduler"].get("error"),
+      cluster["devices"].get("error"),
+    ]
+    runs = join_runs(metadata, cluster)
     ctx = self.status_context(store, cluster)
 
     async def enrich(run):
@@ -335,9 +343,39 @@ class Snapshot:
       "placements": placements_of(cluster, runs),
       "processes": processes,
       "processes_error": processes_error,
+      "error": "; ".join(dict.fromkeys(error for error in errors if error)) or None,
     }
     self.updated = time.monotonic()
     return self.latest
+
+  def lasting(self, source: str, error: str | None, at_once: bool = False) -> str | None:
+    """The error to report for a source: none while it works or has failed only briefly."""
+    if error is None:
+      self.failing.pop(source, None)
+      return None
+    since = self.failing.setdefault(source, time.monotonic())
+    return error if at_once or time.monotonic() - since > GRACE_SECONDS else None
+
+  def merge(self, cluster: dict, previous: dict | None) -> dict:
+    """The fresh cluster, with each section that failed replaced by its last good one."""
+    if previous is None:
+      return cluster
+    if cluster.get("error"):
+      return {**previous, "error": self.lasting("cluster", cluster["error"])}
+    self.lasting("cluster", None)
+    merged = dict(cluster)
+    if cluster.get("nodes_error") and previous.get("nodes"):
+      merged["nodes"] = previous["nodes"]
+    merged["nodes_error"] = self.lasting("nodes", cluster.get("nodes_error"))
+    if cluster["scheduler"].get("error") and previous["scheduler"].get("workloads"):
+      merged["scheduler"] = previous["scheduler"]
+    merged["scheduler"] = {**merged["scheduler"], "error": self.lasting("scheduler", cluster["scheduler"].get("error"))}
+    if cluster["devices"].get("error") and any(node.get("devices") for node in previous.get("nodes", [])):
+      known = {node["name"]: node.get("devices", []) for node in previous["nodes"]}
+      merged["nodes"] = [{**node, "devices": node.get("devices") or known.get(node["name"], [])} for node in merged["nodes"]]
+      merged["devices"] = {**previous["devices"], "error": cluster["devices"]["error"]}
+    merged["devices"] = {**merged["devices"], "error": self.lasting("devices", cluster["devices"].get("error"))}
+    return merged
 
   def invalidate(self) -> None:
     """Read again on the next call, still falling back to this snapshot's records."""

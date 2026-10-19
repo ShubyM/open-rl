@@ -33,7 +33,29 @@ MAX_CURSOR = 16 * 1024
 MAX_PLAN_BYTES = 128 * 1024
 CURSOR_SECONDS = 900
 # Share this secret between dashboard replicas to keep cursors valid across them.
-_CURSOR_KEY = os.getenv("OPEN_RL_LOG_CURSOR_SECRET", "").encode() or secrets.token_bytes(32)
+_CURSOR_KEY = os.getenv("OPEN_RL_LOG_CURSOR_SECRET", "").encode() or None
+CURSOR_KEY_RECORD = "open_rl:dashboard:log_cursor_key"
+
+
+async def cursor_key() -> bytes:
+  """One signing key for every dashboard on the run store, so a log cursor survives a restart
+  and works on both the standalone and the gateway-mounted dashboard. Without the store it
+  is random to this process, as before."""
+  global _CURSOR_KEY
+  if _CURSOR_KEY is None:
+    try:
+      from server.store import get_state_store
+
+      store = get_state_store()
+      if not await store.get_value(CURSOR_KEY_RECORD):
+        await store.set_value(CURSOR_KEY_RECORD, secrets.token_hex(32))
+      # Read back, so two dashboards starting together settle on the one stored key.
+      _CURSOR_KEY = bytes.fromhex(await store.get_value(CURSOR_KEY_RECORD))
+    except Exception:
+      _CURSOR_KEY = secrets.token_bytes(32)
+  return _CURSOR_KEY
+
+
 REFUSED = "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"
 UNAVAILABLE = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
 
@@ -104,6 +126,9 @@ async def discover() -> dict:
     return configuration()
 
 
+TOKEN_SECONDS = 10
+
+
 def access_token() -> str:
   global _credentials
   with _LOCK:
@@ -124,9 +149,9 @@ def quota_headers() -> dict[str, str]:
 
 
 async def request(method: str, url: str, **kwargs) -> dict:
-  token = await asyncio.to_thread(access_token)
-  response = await http.client().request(method, url, headers={"Authorization": f"Bearer {token}", **quota_headers()}, **kwargs)
-  response.raise_for_status()
+  # A hung token refresh holds the credentials lock; bound it rather than a thread per call.
+  token = await asyncio.wait_for(asyncio.to_thread(access_token), timeout=TOKEN_SECONDS)
+  response = await http.send(method, url, headers={"Authorization": f"Bearer {token}", **quota_headers()}, **kwargs)
   return response.json()
 
 
@@ -288,6 +313,7 @@ async def run_logs(
   run_id: str, sources: list[dict], *, since=None, until=None, cursor=None, limit=200, q="", pod=None, node=None, severity=None, shared_runtime=False
 ) -> dict:
   global _refused_until
+  await cursor_key()
   selection = [run_id, limit, q, pod, node, severity]
   plan = page_plan(cursor, selection, since, until) if cursor else None
   result = {

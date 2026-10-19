@@ -6,9 +6,13 @@ from contextlib import asynccontextmanager
 import httpx
 
 _client: httpx.AsyncClient | None = None
+# Used outside the server lifespan, by a script or a test, created on first use instead.
+_fallback: httpx.AsyncClient | None = None
 _inflight: dict[tuple, asyncio.Task] = {}
 MAX_INFLIGHT = 128
 REQUEST_SECONDS = 10
+# A quota refusal or server error is usually momentary; one retry spares the page an error.
+RETRY_SECONDS = 1
 
 
 @asynccontextmanager
@@ -28,17 +32,33 @@ async def lifespan(_app=None):
 
 
 def client() -> httpx.AsyncClient:
-  if _client is None:
-    raise RuntimeError("Telemetry HTTP client requires the server lifespan")
-  return _client
+  global _fallback
+  if _client is not None:
+    return _client
+  if _fallback is None or _fallback.is_closed:
+    _fallback = httpx.AsyncClient(timeout=10)
+  return _fallback
+
+
+def transient(response: httpx.Response) -> bool:
+  return response.status_code == 429 or response.status_code >= 500
+
+
+async def send(method: str, url: str, **kwargs) -> httpx.Response:
+  """One request, retried once after a transient refusal."""
+  call = client().get if method == "GET" else lambda url, **kw: client().request(method, url, **kw)
+  response = await call(url, **kwargs)
+  if transient(response):
+    await asyncio.sleep(RETRY_SECONDS)
+    response = await call(url, **kwargs)
+  response.raise_for_status()
+  return response
 
 
 async def _get_json(url: str, params: dict, headers: dict) -> dict:
   # A shared request can outlive its callers, so bound the whole operation.
-  async with asyncio.timeout(REQUEST_SECONDS):
-    response = await client().get(url, params=params, headers=headers)
-    response.raise_for_status()
-    return response.json()
+  async with asyncio.timeout(REQUEST_SECONDS + RETRY_SECONDS):
+    return (await send("GET", url, params=params, headers=headers)).json()
 
 
 async def get_json(url: str, *, params: dict, headers: dict) -> dict:

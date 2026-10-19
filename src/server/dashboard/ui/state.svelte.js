@@ -74,9 +74,13 @@ class QueryState {
   error = $state(null);
   status = $state(null);
   pending = $state(false);
+  // A brief failure keeps the last response and retries; this says it may be out of date.
+  stale = $state(false);
   retry = $state(() => {});
 }
-export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () => true, key = url, merge = (next) => next } = {}) {
+// remember: whether responses go in the shared cache. A live view's window moves every poll, so its
+// responses are never revisited and would only push out the ones that are.
+export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () => true, key = url, merge = (next) => next, remember = () => true } = {}) {
   let previousScope;
   const result = new QueryState();
   const selectedKey = $derived.by(key), selectedScope = $derived.by(scope);
@@ -107,18 +111,20 @@ export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () =
           const { data, etag } = await get(requested, controller.signal, cache.get(requested));
           if (controller.signal.aborted) return;
           failures = 0;
-          Object.assign(result, { error: data.error || null, status: null });
+          Object.assign(result, { error: data.error || null, status: null, stale: false });
           if (data !== result.data && (!result.error || !result.data)) result.data = merge(data, result.data);
-          if (!result.error) {
+          if (!result.error && remember()) {
             cache.set(requested, { data: result.data, etag });
             if (cache.size > 24) cache.delete([...cache.keys()].find((key) => key !== inspectUrl("inventory")));
           }
         } catch (error) {
           if (controller.signal.aborted) return;
-          // Keep the last response visible while one schedule handles transient retries.
+          // A dropped tunnel or a busy server is usually brief: keep what is shown, retry on the one
+          // schedule, and report the failure only if it lasts. A rejected request is reported at once.
           failures += 1;
           retry = (!error.status || error.status >= 500 || error.status === 429) && failures < 4;
-          Object.assign(result, { error: error.message, status: error.status || null });
+          if (retry) result.stale = Boolean(result.data);
+          else Object.assign(result, { error: error.message, status: error.status || null, stale: false });
         }
         finally {
           if (!controller.signal.aborted) {

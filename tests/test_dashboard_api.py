@@ -14,6 +14,8 @@ WINDOW = {"since": "1970-01-01T00:02:00Z", "until": "1970-01-01T00:03:10Z"}
 
 class InspectionApiTest(unittest.TestCase):
   def setUp(self):
+    router.operations.clear()
+    router.finished_activity.clear()
     self.client = TestClient(app)
     self.state = state()
     self.state["runs"][0].update(shared_runtime=False)
@@ -145,12 +147,14 @@ class InspectionApiTest(unittest.TestCase):
     router.gke.discover.assert_not_awaited()
     self.store.read_samples.assert_not_awaited()
 
-  def test_unavailable_historical_identity_is_not_empty_logs_or_metrics(self):
+  def test_unavailable_historical_records_leave_logs_and_series_with_a_note(self):
+    # A run whose records cannot be read still has its known pods' logs and series, and says what is missing.
     self.store.read_samples.side_effect = RuntimeError("store offline")
-    for endpoint in ("logs", "series"):
-      response = self.client.get(f"/api/v1/inspect/{endpoint}", params={"run_id": "r1", **WINDOW})
-      self.assertEqual(response.status_code, 503)
-      self.assertIn("Operation records unavailable", response.json()["detail"])
+    logs = self.client.get("/api/v1/inspect/logs", params={"run_id": "r1", **WINDOW})
+    self.assertEqual(logs.status_code, 200)
+    self.assertIn("Operation records unavailable", logs.json()["note"])
+    series = self.client.get("/api/v1/inspect/series", params={"run_id": "r1", **WINDOW})
+    self.assertEqual(series.status_code, 200)
 
   def test_request_deadline_cancels_pending_source_work(self):
     cancelled = []

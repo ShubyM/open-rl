@@ -6,4 +6,4 @@ resources:
   - dashboard.yaml
 images:
   - name: ghcr.io/gke-labs/open-rl/api-server
-    newTag: 0.6.19
+    newTag: latest

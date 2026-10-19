@@ -15,12 +15,12 @@
   const range = $derived(rangeOf(inventory, view));
   const bounds = $derived({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() });
   const selection = () => !navigating && `${view.duration} ${view.end}`;
-  const history = createQuery(() => inspectUrl("activity", bounds), { poll: 15000, pollWhen: () => view.end === null, key: selection });
+  const history = createQuery(() => inspectUrl("activity", bounds), { poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: selection });
   // Lanes wait for the first history response so they render once, complete, instead of filling in and shifting.
   const loading = $derived(!history.data && !history.error);
   const all = $derived(clipPlacements(history.data?.placements || [], range, history.error, history.status));
   const node = $derived(inventory.cluster.nodes.find((n) => n.name === view.node));
-  const series = createQuery(() => node ? inspectUrl("series", { node_id: node.name, kind: "hardware", ...bounds }) : null, { scope: () => node?.name ?? null, merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, key: () => node && !navigating && `${node.name} ${selection()}` });
+  const series = createQuery(() => node ? inspectUrl("series", { node_id: node.name, kind: "hardware", ...bounds }) : null, { scope: () => node?.name ?? null, merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: () => node && !navigating && `${node.name} ${selection()}` });
   const metrics = $derived(series.data || { devices: [], workers: [], reason: series.error || "Loading…" });
   const selectedDevices = $derived([...new Map((metrics.devices || []).filter((d) => view.gpu === "all" || view.gpu === d.id).map((d) => [d.uuid || d.id, d])).values()]);
   const gpuPoints = $derived(deviceSeries(selectedDevices, "utilization"));
