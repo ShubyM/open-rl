@@ -25,6 +25,9 @@ class RunMetricsTest(unittest.IsolatedAsyncioTestCase):
     self.enterContext(patch.object(router, "get_state_store", return_value=self.state))
     self.dashboard = httpx.AsyncClient(transport=httpx.ASGITransport(app=dashboard_app), base_url="http://dashboard")
     self.addAsyncCleanup(self.dashboard.aclose)
+    # A run is its model, so a client may only send for model ids the gateway knows.
+    for run_id in ("run:latest", "run-1", "run-7", "recent", "quiet", "gone"):
+      await self.state.set_value(f"open_rl:model_meta:{run_id}", json.dumps({"base_model": "m"}))
 
   async def rows(self, run_id: str) -> list[dict]:
     response = await self.dashboard.get("/api/v1/inspect/run_metrics", params={"run_id": run_id})
@@ -83,6 +86,34 @@ class RunMetricsTest(unittest.IsolatedAsyncioTestCase):
     self.assertNotIn('run_id="quiet"', scrape)
     self.assertNotIn('run_id="gone"', scrape)
     self.assertEqual(await self.state.set_members(run_metrics.INDEX), {"recent", "quiet"})
+
+  async def test_client_logs_are_kept_with_their_run_and_unknown_runs_are_refused(self) -> None:
+    async with asgi_client() as gateway:
+      missing = await gateway.post("/api/v1/runs/no-such-model/logs", json={"lines": [{"message": "hi"}]})
+      self.assertEqual(missing.status_code, 404)
+      self.assertEqual((await gateway.post("/api/v1/runs/no-such-model/metrics", json={"rows": []})).status_code, 404)
+      with patch("builtins.print") as printed:
+        sent = await gateway.post(
+          "/api/v1/runs/run-1/logs", json={"lines": [{"message": "step 3 done", "severity": "warning"}, {"message": "x", "severity": "LOUD"}]}
+        )
+    self.assertEqual(sent.json(), {"accepted": 2})
+    first = json.loads(printed.call_args_list[0].args[0])
+    self.assertEqual(
+      (first["severity"], first["message"], first["logging.googleapis.com/labels"]),
+      ("WARNING", "step 3 done", {"openrl_run_id": "run-1", "openrl_source": "client"}),
+    )
+    self.assertEqual(json.loads(printed.call_args_list[1].args[0])["severity"], "INFO")
+    # Without Cloud Logging, the run's Logs tab shows the tail kept in the run store, newest first.
+    with patch.object(
+      router,
+      "run_of",
+      return_value=(
+        {"observed_at": "2026-01-01T00:00:00+00:00", "runs": [], "placements": [], "processes": [], "cluster": {"nodes": []}},
+        {"run_id": "run-1", "shared_runtime": False},
+      ),
+    ):
+      logs = (await self.dashboard.get("/api/v1/inspect/logs", params={"run_id": "run-1"})).json()
+    self.assertEqual([(r["pod"], r["message"]) for r in logs["records"]], [("client", "x"), ("client", "step 3 done")])
 
   async def test_conditional_history_reuses_unchanged_rows_and_invalidates_old_step_corrections(self) -> None:
     url = "/api/v1/inspect/run_metrics?run_id=run-1"

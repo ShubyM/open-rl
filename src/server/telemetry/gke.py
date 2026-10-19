@@ -250,15 +250,25 @@ def scope_filter() -> list[str]:
   return ['resource.type="k8s_container"', *[f"resource.labels.{label}={json.dumps(value)}" for label, value in labels]]
 
 
-def source_filter(sources: list[dict]) -> str:
+# A client's own output, sent through the gateway, is logged by the gateway with these labels
+# naming the run (its model id); see server.telemetry.run_logs.
+CLIENT = "client"
+RUN_LABEL = "openrl_run_id"
+SOURCE_LABEL = "openrl_source"
+
+
+def source_filter(sources: list[dict], client_of: str | None = None) -> str:
   def clause(s: dict) -> str:
     return f"(resource.labels.pod_name={json.dumps(s['pod'])} AND timestamp>={json.dumps(s['created_at'])} AND timestamp<={json.dumps(s['until'])})"
 
-  return "(" + " OR ".join(clause(s) for s in sources) + ")"
+  clauses = [clause(s) for s in sources]
+  if client_of:
+    clauses.append(f"(labels.{RUN_LABEL}={json.dumps(client_of)} AND labels.{SOURCE_LABEL}={json.dumps(CLIENT)})")
+  return "(" + " OR ".join(clauses) + ")"
 
 
-def logs_filter(sources: list[dict], start: str, end: str, severity: str | None, q: str) -> str:
-  clauses = scope_filter() + [source_filter(sources), f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
+def logs_filter(sources: list[dict], start: str, end: str, severity: str | None, q: str, client_of: str | None = None) -> str:
+  clauses = scope_filter() + [source_filter(sources, client_of), f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
   if severity in _RELABELED:
     stderr = json.dumps(f"projects/{configuration()['project']}/logs/stderr")
     clauses.append(f'(severity={json.dumps(severity)} OR (severity="ERROR" AND logName={stderr}))')
@@ -282,7 +292,10 @@ def entry_record(entry: dict, sources: list[dict], run_id: str) -> dict | None:
   """One log entry as a dashboard record, or None when it belongs to no source lifetime."""
   labels = entry.get("resource", {}).get("labels", {})
   at = timestamp(entry["timestamp"])
-  match = next((s for s in sources if s["pod"] == labels.get("pod_name") and s["created_at"] <= at <= s["until"]), None)
+  if entry.get("labels", {}).get(SOURCE_LABEL) == CLIENT and entry["labels"].get(RUN_LABEL) == run_id:
+    match = {"pod": CLIENT, "role": CLIENT}
+  else:
+    match = next((s for s in sources if s["pod"] == labels.get("pod_name") and s["created_at"] <= at <= s["until"]), None)
   if match is None:
     return None
   fields = entry.get("jsonPayload") or {}
@@ -333,7 +346,9 @@ async def run_logs(
   if plan is None:
     start, end = time_range(since, until)
     selected = [s for s in sources if (pod is None or s["pod"] == pod) and (node is None or s.get("node") == node)]
-    if not selected:
+    # The run's client output is one more source, unless a pod or node filter names another.
+    client_of = run_id if pod in (None, CLIENT) and node is None else None
+    if not selected and not client_of:
       return {**result, "available": True, "note": "No pod lifetimes match this run and filter"}
     if len(selected) > MAX_SOURCES:
       raise ValueError(f"Select a pod to narrow this query to at most {MAX_SOURCES} pod lifetimes")
@@ -344,7 +359,7 @@ async def run_logs(
       "sources": selected,
       "request": {
         "resourceNames": log_views(),
-        "filter": logs_filter(selected, start, end, severity, q),
+        "filter": logs_filter(selected, start, end, severity, q, client_of),
         "orderBy": "timestamp desc",
         "pageSize": limit,
       },

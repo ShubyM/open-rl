@@ -25,18 +25,3 @@ spec:
   endpoints:
   - port: metrics
     interval: 15s
----
-# Client metrics are read from Redis by the operator dashboard. Scraping never
-# replays the step history; each run exposes only its latest reported step.
-apiVersion: monitoring.googleapis.com/v1
-kind: PodMonitoring
-metadata:
-  name: open-rl-run-metrics
-spec:
-  selector:
-    matchLabels:
-      app: open-rl-dashboard
-  endpoints:
-  - port: http
-    path: /metrics
-    interval: 15s

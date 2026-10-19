@@ -22,6 +22,16 @@ def entry(pod="orw-a", at="2026-09-10T10:30:00Z", **extra):
 
 
 class GkeLogHelpersTest(unittest.TestCase):
+  def test_a_runs_client_lines_are_queried_and_shown_as_its_client(self) -> None:
+    with patch.dict("os.environ", {"OPEN_RL_GKE_PROJECT": "p", "OPEN_RL_GKE_CLUSTER": "c", "OPEN_RL_GKE_LOCATION": "l"}):
+      query = gke.logs_filter([], "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, "", client_of="run-1")
+    self.assertIn('labels.openrl_run_id="run-1" AND labels.openrl_source="client"', query)
+    entry = {"timestamp": "2026-01-01T01:00:00Z", "jsonPayload": {"message": "hi"}, "resource": {"labels": {"pod_name": "gateway"}}}
+    labeled = {**entry, "labels": {"openrl_run_id": "run-1", "openrl_source": "client"}}
+    self.assertEqual(gke.entry_record(labeled, [], "run-1")["pod"], "client")
+    self.assertIsNone(gke.entry_record({**labeled, "labels": {"openrl_run_id": "run-2", "openrl_source": "client"}}, [], "run-1"))
+    self.assertIsNone(gke.entry_record(entry, [], "run-1"))
+
   def setUp(self) -> None:
     for module, name, value in ((gke, "configuration", lambda: CONFIG), (gke.kubernetes, "namespace", lambda: "openrl-system")):
       patcher = patch.object(module, name, value)

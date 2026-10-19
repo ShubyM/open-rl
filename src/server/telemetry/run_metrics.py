@@ -31,9 +31,17 @@ class Request(BaseModel):
   rows: list[Row] = Field(max_length=1000)
 
 
-async def ingest(store, run_id: str, body: Request) -> dict:
+async def known_run(store, run_id: str) -> None:
+  """A client's metrics and logs belong to a run, and a run is its model: the run id is the
+  model id the client trains. Anything else is refused rather than kept under a run nobody has."""
   if not RUN_ID.fullmatch(run_id):
     raise HTTPException(400, "run_id must be 1-128 letters, digits, '.', '_', ':' or '-'")
+  if not await store.get_value(f"open_rl:model_meta:{run_id}"):
+    raise HTTPException(404, f"No run {run_id}; a run is its model, so send the model id the client trains")
+
+
+async def ingest(store, run_id: str, body: Request) -> dict:
+  await known_run(store, run_id)
   at = time.time()
   rows = [{"step": row.step, "at": at, "metrics": values} for row in body.rows if (values := finite_metrics(row.metrics))]
   await store.put_steps(PREFIX + run_id, rows, ops.SAMPLE_LIMIT, ops.TTL_SECONDS)

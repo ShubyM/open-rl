@@ -36,6 +36,7 @@ from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import get_state_store, get_store
 from server.telemetry import http as telemetry_http
+from server.telemetry import run_logs as client_logs
 from server.telemetry import run_metrics as client_metrics
 from server.telemetry.tracing import configure_tracing
 from server.vllm_options import split_stop
@@ -1284,8 +1285,16 @@ async def list_adapters():
 
 @app.post("/api/v1/runs/{run_id}/metrics")
 async def run_metrics(run_id: str, body: client_metrics.Request):
-  """Replace per-step client metrics; expose retained history and latest values to operators."""
+  """Replace per-step client metrics; expose retained history and latest values to operators.
+  run_id is the model id the client trains."""
   return await client_metrics.ingest(state, run_id, body)
+
+
+@app.post("/api/v1/runs/{run_id}/logs")
+async def run_logs(run_id: str, body: client_logs.Request):
+  """Keep a client's own output with its run, beside the run's worker logs. run_id is the
+  model id the client trains."""
+  return await client_logs.ingest(state, run_id, body)
 
 
 @app.post("/api/v1/telemetry")

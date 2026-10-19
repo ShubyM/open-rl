@@ -17,6 +17,7 @@ from server.dashboard.schema import Activity, Inventory, Logs, Operation, PodLog
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.store import get_state_store
 from server.telemetry import gke, kubernetes, ops
+from server.telemetry import run_logs as client_logs
 from server.telemetry import run_metrics as client_metrics
 
 REQUEST_SECONDS = 12
@@ -264,6 +265,14 @@ async def run_logs(
     )
   except ValueError as exc:
     raise HTTPException(400, str(exc)) from exc
+  if not gke.configuration()["configured"] and pod in (None, gke.CLIENT) and not cursor:
+    # Without Cloud Logging the run's client output still has its tail in the run store.
+    try:
+      client = await asyncio.wait_for(client_logs.tail(get_state_store(), run_id, limit), timeout=5)
+    except Exception:
+      client = []
+    if client:
+      result.update(records=client, available=True, error=None, note="Cloud Logging is not configured; showing the run's recent client output")
   if note and not result.get("note"):
     result["note"] = note
   return result

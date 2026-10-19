@@ -4,6 +4,7 @@ namespace: openrl-system
 resources:
   - rbac.yaml
   - dashboard.yaml
+  - monitoring.yaml
 images:
   - name: ghcr.io/gke-labs/open-rl/api-server
     newTag: latest
