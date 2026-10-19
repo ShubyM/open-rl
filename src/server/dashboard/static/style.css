@@ -1199,7 +1199,6 @@ body {
   padding-bottom: 12px;
   border-bottom: 1px solid var(--line);
 }
-#app .run-time-controls,
 #app .run-time-controls label {
   display: flex;
   align-items: center;
