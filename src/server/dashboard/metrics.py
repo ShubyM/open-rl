@@ -17,7 +17,7 @@ def hardware() -> tuple[PromQL | None, str | None]:
     return PromQL("prometheus", url, None, config["cluster"] or None, kubernetes.namespace()), None
   if config["configured"]:
     endpoint = f"https://monitoring.googleapis.com/v1/projects/{config['project']}/location/global/prometheus"
-    return PromQL("gke", endpoint, gke.access_token, config["cluster"], kubernetes.namespace()), None
+    return PromQL("gke", endpoint, gke.access_token, config["cluster"], kubernetes.namespace(), gke.quota_headers), None
   return None, "No GPU metrics source: not on GKE and OPEN_RL_PROMETHEUS_URL is unset"
 
 

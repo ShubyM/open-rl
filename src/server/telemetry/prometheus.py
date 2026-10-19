@@ -39,10 +39,19 @@ def any_of(values: list[str]) -> str:
 
 
 class PromQL:
-  def __init__(self, name: str, url: str, token: Callable[[], str] | None, cluster_name: str | None, namespace: str) -> None:
+  def __init__(
+    self,
+    name: str,
+    url: str,
+    token: Callable[[], str] | None,
+    cluster_name: str | None,
+    namespace: str,
+    extra_headers: Callable[[], dict] | None = None,
+  ) -> None:
     self.name = name
     self.url = url
     self.token = token
+    self.extra_headers = extra_headers
     self.cluster = cluster_name
     self.namespace = namespace
 
@@ -51,6 +60,8 @@ class PromQL:
     headers = {}
     if self.token is not None:
       headers["Authorization"] = f"Bearer {await asyncio.wait_for(asyncio.to_thread(self.token), timeout=10)}"
+    if self.extra_headers is not None:
+      headers.update(self.extra_headers())
     step = max(MIN_STEP_SECONDS, int((end - start) / MAX_POINTS))
     # Samples land on multiples of step, not offsets from start, so queries made
     # at different moments (or for different allocations) share timestamps and
@@ -59,6 +70,9 @@ class PromQL:
     async with httpx.AsyncClient(timeout=10) as client:
       params = {"query": query, "start": start, "end": end, "step": step}
       response = await client.get(f"{self.url}/api/v1/query_range", params=params, headers=headers)
+      if response.status_code == 429 or response.status_code >= 500:
+        await asyncio.sleep(1)
+        response = await client.get(f"{self.url}/api/v1/query_range", params=params, headers=headers)
     response.raise_for_status()
     payload = response.json()
     if payload.get("status") != "success":

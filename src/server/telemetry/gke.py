@@ -17,6 +17,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import google.auth
+import google.oauth2.credentials
 import httpx
 from google.auth.transport.requests import Request
 
@@ -104,10 +105,24 @@ def access_token() -> str:
     return _credentials.token
 
 
+def quota_headers() -> dict[str, str]:
+  """Bill API reads to this project when running on a person's gcloud login. Without it,
+  user credentials draw on the gcloud SDK's own shared quota and reads fail with 429.
+  Service-account credentials, as in the cluster, bill their own project already."""
+  if isinstance(_credentials, google.oauth2.credentials.Credentials) and not _credentials.quota_project_id and configuration()["project"]:
+    return {"x-goog-user-project": configuration()["project"]}
+  return {}
+
+
 async def request(method: str, url: str, **kwargs) -> dict:
   token = await asyncio.wait_for(asyncio.to_thread(access_token), timeout=10)
+  headers = {"Authorization": f"Bearer {token}", **quota_headers()}
   async with httpx.AsyncClient(timeout=15) as client:
-    response = await client.request(method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
+    response = await client.request(method, url, headers=headers, **kwargs)
+    # One quota refusal or server error is usually momentary; one retry spares the page an error.
+    if response.status_code == 429 or response.status_code >= 500:
+      await asyncio.sleep(1)
+      response = await client.request(method, url, headers=headers, **kwargs)
     response.raise_for_status()
     return response.json()
 
