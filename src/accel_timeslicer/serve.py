@@ -34,12 +34,19 @@ async def start_tcp_time_slicer(time_slicer: SingleNodeTimeSlicer, host: str, po
 
 async def handle_connection(time_slicer: SingleNodeTimeSlicer, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
   connection_id = id(writer)
+
+  def tell(message: dict[str, Any]) -> None:
+    if not writer.is_closing():
+      writer.write(json.dumps(message).encode("utf-8") + b"\n")
+
+  time_slicer.connections[connection_id] = tell
   try:
     while line := await reader.readline():
       response = await dispatch(time_slicer, line, connection_id)
       writer.write(json.dumps(response).encode("utf-8") + b"\n")
       await writer.drain()
   finally:
+    time_slicer.connections.pop(connection_id, None)
     await time_slicer.connection_closed(connection_id)
     writer.close()
     await writer.wait_closed()
@@ -55,9 +62,9 @@ async def dispatch(time_slicer: SingleNodeTimeSlicer, line: bytes, connection_id
     case "REGISTER":
       return await time_slicer.register(workload, connection_id=connection_id)
     case "ACQUIRE":
-      return await time_slicer.acquire(workload)
+      return await time_slicer.acquire(workload, connection_id=connection_id)
     case "RELEASE":
-      return await time_slicer.release(workload)
+      return await time_slicer.release(workload, connection_id=connection_id)
     case "UNREGISTER":
       return await time_slicer.unregister(workload)
     case _:

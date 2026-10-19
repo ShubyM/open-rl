@@ -157,7 +157,9 @@ def router(log: list, replicas: list[FakeReplica], http: httpx.AsyncClient) -> S
   return Starlette(routes=[Route("/inference/v1/generate", route, methods=["POST"])])
 
 
-class SamplingDispatcherTest(RedisTestCase):
+class DispatcherTestCase(RedisTestCase):
+  """The pool, its fake replicas and the dispatcher under test. The tests on leased replicas build on it too."""
+
   async def asyncSetUp(self) -> None:
     await super().asyncSetUp()
     self.store, self.pool, self.log, self.http = SamplingStore(self.redis), f"sampler-{uuid.uuid4()}", [], httpx.AsyncClient()
@@ -205,6 +207,8 @@ class SamplingDispatcherTest(RedisTestCase):
     await asyncio.sleep(0.3)  # a second commit would show by now
     return [json.loads(raw) for raw in await self.redis.lrange(future_key(request_id), 0, -1)]
 
+
+class SamplingDispatcherTest(DispatcherTestCase):
   async def test_each_request_is_generated_once(self):
     replicas = await self.replicas("default", "default")
     records = [await self.accepted() for _ in range(40)]

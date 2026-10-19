@@ -208,19 +208,33 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "trainer-Model_A.1")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "trainers")
 
-  async def test_local_sampler_is_vllm_serve_and_its_dispatcher_each_in_its_own_process_group(self) -> None:
-    with (
-      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}, clear=True),
-      patch("server.worker_manager.subprocess.Popen") as popen,
-    ):
-      manager = LocalWorkerManager()
-      manager.ensure("Model_A.1", "sampler")
-
+  def launch_local_sampler(self, **env: str) -> tuple[list, dict, list, dict]:
+    base = {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}
+    with patch.dict("os.environ", {**base, **env}, clear=True), patch("server.worker_manager.subprocess.Popen") as popen:
+      LocalWorkerManager().ensure("Model_A.1", "sampler")
     (serve, serve_kwargs), (dispatch, dispatch_kwargs) = [(c[0][0], c[1]) for c in popen.call_args_list]
+    return serve, serve_kwargs, dispatch, dispatch_kwargs
+
+  async def test_a_local_pool_sampler_is_vllm_serve_and_its_dispatcher_each_in_its_own_process_group(self) -> None:
+    serve, serve_kwargs, dispatch, dispatch_kwargs = self.launch_local_sampler(OPEN_RL_TIME_SLICING="off")
     self.assertEqual((serve_kwargs["start_new_session"], dispatch_kwargs["start_new_session"]), (True, True))
     self.assertEqual((serve[serve.index("serve") + 1], serve_kwargs["env"]["OPEN_RL_ENABLE_FFT"]), ("Model_A.1", "true"))
+    self.assertNotIn("server.sampler_launcher", serve)
+    self.assertNotIn("--enable-sleep-mode", serve)
     self.assertNotIn("OPEN_RL_TIME_SLICE_JOB_ID", serve_kwargs["env"])
+    self.assertNotIn("OPEN_RL_TIME_SLICED_SAMPLER", dispatch_kwargs["env"])
     self.assertEqual(dispatch[-1], "server.sampling_dispatcher")
+
+  async def test_a_local_fft_sampler_boots_under_a_lease_in_the_trainers_claim_and_its_dispatcher_carries_its_tags(self) -> None:
+    serve, serve_kwargs, dispatch, dispatch_kwargs = self.launch_local_sampler()
+    self.assertEqual(serve[serve.index("-m") + 1 : serve.index("serve")], ["server.sampler_launcher", serve[serve.index("serve") - 1]])
+    self.assertTrue(serve[serve.index("serve") - 1].endswith("vllm"))
+    self.assertEqual((serve[serve.index("serve") + 1], serve[-1]), ("Model_A.1", "--enable-sleep-mode"))
+    tags = {"OPEN_RL_TIME_SLICED_SAMPLER": "true", "OPEN_RL_TIME_SLICE_JOB_ID": "sampler-Model_A.1", "OPEN_RL_TIME_SLICE_GROUP": "trainers"}
+    self.assertEqual({k: serve_kwargs["env"][k] for k in tags}, tags)
+    self.assertEqual({k: dispatch_kwargs["env"][k] for k in tags}, tags)
+    port = serve[serve.index("--port") + 1]
+    self.assertEqual(dispatch_kwargs["env"]["OPEN_RL_SAMPLER_ENDPOINTS"], f"http://127.0.0.1:{port}")
 
   async def test_launch_fetches_metadata_from_store(self) -> None:
     import json

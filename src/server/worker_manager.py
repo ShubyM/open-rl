@@ -14,10 +14,12 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+from accel_timeslicer.time_slicer import time_slicing_enabled
 from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.estimator import footprint
 from server.lora_snapshots import snapshot_root
 from server.model_metadata import TrainingModelMetadata, decode_model_metadata
+from server.sampling_dispatcher import TIME_SLICED_SAMPLER
 from server.store import get_state_store
 from server.vllm_options import serve_args
 
@@ -214,14 +216,28 @@ class LocalWorkerManager:
       with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-      vllm = ["uv", "run", "--extra", "gpu", "--extra", "vllm", "vllm"] if shutil.which("uv") else [str(Path(sys.executable).with_name("vllm"))]
+      runner = ["uv", "run", "--extra", "gpu", "--extra", "vllm"] if shutil.which("uv") else []
+      vllm = ["vllm"] if runner else [str(Path(sys.executable).with_name("vllm"))]
+      serve = ["serve", *serve_args(base_model, is_lora, env, port)]
       if is_lora:
         # vLLM's filesystem LoRA resolver exits at startup without its directory, and no adapter may be frozen yet.
         snapshot_root().mkdir(parents=True, exist_ok=True)
-      self.spawn(role, runtime, [*vllm, "serve", *serve_args(base_model, is_lora, env, port)], env)
       dispatcher_env = {**os.environ, "OPEN_RL_SAMPLER_POOL": meta.pool(runtime), "OPEN_RL_SAMPLER_ENDPOINTS": f"http://127.0.0.1:{port}"}
       # The dispatcher keeps the pool's revision file under the same root the API server uses.
       dispatcher_env["OPEN_RL_TMP_DIR"] = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+      if meta.shares_gpu() and time_slicing_enabled():
+        # The replica takes turns on the one GPU with its trainer, so it is in the trainer's claim. The launcher boots
+        # vLLM inside a turn, and the dispatcher, marked with the same tags, holds the lease for every turn after.
+        tags = {
+          TIME_SLICED_SAMPLER: "true",
+          "OPEN_RL_TIME_SLICE_JOB_ID": workload_job_id(role, runtime),
+          "OPEN_RL_TIME_SLICE_GROUP": TRAINER_TIME_SLICE_GROUP,
+        }
+        env.update(tags)
+        dispatcher_env.update(tags)
+        self.spawn(role, runtime, python_command(["gpu", "vllm"], "server.sampler_launcher", [*vllm, *serve, "--enable-sleep-mode"]), env)
+      else:
+        self.spawn(role, runtime, [*runner, *vllm, *serve], env)
       self.dispatchers[runtime] = (python_command([], "server.sampling_dispatcher", []), dispatcher_env)
       self.spawn("dispatcher", runtime, *self.dispatchers[runtime])
 

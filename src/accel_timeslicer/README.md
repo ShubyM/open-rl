@@ -38,6 +38,23 @@ one DRA `ResourceClaim`. The cluster manifest runs this process with
 `--backend llmd` so llm-d's snapshot agent owns pod/PID discovery and physical
 checkpoint/restore.
 
+The process that owns a workload's work queue holds its lease. A trainer
+registers, acquires and releases from inside its own process. A pool sampler
+that shares its GPU is `vllm serve` run by
+`server.sampler_launcher`, which registers the workload, starts vLLM inside one
+turn, puts it to sleep and releases over a connection it keeps open for as long
+as vLLM runs; from then on the pool's dispatcher acquires and releases the same
+workload over its own connection for each turn. A registration belongs to the
+connection that made it, and a grant to the connection whose `ACQUIRE` holds it,
+which alone can `RELEASE` it. When a connection closes while holding a grant on
+a workload it did not register, the slicer releases that workload, checkpointing
+it, before the next waiter is granted. A workload whose checkpoint fails keeps
+the grant until the connection that registered it closes. When another
+connection's release is the one that failed, as at the end of a dispatcher's
+turn, the slicer tells the registering connection with a line it did not ask
+for, `{"event": "FAULT", "name": ..., "claim": ..., "error": ...}`, and the
+sampler launcher stops vLLM and exits on it.
+
 ## llm-d snapshot backend
 
 The same OpenRL acquire/release protocol can use llm-d's snapshot agent by

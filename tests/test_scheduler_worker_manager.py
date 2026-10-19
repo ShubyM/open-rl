@@ -116,11 +116,16 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     with patch("server.worker_manager.get_state_store", return_value=s):
       self.manager.ensure("Model_A.1", "trainer")
       self.manager.ensure("Model_A.1", "sampler")
-
     for worker in self.api.created:
       self.assertTrue(worker["spec"]["exclusive"])
-      env = {e["name"]: e.get("value") for e in worker["spec"]["template"]["spec"]["containers"][0]["env"]}
+      container = worker["spec"]["template"]["spec"]["containers"][0]
+      env = {e["name"]: e.get("value") for e in container["env"]}
       self.assertEqual(env["OPEN_RL_TIME_SLICING"], "off")
+      self.assertNotIn("OPEN_RL_TIME_SLICED_SAMPLER", env)
+    # The sampler has a GPU of its own, so it is plain vllm serve with nothing to boot inside a turn.
+    sampler = self.api.created[1]["spec"]["template"]["spec"]["containers"][0]
+    self.assertEqual((sampler["command"], "startupProbe" in sampler), (["uv", "run", "vllm", "serve"], False))
+    self.assertNotIn("--enable-sleep-mode", sampler["args"])
 
   def test_fft_worker_is_its_own_owner(self) -> None:
     s = self.store_with("Model_A.1", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
@@ -444,6 +449,16 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     labels = {"app.kubernetes.io/component": "sampler", "app.kubernetes.io/instance": "sampler-fft-job"}
     container = sampler["spec"]["template"]["spec"]["containers"][0]
     self.assertNotIn("--middleware", container["args"])
+    # An FFT replica shares its GPU with its trainer: the launcher boots vLLM, able to sleep, inside a time-slicer
+    # turn, the env marks it for the pool's dispatcher to lease, and the container starts once it is up.
+    self.assertFalse(sampler["spec"]["exclusive"])
+    self.assertEqual(container["command"], ["uv", "run", "python", "-u", "-m", "server.sampler_launcher", "vllm", "serve"])
+    self.assertEqual((container["args"][0], container["args"][-1]), ("Qwen/Qwen3-8B", "--enable-sleep-mode"))
+    self.assertEqual(container["startupProbe"]["exec"]["command"], ["test", "-f", "/tmp/open-rl-sampler-awake"])
+    self.assertEqual(sampler["spec"]["template"]["metadata"]["labels"], labels)
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    self.assertEqual((env["OPEN_RL_TIME_SLICED_SAMPLER"], env["OPEN_RL_WORKLOAD_ID"]), ("true", "fft-fft-job-sampler"))
+    self.assertEqual((env["OPEN_RL_ACCEL_TIMESLICER_PORT"], env.get("OPEN_RL_TIME_SLICING")), ("9753", None))
     probe = container["readinessProbe"]["exec"]["command"]
     self.assertEqual(
       (probe[:2], "/weight_info" in probe[2], f"{self.tmp}/sampling/sampler-fft-job/revision" in probe[2]),

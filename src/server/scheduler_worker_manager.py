@@ -30,7 +30,7 @@ from kubernetes import client, config
 
 from server.estimator import Footprint, footprint
 from server.lora_snapshots import snapshot_root
-from server.sampling_dispatcher import revision_file, tmp_root
+from server.sampling_dispatcher import TIME_SLICED_SAMPLER, revision_file, tmp_root
 from server.vllm_options import serve_args
 from server.worker_manager import (
   FAILED,
@@ -116,8 +116,7 @@ def describe_worker(model_id: str, role: str) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
   pool = meta.pool(runtime) if role == "sampler" else None
-  # A pool sampler keeps its GPUs between batches; nothing time-slices it.
-  exclusive = not meta.shares_gpu() or role == "sampler"
+  exclusive = not meta.shares_gpu()
   devices = meta.trainer_gpus if role == "trainer" else 1
   size = footprint(base_model, meta.fine_tuning_type, role)
   # Each torchrun rank is its own process with its own host memory.
@@ -215,6 +214,14 @@ def pod_template(worker: Worker) -> dict[str, Any]:
     )
     container["readinessProbe"] = {"exec": {"command": ["/app/.venv/bin/python", "-c", probe]}, "periodSeconds": 2, "timeoutSeconds": 2}
     template["metadata"] = {"labels": pool_labels("sampler", worker.pool)}
+    if not worker.exclusive:
+      # The replica shares its GPU with its trainer, so the launcher boots vLLM, able to sleep, inside a time-slicer
+      # turn, and the pool's dispatcher, which finds the replica by this variable, takes its turns after that. The
+      # container starts once the launcher marks the replica up, so no turn is taken on one still booting.
+      container["command"] = ["uv", "run", "python", "-u", "-m", "server.sampler_launcher", "vllm", "serve"]
+      container["args"].append("--enable-sleep-mode")
+      container["env"].append({"name": TIME_SLICED_SAMPLER, "value": "true"})
+      container["startupProbe"] = {"exec": {"command": ["test", "-f", "/tmp/open-rl-sampler-awake"]}, "periodSeconds": 2, "failureThreshold": 600}
 
   if pull_policy := os.getenv("OPEN_RL_WORKER_IMAGE_PULL_POLICY"):
     template["spec"]["containers"][0]["imagePullPolicy"] = pull_policy

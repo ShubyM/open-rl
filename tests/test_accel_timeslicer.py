@@ -11,7 +11,7 @@ from accel_timeslicer.checkpoint import CudaCheckpointRestorer
 from accel_timeslicer.llmd import LlmDCheckpointRestorer
 from accel_timeslicer.serve import start_tcp_time_slicer, start_time_slicer
 from accel_timeslicer.single_node import SingleNodeTimeSlicer
-from accel_timeslicer.time_slicer import SocketTimeSlicerClient, time_slicer_client_from_env, workload_from_env
+from accel_timeslicer.time_slicer import SocketTimeSlicerClient, TimeSlicerFault, time_slicer_client_from_env, workload_from_env
 from accel_timeslicer.workload import WorkloadRef
 
 
@@ -65,6 +65,13 @@ class FailingCheckpointRestorer(RecordingRestorer):
   def checkpoint(self, target: WorkloadRef) -> None:
     super().checkpoint(target)
     raise RuntimeError("cuda-checkpoint refused the process")
+
+
+class FirstCheckpointFailsRestorer(RecordingRestorer):
+  def checkpoint(self, target: WorkloadRef) -> None:
+    super().checkpoint(target)
+    if len(self.calls) == 1:
+      raise RuntimeError("cuda-checkpoint refused the process")
 
 
 class SingleNodeTimeSlicerTest(unittest.IsolatedAsyncioTestCase):
@@ -309,6 +316,161 @@ class FailedCheckpointTest(unittest.IsolatedAsyncioTestCase):
       finally:
         await client_a.close()
         await client_b.close()
+        server.close()
+        await server.wait_closed()
+
+
+class LeaseHolderTest(unittest.IsolatedAsyncioTestCase):
+  """A workload one connection registered and another holds, as a pool replica's launcher and its dispatcher do."""
+
+  async def test_closing_the_holders_connection_checkpoints_the_workload_before_the_next_grant(self) -> None:
+    restorer = BlockingRestorer()
+    agent = SingleNodeTimeSlicer(restorer)
+    await agent.register(WorkloadRef(name="replica"), connection_id=1)
+    await agent.register(WorkloadRef(name="trainer"), connection_id=3)
+    self.assertTrue((await agent.acquire(WorkloadRef(name="replica"), connection_id=2))["ok"])
+    blocked = asyncio.create_task(agent.acquire(WorkloadRef(name="trainer"), connection_id=3))
+    await asyncio.sleep(0.05)
+    restorer.block_checkpoint = True
+    closed = asyncio.create_task(agent.connection_closed(2))
+    await asyncio.to_thread(restorer.checkpoint_started.wait, 1.0)
+    # The replica is still being checkpointed, so the trainer is not granted yet.
+    self.assertFalse(blocked.done())
+    self.assertEqual(agent.running, {"shared-accelerator": "replica"})
+    restorer.finish_checkpoint.set()
+    await closed
+    self.assertTrue((await asyncio.wait_for(blocked, timeout=1.0))["ok"])
+    self.assertEqual(agent.running, {"shared-accelerator": "trainer"})
+    # The replica's own process is still up behind its own connection, so the next dispatcher leases it again.
+    self.assertEqual((agent.workloads["replica"].failed, agent.workloads["replica"].checkpointed), (False, True))
+    await agent.release(WorkloadRef(name="trainer"))
+    self.assertTrue((await agent.acquire(WorkloadRef(name="replica"), connection_id=4))["ok"])
+    self.assertEqual(restorer.simple_labels(), [("checkpoint", "replica"), ("checkpoint", "trainer"), ("restore", "replica")])
+
+  async def test_only_the_connection_holding_a_grant_can_release_it(self) -> None:
+    restorer = RecordingRestorer()
+    agent = SingleNodeTimeSlicer(restorer)
+    await agent.register(WorkloadRef(name="replica"), connection_id=1)
+    self.assertTrue((await agent.acquire(WorkloadRef(name="replica"), connection_id=2))["ok"])
+    refused = await agent.release(WorkloadRef(name="replica"), connection_id=3)
+    error = "workload replica is held by another connection; only the connection that acquired it can release it"
+    self.assertEqual(refused, {"ok": False, "error": error})
+    self.assertEqual((agent.running, restorer.calls), ({"shared-accelerator": "replica"}, []))
+    self.assertTrue((await agent.release(WorkloadRef(name="replica"), connection_id=2))["ok"])
+    # A caller in the slicer's own process names no connection.
+    self.assertTrue((await agent.acquire(WorkloadRef(name="replica"), connection_id=4))["ok"])
+    self.assertTrue((await agent.release(WorkloadRef(name="replica")))["ok"])
+
+  async def test_a_failed_checkpoint_after_the_holders_connection_closed_keeps_the_grant(self) -> None:
+    agent = SingleNodeTimeSlicer(FailingCheckpointRestorer())
+    await agent.register(WorkloadRef(name="replica"), connection_id=1)
+    self.assertTrue((await agent.acquire(WorkloadRef(name="replica"), connection_id=2))["ok"])
+    blocked = asyncio.create_task(agent.acquire(WorkloadRef(name="trainer"), connection_id=3))
+    await asyncio.sleep(0.05)
+    await agent.connection_closed(2)
+    await asyncio.sleep(0.05)
+    # The replica is still on the devices, so it keeps the grant until its own process is gone.
+    self.assertFalse(blocked.done())
+    self.assertEqual(agent.running, {"shared-accelerator": "replica"})
+    self.assertTrue(agent.workloads["replica"].failed)
+    await agent.connection_closed(1)
+    self.assertTrue((await asyncio.wait_for(blocked, timeout=1.0))["ok"])
+
+  async def test_a_socket_client_that_drops_while_holding_anothers_workload_is_released(self) -> None:
+    restorer = RecordingRestorer()
+    agent = SingleNodeTimeSlicer(restorer)
+    with tempfile.TemporaryDirectory() as tmp:
+      socket_path = str(Path(tmp) / "accel-timeslicer.sock")
+      server = await start_time_slicer(agent, socket_path)
+      launcher, dispatcher, trainer = (SocketTimeSlicerClient(socket_path) for _ in range(3))
+      try:
+        await launcher.register(WorkloadRef(name="replica"))
+        await trainer.register(WorkloadRef(name="trainer"))
+        await dispatcher.request({"command": "ACQUIRE", "name": "replica", "claim": "shared-accelerator"})
+        blocked = asyncio.create_task(acquire_once(trainer, WorkloadRef(name="trainer")))
+        await asyncio.sleep(0.05)
+        self.assertFalse(blocked.done())
+        await dispatcher.close()
+        self.assertEqual(await asyncio.wait_for(blocked, timeout=1.0), "trainer")
+        self.assertEqual(restorer.simple_labels()[0], ("checkpoint", "replica"))
+        self.assertFalse(agent.workloads["replica"].failed)
+      finally:
+        for client in (launcher, dispatcher, trainer):
+          await client.close()
+        server.close()
+        await server.wait_closed()
+
+  async def test_a_failed_park_is_told_to_the_connection_that_registered_the_workload(self) -> None:
+    agent = SingleNodeTimeSlicer(FailingCheckpointRestorer())
+    with tempfile.TemporaryDirectory() as tmp:
+      socket_path = str(Path(tmp) / "accel-timeslicer.sock")
+      server = await start_time_slicer(agent, socket_path)
+      launcher, dispatcher, trainer = (SocketTimeSlicerClient(socket_path) for _ in range(3))
+      try:
+        await launcher.register(WorkloadRef(name="replica"))
+        async with dispatcher.acquire(WorkloadRef(name="replica")):
+          pass
+        # The dispatcher hears it in the reply to its release. The launcher, the one process that can free the devices, is told unasked.
+        self.assertIn("must exit", dispatcher.faulted or "")
+        self.assertEqual(await asyncio.wait_for(launcher.fault(), 1.0), dispatcher.faulted)
+        # A process that registered and released its workload itself hears it once, in the reply.
+        await trainer.register(WorkloadRef(name="trainer", claim="other"))
+        async with trainer.acquire(WorkloadRef(name="trainer", claim="other")):
+          pass
+        self.assertIn("must exit", trainer.faulted or "")
+        with self.assertRaises(TimeoutError):
+          await asyncio.wait_for(trainer.reader.readline(), 0.2)
+      finally:
+        for client in (launcher, dispatcher, trainer):
+          await client.close()
+        server.close()
+        await server.wait_closed()
+
+  async def test_when_a_dead_dispatchers_turn_cannot_be_parked_the_launcher_is_told_and_its_exit_frees_the_claim(self) -> None:
+    agent = SingleNodeTimeSlicer(FailingCheckpointRestorer())
+    with tempfile.TemporaryDirectory() as tmp:
+      socket_path = str(Path(tmp) / "accel-timeslicer.sock")
+      server = await start_time_slicer(agent, socket_path)
+      launcher, dispatcher, trainer = (SocketTimeSlicerClient(socket_path) for _ in range(3))
+      try:
+        await launcher.register(WorkloadRef(name="replica"))
+        await trainer.register(WorkloadRef(name="trainer"))
+        await dispatcher.request({"command": "ACQUIRE", "name": "replica", "claim": "shared-accelerator"})
+        blocked = asyncio.create_task(acquire_once(trainer, WorkloadRef(name="trainer")))
+        # The dispatcher dies holding the turn, and the park the slicer runs for it fails.
+        await dispatcher.close()
+        self.assertIn("must exit", await asyncio.wait_for(launcher.fault(), 1.0) or "")
+        self.assertFalse(blocked.done())
+        # The launcher stops vLLM and exits, which closes its connection, and only then is the trainer granted.
+        await launcher.close()
+        self.assertEqual(await asyncio.wait_for(blocked, timeout=1.0), "trainer")
+      finally:
+        for client in (launcher, dispatcher, trainer):
+          await client.close()
+        server.close()
+        await server.wait_closed()
+
+  async def test_a_fault_told_while_a_request_waits_is_noted_and_not_taken_for_its_reply(self) -> None:
+    agent = SingleNodeTimeSlicer(FirstCheckpointFailsRestorer())
+    with tempfile.TemporaryDirectory() as tmp:
+      socket_path = str(Path(tmp) / "accel-timeslicer.sock")
+      server = await start_time_slicer(agent, socket_path)
+      launcher, dispatcher = SocketTimeSlicerClient(socket_path), SocketTimeSlicerClient(socket_path)
+      try:
+        await launcher.register(WorkloadRef(name="replica"))
+        await dispatcher.request({"command": "ACQUIRE", "name": "replica", "claim": "shared-accelerator"})
+        waiting = asyncio.create_task(launcher.request({"command": "ACQUIRE", "name": "other", "claim": "shared-accelerator"}))
+        await asyncio.sleep(0.05)
+        # The release fails and the launcher is told while its acquire waits. Closing the dispatcher parks the replica after all.
+        with self.assertRaises(TimeSlicerFault):
+          await dispatcher.request({"command": "RELEASE", "name": "replica", "claim": "shared-accelerator"})
+        await dispatcher.close()
+        self.assertTrue((await asyncio.wait_for(waiting, timeout=1.0))["ok"])
+        self.assertIn("must exit", launcher.faulted or "")
+        self.assertEqual(agent.running, {"shared-accelerator": "other"})
+      finally:
+        await launcher.close()
+        await dispatcher.close()
         server.close()
         await server.wait_closed()
 

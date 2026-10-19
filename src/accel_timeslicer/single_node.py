@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,8 @@ class WorkloadState:
   workload: WorkloadRef
   checkpointed: bool = False
   failed: bool = False
+  # The connection whose acquire holds the grant, while one does.
+  holder: int | None = None
 
 
 class SingleNodeTimeSlicer(TimeSlicer):
@@ -34,6 +37,8 @@ class SingleNodeTimeSlicer(TimeSlicer):
     self.running: dict[str, str] = {}
     self.condition = asyncio.Condition()
     self.last_release_time: dict[str, float] = {}
+    # How the server reaches each open connection with a line it did not ask for.
+    self.connections: dict[int, Callable[[dict[str, Any]], None]] = {}
 
   def next_waiter(self, claim: str) -> str | None:
     """The earliest waiter under fifo, the least recently served otherwise."""
@@ -58,7 +63,7 @@ class SingleNodeTimeSlicer(TimeSlicer):
       self.condition.notify_all()
       return {"ok": True}
 
-  async def acquire(self, workload: WorkloadRef) -> dict[str, Any]:
+  async def acquire(self, workload: WorkloadRef, connection_id: int | None = None) -> dict[str, Any]:
     async with self.condition:
       name, claim = workload.name, workload.claim
       state = self.workloads.get(name)
@@ -88,6 +93,7 @@ class SingleNodeTimeSlicer(TimeSlicer):
 
       self.waiting_workloads.remove(name)
       self.running[claim] = name
+      state.holder = connection_id
       self.condition.notify_all()
 
     if state.checkpointed:
@@ -99,12 +105,16 @@ class SingleNodeTimeSlicer(TimeSlicer):
         self.condition.notify_all()
     return {"ok": True}
 
-  async def release(self, workload: WorkloadRef) -> dict[str, Any]:
+  async def release(self, workload: WorkloadRef, connection_id: int | None = None) -> dict[str, Any]:
     async with self.condition:
       name, claim = workload.name, workload.claim
       state = self.workloads.get(name)
       if state is None or self.running.get(claim) != name:
         return {"ok": False, "error": f"workload {name} does not hold an active acquire"}
+      # A grant the workload took again over another connection, as a restarted launcher does for its boot turn, is
+      # not this connection's to end. A caller in this process names no connection and is not checked.
+      if connection_id is not None and state.holder != connection_id:
+        return {"ok": False, "error": f"workload {name} is held by another connection; only the connection that acquired it can release it"}
 
     # The grant is held through the checkpoint, so the next waiter is not
     # granted until this workload is off the devices.
@@ -115,13 +125,18 @@ class SingleNodeTimeSlicer(TimeSlicer):
       # the grant so nobody is restored on top of its memory; the seat frees
       # when its process exits and the connection closes.
       logger.error("checkpoint failed for workload %s claim %s; it keeps the grant until its process exits: %s", name, claim, exc)
+      error = f"checkpoint failed for workload {name}; it still holds the accelerator and must exit: {exc}"
       async with self.condition:
         state = self.workloads.get(name)
         if state is not None:
           state.failed = True
           state.checkpointed = False
+          # Only the process that registered the workload can free the devices, by exiting, so it is told when another
+          # connection's release failed, as a pool dispatcher's can for a sampler. One that released it itself has the reply.
+          if state.connection_id != connection_id and (tell := self.connections.get(state.connection_id)):
+            tell({"event": "FAULT", **workload.as_payload(), "error": error})
         self.condition.notify_all()
-      return {"ok": False, "faulted": True, "error": f"checkpoint failed for workload {name}; it still holds the accelerator and must exit: {exc}"}
+      return {"ok": False, "faulted": True, "error": error}
 
     async with self.condition:
       state = self.workloads.get(name)
@@ -144,6 +159,13 @@ class SingleNodeTimeSlicer(TimeSlicer):
       return {"ok": True}
 
   async def connection_closed(self, connection_id: int) -> None:
+    # A grant held over a connection other than the registering one is a lease another process took, the pool
+    # dispatcher for a sampler. The workload is still on the devices, so it is released, which checkpoints it.
+    async with self.condition:
+      leased = [state.workload for state in self.workloads.values() if state.holder == connection_id and state.connection_id != connection_id]
+    for workload in leased:
+      logger.warning("connection holding workload %s claim %s closed; releasing it", workload.name, workload.claim)
+      await self.release(workload, connection_id)
     async with self.condition:
       for name, state in self.workloads.items():
         if state.connection_id != connection_id:
@@ -160,6 +182,8 @@ class SingleNodeTimeSlicer(TimeSlicer):
     for claim, holder in list(self.running.items()):
       if holder == name:
         del self.running[claim]
+    if (state := self.workloads.get(name)) is not None:
+      state.holder = None
 
   async def run_checkpoint(self, state: WorkloadState) -> bool | None:
     """Parks the workload. Raises when the restorer could not, since the workload then still holds the devices."""

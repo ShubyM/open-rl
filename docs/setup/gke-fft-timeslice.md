@@ -182,6 +182,32 @@ in-memory queue and active/checkpointed state for workloads sharing the physical
 GPU. The worker pod labels provide the workload identity llm-d uses to discover
 the relevant pod and process set.
 
+An FFT job's pool sampler shares the
+trainer's GPU and takes turns with it through the same coordinator, with no
+proxy in the request path. Its pod runs
+`python -m server.sampler_launcher vllm serve ... --enable-sleep-mode` with
+`OPEN_RL_TIME_SLICED_SAMPLER=true`. The launcher registers the sampler's
+workload, starts vLLM inside one turn, puts it to sleep and releases, so vLLM
+never takes GPU memory while the trainer holds the device, then keeps the
+registration open for as long as vLLM runs. The container counts as started only
+then, and the pool's dispatcher, which reads the same variable from the pod,
+leases the replica for each turn through the slicer on its node
+(`status.hostIP` and `OPEN_RL_ACCEL_TIMESLICER_PORT`), wakes vLLM, loads any
+pending weights as a whole, sends requests to it directly rather than through
+the router, puts it to sleep and releases. A turn ends once the replica is idle,
+or after `OPEN_RL_SAMPLER_TURN_SECONDS` (60 by default) with requests still
+pending, so the trainer gets its turn. Requests still running then get ten
+seconds more. After that they are cancelled, aborted inside vLLM by its sleep,
+and sent again in a later turn. If the dispatcher dies holding a lease,
+the slicer checkpoints the replica before anyone else is granted the device. If
+that checkpoint, or the one at the end of a turn, fails, the slicer tells the
+launcher, which stops vLLM and exits, so the device frees for the trainer and
+kubelet restarts the replica. A
+pod deleted while vLLM is still starting is killed by its launcher a few seconds
+after the SIGTERM vLLM ignores at that point, so the turn is freed at once
+rather than at kubelet's SIGKILL. Exclusive jobs' pool samplers and LoRA pool
+samplers keep a GPU of their own and never talk to the slicer.
+
 ## Requirements
 
 - GKE Standard cluster on **1.35 or newer** ([DRA for GPUs](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/set-up-dra)

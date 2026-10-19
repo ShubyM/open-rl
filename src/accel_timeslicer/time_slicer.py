@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 from collections.abc import AsyncIterator
@@ -50,8 +51,9 @@ class SocketTimeSlicerClient:
     self.port = port
     self.reader: asyncio.StreamReader | None = None
     self.writer: asyncio.StreamWriter | None = None
-    # Set when a release could not park this process. The caller finishes
-    # publishing its results and exits; the grant moves on once it is gone.
+    # Set when a release could not park this process, whether this connection
+    # released it or another one leased the workload it registered. The caller
+    # finishes publishing its results and exits; the grant moves on once it is gone.
     self.faulted: str | None = None
 
   async def connect(self, retries: int = 10, backoff: float = 0.5) -> None:
@@ -103,12 +105,9 @@ class SocketTimeSlicerClient:
     try:
       self.writer.write(json.dumps(payload).encode("utf-8") + b"\n")
       await self.writer.drain()
-      line = await self.reader.readline()
-      if not line:
-        await self.close()
-        raise RuntimeError("time slicer connection closed")
-
-      response = json.loads(line.decode("utf-8"))
+      response = await self.receive()
+      while response.get("event") == "FAULT":
+        response = await self.receive()
       if not response.get("ok"):
         if response.get("faulted"):
           # The connection stays open: closing it would hand the grant to the
@@ -121,6 +120,26 @@ class SocketTimeSlicerClient:
     except Exception:
       await self.close()
       raise
+
+  async def receive(self) -> dict[str, Any]:
+    """The next line from the slicer. A FAULT, which the slicer sends unasked and never as a reply, is noted."""
+    assert self.reader is not None
+    line = await self.reader.readline()
+    if not line:
+      await self.close()
+      raise RuntimeError("time slicer connection closed")
+    message = json.loads(line.decode("utf-8"))
+    if message.get("event") == "FAULT":
+      self.faulted = message.get("error", "the time slicer could not park this process")
+    return message
+
+  async def fault(self) -> str | None:
+    """Waits, with no request in flight, until the slicer says another connection's release could not park the
+    workload this connection registered. None if the connection closes first."""
+    with contextlib.suppress(OSError, RuntimeError):
+      while self.faulted is None and self.reader is not None:
+        await self.receive()
+    return self.faulted
 
 
 def workload_from_env(pid: int | None = None, name: str | None = None, claim: str = DEFAULT_CLAIM) -> WorkloadRef:
