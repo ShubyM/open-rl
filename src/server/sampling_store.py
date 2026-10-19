@@ -45,13 +45,11 @@ class SamplingStore:
 
     return await self.redis.transaction(add, key, value_from_callable=True)
 
-  async def pending(self, pool: str, limit: int | None = 1000, after: str | None = None) -> list[dict[str, Any]]:
-    """Pending records in stream order, only those newer than stream id `after` when given."""
-    entries = await self.redis.xrange(stream_key(pool), min=f"({after}" if after else "-", count=limit)
+  async def pending(self, pool: str, limit: int | None = 1000, after: str = "0-0") -> list[dict[str, Any]]:
+    entries = await self.redis.xrange(stream_key(pool), min=f"({after}", count=limit)
     return [{**json.loads(fields["record"]), "entry_id": entry_id} for entry_id, fields in entries]
 
   async def wait_for_new(self, pool: str, after: str, timeout_ms: int) -> None:
-    """Returns once a request newer than stream id `after` arrives, or after timeout_ms."""
     await self.redis.xread({stream_key(pool): after}, count=1, block=timeout_ms)
 
   async def commit(self, record: dict[str, Any], result: dict[str, Any]) -> bool:
