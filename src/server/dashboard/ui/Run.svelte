@@ -75,9 +75,10 @@
     <!-- The summary is the agent-facing one-liner; when the workers are listed below, only pod problems add to it. -->
     {#if run.workers?.length}
       {#each (run.pods || []).filter((p) => p.problem) as pod}<p class="source-error" role="status">{pod.name}: {pod.problem}</p>{/each}
-    {:else}<p>{run.summary || "Run state unavailable"}</p>{/if}
+    {:else if !finished}<p>{run.summary || "Run state unavailable"}</p>{/if}
     {#if run.progress && !finished}<p class={run.progress.state === "OK" ? "muted" : "source-error"} role="status">Progress: {run.progress.state} · {run.progress.reason}</p>{/if}
-    <p class="muted">Model session: {run.session_live == null ? "Unknown" : run.session_live ? "Live" : "No live session"}{run.shared_runtime ? " · Shared runtime" : ""}</p>
+    <!-- A finished run has no session or workers by definition; saying so is noise. -->
+    {#if !finished}<p class="muted">Model session: {run.session_live == null ? "Unknown" : run.session_live ? "Live" : "No live session"}{run.shared_runtime ? " · Shared runtime" : ""}</p>{/if}
     {#if run.workers_error}<p class="source-error" role="status">Workers: {run.workers_error}</p>{/if}
     {#if run.workers?.length}
       <div class="table-scroll"><table class="run-table worker-table" aria-label="Workers"><thead><tr><th>Worker</th><th>State</th><th>Node</th><th>Restarts</th><th>Age</th></tr></thead><tbody>
@@ -87,7 +88,7 @@
             <td title={worker.node}>{worker.node ? shortNodeName(worker.node, inventory.cluster.nodes) : "—"}</td><td>{pod?.restarts ?? "—"}</td><td>{worker.age_seconds == null ? "—" : duration(worker.age_seconds)}</td></tr>
         {/each}
       </tbody></table></div>
-    {:else if !run.workers_error}<p class="muted">No workers reported</p>{/if}
+    {:else if !run.workers_error && !finished}<p class="muted">No workers reported</p>{/if}
     <Configuration settings={run.settings} />
   </section>
   <div use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => navigating = !!value }}>
