@@ -2,7 +2,7 @@ import asyncio
 import json
 import uuid
 
-from server.sampling_store import SamplingStore, future_key
+from server.sampling_store import PENDING_TTL_SECONDS, RESULT_TTL_SECONDS, SamplingStore, future_key, idempotency_key
 from tests.redis_server import RedisTestCase
 
 
@@ -25,10 +25,20 @@ class SamplingStoreTest(RedisTestCase):
     await self.store.commit(pending[first["request_id"]], {"type": "sample"})
     self.assertEqual(await self.store.accept(self.record(key="session:7")), first["request_id"])
 
+  async def test_a_key_expires_days_after_accept_and_minutes_after_commit(self) -> None:
+    await self.store.accept(self.record(key="session:7"))
+    key = idempotency_key(self.pool, "session:7")
+    self.assertAlmostEqual(await self.redis.ttl(key), PENDING_TTL_SECONDS, delta=60)
+    [pending] = (await self.pending()).values()
+    await self.store.commit(pending, {"type": "sample"})
+    self.assertAlmostEqual(await self.redis.ttl(key), RESULT_TTL_SECONDS, delta=60)
+
   async def test_concurrent_commits_save_exactly_one_result_and_clear_pending(self) -> None:
     r = self.record()
     await self.store.accept(r)
     [pending] = (await self.pending()).values()
+    # Open the connections first, so the commits overlap instead of queueing behind connection setup.
+    await asyncio.gather(*(self.redis.ping() for _ in range(5)))
     won = await asyncio.gather(*(self.store.commit(pending, {"type": "sample", "attempt": i}) for i in range(5)))
     saved = [json.loads(raw)["attempt"] for raw in await self.redis.lrange(future_key(r["request_id"]), 0, -1)]
     self.assertEqual((won.count(True), saved, await self.pending()), (1, [won.index(True)], {}))

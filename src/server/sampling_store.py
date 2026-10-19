@@ -1,14 +1,14 @@
-"""Durable sampling records for sampling pools. Each pool's pending requests are one
-Redis stream, read without removal. Results land in the same `open_rl:future:<id>`
-list that `retrieve_future` already reads."""
+"""Each sampling pool's pending requests are one Redis stream, read without removal.
+Results land in the `open_rl:future:<id>` list that `retrieve_future` already reads."""
 
 import json
 from typing import Any
 
 import redis.asyncio as redis
-from redis.exceptions import WatchError
 
 RESULT_TTL_SECONDS = 300
+# An accepted request may never be committed, so its idempotency key expires instead of staying until Redis is full.
+PENDING_TTL_SECONDS = 3 * 24 * 3600
 
 
 def stream_key(pool: str) -> str:
@@ -34,19 +34,16 @@ class SamplingStore:
       await self.redis.xadd(stream, fields)
       return record["request_id"]
     key = idempotency_key(record["pool"], record["idempotency_key"])
-    async with self.redis.pipeline() as pipe:
-      while True:
-        try:
-          await pipe.watch(key)
-          if existing := await pipe.get(key):
-            return existing
-          pipe.multi()
-          pipe.set(key, record["request_id"])
-          pipe.xadd(stream, fields)
-          await pipe.execute()
-          return record["request_id"]
-        except WatchError:
-          continue
+
+    async def add(pipe) -> str:
+      if existing := await pipe.get(key):
+        return existing
+      pipe.multi()
+      pipe.set(key, record["request_id"], ex=PENDING_TTL_SECONDS)
+      pipe.xadd(stream, fields)
+      return record["request_id"]
+
+    return await self.redis.transaction(add, key, value_from_callable=True)
 
   async def pending(self, pool: str, limit: int | None = 1000) -> list[dict[str, Any]]:
     entries = await self.redis.xrange(stream_key(pool), count=limit)
@@ -55,23 +52,20 @@ class SamplingStore:
   async def commit(self, record: dict[str, Any], result: dict[str, Any]) -> bool:
     """Save the first final result and drop the pending entry. False if it was already committed."""
     stream, future, entry_id = stream_key(record["pool"]), future_key(record["request_id"]), record["entry_id"]
-    async with self.redis.pipeline() as pipe:
-      while True:
-        try:
-          # Every commit writes the result key, so watching it lets only one through.
-          await pipe.watch(future)
-          if await pipe.exists(future) or not await pipe.xrange(stream, entry_id, entry_id):
-            return False
-          pipe.multi()
-          pipe.rpush(future, json.dumps(result))
-          pipe.expire(future, RESULT_TTL_SECONDS)
-          pipe.xdel(stream, entry_id)
-          if key := record.get("idempotency_key"):
-            pipe.expire(idempotency_key(record["pool"], key), RESULT_TTL_SECONDS)
-          await pipe.execute()
-          return True
-        except WatchError:
-          continue
+
+    async def save(pipe) -> bool:
+      if not await pipe.xrange(stream, entry_id, entry_id):
+        return False
+      pipe.multi()
+      pipe.rpush(future, json.dumps(result))
+      pipe.expire(future, RESULT_TTL_SECONDS)
+      pipe.xdel(stream, entry_id)
+      if key := record.get("idempotency_key"):
+        pipe.expire(idempotency_key(record["pool"], key), RESULT_TTL_SECONDS)
+      return True
+
+    # Every commit writes the result key, so watching it lets only one through.
+    return await self.redis.transaction(save, future, value_from_callable=True)
 
   async def pinned_revisions(self, pool: str) -> set[str]:
     """Revisions that pending requests still name, so their weights must stay."""

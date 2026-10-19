@@ -1224,7 +1224,7 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
       raise HTTPException(status_code=400, detail=f"No saved sampler weights for {ref}")
   else:
     revision, model = "", snapshot_name(ref)
-    if model is None or not (snapshot_root() / model / "adapter_config.json").is_file():
+    if not (snapshot_root() / model / "adapter_config.json").is_file():
       raise HTTPException(status_code=400, detail=f"No saved LoRA sampler weights for {ref}")
   try:
     pool = meta.pool(lookup_id)
@@ -1233,10 +1233,9 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
 
   params = req.sampling_params
   stop, stop_token_ids = split_stop(params.stop)
-  request_id = new_request_id()
   return await SamplingStore(store.redis).accept(
     {
-      "request_id": request_id,
+      "request_id": new_request_id(),
       "pool": pool,
       "revision": revision,
       "model": model,
@@ -1244,7 +1243,6 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
       "prompt_token_ids": prompt,
       "sampling_params": {"n": req.num_samples, **params.model_dump(exclude={"stop"}), "stop": stop or [], "stop_token_ids": stop_token_ids or []},
       "include_prompt_logprobs": req.prompt_logprobs,
-      "trace_context": await open_future(request_id),
     }
   )
 

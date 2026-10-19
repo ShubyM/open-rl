@@ -16,8 +16,6 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: redis-data
-  labels:
-    app: redis
 spec:
   accessModes: ["ReadWriteOnce"]
   resources:
@@ -45,19 +43,12 @@ spec:
       containers:
       - name: redis
         image: redis:7-alpine
-        # A write is acknowledged only once it is on disk. Below the pod limit,
-        # a full Redis refuses writes rather than evicting keys or being killed.
-        args:
-        - --dir
-        - /data
-        - --appendonly
-        - "yes"
-        - --appendfsync
-        - always
-        - --maxmemory
-        - 3gb
-        - --maxmemory-policy
-        - noeviction
+        # Redis by default fsyncs once a second and never evicts keys. Fsyncing every
+        # write would make every queue on this single-threaded server wait on the disk.
+        # A crash can lose the last second of writes. Nothing retries a lost
+        # request or result, so its client polls for a future that never arrives.
+        # Below the pod limit, a full Redis refuses writes instead of being killed.
+        args: ["--appendonly", "yes", "--maxmemory", "3gb"]
         ports:
         - containerPort: 6379
         volumeMounts:

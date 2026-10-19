@@ -46,8 +46,7 @@ def default_metadata(model_id: str) -> TrainingModelMetadata:
   name. It is FFT when this deployment enables FFT and LoRA otherwise, because
   an FFT sampler in a LoRA deployment would serve base weights and ignore every
   adapter."""
-  kind = "full" if os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true" else "lora"
-  return TrainingModelMetadata(base_model=model_id, created_at=0.0, fine_tuning_type=kind)
+  return TrainingModelMetadata(base_model=model_id, fine_tuning_type="full" if os.getenv("OPEN_RL_ENABLE_FFT", "").lower() == "true" else "lora")
 
 
 def runtime_of(model_id: str) -> tuple[TrainingModelMetadata, str, bool]:
