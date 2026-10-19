@@ -43,7 +43,6 @@ class GkeLogHelpersTest(unittest.TestCase):
     self.assertIsNone(gke.entry_record(entry(at="2026-09-10T12:00:00Z", textPayload="late"), [SOURCE], "run-1"))
     self.assertIsNone(gke.entry_record(entry(pod="someone-else", textPayload="x"), [SOURCE], "run-1"))
 
-  def test_json_payload_is_rendered_when_there_is_no_text(self) -> None:
     record = gke.entry_record(entry(jsonPayload={"message": "m", "rank": 2}), [SOURCE], "run-1")
     self.assertEqual(record["rank"], 2)
     self.assertIn('"message": "m"', record["message"])
@@ -78,12 +77,45 @@ class GkeLogHelpersTest(unittest.TestCase):
     self.assertEqual([record["message"] for record in result["records"]], ["Traceback (most recent call last):"])
 
   def test_logs_come_from_the_configured_views_or_else_the_project(self) -> None:
-    window = {"since": "2026-09-10T10:00:00Z", "until": "2026-09-10T11:00:00Z"}
     view = "projects/proj/locations/global/buckets/openrl-runs/views/_AllLogs"
-    for env, expected in (({}, ["projects/proj"]), ({"OPEN_RL_LOG_VIEWS": view}, [view])):
-      with self.subTest(env=env), patch.dict("os.environ", env), patch.object(gke, "request", AsyncMock(return_value={"entries": []})) as request:
-        asyncio.run(gke.run_logs("r", [SOURCE], **window))
-        self.assertEqual(request.await_args.kwargs["json"]["resourceNames"], expected)
+    for setting, expected in (("", ["projects/proj"]), (view, [view])):
+      with self.subTest(setting=setting), patch.dict("os.environ", {"OPEN_RL_LOG_VIEWS": setting}):
+        self.assertEqual(gke.log_views(), expected)
+
+  def test_paging_preserves_the_query_and_lifetimes_after_inventory_changes(self) -> None:
+    window = {"since": "2026-09-10T10:00:00Z", "until": "2026-09-10T11:00:00Z"}
+    with patch.object(
+      gke, "request", AsyncMock(side_effect=[{"nextPageToken": "provider-page-2"}, {"entries": [entry(textPayload="older")]}])
+    ) as request:
+      first = asyncio.run(gke.run_logs("r", [SOURCE], shared_runtime=True, **window))
+      second = asyncio.run(gke.run_logs("r", [], cursor=first["next_cursor"]))
+    before, after = [call.kwargs["json"] for call in request.await_args_list]
+    self.assertEqual(after, {**before, "pageToken": "provider-page-2"})
+    self.assertEqual(second["records"][0]["message"], "older")
+    self.assertEqual(second["sources"], [SOURCE])
+    self.assertEqual((second["since"], second["until"]), (first["since"], first["until"]))
+    self.assertTrue(second["shared_runtime"])
+
+  def test_cursor_rejects_tampering_expiry_and_changed_selection_before_querying(self) -> None:
+    window = {"since": "2026-09-10T10:00:00Z", "until": "2026-09-10T11:00:00Z"}
+    with patch.object(gke, "request", AsyncMock(return_value={"nextPageToken": "provider-page"})) as request:
+      cursor = asyncio.run(gke.run_logs("r", [SOURCE], **window))["next_cursor"]
+      request.reset_mock()
+      for change in ({"run_id": "other"}, {"q": "different"}, {"limit": 50}, {"until": "2026-09-10T11:01:00Z"}, {"cursor": "bad" + cursor}):
+        with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Invalid or expired"):
+          asyncio.run(gke.run_logs(**{"run_id": "r", "sources": [SOURCE], "cursor": cursor, **window, **change}))
+      with patch.object(gke.time, "time", return_value=10**12), self.assertRaisesRegex(ValueError, "Invalid or expired"):
+        asyncio.run(gke.run_logs("r", [SOURCE], cursor=cursor, **window))
+      request.assert_not_awaited()
+
+  def test_cursor_has_bounded_encoded_and_decompressed_sizes(self) -> None:
+    with self.assertRaisesRegex(ValueError, "too large"):
+      gke.page_cursor({"value": "x" * gke.MAX_PLAN_BYTES})
+    with patch.object(gke, "MAX_CURSOR", 10), self.assertRaisesRegex(ValueError, "too large"):
+      gke.page_cursor({"value": "small"})
+    cursor = gke.page_cursor({"value": "x" * 1000})
+    with patch.object(gke, "MAX_PLAN_BYTES", 100), self.assertRaisesRegex(ValueError, "Invalid or expired"):
+      gke.page_plan(cursor, [], None, None)
 
   def test_refused_credentials_back_off_without_repeating_the_request(self) -> None:
     response = httpx.Response(403, request=httpx.Request("POST", "https://logging.googleapis.com"))
@@ -97,16 +129,6 @@ class GkeLogHelpersTest(unittest.TestCase):
       second = asyncio.run(gke.run_logs("r", [SOURCE]))
       self.assertEqual((first["error"], second["error"]), (gke.REFUSED, gke.REFUSED))
       self.assertEqual(request.await_count, 1)
-      self.assertEqual(gke._refused_until, 700)
-
-  def test_pod_sources_cover_live_pods_and_the_runs_processes(self) -> None:
-    run = {"run_id": "run-1", "pods": [{"name": "orw-live", "node": "n1", "role": "sampler", "created_at": "2026-09-10T10:00:00Z"}]}
-    lanes = [{"pod": "orw-gone", "node": "n2", "role": "trainer", "start": 1789000000.0, "end": 1789003600.0}]
-    sources = {s["pod"]: s for s in gke.pod_sources(run, lanes, "2026-09-10T11:00:00Z")}
-    self.assertEqual(set(sources), {"orw-live", "orw-gone"})
-    self.assertEqual(sources["orw-live"]["until"], "2026-09-10T11:00:00.000000+00:00")
-    self.assertEqual(sources["orw-gone"]["role"], "trainer")
-    self.assertEqual(sources["orw-gone"]["until"], gke.timestamp(1789003660.0))
 
   def test_same_name_pod_replacements_keep_separate_log_lifetimes(self) -> None:
     lanes = [

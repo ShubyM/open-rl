@@ -77,9 +77,8 @@ export function sumSeries(workers, field) {
   for (const worker of workers) for (const [at, value] of worker[field] || []) byTime.set(at, (byTime.get(at) || 0) + value);
   return [...byTime].sort((a, b) => a[0] - b[0]);
 }
-export function gapFor(points, floor) {
-  const times = points.map(([at]) => at).sort((a, b) => a - b);
-  const spacings = times.slice(1).map((at, i) => at - times[i]).filter((d) => d > 0).sort((a, b) => a - b);
+export function gapFor(sortedPoints, floor) {
+  const spacings = sortedPoints.slice(1).map(([at], i) => at - sortedPoints[i][0]).filter((d) => d > 0).sort((a, b) => a - b);
   return Math.max(floor, 3 * (spacings[Math.floor(spacings.length / 2)] || 0));
 }
 // Aggregate one physical generation per slot and timestamp; incomplete or ambiguous samples stay gaps.

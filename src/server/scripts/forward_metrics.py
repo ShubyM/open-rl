@@ -22,6 +22,8 @@ from pathlib import Path
 
 import httpx
 
+from server.telemetry.run_metrics import finite_metrics
+
 TINKER_PATH = re.compile(r"tinker://([^/\"]+)/")
 BATCH = 200
 
@@ -48,15 +50,23 @@ def read_rows(path: Path, offset: int) -> tuple[list[dict], int]:
       record = json.loads(line)
     except json.JSONDecodeError:
       continue
+    if not isinstance(record, dict):
+      continue
     step = record.get("step", record.get("progress/batch"))
-    if isinstance(step, int) and not isinstance(step, bool):
-      rows.append({"step": step, "metrics": {name: value for name, value in record.items() if name != "step"}})
+    if isinstance(step, int) and not isinstance(step, bool) and 0 <= step <= 2**53 - 1:
+      record.pop("step", None)
+      if metrics := finite_metrics(record):
+        rows.append({"step": step, "metrics": metrics})
   return rows, offset + end
 
 
-def send(http: httpx.Client, base_url: str, run_id: str, rows: list[dict]) -> None:
-  for i in range(0, len(rows), BATCH):
-    http.post(f"{base_url}/api/v1/runs/{run_id}/metrics", json={"rows": rows[i : i + BATCH]}).raise_for_status()
+def send(http: httpx.Client, base_url: str, run_id: str, rows: list[dict]) -> int:
+  """Consume each acknowledged batch, leaving only unsent rows after a failure."""
+  count = len(rows)
+  while rows:
+    http.post(f"{base_url}/api/v1/runs/{run_id}/metrics", json={"rows": rows[:BATCH]}).raise_for_status()
+    del rows[:BATCH]
+  return count
 
 
 def main() -> None:
@@ -80,9 +90,8 @@ def main() -> None:
       run_id = run_id or run_id_of(args.log_path)
       if run_id and pending:
         try:
-          send(http, base_url, run_id, pending)
-          print(f"sent {len(pending)} steps of run {run_id}", flush=True)
-          pending = []
+          count = send(http, base_url, run_id, pending)
+          print(f"sent {count} steps of run {run_id}", flush=True)
         except httpx.HTTPError as exc:
           print(f"could not send {len(pending)} steps of run {run_id}: {exc}", file=sys.stderr, flush=True)
       if not args.follow:

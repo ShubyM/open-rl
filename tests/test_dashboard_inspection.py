@@ -125,10 +125,6 @@ class InspectionActivityTest(unittest.TestCase):
         self.assertEqual((lane["end"], lane["ended"]), (record["heartbeat_at"], True))
         self.assertEqual((lane["devices"], lane["device_uuids"], lane["device_count"]), (["gpu-0"], {"gpu-0": "GPU-1"}, 1))
 
-  def test_a_pool_dispatcher_is_not_a_gpu_lane(self):
-    dispatcher = {**PROCESS, "id": "d", "role": "dispatcher", "runtime_id": None, "gpus": [], "pool": "sampler-r1"}
-    self.assertEqual([lane["id"] for lane in inspection.segments(state(processes=[PROCESS, dispatcher]))], ["p1"])
-
   def test_a_placed_workload_is_a_lane_before_its_process_reports(self):
     (lane,) = inspection.segments(state(processes=[]))
     self.assertEqual((lane["id"], lane["start"], lane["end"], lane["ended"]), ("w1", 90, 200, False))
@@ -145,23 +141,11 @@ class InspectionActivityTest(unittest.TestCase):
     self.assertEqual((previous["id"], previous["end"], previous["ended"]), ("first", 150, True))
     self.assertEqual((current["id"], current["start"], current["ended"]), ("second", 160, False))
 
-  def test_operations_overlapping_window_edges_are_clipped_and_merged(self):
-    operations = {"r1": {"samples": [operation(110, 130), operation(125, 145), operation(170, 210)]}}
-    result = inspection.activity(state(), 120, 190, operations)["placements"][0]
-    self.assertEqual(result["intervals"], [[120, 145], [170, 190]])
-    self.assertEqual(result["ops"], {"train": [[120, 145], [170, 190]]})
-    self.assertFalse(result["exact"])
-
   def test_dispatcher_sample_ops_land_on_the_replica_that_answered(self):
     sampler = {**PLACEMENT, "id": "s1", "name": "sampler", "role": "sampler", "pod": "sampler-0", "pod_uid": "u-s"}
     sample = {"run_id": "r1", "role": "sampler", "pod": "sampler-0", "operation": "sample", "started_at": 120, "at": 150}
     (lane,) = inspection.activity(state(live=[sampler], processes=[]), 100, 200, {"r1": {"samples": [sample]}})["placements"]
     self.assertEqual((lane["intervals"], list(lane["ops"])), ([[120, 150]], ["sample"]))
-
-  def test_ops_from_a_previous_pod_with_the_same_name_stay_off_the_lane(self):
-    operations = {"r1": {"samples": [operation(160, 180, pod_uid="previous-pod"), operation(180, 190)]}}
-    result = inspection.activity(state(), 150, 200, operations)["placements"][0]
-    self.assertEqual(result["intervals"], [[180, 190]])
 
   def test_a_shared_runtime_splits_by_run_and_shows_only_each_runs_ops(self):
     shared = {**PROCESS, "runtime_id": "base", "turns": [[100, 200]]}
@@ -175,15 +159,23 @@ class InspectionActivityTest(unittest.TestCase):
     (lane,) = inspection.activity(state(live=[], processes=[shared], runs=runs), 100, 220, operations, run_id="r1")["placements"]
     self.assertEqual(lane["allocation_id"], "p1")
 
-  def test_a_released_samplers_lane_comes_from_the_runs_recorded_samples(self):
-    samples = [
-      operation(110, 120, role="sampler", pod="pool-0-sampler", operation="sample"),
-      operation(150, 160, role="sampler", pod="pool-0-sampler", operation="sample"),
-    ]
-    lanes = inspection.activity(state(live=[]), 100, 220, {"r1": {"samples": [operation(130, 140), *samples]}}, run_id="r1")["placements"]
-    recorded = next(p for p in lanes if p["pod"] == "pool-0-sampler")
-    self.assertEqual((recorded["role"], recorded["ended"], recorded["ops"]), ("sampler", True, {"sample": [[110, 120], [150, 160]]}))
-    self.assertEqual([p["pod"] for p in lanes].count("trainer-0"), 1)
+  def test_historical_sampler_and_dispatcher_sources_are_shared_by_every_reader(self):
+    dispatcher = {**PROCESS, "id": "dispatcher", "pod": "pool-dispatcher", "pod_uid": "d1", "role": "dispatcher", "pool": "pool", "gpus": []}
+    snapshot = state(live=[], processes=[PROCESS, dispatcher], runs=[{**RUN, "pool": "pool"}])
+    samples = [operation(start, start + 10, role="sampler", pod="deleted-sampler", operation="sample") for start in (110, 150)]
+    sources = inspection.sources(snapshot, run_id="r1", samples=samples)
+    self.assertEqual({p["pod"] for p in sources}, {"trainer-0", "deleted-sampler", "pool-dispatcher"})
+    lanes = inspection.segments(snapshot, run_id="r1", samples=samples)
+    self.assertEqual({p["pod"] for p in lanes}, {"trainer-0", "deleted-sampler"})
+    recorded = inspection.activity(snapshot, 100, 220, {"r1": {"samples": samples}}, run_id="r1")["placements"][1]
+    self.assertEqual((recorded["pod"], recorded["ended"], recorded["ops"]), ("deleted-sampler", True, {"sample": [[110, 120], [150, 160]]}))
+
+  def test_current_dispatcher_is_a_source_before_its_process_reports(self):
+    pod = {"name": "pool-dispatcher", "uid": "d1", "node": "n1", "role": "dispatcher", "created_at": "1970-01-01T00:01:30Z"}
+    snapshot = state(live=[], processes=[], runs=[{**RUN, "pods": [pod]}])
+    (source,) = inspection.sources(snapshot, run_id="r1")
+    self.assertEqual((source["pod"], source["start"], source["devices"]), ("pool-dispatcher", 90, []))
+    self.assertEqual(inspection.segments(snapshot, run_id="r1"), [])
 
   def test_a_dedicated_lane_shows_gpu_turns_inside_the_window(self):
     record = {**PROCESS, "turns": [[10, 20], [110, 150]]}
@@ -214,5 +206,7 @@ class InspectionActivityTest(unittest.TestCase):
       lane = inspection.activity(state(), 120, 190, {"r1": {"samples": records}})["placements"][0]
       actual = {tick for low, high in lane["intervals"] for tick in range(low, high)}
       self.assertEqual(actual, expected, f"case {case}")
+      self.assertEqual(lane["ops"].get("train", []), lane["intervals"])
+      self.assertFalse(lane["exact"])
       self.assertTrue(all(120 <= low < high <= 190 for low, high in lane["intervals"]))
       self.assertTrue(all(a[1] < b[0] for a, b in zip(lane["intervals"], lane["intervals"][1:])))

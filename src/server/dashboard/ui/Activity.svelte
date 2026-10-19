@@ -1,10 +1,10 @@
 <script>
   import { nodeLink, viewLink, crosshair, crosshairOffset, timeAt } from "./state.svelte.js";
-  import { axisTime, chartTime, valueText, placementColor, processLabel, shortNodeName, opRank, opLabel, clipPlacements, activitySource } from "./visualization.js";
-  let { placements = [], range, inventory, acrossNodes = false, activeOnly = false, selected = null, onselect, error = null, status = null, pending = false, showSource = true, back = null, navigating = false, onpick = null } = $props();
+  import { axisTime, chartTime, valueText, placementColor, processLabel, shortNodeName, opRank, opLabel, activitySource } from "./visualization.js";
+  let { placements = [], range, inventory, acrossNodes = false, activeOnly = false, selected = null, onselect, error = null, pending = false, showSource = true, back = null, navigating = false, onpick = null } = $props();
   let tooltip = $state(null), tip;
   const cursor = $derived(crosshairOffset(range));
-  const activities = $derived(clipPlacements(placements, range, error, status).sort((a, b) => (acrossNodes ? (({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""))) : 0) || a.start - b.start || a.id.localeCompare(b.id)));
+  const activities = $derived(placements.toSorted((a, b) => (acrossNodes ? (({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""))) : 0) || a.start - b.start || a.id.localeCompare(b.id)));
   const shown = $derived(activeOnly ? activities.filter((p) => p.intervals.length || p.error) : activities);
   const warnings = $derived([...new Set(activities.flatMap((p) => [p.partial, p.errorStatus !== 404 && p.error]).filter(Boolean))]);
   const ops = $derived([...new Set(shown.flatMap((p) => Object.keys(p.ops || {})))].sort((a, b) => opRank(a) - opRank(b) || a.localeCompare(b)));

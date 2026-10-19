@@ -4,12 +4,14 @@
 # green on machines without Redis.
 
 import asyncio
+import json
 import os
 import shutil
 import socket
 import subprocess
 import time
 import unittest
+from unittest.mock import patch
 
 import redis as sync_redis
 import redis.asyncio as redis
@@ -27,6 +29,29 @@ def free_port() -> int:
 
 
 class SampleStoreContract:
+  async def test_step_revisions_skip_decoding_and_change_for_corrections_and_expiry(self) -> None:
+    await self.state.put_steps("history", [{"step": 1, "value": 1}, {"step": 2, "value": 2}], 10, None)
+    revision, rows = await self.state.read_steps("history")
+    self.assertEqual([row["step"] for row in rows], [1, 2])
+    await self.state.put_steps("history", [], 10, None)
+    with patch("server.store.json.loads", side_effect=AssertionError("unchanged rows must not be decoded")):
+      self.assertEqual(await self.state.read_steps("history", ("older", revision)), (revision, None))
+    await self.state.put_steps("history", [{"step": 1, "value": 10}], 10, None)
+    corrected, rows = await self.state.read_steps("history", (revision,))
+    self.assertNotEqual(corrected, revision)
+    self.assertEqual(rows[0]["value"], 10)
+    self.assertEqual(json.loads(await self.state.get_value("latest:history"))["step"], 2)
+    await self.state.delete_values("revision:history")
+    self.assertEqual(await self.state.read_steps("history", (corrected,)), (None, rows))
+    await self.state.put_steps("history", [{"step": 2, "value": 20}], 10, 0)
+    self.assertEqual(await self.state.read_steps("history", (corrected,)), (None, []))
+    await self.state.put_steps("history", [{"step": 1, "value": 100}], 10, None)
+    recreated, rows = await self.state.read_steps("history", (revision, corrected))
+    self.assertNotIn(recreated, (revision, corrected))
+    self.assertEqual(rows, [{"step": 1, "value": 100}])
+    await self.state.delete_values("history")
+    self.assertEqual(await self.state.read_steps("history", (recreated,)), (None, []))
+
   async def test_sample_lists_keep_the_newest(self) -> None:
     for step in range(3):
       await self.state.append_sample("samples", {"step": step}, limit=2, ttl_seconds=60)
@@ -90,6 +115,29 @@ class RedisFutureTest(SampleStoreContract, unittest.IsolatedAsyncioTestCase):
     await self.state.append_sample("ops", {"n": 2}, 10, None)
     self.assertEqual(await self.store.redis.ttl("ops"), -1)
     self.assertEqual([s["n"] for s in await self.state.read_samples("ops")], [1, 2])
+
+  async def test_concurrent_replayed_batches_retain_distinct_steps_and_latest_precision(self) -> None:
+    await self.state.put_steps("steps", [{"step": step, "value": step} for step in range(4)], 4, 60)
+    latest = {"step": 2**53 - 1, "value": 0.12345678901234567}
+    await asyncio.gather(
+      *(self.state.put_steps("steps", rows, 4, 60) for rows in ([{"step": 3, "value": 30}] * 10, [latest], [{"step": 0, "value": 0}]))
+    )
+    _, rows = await self.state.read_steps("steps")
+    self.assertEqual([row["step"] for row in rows], [1, 2, 3, latest["step"]])
+    self.assertEqual(json.loads(await self.state.get_value("latest:steps")), latest)
+
+  async def test_thousand_row_batches_and_matching_history_export_expiry(self) -> None:
+    await self.state.put_steps("batch", [{"step": step} for step in range(1000)], 2000, None)
+    _, rows = await self.state.read_steps("batch")
+    self.assertEqual(len(rows), 1000)
+    for key in ("batch", "latest:batch", "revision:batch"):
+      self.assertEqual(await self.store.redis.ttl(key), -1)
+    for ttl in (0, 0.0001, 0.01):
+      await self.state.put_steps("batch", [{"step": 1}], 10, ttl)
+      await asyncio.sleep(0.02)
+      self.assertEqual(await self.state.read_steps("batch"), (None, []))
+      self.assertIsNone(await self.state.get_value("latest:batch"))
+      self.assertIsNone(await self.state.get_value("revision:batch"))
 
   async def asyncTearDown(self) -> None:
     await self.store.redis.aclose()

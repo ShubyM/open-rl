@@ -2,9 +2,10 @@
   import { untrack, tick } from "svelte";
   import { get, inspectUrl } from "./state.svelte.js";
   import { escapeRegExp } from "./format.js";
-  let { run, view, range, allLogs } = $props();
-  let records = $state([]), lifetimes = $state([]), cursor = $state(null), pending = $state(true), error = $state(null), source = $state(null), note = $state(null);
-  let controller, request = 0, loaded = "", filters = "", successfulParams, successfulEnd, failedPage, lines, fromBottom = 0;
+  let { run, view, range, allLogs, navigating = false } = $props();
+  let data = $state.raw(null), pending = $state(true), error = $state(null);
+  let controller, filters, failedCursor, lines, fromBottom = 0;
+  const records = $derived(data?.records || []), cursor = $derived(records.length < 2000 ? data?.next_cursor : null);
   // A shared runtime's pods also log for other runs, so by default the run sees only the lines that name it.
   let everything = $state(false);
   const scope = $derived(view.q || (run.shared_runtime && !everything ? run.run_id : ""));
@@ -14,11 +15,11 @@
   });
   const params = $derived({ run_id: view.id, q: scope, limit: "200", ...logRange, ...(view.pod ? { pod: view.pod } : {}) });
   // The user's selection, not the live window, which moves with every snapshot and is read at each load.
-  const queryKey = $derived(JSON.stringify([view.id, scope, view.pod, view.event, view.duration, view.end]));
   const filterKey = $derived(JSON.stringify([view.id, scope, view.pod, view.event, view.duration]));
+  const queryKey = $derived(`${filterKey}:${view.end}`);
   const sources = $derived.by(() => {
     const pods = new Map((run.pods || []).map((p) => [p.name, p]));
-    for (const record of [...lifetimes, ...records]) if (record.pod && !pods.has(record.pod)) pods.set(record.pod, { ...record, name: record.pod });
+    for (const record of [...(data?.sources || []), ...records]) if (record.pod && !pods.has(record.pod)) pods.set(record.pod, { ...record, name: record.pod });
     if (view.pod && !pods.has(view.pod)) pods.set(view.pod, { name: view.pod });
     return [...pods.values()].sort((a, b) => a.name.localeCompare(b.name));
   });
@@ -36,43 +37,42 @@
   const shown = $derived(records.toReversed());
   const paging = $derived(pending && view.end !== null);
   const status = $derived([
-    { gke: "Cloud Logging" }[source] || source || "Logs",
+    { gke: "Cloud Logging" }[data?.source] || data?.source || "Logs",
     records.length || !error ? `${records.length.toLocaleString()} ${records.length === 1 ? "record" : "records"}` : "",
     pending && !records.length ? "Loading…" : error ? "" : view.end === null ? "Live" : "Paused",
   ].filter(Boolean).join(" · "));
-  const stop = () => { request++; controller?.abort(); controller = null; pending = false; };
+  const stop = () => { controller?.abort(); controller = null; pending = false; };
   async function load(query, page = null) {
     stop();
-    const version = request, windowEnd = range.now;
-    controller = new AbortController();
+    const active = controller = new AbortController(), windowEnd = range.now;
     pending = true;
+    failedCursor = page;
     try {
-      const data = await get(inspectUrl("logs", { ...query, ...(page ? { cursor: page } : {}) }), controller.signal);
-      if (version !== request) return;
-      if (data.error) throw new Error(data.error);
+      // The signed cursor already pins the query window and pod lifetimes.
+      const { data: response } = await get(inspectUrl("logs", { ...query, ...(page ? { since: null, until: null, cursor: page } : {}) }), active.signal);
+      if (active.signal.aborted) return;
+      if (response.error) throw new Error(response.error);
       fromBottom = page ? lines.scrollHeight - lines.clientHeight - lines.scrollTop : 0;
-      records = [...new Map([...(page ? records : []), ...(data.records || [])].map((r) => [r.id, r])).values()].slice(0, 2000);
-      lifetimes = data.sources || [];
-      cursor = records.length < 2000 ? data.next_cursor : null;
-      source = data.source;
-      note = data.note || null;
+      data = { ...response, queryKey, windowEnd, records: [...new Map([...(page ? records : []), ...(response.records || [])].map((r) => [r.id, r])).values()].slice(0, 2000) };
       error = null;
-      successfulParams = query;
-      successfulEnd = windowEnd;
-      loaded = queryKey;
-      failedPage = null;
     } catch (failure) {
-      if (version === request) { error = failure.message; failedPage = { query, page }; }
-    } finally { if (version === request) { pending = false; controller = null; } }
+      if (!active.signal.aborted) { error = failure.message; if (page && failure.status === 400) failedCursor = null; }
+    } finally { if (!active.signal.aborted) { pending = false; controller = null; } }
   }
   $effect(() => {
-    const key = queryKey, follow = view.end === null, scope = filterKey;
+    if (navigating) return;
+    const key = queryKey, follow = view.end === null, filter = filterKey;
     return untrack(() => {
-      const changed = scope !== filters, searched = changed && filters && JSON.parse(scope)[1] !== JSON.parse(filters)[1];
-      if (changed) { records = []; cursor = source = error = note = null; loaded = ""; successfulParams = successfulEnd = undefined; filters = scope; }
-      const start = key !== loaded ? setTimeout(() => load(params), searched ? 250 : 0) : null;
-      const timer = follow ? setInterval(() => { if (!document.hidden && !pending) load(params); }, 5000) : null;
-      return () => { clearTimeout(start); clearInterval(timer); stop(); };
+      const changed = filter !== filters?.key, searched = filters && params.q !== filters.q;
+      if (changed) { data = error = null; filters = { key: filter, q: params.q }; }
+      let timer, active = true;
+      const refresh = async (first = false) => {
+        if (first || (!document.hidden && !pending)) await load(params);
+        if (active && follow) timer = setTimeout(refresh, 5000);
+      };
+      if (key !== data?.queryKey) timer = setTimeout(() => refresh(true), searched ? 250 : 0);
+      else if (follow) timer = setTimeout(refresh, 5000);
+      return () => { active = false; clearTimeout(timer); stop(); };
     });
   });
   // Pin the tail to the newest line; an older page keeps the lines in view where they were.
@@ -80,20 +80,19 @@
   function pause() {
     stop();
     // Event-clipped `until` can be earlier than the inspected window end.
-    view.end = successfulEnd ?? range.now;
-    if (successfulParams) loaded = queryKey;
+    view.end = data?.windowEnd ?? range.now;
+    if (data) data = { ...data, queryKey };
   }
   function follow() {
     view.event = view.end = null;
-    cursor = null;
-    loaded = "";
+    if (data) data = { ...data, next_cursor: null, queryKey: null };
   }
   async function older() {
     if (paging || !cursor) return;
     pause();
     // Wait for the paused query's effect cleanup before starting its next page.
     await tick();
-    load(successfulParams, cursor);
+    load(params, cursor);
   }
   const timestamp = (value) => Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : "";
   const severity = (record) => ["ERROR", "CRITICAL", "ALERT", "EMERGENCY"].includes(record.severity) ? "error" : record.severity === "WARNING" ? "warning" : undefined;
@@ -111,7 +110,7 @@
   <button type="button" class="chip" onclick={() => view.end === null ? pause() : follow()}>{view.end === null ? "Pause" : "Jump to latest"}</button>
 </div>
 <div id="log-status" class="log-status" role="status"><span>{status}</span>
-  {#if error}<span class="log-error">{error}{records.length ? " · Showing previously fetched records" : ""}</span><span><button type="button" class="chip" disabled={pending} onclick={() => load(failedPage.query, failedPage.page)}>Retry logs</button></span>{/if}
+  {#if error}<span class="log-error">{error}{records.length ? " · Showing previously fetched records" : ""}</span><span><button type="button" class="chip" disabled={pending} onclick={() => load(params, failedCursor)}>Retry logs</button></span>{/if}
 </div>
 <!-- svelte-ignore a11y_no_noninteractive_tabindex (The log region supports native keyboard scrolling.) -->
 <div id="log-lines" bind:this={lines} tabindex="0" role="region" aria-label="Run logs" style:--tag-width={`${tagWidth}ch`} onscroll={(event) => { const box = event.currentTarget; if (view.end === null && box.scrollHeight - box.clientHeight - box.scrollTop > 24) pause(); }}>
@@ -122,5 +121,5 @@
     <div class="workspace-logrow" data-key={record.id} data-severity={severity(record)}>
       <time class="log-time" datetime={at} title={at || "No timestamp"}>{at ? at.slice(11, 23) : "—"}</time><span class={`log-pod ${hues.get(record.pod) || ""}`} title={record.pod}>{record.pod?.slice(cut)}</span><pre class="log-message">{#each match ? record.message.split(match) : [record.message] as part, i}{#if i % 2}<mark>{part}</mark>{:else}{part}{/if}{/each}{#if record.message_truncated}<span class="muted">{"\n[Message truncated by source]"}</span>{/if}</pre>
     </div>
-  {:else}{#if !pending && !error}<p class="empty-state">{note || "No logs match this time range and filter"}</p>{/if}{/each}
+  {:else}{#if !pending && !error}<p class="empty-state">{data?.note || "No logs match this time range and filter"}</p>{/if}{/each}
 </div>

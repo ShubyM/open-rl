@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import unittest
@@ -271,7 +272,7 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.snapshot = snapshot.Snapshot()
     self.store = InMemoryStateStore()
     self.metadata = self.enterContext(patch.object(snapshot, "metadata_of", AsyncMock(return_value=copy.deepcopy(METADATA))))
-    self.enterContext(patch.object(snapshot.kubernetes, "read", return_value=STATE))
+    self.cluster = self.enterContext(patch.object(snapshot.kubernetes, "read", return_value=STATE))
     self.processes = self.enterContext(patch.object(snapshot, "processes_of", AsyncMock(return_value=[{"id": "past"}])))
     self.enterContext(patch.object(router, "snapshot", self.snapshot))
     self.enterContext(patch.object(router, "get_state_store", return_value=self.store))
@@ -283,18 +284,92 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     stale = await self.snapshot.current(self.store)
     self.assertEqual([r["run_id"] for r in stale["runs"]], [r["run_id"] for r in first["runs"]])
     self.assertEqual(stale["processes"], first["processes"])
-    # A brief outage is ridden out on the last records; one that lasts is reported.
-    self.assertEqual((stale["store_error"], stale["processes_error"]), (None, None))
-    with patch.object(snapshot, "STORE_GRACE_SECONDS", 0):
-      self.snapshot.invalidate()
-      lasting = await self.snapshot.current(self.store)
-    self.assertTrue(lasting["store_error"] and lasting["processes_error"])
-    self.assertEqual(lasting["processes"], first["processes"])
+    self.assertTrue(stale["store_error"] and stale["processes_error"])
+    self.assertEqual(stale["observed_at"], first["observed_at"])
+    self.assertIs(stale["runs"], first["runs"])
     self.metadata.side_effect = self.processes.side_effect = None
     self.metadata.return_value = self.processes.return_value = []
     self.snapshot.invalidate()
     recovered = await self.snapshot.current(self.store)
     self.assertEqual((recovered["runs"], recovered["store_error"], recovered["processes_error"]), ([], None, None))
+
+  async def test_a_failed_process_read_cannot_age_live_work_into_dead_work(self) -> None:
+    self.processes.return_value = [
+      {
+        "id": "worker",
+        "runtime_id": "Qwen/Qwen3-8B",
+        "role": "trainer",
+        "heartbeat_at": 1000,
+        "started_at": 900,
+        "phase": "on_gpu",
+        "outstanding": [{"run_id": "r1", "since": 995, "op": "forward_backward", "count": 1}],
+      }
+    ]
+    with patch.object(snapshot.time, "time", return_value=1000):
+      first = await self.snapshot.current(self.store)
+    self.processes.side_effect = TimeoutError()
+    self.snapshot.invalidate()
+    with patch.object(snapshot.time, "time", return_value=1100):
+      stale = await self.snapshot.current(self.store)
+    self.assertEqual(stale["observed_at"], first["observed_at"])
+    self.assertTrue(stale["processes_error"])
+    self.assertEqual(stale["runs"], first["runs"])
+    self.assertTrue(all(r.get("progress", {}).get("state") != "DEAD" for r in stale["runs"]))
+
+  async def test_status_reuses_the_metadata_already_read_by_the_snapshot(self) -> None:
+    with patch.object(self.store, "get_value", wraps=self.store.get_value) as read:
+      result = await self.snapshot.current(self.store)
+    self.assertFalse(any(call.args[0].startswith(snapshot.METADATA_PREFIX) for call in read.await_args_list))
+    self.assertTrue(all("_metadata" not in run for run in result["runs"]))
+
+  async def test_cluster_failure_preserves_placements_and_reports_the_error(self) -> None:
+    first = await self.snapshot.current(self.store)
+    self.cluster.return_value = snapshot.kubernetes.unavailable("openrl-system", "Kubernetes offline")
+    self.snapshot.invalidate()
+    stale = await self.snapshot.current(self.store)
+    self.assertEqual(stale["observed_at"], first["observed_at"])
+    self.assertEqual(stale["placements"], first["placements"])
+    self.assertEqual(stale["cluster"]["pods"], first["cluster"]["pods"])
+    self.assertIs(stale["cluster"], first["cluster"])
+    self.assertIn("Kubernetes offline", stale["error"])
+    self.cluster.return_value = STATE
+    self.snapshot.invalidate()
+    self.assertIsNone((await self.snapshot.current(self.store))["cluster"].get("error"))
+
+  async def test_dra_failure_preserves_idle_gpu_devices_without_claims(self) -> None:
+    self.cluster.return_value = {**copy.deepcopy(STATE), "nodes": [{"name": "n1", "devices": [{"id": "gpu0"}]}]}
+    self.cluster.return_value["devices"] = {"available": True, "claims": {}}
+    first = await self.snapshot.current(self.store)
+    self.cluster.return_value = copy.deepcopy(self.cluster.return_value)
+    self.cluster.return_value["devices"].update(available=False, error="DRA read failed")
+    self.cluster.return_value["nodes"][0]["devices"] = []
+    self.snapshot.invalidate()
+    stale = await self.snapshot.current(self.store)
+    self.assertEqual(stale["cluster"]["nodes"], first["cluster"]["nodes"])
+    self.assertEqual(stale["observed_at"], first["observed_at"])
+    self.assertIn("DRA read failed", stale["error"])
+
+  async def test_cancelled_request_does_not_restart_the_shared_source_read(self) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_metadata(store):
+      entered.set()
+      await release.wait()
+      return copy.deepcopy(METADATA)
+
+    self.metadata.side_effect = slow_metadata
+    first = asyncio.create_task(self.snapshot.current(self.store))
+    await entered.wait()
+    first.cancel()
+    with self.assertRaises(asyncio.CancelledError):
+      await first
+    second = asyncio.create_task(self.snapshot.current(self.store))
+    await asyncio.sleep(0)
+    release.set()
+    result = await second
+    self.assertEqual(len(result["runs"]), 3)
+    self.metadata.assert_awaited_once()
+    self.cluster.assert_called_once()
 
   async def test_a_run_created_since_the_cached_snapshot_is_found(self) -> None:
     await self.snapshot.current(self.store)

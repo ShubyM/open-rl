@@ -49,23 +49,20 @@ def incidents(run: dict, start: float, end: float) -> list[dict]:
   return list(unique.values())
 
 
-def segments(state: dict, run_id=None, node_id=None) -> list[dict]:
-  """One lane per worker process from the record it keeps, plus placed workloads whose
-  process has not reported yet. A lane on a shared runtime splits into one per run."""
+def sources(state: dict, run_id=None, node_id=None, samples=()) -> list[dict]:
+  """Pod lifetimes shared by activity, logs and series. Historical sampler identity
+  is limited to retained operations; dispatcher identity comes from its process record."""
   observed = datetime.fromisoformat(state["observed_at"]).timestamp()
   runs = state["runs"]
   uuids = {d["uuid"]: d["id"] for node in state["cluster"]["nodes"] for d in node["devices"] if d.get("uuid")}
   placed = {p["pod_uid"]: p for p in state["placements"] if p.get("pod_uid")}
   found = []
   for record in state["processes"]:
-    if record.get("role") == "dispatcher":
-      continue  # a pool's CPU process: it shows in progress, not as a GPU lane
     placement = placed.pop(record.get("pod_uid"), {})
     live = alive(record, observed)
     end = observed if live else record["heartbeat_at"]
-    members = [
-      r for r in runs if r["runtime_id"] == record["runtime_id"] and r["created_at"] <= end and (r["completed_at"] or end) >= record["started_at"]
-    ]
+    owner = "pool" if record.get("role") == "dispatcher" else "runtime_id"
+    members = [r for r in runs if r.get(owner) == record.get(owner) and r["created_at"] <= end and (r["completed_at"] or end) >= record["started_at"]]
     ids, gpus = [r["run_id"] for r in members], record.get("gpus") or []
     # A GPU no current device slot reports keeps its UUID as its identity, so its series stay queryable.
     found.append(
@@ -86,6 +83,31 @@ def segments(state: dict, run_id=None, node_id=None) -> list[dict]:
   for placement in [*placed.values(), *(p for p in state["placements"] if not p.get("pod_uid"))]:
     started = datetime.fromisoformat(placement["created_at"]).timestamp() if placement.get("created_at") else observed
     found.append({**placement, "start": started, "end": observed, "ended": False})
+  # Dispatchers are Deployments, not scheduler Workloads. Include their current
+  # pods even before the process's first record, and retain every associated run.
+  by_pod = {(p.get("pod"), p.get("pod_uid")): p for p in found}
+  for run in runs:
+    for pod in run.get("pods", []):
+      if pod.get("role") != "dispatcher":
+        continue
+      key = pod["name"], pod.get("uid")
+      if key not in by_pod:
+        lane = {
+          "id": pod.get("uid") or pod["name"],
+          "pod": pod["name"],
+          "pod_uid": pod.get("uid"),
+          "role": pod.get("role"),
+          "node": pod.get("node") or "",
+          "run_ids": [],
+          "devices": pod.get("devices", []),
+          "start": datetime.fromisoformat(pod["created_at"]).timestamp() if pod.get("created_at") else observed,
+          "end": observed,
+          "ended": False,
+        }
+        found.append(lane)
+        by_pod[key] = lane
+      if run["run_id"] not in by_pod[key]["run_ids"]:
+        by_pod[key]["run_ids"].append(run["run_id"])
   lanes = []
   for lane in found:
     if lane.get("shared_runtime") and lane["run_ids"]:
@@ -102,7 +124,14 @@ def segments(state: dict, run_id=None, node_id=None) -> list[dict]:
         )
     else:
       lanes.append(lane)
+  if run_id and not node_id:
+    lanes += recorded_lanes(run_id, lanes, samples)
   return [p for p in lanes if (not run_id or run_id in p["run_ids"]) and (not node_id or p["node"] == node_id)]
+
+
+def segments(state: dict, run_id=None, node_id=None, samples=()) -> list[dict]:
+  """Activity's GPU lanes are the canonical sources without pool CPU processes."""
+  return [p for p in sources(state, run_id, node_id, samples) if p.get("role") != "dispatcher"]
 
 
 def merge(intervals: list) -> list:
@@ -125,9 +154,7 @@ def matches(sample: dict, placement: dict) -> bool:
 
 def activity(state: dict, start: float, end: float, operations: dict, run_id=None, node_id=None) -> dict:
   """GPU turns and recorded ops for each lane in the window. Never utilization."""
-  lanes = segments(state, run_id, node_id)
-  if run_id and not node_id:
-    lanes += recorded_lanes(run_id, lanes, operations.get(run_id, {}).get("samples", []))
+  lanes = segments(state, run_id, node_id, operations.get(run_id, {}).get("samples", []))
   return {"placements": [lane_activity(p, start, end, operations) for p in lanes if p["start"] <= end and p["end"] >= start]}
 
 

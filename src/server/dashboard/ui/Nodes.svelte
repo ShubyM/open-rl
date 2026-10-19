@@ -4,34 +4,33 @@
   import Activity from "./Activity.svelte";
   import CopyLink from "./CopyLink.svelte";
   import TimeControl from "./TimeControl.svelte";
-  import { createQuery, inspectUrl, now, viewLink, crosshair, crosshairOffset, timeAt, MAX_WINDOW } from "./state.svelte.js";
+  import { createQuery, inspectUrl, now, rangeOf, viewLink, crosshair, crosshairOffset, timeAt } from "./state.svelte.js";
   import { nodeTime } from "./node-time.js";
+  import { mergeSeries, seriesError } from "./series.js";
   import { axisTime, deviceLabel, acceleratorLabel, shortNodeName, placementColor, clipPlacements, duty, claimLabel, capacityBars, activitySource, deviceSeries, sumSeries, gapFor, lastValue } from "./visualization.js";
 
   let { inventory, view } = $props();
-  let element, frozen = $state(null);
+  let element, navigating = $state(false);
   const observed = $derived(now(inventory));
-  const range = $derived.by(() => {
-    const duration = Math.max(60, Math.min(MAX_WINDOW, Math.round(view.duration || 1800)));
-    const end = Math.max(observed - MAX_WINDOW + duration, Math.min(observed, view.end ?? observed));
-    return { start: end - duration, now: end, live: view.end === null };
-  });
-  const queryRange = $derived(frozen || range);
-  const bounds = $derived({ since: new Date(queryRange.start * 1000).toISOString(), until: new Date(queryRange.now * 1000).toISOString() });
-  const selection = () => `${view.duration} ${view.end} ${frozen?.start ?? ""} ${frozen?.now ?? ""}`;
-  const history = createQuery(() => inspectUrl("activity", bounds), { poll: 15000, pollWhen: () => !frozen, key: selection });
+  const range = $derived(rangeOf(inventory, view));
+  const bounds = $derived({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() });
+  const selection = () => !navigating && `${view.duration} ${view.end}`;
+  const history = createQuery(() => inspectUrl("activity", bounds), { poll: 15000, pollWhen: () => view.end === null, key: selection });
   // Lanes wait for the first history response so they render once, complete, instead of filling in and shifting.
   const loading = $derived(!history.data && !history.error);
   const all = $derived(clipPlacements(history.data?.placements || [], range, history.error, history.status));
   const node = $derived(inventory.cluster.nodes.find((n) => n.name === view.node));
-  const series = createQuery(() => node ? inspectUrl("series", { node_id: node.name, ...bounds }) : null, { scope: () => node?.name, poll: 15000, pollWhen: () => !frozen, key: () => node && `${node.name} ${selection()}` });
+  const series = createQuery(() => node ? inspectUrl("series", { node_id: node.name, kind: "hardware", ...bounds }) : null, { scope: () => node?.name ?? null, merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, key: () => node && !navigating && `${node.name} ${selection()}` });
   const metrics = $derived(series.data || { devices: [], workers: [], reason: series.error || "Loading…" });
   const selectedDevices = $derived([...new Map((metrics.devices || []).filter((d) => view.gpu === "all" || view.gpu === d.id).map((d) => [d.uuid || d.id, d])).values()]);
   const gpuPoints = $derived(deviceSeries(selectedDevices, "utilization"));
   const cpuPoints = $derived(sumSeries(metrics.workers || [], "cpu_cores"));
   const gpuMemory = $derived(lastValue(deviceSeries(selectedDevices, "memory_mib"), range));
   const workerMemory = $derived(lastValue(sumSeries(metrics.workers || [], "memory_bytes"), range));
-  const failures = $derived([...new Set([series.error, ...selectedDevices.map((d) => d.reason)].filter(Boolean))]);
+  const gpuError = $derived(seriesError(selectedDevices, "utilization", series.error));
+  const cpuError = $derived(seriesError(metrics.workers || [], "cpu_cores", series.error));
+  const gpuMemoryError = $derived(seriesError(selectedDevices, "memory_mib", series.error));
+  const workerMemoryError = $derived(seriesError(metrics.workers || [], "memory_bytes", series.error));
   const visible = $derived(all.filter((p) => p.node === node?.name && (view.gpu === "all" || p.devices.includes(view.gpu)) && p.start <= range.now && p.end >= range.start));
   const errors = $derived([...new Set([inventory.cluster.error, inventory.cluster.nodes_error, inventory.cluster.devices?.error, inventory.cluster.scheduler?.error, inventory.processes_error, history.error].filter(Boolean))]);
   const nodes = $derived([...inventory.cluster.nodes].sort((a, b) => Number(inventory.placements.some((p) => p.node === b.name)) - Number(inventory.placements.some((p) => p.node === a.name)) || Number(b.gpu_capacity > 0) - Number(a.gpu_capacity > 0)));
@@ -83,7 +82,7 @@
   onDestroy(() => element?.closest("#app")?.style.removeProperty("min-height"));
 </script>
 <svelte:window onhashchange={() => scrollSelection = true} onkeydown={escapeKey} />
-<div bind:this={element} use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => frozen = value }} data-crosshair={cursor !== null ? "" : undefined} style:--crosshair={`${cursor ?? 0}%`}>
+<div bind:this={element} use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => navigating = !!value }} data-crosshair={cursor !== null ? "" : undefined} style:--crosshair={`${cursor ?? 0}%`}>
   <div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>
     <div class="time-control" aria-label="Node time range">
       <TimeControl {view} {range} {observed} /><CopyLink />
@@ -122,11 +121,11 @@
             <!-- GPU labels wait for the first metrics response, so the centered numbers don't slide when utilization arrives. -->
             {#each devices as device (device.id)}{@const value = lastValue(deviceSeries((metrics.devices || []).filter((d) => d.id === device.id), "utilization"), range)}<button type="button" class="chip" data-device={device.id} title={`GPU ${deviceLabel(device.name)}`} aria-pressed={view.gpu === device.id} onclick={() => { keepViewport(); view.gpu = device.id; }}>{#if series.data || series.error}{deviceLabel(device.name)}{Number.isFinite(value) ? ` · ${Math.round(value)}%` : ""}{/if}</button>{/each}
           </div>{/if}
-          <div class="node-activity" data-key="node-timeline"><Activity placements={visible} {range} {inventory} selected={view.placement} onselect={select} {back} activeOnly showSource={false} navigating={!!frozen} /></div>
-          {#if item.gpu_capacity}<div class="node-gpu-detail" data-key="node-gpu-detail"><div><Chart title={`GPU utilization · ${label}`} unit="%" points={gpuPoints} start={range.start} end={range.now} min={0} max={100} gapSeconds={gapFor(gpuPoints, 60)} empty={series.error || metrics.reason || selectedDevices.find((d) => d.reason)?.reason || "No samples for this GPU"} note={failures.length ? `${failures.join(" · ")}${series.error ? " · Showing previously fetched samples" : ""}` : ""} navigating={!!frozen} />
+          <div class="node-activity" data-key="node-timeline"><Activity placements={visible} {range} {inventory} selected={view.placement} onselect={select} {back} activeOnly showSource={false} {navigating} /></div>
+          {#if item.gpu_capacity}<div class="node-gpu-detail" data-key="node-gpu-detail"><div><Chart title={`GPU utilization · ${label}`} unit="%" points={gpuPoints} start={range.start} end={range.now} min={0} max={100} gapSeconds={gapFor(gpuPoints, 60)} empty={gpuError || (!series.data && metrics.reason) || "No samples for this GPU"} note={gpuError ? `${gpuError} · Showing previously fetched samples` : ""} {navigating} />
             {#if series.error}<button type="button" class="chip" onclick={series.retry}>Retry GPU metrics</button>{/if}
-          </div><div class="allocation-detail-footer"><span>{activitySource(visible)}</span><span class="allocation-memory">GPU memory <strong>{Number.isFinite(gpuMemory) ? `${(gpuMemory / 1024).toFixed(1)} GiB` : "—"}</strong></span></div></div>{/if}
-          {#if placements.length || metrics.workers?.length}<div class="node-gpu-detail" data-key="node-worker-detail"><Chart title={`Worker CPU${metrics.workers.length ? ` · ${metrics.workers.length} process${metrics.workers.length === 1 ? "" : "es"}` : ""}`} unit="cores" points={cpuPoints} start={range.start} end={range.now} min={0} gapSeconds={gapFor(cpuPoints, 180)} empty={metrics.reason || metrics.workers.find((w) => w.reason)?.reason || "No CPU samples for these workers"} navigating={!!frozen} /><div class="allocation-detail-footer"><span>{sourceNote}</span><span class="allocation-memory">Worker memory <strong>{Number.isFinite(workerMemory) ? `${(workerMemory / 2 ** 30).toFixed(1)} GiB` : "—"}</strong></span></div></div>{/if}
+          </div><div class="allocation-detail-footer"><span>{activitySource(visible)}</span><span class="allocation-memory">GPU memory <strong>{Number.isFinite(gpuMemory) ? `${(gpuMemory / 1024).toFixed(1)} GiB` : "—"}</strong>{#if gpuMemoryError}<span class="source-error" role="status"> · {Number.isFinite(gpuMemory) ? "Stale" : "Unavailable"}: {gpuMemoryError}</span>{/if}</span></div></div>{/if}
+          {#if placements.length || metrics.workers?.length}<div class="node-gpu-detail" data-key="node-worker-detail"><Chart title={`Worker CPU${metrics.workers.length ? ` · ${metrics.workers.length} process${metrics.workers.length === 1 ? "" : "es"}` : ""}`} unit="cores" points={cpuPoints} start={range.start} end={range.now} min={0} gapSeconds={gapFor(cpuPoints, 180)} empty={cpuError || (!series.data && metrics.reason) || "No CPU samples for these workers"} note={cpuError ? `${cpuError} · Showing previously fetched samples` : ""} {navigating} /><div class="allocation-detail-footer"><span>{sourceNote}</span><span class="allocation-memory">Worker memory <strong>{Number.isFinite(workerMemory) ? `${(workerMemory / 2 ** 30).toFixed(1)} GiB` : "—"}</strong>{#if workerMemoryError}<span class="source-error" role="status"> · {Number.isFinite(workerMemory) ? "Stale" : "Unavailable"}: {workerMemoryError}</span>{/if}</span></div></div>{/if}
         </section>
       {/if}
     </div>

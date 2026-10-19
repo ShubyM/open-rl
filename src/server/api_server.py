@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import math
 import os
 import re
 import time
@@ -36,7 +35,8 @@ from server.model_metadata import (
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import get_state_store, get_store
-from server.telemetry import ops
+from server.telemetry import http as telemetry_http
+from server.telemetry import run_metrics as client_metrics
 from server.telemetry.tracing import configure_tracing
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
@@ -658,7 +658,8 @@ async def lifespan(_: FastAPI):
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
   reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
   try:
-    yield
+    async with telemetry_http.lifespan():
+      yield
   finally:
     if reap_task is not None:
       reap_task.cancel()
@@ -1281,37 +1282,10 @@ async def list_adapters():
 # *** Internal ***
 
 
-RUN_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
-METRICS_PER_ROW = 500
-
-
-class RunMetricsRow(BaseModel):
-  step: int = Field(ge=0)
-  metrics: dict[str, Any]
-
-
-class RunMetricsRequest(BaseModel):
-  rows: list[RunMetricsRow] = Field(max_length=1000)
-
-
 @app.post("/api/v1/runs/{run_id}/metrics")
-async def run_metrics(run_id: str, body: RunMetricsRequest):
-  """A training client's own per-step metrics (rewards, eval pass rates, losses), kept
-  beside the run's operation records for the dashboard. A step sent again replaces the
-  earlier row. Values that are not finite numbers are dropped."""
-  if not RUN_ID.fullmatch(run_id):
-    raise HTTPException(status_code=400, detail="run_id must be 1-128 letters, digits, '.', '_', ':' or '-'")
-  at, accepted = time.time(), 0
-  for row in body.rows:
-    values = {
-      name: float(value)
-      for name, value in list(row.metrics.items())[:METRICS_PER_ROW]
-      if len(name) <= 200 and isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
-    }
-    if values:
-      await state.append_sample(ops.metrics_key(run_id), {"step": row.step, "at": at, "metrics": values}, ops.SAMPLE_LIMIT, ops.TTL_SECONDS)
-      accepted += 1
-  return {"accepted": accepted}
+async def run_metrics(run_id: str, body: client_metrics.Request):
+  """Replace per-step client metrics; expose retained history and latest values to operators."""
+  return await client_metrics.ingest(state, run_id, body)
 
 
 @app.post("/api/v1/telemetry")

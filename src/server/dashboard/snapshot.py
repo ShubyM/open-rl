@@ -18,8 +18,6 @@ from server.telemetry import kubernetes, ops
 from server.worker_manager import FAILED, READY, STARTING, STOPPED, WAITING_FOR_PLACEMENT
 
 CACHE_SECONDS = 5
-# A store read that fails briefly, say a dropped tunnel, is ridden out on the last records before it is reported.
-STORE_GRACE_SECONDS = 30
 # The longest window the dashboard shows, matching the logs API's seven-day limit.
 HISTORY_WINDOW_SECONDS = 7 * 86400
 METADATA_PREFIX = "open_rl:model_meta:"
@@ -72,9 +70,10 @@ def display_status(run: dict, launcher: str) -> str:
 
 async def add_status(ctx: openrl_status.StatusContext, run: dict) -> None:
   """Worker and session state as the gateway reports it, for runs that may still have workers."""
+  meta = run.pop("_metadata")
   if run["status"] == "active":
     try:
-      run.update(await asyncio.wait_for(openrl_status.model_status(ctx, run["run_id"]), timeout=5) or {})
+      run.update(await asyncio.wait_for(openrl_status.model_status(ctx, run["run_id"], meta), timeout=5) or {})
     except Exception as exc:
       run.update(workers_error=f"status unavailable: {type(exc).__name__}", summary="status unavailable")
   run["summary"] = "; ".join([run["summary"], *(pod["problem"] for pod in run["pods"] if pod["problem"])])
@@ -98,7 +97,7 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
   runs = []
   for row in metadata:
     run_id = row["model_id"]
-    meta = decode_model_metadata(json.dumps(row))
+    meta = decode_model_metadata(row)
     kind = "lora" if meta.fine_tuning_type == "lora" else "fft"
     runtime = meta.runtime(run_id)
     shared, pool = runtime != run_id, meta.pool(run_id)
@@ -115,6 +114,7 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
         pods.append(pod)
     runs.append(
       {
+        "_metadata": meta,
         "run_id": run_id,
         "name": row.get("name") or row.get("run_name") or f"{(meta.base_model or 'Run').split('/')[-1]} · {run_id[:8]}",
         "model": meta.base_model,
@@ -225,8 +225,6 @@ async def add_progress(store: StateStore, run: dict, processes: list[dict], now:
     run["progress"] = {"state": "UNKNOWN", "reason": f"progress unavailable: {type(exc).__name__}"}
     return
   run["progress"] = progress(run, processes, recent, {"trainer": trainer}, now, backlog)
-  if run["progress"]["state"] in ("DEAD", "STALLED") and run["display_status"] in ("Ready", "Active"):
-    run["display_status"] = "Stalled"
 
 
 async def processes_of(store: StateStore, since: float) -> list[dict]:
@@ -269,55 +267,77 @@ class Snapshot:
   """Reads the cluster at most once per CACHE_SECONDS however many pages poll."""
 
   def __init__(self) -> None:
-    self.lock = asyncio.Lock()
+    self.refresh: asyncio.Task | None = None
     self.latest: dict | None = None
     self.updated = 0.0
-    self.metadata: list[dict] = []
-    self.failing: dict[str, float] = {}
     # The gateway mount swaps in its own worker manager's context.
     self.status_context: Callable[[StateStore, dict], openrl_status.StatusContext] = cluster_status_context
 
   async def current(self, store: StateStore) -> dict:
-    async with self.lock:
-      if self.latest is not None and time.monotonic() - self.updated < CACHE_SECONDS:
-        return self.latest
-      cluster = await asyncio.to_thread(kubernetes.read)
-      store_error = None
-      try:
-        self.metadata = await asyncio.wait_for(metadata_of(store), timeout=5)
-        self.failing.pop("store", None)
-      except Exception:
-        if self.lasting("store") or not self.metadata:
-          store_error = "Run store unavailable; showing last known run records" if self.metadata else "Run store unavailable"
-      runs = join_runs(self.metadata, cluster)
-      ctx = self.status_context(store, cluster)
-      await asyncio.gather(*(add_status(ctx, run) for run in runs))
-      now = time.time()
-      processes_error = None
-      try:
-        processes = await asyncio.wait_for(processes_of(store, now - HISTORY_WINDOW_SECONDS), timeout=5)
-        self.failing.pop("processes", None)
-      except Exception:
-        processes = self.latest["processes"] if self.latest else []
-        if self.lasting("processes") or not processes:
-          processes_error = "Worker process records unavailable; showing last known" if processes else "Worker process records unavailable"
-      await asyncio.gather(*(add_progress(store, run, processes, now) for run in runs if run["status"] == "active"))
-      self.latest = {
-        "observed_at": datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds"),
-        "cluster": cluster,
-        "runs": runs,
-        "store_error": store_error,
-        "placements": placements_of(cluster, runs),
-        "processes": processes,
-        "processes_error": processes_error,
-      }
-      self.updated = time.monotonic()
+    if self.latest is not None and time.monotonic() - self.updated < CACHE_SECONDS:
       return self.latest
+    if self.refresh is None or self.refresh.done():
+      self.refresh = asyncio.create_task(self.read(store))
+      self.refresh.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+    # A client timeout cannot cancel the shared read and start overlapping Kubernetes threads.
+    return await asyncio.shield(self.refresh)
 
-  def lasting(self, source: str) -> bool:
-    """Whether this source has been failing longer than the grace period."""
-    since = self.failing.setdefault(source, time.monotonic())
-    return time.monotonic() - since > STORE_GRACE_SECONDS
+  async def read(self, store: StateStore) -> dict:
+    now = time.time()
+    cluster, metadata, processes = await asyncio.gather(
+      asyncio.to_thread(kubernetes.read),
+      asyncio.wait_for(metadata_of(store), timeout=5),
+      asyncio.wait_for(processes_of(store, now - HISTORY_WINDOW_SECONDS), timeout=5),
+      return_exceptions=True,
+    )
+    if isinstance(cluster, Exception):
+      cluster = kubernetes.unavailable(kubernetes.namespace(), "Cluster inventory unavailable")
+    store_error = "Run store unavailable" if isinstance(metadata, Exception) else None
+    processes_error = "Worker process records unavailable" if isinstance(processes, Exception) else None
+    if self.latest:
+      previous = self.latest["cluster"]
+      errors = [store_error, processes_error, cluster.get("error"), cluster.get("nodes_error")]
+      if previous["scheduler"]["workloads"]:
+        errors.append(cluster["scheduler"].get("error"))
+      if any(node.get("devices") for node in previous.get("nodes", [])):
+        errors.append(cluster["devices"].get("error"))
+      if any(errors):
+        # Keep the entire observation intact; report the failed refresh separately.
+        self.latest = {
+          **self.latest,
+          "store_error": store_error,
+          "processes_error": processes_error,
+          "error": "; ".join(dict.fromkeys(error for error in errors if error)),
+        }
+        self.updated = time.monotonic()
+        return self.latest
+    runs = join_runs([] if store_error else metadata, cluster)
+    processes = [] if processes_error else processes
+    ctx = self.status_context(store, cluster)
+
+    async def enrich(run):
+      tasks = [add_status(ctx, run)]
+      if run["status"] == "active":
+        if processes_error:
+          run["progress"] = {"state": "UNKNOWN", "reason": processes_error}
+        else:
+          tasks.append(add_progress(store, run, processes, now))
+      await asyncio.gather(*tasks)
+      if run.get("progress", {}).get("state") in ("DEAD", "STALLED") and run["display_status"] in ("Ready", "Active"):
+        run["display_status"] = "Stalled"
+
+    await asyncio.gather(*(enrich(run) for run in runs))
+    self.latest = {
+      "observed_at": datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds"),
+      "cluster": cluster,
+      "runs": runs,
+      "store_error": store_error,
+      "placements": placements_of(cluster, runs),
+      "processes": processes,
+      "processes_error": processes_error,
+    }
+    self.updated = time.monotonic()
+    return self.latest
 
   def invalidate(self) -> None:
     """Read again on the next call, still falling back to this snapshot's records."""

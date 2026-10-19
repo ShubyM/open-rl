@@ -30,9 +30,9 @@ configMapGenerator:
 
 images:
   - name: ghcr.io/gke-labs/open-rl/server
-    newTag: latest
+    newTag: 0.6.19
   - name: ghcr.io/gke-labs/open-rl/api-server
-    newTag: latest
+    newTag: 0.6.19
 
 # FFT remains an optional deployment with cooperative GPU sharing.
 patches:

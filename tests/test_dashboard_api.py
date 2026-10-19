@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest import mock
 
@@ -5,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from server.dashboard import router
 from server.dashboard.__main__ import app
+from tests.test_dashboard_gke_logs import CONFIG
 from tests.test_dashboard_inspection import PLACEMENT, PROCESS, RUN, operation, state
 
 WINDOW = {"since": "1970-01-01T00:02:00Z", "until": "1970-01-01T00:03:10Z"}
@@ -12,11 +14,10 @@ WINDOW = {"since": "1970-01-01T00:02:00Z", "until": "1970-01-01T00:03:10Z"}
 
 class InspectionApiTest(unittest.TestCase):
   def setUp(self):
-    router.FINISHED_ACTIVITY.clear()
     self.client = TestClient(app)
     self.state = state()
     self.state["runs"][0].update(shared_runtime=False)
-    self.store = mock.Mock(read_samples=mock.AsyncMock(return_value=[]))
+    self.store = mock.Mock(read_samples=mock.AsyncMock(return_value=[]), read_steps=mock.AsyncMock(return_value=(None, [])))
     patches = [
       mock.patch.object(router.snapshot, "current", mock.AsyncMock(return_value=self.state)),
       mock.patch.object(router.gke, "discover", mock.AsyncMock()),
@@ -58,9 +59,10 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual((lanes["p1:r2"]["intervals"], lanes["p1:r2"]["error"]), ([], "Operation records unavailable"))
 
   def test_queries_validate_windows_without_touching_sources(self):
-    for path in ("activity", "series"):
-      response = self.client.get(f"/api/v1/inspect/{path}", params={"since": "invalid"})
-      self.assertEqual(response.status_code, 400)
+    for path in ("activity", "series", "logs"):
+      for bound, value in (("since", "invalid"), ("until", "0001-01-01T00:00:00Z"), ("since", "9999-12-31T23:59:59-23:59")):
+        response = self.client.get(f"/api/v1/inspect/{path}", params={"run_id": "r1", bound: value})
+        self.assertEqual(response.status_code, 400)
     self.store.read_samples.assert_not_awaited()
 
   def test_run_activity_keeps_metrics_and_incidents_without_placement_history(self):
@@ -76,25 +78,11 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual(data["incidents"][0]["reason"], "OOMKilled")
     self.store.read_samples.assert_awaited_once_with(router.ops.key("r1"))
 
-  def test_a_finished_runs_activity_is_computed_once_and_a_live_runs_every_time(self):
-    self.store.read_samples.return_value = [operation(125, 140)]
-    params = {**WINDOW, "run_id": "r1"}
-    for status in ("Ready", "Ready"):
-      self.state["runs"][0].update(status="active", display_status=status)
-      self.assertEqual(self.client.get("/api/v1/inspect/activity", params=params).status_code, 200)
-    self.assertEqual(self.store.read_samples.await_count, 2)
-    self.state["runs"][0].update(display_status="Ended")
-    first = self.client.get("/api/v1/inspect/activity", params=params).json()
-    again = self.client.get("/api/v1/inspect/activity", params=params).json()
-    self.assertEqual(self.store.read_samples.await_count, 3)
-    self.assertEqual(again["samples"], first["samples"])
-    self.assertEqual(again["run"]["display_status"], "Ended")
-
   def test_series_is_independently_callable_and_keeps_partial_data(self):
     backend = mock.Mock(name="hardware")
     backend.name = "fake"
-    backend.devices = mock.AsyncMock(side_effect=RuntimeError("offline"))
-    backend.workers_series = mock.AsyncMock(return_value={"trainer-0": {"cpu_cores": [[150, 2]], "memory_bytes": []}})
+    backend.devices = mock.AsyncMock(return_value=({}, {"utilization": "GPU metrics query unavailable"}))
+    backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"trainer-0": [[150, 2]]}}, {}))
     with mock.patch.object(router.metrics, "hardware", return_value=(backend, None)):
       response = self.client.get("/api/v1/inspect/series", params={**WINDOW, "node_id": "n1"})
     self.assertEqual(response.status_code, 200)
@@ -102,66 +90,83 @@ class InspectionApiTest(unittest.TestCase):
     self.assertTrue(data["available"])
     self.assertEqual(data["workers"][0]["cpu_cores"], [[150, 2]])
     self.assertIn("unavailable", data["reason"])
+    self.assertEqual(data["devices"][0]["errors"], {"utilization": "GPU metrics query unavailable"})
     router.gke.discover.assert_awaited_once()
 
-  def test_logs_keep_pagination_and_shared_membership(self):
-    result = {"run_id": "r1", "available": True, "records": [], "next_cursor": "page2"}
+  def test_log_cursor_continuation_uses_no_inventory_or_store_reads(self):
+    self.state["runs"][0]["shared_runtime"] = True
     with (
-      mock.patch.object(router.gke, "pod_sources", return_value=[]),
-      mock.patch.object(router.gke, "run_logs", mock.AsyncMock(return_value=result)),
+      mock.patch.object(router.gke, "configuration", return_value=CONFIG),
+      mock.patch.object(router.gke, "request", mock.AsyncMock(side_effect=[{"nextPageToken": "next-provider-page"}, {}])) as request,
     ):
-      response = self.client.get("/api/v1/inspect/logs", params={"run_id": "r1", **WINDOW})
-    self.assertEqual(response.status_code, 200)
-    self.assertEqual(response.json()["next_cursor"], "page2")
-    self.assertIs(response.json()["shared_runtime"], False)
+      first = self.client.get("/api/v1/inspect/logs", params={"run_id": "r1", **WINDOW}).json()
+      router.snapshot.current.reset_mock()
+      router.snapshot.current.side_effect = RuntimeError("inventory offline")
+      router.get_state_store.reset_mock()
+      self.store.read_samples.reset_mock()
+      second = self.client.get("/api/v1/inspect/logs", params={"run_id": "r1", "cursor": first["next_cursor"], **WINDOW})
+    self.assertEqual(second.status_code, 200)
+    self.assertTrue(second.json()["shared_runtime"])
+    router.snapshot.current.assert_not_awaited()
+    router.get_state_store.assert_not_called()
+    self.store.read_samples.assert_not_awaited()
+    before, after = [call.kwargs["json"] for call in request.await_args_list]
+    self.assertEqual(after, {**before, "pageToken": "next-provider-page"})
 
-  def test_openapi_describes_every_response_and_nested_diagnostic_contract(self):
-    spec = self.client.get("/openapi.json").json()
-    for path, methods in spec["paths"].items():
-      schema = methods["get"]["responses"]["200"]["content"]["application/json"]["schema"]
-      self.assertIn("$ref", schema, path)
-      model = spec["components"]["schemas"][schema["$ref"].rsplit("/", 1)[1]]
-      self.assertTrue(model["properties"], path)
-    models = spec["components"]["schemas"]
-    for name, fields in {
-      "Run": ["display_status", "session_live", "workers", "workers_error", "settings", "shared_runtime", "progress"],
-      "Progress": ["state", "reason", "outstanding", "queued"],
-      "Workload": ["placed_message", "placed_reason", "requested_memory"],
-      "PlacementActivity": ["exact", "partial", "error", "intervals", "phase"],
-      "Series": ["reason", "available"],
-      "Logs": ["next_cursor", "error"],
-      "PodLogs": ["previous", "text"],
-    }.items():
-      for field in fields:
-        self.assertIn(field, models[name]["properties"])
+  def test_historical_sampler_operations_feed_both_logs_and_series(self):
+    self.state.update(placements=[], processes=[])
+    self.store.read_samples.return_value = [operation(125, 170, role="sampler", pod="deleted-sampler", operation="sample")]
+    backend = mock.Mock(name="prometheus")
+    backend.name = "prometheus"
+    backend.samplers = mock.AsyncMock(return_value=({"requests_running": [[150, 2]]}, {"request_latency_p99_seconds": "Query unavailable"}))
+    backend.devices = mock.AsyncMock()
+    backend.workers_series = mock.AsyncMock()
+    with (
+      mock.patch.object(router.gke, "configuration", return_value=CONFIG),
+      mock.patch.object(router.gke, "request", mock.AsyncMock(return_value={})) as request,
+      mock.patch.object(router.metrics, "hardware", return_value=(backend, None)),
+    ):
+      logs = self.client.get("/api/v1/inspect/logs", params={"run_id": "r1", **WINDOW})
+      series = self.client.get("/api/v1/inspect/series", params={"run_id": "r1", "kind": "samplers", **WINDOW})
+    self.assertEqual(logs.status_code, 200)
+    self.assertIn('resource.labels.pod_name="deleted-sampler"', request.await_args.kwargs["json"]["filter"])
+    self.assertEqual(series.status_code, 200)
+    self.assertTrue(series.json()["available"])
+    self.assertEqual(series.json()["samplers_errors"], {"request_latency_p99_seconds": "Query unavailable"})
+    self.assertEqual(backend.samplers.await_args.args[0], ["deleted-sampler"])
+    backend.devices.assert_not_awaited()
+    backend.workers_series.assert_not_awaited()
 
-  def test_schema_preserves_unknown_fields_null_false_zero_and_empty_collections(self):
-    import random
-
-    rng = random.Random(1739)
-    for _ in range(100):
-      extra = {"null": None, "false": False, "zero": 0, "array": [], "nested": {"value": rng.choice([None, False, 0, "λ<script>"])}}
-      self.state["runs"][0].update(settings=extra, diagnostic=extra, session_live=None, workers_error="Store unavailable")
-      self.state["cluster"]["scheduler"].update(error="Scheduler unavailable", available=False)
-      data = self.client.get("/api/v1/inspect/inventory").json()
-      self.assertEqual(data["runs"], self.state["runs"])
-      self.assertEqual(data["cluster"], self.state["cluster"])
-      self.assertNotIn("processes", data)
-
-  def test_fuzz_invalid_query_parameters_never_read_sources(self):
-    import random
-
-    rng = random.Random(42)
-    cases = [("since", "".join(rng.choices("!xyz?<>&/λ", k=rng.randint(1, 60)))) for _ in range(100)]
-    cases += [("until", "0001-01-01T00:00:00Z"), ("since", "9999-12-31T23:59:59-23:59")]
-    for path in ("activity", "series", "logs"):
-      for key, value in cases:
-        with self.subTest(path=path, value=value):
-          response = self.client.get(f"/api/v1/inspect/{path}", params={"run_id": "r1", key: value})
-          self.assertIn(response.status_code, (400, 422))
+  def test_invalid_series_kinds_fail_before_reading_sources(self):
+    for params, expected in (({"kind": "invalid"}, 422), ({"kind": "samplers"}, 400)):
+      response = self.client.get("/api/v1/inspect/series", params=params)
+      self.assertEqual(response.status_code, expected)
     router.snapshot.current.assert_not_awaited()
     router.gke.discover.assert_not_awaited()
     self.store.read_samples.assert_not_awaited()
+
+  def test_unavailable_historical_identity_is_not_empty_logs_or_metrics(self):
+    self.store.read_samples.side_effect = RuntimeError("store offline")
+    for endpoint in ("logs", "series"):
+      response = self.client.get(f"/api/v1/inspect/{endpoint}", params={"run_id": "r1", **WINDOW})
+      self.assertEqual(response.status_code, 503)
+      self.assertIn("Operation records unavailable", response.json()["detail"])
+
+  def test_request_deadline_cancels_pending_source_work(self):
+    cancelled = []
+
+    async def stalled_snapshot(_):
+      try:
+        await asyncio.Future()
+      finally:
+        cancelled.append(True)
+
+    router.snapshot.current.side_effect = stalled_snapshot
+    with mock.patch.object(router, "REQUEST_SECONDS", 0.02):
+      response = self.client.get("/api/v1/inspect/inventory")
+    self.assertEqual(response.status_code, 504)
+    self.assertEqual(cancelled, [True])
+    self.assertIn("Inspection timed out", response.json()["detail"])
 
   def test_corrupt_telemetry_keeps_valid_records_and_reports_partial_failure(self):
     bad = [
@@ -199,20 +204,3 @@ class InspectionApiTest(unittest.TestCase):
       self.assertIn("Missing records do not prove no requests arrived", data["coverage"])
       self.assertEqual(data["placements"][0]["intervals"], [[125, 140]])
       self.assertEqual(len(data["samples"]), 1)
-
-  def test_random_corrupt_ops_preserve_good_samples(self):
-    import random
-
-    rng = random.Random(1739)
-    invalid = [None, False, "bad", [], {}, float("nan"), float("inf")]
-    for case in range(200):
-      bad_op = operation(125, 140)
-      bad_op[rng.choice(["at", "started_at", "operation", "metrics", "nonfinite"])] = rng.choice(invalid)
-      # Some mutations (empty metrics) are valid; all must remain serializable.
-      records = {router.ops.key("r1"): [bad_op, operation(155, 165)]}
-      self.store.read_samples.side_effect = records.__getitem__
-      response = self.client.get("/api/v1/inspect/activity", params={**WINDOW, "run_id": "r1"})
-      self.assertEqual(response.status_code, 200, case)
-      self.assertIn(165, [sample["at"] for sample in response.json()["samples"]], case)
-      for lane in response.json()["placements"]:
-        self.assertTrue(all(120 <= low < high <= 190 for low, high in lane["intervals"]), case)

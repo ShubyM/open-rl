@@ -1,26 +1,40 @@
 """The operator UI and the same read-only JSON API for agents."""
 
 import asyncio
-import time
-from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi.responses import FileResponse, Response
+from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
 from server.dashboard import inspection, metrics
-from server.dashboard.schema import Activity, Inventory, Logs, Operation, PodLogs, RunMetrics, RunMetricsRow, Series
+from server.dashboard.schema import Activity, Inventory, Logs, Operation, PodLogs, RunMetrics, Series
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.store import get_state_store
 from server.telemetry import gke, kubernetes, ops
+from server.telemetry import run_metrics as client_metrics
 
-router = APIRouter(tags=["inspection"])
-# A finished run's records no longer change, so its activity for a window is computed once.
-FINISHED_ACTIVITY: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
-FINISHED_ACTIVITY_SECONDS = 300
+REQUEST_SECONDS = 12
+
+
+class InspectionRoute(APIRoute):
+  def get_route_handler(self):
+    handler = super().get_route_handler()
+
+    async def bounded(request):
+      try:
+        async with asyncio.timeout(REQUEST_SECONDS):
+          return await handler(request)
+      except TimeoutError as exc:
+        raise HTTPException(504, "Inspection timed out; try again") from exc
+
+    return bounded
+
+
+router = APIRouter(tags=["inspection"], route_class=InspectionRoute)
 STATIC = Path(__file__).parent / "static"
 TimeBound = Annotated[
   str | None,
@@ -73,6 +87,27 @@ async def inventory():
   return {key: value for key, value in state.items() if key != "processes"}
 
 
+async def read_operations(identity: str) -> dict:
+  try:
+    records = await asyncio.wait_for(get_state_store().read_samples(ops.key(identity)), timeout=5)
+    if not isinstance(records, list):
+      raise ValueError("Expected telemetry records")
+  except Exception:
+    return {"samples": [], "error": "Operation records unavailable"}
+
+  def validate():
+    samples, invalid = [], 0
+    for record in records:
+      try:
+        Operation.model_validate(record, strict=True)
+        samples.append(record)
+      except ValidationError:
+        invalid += 1
+    return {"samples": samples, **({"partial": f"Skipped {invalid} invalid operation records"} if invalid else {})}
+
+  return await asyncio.to_thread(validate)
+
+
 @router.get("/api/v1/inspect/activity", operation_id="activity", response_model=Activity, response_model_exclude_unset=True)
 async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str | None = None, node_id: str | None = None):
   """Per-process GPU turns and completed-op intervals, in Unix seconds.
@@ -81,41 +116,12 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
   store = get_state_store()
   state, run = await run_of(run_id) if run_id else (await snapshot.current(store), None)
   start, end, low, high = time_range(since, until or state["observed_at"])
-  finished = bool(run) and (run.get("status") != "active" or run.get("display_status") in ("Ended", "Stopped"))
-  cached = FINISHED_ACTIVITY.get((run_id, node_id, start, end)) if finished else None
-  if cached and cached[0] > time.monotonic():
-    return {**cached[1], "run": run, "observed_at": state["observed_at"]}
   selected = [p for p in inspection.segments(state, run_id, node_id) if p["start"] <= high and p["end"] >= low]
   # Each lane's runs, and its runtime for the worker-level ops recorded there.
   keys = sorted({k for p in selected for k in [*p["run_ids"], p.get("runtime_id")] if k} | ({run_id} if run_id else set()))
 
-  async def read(key):
-    try:
-      # A long run holds tens of thousands of records; a one-second budget showed it as empty.
-      records = await asyncio.wait_for(store.read_samples(key), timeout=15)
-      if not isinstance(records, list):
-        raise ValueError("Expected telemetry records")
-      return records
-    except Exception:
-      return None
-
-  def validated(records):
-    if records is None:
-      return {"samples": [], "error": "Operation records unavailable"}
-    samples, invalid = [], 0
-    for record in records:
-      try:
-        samples.append(Operation.model_validate(record, strict=True).model_dump(exclude_unset=True))
-      except ValidationError:
-        invalid += 1
-    return {"samples": samples, **({"partial": f"Skipped {invalid} invalid operation records"} if invalid else {})}
-
-  def summarize(raw):
-    records = {key: validated(r) for key, r in zip(keys, raw)}
-    return records, inspection.activity(state, low, high, records, run_id, node_id)
-
-  # Tens of thousands of records take seconds to check and join; a thread keeps other requests moving meanwhile.
-  records, result = await asyncio.to_thread(summarize, await asyncio.gather(*(read(ops.key(k)) for k in keys)))
+  records = dict(zip(keys, await asyncio.gather(*(read_operations(k) for k in keys))))
+  result = await asyncio.to_thread(inspection.activity, state, low, high, records, run_id, node_id)
   result.update(since=start, until=end, observed_at=state["observed_at"])
   result["coverage"] = (
     f"At most {ops.SAMPLE_LIMIT} completed records per run/worker, best effort. "
@@ -129,22 +135,29 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
       partial=records[run_id].get("partial"),
       incidents=inspection.incidents(run, low, high),
     )
-  if finished and not result.get("error"):
-    FINISHED_ACTIVITY[(run_id, node_id, start, end)] = (time.monotonic() + FINISHED_ACTIVITY_SECONDS, result)
-    while len(FINISHED_ACTIVITY) > 16:
-      FINISHED_ACTIVITY.popitem(last=False)
   return result
 
 
 @router.get("/api/v1/inspect/series", operation_id="series", response_model=Series, response_model_exclude_unset=True)
-async def series(node_id: str | None = None, run_id: str | None = None, since: TimeBound = None, until: TimeBound = None):
+async def series(
+  node_id: str | None = None,
+  run_id: str | None = None,
+  since: TimeBound = None,
+  until: TimeBound = None,
+  kind: Literal["all", "hardware", "samplers"] = "all",
+):
   """GPU utilization/memory and worker CPU/memory over time, including idle devices and past placements.
   With run_id, the run's own GPUs and workers, plus throughput, queue, KV cache and latency of its vLLM samplers."""
   validate_bounds(since, until)
+  if kind == "samplers" and not run_id:
+    raise HTTPException(400, "Sampler series require run_id")
   await gke.discover()
   state = await snapshot.current(get_state_store())
   start, end, _, _ = time_range(since, until or state["observed_at"])
-  return await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id)
+  records = await read_operations(run_id) if run_id else {"samples": []}
+  if records.get("error"):
+    raise HTTPException(503, records["error"])
+  return await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id, kind=kind, samples=records["samples"])
 
 
 async def run_of(run_id: str) -> tuple[dict, dict]:
@@ -177,19 +190,36 @@ async def run_logs(
   since: TimeBound = None,
   until: TimeBound = None,
   limit: int = Query(200, ge=1, le=1000),
-  cursor: str | None = Query(None, max_length=4096),
+  cursor: str | None = Query(None, max_length=gke.MAX_CURSOR),
 ):
   """Cloud Logging for every pod the run has owned, live or gone."""
   validate_bounds(since, until)
   await gke.discover()
-  state, run = await run_of(run_id)
-  since, until, _, _ = time_range(since, until or state["observed_at"])
-  sources = gke.pod_sources(run, inspection.segments(state, run_id), state["observed_at"])
+  sources, shared_runtime = [], False
+  if not cursor:
+    state, run = await run_of(run_id)
+    records = await read_operations(run_id)
+    if records.get("error"):
+      raise HTTPException(503, records["error"])
+    since, until, _, _ = time_range(since, until or state["observed_at"])
+    sources = gke.pod_sources(run, inspection.sources(state, run_id, samples=records["samples"]), state["observed_at"])
+    shared_runtime = run["shared_runtime"]
   try:
-    result = await gke.run_logs(run_id, sources, since=since, until=until, cursor=cursor, limit=limit, q=q, pod=pod, node=node, severity=severity)
+    return await gke.run_logs(
+      run_id,
+      sources,
+      since=since,
+      until=until,
+      cursor=cursor,
+      limit=limit,
+      q=q,
+      pod=pod,
+      node=node,
+      severity=severity,
+      shared_runtime=shared_runtime,
+    )
   except ValueError as exc:
     raise HTTPException(400, str(exc)) from exc
-  return {**result, "shared_runtime": run["shared_runtime"]}
 
 
 @router.get("/api/v1/inspect/pods/{pod}/logs", operation_id="pods_pod_logs", response_model=PodLogs, response_model_exclude_unset=True)
@@ -202,18 +232,28 @@ async def pod_logs(pod: str, container: str | None = None, previous: bool = Fals
 
 
 @router.get("/api/v1/inspect/run_metrics", operation_id="run_metrics", response_model=RunMetrics, response_model_exclude_unset=True)
-async def run_metrics(run_id: str):
+async def run_metrics(run_id: str, response: Response, if_none_match: Annotated[str | None, Header()] = None):
   """The run's own per-step metrics, such as rewards, eval pass rates and losses, when its
   training client sends them to the gateway; empty for a run that never did."""
+  response.headers["Cache-Control"] = "private, no-cache"
+  tags = [tag.strip().removeprefix("W/") for tag in (if_none_match or "").split(",")]
+  known = tuple(tag[1:-1] for tag in tags if tag.startswith('"') and tag.endswith('"')) + (("*",) if "*" in tags else ())
   try:
-    records = await asyncio.wait_for(get_state_store().read_samples(ops.metrics_key(run_id)), timeout=2)
+    revision, rows = await asyncio.wait_for(get_state_store().read_steps(client_metrics.PREFIX + run_id, known), timeout=2)
   except Exception:
-    return RunMetrics(available=False, error="Run metrics unavailable", run_id=run_id, rows=[])
-  latest: dict[int, RunMetricsRow] = {}
-  for record in records:
-    try:
-      row = RunMetricsRow.model_validate(record)
-    except ValidationError:
-      continue
-    latest[row.step] = row
-  return RunMetrics(available=True, run_id=run_id, rows=[latest[step] for step in sorted(latest)])
+    return {"available": False, "error": "Run metrics unavailable", "run_id": run_id, "rows": []}
+  if revision:
+    response.headers["ETag"] = f'W/"{revision}"'
+  if rows is None:
+    return Response(status_code=304, headers=response.headers)
+  return {"available": True, "run_id": run_id, "rows": rows}
+
+
+@router.get("/metrics", include_in_schema=False)
+async def prometheus_metrics():
+  """Latest client metrics, without reading or replaying the step history."""
+  try:
+    body = await client_metrics.exposition(get_state_store())
+  except Exception as exc:
+    raise HTTPException(503, "Run metrics unavailable") from exc
+  return Response(body, headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})

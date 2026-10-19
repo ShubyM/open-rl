@@ -8,7 +8,7 @@ from kubernetes import client
 
 from server.dashboard import metrics
 from server.scheduler_worker_manager import SchedulerWorkerManager
-from server.telemetry import kubernetes, prometheus
+from server.telemetry import http, kubernetes, prometheus
 from server.telemetry.prometheus import PromQL
 
 GPU = "GPU-375ff71c-7c41-a89e-3843-c62c7476bc2b"
@@ -107,6 +107,134 @@ class KubernetesInventoryTest(unittest.TestCase):
 
 
 class PromQLTest(unittest.TestCase):
+  def test_identical_requests_share_work_without_sharing_waiter_cancellation(self):
+    async def exercise():
+      entered, release = asyncio.Event(), asyncio.Event()
+      calls = 0
+
+      async def respond(request):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={"answer": 42})
+
+      connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+      with mock.patch.object(httpx, "AsyncClient", return_value=connection):
+        async with http.lifespan():
+          first = asyncio.create_task(http.get_json("https://example/query", params={"query": "up"}, headers={}))
+          await entered.wait()
+          second = asyncio.create_task(http.get_json("https://example/query", params={"query": "up"}, headers={}))
+          await asyncio.sleep(0)
+          first.cancel()
+          with self.assertRaises(asyncio.CancelledError):
+            await first
+          release.set()
+          self.assertEqual(await second, {"answer": 42})
+          self.assertEqual(calls, 1)
+          await http.get_json("https://example/query", params={"query": "up"}, headers={})
+          self.assertEqual(calls, 2)  # Completed results are not cached.
+          entered.clear()
+          release.clear()
+          abandoned = asyncio.create_task(http.get_json("https://example/query", params={"query": "up"}, headers={}))
+          await entered.wait()
+        with self.assertRaises(asyncio.CancelledError):
+          await abandoned  # Shutdown cancels and drains the outstanding request.
+      self.assertTrue(connection.is_closed)
+
+    asyncio.run(exercise())
+
+  def test_shared_requests_isolate_credentials_and_queries_and_do_not_cache_errors(self):
+    async def exercise():
+      entered, release = asyncio.Event(), asyncio.Event()
+      calls = 0
+
+      async def respond(request):
+        nonlocal calls
+        calls += 1
+        if calls == 6:
+          entered.set()
+        await release.wait()
+        return httpx.Response(503)
+
+      url, params, headers = "https://example/query", {"query": "up", "end": 60}, {"Authorization": "Bearer a", "x-goog-user-project": "p"}
+      requests = [
+        (url, params, headers),
+        (url, params, headers),
+        (url, params, {**headers, "Authorization": "Bearer b"}),
+        (url, params, {**headers, "x-goog-user-project": "other"}),
+        (url, {**params, "query": "down"}, headers),
+        (url, {**params, "end": 90}, headers),
+        (url + "/other", params, headers),
+      ]
+      connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+      with mock.patch.object(httpx, "AsyncClient", return_value=connection), mock.patch.object(http, "MAX_INFLIGHT", 1):
+        async with http.lifespan():
+          tasks = [asyncio.create_task(http.get_json(u, params=p, headers=h)) for u, p, h in requests]
+          await asyncio.wait_for(entered.wait(), timeout=1)
+          release.set()
+          errors = await asyncio.gather(*tasks, return_exceptions=True)
+          self.assertTrue(all(isinstance(error, httpx.HTTPStatusError) for error in errors))
+          self.assertEqual(calls, 6)
+          with self.assertRaises(httpx.HTTPStatusError):
+            await http.get_json(url, params=params, headers=headers)
+          self.assertEqual(calls, 7)
+          release.clear()
+          with mock.patch.object(http, "REQUEST_SECONDS", 0.01), self.assertRaises(TimeoutError):
+            await http.get_json(url, params=params, headers=headers)
+
+    asyncio.run(exercise())
+
+  def test_partial_failure_keeps_successful_fields_without_retrying(self):
+    calls = []
+
+    async def respond(request):
+      query = request.url.params["query"]
+      calls.append(query)
+      if "FB_USED" in query:
+        return httpx.Response(503)
+      return httpx.Response(200, json={"status": "success", "data": {"result": [{"metric": {"UUID": GPU}, "values": [[1, "80"]]}]}})
+
+    for denied in (False, True):
+      with self.subTest(credentials_denied=denied):
+        calls.clear()
+        token = mock.Mock(return_value="token", side_effect=RuntimeError("no credentials") if denied else None)
+        backend = PromQL("gke", "https://example", token, None, "openrl-system")
+        connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+        async def query(backend=backend, connection=connection):
+          async with http.lifespan():
+            self.assertIs(http.client(), connection)
+            return await backend.devices([GPU], 0, 60)
+
+        with mock.patch.object(httpx, "AsyncClient", return_value=connection) as factory:
+          found, errors = asyncio.run(query())
+        self.assertEqual(found, {} if denied else {"utilization": {GPU: [[1.0, 80.0]]}})
+        expected = (
+          dict.fromkeys(prometheus.GPU_METRICS, "Metrics query unavailable") if denied else {"memory_mib": "Metrics source returned HTTP 503"}
+        )
+        self.assertEqual(errors, expected)
+        self.assertEqual(len(calls), 0 if denied else 2)
+        token.assert_called_once()
+        factory.assert_called_once()
+        self.assertTrue(connection.is_closed)
+        with self.assertRaises(RuntimeError):
+          http.client()
+
+  def test_a_sampler_timeout_does_not_discard_other_charts(self):
+    backend = PromQL("prometheus", "https://example", None, None, "openrl-system")
+
+    async def query(query, start, end):
+      if "num_requests_waiting" in query:
+        raise TimeoutError
+      return {"": [[1, 2]]}
+
+    with mock.patch.object(backend, "query_range", side_effect=query):
+      found, errors = asyncio.run(backend.samplers(["sampler"], 0, 60))
+    self.assertEqual(found["requests_running"], [[1, 2]])
+    self.assertEqual(found["requests_waiting"], [])
+    self.assertEqual(errors, {"requests_waiting": "Metrics query timed out"})
+
   def test_one_query_per_metric_scoped_to_the_cluster_and_deduplicated_by_uuid(self) -> None:
     backend = PromQL("gke", "https://example", None, "open-rl-fft-test", "openrl-system")
     queries = []
@@ -116,12 +244,12 @@ class PromQLTest(unittest.TestCase):
       return {GPU: [[1.0, 7.0]]}
 
     with mock.patch.object(backend, "query_range", side_effect=fake):
-      result = asyncio.run(backend.devices([GPU, "GPU-other"], 0, 60))
+      result, errors = asyncio.run(backend.devices([GPU, "GPU-other"], 0, 60))
+    self.assertEqual(errors, {})
     self.assertEqual(len(queries), 2)
     self.assertTrue(all(q.startswith("max by (UUID) (DCGM_FI_DEV_") and 'cluster="open-rl-fft-test"' in q for q in queries))
     self.assertIn("GPU\\\\-375ff71c", queries[0])  # regex-escaped inside a PromQL string
-    self.assertEqual(result[GPU]["utilization"], [[1.0, 7.0]])
-    self.assertEqual(result["GPU-other"], {"utilization": [], "memory_mib": []})
+    self.assertEqual(result["utilization"], {GPU: [[1.0, 7.0]]})
 
   def test_sampler_series_use_vllm_metrics_summed_over_the_runs_replicas(self) -> None:
     backend = PromQL("gke", "https://example", None, "open-rl-fft-test", "openrl-system")
@@ -132,7 +260,8 @@ class PromQLTest(unittest.TestCase):
       return {"": [[1.0, 2.0]]}
 
     with mock.patch.object(backend, "query_range", side_effect=fake):
-      result = asyncio.run(backend.samplers(["sampler-0", "sampler-1"], 0, 60))
+      result, errors = asyncio.run(backend.samplers(["sampler-0", "sampler-1"], 0, 60))
+    self.assertEqual(errors, {})
     self.assertEqual(set(result), set(prometheus.SAMPLER_QUERIES))
     match = f'namespace="openrl-system",pod=~{prometheus.any_of(["sampler-0", "sampler-1"])},cluster="open-rl-fft-test"'
     self.assertTrue(all("vllm:" in q and match in q for q in queries), queries)
@@ -147,11 +276,12 @@ class PromQLTest(unittest.TestCase):
       return {"orw-trainer": [[1.0, 3.0]]}
 
     with mock.patch.object(backend, "query_range", side_effect=fake):
-      result = asyncio.run(backend.workers_series(["orw-trainer"], 0, 60))
+      result, errors = asyncio.run(backend.workers_series(["orw-trainer"], 0, 60))
+    self.assertEqual(errors, {})
     self.assertIn("kubernetes_io:container_cpu_core_usage_time", queries[0])
     self.assertIn('namespace_name="openrl-system"', queries[0])
     self.assertIn("kubernetes_io:container_memory_used_bytes", queries[1])
-    self.assertEqual(result["orw-trainer"], {"cpu_cores": [[1.0, 3.0]], "memory_bytes": [[1.0, 3.0]]})
+    self.assertEqual(result, {"cpu_cores": {"orw-trainer": [[1.0, 3.0]]}, "memory_bytes": {"orw-trainer": [[1.0, 3.0]]}})
 
   def test_queries_made_at_different_moments_share_sample_times(self) -> None:
     # Each allocation is fetched separately and the window slides with every
@@ -164,9 +294,13 @@ class PromQLTest(unittest.TestCase):
       sent.append(params)
       return httpx.Response(200, json={"status": "success", "data": {"result": []}}, request=httpx.Request("GET", url))
 
+    async def query():
+      async with http.lifespan():
+        for start in (1000.4, 1010.4):
+          await backend.query_range("q", start, start + 1800)
+
     with mock.patch.object(httpx.AsyncClient, "get", get):
-      for start in (1000.4, 1010.4):
-        asyncio.run(backend.query_range("q", start, start + 1800))
+      asyncio.run(query())
     self.assertEqual([p["step"] for p in sent], [15, 15])
     self.assertEqual([p["start"] % 15 for p in sent], [0, 0])
     self.assertTrue(all(p["start"] <= s for p, s in zip(sent, (1000.4, 1010.4), strict=True)))
@@ -191,6 +325,26 @@ class HardwareSourceTest(unittest.TestCase):
 
 
 class HardwareSeriesTest(unittest.TestCase):
+  def test_total_failure_is_distinct_from_successful_empty_series(self):
+    state = {
+      "observed_at": WINDOW["until"],
+      "runs": [],
+      "cluster": {"nodes": [{"name": "node", "devices": [{"id": "d0", "uuid": GPU}]}]},
+      "placements": [],
+      "processes": [],
+    }
+    backend = mock.Mock()
+    backend.name = "fake"
+    for errors in ({}, {"memory_mib": "Offline"}, dict.fromkeys(prometheus.GPU_METRICS, "Offline")):
+      with self.subTest(errors=errors):
+        backend.devices = mock.AsyncMock(return_value=({}, errors))
+        with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
+          result = asyncio.run(metrics.series(state, node_id="node", kind="hardware", **WINDOW))
+        self.assertEqual(result["error"], "Offline" if len(errors) == 2 else None)
+        self.assertEqual(result["devices"][0]["errors"], errors)
+        self.assertFalse(result["available"])
+        backend.samplers.assert_not_called()
+
   def test_node_query_batches_idle_gpus_and_historical_workers(self) -> None:
     state = {
       "observed_at": WINDOW["since"],
@@ -204,8 +358,8 @@ class HardwareSeriesTest(unittest.TestCase):
     state["cluster"]["nodes"][0]["devices"].append({"id": "gone", "uuid": GPU})
     backend = mock.Mock(name="source")
     backend.name = "fake"
-    backend.devices = mock.AsyncMock(return_value={GPU: {"utilization": [[1, 80]], "memory_mib": []}})
-    backend.workers_series = mock.AsyncMock(return_value={"old-pod": {"cpu_cores": [[1, 2]], "memory_bytes": []}})
+    backend.devices = mock.AsyncMock(return_value=({"utilization": {GPU: [[1, 80]]}}, {}))
+    backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"old-pod": [[1, 2]]}}, {}))
     with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
       result = asyncio.run(metrics.series(state, node_id="node", **WINDOW))
     self.assertCountEqual(backend.devices.await_args.args[0], ["GPU-idle", GPU])
@@ -213,25 +367,6 @@ class HardwareSeriesTest(unittest.TestCase):
     self.assertCountEqual([(d["id"], d["uuid"]) for d in result["devices"]], [("idle", "GPU-idle"), ("gone", GPU)])
     self.assertEqual([(w["id"], w["pod_uid"]) for w in result["workers"]], [("worker", "uid")])
     self.assertTrue(result["available"])
-
-  def test_hardware_failure_preserves_worker_data_and_reports_the_error(self) -> None:
-    state = {
-      "observed_at": WINDOW["until"],
-      "runs": [],
-      "cluster": {"available": True, "scheduler": {}, "nodes": [{"name": "node", "devices": [{"id": "d0", "uuid": GPU}]}]},
-      "placements": [{"id": "w", "label": "worker", "run_ids": [], "devices": ["d0"], "pod": "p", "node": "node", "created_at": WINDOW["since"]}],
-      "processes": [],
-    }
-    backend = mock.Mock()
-    backend.name = "fake"
-    backend.devices = mock.AsyncMock(side_effect=httpx.ConnectError("offline"))
-    backend.workers_series = mock.AsyncMock(return_value={"p": {"cpu_cores": [[1, 2]], "memory_bytes": []}})
-    with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
-      result = asyncio.run(metrics.series(state, **WINDOW))
-    self.assertTrue(result["available"])
-    self.assertEqual(result["reason"], "GPU metrics query unavailable")
-    self.assertEqual(result["devices"][0]["reason"], result["reason"])
-    self.assertIsNone(result["workers"][0]["reason"])
 
   def test_fresh_worker_series_include_its_lifetime_before_first_snapshot(self) -> None:
     state = {
@@ -248,10 +383,10 @@ class HardwareSeriesTest(unittest.TestCase):
       name = "fake"
 
       async def devices(self, uuids, start, end):
-        return {u: {"utilization": [[start, 90.0]], "memory_mib": [[start, 1.0]]} for u in uuids}
+        return {"utilization": {u: [[start, 90.0]] for u in uuids}, "memory_mib": {u: [[start, 1.0]] for u in uuids}}, {}
 
       async def workers_series(self, pods, start, end):
-        return {p: {"cpu_cores": [[start, 4.0]], "memory_bytes": [[start, 8.0]]} for p in pods}
+        return {"cpu_cores": {p: [[start, 4.0]] for p in pods}, "memory_bytes": {p: [[start, 8.0]] for p in pods}}, {}
 
     with mock.patch.object(metrics, "hardware", return_value=(Backend(), None)):
       result = asyncio.run(metrics.series(state, **WINDOW))
@@ -296,8 +431,8 @@ class HardwareSeriesTest(unittest.TestCase):
     }
     backend = mock.Mock()
     backend.name = "fake"
-    backend.devices = mock.AsyncMock(return_value={GPU: {"utilization": [[3, 50]], "memory_mib": []}})
-    backend.workers_series = mock.AsyncMock(return_value={"reused-name": {"cpu_cores": [[1, 1], [3, 2], [9, 3]], "memory_bytes": []}})
+    backend.devices = mock.AsyncMock(return_value=({"utilization": {GPU: [[3, 50]]}}, {}))
+    backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"reused-name": [[1, 1], [3, 2], [9, 3]]}}, {}))
     with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
       result = asyncio.run(metrics.series(state, node_id="node", **WINDOW))
     self.assertCountEqual(backend.devices.await_args.args[0], [GPU, "GPU-new"])

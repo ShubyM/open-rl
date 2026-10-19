@@ -1,8 +1,11 @@
 import { untrack } from "svelte";
 
-const queryString = (params) => new URLSearchParams(Object.entries(params).filter(([, v]) => v !== null && v !== undefined && v !== "")).toString();
-export const viewLink = (path, params = {}) => `#${path}${queryString(params) ? `?${queryString(params)}` : ""}`;
-export const inspectUrl = (resource, params = {}) => `/api/v1/inspect/${resource}${queryString(params) ? `?${queryString(params)}` : ""}`;
+const queryString = (params) => {
+  const query = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== null && v !== undefined && v !== "")).toString();
+  return query ? `?${query}` : "";
+};
+export const viewLink = (path, params = {}) => `#${path}${queryString(params)}`;
+export const inspectUrl = (resource, params = {}) => `/api/v1/inspect/${resource}${queryString(params)}`;
 export const nodeLink = (placement, range) => viewLink("nodes", { placement, duration: range.now - range.start, end: range.now });
 export const now = (inventory) => Date.parse(inventory?.observed_at) / 1000 || Date.now() / 1000;
 const cache = new Map();
@@ -15,7 +18,7 @@ export function parseView(hash = location.hash) {
   const [page, id = "", tab = "activity"] = path.split("/").map((part) => { try { return decodeURIComponent(part); } catch { return part; } });
   const params = new URLSearchParams(search), duration = Math.max(60, Math.min(MAX_WINDOW, Math.round(number(params, "duration", 1800))));
   const end = number(params, "end", null), event = number(params, "event", null), back = params.get("back");
-  return { page: ["nodes", "run", "health"].includes(page) ? page : "overview", id, tab,
+  return { page: ["nodes", "run", "health"].includes(page) ? page : "overview", id, tab, explicitWindow: params.has("duration") || params.has("end"),
     duration, end: end !== null && end >= duration && end <= 8.64e12 ? end : null,
     event: event !== null && (end === null || (event >= end - duration && event <= end)) ? event : null,
     back: back?.startsWith("#nodes?") ? back : null,
@@ -25,8 +28,9 @@ export function parseView(hash = location.hash) {
 }
 export const view = $state(parseView());
 export const rangeOf = (inventory, selection = view) => {
-  const end = selection.end ?? now(inventory);
-  return { start: end - selection.duration, now: end, live: selection.end === null };
+  const observed = now(inventory), duration = Math.max(60, Math.min(MAX_WINDOW, Math.round(selection.duration || 1800)));
+  const end = Math.max(observed - MAX_WINDOW + duration, Math.min(observed, selection.end ?? observed));
+  return { start: end - duration, now: end, live: selection.end === null };
 };
 // Grafana's shared crosshair: hovering any chart or timeline marks the same instant on the others.
 export const crosshair = $state({ at: null });
@@ -38,18 +42,19 @@ export const crosshairOffset = (range) => crosshair.at === null || crosshair.at 
 export function currentView(freeze = false, tab = view.tab) {
   const { page, id, duration, end, back, event, q, pod, node, placement, gpu, status } = view;
   if (page === "overview") return viewLink(page, { q, status: status === "all" ? null : status });
-  if (page === "run") return viewLink(`run/${encodeURIComponent(id)}/${tab || "activity"}`, { duration, end: freeze ? end ?? now(cache.get(inspectUrl("inventory"))) : end, back, event, q, pod });
-  if (page === "nodes") return viewLink(page, { duration, end: freeze ? end ?? now(cache.get(inspectUrl("inventory"))) : end, node, placement, gpu: node && gpu !== "all" ? gpu : null });
+  if (page === "run") return viewLink(`run/${encodeURIComponent(id)}/${tab || "activity"}`, { duration, end: freeze ? end ?? now(cache.get(inspectUrl("inventory"))?.data) : end, back, event, q, pod });
+  if (page === "nodes") return viewLink(page, { duration, end: freeze ? end ?? now(cache.get(inspectUrl("inventory"))?.data) : end, node, placement, gpu: node && gpu !== "all" ? gpu : null });
   return viewLink(page + (id ? `/${encodeURIComponent(id)}` : ""));
 }
-export async function get(url, signal) {
+export async function get(url, signal, previous) {
   const timeout = AbortSignal.timeout(15000);
   let response;
-  try { response = await fetch(url, { cache: "no-store", signal: signal ? AbortSignal.any([signal, timeout]) : timeout }); }
+  try { response = await fetch(url, { cache: "no-store", headers: previous?.etag ? { "If-None-Match": previous.etag } : undefined, signal: signal ? AbortSignal.any([signal, timeout]) : timeout }); }
   catch (error) {
     if (signal?.aborted) throw error;
     throw new Error(timeout.aborted ? "Dashboard request timed out. Try again." : "Cannot reach the dashboard. Check the connection and try again.");
   }
+  if (response.status === 304 && previous?.etag) return previous;
   if (!response.ok) {
     const data = await response.json().catch(() => null);
     const detail = Array.isArray(data?.detail) ? data.detail.map((item) => `${(item.loc || []).filter((part) => part !== "body").join(".")}: ${item.msg}`).join("; ") : data?.detail;
@@ -57,54 +62,73 @@ export async function get(url, signal) {
     error.status = response.status;
     throw error;
   }
-  return response.json().catch(() => { throw new Error("The dashboard returned an invalid response. Try again."); });
+  const data = await response.json().catch(() => { throw new Error("The dashboard returned an invalid response. Try again."); });
+  return { data, etag: response.headers.get("ETag") };
 }
 
 // Reuse recent responses across navigation; changing the key or unmounting aborts old work.
 // A live view keys on the user's selection, so its moving window is read at each poll instead of restarting it.
-export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () => true, key = url } = {}) {
+class QueryState {
+  // Responses are immutable snapshots. Only replacing the tree needs to be reactive.
+  data = $state.raw(null);
+  error = $state(null);
+  status = $state(null);
+  pending = $state(false);
+  retry = $state(() => {});
+}
+export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () => true, key = url, merge = (next) => next } = {}) {
   let previousScope;
-  const result = $state({ data: null, error: null, status: null, pending: false, stale: false, retry: () => {} });
+  const result = new QueryState();
+  const selectedKey = $derived.by(key), selectedScope = $derived.by(scope);
   $effect(() => {
-    const requestedKey = key(), requestedScope = scope();
+    const requestedKey = selectedKey, requestedScope = selectedScope;
     return untrack(() => {
-      if (!requestedKey || !url()) return;
-      if (requestedScope !== previousScope) { result.data = result.error = result.status = null; }
+      result.retry = () => {};
+      if (requestedScope !== previousScope) result.data = result.error = result.status = null;
       previousScope = requestedScope;
-      result.data = cache.get(url()) ?? result.data;
+      const initialUrl = requestedKey && url();
+      if (!initialUrl) return;
+      result.data = cache.get(initialUrl)?.data ?? result.data;
       const controller = new AbortController();
-      let failures = 0, retryTimer = null;
+      let failures = 0, timer;
+      const schedule = (delay, retry) => {
+        if (delay) timer = setTimeout(() => {
+          if (!document.hidden && (retry || pollWhen())) load();
+          else schedule(delay, retry);
+        }, delay);
+      };
       const load = result.retry = async () => {
         const requested = url();
-        if (!requested || result.pending) return;
+        if (!requested || result.pending || controller.signal.aborted) return;
+        clearTimeout(timer);
         result.pending = true;
+        let retry = false;
         try {
-          const data = await get(requested, controller.signal);
+          const { data, etag } = await get(requested, controller.signal, cache.get(requested));
           if (controller.signal.aborted) return;
           failures = 0;
-          Object.assign(result, { error: data.error || null, status: null, stale: false });
-          if (!result.error || !result.data) result.data = data;
+          Object.assign(result, { error: data.error || null, status: null });
+          if (data !== result.data && (!result.error || !result.data)) result.data = merge(data, result.data);
           if (!result.error) {
-            cache.set(requested, data);
+            cache.set(requested, { data: result.data, etag });
             if (cache.size > 24) cache.delete([...cache.keys()].find((key) => key !== inspectUrl("inventory")));
           }
         } catch (error) {
           if (controller.signal.aborted) return;
-          // A dropped tunnel or a busy server is usually brief, so keep what is shown and retry; report it only if it lasts.
+          // Keep the last response visible while one schedule handles transient retries.
           failures += 1;
-          if ((!error.status || error.status >= 500 || error.status === 429) && failures < 4) {
-            result.stale = Boolean(result.data);
-            clearTimeout(retryTimer);
-            retryTimer = setTimeout(load, 2000 * 2 ** (failures - 1));
-          } else {
-            Object.assign(result, { error: error.message, status: error.status || null, stale: false });
+          retry = (!error.status || error.status >= 500 || error.status === 429) && failures < 4;
+          Object.assign(result, { error: error.message, status: error.status || null });
+        }
+        finally {
+          if (!controller.signal.aborted) {
+            result.pending = false;
+            schedule(retry ? 2000 * 2 ** (failures - 1) : poll, retry);
           }
         }
-        finally { if (!controller.signal.aborted) { result.pending = false; } }
       };
       load();
-      const timer = poll ? setInterval(() => { if (!document.hidden && pollWhen()) load(); }, poll) : null;
-      return () => { controller.abort(); clearInterval(timer); clearTimeout(retryTimer); result.pending = false; };
+      return () => { controller.abort(); clearTimeout(timer); result.pending = false; };
     });
   });
   return result;

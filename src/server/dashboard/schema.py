@@ -145,6 +145,7 @@ class Inventory(Record):
   """Current observations. Check source errors before interpreting empty collections."""
 
   observed_at: str = Field(description="ISO timestamp; anchor queries to this, not the client's wall clock")
+  error: str | None = Field(None, description="A critical source failed; this is the previous observation")
   cluster: Cluster
   runs: list[Run]
   placements: list[Placement]
@@ -217,6 +218,7 @@ class DeviceSeries(Device):
   utilization: list[tuple[float, float]] = Field(description="[Unix seconds, percent]; physical GPU, not per-run")
   memory_mib: list[tuple[float, float]]
   reason: str | None = None
+  errors: dict[str, str] = Field(default_factory=dict, description="Failed fields; retain their previous samples")
 
 
 class WorkerSeries(Record):
@@ -226,12 +228,14 @@ class WorkerSeries(Record):
   cpu_cores: list[tuple[float, float]]
   memory_bytes: list[tuple[float, float]] = Field(description="Host memory, not GPU memory; points use Unix seconds")
   reason: str | None = None
+  errors: dict[str, str] = Field(default_factory=dict)
 
 
 class Series(Record):
   available: bool = Field(description="At least one series has samples; other series may still be unavailable")
   source: str | None
   reason: str | None
+  error: str | None = Field(None, description="All requested queries failed; preserve the previous result")
   since: str
   until: str
   devices: list[DeviceSeries]
@@ -242,6 +246,7 @@ class Series(Record):
     "A shared pool includes other runs",
   )
   samplers_reason: str | None = None
+  samplers_errors: dict[str, str] = Field(default_factory=dict)
 
 
 class LogRecord(Record):
@@ -259,6 +264,8 @@ class Logs(Source):
   records: list[LogRecord]
   next_cursor: str | None = Field(description="Pass back as cursor with the same filters for older records")
   shared_runtime: bool
+  since: str | None = None
+  until: str | None = None
   sources: list[dict[str, JsonValue]] = Field(default_factory=list)
   note: str | None = Field(None, description="Why an available result is empty")
 

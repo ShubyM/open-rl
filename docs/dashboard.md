@@ -22,7 +22,7 @@ The inspection API lists every run in the fleet, while the client-facing API ser
 - **Nodes**: which worker process held which GPUs and when, per-GPU activity, and GPU and CPU charts. On the timelines and charts, drag or press A/D to pan; use Ctrl/⌘ + wheel, pinch, or W/S to zoom.
 - **Health**: pod and node problems, and unavailable sources.
 
-Recent query responses are kept in a bounded, in-memory cache and shown while refreshing. Reloading clears this cache. Logs load alongside activity; incidents appear below the panel so their arrival does not move the log controls.
+Recent query responses are kept in a bounded, in-memory cache and shown while refreshing. Reloading clears this cache. Logs do not poll activity. Failed metrics fields retain their last samples with a stale note; successful fields continue updating. A failed inventory store read retains the previous observation time and reports the source error immediately, so stale heartbeats cannot turn into new worker-death verdicts.
 
 ## API
 
@@ -33,8 +33,31 @@ Recent query responses are kept in a bounded, in-memory cache and shown while re
 | `GET /series` | GPU utilization and memory per device UUID, and worker CPU and memory, for one `node_id` or one `run_id`. With `run_id`, also the run's vLLM samplers: token throughput, running and waiting requests, KV cache use, preemptions, and p99 time to first token and request latency |
 | `GET /logs` | A run's Cloud Logging records, with `q`, `pod`, `node` and `severity` filters and cursor paging |
 | `GET /pods/{pod}/logs` | Current or previous container output from the kubelet |
+| `GET /run_metrics` | Distinct training steps reported by a client, ordered by step |
 
 `activity`, `series` and `logs` take ISO `since` and `until` bounds, up to seven days. An omitted end uses inventory's `observed_at`; an omitted start uses the preceding 30 minutes. Activity returns the resolved bounds for subsequent queries and a coverage note: missing completed records do not establish that no requests arrived or that workers were idle. Response schemas are generated from the same models used to validate responses; extra diagnostic fields are preserved. Invalid operation records are skipped and reported in `partial`, separately from `error`, which means a source could not be read.
+
+`series?kind=samplers&run_id=...` reads only the eight sampler metrics; `kind=hardware` reads GPU and worker metrics. The default `all` retains both. Each field reports its own error; a top-level error means all attempted queries failed. Telemetry shares one connection pool and makes no hidden HTTP retries. Inspection requests have a 12-second budget, below the browser's 15-second timeout.
+
+Concurrent Prometheus requests with identical queries, bounds and credentials share one fetch within a dashboard process. Completed results and failures are discarded. Cancelling one viewer does not cancel another viewer's request; shared requests have a 10-second deadline.
+
+Log cursors preserve the original bounds, pod lifetimes and provider query for 15 minutes. Continuations need no inventory or Redis reads. Reuse the same filters and bounds, or keep omitted bounds omitted. Set the same `OPEN_RL_LOG_CURSOR_SECRET` on dashboard replicas to keep cursors valid across replicas and restarts; otherwise each process uses an ephemeral secret. Deleted sampler identities are recoverable only while their operation records remain retained.
+
+## Client metrics and Prometheus
+
+Send batches to the gateway with `POST /api/v1/runs/{run_id}/metrics`, or forward cookbook output:
+
+```sh
+python -m server.scripts.forward_metrics /path/to/run --base-url http://gateway:8000 --run-id RUN_ID --follow
+```
+
+Each batch atomically replaces rows by step and retains the highest `OPEN_RL_OPS_SAMPLE_LIMIT` distinct steps. Retrying an acknowledged batch cannot evict other steps. The forwarder filters nonfinite values before JSON encoding and retries only unacknowledged batches.
+
+History responses include an ETag. The browser revalidates its cached history: unchanged polls return `304` without reading, decoding or transferring the rows, and keep the existing chart data. Every accepted batch changes the revision, including corrections to older steps; changed histories return the full retained rows. The standalone dashboard uses gzip level 1 for large responses.
+
+The dashboard's `/metrics` endpoint exposes the latest reported step as `openrl_run_metric{run_id="...",metric="..."}`, plus `openrl_run_step` and `openrl_run_metrics_received_timestamp_seconds`. Step numbers are values, never labels. Each scrape reads one latest-step snapshot per retained run; dashboard charts read the step history directly. The GKE overlay includes a PodMonitoring for the dashboard; other Prometheus installations can scrape its port 8000 at `/metrics`. Metrics expire with the configured operation TTL.
+
+Earlier development builds used a list format. Those records remain untouched; replay the run's `metrics.jsonl` with the forwarder to load them into keyed step storage.
 
 ## Progress
 

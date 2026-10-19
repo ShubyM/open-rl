@@ -1,5 +1,4 @@
 <script>
-  import { onMount } from "svelte";
   import { view, saved, parseView, currentView, createQuery, inspectUrl } from "./state.svelte.js";
   import Run from "./Run.svelte";
   import Nodes from "./Nodes.svelte";
@@ -13,20 +12,16 @@
     if (view.page === "run" && view.back) saved.nodes = view.back;
   });
   const section = $derived(view.page === "run" ? view.back ? "nodes" : "overview" : view.page);
-  const connection = $derived(inventory.error ? inventory.data ? "Stale snapshot" : "Unavailable" : inventory.stale ? "Reconnecting…" : !inventory.data ? "Connecting…" : inventory.data.cluster.available ? "Connected" : "Cluster unavailable");
-  onMount(() => {
-    const navigate = () => {
-      const next = parseView();
-      if (view.page !== next.page || view.id !== next.id) window.scrollTo(0, 0);
-      Object.assign(view, next);
-    };
-    const visible = () => { if (!document.hidden) inventory.retry(); };
-    window.addEventListener("hashchange", navigate);
-    document.addEventListener("visibilitychange", visible);
-    return () => { window.removeEventListener("hashchange", navigate); document.removeEventListener("visibilitychange", visible); };
-  });
+  const connection = $derived(inventory.error ? inventory.data ? "Stale snapshot" : "Unavailable" : !inventory.data ? "Connecting…" : inventory.data.cluster.available ? "Connected" : "Cluster unavailable");
+  function navigate() {
+    const next = parseView();
+    if (view.page !== next.page || view.id !== next.id) window.scrollTo(0, 0);
+    Object.assign(view, next);
+  }
 </script>
 
+<svelte:window onhashchange={navigate} />
+<svelte:document onvisibilitychange={() => { if (!document.hidden) inventory.retry(); }} />
 <div class="product">
   <header class="appbar">
     <a href={saved.overview} class="brand">OpenRL</a>

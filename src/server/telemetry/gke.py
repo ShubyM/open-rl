@@ -3,17 +3,21 @@
 The gateway learns its project, cluster and location from the metadata
 server, authenticates with Application Default Credentials (Workload Identity
 in the cluster), and queries entries for the pods a run has owned. Paging is
-stateless: the cursor is Cloud Logging's own page token, valid for the same
-filters and window.
+stateless: a signed cursor keeps Cloud Logging's query and pod lifetimes fixed
+while the live inventory changes.
 """
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import threading
 import time
+import zlib
 from datetime import UTC, datetime, timedelta
 
 import google.auth
@@ -21,10 +25,15 @@ import google.oauth2.credentials
 import httpx
 from google.auth.transport.requests import Request
 
-from server.telemetry import kubernetes
+from server.telemetry import http, kubernetes
 
 MAX_MESSAGE = 16 * 1024
 MAX_SOURCES = 64
+MAX_CURSOR = 16 * 1024
+MAX_PLAN_BYTES = 128 * 1024
+CURSOR_SECONDS = 900
+# Share this secret between dashboard replicas to keep cursors valid across them.
+_CURSOR_KEY = os.getenv("OPEN_RL_LOG_CURSOR_SECRET", "").encode() or secrets.token_bytes(32)
 REFUSED = "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"
 UNAVAILABLE = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
 
@@ -115,16 +124,10 @@ def quota_headers() -> dict[str, str]:
 
 
 async def request(method: str, url: str, **kwargs) -> dict:
-  token = await asyncio.wait_for(asyncio.to_thread(access_token), timeout=10)
-  headers = {"Authorization": f"Bearer {token}", **quota_headers()}
-  async with httpx.AsyncClient(timeout=15) as client:
-    response = await client.request(method, url, headers=headers, **kwargs)
-    # One quota refusal or server error is usually momentary; one retry spares the page an error.
-    if response.status_code == 429 or response.status_code >= 500:
-      await asyncio.sleep(1)
-      response = await client.request(method, url, headers=headers, **kwargs)
-    response.raise_for_status()
-    return response.json()
+  token = await asyncio.to_thread(access_token)
+  response = await http.client().request(method, url, headers={"Authorization": f"Bearer {token}", **quota_headers()}, **kwargs)
+  response.raise_for_status()
+  return response.json()
 
 
 # ---- time and sources -----------------------------------------------------------
@@ -176,6 +179,39 @@ def pod_sources(run: dict | None, lanes: list[dict], observed_at: str) -> list[d
 
 
 # ---- query -------------------------------------------------------------------------
+
+
+def page_cursor(plan: dict) -> str:
+  raw = json.dumps({**plan, "expires": time.time() + CURSOR_SECONDS}, separators=(",", ":")).encode()
+  if len(raw) > MAX_PLAN_BYTES:
+    raise ValueError("Log query is too large to page; narrow the pod filter")
+  payload = zlib.compress(raw)
+  token = base64.urlsafe_b64encode(hmac.digest(_CURSOR_KEY, payload, "sha256") + payload).decode()
+  if len(token) > MAX_CURSOR:
+    raise ValueError("Log query is too large to page; narrow the pod filter")
+  return token
+
+
+def page_plan(cursor: str, selection: list, since, until) -> dict:
+  try:
+    if len(cursor) > MAX_CURSOR:
+      raise ValueError
+    signed = base64.urlsafe_b64decode(cursor)
+    signature, payload = signed[:32], signed[32:]
+    if not hmac.compare_digest(signature, hmac.digest(_CURSOR_KEY, payload, "sha256")):
+      raise ValueError
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(payload, MAX_PLAN_BYTES + 1)
+    if len(raw) > MAX_PLAN_BYTES or not decoder.eof:
+      raise ValueError
+    plan = json.loads(raw)
+    if plan["expires"] < time.time() or plan["selection"] != selection:
+      raise ValueError
+    if any(value is not None and timestamp(value) != bound for value, bound in zip((since, until), plan["window"], strict=True)):
+      raise ValueError
+    return plan
+  except (ValueError, KeyError, TypeError, zlib.error):
+    raise ValueError("Invalid or expired log cursor; repeat the query without it") from None
 
 
 def scope_filter() -> list[str]:
@@ -249,31 +285,48 @@ def entry_record(entry: dict, sources: list[dict], run_id: str) -> dict | None:
 
 
 async def run_logs(
-  run_id: str, sources: list[dict], *, since=None, until=None, cursor=None, limit=200, q="", pod=None, node=None, severity=None
+  run_id: str, sources: list[dict], *, since=None, until=None, cursor=None, limit=200, q="", pod=None, node=None, severity=None, shared_runtime=False
 ) -> dict:
   global _refused_until
-  result = {"run_id": run_id, "source": "gke", "records": [], "sources": sources, "order": "newest_first", "next_cursor": None, "available": False}
+  selection = [run_id, limit, q, pod, node, severity]
+  plan = page_plan(cursor, selection, since, until) if cursor else None
+  result = {
+    "run_id": run_id,
+    "source": "gke",
+    "records": [],
+    "sources": sources,
+    "order": "newest_first",
+    "next_cursor": None,
+    "available": False,
+    "shared_runtime": plan["shared_runtime"] if plan else shared_runtime,
+  }
   if not configuration()["configured"]:
     return {**result, "error": "GKE telemetry is not configured"}
   if time.monotonic() < _refused_until:
     return {**result, "error": REFUSED}
-  selected = [s for s in sources if (pod is None or s["pod"] == pod) and (node is None or s.get("node") == node)]
-  if not selected:
-    return {**result, "available": True, "note": "No pod lifetimes match this run and filter"}
-  if len(selected) > MAX_SOURCES:
-    raise ValueError(f"Select a pod to narrow this query to at most {MAX_SOURCES} pod lifetimes")
-  start, end = time_range(since, until)
-  body = {
-    "resourceNames": log_views(),
-    "filter": logs_filter(selected, start, end, severity, q),
-    "orderBy": "timestamp desc",
-    "pageSize": limit,
-  }
-  if cursor:
-    body["pageToken"] = cursor
+  if plan is None:
+    start, end = time_range(since, until)
+    selected = [s for s in sources if (pod is None or s["pod"] == pod) and (node is None or s.get("node") == node)]
+    if not selected:
+      return {**result, "available": True, "note": "No pod lifetimes match this run and filter"}
+    if len(selected) > MAX_SOURCES:
+      raise ValueError(f"Select a pod to narrow this query to at most {MAX_SOURCES} pod lifetimes")
+    plan = {
+      "selection": selection,
+      "shared_runtime": shared_runtime,
+      "window": [start, end],
+      "sources": selected,
+      "request": {
+        "resourceNames": log_views(),
+        "filter": logs_filter(selected, start, end, severity, q),
+        "orderBy": "timestamp desc",
+        "pageSize": limit,
+      },
+    }
+  result.update(sources=plan["sources"], since=plan["window"][0], until=plan["window"][1])
   try:
-    payload = await request("POST", "https://logging.googleapis.com/v2/entries:list", json=body)
-    records = [record for entry in payload.get("entries", []) if (record := entry_record(entry, selected, run_id))]
+    payload = await request("POST", "https://logging.googleapis.com/v2/entries:list", json=plan["request"])
+    records = [record for entry in payload.get("entries", []) if (record := entry_record(entry, plan["sources"], run_id))]
     if severity in (*_RELABELED, "ERROR"):
       records = [record for record in records if record["severity"] == severity]
   except httpx.HTTPStatusError as exc:
@@ -286,4 +339,7 @@ async def run_logs(
     return {**result, "error": UNAVAILABLE}
   except Exception:
     return {**result, "error": UNAVAILABLE}
-  return {**result, "records": records, "available": True, "next_cursor": payload.get("nextPageToken")}
+  next_cursor = None
+  if token := payload.get("nextPageToken"):
+    next_cursor = page_cursor({**plan, "request": {**plan["request"], "pageToken": token}})
+  return {**result, "records": records, "available": True, "next_cursor": next_cursor}

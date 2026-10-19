@@ -101,10 +101,10 @@ class TrainingModelMetadata(BaseModel):
     return f"sampler-{slug}-{hashlib.sha256(runtime.encode()).hexdigest()[:8]}"
 
 
-def decode_model_metadata(raw: str | None) -> TrainingModelMetadata | None:
+def decode_model_metadata(raw: str | dict | None) -> TrainingModelMetadata | None:
   if raw is None:
     return None
-  data = json.loads(raw)
+  data = json.loads(raw) if isinstance(raw, str) else raw.copy()
   if not isinstance(data, dict):
     raise ValueError("Model metadata must be a JSON object")
   # Older restores used a placeholder kind and could omit the base model.

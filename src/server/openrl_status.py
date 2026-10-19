@@ -115,8 +115,8 @@ def summarize(ctx: StatusContext, entry: dict[str, Any], workers: list[dict[str,
   return "; ".join(w["summary"] for w in workers)
 
 
-async def model_status(ctx: StatusContext, model_id: str) -> dict[str, Any] | None:
-  meta = await get_model_metadata(ctx.state, model_id)
+async def model_status(ctx: StatusContext, model_id: str, meta: TrainingModelMetadata | None = None) -> dict[str, Any] | None:
+  meta = meta if meta is not None else await get_model_metadata(ctx.state, model_id)
   if meta is None:
     return None
   owner = owner_id(meta.runtime(model_id))

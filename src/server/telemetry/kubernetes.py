@@ -286,10 +286,6 @@ def read() -> dict:
   ns = namespace()
   if core is None:
     return unavailable(ns, error)
-  try:
-    pods = [pod_summary(p) for p in core.list_namespaced_pod(ns, _request_timeout=REQUEST_TIMEOUT).items]
-  except Exception as exc:
-    return unavailable(ns, f"pod list failed: {exc}")
 
   def attempt(call, *args, **kwargs):
     try:
@@ -297,7 +293,8 @@ def read() -> dict:
     except Exception as exc:
       return None, str(exc)
 
-  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+  with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+    pods_f = pool.submit(attempt, core.list_namespaced_pod, ns, _request_timeout=REQUEST_TIMEOUT)
     nodes_f = pool.submit(attempt, core.list_node, _request_timeout=REQUEST_TIMEOUT)
     events_f = pool.submit(attempt, core.list_namespaced_event, ns, field_selector="involvedObject.kind=Pod", _request_timeout=REQUEST_TIMEOUT)
     scheduler_f = pool.submit(scheduler_state, custom, ns)
@@ -306,10 +303,15 @@ def read() -> dict:
     event_list, events_error = events_f.result()
     scheduler = scheduler_f.result()
     devices = devices_f.result()
+    pod_list, pods_error = pods_f.result()
 
+  if pods_error:
+    return unavailable(ns, f"pod list failed: {pods_error}")
+  pods = [pod_summary(p) for p in pod_list.items]
+  device_nodes = devices.pop("nodes")
   nodes = [node_summary(n) for n in node_list.items] if node_list else []
   for node in nodes:
-    node["devices"] = devices["nodes"].get(node["name"], [])
+    node["devices"] = device_nodes.get(node["name"], [])
     node["gpu_capacity"] = max(node["gpu_capacity"], len(node["devices"]))
   events_by_pod: dict[str, list[dict]] = {}
   for event in event_list.items if event_list else []:
