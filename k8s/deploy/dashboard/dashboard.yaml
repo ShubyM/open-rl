@@ -36,10 +36,13 @@ spec:
         # Prometheus API directly, which needs monitoring.viewer on the SA.
         - name: OPEN_RL_PROMETHEUS_URL
           value: http://gmp-frontend:9090
+        # A long run's activity keeps the process busy for seconds; the default
+        # one-second timeout took the pod out of its Service meanwhile.
         readinessProbe:
           httpGet:
             path: /openapi.json
             port: 8000
+          timeoutSeconds: 5
         resources:
           requests:
             cpu: 250m
