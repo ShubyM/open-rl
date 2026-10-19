@@ -1,17 +1,17 @@
 <script>
   import Status from "./Status.svelte";
   import { inspectUrl, now, viewLink } from "./state.svelte.js";
-  import { duration, elapsedTime, KINDS, runDescription } from "./format.js";
+  import { duration, elapsedTime, KINDS, runDescription, isFinished } from "./format.js";
 
   let { inventory, view = $bindable() } = $props();
-  const GROUPS = { unassigned: ["Unassigned"], finished: ["Completed", "Ended"] };
+  const GROUPS = { unassigned: ["Unassigned"] };
   const FILTERS = [
     ["all", "All", "Every recorded run"],
     ["active", "Active", "Runs with workers, or whose workers cannot be checked"],
     ["unassigned", "Unassigned", "Recorded as active, but no workers are assigned; usually a client that exited without finishing"],
-    ["finished", "Finished", "Completed or ended"],
+    ["finished", "Finished", "Completed, ended or stopped"],
   ];
-  const group = (run) => Object.keys(GROUPS).find((key) => GROUPS[key].includes(run.display_status)) || "active";
+  const group = (run) => isFinished(run) ? "finished" : Object.keys(GROUPS).find((key) => GROUPS[key].includes(run.display_status)) || "active";
   const runLink = (run, tab = "activity") => viewLink(`run/${encodeURIComponent(run.run_id)}/${tab}`);
   const shown = $derived.by(() => {
     const terms = view.q.toLowerCase().split(/\s+/).filter(Boolean);

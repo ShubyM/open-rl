@@ -1,7 +1,13 @@
 export const duration = (total) => total < 90 ? `${Math.round(total)}s` : total < 5400 ? `${Math.round(total / 60)}m` : total < 172800 ? `${(total / 3600).toFixed(1)}h` : `${(total / 86400).toFixed(1)}d`;
 const seconds = (value) => value === null || value === undefined || value === "" ? NaN : typeof value === "number" ? value : Date.parse(value) / 1000;
+// A run is finished once the gateway marks it so, or once nothing serves it any more; a client
+// that never deletes its model leaves the status active.
+export const isFinished = (run) => !!run && (run.status !== "active" || ["Ended", "Stopped"].includes(run.display_status));
+// When a finished run stopped: when it was marked complete, else its last completed work.
+export const finishedAt = (run) => [seconds(run.completed_at), run.progress?.last_completed_at].find(Number.isFinite) ?? NaN;
 export function elapsedTime(run, observedAt) {
-  const start = seconds(run.created_at), end = ["completed", "failed", "ended"].includes(String(run.status || "").toLowerCase()) && run.completed_at ? seconds(run.completed_at) : seconds(observedAt);
+  const stop = isFinished(run) ? finishedAt(run) : NaN;
+  const start = seconds(run.created_at), end = Number.isFinite(stop) ? stop : seconds(observedAt);
   return Number.isFinite(start) && Number.isFinite(end) ? duration(Math.max(0, end - start)) : "—";
 }
 export function shortNodeName(name, nodes = []) {

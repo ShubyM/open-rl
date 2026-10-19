@@ -8,7 +8,7 @@
   import Logs from "./Logs.svelte";
   import CopyLink from "./CopyLink.svelte";
   import Configuration from "./Configuration.svelte";
-  import { duration, shortNodeName, KINDS, runDescription } from "./format.js";
+  import { duration, shortNodeName, KINDS, runDescription, isFinished, finishedAt } from "./format.js";
   let { inventory, view } = $props();
   // The same window and gestures as the Nodes page; the query window holds still while a gesture runs.
   let frozen = $state(null);
@@ -47,14 +47,14 @@
   let reportedFilter = $state("");
   const reportedShown = $derived(reportedFilter ? reportedNames.filter((name) => name.includes(reportedFilter)).slice(0, 12).map((name) => [name, name]) : REPORTED_CHARTS.filter(([name]) => reportedNames.includes(name)));
   // A finished run opens on its own lifetime rather than the last 30 minutes, unless the link names a window.
-  const finished = $derived(!!run && (run.status !== "active" || ["Ended", "Stopped"].includes(run.display_status)));
+  const finished = $derived(isFinished(run));
   let opened = null;
   $effect(() => {
     if (!run || !finished || opened === run.run_id) return;
     opened = run.run_id;
     const params = new URLSearchParams(location.hash.split("?")[1] || "");
-    const stop = run.completed_at || run.progress?.last_completed_at;
-    if (params.has("end") || params.has("duration") || !stop) return;
+    const stop = finishedAt(run);
+    if (params.has("end") || params.has("duration") || !Number.isFinite(stop)) return;
     const span = Math.max(0, stop - (run.created_at || stop));
     view.duration = Math.max(1800, Math.min(MAX_WINDOW, Math.round(span * 1.05)));
     view.end = Math.min(observed, Math.round(stop + Math.max(60, span * 0.025)));
