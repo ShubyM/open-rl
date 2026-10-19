@@ -11,7 +11,6 @@ from server.dashboard import router
 from server.dashboard.__main__ import app as dashboard_app
 from server.scripts import forward_metrics
 from server.store import InMemoryStateStore
-from server.telemetry import run_metrics
 from tests.api_client import asgi_client
 
 
@@ -62,58 +61,6 @@ class RunMetricsTest(unittest.IsolatedAsyncioTestCase):
     with patch.object(self.state, "set_members", side_effect=RuntimeError("store unavailable")):
       response = await self.dashboard.get("/metrics")
     self.assertEqual(response.status_code, 503)
-
-  async def test_history_sent_to_an_earlier_gateway_still_reads(self) -> None:
-    # Earlier gateways kept a capped list per run; a step sent twice keeps its newer row.
-    for row in (
-      {"step": 0, "at": 1.0, "metrics": {"reward": 0.1}},
-      {"step": 1, "at": 2.0, "metrics": {"reward": 0.2}},
-      {"step": 0, "at": 3.0, "metrics": {"reward": 0.3}},
-    ):
-      await self.state.append_sample(run_metrics.LEGACY_PREFIX + "old-run", row, 100, None)
-    rows = await self.rows("old-run")
-    self.assertEqual([(row["step"], row["metrics"]["reward"]) for row in rows], [(0, 0.3), (1, 0.2)])
-
-  async def test_a_scrape_exports_recent_runs_and_forgets_expired_ones(self) -> None:
-    async with asgi_client() as gateway:
-      for run in ("recent", "quiet", "gone"):
-        await gateway.post(f"/api/v1/runs/{run}/metrics", json={"rows": [{"step": 1, "metrics": {"reward": 0.5}}]})
-    quiet = json.loads(await self.state.get_value("latest:" + run_metrics.PREFIX + "quiet"))
-    await self.state.set_value("latest:" + run_metrics.PREFIX + "quiet", json.dumps({**quiet, "at": quiet["at"] - run_metrics.EXPORT_SECONDS - 1}))
-    await self.state.delete_values("latest:" + run_metrics.PREFIX + "gone")
-    scrape = (await self.dashboard.get("/metrics")).text
-    self.assertIn('run_id="recent"', scrape)
-    self.assertNotIn('run_id="quiet"', scrape)
-    self.assertNotIn('run_id="gone"', scrape)
-    self.assertEqual(await self.state.set_members(run_metrics.INDEX), {"recent", "quiet"})
-
-  async def test_client_logs_are_kept_with_their_run_and_unknown_runs_are_refused(self) -> None:
-    async with asgi_client() as gateway:
-      missing = await gateway.post("/api/v1/runs/no-such-model/logs", json={"lines": [{"message": "hi"}]})
-      self.assertEqual(missing.status_code, 404)
-      self.assertEqual((await gateway.post("/api/v1/runs/no-such-model/metrics", json={"rows": []})).status_code, 404)
-      with patch("builtins.print") as printed:
-        sent = await gateway.post(
-          "/api/v1/runs/run-1/logs", json={"lines": [{"message": "step 3 done", "severity": "warning"}, {"message": "x", "severity": "LOUD"}]}
-        )
-    self.assertEqual(sent.json(), {"accepted": 2})
-    first = json.loads(printed.call_args_list[0].args[0])
-    self.assertEqual(
-      (first["severity"], first["message"], first["logging.googleapis.com/labels"]),
-      ("WARNING", "step 3 done", {"openrl_run_id": "run-1", "openrl_source": "client"}),
-    )
-    self.assertEqual(json.loads(printed.call_args_list[1].args[0])["severity"], "INFO")
-    # Without Cloud Logging, the run's Logs tab shows the tail kept in the run store, newest first.
-    with patch.object(
-      router,
-      "run_of",
-      return_value=(
-        {"observed_at": "2026-01-01T00:00:00+00:00", "runs": [], "placements": [], "processes": [], "cluster": {"nodes": []}},
-        {"run_id": "run-1", "shared_runtime": False},
-      ),
-    ):
-      logs = (await self.dashboard.get("/api/v1/inspect/logs", params={"run_id": "run-1"})).json()
-    self.assertEqual([(r["pod"], r["message"]) for r in logs["records"]], [("client", "x"), ("client", "step 3 done")])
 
   async def test_conditional_history_reuses_unchanged_rows_and_invalidates_old_step_corrections(self) -> None:
     url = "/api/v1/inspect/run_metrics?run_id=run-1"

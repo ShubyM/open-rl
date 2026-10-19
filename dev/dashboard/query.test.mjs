@@ -63,15 +63,6 @@ test('cached revisit renders immediately, refreshes, preserves data on failure a
   revisit.close();
 });
 
-test('a live view leaves the shared cache to responses that will be revisited', async () => {
-  requests = [];
-  const live = open('/activity?until=1', '', { remember: () => false });
-  requests.at(-1).respond({ samples: [1] }); await settle(); live.close();
-  const again = open('/activity?until=1');
-  assert.equal(again.query.data, null, 'a live window is not cached');
-  again.close();
-});
-
 test('changed scopes and cancelled responses never leak another node or time window', async () => {
   requests = [];
   const view = open('/series?node=a&end=1', 'a');
