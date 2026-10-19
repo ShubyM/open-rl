@@ -64,7 +64,7 @@ export async function get(url, signal) {
 // A live view keys on the user's selection, so its moving window is read at each poll instead of restarting it.
 export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () => true, key = url } = {}) {
   let previousScope;
-  const result = $state({ data: null, error: null, status: null, pending: false, retry: () => {} });
+  const result = $state({ data: null, error: null, status: null, pending: false, stale: false, retry: () => {} });
   $effect(() => {
     const requestedKey = key(), requestedScope = scope();
     return untrack(() => {
@@ -73,6 +73,7 @@ export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () =
       previousScope = requestedScope;
       result.data = cache.get(url()) ?? result.data;
       const controller = new AbortController();
+      let failures = 0, retryTimer = null;
       const load = result.retry = async () => {
         const requested = url();
         if (!requested || result.pending) return;
@@ -80,18 +81,30 @@ export function createQuery(url, { poll = 0, pollWhen = () => true, scope = () =
         try {
           const data = await get(requested, controller.signal);
           if (controller.signal.aborted) return;
-          Object.assign(result, { error: data.error || null, status: null });
+          failures = 0;
+          Object.assign(result, { error: data.error || null, status: null, stale: false });
           if (!result.error || !result.data) result.data = data;
           if (!result.error) {
             cache.set(requested, data);
             if (cache.size > 24) cache.delete([...cache.keys()].find((key) => key !== inspectUrl("inventory")));
           }
-        } catch (error) { if (!controller.signal.aborted) { result.error = error.message; result.status = error.status || null; } }
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          // A dropped tunnel or a busy server is usually brief, so keep what is shown and retry; report it only if it lasts.
+          failures += 1;
+          if ((!error.status || error.status >= 500 || error.status === 429) && failures < 4) {
+            result.stale = Boolean(result.data);
+            clearTimeout(retryTimer);
+            retryTimer = setTimeout(load, 2000 * 2 ** (failures - 1));
+          } else {
+            Object.assign(result, { error: error.message, status: error.status || null, stale: false });
+          }
+        }
         finally { if (!controller.signal.aborted) { result.pending = false; } }
       };
       load();
       const timer = poll ? setInterval(() => { if (!document.hidden && pollWhen()) load(); }, poll) : null;
-      return () => { controller.abort(); clearInterval(timer); result.pending = false; };
+      return () => { controller.abort(); clearInterval(timer); clearTimeout(retryTimer); result.pending = false; };
     });
   });
   return result;

@@ -13,7 +13,7 @@
     if (view.page === "run" && view.back) saved.nodes = view.back;
   });
   const section = $derived(view.page === "run" ? view.back ? "nodes" : "overview" : view.page);
-  const connection = $derived(inventory.error ? inventory.data ? "Stale snapshot" : "Unavailable" : !inventory.data ? "Connecting…" : inventory.data.cluster.available ? "Connected" : "Cluster unavailable");
+  const connection = $derived(inventory.error ? inventory.data ? "Stale snapshot" : "Unavailable" : inventory.stale ? "Reconnecting…" : !inventory.data ? "Connecting…" : inventory.data.cluster.available ? "Connected" : "Cluster unavailable");
   onMount(() => {
     const navigate = () => {
       const next = parseView();

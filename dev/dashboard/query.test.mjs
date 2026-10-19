@@ -38,16 +38,32 @@ test('cached revisit renders immediately, refreshes, preserves data on failure a
   const revisit = open('/activity?run=a');
   assert.deepEqual(revisit.query.data.samples, [1]);
   assert.equal(revisit.query.pending, true);
+  // A brief outage keeps the data and retries quietly; it is reported only once it lasts.
   requests.at(-1).respond({ detail: 'Offline' }, 503); await settle();
+  assert.deepEqual(revisit.query.data.samples, [1]);
+  assert.equal(revisit.query.error, null);
+  assert.equal(revisit.query.stale, true);
+  for (let i = 0; i < 3; i++) { revisit.query.retry(); requests.at(-1).respond({ detail: 'Offline' }, 503); await settle(); }
   assert.deepEqual(revisit.query.data.samples, [1]);
   assert.equal(revisit.query.error, 'Offline');
   assert.equal(revisit.query.status, 503);
+  assert.equal(revisit.query.stale, false);
   revisit.query.retry();
   requests.at(-1).respond({ samples: [2] }); await settle();
   assert.deepEqual(revisit.query.data.samples, [2]);
   assert.equal(revisit.query.error, null);
   assert.equal(revisit.query.status, null);
   revisit.close();
+});
+
+test('a request the server rejects is reported at once, not retried', async () => {
+  requests = [];
+  const page = open('/activity?run=missing');
+  requests.at(-1).respond({ detail: 'Requested data not found' }, 404); await settle();
+  assert.equal(page.query.error, 'Requested data not found');
+  assert.equal(page.query.stale, false);
+  assert.equal(requests.length, 1);
+  page.close();
 });
 
 test('changed scopes and cancelled responses never leak another node or time window', async () => {
