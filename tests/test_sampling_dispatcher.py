@@ -1,8 +1,11 @@
 import asyncio
 import inspect
 import json
+import random
 import tempfile
+import tracemalloc
 import uuid
+from array import array
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,7 +20,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from server.sampling_dispatcher import UNKNOWN_WEIGHTS, Dispatcher, http_client, redis_client, revision_file
+from server.sampling_dispatcher import UNKNOWN_WEIGHTS, Dispatcher, http_client, redis_client, revision_file, to_result
 from server.sampling_store import SamplingStore, future_key
 from tests.redis_server import RedisTestCase
 from tests.test_exclusive_trainer import tiny_worker
@@ -84,11 +87,11 @@ def same(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> bool:
 class FakeReplica:
   """vLLM's weight endpoints and generate with a real weight version. `held` pauses both; an update logs what the readiness probe expects.
   Like vLLM, a paused replica queues generate until it is resumed, one weight update is active from start to finish,
-  and only a finish that names a version, or /update_weight_version, changes the version."""
+  and only a finish that names a version, or /update_weight_version, changes the version. `prompts` keeps the token ids sent."""
 
   def __init__(self, name: str, log: list, version: str, expected: Path):
     self.name, self.log, self.version, self.expected, self.held, self.url = name, log, version, expected, asyncio.Event(), ""
-    self.resumed, self.probes, self.paused, self.updating, self.fail_update = 0, 0, False, False, False
+    self.resumed, self.probes, self.paused, self.updating, self.fail_update, self.prompts = 0, 0, False, False, False, []
     gets = [Route("/weight_info", lambda r: JSONResponse({"weight_version": self.version}))]
     gets.append(Route("/is_paused", lambda r: JSONResponse({"is_paused": self.paused})))
     posts = {"/pause": self.pause, "/resume": self.resume, "/start_weight_update": self.start, "/update_weight_version": self.set_version}
@@ -136,6 +139,7 @@ class FakeReplica:
 
   async def generate(self, request) -> Response:
     self.log.append(("generate", self.name, self.version))
+    self.prompts.append((await request.json())["token_ids"])
     await until(lambda: not self.held.is_set() and not self.paused)
     return JSONResponse({"choices": [CHOICE]})
 
@@ -183,9 +187,9 @@ class SamplingDispatcherTest(RedisTestCase):
   def loads(self, *names: str) -> dict[str, list[str]]:
     return {name: [entry[2] for entry in self.log if entry[:2] == ("update", name)] for name in names}
 
-  async def accepted(self, revision: str = "") -> dict:
+  async def accepted(self, revision: str = "", prompt: list | None = None) -> dict:
     identity = {"request_id": str(uuid.uuid4()), "pool": self.pool, "revision": revision, "model": "base", "idempotency_key": None}
-    r = {**identity, "prompt_token_ids": [1, 2, 3], "sampling_params": {"n": 1, "max_tokens": 2}, "include_prompt_logprobs": False}
+    r = {**identity, "prompt_token_ids": prompt or [1, 2, 3], "sampling_params": {"n": 1, "max_tokens": 2}, "include_prompt_logprobs": False}
     await self.store.accept(r)
     return r
 
@@ -293,6 +297,37 @@ class SamplingDispatcherTest(RedisTestCase):
     dispatcher = Dispatcher(self.store, self.pool, self.http, None, [hung.url], concurrency=1)
     await asyncio.wait_for(dispatcher.send(r), 5)
     self.assertEqual(self.log, [("generate", "pod-0", "default")])
+
+  async def test_the_dispatcher_holds_a_pending_prompt_in_a_few_bytes_a_token(self):
+    # It keeps every record until it commits, inside a 2Gi limit, so a long-context backlog must stay small once read
+    # and while it is read. A list of ints costs about 36 bytes a token.
+    prompt, count = [random.randrange(1000, 150000) for _ in range(20_000)], 50
+    for _ in range(count):
+      await self.accepted(prompt=prompt)
+    dispatcher = Dispatcher(self.store, self.pool, self.http, None, ["http://127.0.0.1:9"], concurrency=4)  # nothing answers
+    tracemalloc.start()
+    self.addCleanup(tracemalloc.stop)
+    before, _ = tracemalloc.get_traced_memory()
+    tracemalloc.reset_peak()
+    await dispatcher.dispatch()
+    after, peak = tracemalloc.get_traced_memory()
+    held, peak_held = (after - before) / (count * len(prompt)), (peak - before) / (count * len(prompt))
+    self.assertEqual(len(dispatcher.records), count)
+    self.assertLess(held, 8, f"{held:.1f} bytes a token once read")
+    self.assertLess(peak_held, 20, f"{peak_held:.1f} bytes a token while read")
+
+  async def test_a_prompt_kept_compact_is_sent_and_scored_as_the_client_sent_it(self):
+    (replica,) = replicas = await self.replicas("default")
+    # A negative token does not fit array('I'), so that prompt stays the list the client sent, for vLLM to refuse.
+    records = [await self.accepted(), await self.accepted(prompt=[-1, 2])]
+    compact, as_sent = await self.store.pending(self.pool)
+    self.assertEqual((type(compact["prompt_token_ids"]), as_sent["prompt_token_ids"]), (array, [-1, 2]))
+    body = {"choices": [CHOICE], "prompt_logprobs": [None, {"2": {"logprob": -0.5}}, {"3": {"logprob": -0.25}}]}
+    self.assertEqual(to_result(body, {**compact, "include_prompt_logprobs": True})["prompt_logprobs"], [None, -0.5, -0.25])
+    await self.dispatcher(replicas)
+    for r in records:
+      self.assertEqual(await self.committed(r["request_id"]), [SAMPLE])
+    self.assertEqual(sorted(replica.prompts), [[-1, 2], [1, 2, 3]])
 
   async def test_a_redis_timeout_does_not_stop_dispatching(self):
     replicas = await self.replicas("default")

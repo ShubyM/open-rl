@@ -113,11 +113,11 @@ def worker_env(meta: TrainingModelMetadata, base_model: str, runtime: str, is_lo
   else:
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-    # torch.compile artifacts and Triton kernels persist on the shared volume, so
-    # only a model's first replica compiles (about a minute for a 0.6B model).
-    cache = Path(os.getenv("OPEN_RL_TMP_DIR", "/mnt/shared/open-rl"), "cache")
-    env["VLLM_CACHE_ROOT"] = str(cache / "vllm")
-    env["TRITON_CACHE_DIR"] = str(cache / "triton")
+    # Triton kernels persist on the shared volume, so later replicas skip compiling them,
+    # and Triton renames each kernel into place from a unique temp dir, so concurrent
+    # writers are safe. vLLM's compile cache is not shared, because vLLM names its AOT
+    # temp file by PID alone and replicas in different pods can run the same PID.
+    env["TRITON_CACHE_DIR"] = str(Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"), "cache", "triton"))
     if is_lora:
       # vLLM loads each frozen adapter snapshot by name from this directory.
       env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "true"
@@ -176,6 +176,8 @@ class LocalWorkerManager:
     self.project_dir = project_dir
     self.processes: dict[tuple[str, str], subprocess.Popen] = {}
     self.started: dict[tuple[str, str], float] = {}
+    # Each local pool's dispatcher command and env, to start it again while its vLLM runs on.
+    self.dispatchers: dict[str, tuple[list[str], dict[str, str]]] = {}
     self.lock = threading.Lock()
 
   def ensure(self, model_id: str, role: str) -> None:
@@ -185,6 +187,10 @@ class LocalWorkerManager:
     with self.lock:
       proc = self.processes.get((role, runtime))
       if proc is not None and proc.poll() is None:
+        dispatcher = self.processes.get(("dispatcher", runtime))
+        if role == "sampler" and (dispatcher is None or dispatcher.poll() is not None):
+          # A pool without its dispatcher answers nothing, so a dead one starts again against the running vLLM.
+          self.spawn("dispatcher", runtime, *self.dispatchers[runtime])
         return
       base_model = base_model_of(meta, runtime)
       env = {**os.environ, **worker_env(meta, base_model, runtime, is_lora, role)}
@@ -196,14 +202,28 @@ class LocalWorkerManager:
         env["OPEN_RL_TIME_SLICE_GROUP"] = TRAINER_TIME_SLICE_GROUP
         self.spawn(role, runtime, python_command(["gpu"], worker_module(role), worker_args(runtime, role, is_lora)), env)
         return
-      # A local pool is one vllm serve replica and the dispatcher that sends to it directly.
+      # A local pool is one vllm serve replica and the dispatcher that sends to it directly. The dispatcher of a vLLM
+      # that died is stopped before a new pair starts, so two dispatchers never read one stream.
+      if (old := self.processes.get(("dispatcher", runtime))) is not None:
+        self.terminate(("dispatcher", runtime))
+        try:
+          old.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+          old.kill()
+          old.wait()
       with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
       vllm = ["uv", "run", "--extra", "gpu", "--extra", "vllm", "vllm"] if shutil.which("uv") else [str(Path(sys.executable).with_name("vllm"))]
+      if is_lora:
+        # vLLM's filesystem LoRA resolver exits at startup without its directory, and no adapter may be frozen yet.
+        snapshot_root().mkdir(parents=True, exist_ok=True)
       self.spawn(role, runtime, [*vllm, "serve", *serve_args(base_model, is_lora, env, port)], env)
       dispatcher_env = {**os.environ, "OPEN_RL_SAMPLER_POOL": meta.pool(runtime), "OPEN_RL_SAMPLER_ENDPOINTS": f"http://127.0.0.1:{port}"}
-      self.spawn("dispatcher", runtime, python_command([], "server.sampling_dispatcher", []), dispatcher_env)
+      # The dispatcher keeps the pool's revision file under the same root the API server uses.
+      dispatcher_env["OPEN_RL_TMP_DIR"] = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+      self.dispatchers[runtime] = (python_command([], "server.sampling_dispatcher", []), dispatcher_env)
+      self.spawn("dispatcher", runtime, *self.dispatchers[runtime])
 
   def spawn(self, role: str, runtime: str, command: list[str], env: dict[str, str]) -> None:
     log_dir = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp"))

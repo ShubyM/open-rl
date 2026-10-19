@@ -10,6 +10,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -579,13 +580,11 @@ async def ensure_sampler_launched(model_id: str) -> None:
       traceback.print_exc()
 
 
-def check_single_process_backend() -> None:
-  """vLLM sampling runs in a worker the API server launches, and they share queues
-  through Redis, so one process can only sample with torch."""
-  if get_sampler_backend() == "vllm":
+def check_sampler_backend() -> None:
+  if get_sampler_backend() == "vllm" and not os.getenv("REDIS_URL"):
     raise RuntimeError(
-      "SAMPLING_BACKEND=vllm needs REDIS_URL: the API server launches the vLLM sampler as a separate worker. "
-      "Set REDIS_URL (for example redis://127.0.0.1:6379/0), or unset SAMPLING_BACKEND to sample with torch in one process."
+      "Sampling pools need REDIS_URL, because vLLM sampling requests wait in a Redis stream for each pool's dispatcher. "
+      "Set REDIS_URL (for example redis://127.0.0.1:6379/0), or set BASE_MODEL and unset SAMPLING_BACKEND to sample with torch in one process."
     )
 
 
@@ -646,6 +645,7 @@ async def reap_dead_sessions():
 async def lifespan(_: FastAPI):
   global worker_manager
   task = None
+  check_sampler_backend()
   if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER"):
     worker_manager = create_worker_manager()
   if is_single_process_mode():
@@ -657,7 +657,6 @@ async def lifespan(_: FastAPI):
     print(f"-> Sampling backend: {get_sampler_backend()}")
     print(f"-> FFT enabled     : {is_fft_enabled()}")
     print("-> Server mode     : API server + worker loop in one process\n")
-    check_single_process_backend()
     if not is_fft_enabled():
       from server import training_requests_processor
 
@@ -1188,6 +1187,35 @@ def sample_sequence_ids(request_id: str, num_samples: int) -> list[str]:
   return [f"{request_id}:{index}" for index in range(max(1, int(num_samples)))]
 
 
+# How long a sample waits for weights another node just saved to show up here.
+SAVED_WEIGHTS_WAIT_SECONDS = 2.0
+
+
+def visible(path: Path) -> bool:
+  """Whether a file another node saved shows here. An NFS client keeps a failed
+  lookup until it revalidates the directory, and listing a directory makes it
+  revalidate, so on a miss this lists the nearest directory above the file that
+  exists and looks again."""
+  if path.is_file():
+    return True
+  for directory in path.parents:
+    try:
+      os.listdir(directory)
+      break
+    except OSError:
+      continue
+  return path.is_file()
+
+
+async def wait_until_visible(path: Path) -> bool:
+  deadline = time.monotonic() + SAVED_WEIGHTS_WAIT_SECONDS
+  while not await asyncio.to_thread(visible, path):
+    if time.monotonic() >= deadline:
+      return False
+    await asyncio.sleep(0.2)
+  return True
+
+
 async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
   """Missing weights are a 400, never a fallback to other weights."""
   ref = sampling_ref(req.model_id or req.sampling_session_id or "")
@@ -1198,11 +1226,11 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
   elif meta.fine_tuning_type == "full":
     revision, model = resolve_sampler_weights_path(ref), meta.base_model
     # The trainer writes metadata.json last, so a save in progress is missing too.
-    if not os.path.isfile(os.path.join(revision, "metadata.json")):
+    if not await wait_until_visible(Path(revision, "metadata.json")):
       raise HTTPException(status_code=400, detail=f"No saved sampler weights for {ref}")
   else:
     revision, model = "", snapshot_name(ref)
-    if not (snapshot_root() / model / "adapter_config.json").is_file():
+    if not await wait_until_visible(snapshot_root() / model / "adapter_config.json"):
       raise HTTPException(status_code=400, detail=f"No saved LoRA sampler weights for {ref}")
   pool = meta.pool(lookup_id)
 

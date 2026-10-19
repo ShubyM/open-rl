@@ -53,47 +53,15 @@ def gpu_memory_utilization() -> float:
   return 0.90
 
 
-def sampler_batch_limits(device_memory_bytes: int | None = None) -> dict[str, int]:
-  """vLLM's concurrency for this device: sequences in flight and prefill tokens per step.
-
-  A sweep's sampler serves many groups at once, and the defaults (64
-  sequences, 2048 prefill tokens) leave most of an 80 GB card idle. Explicit
-  VLLM_MAX_NUM_SEQS / VLLM_MAX_NUM_BATCHED_TOKENS win; otherwise size by memory.
-  """
-  if device_memory_bytes is None:
-    device_memory_bytes = detected_device_memory_bytes()
-  gib = device_memory_bytes / 2**30
-  if gib >= 60:
-    seqs, tokens = 256, 16384
-  elif gib >= 36:
-    seqs, tokens = 128, 8192
-  else:
-    seqs, tokens = 64, 4096
-  return {
-    "max_num_seqs": int(os.getenv("VLLM_MAX_NUM_SEQS", seqs)),
-    "max_num_batched_tokens": int(os.getenv("VLLM_MAX_NUM_BATCHED_TOKENS", tokens)),
-  }
-
-
-def detected_device_memory_bytes() -> int:
-  try:
-    import torch
-
-    if torch.cuda.is_available():
-      return int(torch.cuda.get_device_properties(0).total_memory)
-  except Exception:
-    pass
-  return 0
-
-
 def serve_args(base_model: str, is_lora: bool, env: Mapping[str, str | None], port: int = 8000) -> list[str]:
   """`vllm serve` flags for a sampling pool replica."""
   args = [base_model, "--port", str(port), "--api-server-count", "1", "--enable-scale-out", "--enable-prefix-caching"]
-  # The queue sampler built SamplingParams itself, so a checkpoint's
-  # generation_config.json defaults never applied. vllm serve would apply them.
+  # A checkpoint's generation_config.json could add sampling params the client never asked for, such as a repetition penalty.
   args += ["--generation-config", "vllm", "--max-model-len", os.getenv("VLLM_MAX_MODEL_LEN", "8192")]
-  # The API server's vLLM settings, as flags. VLLM_MAX_NUM_SEQS becomes --max-num-seqs.
-  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_NUM_SEQS", "VLLM_MAX_NUM_BATCHED_TOKENS"):
+  # vLLM's own default of 0.92 has run FFT delta applies out of memory on an L4.
+  args += ["--gpu-memory-utilization", str(gpu_memory_utilization())]
+  # These args are rendered where the replica's device is unknown, so vLLM sizes the batch for the device it runs on unless told.
+  for name in ("VLLM_MAX_NUM_SEQS", "VLLM_MAX_NUM_BATCHED_TOKENS"):
     if os.getenv(name):
       args += ["--" + name.removeprefix("VLLM_").lower().replace("_", "-"), os.environ[name]]
   if text_only := text_only_engine_kwargs():

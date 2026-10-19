@@ -48,7 +48,7 @@ REDIS_URL=redis://127.0.0.1:6379/0 VLLM_ARCHITECTURE_OVERRIDE=Gemma4ForCausalLM 
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `BASE_MODEL` | unset | Hugging Face model id loaded by the trainer and, when using vLLM, by the sampler. |
-| `SAMPLING_BACKEND` | `torch` in one process, `vllm` when `REDIS_URL` is set | Sampling backend selector. `torch` samples in the training process. `vllm` queues sampling requests for a vLLM sampler worker and needs `REDIS_URL`. |
+| `SAMPLING_BACKEND` | `torch` in one process, `vllm` when `REDIS_URL` is set | Sampling backend selector. `torch` samples in the training process. `vllm` samples through the sampling pools described below and needs `REDIS_URL`. |
 | `REDIS_URL` | unset | Enables distributed mode by switching the request store to Redis. Leave unset for a single-machine run. |
 | `OPEN_RL_FUTURE_TTL_S` | `300` | How long resolved request results stay readable by `retrieve_future` after a worker resolves them. |
 
@@ -121,6 +121,4 @@ On one machine the local worker manager starts one `vllm serve` on
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `OPEN_RL_DISPATCH_CONCURRENCY` | `256` | Requests one pool's dispatcher keeps in flight across its replicas. |
-| `OPEN_RL_SAMPLER_ROUTER` | `http://127.0.0.1:8081` | Where a pool's dispatcher sends requests on Kubernetes, Envoy in its own pod. |
-| `OPEN_RL_SAMPLER_ENDPOINTS` | unset | Comma-separated replica URLs for a dispatcher with no router. The local worker manager sets it. |
 | `OPEN_RL_DISPATCHER_IMAGE` | the worker image | Image for each pool's dispatcher container. The release sets it to the API-server image, which carries the dispatcher without the GPU stack and pulls in seconds. |

@@ -1,6 +1,6 @@
 # The API server requests one Workload per worker process; the scheduler owns the
-# pods and claims from there. It also creates and deletes each sampling pool's
-# CPU-pod Deployment and NetworkPolicy.
+# pods and claims from there. It also manages each sampling pool's CPU pod and
+# lists sampler pods, because a sampler is ready only once its pod is Ready.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -11,10 +11,13 @@ rules:
   verbs: ["create", "get", "list", "watch", "delete"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
-  verbs: ["create", "get", "list", "delete"]
+  verbs: ["create", "get", "delete"]
 - apiGroups: ["networking.k8s.io"]
   resources: ["networkpolicies"]
-  verbs: ["create", "get", "delete"]
+  verbs: ["create", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -22,7 +25,7 @@ metadata:
   name: open-rl-worker-launcher
 subjects:
 - kind: ServiceAccount
-  name: open-rl-api-server
+  name: open-rl-sa
 roleRef:
   kind: Role
   name: open-rl-worker-launcher
