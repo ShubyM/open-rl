@@ -312,14 +312,11 @@ class Snapshot:
       processes_error = self.lasting("processes", "Worker process records unavailable", previous is None)
     else:
       self.processes_at, processes_error = now, self.lasting("processes", None)
-    errors = [
-      store_error,
-      processes_error,
-      cluster.get("error"),
-      cluster.get("nodes_error"),
-      cluster["scheduler"].get("error"),
-      cluster["devices"].get("error"),
-    ]
+    errors = [store_error, processes_error]
+    # Kubernetes is optional locally. Section diagnostics remain visible, but
+    # must not make the browser reject fresh run data when no cluster was read.
+    if cluster["available"]:
+      errors.extend([cluster.get("error"), cluster.get("nodes_error"), cluster["scheduler"].get("error"), cluster["devices"].get("error")])
     runs = join_runs(metadata, cluster)
     ctx = self.status_context(store, cluster)
 

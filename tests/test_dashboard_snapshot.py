@@ -350,6 +350,38 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.snapshot.invalidate()
     self.assertIsNone((await self.snapshot.current(self.store))["cluster"].get("error"))
 
+  async def test_without_kubernetes_runs_and_processes_refresh_then_join_when_it_appears(self) -> None:
+    self.cluster.return_value = snapshot.kubernetes.unavailable("openrl-system", "No cluster configured")
+    with patch.object(snapshot.time, "time", return_value=1000):
+      first = await self.snapshot.current(self.store)
+    self.assertIsNone(first["error"])
+    self.metadata.return_value = [{**row, "status": "completed"} for row in METADATA] + [{**METADATA[0], "model_id": "new-run"}]
+    self.processes.return_value = [{"id": "new-process"}]
+    await self.store.set_value("open_rl:model_meta:new-run", json.dumps(RECORDS["r1"]))
+    with patch.object(snapshot.time, "time", return_value=1001):
+      updated, run = await router.run_of("new-run")
+    self.assertEqual(run["run_id"], "new-run")
+    self.assertEqual({r["display_status"] for r in updated["runs"] if r["run_id"] != "new-run"}, {"Completed"})
+    self.assertEqual(updated["processes"], [{"id": "new-process"}])
+    self.assertNotEqual(updated["observed_at"], first["observed_at"])
+    self.assertFalse(updated["cluster"]["available"])
+    self.assertIsNone(updated.get("error"))
+    self.metadata.return_value[-1]["steps"] = 3
+    self.processes.return_value = []
+    with patch.object(snapshot, "GRACE_SECONDS", 0):
+      self.snapshot.invalidate()
+      later = await self.snapshot.current(self.store)
+    self.assertIsNone(later["error"])
+    self.assertIn("No cluster configured", later["cluster"]["error"])
+    self.assertEqual(later["processes"], [])
+    self.assertEqual(next(r["steps"] for r in later["runs"] if r["run_id"] == "new-run"), 3)
+    self.cluster.return_value = STATE
+    self.snapshot.invalidate()
+    recovered = await self.snapshot.current(self.store)
+    run = next(r for r in recovered["runs"] if r["run_id"] == "new-run")
+    self.assertTrue(recovered["cluster"]["available"])
+    self.assertEqual([pod["name"] for pod in run["pods"]], ["orw-lora-trainer"])
+
   async def test_dra_failure_preserves_idle_gpu_devices_without_claims(self) -> None:
     self.cluster.return_value = {**copy.deepcopy(STATE), "nodes": [{"name": "n1", "devices": [{"id": "gpu0"}]}]}
     self.cluster.return_value["devices"] = {"available": True, "claims": {}}

@@ -9,11 +9,15 @@ npm --prefix dev/dashboard ci  # once; installs Svelte and esbuild
 make dashboard                 # builds static/app.js and serves on port 8080
 ```
 
-The standalone process is `uv run --extra cluster python -m server.dashboard`. Point it at the API server's Redis (`REDIS_URL`) and worker namespace. Rebuild with `make dashboard-build` after changing `src/server/dashboard/ui`; when packaging a wheel, build it before `uv build`.
+The standalone process is `uv run --extra cluster python -m server.dashboard`. Point it at the API server's Redis (`REDIS_URL`) and worker namespace. Without shared Redis, a separate dashboard has its own empty in-memory store and cannot see another server's runs. Rebuild with `make dashboard-build` after changing `src/server/dashboard/ui`; when packaging a wheel, build it before `uv build`.
 
-On Kubernetes, `kubectl apply -k k8s/deploy/dashboard` deploys it into `openrl-system` with the existing `open-rl-sa`. It uses the API-server image, whose Dockerfile builds the UI in a Node stage. Set the image tag in that directory's `kustomization.yaml`.
+On GKE with Managed Prometheus CRDs installed, `kubectl apply -k k8s/deploy/dashboard` deploys it and its PodMonitoring into `openrl-system` with the existing `open-rl-sa`. It uses the API-server image, whose Dockerfile builds the UI in a Node stage. Set the image tag in that directory's `kustomization.yaml`.
 
-The inspection API lists every run in the fleet, while the client-facing API server only answers for model IDs a client already holds. So the API server does not mount it by default. For a trusted local setup, run `make dashboard-build`, then `OPEN_RL_INSPECTION_API=true make server`.
+The inspection API lists every run in the fleet, while the client-facing API server only answers for model IDs a client already holds. So the API server does not mount it by default. For a trusted local server without Redis, run `make dashboard-build`, then `OPEN_RL_INSPECTION_API=true make server` and open `http://127.0.0.1:9003/dashboard`. This shares the server's in-memory run and operation data. Missing Kubernetes does not prevent that data from refreshing.
+
+To view a deployed dashboard from a laptop, use `kubectl -n openrl-system port-forward svc/open-rl-dashboard 8080:8000`, then open `http://127.0.0.1:8080/dashboard`. Its data sources and cloud credentials stay in the cluster.
+
+Local inspection currently has narrower coverage: worker log history requires Cloud Logging, nodes and pod logs require Kubernetes, and hardware/sampler charts require a configured metrics backend. Forwarded client logs have a retained tail available without Cloud Logging. `OPEN_RL_PROMETHEUS_URL` supports appropriately labelled DCGM and vLLM series, but worker CPU/memory queries currently use GKE system metric names. The UI still shows unavailable-source messages for unconfigured features.
 
 ## Pages
 
@@ -22,7 +26,7 @@ The inspection API lists every run in the fleet, while the client-facing API ser
 - **Nodes**: which worker process held which GPUs and when, per-GPU activity, and GPU and CPU charts. On the timelines and charts, drag or press A/D to pan; use Ctrl/⌘ + wheel, pinch, or W/S to zoom.
 - **Health**: pod and node problems, and unavailable sources.
 
-Recent query responses are kept in a bounded, in-memory cache and shown while refreshing. Reloading clears this cache. Logs do not poll activity. Failed metrics fields retain their last samples with a stale note; successful fields continue updating. A failed inventory store read retains the previous observation time and reports the source error immediately, so stale heartbeats cannot turn into new worker-death verdicts.
+Recent query responses are kept in a bounded, in-memory cache and shown while refreshing. Reloading clears this cache. Logs do not poll activity. Failed metrics fields retain their last samples with a stale note; successful fields continue updating. Inventory sources refresh independently; a failed source keeps its last successful data during a 30-second grace period, after which its error is reported.
 
 ## API
 
@@ -31,7 +35,7 @@ Recent query responses are kept in a bounded, in-memory cache and shown while re
 | `GET /inventory` | Runs with status, progress, workers, pods and scheduler workloads, each with its placement decision; nodes, devices and current placements; claim reservations; an error field per unavailable source |
 | `GET /activity` | One lane per worker process: its GPU turns and completed ops, in Unix seconds. With `run_id`: the run, its op samples and pod incidents |
 | `GET /series` | GPU utilization and memory per device UUID, and worker CPU and memory, for one `node_id` or one `run_id`. With `run_id`, also the run's vLLM samplers: token throughput, running and waiting requests, KV cache use, preemptions, and p99 time to first token and request latency |
-| `GET /logs` | A run's Cloud Logging records, with `q`, `pod`, `node` and `severity` filters and cursor paging |
+| `GET /logs` | Worker and forwarded client logs from Cloud Logging, with filters and cursor paging; a retained client-log tail when Cloud Logging is unconfigured |
 | `GET /pods/{pod}/logs` | Current or previous container output from the kubelet |
 | `GET /run_metrics` | Distinct training steps reported by a client, ordered by step |
 
@@ -45,19 +49,25 @@ Log cursors preserve the original bounds, pod lifetimes and provider query for 1
 
 ## Client metrics and Prometheus
 
-Send batches to the gateway with `POST /api/v1/runs/{run_id}/metrics`, or forward cookbook output:
+Send batches to the gateway with `POST /api/v1/runs/{run_id}/metrics`, or run the companion beside an unchanged cookbook example:
 
 ```sh
 python -m server.scripts.forward_metrics /path/to/run --base-url http://gateway:8000 --run-id RUN_ID --follow
 ```
 
+The forwarder must be started explicitly where the files live, with the OpenRL modules and `httpx` installed. It reads `metrics.jsonl` every 15 seconds and sends batches of 200 rows. Metric names are discovered from finite numeric values; no per-metric registration is needed. Records require an integer `step` or `progress/batch`. The dashboard's metric filter finds custom names. Direct API callers send `{"rows": [{"step": 12, "metrics": {"custom_score": 0.8}}]}`.
+
+`RUN_ID` must be an existing model ID. If omitted, the forwarder waits for the first model path in `checkpoints.jsonl`. This still assumes one model per source file; repeated steps replace entire rows, and string fields such as `phase` are discarded.
+
+By default it also sends `logs.log` to `POST /api/v1/runs/{run_id}/logs`; use `--no-logs` for metrics only. The gateway emits structured client logs for Cloud Logging and retains the last 5,000 lines in its run store for local inspection. Log forwarding can duplicate lines after retries or restarts.
+
 Each batch atomically replaces rows by step and retains the highest `OPEN_RL_OPS_SAMPLE_LIMIT` distinct steps. Retrying an acknowledged batch cannot evict other steps. The forwarder filters nonfinite values before JSON encoding and retries only unacknowledged batches.
 
-History responses include an ETag. The browser revalidates its cached history: unchanged polls return `304` without reading, decoding or transferring the rows, and keep the existing chart data. Every accepted batch changes the revision, including corrections to older steps; changed histories return the full retained rows. The standalone dashboard uses gzip level 1 for large responses.
+History responses include an ETag. The browser revalidates its cached history: unchanged polls return `304` without reading, decoding or transferring the rows, and keep the existing chart data. Changed batches invalidate the revision, including corrections to older steps; replaying unchanged rows keeps it. Changed histories return the full retained rows. The standalone dashboard uses gzip level 1 for large responses.
 
-The dashboard's `/metrics` endpoint exposes the latest reported step as `openrl_run_metric{run_id="...",metric="..."}`, plus `openrl_run_step` and `openrl_run_metrics_received_timestamp_seconds`. Step numbers are values, never labels. Each scrape reads one latest-step snapshot per retained run; dashboard charts read the step history directly. The GKE overlay includes a PodMonitoring for the dashboard; other Prometheus installations can scrape its port 8000 at `/metrics`. Metrics expire with the configured operation TTL.
+The dashboard's `/metrics` endpoint exposes the highest reported step as `openrl_run_metric{run_id="...",metric="..."}`, plus `openrl_run_step` and `openrl_run_metrics_received_timestamp_seconds`. Step numbers are values, never labels. Each scrape reads one latest-step snapshot per indexed run; dashboard charts read the step history directly. By default, export includes the first 64 metric names alphabetically from rows received within six hours (`OPEN_RL_METRICS_EXPORT_LIMIT` and `OPEN_RL_METRICS_EXPORT_HOURS`). Metrics absent from that row are not exported. The dashboard overlay includes its PodMonitoring; other Prometheus installations can scrape port 8000 at `/metrics`. History expires with the configured operation TTL.
 
-Earlier development builds used a list format. Those records remain untouched; replay the run's `metrics.jsonl` with the forwarder to load them into keyed step storage.
+Earlier development builds used a list format. History reads fall back to those records when keyed step history is absent; replay the run's `metrics.jsonl` to populate keyed storage and Prometheus export.
 
 ## Progress
 
@@ -94,4 +104,4 @@ For local regression checks, run `make test`; query lifecycle checks run with `n
 
 `uv run --extra cluster python dev/inspection_eval.py --port 9042` serves ten deterministic cases through the real inspection routes without cluster access. Give an agent only a printed case URL, run ID, symptom, and the skill; the fixture source contains the answer key. Score diagnosis, cited evidence, uncertainty, next check, and whether it obeyed instructions embedded in logs.
 
-Run-scoped logs join trainer, sampler and pool dispatcher pods, not the client Job; the raw pod-log route can read a known client pod.
+Run-scoped logs join trainer, sampler and pool dispatcher pods with forwarded client output. A client Job's pod is not discovered automatically; the raw pod-log route can read a known client pod.
