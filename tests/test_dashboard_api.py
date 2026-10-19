@@ -12,6 +12,7 @@ WINDOW = {"since": "1970-01-01T00:02:00Z", "until": "1970-01-01T00:03:10Z"}
 
 class InspectionApiTest(unittest.TestCase):
   def setUp(self):
+    router.FINISHED_ACTIVITY.clear()
     self.client = TestClient(app)
     self.state = state()
     self.state["runs"][0].update(shared_runtime=False)
@@ -74,6 +75,20 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual([s["at"] for s in data["samples"]], [140])
     self.assertEqual(data["incidents"][0]["reason"], "OOMKilled")
     self.store.read_samples.assert_awaited_once_with(router.ops.key("r1"))
+
+  def test_a_finished_runs_activity_is_computed_once_and_a_live_runs_every_time(self):
+    self.store.read_samples.return_value = [operation(125, 140)]
+    params = {**WINDOW, "run_id": "r1"}
+    for status in ("Ready", "Ready"):
+      self.state["runs"][0].update(status="active", display_status=status)
+      self.assertEqual(self.client.get("/api/v1/inspect/activity", params=params).status_code, 200)
+    self.assertEqual(self.store.read_samples.await_count, 2)
+    self.state["runs"][0].update(display_status="Ended")
+    first = self.client.get("/api/v1/inspect/activity", params=params).json()
+    again = self.client.get("/api/v1/inspect/activity", params=params).json()
+    self.assertEqual(self.store.read_samples.await_count, 3)
+    self.assertEqual(again["samples"], first["samples"])
+    self.assertEqual(again["run"]["display_status"], "Ended")
 
   def test_series_is_independently_callable_and_keeps_partial_data(self):
     backend = mock.Mock(name="hardware")

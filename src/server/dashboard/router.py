@@ -1,6 +1,8 @@
 """The operator UI and the same read-only JSON API for agents."""
 
 import asyncio
+import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -16,6 +18,9 @@ from server.store import get_state_store
 from server.telemetry import gke, kubernetes, ops
 
 router = APIRouter(tags=["inspection"])
+# A finished run's records no longer change, so its activity for a window is computed once.
+FINISHED_ACTIVITY: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
+FINISHED_ACTIVITY_SECONDS = 300
 STATIC = Path(__file__).parent / "static"
 TimeBound = Annotated[
   str | None,
@@ -76,13 +81,18 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
   store = get_state_store()
   state, run = await run_of(run_id) if run_id else (await snapshot.current(store), None)
   start, end, low, high = time_range(since, until or state["observed_at"])
+  finished = bool(run) and (run.get("status") != "active" or run.get("display_status") in ("Ended", "Stopped"))
+  cached = FINISHED_ACTIVITY.get((run_id, node_id, start, end)) if finished else None
+  if cached and cached[0] > time.monotonic():
+    return {**cached[1], "run": run, "observed_at": state["observed_at"]}
   selected = [p for p in inspection.segments(state, run_id, node_id) if p["start"] <= high and p["end"] >= low]
   # Each lane's runs, and its runtime for the worker-level ops recorded there.
   keys = sorted({k for p in selected for k in [*p["run_ids"], p.get("runtime_id")] if k} | ({run_id} if run_id else set()))
 
   async def read(key):
     try:
-      records = await asyncio.wait_for(store.read_samples(key), timeout=1)
+      # A long run holds tens of thousands of records; a one-second budget showed it as empty.
+      records = await asyncio.wait_for(store.read_samples(key), timeout=15)
       if not isinstance(records, list):
         raise ValueError("Expected telemetry records")
       return records
@@ -119,6 +129,10 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
       partial=records[run_id].get("partial"),
       incidents=inspection.incidents(run, low, high),
     )
+  if finished and not result.get("error"):
+    FINISHED_ACTIVITY[(run_id, node_id, start, end)] = (time.monotonic() + FINISHED_ACTIVITY_SECONDS, result)
+    while len(FINISHED_ACTIVITY) > 16:
+      FINISHED_ACTIVITY.popitem(last=False)
   return result
 
 

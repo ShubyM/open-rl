@@ -18,6 +18,8 @@ from server.telemetry import kubernetes, ops
 from server.worker_manager import FAILED, READY, STARTING, STOPPED, WAITING_FOR_PLACEMENT
 
 CACHE_SECONDS = 5
+# A store read that fails briefly, say a dropped tunnel, is ridden out on the last records before it is reported.
+STORE_GRACE_SECONDS = 30
 # The longest window the dashboard shows, matching the logs API's seven-day limit.
 HISTORY_WINDOW_SECONDS = 7 * 86400
 METADATA_PREFIX = "open_rl:model_meta:"
@@ -271,6 +273,7 @@ class Snapshot:
     self.latest: dict | None = None
     self.updated = 0.0
     self.metadata: list[dict] = []
+    self.failing: dict[str, float] = {}
     # The gateway mount swaps in its own worker manager's context.
     self.status_context: Callable[[StateStore, dict], openrl_status.StatusContext] = cluster_status_context
 
@@ -282,8 +285,10 @@ class Snapshot:
       store_error = None
       try:
         self.metadata = await asyncio.wait_for(metadata_of(store), timeout=5)
+        self.failing.pop("store", None)
       except Exception:
-        store_error = "Run store unavailable; showing last known run records" if self.metadata else "Run store unavailable"
+        if self.lasting("store") or not self.metadata:
+          store_error = "Run store unavailable; showing last known run records" if self.metadata else "Run store unavailable"
       runs = join_runs(self.metadata, cluster)
       ctx = self.status_context(store, cluster)
       await asyncio.gather(*(add_status(ctx, run) for run in runs))
@@ -291,9 +296,11 @@ class Snapshot:
       processes_error = None
       try:
         processes = await asyncio.wait_for(processes_of(store, now - HISTORY_WINDOW_SECONDS), timeout=5)
+        self.failing.pop("processes", None)
       except Exception:
         processes = self.latest["processes"] if self.latest else []
-        processes_error = "Worker process records unavailable; showing last known" if processes else "Worker process records unavailable"
+        if self.lasting("processes") or not processes:
+          processes_error = "Worker process records unavailable; showing last known" if processes else "Worker process records unavailable"
       await asyncio.gather(*(add_progress(store, run, processes, now) for run in runs if run["status"] == "active"))
       self.latest = {
         "observed_at": datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds"),
@@ -306,6 +313,11 @@ class Snapshot:
       }
       self.updated = time.monotonic()
       return self.latest
+
+  def lasting(self, source: str) -> bool:
+    """Whether this source has been failing longer than the grace period."""
+    since = self.failing.setdefault(source, time.monotonic())
+    return time.monotonic() - since > STORE_GRACE_SECONDS
 
   def invalidate(self) -> None:
     """Read again on the next call, still falling back to this snapshot's records."""

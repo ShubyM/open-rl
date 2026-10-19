@@ -283,7 +283,13 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     stale = await self.snapshot.current(self.store)
     self.assertEqual([r["run_id"] for r in stale["runs"]], [r["run_id"] for r in first["runs"]])
     self.assertEqual(stale["processes"], first["processes"])
-    self.assertTrue(stale["store_error"] and stale["processes_error"])
+    # A brief outage is ridden out on the last records; one that lasts is reported.
+    self.assertEqual((stale["store_error"], stale["processes_error"]), (None, None))
+    with patch.object(snapshot, "STORE_GRACE_SECONDS", 0):
+      self.snapshot.invalidate()
+      lasting = await self.snapshot.current(self.store)
+    self.assertTrue(lasting["store_error"] and lasting["processes_error"])
+    self.assertEqual(lasting["processes"], first["processes"])
     self.metadata.side_effect = self.processes.side_effect = None
     self.metadata.return_value = self.processes.return_value = []
     self.snapshot.invalidate()
