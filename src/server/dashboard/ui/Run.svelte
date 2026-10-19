@@ -46,6 +46,19 @@
     ["optim/entropy", "Entropy"], ["optim/kl_sample_train_v2", "Sampler-trainer KL"], ["loss_per_token", "Loss per token"], ["train_mean_nll", "Train NLL"], ["time/total", "Step time", "s"]];
   let reportedFilter = $state("");
   const reportedShown = $derived(reportedFilter ? reportedNames.filter((name) => name.includes(reportedFilter)).slice(0, 12).map((name) => [name, name]) : REPORTED_CHARTS.filter(([name]) => reportedNames.includes(name)));
+  // A finished run opens on its own lifetime rather than the last 30 minutes, unless the link names a window.
+  const finished = $derived(!!run && (run.status !== "active" || ["Ended", "Stopped"].includes(run.display_status)));
+  let opened = null;
+  $effect(() => {
+    if (!run || !finished || opened === run.run_id) return;
+    opened = run.run_id;
+    const params = new URLSearchParams(location.hash.split("?")[1] || "");
+    const stop = run.completed_at || run.progress?.last_completed_at;
+    if (params.has("end") || params.has("duration") || !stop) return;
+    const span = Math.max(0, stop - (run.created_at || stop));
+    view.duration = Math.max(1800, Math.min(MAX_WINDOW, Math.round(span * 1.05)));
+    view.end = Math.min(observed, Math.round(stop + Math.max(60, span * 0.025)));
+  });
   const link = (tab, changes = {}) => viewLink(`run/${encodeURIComponent(view.id)}/${tab}`, { duration: view.duration, end: view.end, back: view.back, event: view.event, q: view.q, pod: view.pod, ...changes });
 </script>
 
@@ -63,7 +76,7 @@
     {#if run.workers?.length}
       {#each (run.pods || []).filter((p) => p.problem) as pod}<p class="source-error" role="status">{pod.name}: {pod.problem}</p>{/each}
     {:else}<p>{run.summary || "Run state unavailable"}</p>{/if}
-    {#if run.progress}<p class={run.progress.state === "OK" ? "muted" : "source-error"} role="status">Progress: {run.progress.state} · {run.progress.reason}</p>{/if}
+    {#if run.progress && !finished}<p class={run.progress.state === "OK" ? "muted" : "source-error"} role="status">Progress: {run.progress.state} · {run.progress.reason}</p>{/if}
     <p class="muted">Model session: {run.session_live == null ? "Unknown" : run.session_live ? "Live" : "No live session"}{run.shared_runtime ? " · Shared runtime" : ""}</p>
     {#if run.workers_error}<p class="source-error" role="status">Workers: {run.workers_error}</p>{/if}
     {#if run.workers?.length}
