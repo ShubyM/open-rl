@@ -106,24 +106,28 @@
     {:else if view.tab !== "metrics"}
       <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {:else}
+      {#snippet training()}
+        <h2 class="scheduler-title">Training</h2>
+        {#if reported.error}<p class="source-error" role="status">{reported.error}{reportedRows.length ? " · Showing previously fetched metrics" : ""}</p>{/if}
+        {#if !reported.data}{#if !reported.error}<p class="muted">Loading…</p>{/if}
+        {:else if !reportedRows.length}<p class="muted">The run's training client has not sent metrics. <code>python -m server.scripts.forward_metrics LOG_PATH</code> sends a cookbook run's.</p>
+        {:else}
+          <div class="log-toolbar"><input type="search" bind:value={reportedFilter} placeholder={`Filter ${reportedNames.length} metrics, e.g. reward`} aria-label="Filter training metrics" /></div>
+          <div class="chart-grid">
+            {#each reportedShown as [key, title, unit = ""] (key)}<Chart {title} {unit} steps points={reportedRows.filter((row) => Number.isFinite(row.metrics[key])).map((row) => [row.step, row.metrics[key]])} start={reportedRows[0].step} end={reportedRows.at(-1).step} empty="No values" />{/each}
+            {#if !reportedShown.length}<p class="empty-state">No metric matches</p>{/if}
+          </div>
+        {/if}
+      {/snippet}
       <div class="run-metrics" data-run-metrics={view.id}>
+          {#if reportedRows.length}{@render training()}<h2 class="scheduler-title">Operations</h2>{/if}
           <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span>{#if metricStatus}<span class={detail.error ? "source-error" : "muted"} role="status">{metricStatus}</span>{/if}</div>
           <div class="chart-grid">
             {#each roles as role (role)}<Chart title={`${{ trainer: "Trainer", sampler: "Sampler", process: "Process" }[role] || role} operation duration`} unit="s" points={samples.filter((s) => (s.role || "process") === role).map((s) => [s.at, s.elapsed_seconds])} start={range.start} end={range.now} min={0} tone="accent" {navigating} />{/each}
             {#each names as name (name)}<Chart title={name} points={samples.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]])} start={range.start} end={range.now} tone="accent" {navigating} />{/each}
             {#if !samples.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">No operations recorded in this time range</p>{/if}
           </div>
-          <h2 class="scheduler-title">Training</h2>
-          {#if reported.error}<p class="source-error" role="status">{reported.error}{reportedRows.length ? " · Showing previously fetched metrics" : ""}</p>{/if}
-          {#if !reported.data}{#if !reported.error}<p class="muted">Loading…</p>{/if}
-          {:else if !reportedRows.length}<p class="muted">The run's training client has not sent metrics. <code>python -m server.scripts.forward_metrics LOG_PATH</code> sends a cookbook run's.</p>
-          {:else}
-            <div class="log-toolbar"><input type="search" bind:value={reportedFilter} placeholder={`Filter ${reportedNames.length} metrics, e.g. reward`} aria-label="Filter training metrics" /></div>
-            <div class="chart-grid">
-              {#each reportedShown as [key, title, unit = ""] (key)}<Chart {title} {unit} steps points={reportedRows.filter((row) => Number.isFinite(row.metrics[key])).map((row) => [row.step, row.metrics[key]])} start={reportedRows[0].step} end={reportedRows.at(-1).step} empty="No values" />{/each}
-              {#if !reportedShown.length}<p class="empty-state">No metric matches</p>{/if}
-            </div>
-          {/if}
+          {#if !reportedRows.length}{@render training()}{/if}
           <h2 class="scheduler-title">Samplers</h2>
           {#if vllm.error && !run.shared_runtime}<p class="source-error" role="status">{vllm.error}{vllm.data ? " · Showing previously fetched metrics" : ""}</p>{/if}
           {#if run.shared_runtime}<p class="muted">The pool's samplers serve every run on this base model; see their load on <a href={viewLink("nodes")}>Nodes</a>.</p>
