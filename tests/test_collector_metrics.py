@@ -84,7 +84,7 @@ class CollectorMetricsTest(unittest.IsolatedAsyncioTestCase):
       restored = await self.client.get("/api/v1/inspect/telemetry", params=self.params)
     self.assertTrue(restored.json()["available"])
     expression = query.call_args.kwargs["params"]["query"]
-    self.assertNotIn(" or ", expression)
+    self.assertTrue(all('openrl_model_id="model-a"' in part for part in expression.split(" or ")))
     self.assertNotIn("session_id=~", expression)
     self.assertNotIn("openrl_runtime_id=~", expression)
 

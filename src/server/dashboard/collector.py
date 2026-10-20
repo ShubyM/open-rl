@@ -39,8 +39,10 @@ async def series(start: float, end: float, *, run_id=None, session_ids=(), runti
     selectors.append(f"k8s_node_name={json.dumps(node_id)}")
   name = json.dumps("(?i).*" + re.escape(metric.strip()) + ".*")
   namespace = json.dumps("|" + re.escape(backend.namespace))
-  common = f'__name__=~"openrl_(client|server)_metric",metric=~{name},namespace=~{namespace}{backend.scope("cluster")}'
-  query = " or ".join("{" + common + "," + selector + "}" for selector in selectors)
+  common = f"metric=~{name},namespace=~{namespace}{backend.scope('cluster')}"
+  # Cloud Monitoring rejects a regex on __name__, so each metric is named exactly.
+  names = ("openrl_client_metric", "openrl_server_metric")
+  query = " or ".join("{" + f'__name__="{metric_name}",{common},{selector}' + "}" for metric_name in names for selector in selectors)
   try:
     # Prometheus bounds the response at the source. Cloud Monitoring does not
     # expose this parameter; its response is still bounded below for the UI.
