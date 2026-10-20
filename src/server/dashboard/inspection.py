@@ -163,7 +163,8 @@ def recorded_lanes(run_id: str, lanes: list[dict], samples: list[dict]) -> list[
   comes from the ops the run recorded there, which name the pod."""
   shown, pods = {p.get("pod") for p in lanes}, {}
   for sample in samples:
-    if sample.get("role") == "sampler" and sample.get("pod") and sample["pod"] not in shown:
+    # A request no replica answered is recorded against the pool router's URL, which is not a pod.
+    if sample.get("role") == "sampler" and sample.get("pod") and "://" not in sample["pod"] and sample["pod"] not in shown:
       pods.setdefault(sample["pod"], []).append(sample)
   return [
     {

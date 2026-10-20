@@ -163,6 +163,7 @@ class InspectionActivityTest(unittest.TestCase):
     dispatcher = {**PROCESS, "id": "dispatcher", "pod": "pool-dispatcher", "pod_uid": "d1", "role": "dispatcher", "pool": "pool", "gpus": []}
     snapshot = state(live=[], processes=[PROCESS, dispatcher], runs=[{**RUN, "pool": "pool"}])
     samples = [operation(start, start + 10, role="sampler", pod="deleted-sampler", operation="sample") for start in (110, 150)]
+    samples.append(operation(130, 131, role="sampler", pod="http://127.0.0.1:8081", operation="sample", status="retried"))
     sources = inspection.sources(snapshot, run_id="r1", samples=samples)
     self.assertEqual({p["pod"] for p in sources}, {"trainer-0", "deleted-sampler", "pool-dispatcher"})
     lanes = inspection.segments(snapshot, run_id="r1", samples=samples)
