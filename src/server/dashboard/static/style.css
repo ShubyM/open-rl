@@ -1158,17 +1158,6 @@ body {
   margin-top: 12px;
   overflow-wrap: anywhere;
 }
-#app .run-settings {
-  margin-top: 12px;
-}
-#app .run-settings summary {
-  cursor: pointer;
-}
-#app .run-settings > summary .muted {
-  display: inline-block;
-  margin-left: 10px;
-  font-weight: 400;
-}
 #app .run-state .table-scroll {
   margin: 12px 0 4px;
 }
@@ -1179,15 +1168,6 @@ body {
 }
 #app .worker-table .micro {
   margin-left: 6px;
-}
-#app .run-settings dl {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 4px 12px;
-  max-width: 600px;
-}
-#app .run-settings dd {
-  margin: 0;
 }
 #app .run-toolbar {
   display: flex;

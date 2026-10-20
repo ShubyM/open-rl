@@ -10,7 +10,6 @@
   import Activity from "./Activity.svelte";
   import Logs from "./Logs.svelte";
   import CopyLink from "./CopyLink.svelte";
-  import Configuration from "./Configuration.svelte";
   import { duration, shortNodeName, KINDS, runDescription, isFinished, finishedAt } from "./format.js";
   let { inventory, view } = $props();
   function metricNames(rows) {
@@ -30,10 +29,23 @@
   const run = $derived(inventoryRun || (detail.status !== 404 ? detail.data?.run : null));
   const error = $derived(inventory.store_error || inventory.processes_error || detail.error);
   const title = $derived(run ? [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), KINDS[run.fine_tuning_type]].filter(Boolean).join(" · ") : "Run");
-  const description = $derived(run ? runDescription(run, title) : "");
+  // The saved settings worth reading, after the recipe; the title already names the training type.
+  function setupOf(s) {
+    const gpus = s["openrl.trainer_gpus"], cp = s["openrl.trainer_cp"], samplers = s["openrl.sampler_replicas"];
+    return [
+      { automodel: "Automodel", pytorch: "PyTorch" }[s["openrl.trainer_backend"]] || s["openrl.trainer_backend"],
+      gpus != null && `${gpus} trainer GPU${gpus === 1 ? "" : "s"}${cp > 1 ? ` (CP ${cp})` : ""}`,
+      samplers != null && `${samplers} sampler${samplers === 1 ? "" : "s"}`,
+      s["openrl.exclusive"] && "exclusive GPUs",
+      // A LoRA run always ships its adapter; the weight sync strategy only applies to full fine-tuning.
+      s["openrl.fine_tuning_type"] === "full" && s["openrl.weight_sync"] && `${s["openrl.weight_sync"]} weight sync`,
+    ];
+  }
+  const description = $derived(run ? [runDescription(run, title), ...setupOf(run.settings || {})].filter(Boolean).join(" · ") : "");
   const samples = $derived((detail.data?.samples || []).filter((s) => s.at >= range.start && s.at <= range.now));
   const roles = $derived([...new Set(samples.map((s) => s.role || "process"))]);
-  const names = $derived(metricNames(samples));
+  const trained = $derived(samples.filter((s) => s.role === "trainer"));
+  const names = $derived(metricNames(trained));
   const metricStatus = $derived(detail.error ? `${detail.error}${samples.length ? " · Showing previously fetched metrics" : ""}` : detail.pending ? "Updating…" : "");
   // A shared pool's load is every run's, so it is charted on Nodes rather than here.
   const vllm = createQuery(() => inspectUrl("series", { ...bounds, kind: "samplers" }), { scope: () => view.id, merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: () => view.tab === "metrics" && run && !run.shared_runtime && selection() });
@@ -84,7 +96,6 @@
         {/each}
       </tbody></table></div>
     {:else if !run.workers_error && !finished}<p class="muted">No workers reported</p>{/if}
-    <Configuration settings={run.settings} />
   </section>
   <div use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => navigating = !!value }}>
   <div class="run-toolbar">
@@ -109,9 +120,9 @@
             {#each roles as role (role)}<Chart title={`${{ trainer: "Trainer", sampler: "Sampler", process: "Process" }[role] || role} operation duration`} unit="s" points={samples.filter((s) => (s.role || "process") === role).map((s) => [s.at, s.elapsed_seconds])} start={range.start} end={range.now} min={0} tone="accent" {navigating} />{/each}
             {#if !samples.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">No operations recorded in this time range</p>{/if}
           </div>
-          <h2 class="scheduler-title">Server metrics</h2>
+          <h2 class="scheduler-title">Trainer metrics</h2>
           {#if names.length}<div class="chart-grid">
-            {#each names as name (name)}<Chart title={name} points={samples.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]])} start={range.start} end={range.now} tone="accent" {navigating} />{/each}
+            {#each names as name (name)}<Chart title={name} points={trained.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]])} start={range.start} end={range.now} tone="accent" {navigating} />{/each}
           </div>{:else if detail.data}<p class="muted">0 metrics</p>{/if}
           <h2 class="scheduler-title">Samplers</h2>
           {#if vllm.error && !run.shared_runtime}<p class="source-error" role="status">{vllm.error}{vllm.data ? " · Showing previously fetched metrics" : ""}</p>{/if}
