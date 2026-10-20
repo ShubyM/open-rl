@@ -288,6 +288,15 @@ class CollectorSeries(Record):
   points: list[tuple[float, float]]
 
 
+class HistoryRow(Record):
+  step: int
+  metrics: dict[str, float]
+
+
+class History(Source):
+  rows: list[HistoryRow] = Field(description="The newest row per step, by step, as a gateway before OpenTelemetry stored it")
+
+
 class CollectorMetrics(Source):
   series: list[CollectorSeries]
   limit: int

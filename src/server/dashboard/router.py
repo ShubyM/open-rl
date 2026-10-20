@@ -1,6 +1,7 @@
 """The operator UI and the same read-only JSON API for agents."""
 
 import asyncio
+import math
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -14,7 +15,7 @@ from pydantic import ValidationError
 
 from server import telemetry
 from server.dashboard import collector, inspection, metrics, sources
-from server.dashboard.schema import Activity, CollectorMetrics, Inventory, Logs, Operation, PodLogs, Series
+from server.dashboard.schema import Activity, CollectorMetrics, History, Inventory, Logs, Operation, PodLogs, Series
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.model_metadata import decode_model_metadata
 from server.store import get_state_store
@@ -217,6 +218,25 @@ async def series(
   if records.get("error") and run_id:
     result["samplers_reason"] = result.get("samplers_reason") or f"{records['error']}; samplers that are gone are not shown"
   return result
+
+
+# Client step history that gateways kept before OpenTelemetry; read only, nothing writes it now.
+HISTORY_PREFIX = "open_rl:run_metrics:"
+
+
+@router.get("/api/v1/inspect/history", operation_id="history", response_model=History, response_model_exclude_unset=True)
+async def history(run_id: str):
+  """A run's client metrics by step, for runs from before OpenTelemetry; empty for newer runs."""
+  try:
+    records = await asyncio.wait_for(get_state_store().read_samples(HISTORY_PREFIX + run_id), timeout=10)
+  except Exception:
+    return {"available": False, "error": "Stored history unavailable", "rows": []}
+  latest = {}
+  for r in records:
+    if isinstance(r, dict) and isinstance(r.get("step"), int) and isinstance(r.get("metrics"), dict):
+      metrics = {k: float(v) for k, v in r["metrics"].items() if isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v)}
+      latest[r["step"]] = {"step": r["step"], "metrics": metrics}
+  return {"available": True, "rows": [latest[step] for step in sorted(latest)]}
 
 
 @router.get("/api/v1/inspect/telemetry", operation_id="telemetry", response_model=CollectorMetrics, response_model_exclude_unset=True)
