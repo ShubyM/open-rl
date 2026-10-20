@@ -22,6 +22,7 @@ from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
 from server.sampling_store import SamplingStore
 from server.store import RedisStore, RequestStore, StateStore, get_state_store, get_store
+from server.telemetry import metrics as server_metrics
 from server.telemetry.ops import Answering, gpu_turn, observe_operation, popped, record_op, serving, set_phase
 from server.telemetry.tracing import configure_tracing
 from training import commands
@@ -505,7 +506,10 @@ def start_request_processing_loop() -> None:
   try:
     asyncio.run(serve_trainer(args))
   finally:
-    provider.shutdown()
+    try:
+      server_metrics.shutdown()
+    finally:
+      provider.shutdown()
 
 
 if __name__ == "__main__":

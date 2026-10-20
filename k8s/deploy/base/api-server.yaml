@@ -38,6 +38,18 @@ spec:
         ports:
         - containerPort: 8000
         env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
         - name: OTEL_TRACES_EXPORTER
           valueFrom:
             configMapKeyRef:

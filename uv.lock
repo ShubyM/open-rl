@@ -1952,6 +1952,7 @@ dependencies = [
     { name = "httpx" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-gcp-trace" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-instrumentation-fastapi" },
     { name = "opentelemetry-sdk" },
     { name = "protobuf" },
@@ -2023,6 +2024,7 @@ requires-dist = [
     { name = "openai-harmony", marker = "extra == 'cpu'" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-gcp-trace" },
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.42.1" },
     { name = "opentelemetry-instrumentation-fastapi" },
     { name = "opentelemetry-sdk" },
     { name = "peft", marker = "extra == 'cpu'" },
@@ -2156,7 +2158,7 @@ name = "opentelemetry-exporter-otlp-proto-common"
 version = "1.42.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "opentelemetry-proto", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
+    { name = "opentelemetry-proto" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/0e/9c/216acfeaedadf2e1937f4373929b20f73197c5c4a2546d4f584b7fa63813/opentelemetry_exporter_otlp_proto_common-1.42.1.tar.gz", hash = "sha256:04f1f01fb597c4249dfcd7f8b861c902c2102369d376d9d346ff38de4469a2ee", size = 21433, upload-time = "2026-05-21T16:32:55.526Z" }
 wheels = [
@@ -2186,13 +2188,13 @@ name = "opentelemetry-exporter-otlp-proto-http"
 version = "1.42.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "googleapis-common-protos", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "opentelemetry-api", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "opentelemetry-exporter-otlp-proto-common", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "opentelemetry-proto", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "opentelemetry-sdk", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "requests", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "typing-extensions", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
+    { name = "googleapis-common-protos" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-common" },
+    { name = "opentelemetry-proto" },
+    { name = "opentelemetry-sdk" },
+    { name = "requests" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/77/32/826bfa1d80ecea24f47808de03cd4a0d13c17ecc07712f45123f0f61e4ac/opentelemetry_exporter_otlp_proto_http-1.42.1.tar.gz", hash = "sha256:bf142a21035d7571ac3a09cb2e5639f49886f243972883cfe777ed3bf02b734d", size = 25406, upload-time = "2026-05-21T16:32:56.807Z" }
 wheels = [
@@ -2251,7 +2253,7 @@ name = "opentelemetry-proto"
 version = "1.42.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
+    { name = "protobuf" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b4/55/63eac3e1089b768ba014091fdd2ae8a9a440c821ef5e2b786909c94c8836/opentelemetry_proto-1.42.1.tar.gz", hash = "sha256:c6a51e6b4f05ae63565f3a113217f3d2bfaec68f78c02d7a6c85f9010d1cfca6", size = 45839, upload-time = "2026-05-21T16:33:03.937Z" }
 wheels = [

@@ -159,6 +159,8 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072",
       "MAX_JOBS": "4",
       "OTEL_TRACES_EXPORTER": "gcp_trace",
+      "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318",
+      "OPEN_RL_SERVER_METRIC_SERIES_LIMIT": "4096",
       "OPEN_RL_OPS_TTL_DAYS": "0",
       "OPEN_RL_OPS_SAMPLE_LIMIT": "200000",
     }
@@ -171,8 +173,14 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       env = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
       self.assertEqual({k: env.get(k) for k in settings}, settings)
 
-  def test_the_dispatcher_keeps_op_records_like_the_workers(self) -> None:
-    settings = {"OPEN_RL_OPS_TTL_DAYS": "0", "OPEN_RL_OPS_SAMPLE_LIMIT": "200000"}
+  def test_the_dispatcher_keeps_telemetry_settings_like_the_workers(self) -> None:
+    settings = {
+      "OPEN_RL_OPS_TTL_DAYS": "0",
+      "OPEN_RL_OPS_SAMPLE_LIMIT": "200000",
+      "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318",
+      "OTEL_METRIC_EXPORT_INTERVAL": "5000",
+      "OPEN_RL_SERVER_METRIC_SERIES_LIMIT": "4096",
+    }
     with patch.dict(os.environ, {"REDIS_URL": "redis://redis:6379", **settings}):
       body = dispatcher_body("sampler-pool")
     (dispatcher,) = [c for c in body["spec"]["template"]["spec"]["containers"] if c["name"] == "dispatcher"]

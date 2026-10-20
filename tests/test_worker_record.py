@@ -113,6 +113,15 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
       self.assertIs(await ops.observe_operation({"model_id": "r"}, "trainer", "r", mock.AsyncMock(return_value=result)), result)
       await asyncio.gather(*list(ops._writes), return_exceptions=True)
 
+  async def test_metric_sdk_failure_preserves_operation_history_and_progress(self) -> None:
+    result = {"metrics": {"loss": 1}}
+    with mock.patch.object(ops, "record_metrics", side_effect=RuntimeError("SDK failure")):
+      observed = await ops.observe_operation({"model_id": "r", "op": "optim_step"}, "trainer", "r", mock.AsyncMock(return_value=result))
+    (sample,) = await self.recorded(ops.key("r"))
+    self.assertIs(observed, result)
+    self.assertEqual(sample["metrics"], {"loss": 1})
+    self.assertEqual(await self.store.get_value(ops.steps_key("r")), "1")
+
   async def test_successful_optimizer_steps_count_without_rewriting_model_metadata(self) -> None:
     metadata = '{"base_model": "Qwen/Qwen3-8B", "session_ids": ["live"]}'
     await self.store.set_value("open_rl:model_meta:r", metadata)
@@ -131,3 +140,59 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(await self.recorded(ops.key("base")), [])
     sample = (await self.recorded(ops.key("run-a")))[0]
     self.assertEqual((sample["run_id"], sample["runtime_id"], sample["operation"], sample["pod_uid"]), ("run-a", "base", "sample", "uid"))
+
+  async def test_thread_metrics_stay_with_concurrent_operations_without_changing_responses(self) -> None:
+    entered, ready = [], asyncio.Event()
+    responses = [{"metrics": {"returned": value}} for value in (1, 2)]
+
+    async def work(value):
+      entered.append(value)
+      if len(entered) == 2:
+        ready.set()
+      await ready.wait()
+      await asyncio.to_thread(ops.metrics, {"internal": value, "returned": 99})
+      return responses[value - 1]
+
+    results = await asyncio.gather(
+      *(ops.observe_operation({"model_id": f"r{value}"}, "trainer", "base", lambda value=value: work(value)) for value in (1, 2))
+    )
+    for value, result, original in zip((1, 2), results, responses):
+      self.assertIs(result, original)
+      self.assertEqual(result, {"metrics": {"returned": value}})
+      (sample,) = await self.recorded(ops.key(f"r{value}"))
+      self.assertEqual(sample["metrics"], {"internal": value, "returned": value})
+    self.assertIsNone(ops._metrics.get())
+
+  async def test_nested_and_cancelled_metric_scopes_restore_their_parent(self) -> None:
+    async def work():
+      ops.metrics({"outer": 1})
+      with ops.record_op("weight_sync"):
+        await asyncio.to_thread(ops.metrics, {"inner": 2})
+      ops.metrics({"after": 3})
+      raise asyncio.CancelledError()
+
+    async with ops.serving("trainer", "base"):
+      with self.assertRaises(asyncio.CancelledError):
+        await ops.observe_operation({"model_id": "run"}, "trainer", "base", work)
+    (outer,) = await self.recorded(ops.key("run"))
+    (inner,) = await self.recorded(ops.key("base"))
+    self.assertEqual((outer["metrics"], outer["status"]), ({"outer": 1, "after": 3}, "cancelled"))
+    self.assertEqual(inner["metrics"], {"inner": 2})
+    self.assertIsNone(ops._metrics.get())
+
+  async def test_contextual_metric_limit_keeps_existing_names_writable_and_warns_once(self) -> None:
+    async def work():
+      ops.metrics({"first": 1, "second": 2, "third": 3})
+      ops.metrics({"first": 4, "fourth": 5})
+      return {}
+
+    with (
+      mock.patch.object(ops, "METRICS_PER_OPERATION", 2),
+      mock.patch.object(ops, "_warned_metrics", False),
+      self.assertLogs(ops.logger) as captured,
+    ):
+      await ops.observe_operation({"model_id": "run"}, "trainer", "base", work)
+    (sample,) = await self.recorded(ops.key("run"))
+    self.assertEqual(sample["metrics"], {"first": 4, "second": 2})
+    self.assertEqual(len(captured.output), 1)
+    self.assertIn("retained 2, dropped 1", captured.output[0])

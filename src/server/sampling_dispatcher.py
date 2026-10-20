@@ -17,7 +17,7 @@ import httpx
 import redis.asyncio as redis
 
 from server.sampling_store import SamplingStore
-from server.telemetry import ops
+from server.telemetry import metrics, ops
 
 logger = logging.getLogger(__name__)
 
@@ -234,4 +234,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-  asyncio.run(main())
+  metrics.configure("open-rl-dispatcher")
+  try:
+    asyncio.run(main())
+  finally:
+    metrics.shutdown()

@@ -66,8 +66,8 @@ class PromQL:
       headers.update(self.extra_headers())
     return headers
 
-  async def query_range(self, query: str, start: float, end: float) -> dict[str, list[list[float]]]:
-    """{series label value: points} for a query aggregated `by (<one label>)`."""
+  async def range_rows(self, query: str, start: float, end: float, *, limit: int | None = None) -> list[dict]:
+    """Prometheus matrix rows, retaining labels for discovered application metrics."""
     step = max(MIN_STEP_SECONDS, int((end - start) / MAX_POINTS))
     # Samples land on multiples of step, not offsets from start, so queries made
     # at different moments (or for different allocations) share timestamps and
@@ -78,11 +78,17 @@ class PromQL:
       self._headers_task = asyncio.create_task(self._load_headers())
     headers = await self._headers_task
     params = {"query": query, "start": start, "end": end, "step": step}
+    if limit is not None:
+      params["limit"] = limit
     payload = await http.get_json(f"{self.url}/api/v1/query_range", params=params, headers=headers)
     if payload.get("status") != "success":
       raise ValueError(payload.get("error") or "query failed")
+    return payload["data"]["result"]
+
+  async def query_range(self, query: str, start: float, end: float) -> dict[str, list[list[float]]]:
+    """{series label value: points} for a query aggregated `by (<one label>)`."""
     found = {}
-    for result in payload["data"]["result"]:
+    for result in await self.range_rows(query, start, end):
       label = next(iter(result["metric"].values()), "")
       found[label] = [[float(t), float(v)] for t, v in result.get("values", []) if v not in ("NaN", "+Inf", "-Inf")]
     return found

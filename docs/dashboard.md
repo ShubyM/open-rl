@@ -38,6 +38,7 @@ Recent query responses are kept in a bounded, in-memory cache and shown while re
 | `GET /logs` | Worker and forwarded client logs from Cloud Logging, with filters and cursor paging; a retained client-log tail when Cloud Logging is unconfigured |
 | `GET /pods/{pod}/logs` | Current or previous container output from the kubelet |
 | `GET /run_metrics` | Distinct training steps reported by a client, ordered by step |
+| `GET /telemetry` | Discovered client/server gauges from the collector's Prometheus backend; scoped to a run or node, optionally filtered by metric name |
 
 `activity`, `series` and `logs` take ISO `since` and `until` bounds, up to seven days. An omitted end uses inventory's `observed_at`; an omitted start uses the preceding 30 minutes. Activity returns the resolved bounds for subsequent queries and a coverage note: missing completed records do not establish that no requests arrived or that workers were idle. Response schemas are generated from the same models used to validate responses; extra diagnostic fields are preserved. Invalid operation records are skipped and reported in `partial`, separately from `error`, which means a source could not be read.
 
@@ -47,13 +48,124 @@ Concurrent Prometheus requests with identical queries, bounds and credentials sh
 
 Log cursors preserve the original bounds, pod lifetimes and provider query for 15 minutes. Continuations need no inventory or Redis reads. Reuse the same filters and bounds, or keep omitted bounds omitted. Set the same `OPEN_RL_LOG_CURSOR_SECRET` on dashboard replicas to keep cursors valid across replicas and restarts; otherwise each process uses an ephemeral secret. Deleted sampler identities are recoverable only while their operation records remain retained.
 
-## Client metrics and Prometheus
+## Collector metrics
 
-Custom loops can attach the small [cookbook OpenTelemetry adapter](../examples/README.md#custom-loop-telemetry)
-to export session/model/step observations and Prometheus gauges through standard
-OTLP exporters. It requires a collector; the dashboard does not yet read that
-history. The existing gateway/Redis path below is separate. Untouched cookbook
-recipes have server/GKE telemetry without client metric forwarding by default.
+New numeric metrics need no frontend changes. Inside a worker operation:
+
+```python
+from server.telemetry import ops
+
+ops.metrics({"tokens_per_second": tokens / elapsed})
+```
+
+This adds values to the existing completed-operation record, inheriting its
+model, worker and timestamp. It works inside `asyncio.to_thread`, keeps concurrent
+operations separate, and leaves the operation's return value unchanged. Repeated
+names keep their latest value; metrics explicitly returned by the operation take
+precedence. Existing `result["metrics"]` values also continue to work.
+
+Outside an operation, use an explicit scope:
+
+```python
+from server.telemetry.metrics import record_metrics
+
+record_metrics({"queue_depth": depth}, model_id=model_id)
+record_metrics({"cache_entries": count}, runtime_id=shared_runtime_id)
+record_metrics({"process_memory_bytes": memory})  # pod/node identity from the process
+```
+
+Standalone observations go through the standard OTel SDK and never create fake
+operations, increment training steps or affect stalled-run detection. Omit model
+identity for shared resources. Optional `session_id` and `phase` identify wider
+session scope and separate phases; step and request IDs are not metric labels.
+Server metric export is enabled only when an OTLP endpoint is configured;
+`OTEL_METRICS_EXPORTER=none` disables it explicitly.
+
+Custom clients append the [cookbook logger adapter](../examples/README.md#custom-loop-telemetry)
+once, then use their existing `logger.log_metrics(...)` calls. Unchanged upstream
+cookbooks still have server telemetry without automatically forwarding arbitrary
+client metrics.
+
+The complete chart path is standard OTLP HTTP → Collector → Prometheus → the
+inspection API. The Collector exposes `openrl_client_metric` and
+`openrl_server_metric`; the original metric name is the `metric` label. The UI
+discovers names, phases and producer identities without a chart registry. Model,
+session and runtime values stay separate, including multiple producers reporting
+the same name. Session-only observations appear as **session-wide** on associated
+models; they are never inferred to belong exclusively to one model. Node details
+show metrics carrying that node's resource identity.
+
+Charts use sampled timestamps, not training steps. Updates between exports or
+scrapes can be missed. Per-call client observations, including repeated steps,
+remain in cookbook JSONL and exported OTel logs. The supplied Collector writes
+OTLP JSON logs to stdout (collected by GKE logging in-cluster); the dashboard does
+not query those logs as exact step history. The Collector expires the latest
+value five minutes after its last update; historical chart retention belongs to
+Prometheus (seven days in the local configuration).
+
+### Local setup
+
+Start the shared monitoring services once, independently of any training command:
+
+```sh
+docker compose -f dev/monitoring/compose.yaml up -d
+```
+
+Configure custom clients and the API server before starting them:
+
+```sh
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_METRIC_EXPORT_INTERVAL=5000
+export OPEN_RL_PROMETHEUS_URL=http://127.0.0.1:9090
+```
+
+Use the embedded dashboard with an in-memory server, or share `REDIS_URL` between
+the API server and standalone dashboard. No cloud credentials are needed locally.
+The server remains usable with export disabled or while the Collector is down;
+operation records still appear through the existing local/Redis path. The local
+Prometheus scrapes the Collector; hardware metrics require their usual exporters.
+
+### Kubernetes setup
+
+The optional overlay uses a stock Collector, a private Service and a GKE
+PodMonitoring for its Prometheus endpoint:
+
+```sh
+kubectl apply -k k8s/deploy/telemetry
+kubectl -n openrl-system set env deployment/open-rl-api-server \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://open-rl-collector:4318 \
+  OTEL_METRIC_EXPORT_INTERVAL=5000
+```
+
+New workers inherit the API server's `OTEL_*` configuration. Existing worker
+processes need restarting to pick up environment changes. The dashboard reads
+Managed Prometheus through its GKE workload identity with `roles/monitoring.viewer`, or an explicit
+`OPEN_RL_PROMETHEUS_URL`. The overlay does not create a public ingestion endpoint.
+For external clients, configure the deployment's authenticated HTTPS ingress and
+use standard `OTEL_EXPORTER_OTLP_HEADERS`; port-forwarding port 4318 is sufficient
+for development. There is no forwarding command per client run.
+
+### Visible limits
+
+Each chart section renders 12 charts at a time and shows its counts. Search finds
+arbitrary names; collector charts also page through producers of the same name.
+Collector reads return at most 200 series, clearly indicate
+truncation, and apply name filters at the backend so later names remain reachable.
+Series preserve producer and phase identity instead of silently aggregating them.
+
+The client adapter admits 500 distinct gauge series by default (`max_series`),
+including metric/phase and step/phase combinations, and keeps 500 finite metrics
+per log event. Overflow warns once per limit and reports dropped counts in events.
+Worker `ops.metrics` collects 500 names per operation. Server gauge export admits
+2,048 name/scope combinations per process (`OPEN_RL_SERVER_METRIC_SERIES_LIMIT`).
+Worker overflow warns with retained/dropped counts; existing series keep updating.
+Metric names are at most 200 characters. Keep names and scope labels stable.
+These producer limits bound memory; the chart limit only bounds rendering.
+
+## Legacy client metrics and Prometheus
+
+The gateway/Redis path below remains available for retained per-step rows. It is
+separate from the Collector's sampled time series above.
 
 Send batches to the gateway with `POST /api/v1/runs/{run_id}/metrics`, or run the companion beside an unchanged cookbook example:
 

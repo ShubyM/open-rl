@@ -1,0 +1,29 @@
+services:
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.147.0
+    command: ["--config=/etc/otelcol-contrib/collector-config.yaml"]
+    ports:
+      - "127.0.0.1:${OPEN_RL_OTLP_PORT:-4318}:4318"
+    volumes:
+      - ../../k8s/deploy/telemetry/collector-config.yaml:/etc/otelcol-contrib/collector-config.yaml:ro
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "127.0.0.1:${OPEN_RL_PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - collector
+volumes:
+  prometheus-data:

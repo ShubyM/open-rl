@@ -158,9 +158,9 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   ):
     if os.getenv(name):
       values[name] = os.environ[name]
-  # OpenTelemetry settings, so workers export traces like the API server.
+  # OpenTelemetry settings, so workers export to the same collector as the API.
   for name, value in os.environ.items():
-    if name.startswith("OTEL_"):
+    if name.startswith("OTEL_") or name == "OPEN_RL_SERVER_METRIC_SERIES_LIMIT":
       values[name] = value
   # No other worker shares an exclusive worker's GPUs, so it never parks.
   if worker.exclusive:
@@ -265,6 +265,9 @@ def dispatcher_body(pool: str) -> dict[str, Any]:
   if concurrency := os.getenv("OPEN_RL_DISPATCH_CONCURRENCY"):
     env.append({"name": "OPEN_RL_DISPATCH_CONCURRENCY", "value": concurrency})
   env += [{"name": name, "value": os.environ[name]} for name in OPS_SETTINGS if os.getenv(name)]
+  env += [
+    {"name": name, "value": value} for name, value in os.environ.items() if name.startswith("OTEL_") or name == "OPEN_RL_SERVER_METRIC_SERIES_LIMIT"
+  ]
   dispatcher = {
     "name": "dispatcher",
     # The dispatcher is a small CPU process; the API-server image carries it without the GPU stack.

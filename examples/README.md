@@ -44,6 +44,7 @@ Custom loops using the cookbook logger can append one OpenTelemetry sink:
 from common.otel_logger import OTelLogger
 from tinker_cookbook.utils import ml_log
 
+session_id = service_client.holder.get_session_id()
 logger = ml_log.setup_logging(log_dir=log_dir, config=config)
 logger.loggers.append(OTelLogger(session_id=session_id, model_id=model_id))
 try:
@@ -79,13 +80,30 @@ numeric `metrics` and an optional `step`. Attributes are `session.id`, optional
 Repeated steps remain separate timestamped events. Gauges `openrl.client.metric`
 (with a `metric` attribute for the original name) and `openrl.client.step` expose
 the latest values per export interval for Prometheus; step is never a label.
+These are sampled time series: several observations between exports can become
+one gauge sample. Use the log events or original JSONL for per-call history.
 Non-numeric values, booleans, NaN, and infinities are excluded. Configuration and
 text remain with the existing cookbook loggers.
 
+Each sink admits at most 500 gauge series over its lifetime. A metric name with
+a different phase is a separate series, and each phase's step gauge also counts.
+Existing series keep updating after the cap; new series are omitted from gauges
+while their observations remain in log events. Set `max_series=` on `OTelLogger`
+to change this budget. Events retain at most 500 numeric values per call, with
+nonempty metric names of at most 200 characters; larger records keep the first
+500 valid names in input order. Counts appear as `dropped_gauge_updates` or
+`dropped_metrics` in affected log events, and each limit produces one warning
+per sink. The existing cookbook JSONL logger continues to receive the original
+records.
+
 OTel owns buffering, retries, and shutdown. Delivery is best effort; keep the
 cookbook JSONL files for recovery. The adapter does not install global OTel
-providers. It exports to the collector's configured backends; those events do
-not populate the dashboard's existing Redis step-history endpoint. See the
+providers. To display sampled metric charts, connect the collector's Prometheus
+exporter to the dashboard's Prometheus source using the
+[collector setup](../docs/dashboard.md#collector-metrics). Names are
+discovered from exported series; custom metrics need no frontend registration.
+Log events do not populate the dashboard's existing Redis step-history endpoint.
+See the
 [OTel exporters](https://opentelemetry.io/docs/languages/python/exporters/) and
 [Google-built collector](https://docs.cloud.google.com/stackdriver/docs/instrumentation/opentelemetry-collector-gke)
 for backend setup. Run its local export regression checks with

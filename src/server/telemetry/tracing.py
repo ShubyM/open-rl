@@ -8,6 +8,8 @@ from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from server.telemetry import metrics
+
 
 def configure_tracing(service_name: str) -> TracerProvider:
   """Install the global TracerProvider, exporting to each exporter named in OTEL_TRACES_EXPORTER."""
@@ -25,4 +27,5 @@ def configure_tracing(service_name: str) -> TracerProvider:
     provider.add_span_processor(BatchSpanProcessor(entry.load()()))
 
   trace.set_tracer_provider(provider)
+  metrics.configure(service_name)
   return provider

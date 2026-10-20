@@ -160,8 +160,6 @@ class OTelLoggerTest(unittest.TestCase):
           "text": "2",
           "nested": {"x": 1},
           "none": None,
-          "": 3,
-          123: 4,
         }
       )
     (record,) = self.logs()
@@ -175,3 +173,29 @@ class OTelLoggerTest(unittest.TestCase):
         ("/custom/metrics", "metrics token"),
       },
     )
+
+  def test_limits_bound_gauges_without_merging_events_and_report_truncation_once(self):
+    with self.assertLogs("common.otel_logger", level="WARNING") as warnings, closing(OTelLogger("session-a", max_series=3)) as logger:
+      logger.log_metrics({"phase": "train", "loss": 1, "reward": 2}, step=7)
+      logger.log_metrics({"phase": "eval", "loss": 3}, step=7)
+      logger.log_metrics({"phase": "train", "loss": 4, "new": 5}, step=7)
+      logger.log_metrics({"phase": "train", **{f"m{i}": i for i in range(501)}, "x" * 201: 1, "": 2, 123: 3}, step=8)
+      logger.log_metrics({"phase": "train", "loss": 6, "x" * 201: 1}, step=9)
+
+    records = [value_of(record.body) for record in self.logs()]
+    self.assertEqual(len(records), 5)
+    self.assertEqual(records[1], {"metrics": {"loss": 3}, "step": 7, "dropped_gauge_updates": 2})
+    self.assertEqual(records[2], {"metrics": {"loss": 4, "new": 5}, "step": 7, "dropped_gauge_updates": 1})
+    self.assertEqual(records[3], {"metrics": {f"m{i}": i for i in range(500)}, "step": 8, "dropped_metrics": 4, "dropped_gauge_updates": 500})
+    self.assertEqual(records[4], {"metrics": {"loss": 6}, "step": 9, "dropped_metrics": 1})
+    self.assertEqual(
+      {(name, attrs.get("metric"), attrs.get("openrl.phase")): value for name, attrs, value in self.gauges()},
+      {
+        ("openrl.client.step", None, "train"): 9,
+        ("openrl.client.metric", "loss", "train"): 6,
+        ("openrl.client.metric", "reward", "train"): 2,
+      },
+    )
+    self.assertEqual(len(warnings.output), 2)
+    self.assertIn("gauge series limit (3)", warnings.output[0])
+    self.assertIn("event limits reached (500 values, 200-character names)", warnings.output[1])

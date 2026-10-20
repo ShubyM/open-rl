@@ -12,8 +12,8 @@ from fastapi.responses import FileResponse, Response
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
-from server.dashboard import inspection, metrics
-from server.dashboard.schema import Activity, Inventory, Logs, Operation, PodLogs, RunMetrics, Series
+from server.dashboard import collector, inspection, metrics
+from server.dashboard.schema import Activity, CollectorMetrics, Inventory, Logs, Operation, PodLogs, RunMetrics, Series
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.model_metadata import decode_model_metadata
 from server.store import get_state_store
@@ -212,6 +212,34 @@ async def series(
   if records.get("error") and run_id:
     result["samplers_reason"] = result.get("samplers_reason") or f"{records['error']}; samplers that are gone are not shown"
   return result
+
+
+@router.get("/api/v1/inspect/telemetry", operation_id="telemetry", response_model=CollectorMetrics, response_model_exclude_unset=True)
+async def telemetry(
+  run_id: str | None = None,
+  node_id: str | None = None,
+  since: TimeBound = None,
+  until: TimeBound = None,
+  metric: Annotated[str, Query(max_length=200)] = "",
+):
+  """Discovered client/server gauges sampled by Prometheus, with their original scope.
+  Session/runtime-wide values are related to a model, not exclusively attributable to it."""
+  if bool(run_id) == bool(node_id):
+    raise HTTPException(400, "Choose exactly one run_id or node_id")
+  _, _, start, end = time_range(since, until)
+  sessions, runtimes = [], []
+  if run_id:
+    try:
+      meta = decode_model_metadata(await get_state_store().get_value(METADATA_PREFIX + run_id))
+    except Exception as exc:
+      raise HTTPException(503, "Run metadata unavailable") from exc
+    if meta is None:
+      raise HTTPException(404, "Run not found")
+    sessions = meta.session_ids
+    if runtime := meta.runtime(run_id):
+      runtimes = [runtime, meta.pool(run_id)]
+  await gke.discover()
+  return await collector.series(start, end, run_id=run_id, node_id=node_id, session_ids=sessions, runtime_ids=runtimes, metric=metric)
 
 
 async def run_of(run_id: str) -> tuple[dict, dict]:

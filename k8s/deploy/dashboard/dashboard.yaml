@@ -32,11 +32,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        # GPU metrics: Managed Service for Prometheus through the in-cluster
-        # frontend. Unset, the dashboard queries the Cloud Monitoring
-        # Prometheus API directly, which needs monitoring.viewer on the SA.
-        - name: OPEN_RL_PROMETHEUS_URL
-          value: http://gmp-frontend:9090
+        # GKE metrics use Cloud Monitoring's PromQL API (monitoring.viewer on
+        # the workload identity). Set OPEN_RL_PROMETHEUS_URL for another backend.
         # A long run's activity keeps the process busy for seconds; the default
         # one-second timeout took the pod out of its Service meanwhile.
         readinessProbe:

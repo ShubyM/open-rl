@@ -36,6 +36,7 @@ from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import get_state_store, get_store
 from server.telemetry import http as telemetry_http
+from server.telemetry import metrics as server_metrics
 from server.telemetry import run_logs as client_logs
 from server.telemetry import run_metrics as client_metrics
 from server.telemetry import sdk_events
@@ -670,6 +671,7 @@ async def lifespan(_: FastAPI):
     if worker_manager is not None:
       worker_manager.close()
       worker_manager = None
+    server_metrics.shutdown()
 
 
 # The release tag, baked in at image build (OPEN_RL_VERSION build arg); the

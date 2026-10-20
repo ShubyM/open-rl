@@ -12,6 +12,7 @@ changes what the op returns or raises."""
 
 import asyncio
 import json
+import logging
 import math
 import os
 import socket
@@ -19,10 +20,12 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, contextmanager, suppress
+from contextvars import ContextVar
 
 from opentelemetry import trace
 
 from server.store import get_state_store
+from server.telemetry.metrics import numeric_values, record_metrics
 
 SAMPLE_LIMIT = int(os.getenv("OPEN_RL_OPS_SAMPLE_LIMIT", "2000"))
 # How long a run's op records and a worker's record outlive their last write; 0 keeps them.
@@ -31,11 +34,15 @@ HEARTBEAT_SECONDS = 5
 # A record not rewritten for this long belongs to a process that is gone.
 STALE_SECONDS = 6 * HEARTBEAT_SECONDS
 MAX_TURNS = 200
+METRICS_PER_OPERATION = 500
+logger = logging.getLogger(__name__)
 
 # This process's record while it serves, or None outside a worker.
 current: "Worker | None" = None
 # In-flight writes, referenced so they are not garbage collected mid-write.
 _writes: set[asyncio.Task] = set()
+_metrics: ContextVar[dict | None] = ContextVar("operation_metrics", default=None)
+_warned_metrics = False
 
 
 def key(run_id: str) -> str:
@@ -188,10 +195,32 @@ def written(task: asyncio.Task) -> None:
     task.exception()  # retrieved, so a dropped write is not logged as an error
 
 
+def metrics(values: dict) -> None:
+  """Add measurements to the current operation, including from asyncio.to_thread.
+
+  Last value per name wins. Outside an observed operation there is no inferred
+  run; use telemetry.metrics.record_metrics with an explicit scope instead.
+  """
+  global _warned_metrics
+  if (collected := _metrics.get()) is None:
+    return
+  dropped = 0
+  for name, value in numeric_values(values).items():
+    if name in collected or len(collected) < METRICS_PER_OPERATION:
+      collected[name] = value
+    else:
+      dropped += 1
+  if dropped and not _warned_metrics:
+    _warned_metrics = True
+    logger.warning("Operation metric limit reached: retained %s, dropped %s names; limit=%s", len(collected), dropped, METRICS_PER_OPERATION)
+
+
 async def observe_operation(request: dict, role: str, runtime_id: str | None, call: Callable[[], Awaitable[dict]]) -> dict:
   """Run one API op and record how it went; returns or raises exactly as the op does."""
   started_at = time.time()
   status, error_type, result = "succeeded", None, {}
+  collected = {}
+  token = _metrics.set(collected)
   try:
     result = await call()
     if result.get("type") == "RequestFailedResponse":
@@ -202,12 +231,22 @@ async def observe_operation(request: dict, role: str, runtime_id: str | None, ca
     error_type = type(error).__name__
     raise
   finally:
+    _metrics.reset(token)
     with suppress(Exception):
-      record(request, role, runtime_id, started_at, status, error_type, result)
+      record(request, role, runtime_id, started_at, status, error_type, {**result, "metrics": {**collected, **(result.get("metrics") or {})}})
 
 
 def record(
-  request: dict, role: str, runtime_id: str | None, started_at: float, status: str, error_type: str | None, result: dict, where: dict | None = None
+  request: dict,
+  role: str,
+  runtime_id: str | None,
+  started_at: float,
+  status: str,
+  error_type: str | None,
+  result: dict,
+  where: dict | None = None,
+  *,
+  run_scoped: bool = True,
 ) -> None:
   """`where` names the pod the op ran on, when that is not this process's own pod.
   No request payloads, outputs or exception messages are recorded."""
@@ -215,7 +254,7 @@ def record(
   if not run_id:
     return
   operation, at = operation_name(request, role), time.time()
-  metrics = {name: value for name, value in (result.get("metrics") or {}).items() if isinstance(value, int | float)}
+  metrics = numeric_values(result.get("metrics") or {})
   sample = {
     "at": at,
     "started_at": started_at,
@@ -236,6 +275,8 @@ def record(
   span = trace.get_current_span().get_span_context()
   if span.is_valid:
     sample.update(trace_id=f"{span.trace_id:032x}", span_id=f"{span.span_id:016x}")
+  with suppress(Exception):
+    record_metrics(sample["metrics"], model_id=run_id if run_scoped else None, runtime_id=runtime_id, phase=operation)
   write(get_state_store().append_sample(key(run_id), sample, SAMPLE_LIMIT, TTL_SECONDS))
   if operation == "optim_step" and status == "succeeded":
     write(get_state_store().increment(steps_key(run_id), TTL_SECONDS))
@@ -246,14 +287,17 @@ def record_op(name: str):
   """Record worker work that serves no one request (init, wake_up, sleep,
   weight_sync) under the worker's runtime."""
   started_at, status = time.time(), "failed"
+  collected = {}
+  token = _metrics.set(collected)
   try:
     yield
     status = "succeeded"
   finally:
+    _metrics.reset(token)
     if current is not None:
       runtime_id, role = current.record["runtime_id"], current.record["role"]
       with suppress(Exception):
-        record({"op": name, "model_id": runtime_id}, role, runtime_id, started_at, status, None, {})
+        record({"op": name, "model_id": runtime_id}, role, runtime_id, started_at, status, None, {"metrics": collected}, run_scoped=False)
 
 
 @asynccontextmanager

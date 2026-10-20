@@ -288,3 +288,20 @@ class RunMetrics(Source):
   rows: list[RunMetricsRow] = Field(
     description="The newest row per step, by step; what the run's training client sent, for example rewards and eval pass rates"
   )
+
+
+class CollectorSeries(Record):
+  id: str
+  name: str
+  source: str
+  scope: str
+  scope_id: str
+  phase: str | None = None
+  labels: dict[str, str]
+  points: list[tuple[float, float]]
+
+
+class CollectorMetrics(Source):
+  series: list[CollectorSeries]
+  limit: int
+  truncated: bool = Field(description="Only the first limit series are returned; filter metric by name to find others")
