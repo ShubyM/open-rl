@@ -15,9 +15,9 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from server import telemetry
 from server.sampling_dispatcher import Dispatcher, redis_client, revision_file
 from server.sampling_store import SamplingStore, future_key
-from server.telemetry import ops
 from tests.redis_server import RedisTestCase
 
 SAMPLE = {"type": "sample", "sequences": [{"tokens": [100, 101], "logprobs": [-0.5, -0.25], "stop_reason": "length"}]}
@@ -161,9 +161,9 @@ class SamplingDispatcherTest(RedisTestCase):
 
   async def test_the_dispatcher_records_its_state_and_each_send_for_the_run(self):
     replicas = await self.replicas("default")
-    worker = ops.Worker("dispatcher", None)
-    self.enterContext(patch.object(ops, "current", worker))
-    sends = self.enterContext(patch.object(ops, "record"))
+    worker = telemetry.Worker("dispatcher", None)
+    self.enterContext(patch.object(telemetry, "current", worker))
+    sends = self.enterContext(patch.object(telemetry, "record"))
     r = await self.accepted(run_id="run-a")
     await self.dispatcher(replicas)
     await self.committed(r["request_id"])

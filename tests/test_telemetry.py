@@ -6,10 +6,9 @@ from unittest import mock
 import httpx
 from kubernetes import client
 
-from server.dashboard import metrics
+from server.dashboard import http, kubernetes, metrics, prometheus
+from server.dashboard.prometheus import PromQL
 from server.scheduler_worker_manager import SchedulerWorkerManager
-from server.telemetry import http, kubernetes, prometheus
-from server.telemetry.prometheus import PromQL
 
 GPU = "GPU-375ff71c-7c41-a89e-3843-c62c7476bc2b"
 WINDOW = {"since": "1970-01-01T00:00:00+00:00", "until": "1970-01-01T00:00:10+00:00"}

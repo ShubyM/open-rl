@@ -46,7 +46,7 @@ class InspectionApiTest(unittest.TestCase):
     self.state["runs"] = [{**RUN, "run_id": identity, "runtime_id": "base", "shared_runtime": True} for identity in ("r1", "r2")]
 
     async def read_samples(key):
-      if key == router.ops.key("r2"):
+      if key == router.telemetry.ops_key("r2"):
         raise RuntimeError("offline")
       return [operation(110, 130)]
 
@@ -54,7 +54,7 @@ class InspectionApiTest(unittest.TestCase):
     response = self.client.get("/api/v1/inspect/activity", params=WINDOW)
     self.assertEqual(response.status_code, 200)
     keys = sorted(call.args[0] for call in self.store.read_samples.await_args_list)
-    self.assertEqual(keys, sorted(router.ops.key(k) for k in ("r1", "r2", "base")))
+    self.assertEqual(keys, sorted(router.telemetry.ops_key(k) for k in ("r1", "r2", "base")))
     lanes = {p["id"]: p for p in response.json()["placements"]}
     self.assertEqual(set(lanes), {"p1:r1", "p1:r2"})
     self.assertEqual((lanes["p1:r1"]["intervals"], lanes["p1:r1"].get("error")), ([[120, 130]], None))
@@ -78,7 +78,7 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual(data["placements"], [])
     self.assertEqual([s["at"] for s in data["samples"]], [140])
     self.assertEqual(data["incidents"][0]["reason"], "OOMKilled")
-    self.store.read_samples.assert_awaited_once_with(router.ops.key("r1"))
+    self.store.read_samples.assert_awaited_once_with(router.telemetry.ops_key("r1"))
 
   def test_series_is_independently_callable_and_keeps_partial_data(self):
     backend = mock.Mock(name="hardware")
@@ -184,7 +184,7 @@ class InspectionApiTest(unittest.TestCase):
       operation(140, 150, metrics={"loss": float("inf")}),
       operation(140, 150, role=[]),
     ]
-    self.store.read_samples.side_effect = lambda key: [operation(125, 140), *bad] if key == router.ops.key("r1") else []
+    self.store.read_samples.side_effect = lambda key: [operation(125, 140), *bad] if key == router.telemetry.ops_key("r1") else []
     response = self.client.get("/api/v1/inspect/activity", params={**WINDOW, "run_id": "r1"})
     self.assertEqual(response.status_code, 200)
     result = response.json()
@@ -200,7 +200,7 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual(response.json(), result)
 
   def test_omitted_bounds_anchor_to_snapshot_and_report_the_resolved_window(self):
-    self.store.read_samples.side_effect = lambda key: [operation(125, 140)] if key == router.ops.key("r1") else []
+    self.store.read_samples.side_effect = lambda key: [operation(125, 140)] if key == router.telemetry.ops_key("r1") else []
     for params in ({"run_id": "r1"}, {"run_id": "r1", "since": WINDOW["since"]}):
       data = self.client.get("/api/v1/inspect/activity", params=params).json()
       self.assertEqual(data["until"], "1970-01-01T00:03:20.000000+00:00")

@@ -52,9 +52,9 @@ Log cursors preserve the original bounds, pod lifetimes and provider query for 1
 New numeric metrics need no frontend changes. Inside a worker operation:
 
 ```python
-from server.telemetry import ops
+from server import telemetry
 
-ops.metrics({"tokens_per_second": tokens / elapsed})
+telemetry.metrics({"tokens_per_second": tokens / elapsed})
 ```
 
 This adds values to the existing completed-operation record, inheriting its
@@ -66,7 +66,7 @@ precedence. Existing `result["metrics"]` values also continue to work.
 Outside an operation, use an explicit scope:
 
 ```python
-from server.telemetry.metrics import record_metrics
+from server.telemetry import record_metrics
 
 record_metrics({"queue_depth": depth}, model_id=model_id)
 record_metrics({"cache_entries": count}, runtime_id=shared_runtime_id)
@@ -155,7 +155,7 @@ Series preserve producer and phase identity instead of silently aggregating them
 The client adapter admits 500 distinct gauge series by default (`max_series`),
 including metric/phase and step/phase combinations, and keeps 500 finite metrics
 per log event. Overflow warns once per limit and reports dropped counts in events.
-Worker `ops.metrics` collects 500 names per operation. Server gauge export admits
+Worker `telemetry.metrics` collects 500 names per operation. Server gauge export admits
 2,048 name/scope combinations per process (`OPEN_RL_SERVER_METRIC_SERIES_LIMIT`).
 Worker overflow warns with retained/dropped counts; existing series keep updating.
 Metric names are at most 200 characters. Keep names and scope labels stable.

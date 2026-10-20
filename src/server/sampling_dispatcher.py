@@ -16,8 +16,8 @@ from typing import Any
 import httpx
 import redis.asyncio as redis
 
+from server import telemetry
 from server.sampling_store import SamplingStore
-from server.telemetry import metrics, ops
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ class Dispatcher:
         except Exception as exc:
           # A Redis or Kubernetes hiccup must not end the pool's dispatching.
           logger.exception("Dispatching pool %s failed; retrying", self.pool)
-          ops.note(last_error=f"{type(exc).__name__} in dispatch")
+          telemetry.note(last_error=f"{type(exc).__name__} in dispatch")
           await asyncio.sleep(RETRY_MS / 1000)
     finally:
       for task in [*self.in_flight.values(), *self.loading.values()]:
@@ -91,7 +91,7 @@ class Dispatcher:
     urls = await self.list_replicas()
     versions = await asyncio.gather(*(self.weight_version(url) for url in urls), return_exceptions=True)
     states = {self.pods.get(u, u): v if isinstance(v, str) else f"unreachable: {type(v).__name__}" for u, v in zip(urls, versions, strict=True)}
-    ops.note(revision=target, replicas=states, loading=[self.pods.get(u, u) for u in self.loading], in_flight=len(self.in_flight))
+    telemetry.note(revision=target, replicas=states, loading=[self.pods.get(u, u) for u in self.loading], in_flight=len(self.in_flight))
     for url, version in zip(urls, versions, strict=True):
       # A replica still starting does not answer yet, and a pool on base weights never loads any.
       if self.revision and isinstance(version, str) and version != target and url not in self.loading:
@@ -145,13 +145,13 @@ class Dispatcher:
       logger.info("Retrying %s after %r", r["request_id"], exc)
       retry = type(exc).__name__
     if result and await self.commit(r, result):
-      ops.note(last_commit_at=time.time())
+      telemetry.note(last_commit_at=time.time())
     elif retry:
-      ops.note(last_error=f"{retry} from {self.pods.get(replica, replica)}")
+      telemetry.note(last_error=f"{retry} from {self.pods.get(replica, replica)}")
     status = "retried" if retry else "failed" if result.get("type") == "RequestFailedResponse" else "succeeded"
     # No runtime: the pool name is not the sampler Workload's runtime, and the replica pod is what joins the op to its lane.
     request = {"op": "sample", "logical_run_id": r.get("run_id"), "request_id": r["request_id"]}
-    ops.record(request, "sampler", None, started, status, retry, {}, where={"pod": self.pods.get(replica, replica)})
+    telemetry.record(request, "sampler", None, started, status, retry, {}, where={"pod": self.pods.get(replica, replica)})
 
   async def load_weights(self, url: str, revision: str) -> None:
     """vLLM's pause lets the requests the replica is running finish first."""
@@ -175,7 +175,7 @@ class Dispatcher:
       await self.post(url, "/resume")
     except Exception as exc:
       logger.warning("Loading %r on %s failed: %r", revision, url, exc)  # the next dispatch tries again
-      ops.note(last_error=f"loading {revision} on {self.pods.get(url, url)}: {exc!r}"[:500])
+      telemetry.note(last_error=f"loading {revision} on {self.pods.get(url, url)}: {exc!r}"[:500])
     finally:
       self.loading.pop(url)
 
@@ -223,9 +223,9 @@ async def main() -> None:
   urls = [url for url in os.getenv("OPEN_RL_SAMPLER_ENDPOINTS", "").split(",") if url]
   router = None if urls else os.getenv("OPEN_RL_SAMPLER_ROUTER", "http://127.0.0.1:8081")
   store, pool = SamplingStore(redis_client(os.environ["REDIS_URL"])), os.environ["OPEN_RL_SAMPLER_POOL"]
-  async with httpx.AsyncClient(limits=httpx.Limits(max_connections=None)) as http, ops.serving("dispatcher", None, pool=pool):
+  async with httpx.AsyncClient(limits=httpx.Limits(max_connections=None)) as http, telemetry.serving("dispatcher", None, pool=pool):
     dispatcher = Dispatcher(store, pool, http, router, urls, int(os.getenv("OPEN_RL_DISPATCH_CONCURRENCY", "256")))
-    ops.set_phase("ready")
+    telemetry.set_phase("ready")
     task = asyncio.create_task(dispatcher.run())
     for sig in (signal.SIGTERM, signal.SIGINT):
       asyncio.get_running_loop().add_signal_handler(sig, task.cancel)
@@ -234,8 +234,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-  metrics.configure("open-rl-dispatcher")
+  telemetry.configure_metrics("open-rl-dispatcher")
   try:
     asyncio.run(main())
   finally:
-    metrics.shutdown()
+    telemetry.shutdown()

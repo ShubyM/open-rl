@@ -14,9 +14,9 @@ from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportM
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
+from server import telemetry
 from server.dashboard.snapshot import progress
 from server.store import InMemoryStateStore
-from server.telemetry import metrics, ops
 
 
 class ServerMetricsTest(unittest.IsolatedAsyncioTestCase):
@@ -25,11 +25,11 @@ class ServerMetricsTest(unittest.IsolatedAsyncioTestCase):
     self.provider = MeterProvider(metric_readers=[self.reader])
     self.addCleanup(self.provider.shutdown)
     gauge = self.provider.get_meter("openrl.server").create_gauge("openrl.server.metric")
-    self.enterContext(patch.object(metrics, "_gauge", gauge))
-    self.enterContext(patch.object(metrics, "_series", set()))
-    self.enterContext(patch.object(metrics, "_warned", False))
+    self.enterContext(patch.object(telemetry, "gauge", gauge))
+    self.enterContext(patch.object(telemetry, "series", set()))
+    self.enterContext(patch.object(telemetry, "warned", set()))
     self.store = InMemoryStateStore()
-    self.enterContext(patch.object(ops, "get_state_store", return_value=self.store))
+    self.enterContext(patch.object(telemetry, "get_state_store", return_value=self.store))
 
   def points(self):
     data = self.reader.get_metrics_data()
@@ -39,25 +39,25 @@ class ServerMetricsTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_operation_and_standalone_metrics_keep_honest_scopes_and_do_not_fake_progress(self):
     async def step():
-      await asyncio.to_thread(ops.metrics, {"internal": 1})
+      await asyncio.to_thread(telemetry.metrics, {"internal": 1})
       return {"metrics": {"loss": 2}}
 
-    await ops.observe_operation({"model_id": "run", "op": "optim_step"}, "trainer", "run", step)
-    await asyncio.gather(*list(ops._writes))
-    before = await self.store.read_samples(ops.key("run"))
+    await telemetry.observe_operation({"model_id": "run", "op": "optim_step"}, "trainer", "run", step)
+    await asyncio.gather(*list(telemetry.writes))
+    before = await self.store.read_samples(telemetry.ops_key("run"))
     run = {"run_id": "run", "runtime_id": "run", "pool": "pool", "created_at": 1}
     state = progress(run, [], before, {}, before[0]["at"] + 1000)
     for value in range(60):
-      metrics.record_metrics({"temperature": value}, model_id="run", session_id="session", phase="background")
-    metrics.record_metrics({"queue": 4}, runtime_id="shared")
-    metrics.record_metrics({"process_load": 0.5})
-    async with ops.serving("trainer", "shared"):
-      with ops.record_op("weight_sync"):
-        await asyncio.to_thread(ops.metrics, {"weight_bytes": 10})
-    await asyncio.gather(*list(ops._writes))
-    self.assertEqual(await self.store.read_samples(ops.key("run")), before)
+      telemetry.record_metrics({"temperature": value}, model_id="run", session_id="session", phase="background")
+    telemetry.record_metrics({"queue": 4}, runtime_id="shared")
+    telemetry.record_metrics({"process_load": 0.5})
+    async with telemetry.serving("trainer", "shared"):
+      with telemetry.record_op("weight_sync"):
+        await asyncio.to_thread(telemetry.metrics, {"weight_bytes": 10})
+    await asyncio.gather(*list(telemetry.writes))
+    self.assertEqual(await self.store.read_samples(telemetry.ops_key("run")), before)
     self.assertEqual(progress(run, [], before, {}, before[0]["at"] + 1000), state)
-    self.assertEqual(await self.store.get_value(ops.steps_key("run")), "1")
+    self.assertEqual(await self.store.get_value(telemetry.steps_key("run")), "1")
     points = {point.attributes["metric"]: point for point in self.points()}
     self.assertEqual(
       points["internal"].attributes, {"openrl.model.id": "run", "openrl.runtime.id": "run", "openrl.phase": "optim_step", "metric": "internal"}
@@ -68,15 +68,15 @@ class ServerMetricsTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(points["process_load"].attributes, {"metric": "process_load"})
 
   async def test_invalid_values_and_cardinality_are_bounded_without_losing_updates(self):
-    with patch.object(metrics, "SERIES_LIMIT", 2), self.assertLogs(metrics.logger) as captured:
-      metrics.record_metrics(
+    with patch.object(telemetry, "SERIES_LIMIT", 2), self.assertLogs(telemetry.logger) as captured:
+      telemetry.record_metrics(
         {"loss": np.float32(2), "nan": float("nan"), "inf": float("inf"), "bool": True, "huge": 10**1000, "": 1, 3: 4}, model_id="a"
       )
-      metrics.record_metrics({"loss": 3}, model_id="b")
-      metrics.record_metrics({"loss": 4, "new": 5}, model_id="c")
-      metrics.record_metrics({"loss": 6}, model_id="a")
-      metrics.record_metrics({"loss": 7}, model_id="d")
-    self.assertEqual(len(metrics._series), 2)
+      telemetry.record_metrics({"loss": 3}, model_id="b")
+      telemetry.record_metrics({"loss": 4, "new": 5}, model_id="c")
+      telemetry.record_metrics({"loss": 6}, model_id="a")
+      telemetry.record_metrics({"loss": 7}, model_id="d")
+    self.assertEqual(len(telemetry.series), 2)
     self.assertEqual({point.attributes["openrl.model.id"]: point.value for point in self.points()}, {"a": 6, "b": 3})
     self.assertEqual(len(captured.output), 1)
     self.assertIn("retained 2, dropped 2", captured.output[0])
@@ -113,22 +113,22 @@ class ServerMetricsExportTest(unittest.TestCase):
     script = f"""
 import os
 from opentelemetry import trace
-from server.telemetry import metrics
+from server import telemetry
 tracer = trace.get_tracer_provider()
-metrics.configure('trainer')
-assert metrics._gauge is None
+telemetry.configure_metrics('trainer')
+assert telemetry.gauge is None
 os.environ['OTEL_EXPORTER_OTLP_METRICS_ENDPOINT'] = 'http://127.0.0.1:{server.server_port}/custom/metrics'
 os.environ['OTEL_METRICS_EXPORTER'] = 'none'
-metrics.configure('trainer')
-assert metrics._gauge is None
+telemetry.configure_metrics('trainer')
+assert telemetry.gauge is None
 del os.environ['OTEL_METRICS_EXPORTER']
-metrics.configure('trainer')
-provider = metrics._provider
-metrics.configure('trainer')
-assert metrics._provider is provider
-metrics.record_metrics({{'loss': 1}}, model_id='run')
-metrics.shutdown()
-metrics.shutdown()
+telemetry.configure_metrics('trainer')
+provider = telemetry.provider
+telemetry.configure_metrics('trainer')
+assert telemetry.provider is provider
+telemetry.record_metrics({{'loss': 1}}, model_id='run')
+telemetry.shutdown()
+telemetry.shutdown()
 assert trace.get_tracer_provider() is tracer
 """
     try:

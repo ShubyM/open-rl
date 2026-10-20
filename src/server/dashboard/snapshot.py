@@ -9,12 +9,12 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from server import openrl_status
+from server import openrl_status, telemetry
+from server.dashboard import kubernetes
 from server.model_metadata import decode_model_metadata
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import StateStore, request_queue
-from server.telemetry import kubernetes, ops
 from server.worker_manager import FAILED, READY, STARTING, STOPPED, WAITING_FOR_PLACEMENT
 
 CACHE_SECONDS = 5
@@ -84,11 +84,11 @@ async def add_status(ctx: openrl_status.StatusContext, run: dict) -> None:
 
 
 async def metadata_of(store: StateStore) -> list[dict]:
-  steps = await store.scan_values(ops.steps_key(""))
+  steps = await store.scan_values(telemetry.steps_key(""))
   rows = []
   for key, value in (await store.scan_values(METADATA_PREFIX)).items():
     run_id = key.removeprefix(METADATA_PREFIX)
-    rows.append({**json.loads(value), "model_id": run_id, "steps": int(steps.get(ops.steps_key(run_id), 0))})
+    rows.append({**json.loads(value), "model_id": run_id, "steps": int(steps.get(telemetry.steps_key(run_id), 0))})
   return rows
 
 
@@ -159,7 +159,7 @@ def progress(run: dict, processes: list[dict], recent: list, queued: dict, now: 
       **group,
       "pod": process.get("pod") or process["id"],
       "phase": process.get("phase"),
-      "process_alive": ops.alive(process, now),
+      "process_alive": telemetry.alive(process, now),
       "age_seconds": now - group["since"],
       "where": f"on {process.get('pod') or process['id']} ({process.get('phase')})",
     }
@@ -183,7 +183,7 @@ def progress(run: dict, processes: list[dict], recent: list, queued: dict, now: 
         "since": since,
         "pod": pod,
         "phase": phase,
-        "process_alive": ops.alive(dispatcher, now) if dispatcher else None,
+        "process_alive": telemetry.alive(dispatcher, now) if dispatcher else None,
         "age_seconds": now - since,
         "where": f"waiting in pool {run['pool']} for dispatcher {pod} ({phase}{error})",
       }
@@ -221,7 +221,8 @@ async def pool_backlog(store: StateStore, pool: str) -> tuple[int, float | None]
 
 
 async def add_progress(store: StateStore, run: dict, processes: list[dict], now: float) -> None:
-  reads = (store.read_samples(ops.key(run["run_id"]), last=50), store.list_length(request_queue(run["run_id"])), pool_backlog(store, run["pool"]))
+  run_id = run["run_id"]
+  reads = (store.read_samples(telemetry.ops_key(run_id), last=50), store.list_length(request_queue(run_id)), pool_backlog(store, run["pool"]))
   try:
     recent, trainer, backlog = await asyncio.wait_for(asyncio.gather(*reads), timeout=5)
   except Exception as exc:
@@ -231,7 +232,7 @@ async def add_progress(store: StateStore, run: dict, processes: list[dict], now:
 
 
 async def processes_of(store: StateStore, since: float) -> list[dict]:
-  records = [json.loads(raw) for raw in (await store.scan_values(ops.worker_key(""))).values()]
+  records = [json.loads(raw) for raw in (await store.scan_values(telemetry.worker_key(""))).values()]
   return [record for record in records if record.get("heartbeat_at", 0) >= since]
 
 

@@ -18,13 +18,12 @@ from opentelemetry import propagate, trace
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, time_slicing_enabled, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
+from server import telemetry
 from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
 from server.sampling_store import SamplingStore
 from server.store import RedisStore, RequestStore, StateStore, get_state_store, get_store
-from server.telemetry import metrics as server_metrics
-from server.telemetry.ops import Answering, gpu_turn, observe_operation, popped, record_op, serving, set_phase
-from server.telemetry.tracing import configure_tracing
+from server.telemetry import Answering, gpu_turn, observe_operation, popped, record_op, serving, set_phase
 from training import commands
 from training.commands import parse_command
 from training.distributed import broadcast_object, is_distributed, is_primary, local_rank
@@ -495,7 +494,7 @@ def start_request_processing_loop() -> None:
   parser.add_argument("--active-tenant-set-id", help="Active tenant rotation set ID for LoRA workers (e.g. Qwen/Qwen3-0.6B-1).")
   args = parser.parse_args()
   initialize_distributed()
-  provider = configure_tracing("open-rl-trainer")
+  provider = telemetry.configure_tracing("open-rl-trainer")
 
   print("\n" + "=" * 50)
   print("      Open-RL PyTorch Training Worker")
@@ -507,7 +506,7 @@ def start_request_processing_loop() -> None:
     asyncio.run(serve_trainer(args))
   finally:
     try:
-      server_metrics.shutdown()
+      telemetry.shutdown()
     finally:
       provider.shutdown()
 

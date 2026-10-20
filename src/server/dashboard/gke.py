@@ -25,7 +25,8 @@ import google.oauth2.credentials
 import httpx
 from google.auth.transport.requests import Request
 
-from server.telemetry import http, kubernetes
+from server.dashboard import http, kubernetes
+from server.telemetry import CLIENT, RUN_LABEL, SOURCE_LABEL, iso, logs_key
 
 MAX_MESSAGE = 16 * 1024
 MAX_SOURCES = 64
@@ -250,13 +251,6 @@ def scope_filter() -> list[str]:
   return ['resource.type="k8s_container"', *[f"resource.labels.{label}={json.dumps(value)}" for label, value in labels]]
 
 
-# A client's own output, sent through the gateway, is logged by the gateway with these labels
-# naming the run (its model id); see server.telemetry.run_logs.
-CLIENT = "client"
-RUN_LABEL = "openrl_run_id"
-SOURCE_LABEL = "openrl_source"
-
-
 def source_filter(sources: list[dict], client_of: str | None = None) -> str:
   def clause(s: dict) -> str:
     return f"(resource.labels.pod_name={json.dumps(s['pod'])} AND timestamp>={json.dumps(s['created_at'])} AND timestamp<={json.dumps(s['until'])})"
@@ -384,3 +378,13 @@ async def run_logs(
   if token := payload.get("nextPageToken"):
     next_cursor = page_cursor({**plan, "request": {**plan["request"], "pageToken": token}})
   return {**result, "records": records, "available": True, "next_cursor": next_cursor}
+
+
+async def client_tail(store, run_id: str, limit: int) -> list[dict]:
+  """The newest client lines the gateway kept in the run store, newest first, as log records."""
+  records = []
+  for line in reversed(await store.read_samples(logs_key(run_id), last=limit)):
+    identity = hashlib.sha256(json.dumps([run_id, line.get("at"), line.get("message")]).encode()).hexdigest()
+    at, severity, message = iso(line.get("at", 0.0)), line.get("severity", "INFO"), line.get("message", "")
+    records.append({"id": identity, "run_id": run_id, "timestamp": at, "pod": CLIENT, "role": CLIENT, "severity": severity, "message": message})
+  return records

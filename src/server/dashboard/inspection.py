@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from server.telemetry.ops import alive
+from server.telemetry import alive
 
 
 def incidents(run: dict, start: float, end: float) -> list[dict]:

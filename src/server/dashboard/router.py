@@ -12,13 +12,12 @@ from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
-from server.dashboard import collector, inspection, metrics
+from server import telemetry
+from server.dashboard import collector, gke, inspection, kubernetes, metrics
 from server.dashboard.schema import Activity, CollectorMetrics, Inventory, Logs, Operation, PodLogs, Series
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.model_metadata import decode_model_metadata
 from server.store import get_state_store
-from server.telemetry import gke, kubernetes, ops, sdk_events
-from server.telemetry import run_logs as client_logs
 
 REQUEST_SECONDS = 12
 # A long run holds tens of thousands of operation records; reading them needs more than a
@@ -121,7 +120,7 @@ async def read_operations(identity: str, finished: bool = False) -> dict:
 
 async def load_operations(identity: str) -> dict:
   try:
-    records = await asyncio.wait_for(get_state_store().read_samples(ops.key(identity)), timeout=OPERATIONS_READ_SECONDS)
+    records = await asyncio.wait_for(get_state_store().read_samples(telemetry.ops_key(identity)), timeout=OPERATIONS_READ_SECONDS)
     if not isinstance(records, list):
       raise ValueError("Expected telemetry records")
   except Exception:
@@ -160,7 +159,7 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
   result = await asyncio.to_thread(inspection.activity, state, low, high, records, run_id, node_id)
   result.update(since=start, until=end, observed_at=state["observed_at"])
   result["coverage"] = (
-    f"At most {ops.SAMPLE_LIMIT} completed records per run/worker, best effort. "
+    f"At most {telemetry.SAMPLE_LIMIT} completed records per run/worker, best effort. "
     "Missing records do not prove no requests arrived or that workers were idle. Queued and in-flight requests are in inventory runs[].progress."
   )
   if run_id:
@@ -179,13 +178,19 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
 
 
 async def sdk_incidents(store, run_id: str, low: float, high: float) -> list[dict]:
-  """SDK errors from the run's own sessions; none when the run store cannot say."""
+  """SDK errors from the run's own sessions, the newest of each reason with its count; none when the store cannot say."""
   try:
     row = await store.get_value(METADATA_PREFIX + run_id)
-    session_ids = decode_model_metadata(row).session_ids if row else []
-    return await sdk_events.incidents(store, session_ids, low, high)
+    sessions = decode_model_metadata(row).session_ids if row else []
+    samples = [s for session in sessions for s in await store.read_samples(telemetry.sdk_errors_key(session))]
   except Exception:
     return []
+  newest = {}
+  for s in sorted(samples, key=lambda s: s.get("at", 0), reverse=True):
+    if low <= s.get("at", 0) <= high:
+      incident = {"at": s["at"], "pod": telemetry.CLIENT, "reason": s["reason"], "tone": "error", "message": s.get("message"), "count": 0}
+      newest.setdefault(s["reason"], incident)["count"] += 1
+  return list(newest.values())
 
 
 @router.get("/api/v1/inspect/series", operation_id="series", response_model=Series, response_model_exclude_unset=True)
@@ -214,7 +219,7 @@ async def series(
 
 
 @router.get("/api/v1/inspect/telemetry", operation_id="telemetry", response_model=CollectorMetrics, response_model_exclude_unset=True)
-async def telemetry(
+async def collector_metrics(
   run_id: str | None = None,
   node_id: str | None = None,
   since: TimeBound = None,
@@ -306,7 +311,7 @@ async def run_logs(
   if not gke.configuration()["configured"] and pod in (None, gke.CLIENT) and not cursor:
     # Without Cloud Logging the run's client output still has its tail in the run store.
     try:
-      client = await asyncio.wait_for(client_logs.tail(get_state_store(), run_id, limit), timeout=5)
+      client = await asyncio.wait_for(gke.client_tail(get_state_store(), run_id, limit), timeout=5)
     except Exception:
       client = []
     if client:

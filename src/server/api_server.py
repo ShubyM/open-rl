@@ -23,7 +23,8 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from server import openrl_status, proto_codec
+from server import openrl_status, proto_codec, telemetry
+from server.dashboard import http as dashboard_http
 from server.lora_snapshots import snapshot_name, snapshot_root
 from server.model_metadata import (
   TrainingModelMetadata,
@@ -35,11 +36,6 @@ from server.model_metadata import (
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import get_state_store, get_store
-from server.telemetry import http as telemetry_http
-from server.telemetry import metrics as server_metrics
-from server.telemetry import run_logs as client_logs
-from server.telemetry import sdk_events
-from server.telemetry.tracing import configure_tracing
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
 from training import commands
@@ -83,7 +79,7 @@ async def reap_owner(owner: str) -> None:
     await session_registry.forget(owner)
 
 
-configure_tracing("open-rl-api-server")
+telemetry.configure_tracing("open-rl-api-server")
 
 
 class FilterNoisyEndpoints(logging.Filter):
@@ -660,7 +656,7 @@ async def lifespan(_: FastAPI):
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
   reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
   try:
-    async with telemetry_http.lifespan():
+    async with dashboard_http.lifespan():
       yield
   finally:
     if reap_task is not None:
@@ -670,7 +666,7 @@ async def lifespan(_: FastAPI):
     if worker_manager is not None:
       worker_manager.close()
       worker_manager = None
-    server_metrics.shutdown()
+    telemetry.shutdown()
 
 
 # The release tag, baked in at image build (OPEN_RL_VERSION build arg); the
@@ -1286,13 +1282,13 @@ async def list_adapters():
 
 
 @app.post("/api/v1/runs/{run_id}/logs")
-async def run_logs(run_id: str, body: client_logs.Request):
+async def run_logs(run_id: str, body: telemetry.LogRequest):
   """Keep a client's own output with its run, beside the run's worker logs. run_id is the
   model id the client trains."""
-  return await client_logs.ingest(state, run_id, body)
+  return await telemetry.ingest_logs(state, run_id, body)
 
 
 @app.post("/api/v1/telemetry")
-async def telemetry(body: dict):
-  await sdk_events.ingest(state, body)
+async def sdk_telemetry(body: dict):
+  await telemetry.ingest_sdk_events(state, body)
   return {"status": "accepted"}

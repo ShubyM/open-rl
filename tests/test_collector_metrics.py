@@ -6,11 +6,10 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from server.dashboard import collector, router
+from server.dashboard import collector, http, router
 from server.dashboard.__main__ import app
+from server.dashboard.prometheus import PromQL
 from server.store import InMemoryStateStore
-from server.telemetry import http
-from server.telemetry.prometheus import PromQL
 
 
 class CollectorMetricsTest(unittest.IsolatedAsyncioTestCase):

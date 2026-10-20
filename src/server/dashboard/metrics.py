@@ -4,9 +4,9 @@ import asyncio
 import os
 from datetime import datetime
 
+from server.dashboard import gke, kubernetes
 from server.dashboard.inspection import sources
-from server.telemetry import gke, kubernetes
-from server.telemetry.prometheus import SAMPLER_QUERIES, PromQL
+from server.dashboard.prometheus import SAMPLER_QUERIES, PromQL
 
 
 def hardware() -> tuple[PromQL | None, str | None]:

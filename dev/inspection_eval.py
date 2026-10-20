@@ -16,12 +16,12 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from server import telemetry
 from server.dashboard import router
 from server.dashboard.__main__ import app as inspection_app
 from server.dashboard.snapshot import progress
 from server.model_metadata import TrainingModelMetadata
 from server.openrl_status import settings_of
-from server.telemetry import ops
 
 NOW = datetime(2026, 1, 2, 12, tzinfo=UTC).timestamp()
 CURRENT = ContextVar("inspection_case")
@@ -148,7 +148,7 @@ def fixture(case):
     "elapsed_seconds": 8,
     "status": "succeeded",
   }
-  data = {"state": state, "samples": {ops.key(run_id): [operation]}, "previous": "No previous output", "logs": [], "pages": {}}
+  data = {"state": state, "samples": {telemetry.ops_key(run_id): [operation]}, "previous": "No previous output", "logs": [], "pages": {}}
   if queued:
     worker.update(state="waiting_for_placement", detail="InsufficientCapacity", node=None)
     workload.update(
@@ -181,7 +181,7 @@ def fixture(case):
     state["runs"].append({**copy.deepcopy(run), "run_id": peer, "name": peer})
     if case == "c":  # slow, not stopped: a request is on the GPU now
       record.update(phase="on_gpu", outstanding=[{"op": "forward_backward", "run_id": run_id, "count": 1, "since": NOW - 200}])
-    data["samples"][ops.key(peer)] = [{**operation, "run_id": peer, "started_at": NOW - 1700, "at": NOW - 600, "elapsed_seconds": 1100}]
+    data["samples"][telemetry.ops_key(peer)] = [{**operation, "run_id": peer, "started_at": NOW - 1700, "at": NOW - 600, "elapsed_seconds": 1100}]
   elif case == "d":
     state["store_error"] = "Run store unavailable; showing last known run records"
     worker.update(state="unknown", detail="Readiness store unavailable")
@@ -191,7 +191,7 @@ def fixture(case):
     run.update(steps=0, summary="Trainer ready; no completed operations recorded")
   elif case == "f":
     run.update(session_live=False, summary="Its session expired; workers stay up while other jobs use them, but this model's session is gone")
-    data["samples"][ops.key(run_id)] = []
+    data["samples"][telemetry.ops_key(run_id)] = []
   elif case == "g":
     record.update(phase="starting", outstanding=[{"op": "create_model", "run_id": run_id, "count": 1, "since": NOW - 120}])
     worker.update(state="starting", detail="Pod running on node-1, loading the model")
@@ -200,16 +200,18 @@ def fixture(case):
     data["logs"] = [log_record(pod, "INFO", "Loading checkpoint shard 4 of 8; model readiness not yet announced", NOW - 30)]
   elif case == "h":
     data["logs"] = [log_record(pod, "ERROR", "Worker heartbeat: ready; no requests pending", NOW - 20)]
-    data["samples"][ops.key(run_id)] = [{**operation, "operation": "optim_step", "started_at": NOW - 60, "at": NOW - 55, "elapsed_seconds": 5}]
+    data["samples"][telemetry.ops_key(run_id)] = [
+      {**operation, "operation": "optim_step", "started_at": NOW - 60, "at": NOW - 55, "elapsed_seconds": 5}
+    ]
   elif case == "i":
-    data["samples"][ops.key(run_id)] = [{**operation, "status": "failed", "error_type": "ValueError"}]
+    data["samples"][telemetry.ops_key(run_id)] = [{**operation, "status": "failed", "error_type": "ValueError"}]
     data["logs"] = [log_record(pod, "ERROR", "Request rejected again; see the original validation error", NOW - 30)]
     data["pages"]["older"] = [log_record(pod, "ERROR", "ValueError: input_ids token 151999 outside vocabulary_size=151936", NOW - 300)]
   elif case == "j":
     process.update(uid="replacement-j", created_at=iso(NOW - 500))
     placement.update(pod_uid=process["uid"])
     state["processes"] = [{**record, "id": process["uid"], "pod_uid": process["uid"], "started_at": NOW - 500}, {**record, "heartbeat_at": NOW - 600}]
-    data["samples"][ops.key(run_id)] = [
+    data["samples"][telemetry.ops_key(run_id)] = [
       {**operation, "status": "failed", "error_type": "MemoryError", "started_at": NOW - 700, "at": NOW - 650, "elapsed_seconds": 50},
       {**operation, "pod_uid": process["uid"], "started_at": NOW - 110, "at": NOW - 100, "elapsed_seconds": 10},
     ]
@@ -217,7 +219,7 @@ def fixture(case):
   queue = {"trainer": int(queued)}
   for item in state["runs"]:
     item["nodes"] = [] if queued else ["node-1"]
-    recent = data["samples"].get(ops.key(item["run_id"]), [])
+    recent = data["samples"].get(telemetry.ops_key(item["run_id"]), [])
     item["progress"] = (
       {"state": "UNKNOWN", "reason": "progress unavailable"} if case == "d" else progress(item, state["processes"], recent, queue, NOW)
     )

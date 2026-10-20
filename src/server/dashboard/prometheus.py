@@ -17,7 +17,7 @@ from collections.abc import Callable
 
 import httpx
 
-from server.telemetry import http
+from server.dashboard import http
 
 GPU_METRICS = {"utilization": "DCGM_FI_DEV_GPU_UTIL", "memory_mib": "DCGM_FI_DEV_FB_USED"}
 # From vLLM's and llm-d's published Grafana dashboards; M is the replica matcher.
