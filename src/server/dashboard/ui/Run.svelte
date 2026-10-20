@@ -13,14 +13,8 @@
   import Configuration from "./Configuration.svelte";
   import { duration, shortNodeName, KINDS, runDescription, isFinished, finishedAt } from "./format.js";
   let { inventory, view } = $props();
-  const CHART_LIMIT = 12;
   function metricNames(rows) {
     return [...new Set(rows.flatMap((row) => Object.entries(row.metrics || {}).filter(([, value]) => Number.isFinite(value)).map(([name]) => name)))];
-  }
-  function matchingMetrics(names, filter) {
-    const query = filter.trim().toLowerCase();
-    // A complete name stays accessible even when it is also a common prefix.
-    return names.filter((name) => name.toLowerCase().includes(query)).sort((a, b) => Number(b.toLowerCase() === query) - Number(a.toLowerCase() === query));
   }
   // Draw gestures immediately, but fetch only once the user settles on a window.
   let navigating = $state(false);
@@ -39,17 +33,13 @@
   const description = $derived(run ? runDescription(run, title) : "");
   const samples = $derived((detail.data?.samples || []).filter((s) => s.at >= range.start && s.at <= range.now));
   const roles = $derived([...new Set(samples.map((s) => s.role || "process"))]);
-  let serverFilter = $state("");
   const names = $derived(metricNames(samples));
-  const serverMatches = $derived(matchingMetrics(names, serverFilter));
-  const serverShown = $derived(serverMatches.slice(0, CHART_LIMIT));
   const metricStatus = $derived(detail.error ? `${detail.error}${samples.length ? " · Showing previously fetched metrics" : ""}` : detail.pending ? "Updating…" : "");
   // A shared pool's load is every run's, so it is charted on Nodes rather than here.
   const vllm = createQuery(() => inspectUrl("series", { ...bounds, kind: "samplers" }), { scope: () => view.id, merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: () => view.tab === "metrics" && run && !run.shared_runtime && selection() });
   // The vLLM series the inspection API returns for a run's samplers, as vLLM's and llm-d's dashboards chart them.
   const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
     ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
-  let collectorFilter = $state("");
   // A finished run opens on its own lifetime rather than the last 30 minutes, unless the link names a window.
   const finished = $derived(isFinished(run));
   let opened = false;
@@ -112,7 +102,7 @@
       <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {:else}
       <div class="run-metrics" data-run-metrics={view.id}>
-          <CollectorMetrics params={bounds} {view} {range} {navigating} bind:search={collectorFilter} />
+          <CollectorMetrics params={bounds} {view} {range} {navigating} />
           <h2 class="scheduler-title">Operations</h2>
           <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span>{#if metricStatus}<span class={detail.error ? "source-error" : "muted"} role="status">{metricStatus}</span>{/if}</div>
           <div class="chart-grid">
@@ -120,13 +110,9 @@
             {#if !samples.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">No operations recorded in this time range</p>{/if}
           </div>
           <h2 class="scheduler-title">Server metrics</h2>
-          <div class="log-toolbar"><input type="search" bind:value={serverFilter} list="server-metric-names" placeholder="Search server metrics" aria-label="Filter server metrics" /></div>
-          <datalist id="server-metric-names">{#each names as name (name)}<option value={name}></option>{/each}</datalist>
-          <p class="muted">Showing {serverShown.length} of {names.length} available metrics{serverFilter.trim() ? ` · ${serverMatches.length} matching` : ""} · {CHART_LIMIT}-chart limit. Search to choose metrics.</p>
-          <div class="chart-grid">
-            {#each serverShown as name (name)}<Chart title={name} points={samples.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]])} start={range.start} end={range.now} tone="accent" {navigating} />{/each}
-            {#if !serverShown.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">{names.length ? "No metric matches" : "No numeric server metrics in this time range"}</p>{/if}
-          </div>
+          {#if names.length}<div class="chart-grid">
+            {#each names as name (name)}<Chart title={name} points={samples.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]])} start={range.start} end={range.now} tone="accent" {navigating} />{/each}
+          </div>{:else if detail.data}<p class="muted">0 metrics</p>{/if}
           <h2 class="scheduler-title">Samplers</h2>
           {#if vllm.error && !run.shared_runtime}<p class="source-error" role="status">{vllm.error}{vllm.data ? " · Showing previously fetched metrics" : ""}</p>{/if}
           {#if run.shared_runtime}<p class="muted">The pool's samplers serve every run on this base model; see their load on <a href={viewLink("nodes")}>Nodes</a>.</p>
