@@ -34,7 +34,9 @@
   const workerMemoryError = $derived(seriesError(metrics.workers || [], "memory_bytes", series.error));
   const visible = $derived(all.filter((p) => p.node === node?.name && (view.gpu === "all" || p.devices.includes(view.gpu)) && p.start <= range.now && p.end >= range.start));
   const errors = $derived([...new Set([inventory.cluster.error, inventory.cluster.nodes_error, inventory.cluster.devices?.error, inventory.cluster.scheduler?.error, inventory.processes_error, history.error].filter(Boolean))]);
-  const nodes = $derived([...inventory.cluster.nodes].sort((a, b) => Number(inventory.placements.some((p) => p.node === b.name)) - Number(inventory.placements.some((p) => p.node === a.name)) || Number(b.gpu_capacity > 0) - Number(a.gpu_capacity > 0)));
+  // Only accelerator nodes are tracked; busy ones first.
+  const busy = (n) => Number(inventory.placements.some((p) => p.node === n.name));
+  const nodes = $derived(inventory.cluster.nodes.filter((n) => n.gpu_capacity > 0 || n.devices?.length).sort((a, b) => busy(b) - busy(a)));
   const unavailable = $derived(!node && (view.node || (view.placement && history.data)));
   const duration = $derived(range.now - range.start);
   const back = $derived(viewLink("nodes", { duration, end: range.now, node: view.node, placement: view.placement, gpu: view.node && view.gpu !== "all" ? view.gpu : null }));
@@ -84,7 +86,7 @@
 </script>
 <svelte:window onhashchange={() => scrollSelection = true} onkeydown={escapeKey} />
 <div bind:this={element} use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => navigating = !!value }} data-crosshair={cursor !== null ? "" : undefined} style:--crosshair={`${cursor ?? 0}%`}>
-  <div class="nodes-heading"><h1 class="heading">Kubernetes nodes</h1>
+  <div class="nodes-heading"><h1 class="heading">Accelerator nodes</h1>
     <div class="time-control" aria-label="Node time range">
       <TimeControl {view} {range} {observed} /><CopyLink />
     </div>
@@ -131,5 +133,5 @@
         </section>
       {/if}
     </div>
-  {:else}{#if loading}<p class="empty-state">Loading activity…</p>{:else if !errors.length && inventory.cluster.available}<p class="empty-state">No nodes reported by Kubernetes</p>{/if}{/each}
+  {:else}{#if loading}<p class="empty-state">Loading activity…</p>{:else if !errors.length && inventory.cluster.available}<p class="empty-state">No accelerator nodes reported by Kubernetes</p>{/if}{/each}
 </div>
