@@ -36,6 +36,61 @@ It uses standard `unittest` in the examples environment.
 
 See [Harvey LAB RL](harvey_labs) for setup and recipe options.
 
+## Custom loop telemetry
+
+Custom loops using the cookbook logger can append one OpenTelemetry sink:
+
+```python
+from common.otel_logger import OTelLogger
+from tinker_cookbook.utils import ml_log
+
+logger = ml_log.setup_logging(log_dir=log_dir, config=config)
+logger.loggers.append(OTelLogger(session_id=session_id, model_id=model_id))
+try:
+    # Existing metric calls continue to write files and now also export telemetry.
+    logger.log_metrics({"phase": "train", "loss": loss}, step=step)
+finally:
+    logger.close()
+```
+
+`session_id` is the existing Tinker client session; `model_id` is optional.
+With our pinned Tinker 0.29.0, `service_client.holder.get_session_id()` obtains
+the session ID. This is a deprecated SDK compatibility accessor, used only in
+the caller until Tinker exposes a public accessor; the adapter does not depend
+on SDK internals. Untouched cookbook recipes do not enable client metric export.
+
+The standard OTLP **HTTP/protobuf** exporters use the collector endpoint and
+authentication configured through `OTEL_EXPORTER_OTLP_*`. For a collector
+running locally or port-forwarded to port 4318:
+
+```sh
+export OTEL_SERVICE_NAME=openrl-client
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_METRIC_EXPORT_INTERVAL=5000
+```
+
+Production uses the collector's protected HTTPS endpoint and configured headers;
+the existing OpenRL API is not an OTLP receiver. This adapter selects HTTP
+exporters explicitly, so setting the protocol to gRPC does not switch it.
+
+Each `log_metrics` call emits an `openrl.training.metrics` log event with finite
+numeric `metrics` and an optional `step`. Attributes are `session.id`, optional
+`openrl.model.id`, and `openrl.phase` when supplied in the metric dictionary.
+Repeated steps remain separate timestamped events. Gauges `openrl.client.metric`
+(with a `metric` attribute for the original name) and `openrl.client.step` expose
+the latest values per export interval for Prometheus; step is never a label.
+Non-numeric values, booleans, NaN, and infinities are excluded. Configuration and
+text remain with the existing cookbook loggers.
+
+OTel owns buffering, retries, and shutdown. Delivery is best effort; keep the
+cookbook JSONL files for recovery. The adapter does not install global OTel
+providers. It exports to the collector's configured backends; those events do
+not populate the dashboard's existing Redis step-history endpoint. See the
+[OTel exporters](https://opentelemetry.io/docs/languages/python/exporters/) and
+[Google-built collector](https://docs.cloud.google.com/stackdriver/docs/instrumentation/opentelemetry-collector-gke)
+for backend setup. Run its local export regression checks with
+`make test-client-telemetry` from the repository root.
+
 ---
 
 ## Examples Overview

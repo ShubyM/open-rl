@@ -112,7 +112,10 @@ test:
 	  exit 2; \
 	fi
 
-.PHONY: test-weight-transfer
+.PHONY: test-client-telemetry test-weight-transfer
+test-client-telemetry:
+	uv run --project examples --locked python -m unittest tests.test_cookbook_otel
+
 test-weight-transfer:
 	uv run --frozen --extra vllm --extra gpu --extra cluster python -m unittest tests.test_delta_weight_transfer_engine tests.test_delta_weight_sync tests.test_weight_sync_config tests.test_weight_transfer_gpu
 

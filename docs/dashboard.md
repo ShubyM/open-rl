@@ -49,6 +49,12 @@ Log cursors preserve the original bounds, pod lifetimes and provider query for 1
 
 ## Client metrics and Prometheus
 
+Custom loops can attach the small [cookbook OpenTelemetry adapter](../examples/README.md#custom-loop-telemetry)
+to export session/model/step observations and Prometheus gauges through standard
+OTLP exporters. It requires a collector; the dashboard does not yet read that
+history. The existing gateway/Redis path below is separate. Untouched cookbook
+recipes have server/GKE telemetry without client metric forwarding by default.
+
 Send batches to the gateway with `POST /api/v1/runs/{run_id}/metrics`, or run the companion beside an unchanged cookbook example:
 
 ```sh
