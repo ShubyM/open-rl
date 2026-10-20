@@ -30,20 +30,6 @@ export function processLabel(p, nodes) {
 export const OP_ORDER = ["forward_backward", "forward", "optim_step", "sample", "init", "wake_up", "sleep", "weight_sync"];
 export const opRank = (name) => OP_ORDER.includes(name) ? OP_ORDER.indexOf(name) : OP_ORDER.length;
 export const opLabel = (name) => name.replace(/_/g, " ");
-export function duty(node, placements, range) {
-  if (!node.gpu_capacity || placements.some((p) => p.devices.length !== p.device_count || p.devices.some((id) => !node.devices.some((d) => d.id === id)))) return "—";
-  const byDevice = new Map();
-  for (const p of placements) for (const id of p.devices) {
-    if (!byDevice.has(id)) byDevice.set(id, []);
-    byDevice.get(id).push([Math.max(range.start, p.start), Math.min(range.now, p.end)]);
-  }
-  let busy = 0;
-  for (const spans of byDevice.values()) {
-    let end = -Infinity;
-    for (const [a, b] of spans.sort((a, b) => a[0] - b[0])) { busy += Math.max(0, b - Math.max(a, end)); end = Math.max(end, b); }
-  }
-  return `${Math.min(100, Math.round(100 * busy / ((range.now - range.start) * node.gpu_capacity)))}%`;
-}
 export function claimLabel(node, placements, live) {
   if (live && !node.ready) return "Offline";
   if (!node.gpu_capacity) return "CPU";

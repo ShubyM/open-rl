@@ -62,7 +62,7 @@ async def series(state: dict, node_id=None, since=None, until=None, run_id=None,
 
   async def samplers():
     pods = sorted({p["pod"] for p in placements if p.get("role") == "sampler" and p.get("pod")})
-    if kind == "hardware" or not run_id or not pods:
+    if kind in ("hardware", "devices") or not run_id or not pods:
       return {}, {}, 0
     if backend is None:
       return {}, dict.fromkeys(SAMPLER_QUERIES, reason), 0
@@ -71,7 +71,7 @@ async def series(state: dict, node_id=None, since=None, until=None, run_id=None,
 
   (gpu, gpu_errors, gpu_ok), (cpu, cpu_errors, cpu_ok), (vllm, vllm_errors, vllm_ok) = await asyncio.gather(
     query("devices", [{"id": identity, "uuid": uuid} for identity, uuid in devices], "uuid", ("utilization", "memory_mib")),
-    query("workers_series", list(workers.values()), "pod", ("cpu_cores", "memory_bytes")),
+    query("workers_series", list(workers.values()) if kind != "devices" else [], "pod", ("cpu_cores", "memory_bytes")),
     samplers(),
   )
   error = next(iter([*gpu_errors.values(), *cpu_errors.values(), *vllm_errors.values()]), None)
@@ -89,7 +89,7 @@ async def series(state: dict, node_id=None, since=None, until=None, run_id=None,
         "samplers_errors": vllm_errors,
         "samplers_reason": next(iter(vllm_errors.values()), reason) or (None if vllm else "No sampler pods for this run in this window"),
       }
-      if run_id and kind != "hardware"
+      if run_id and kind not in ("hardware", "devices")
       else {}
     ),
   }

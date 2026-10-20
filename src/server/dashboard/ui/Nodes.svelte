@@ -8,7 +8,7 @@
   import { createQuery, inspectUrl, now, rangeOf, viewLink, crosshair, crosshairOffset, timeAt } from "./state.svelte.js";
   import { nodeTime } from "./node-time.js";
   import { mergeSeries, seriesError } from "./series.js";
-  import { axisTime, deviceLabel, acceleratorLabel, shortNodeName, placementColor, clipPlacements, duty, claimLabel, capacityBars, activitySource, deviceSeries, sumSeries, gapFor, lastValue } from "./visualization.js";
+  import { axisTime, deviceLabel, acceleratorLabel, shortNodeName, placementColor, clipPlacements, claimLabel, capacityBars, activitySource, deviceSeries, sumSeries, gapFor, lastValue } from "./visualization.js";
 
   let { inventory, view } = $props();
   let element, navigating = $state(false);
@@ -17,6 +17,13 @@
   const bounds = $derived({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString() });
   const selection = () => !navigating && `${view.duration} ${view.end}`;
   const history = createQuery(() => inspectUrl("activity", bounds), { poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: selection });
+  // Duty cycle: mean DCGM GPU utilization, the share of time a kernel was running, over each node's GPUs.
+  const fleet = createQuery(() => inspectUrl("series", { kind: "devices", ...bounds }), { merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: selection });
+  function dutyCycle(node) {
+    const ids = new Set((node.devices || []).map((d) => d.id));
+    const values = (fleet.data?.devices || []).filter((d) => ids.has(d.id)).flatMap((d) => d.utilization.filter(([at]) => at >= range.start && at <= range.now).map(([, v]) => v));
+    return values.length ? `${Math.round(values.reduce((a, b) => a + b, 0) / values.length)}%` : "—";
+  }
   // Lanes wait for the first history response so they render once, complete, instead of filling in and shifting.
   const loading = $derived(!history.data && !history.error);
   const all = $derived(clipPlacements(history.data?.placements || [], range, history.error, history.status));
@@ -95,7 +102,7 @@
   {#if history.error}<button type="button" class="chip" data-retry-data="activity:nodes" onclick={history.retry}>Retry activity</button>{/if}
   {#if !inventory.cluster.available && !errors.length}<p class="empty-state">Kubernetes unavailable</p>{/if}
   {#if unavailable}<div class="unavailable-selection" role="status"><span>{view.node ? "The selected node is no longer reported." : "The selected placement is not in retained history."}</span><button type="button" class="detail-close" data-close-details aria-label="Clear unavailable selection" title="Clear selection" onclick={close}>×</button></div>{/if}
-  <div class="node-time-header"><span>Node</span><div class="node-axis">{#each [0, 1, 2, 3] as step}<span>{axisTime(range.start + (range.now - range.start) * step / 3, range)}</span>{/each}</div><span class="node-duty" title="GPU claimed time over this window, not measured GPU utilization">Claimed</span></div>
+  <div class="node-time-header"><span>Node</span><div class="node-axis">{#each [0, 1, 2, 3] as step}<span>{axisTime(range.start + (range.now - range.start) * step / 3, range)}</span>{/each}</div><span class="node-duty" title="Duty cycle: mean GPU utilization (share of time a kernel was running) over this window, from DCGM">Duty</span></div>
   {#each loading ? [] : nodes as item (item.name)}
     {@const devices = item.devices || []}
     {@const height = devices.length === 1 ? 30 : 22}
@@ -114,7 +121,7 @@
         </div></div>{/if}
         {#each unmapped as p (p.id)}<button type="button" class={`capacity-allocation unknown-mapping ${placementColor(p)}`} data-key={`unmapped:${p.id}`} data-placement={p.id} aria-expanded={p.id === view.placement} onclick={() => select(p, true)}><span class="allocation-name">{p.label}</span><span class="allocation-count">{p.device_count} GPU{p.device_count === 1 ? "" : "s"}</span></button>{/each}
         {#if unmapped.length}<span class="muted micro">Device mapping unavailable</span>{:else if !devices.length && item.gpu_capacity}<p class="empty-state">GPUs without DRA devices</p>{/if}</div>
-        <span class="node-duty" title="Recorded GPU allocation time over the selected window">{duty(item, placements, range)}</span>
+        <span class="node-duty">{dutyCycle(item)}</span>
       </div>
       {#if item.name === view.node}
         {@const label = `${acceleratorLabel(item)} · ${shortNodeName(item.name, inventory.cluster.nodes)}`}

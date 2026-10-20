@@ -199,10 +199,11 @@ async def series(
   run_id: str | None = None,
   since: TimeBound = None,
   until: TimeBound = None,
-  kind: Literal["all", "hardware", "samplers"] = "all",
+  kind: Literal["all", "hardware", "devices", "samplers"] = "all",
 ):
   """GPU utilization/memory and worker CPU/memory over time, including idle devices and past placements.
-  With run_id, the run's own GPUs and workers, plus throughput, queue, KV cache and latency of its vLLM samplers."""
+  With run_id, the run's own GPUs and workers, plus throughput, queue, KV cache and latency of its vLLM samplers.
+  kind=devices is the GPUs alone, for every node when no node or run is named."""
   validate_bounds(since, until)
   if kind == "samplers" and not run_id:
     raise HTTPException(400, "Sampler series require run_id")
