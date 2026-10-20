@@ -15,8 +15,9 @@ from pydantic import ValidationError
 from server.dashboard import inspection, metrics
 from server.dashboard.schema import Activity, Inventory, Logs, Operation, PodLogs, RunMetrics, Series
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
+from server.model_metadata import decode_model_metadata
 from server.store import get_state_store
-from server.telemetry import gke, kubernetes, ops
+from server.telemetry import gke, kubernetes, ops, sdk_events
 from server.telemetry import run_logs as client_logs
 from server.telemetry import run_metrics as client_metrics
 
@@ -169,13 +170,23 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
       samples=[s for s in records[run_id]["samples"] if low <= s["at"] <= high],
       error=records[run_id].get("error"),
       partial=records[run_id].get("partial"),
-      incidents=inspection.incidents(run, low, high),
+      incidents=sorted([*inspection.incidents(run, low, high), *await sdk_incidents(store, run_id, low, high)], key=lambda e: e["at"], reverse=True),
     )
   if finished and not result.get("error"):
     finished_activity[(run_id, node_id, start, end)] = (time.monotonic() + FINISHED_SECONDS, result)
     while len(finished_activity) > 16:
       finished_activity.popitem(last=False)
   return result
+
+
+async def sdk_incidents(store, run_id: str, low: float, high: float) -> list[dict]:
+  """SDK errors from the run's own sessions; none when the run store cannot say."""
+  try:
+    row = await store.get_value(METADATA_PREFIX + run_id)
+    session_ids = decode_model_metadata(row).session_ids if row else []
+    return await sdk_events.incidents(store, session_ids, low, high)
+  except Exception:
+    return []
 
 
 @router.get("/api/v1/inspect/series", operation_id="series", response_model=Series, response_model_exclude_unset=True)

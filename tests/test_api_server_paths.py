@@ -9,6 +9,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from server import api_server
+from server.dashboard.router import sdk_incidents
 from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import LocalWorkerManager
 from tests.test_session_lifecycle import RuntimeManager
@@ -611,6 +612,28 @@ class TelemetryTest(ApiServerTest):
     rows = [(line["severity"], line["message"], line["session_id"]) for line in lines]
     self.assertEqual(rows, [("INFO", "tinker SESSION_START", "sess-123"), ("DEBUG", "tinker custom_event", "sess-123")])
     self.assertEqual(lines[0]["event"]["timestamp"], "2024-01-01")
+
+  def test_a_fatal_sdk_error_is_logged_without_credentials_and_shows_on_its_run(self) -> None:
+    session_id = self.post("create_session", {}).json()["session_id"]
+    model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
+    other_id = self.post("create_model", {"base_model": "m", "session_id": self.post("create_session", {}).json()["session_id"]}).json()["request_id"]
+    data = {
+      "status_code": 401,
+      "detail": "invalid key",
+      "request_headers": {"authorization": "Bearer tml-secret"},
+      "response_headers": {"set-cookie": "s=tml-secret"},
+      "response_body": {"x-api-key": "tml-secret"},
+    }
+    event = {"event": "GENERIC_EVENT", "event_name": "APIFuture.result_async.api_status_error", "severity": "ERROR", "event_data": data}
+    with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+      self.post("telemetry", {"session_id": session_id, "events": [{**event, "timestamp": "2026-10-19T12:00:00+00:00"}]})
+
+    self.assertIn("invalid key", stdout.getvalue())
+    self.assertNotIn("tml-secret", stdout.getvalue())
+    [incident] = asyncio.run(sdk_incidents(api_server.state, model_id, 0, float("inf")))
+    self.assertEqual((incident["tone"], incident["at"]), ("error", 1792411200.0))
+    self.assertIn("invalid key", incident["message"])
+    self.assertEqual(asyncio.run(sdk_incidents(api_server.state, other_id, 0, float("inf"))), [])
 
 
 if __name__ == "__main__":

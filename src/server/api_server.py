@@ -38,6 +38,7 @@ from server.store import get_state_store, get_store
 from server.telemetry import http as telemetry_http
 from server.telemetry import run_logs as client_logs
 from server.telemetry import run_metrics as client_metrics
+from server.telemetry import sdk_events
 from server.telemetry.tracing import configure_tracing
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
@@ -1299,9 +1300,5 @@ async def run_logs(run_id: str, body: client_logs.Request):
 
 @app.post("/api/v1/telemetry")
 async def telemetry(body: dict):
-  # One JSON line per SDK event: on GKE, Cloud Logging indexes it with the event's severity.
-  context = {key: body.get(key) for key in ("session_id", "process_uuid", "sdk_version", "platform")}
-  for event in body.get("events", []):
-    message = f"tinker {event.get('event_name') or event.get('event')}"
-    print(json.dumps({"severity": event.get("severity", "INFO"), "message": message, **context, "event": event}), flush=True)
+  await sdk_events.ingest(state, body)
   return {"status": "accepted"}
