@@ -6,8 +6,8 @@ from unittest import mock
 import httpx
 from kubernetes import client
 
-from server.dashboard import http, kubernetes, metrics, prometheus
-from server.dashboard.prometheus import PromQL
+from server.dashboard import metrics, sources
+from server.dashboard.sources import PromQL
 from server.scheduler_worker_manager import SchedulerWorkerManager
 
 GPU = "GPU-375ff71c-7c41-a89e-3843-c62c7476bc2b"
@@ -33,7 +33,7 @@ class KubernetesInventoryTest(unittest.TestCase):
         custom.list_namespaced_custom_object.return_value = {"items": [item]}
         with mock.patch.dict("os.environ", {"REDIS_URL": "redis://test"}), mock.patch("time.time", return_value=10):
           manager = SchedulerWorkerManager(custom_api=custom)
-          summary = kubernetes.workload_summary(item)
+          summary = sources.workload_summary(item)
           self.assertEqual(summary["worker"], manager.load_workers()[0])
         self.assertEqual(summary["worker"]["state"], expected)
         self.assertEqual(summary["worker"]["age_seconds"], 9)
@@ -51,7 +51,7 @@ class KubernetesInventoryTest(unittest.TestCase):
     ]
     for state, phase, reason, code, started, finished in cases:
       with self.subTest(phase=phase):
-        row = kubernetes.container_summary("worker", "image:v1", state, 2, previous)
+        row = sources.container_summary("worker", "image:v1", state, 2, previous)
         self.assertEqual(
           (row["name"], row["state"], row["reason"], row["exit_code"], row["started_at"], row["finished_at"]),
           ("worker", phase, reason, code, started, finished),
@@ -67,7 +67,7 @@ class KubernetesInventoryTest(unittest.TestCase):
       spec=client.V1PodSpec(containers=[client.V1Container(name="worker", image="trainer:v1")]),
       status=client.V1PodStatus(phase="Pending"),
     )
-    row = kubernetes.pod_summary(pod)
+    row = sources.pod_summary(pod)
     self.assertEqual(row["problem"], "Pending")
     self.assertEqual(
       row["containers"],
@@ -96,13 +96,13 @@ class KubernetesInventoryTest(unittest.TestCase):
       spec=client.V1PodSpec(containers=[client.V1Container(name="dispatcher")]),
       status=client.V1PodStatus(phase="Running", container_statuses=[status]),
     )
-    row = kubernetes.pod_summary(pod)
+    row = sources.pod_summary(pod)
     self.assertEqual((row["problem"], row["restarts"]), (None, 1))
 
   def test_a_probe_traceback_event_keeps_only_its_first_and_last_lines(self):
     probe = 'Readiness probe failed: Traceback (most recent call last):\n  File "<string>", line 2\nURLError: [Errno 111]\n'
-    self.assertEqual(kubernetes.event_message(probe), "Readiness probe failed: Traceback (most recent call last): … URLError: [Errno 111]")
-    self.assertEqual(kubernetes.event_message("Back-off restarting failed container"), "Back-off restarting failed container")
+    self.assertEqual(sources.event_message(probe), "Readiness probe failed: Traceback (most recent call last): … URLError: [Errno 111]")
+    self.assertEqual(sources.event_message("Back-off restarting failed container"), "Back-off restarting failed container")
 
 
 class PromQLTest(unittest.TestCase):
@@ -120,10 +120,10 @@ class PromQLTest(unittest.TestCase):
 
       connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
       with mock.patch.object(httpx, "AsyncClient", return_value=connection):
-        async with http.lifespan():
-          first = asyncio.create_task(http.get_json("https://example/query", params={"query": "up"}, headers={}))
+        async with sources.lifespan():
+          first = asyncio.create_task(sources.get_json("https://example/query", params={"query": "up"}, headers={}))
           await entered.wait()
-          second = asyncio.create_task(http.get_json("https://example/query", params={"query": "up"}, headers={}))
+          second = asyncio.create_task(sources.get_json("https://example/query", params={"query": "up"}, headers={}))
           await asyncio.sleep(0)
           first.cancel()
           with self.assertRaises(asyncio.CancelledError):
@@ -131,11 +131,11 @@ class PromQLTest(unittest.TestCase):
           release.set()
           self.assertEqual(await second, {"answer": 42})
           self.assertEqual(calls, 1)
-          await http.get_json("https://example/query", params={"query": "up"}, headers={})
+          await sources.get_json("https://example/query", params={"query": "up"}, headers={})
           self.assertEqual(calls, 2)  # Completed results are not cached.
           entered.clear()
           release.clear()
-          abandoned = asyncio.create_task(http.get_json("https://example/query", params={"query": "up"}, headers={}))
+          abandoned = asyncio.create_task(sources.get_json("https://example/query", params={"query": "up"}, headers={}))
           await entered.wait()
         with self.assertRaises(asyncio.CancelledError):
           await abandoned  # Shutdown cancels and drains the outstanding request.
@@ -169,11 +169,11 @@ class PromQLTest(unittest.TestCase):
       connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
       with (
         mock.patch.object(httpx, "AsyncClient", return_value=connection),
-        mock.patch.object(http, "MAX_INFLIGHT", 1),
-        mock.patch.object(http, "RETRY_SECONDS", 0),
+        mock.patch.object(sources, "MAX_INFLIGHT", 1),
+        mock.patch.object(sources, "RETRY_SECONDS", 0),
       ):
-        async with http.lifespan():
-          tasks = [asyncio.create_task(http.get_json(u, params=p, headers=h)) for u, p, h in requests]
+        async with sources.lifespan():
+          tasks = [asyncio.create_task(sources.get_json(u, params=p, headers=h)) for u, p, h in requests]
           await asyncio.wait_for(entered.wait(), timeout=1)
           release.set()
           errors = await asyncio.gather(*tasks, return_exceptions=True)
@@ -181,11 +181,11 @@ class PromQLTest(unittest.TestCase):
           # Six distinct requests, each retried once after its 503.
           self.assertEqual(calls, 12)
           with self.assertRaises(httpx.HTTPStatusError):
-            await http.get_json(url, params=params, headers=headers)
+            await sources.get_json(url, params=params, headers=headers)
           self.assertEqual(calls, 14)
           release.clear()
-          with mock.patch.object(http, "REQUEST_SECONDS", 0.01), self.assertRaises(TimeoutError):
-            await http.get_json(url, params=params, headers=headers)
+          with mock.patch.object(sources, "HTTP_SECONDS", 0.01), self.assertRaises(TimeoutError):
+            await sources.get_json(url, params=params, headers=headers)
 
     asyncio.run(exercise())
 
@@ -207,23 +207,21 @@ class PromQLTest(unittest.TestCase):
         connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
 
         async def query(backend=backend, connection=connection):
-          async with http.lifespan():
-            self.assertIs(http.client(), connection)
+          async with sources.lifespan():
+            self.assertIs(sources.http_client(), connection)
             return await backend.devices([GPU], 0, 60)
 
-        with mock.patch.object(httpx, "AsyncClient", return_value=connection) as factory, mock.patch.object(http, "RETRY_SECONDS", 0):
+        with mock.patch.object(httpx, "AsyncClient", return_value=connection) as factory, mock.patch.object(sources, "RETRY_SECONDS", 0):
           found, errors = asyncio.run(query())
         self.assertEqual(found, {} if denied else {"utilization": {GPU: [[1.0, 80.0]]}})
-        expected = (
-          dict.fromkeys(prometheus.GPU_METRICS, "Metrics query unavailable") if denied else {"memory_mib": "Metrics source returned HTTP 503"}
-        )
+        expected = dict.fromkeys(sources.GPU_METRICS, "Metrics query unavailable") if denied else {"memory_mib": "Metrics source returned HTTP 503"}
         self.assertEqual(errors, expected)
         # The failed query is retried once; denied credentials make no request at all.
         self.assertEqual(len(calls), 0 if denied else 3)
         token.assert_called_once()
         factory.assert_called_once()
         self.assertTrue(connection.is_closed)
-        self.assertIsNone(http._client)
+        self.assertIsNone(sources.pool)
 
   def test_a_sampler_timeout_does_not_discard_other_charts(self):
     backend = PromQL("prometheus", "https://example", None, None, "openrl-system")
@@ -266,8 +264,8 @@ class PromQLTest(unittest.TestCase):
     with mock.patch.object(backend, "query_range", side_effect=fake):
       result, errors = asyncio.run(backend.samplers(["sampler-0", "sampler-1"], 0, 60))
     self.assertEqual(errors, {})
-    self.assertEqual(set(result), set(prometheus.SAMPLER_QUERIES))
-    match = f'namespace="openrl-system",pod=~{prometheus.any_of(["sampler-0", "sampler-1"])},cluster="open-rl-fft-test"'
+    self.assertEqual(set(result), set(sources.SAMPLER_QUERIES))
+    match = f'namespace="openrl-system",pod=~{sources.any_of(["sampler-0", "sampler-1"])},cluster="open-rl-fft-test"'
     self.assertTrue(all("vllm:" in q and match in q for q in queries), queries)
     self.assertEqual(result["requests_waiting"], [[1.0, 2.0]])
 
@@ -294,16 +292,16 @@ class PromQLTest(unittest.TestCase):
     backend = PromQL("gke", "https://example", None, None, "openrl-system")
     sent = []
 
-    async def get(self, url, params, headers):
+    async def request(self, method, url, params, headers):
       sent.append(params)
       return httpx.Response(200, json={"status": "success", "data": {"result": []}}, request=httpx.Request("GET", url))
 
     async def query():
-      async with http.lifespan():
+      async with sources.lifespan():
         for start in (1000.4, 1010.4):
           await backend.query_range("q", start, start + 1800)
 
-    with mock.patch.object(httpx.AsyncClient, "get", get):
+    with mock.patch.object(httpx.AsyncClient, "request", request):
       asyncio.run(query())
     self.assertEqual([p["step"] for p in sent], [15, 15])
     self.assertEqual([p["start"] % 15 for p in sent], [0, 0])
@@ -315,14 +313,14 @@ class HardwareSourceTest(unittest.TestCase):
     gke_on = {"project": "p", "cluster": "c", "location": "l", "mode": "auto", "enabled": True, "configured": True}
     gke_off = {**gke_on, "project": "", "configured": False, "cluster": ""}
     gmp = {"OPEN_RL_PROMETHEUS_URL": "http://gmp:9090/"}
-    with mock.patch.dict("os.environ", gmp), mock.patch.object(metrics.gke, "configuration", return_value=gke_on):
+    with mock.patch.dict("os.environ", gmp), mock.patch.object(metrics.sources, "configuration", return_value=gke_on):
       source, _ = metrics.hardware()
       self.assertEqual((source.name, source.url, source.cluster), ("prometheus", "http://gmp:9090", "c"))
-    with mock.patch.dict("os.environ", {"OPEN_RL_PROMETHEUS_URL": ""}), mock.patch.object(metrics.gke, "configuration", return_value=gke_on):
+    with mock.patch.dict("os.environ", {"OPEN_RL_PROMETHEUS_URL": ""}), mock.patch.object(metrics.sources, "configuration", return_value=gke_on):
       source, _ = metrics.hardware()
       self.assertEqual(source.name, "gke")
       self.assertIn("/projects/p/location/global/prometheus", source.url)
-    with mock.patch.dict("os.environ", {"OPEN_RL_PROMETHEUS_URL": ""}), mock.patch.object(metrics.gke, "configuration", return_value=gke_off):
+    with mock.patch.dict("os.environ", {"OPEN_RL_PROMETHEUS_URL": ""}), mock.patch.object(metrics.sources, "configuration", return_value=gke_off):
       source, reason = metrics.hardware()
       self.assertIsNone(source)
       self.assertIn("OPEN_RL_PROMETHEUS_URL", reason)
@@ -339,7 +337,7 @@ class HardwareSeriesTest(unittest.TestCase):
     }
     backend = mock.Mock()
     backend.name = "fake"
-    for errors in ({}, {"memory_mib": "Offline"}, dict.fromkeys(prometheus.GPU_METRICS, "Offline")):
+    for errors in ({}, {"memory_mib": "Offline"}, dict.fromkeys(sources.GPU_METRICS, "Offline")):
       with self.subTest(errors=errors):
         backend.devices = mock.AsyncMock(return_value=({}, errors))
         with mock.patch.object(metrics, "hardware", return_value=(backend, None)):

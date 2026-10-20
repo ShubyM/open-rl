@@ -272,7 +272,7 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.snapshot = snapshot.Snapshot()
     self.store = InMemoryStateStore()
     self.metadata = self.enterContext(patch.object(snapshot, "metadata_of", AsyncMock(return_value=copy.deepcopy(METADATA))))
-    self.cluster = self.enterContext(patch.object(snapshot.kubernetes, "read", return_value=STATE))
+    self.cluster = self.enterContext(patch.object(snapshot.sources, "read_cluster", return_value=STATE))
     self.processes = self.enterContext(patch.object(snapshot, "processes_of", AsyncMock(return_value=[{"id": "past"}])))
     self.enterContext(patch.object(router, "snapshot", self.snapshot))
     self.enterContext(patch.object(router, "get_state_store", return_value=self.store))
@@ -334,7 +334,7 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_cluster_failure_preserves_placements_and_reports_the_error(self) -> None:
     first = await self.snapshot.current(self.store)
-    self.cluster.return_value = snapshot.kubernetes.unavailable("openrl-system", "Kubernetes offline")
+    self.cluster.return_value = snapshot.sources.cluster_unavailable("openrl-system", "Kubernetes offline")
     self.snapshot.invalidate()
     stale = await self.snapshot.current(self.store)
     self.assertGreater(stale["observed_at"], first["observed_at"])
@@ -351,7 +351,7 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.assertIsNone((await self.snapshot.current(self.store))["cluster"].get("error"))
 
   async def test_without_kubernetes_runs_and_processes_refresh_then_join_when_it_appears(self) -> None:
-    self.cluster.return_value = snapshot.kubernetes.unavailable("openrl-system", "No cluster configured")
+    self.cluster.return_value = snapshot.sources.cluster_unavailable("openrl-system", "No cluster configured")
     with patch.object(snapshot.time, "time", return_value=1000):
       first = await self.snapshot.current(self.store)
     self.assertIsNone(first["error"])

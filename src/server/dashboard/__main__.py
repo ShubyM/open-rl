@@ -11,10 +11,10 @@ from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
 
-from server.dashboard import http
+from server.dashboard import sources
 from server.dashboard.router import router
 
-app = FastAPI(title="Open-RL Inspection API", lifespan=http.lifespan)
+app = FastAPI(title="Open-RL Inspection API", lifespan=sources.lifespan)
 # Snapshots run to megabytes of JSON, and a port-forward carries them slowly.
 app.add_middleware(GZipMiddleware, minimum_size=4096, compresslevel=1)
 app.include_router(router)

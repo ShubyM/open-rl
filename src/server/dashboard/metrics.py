@@ -4,28 +4,27 @@ import asyncio
 import os
 from datetime import datetime
 
-from server.dashboard import gke, kubernetes
-from server.dashboard.inspection import sources
-from server.dashboard.prometheus import SAMPLER_QUERIES, PromQL
+from server.dashboard import inspection, sources
+from server.dashboard.sources import SAMPLER_QUERIES, PromQL
 
 
 def hardware() -> tuple[PromQL | None, str | None]:
   """The series source: an explicit Prometheus, else GKE's managed one, else (None, why)."""
-  config = gke.configuration()
+  config = sources.configuration()
   url = os.getenv("OPEN_RL_PROMETHEUS_URL", "").rstrip("/")
   if url:
-    return PromQL("prometheus", url, None, config["cluster"] or None, kubernetes.namespace()), None
+    return PromQL("prometheus", url, None, config["cluster"] or None, sources.namespace()), None
   if config["configured"]:
     endpoint = f"https://monitoring.googleapis.com/v1/projects/{config['project']}/location/global/prometheus"
-    return PromQL("gke", endpoint, gke.access_token, config["cluster"], kubernetes.namespace(), gke.quota_headers), None
+    return PromQL("gke", endpoint, sources.access_token, config["cluster"], sources.namespace(), sources.quota_headers), None
   return None, "No GPU metrics source: not on GKE and OPEN_RL_PROMETHEUS_URL is unset"
 
 
 async def series(state: dict, node_id=None, since=None, until=None, run_id=None, kind="all", samples=()) -> dict:
   """A node's devices and workers, idle GPUs included; or a run's, with its samplers' vLLM series."""
-  start, end = gke.time_range(since, until)
+  start, end = sources.log_window(since, until)
   low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
-  placements = [p for p in sources(state, run_id=run_id, node_id=node_id, samples=samples) if p["start"] <= high and p["end"] >= low]
+  placements = [p for p in inspection.sources(state, run_id=run_id, node_id=node_id, samples=samples) if p["start"] <= high and p["end"] >= low]
   nodes = [n for n in state["cluster"]["nodes"] if not node_id or n.get("name") == node_id]
   current = {d["id"]: d.get("uuid") for n in nodes for d in n["devices"]}
   devices, workers = {}, {}

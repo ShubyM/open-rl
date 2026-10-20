@@ -6,7 +6,7 @@ import math
 import re
 
 from server.dashboard.metrics import hardware
-from server.dashboard.prometheus import any_of
+from server.dashboard.sources import any_of
 
 SERIES_LIMIT = 200
 IDENTITIES = (

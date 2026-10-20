@@ -13,7 +13,7 @@ from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
 from server import telemetry
-from server.dashboard import collector, gke, inspection, kubernetes, metrics
+from server.dashboard import collector, inspection, metrics, sources
 from server.dashboard.schema import Activity, CollectorMetrics, Inventory, Logs, Operation, PodLogs, Series
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.model_metadata import decode_model_metadata
@@ -74,7 +74,7 @@ async def dashboard_asset(name: str):
 
 def time_range(since, until):
   try:
-    start, end = gke.time_range(since, until)
+    start, end = sources.log_window(since, until)
     return start, end, datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
   except (ValueError, OverflowError, OSError) as exc:
     raise HTTPException(400, "Use ISO-8601 since/until timestamps and a positive window of at most seven days") from exc
@@ -86,7 +86,7 @@ def validate_bounds(since, until):
     time_range(since, until)
   elif since is not None:
     try:
-      gke.timestamp(since)
+      sources.timestamp(since)
     except (ValueError, OverflowError, OSError) as exc:
       raise HTTPException(400, "since must be an ISO-8601 timestamp") from exc
 
@@ -94,7 +94,7 @@ def validate_bounds(since, until):
 @router.get("/api/v1/inspect/inventory", operation_id="inventory", response_model=Inventory, response_model_exclude_unset=True)
 async def inventory():
   """Current runs, placements, nodes and scheduler state, with an error field per unavailable source."""
-  await gke.discover()
+  await sources.discover()
   state = await snapshot.current(get_state_store())
   return {key: value for key, value in state.items() if key != "processes"}
 
@@ -206,7 +206,7 @@ async def series(
   validate_bounds(since, until)
   if kind == "samplers" and not run_id:
     raise HTTPException(400, "Sampler series require run_id")
-  await gke.discover()
+  await sources.discover()
   state = await snapshot.current(get_state_store())
   start, end, _, _ = time_range(since, until or state["observed_at"])
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None) if run_id else None
@@ -242,7 +242,7 @@ async def collector_metrics(
     sessions = meta.session_ids
     if runtime := meta.runtime(run_id):
       runtimes = [runtime, meta.pool(run_id)]
-  await gke.discover()
+  await sources.discover()
   return await collector.series(start, end, run_id=run_id, node_id=node_id, session_ids=sessions, runtime_ids=runtimes, metric=metric)
 
 
@@ -276,26 +276,26 @@ async def run_logs(
   since: TimeBound = None,
   until: TimeBound = None,
   limit: int = Query(200, ge=1, le=1000),
-  cursor: str | None = Query(None, max_length=gke.MAX_CURSOR),
+  cursor: str | None = Query(None, max_length=sources.MAX_CURSOR),
 ):
   """Cloud Logging for every pod the run has owned, live or gone."""
   validate_bounds(since, until)
-  await gke.discover()
-  sources, shared_runtime = [], False
+  await sources.discover()
+  lifetimes, shared_runtime = [], False
   if not cursor:
     state, run = await run_of(run_id)
     records = await read_operations(run_id, is_finished(run))
     since, until, _, _ = time_range(since, until or state["observed_at"])
-    sources = gke.pod_sources(run, inspection.sources(state, run_id, samples=records["samples"]), state["observed_at"])
+    lifetimes = sources.pod_sources(run, inspection.sources(state, run_id, samples=records["samples"]), state["observed_at"])
     shared_runtime = run["shared_runtime"]
     # Without its records a run's logs still cover the pods it is known to have had.
     note = f"{records['error']}; logs of pods known only from those records are not shown" if records.get("error") else None
   else:
     note = None
   try:
-    result = await gke.run_logs(
+    result = await sources.run_logs(
       run_id,
-      sources,
+      lifetimes,
       since=since,
       until=until,
       cursor=cursor,
@@ -308,10 +308,10 @@ async def run_logs(
     )
   except ValueError as exc:
     raise HTTPException(400, str(exc)) from exc
-  if not gke.configuration()["configured"] and pod in (None, gke.CLIENT) and not cursor:
+  if not sources.configuration()["configured"] and pod in (None, sources.CLIENT) and not cursor:
     # Without Cloud Logging the run's client output still has its tail in the run store.
     try:
-      client = await asyncio.wait_for(gke.client_tail(get_state_store(), run_id, limit), timeout=5)
+      client = await asyncio.wait_for(sources.client_tail(get_state_store(), run_id, limit), timeout=5)
     except Exception:
       client = []
     if client:
@@ -325,6 +325,6 @@ async def run_logs(
 async def pod_logs(pod: str, container: str | None = None, previous: bool = False, tail: int = Query(200, ge=1, le=1000)):
   """Current or previous container output straight from the kubelet, for any pod in the namespace."""
   try:
-    return await asyncio.to_thread(kubernetes.pod_logs, pod, container, tail, previous)
+    return await asyncio.to_thread(sources.pod_logs, pod, container, tail, previous)
   except Exception as exc:
     raise HTTPException(503, "Pod logs unavailable in the configured namespace") from exc

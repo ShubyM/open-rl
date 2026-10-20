@@ -24,7 +24,7 @@ from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, C
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import openrl_status, proto_codec, telemetry
-from server.dashboard import http as dashboard_http
+from server.dashboard import sources as dashboard_sources
 from server.lora_snapshots import snapshot_name, snapshot_root
 from server.model_metadata import (
   TrainingModelMetadata,
@@ -656,7 +656,7 @@ async def lifespan(_: FastAPI):
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
   reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
   try:
-    async with dashboard_http.lifespan():
+    async with dashboard_sources.lifespan():
       yield
   finally:
     if reap_task is not None:

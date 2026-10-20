@@ -10,7 +10,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from server import openrl_status, telemetry
-from server.dashboard import kubernetes
+from server.dashboard import sources
 from server.model_metadata import decode_model_metadata
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
@@ -292,13 +292,13 @@ class Snapshot:
   async def read(self, store: StateStore) -> dict:
     now = time.time()
     cluster, metadata, processes = await asyncio.gather(
-      asyncio.to_thread(kubernetes.read),
+      asyncio.to_thread(sources.read_cluster),
       asyncio.wait_for(metadata_of(store), timeout=5),
       asyncio.wait_for(processes_of(store, now - HISTORY_WINDOW_SECONDS), timeout=5),
       return_exceptions=True,
     )
     if isinstance(cluster, Exception):
-      cluster = kubernetes.unavailable(kubernetes.namespace(), "Cluster inventory unavailable")
+      cluster = sources.cluster_unavailable(sources.namespace(), "Cluster inventory unavailable")
     # Each failed source falls back to its own last good section; the rest refreshes.
     cluster = self.merge(cluster, self.latest["cluster"] if self.latest else None)
     if isinstance(metadata, Exception):

@@ -22,7 +22,7 @@ class InspectionApiTest(unittest.TestCase):
     self.store = mock.Mock(read_samples=mock.AsyncMock(return_value=[]))
     patches = [
       mock.patch.object(router.snapshot, "current", mock.AsyncMock(return_value=self.state)),
-      mock.patch.object(router.gke, "discover", mock.AsyncMock()),
+      mock.patch.object(router.sources, "discover", mock.AsyncMock()),
       mock.patch.object(router, "get_state_store", return_value=self.store),
     ]
     for patch in patches:
@@ -93,13 +93,13 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual(data["workers"][0]["cpu_cores"], [[150, 2]])
     self.assertIn("unavailable", data["reason"])
     self.assertEqual(data["devices"][0]["errors"], {"utilization": "GPU metrics query unavailable"})
-    router.gke.discover.assert_awaited_once()
+    router.sources.discover.assert_awaited_once()
 
   def test_log_cursor_continuation_uses_no_inventory_or_store_reads(self):
     self.state["runs"][0]["shared_runtime"] = True
     with (
-      mock.patch.object(router.gke, "configuration", return_value=CONFIG),
-      mock.patch.object(router.gke, "request", mock.AsyncMock(side_effect=[{"nextPageToken": "next-provider-page"}, {}])) as request,
+      mock.patch.object(router.sources, "configuration", return_value=CONFIG),
+      mock.patch.object(router.sources, "gcp_request", mock.AsyncMock(side_effect=[{"nextPageToken": "next-provider-page"}, {}])) as request,
     ):
       first = self.client.get("/api/v1/inspect/logs", params={"run_id": "r1", **WINDOW}).json()
       router.snapshot.current.reset_mock()
@@ -124,8 +124,8 @@ class InspectionApiTest(unittest.TestCase):
     backend.devices = mock.AsyncMock()
     backend.workers_series = mock.AsyncMock()
     with (
-      mock.patch.object(router.gke, "configuration", return_value=CONFIG),
-      mock.patch.object(router.gke, "request", mock.AsyncMock(return_value={})) as request,
+      mock.patch.object(router.sources, "configuration", return_value=CONFIG),
+      mock.patch.object(router.sources, "gcp_request", mock.AsyncMock(return_value={})) as request,
       mock.patch.object(router.metrics, "hardware", return_value=(backend, None)),
     ):
       logs = self.client.get("/api/v1/inspect/logs", params={"run_id": "r1", **WINDOW})
@@ -144,7 +144,7 @@ class InspectionApiTest(unittest.TestCase):
       response = self.client.get("/api/v1/inspect/series", params=params)
       self.assertEqual(response.status_code, expected)
     router.snapshot.current.assert_not_awaited()
-    router.gke.discover.assert_not_awaited()
+    router.sources.discover.assert_not_awaited()
     self.store.read_samples.assert_not_awaited()
 
   def test_unavailable_historical_records_leave_logs_and_series_with_a_note(self):
@@ -195,7 +195,7 @@ class InspectionApiTest(unittest.TestCase):
 
   def test_pod_logs_preserve_previous_and_unknown_diagnostics(self):
     result = {"pod": "p", "container": None, "previous": True, "text": "untrusted <script> false 0", "future": {"flag": False}}
-    with mock.patch.object(router.kubernetes, "pod_logs", return_value=result):
+    with mock.patch.object(router.sources, "pod_logs", return_value=result):
       response = self.client.get("/api/v1/inspect/pods/p/logs?previous=true")
     self.assertEqual(response.json(), result)
 

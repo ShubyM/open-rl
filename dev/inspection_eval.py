@@ -274,7 +274,7 @@ async def logs(run_id, sources, **kwargs):
     "records": [
       r
       for r in CASES[case]["pages"].get(kwargs.get("cursor"), CASES[case]["logs"])
-      if kwargs["since"] <= router.gke.timestamp(r["timestamp"]) <= kwargs["until"]
+      if kwargs["since"] <= router.sources.timestamp(r["timestamp"]) <= kwargs["until"]
       and (not kwargs.get("severity") or r["severity"] == kwargs["severity"])
       and (not kwargs.get("pod") or r["pod"] == kwargs["pod"])
       and kwargs.get("q", "").lower() in r["message"].lower()
@@ -297,10 +297,10 @@ def pod_logs(pod, container, tail, previous=False):
 def make_app(log_path):
   router.snapshot.current = current
   router.get_state_store = FixtureStore
-  router.gke.discover = discover
-  router.gke.run_logs = logs
+  router.sources.discover = discover
+  router.sources.run_logs = logs
   router.metrics.hardware = lambda: (Hardware(), None)
-  router.kubernetes.pod_logs = pod_logs
+  router.sources.pod_logs = pod_logs
   app = FastAPI()
 
   @app.middleware("http")
