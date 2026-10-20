@@ -14,9 +14,8 @@
   import { duration, shortNodeName, KINDS, runDescription, isFinished, finishedAt } from "./format.js";
   let { inventory, view } = $props();
   const CHART_LIMIT = 12;
-  function metricNames(rows, preferred = []) {
-    const names = new Set(rows.flatMap((row) => Object.entries(row.metrics || {}).filter(([, value]) => Number.isFinite(value)).map(([name]) => name)));
-    return [...new Set([...preferred.filter((name) => names.has(name)), ...names])];
+  function metricNames(rows) {
+    return [...new Set(rows.flatMap((row) => Object.entries(row.metrics || {}).filter(([, value]) => Number.isFinite(value)).map(([name]) => name)))];
   }
   function matchingMetrics(names, filter) {
     const query = filter.trim().toLowerCase();
@@ -50,16 +49,6 @@
   // The vLLM series the inspection API returns for a run's samplers, as vLLM's and llm-d's dashboards chart them.
   const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
     ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
-  // What the run's training client reported per step, such as reward and eval pass rate, charted by step.
-  const reported = createQuery(() => inspectUrl("run_metrics", { run_id: view.id }), { poll: 30000, pollWhen: () => view.end === null, key: () => view.tab === "metrics" && view.id });
-  const reportedRows = $derived(reported.data?.rows || []);
-  const REPORTED_CHARTS = [["env/all/reward/total", "Reward"], ["test/env/all/reward/total", "Held-out reward"], ["env/all/lab/criteria_pass_fraction", "Criteria pass rate"],
-    ["test/env/all/lab/criteria_pass_fraction", "Held-out criteria pass rate"], ["env/all/lab/no_output", "Episodes without output"], ["test/env/all/lab/no_output", "Held-out episodes without output"],
-    ["optim/entropy", "Entropy"], ["optim/kl_sample_train_v2", "Sampler-trainer KL"], ["loss_per_token", "Loss per token"], ["train_mean_nll", "Train NLL"], ["time/total", "Step time", "s"]];
-  let reportedFilter = $state("");
-  const reportedNames = $derived(metricNames(reportedRows, REPORTED_CHARTS.map(([name]) => name)));
-  const reportedMatches = $derived(matchingMetrics(reportedNames, reportedFilter));
-  const reportedShown = $derived(reportedMatches.slice(0, CHART_LIMIT).map((name) => REPORTED_CHARTS.find(([key]) => key === name) || [name, name]));
   let collectorFilter = $state("");
   // A finished run opens on its own lifetime rather than the last 30 minutes, unless the link names a window.
   const finished = $derived(isFinished(run));
@@ -122,23 +111,9 @@
     {:else if view.tab !== "metrics"}
       <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {:else}
-      {#snippet training()}
-        <h2 class="scheduler-title">Training</h2>
-        {#if reported.error}<p class="source-error" role="status">{reported.error}{reportedRows.length ? " · Showing previously fetched metrics" : ""}</p>{/if}
-        {#if !reported.data}{#if !reported.error}<p class="muted">Loading…</p>{/if}
-        {:else if !reportedRows.length}<p class="muted">No step metrics were reported for this run.</p>
-        {:else}
-          <div class="log-toolbar"><input type="search" bind:value={reportedFilter} list="reported-metric-names" placeholder="Search client metrics, e.g. reward" aria-label="Filter training metrics" /></div>
-          <datalist id="reported-metric-names">{#each reportedNames as name (name)}<option value={name}></option>{/each}</datalist>
-          <p class="muted">Showing {reportedShown.length} of {reportedNames.length} available metrics{reportedFilter.trim() ? ` · ${reportedMatches.length} matching` : ""} · {CHART_LIMIT}-chart limit. Search to choose metrics.</p>
-          <div class="chart-grid">
-            {#each reportedShown as [key, title, unit = ""] (key)}<Chart {title} {unit} steps points={reportedRows.filter((row) => Number.isFinite(row.metrics[key])).map((row) => [row.step, row.metrics[key]])} start={reportedRows[0].step} end={reportedRows.at(-1).step} empty="No values" />{/each}
-            {#if !reportedShown.length}<p class="empty-state">{reportedNames.length ? "No metric matches" : "No numeric client metrics reported"}</p>{/if}
-          </div>
-        {/if}
-      {/snippet}
       <div class="run-metrics" data-run-metrics={view.id}>
-          {#if reportedRows.length}{@render training()}<h2 class="scheduler-title">Operations</h2>{/if}
+          <CollectorMetrics params={bounds} {view} {range} {navigating} bind:search={collectorFilter} />
+          <h2 class="scheduler-title">Operations</h2>
           <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span>{#if metricStatus}<span class={detail.error ? "source-error" : "muted"} role="status">{metricStatus}</span>{/if}</div>
           <div class="chart-grid">
             {#each roles as role (role)}<Chart title={`${{ trainer: "Trainer", sampler: "Sampler", process: "Process" }[role] || role} operation duration`} unit="s" points={samples.filter((s) => (s.role || "process") === role).map((s) => [s.at, s.elapsed_seconds])} start={range.start} end={range.now} min={0} tone="accent" {navigating} />{/each}
@@ -152,8 +127,6 @@
             {#each serverShown as name (name)}<Chart title={name} points={samples.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]])} start={range.start} end={range.now} tone="accent" {navigating} />{/each}
             {#if !serverShown.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">{names.length ? "No metric matches" : "No numeric server metrics in this time range"}</p>{/if}
           </div>
-          {#if !reportedRows.length}{@render training()}{/if}
-          <CollectorMetrics params={bounds} {view} {range} {navigating} bind:search={collectorFilter} />
           <h2 class="scheduler-title">Samplers</h2>
           {#if vllm.error && !run.shared_runtime}<p class="source-error" role="status">{vllm.error}{vllm.data ? " · Showing previously fetched metrics" : ""}</p>{/if}
           {#if run.shared_runtime}<p class="muted">The pool's samplers serve every run on this base model; see their load on <a href={viewLink("nodes")}>Nodes</a>.</p>

@@ -38,7 +38,6 @@ from server.store import get_state_store, get_store
 from server.telemetry import http as telemetry_http
 from server.telemetry import metrics as server_metrics
 from server.telemetry import run_logs as client_logs
-from server.telemetry import run_metrics as client_metrics
 from server.telemetry import sdk_events
 from server.telemetry.tracing import configure_tracing
 from server.vllm_options import split_stop
@@ -1284,13 +1283,6 @@ async def list_adapters():
 
 
 # *** Internal ***
-
-
-@app.post("/api/v1/runs/{run_id}/metrics")
-async def run_metrics(run_id: str, body: client_metrics.Request):
-  """Replace per-step client metrics; expose retained history and latest values to operators.
-  run_id is the model id the client trains."""
-  return await client_metrics.ingest(state, run_id, body)
 
 
 @app.post("/api/v1/runs/{run_id}/logs")

@@ -11,7 +11,7 @@ make dashboard                 # builds static/app.js and serves on port 8080
 
 The standalone process is `uv run --extra cluster python -m server.dashboard`. Point it at the API server's Redis (`REDIS_URL`) and worker namespace. Without shared Redis, a separate dashboard has its own empty in-memory store and cannot see another server's runs. Rebuild with `make dashboard-build` after changing `src/server/dashboard/ui`; when packaging a wheel, build it before `uv build`.
 
-On GKE with Managed Prometheus CRDs installed, `kubectl apply -k k8s/deploy/dashboard` deploys it and its PodMonitoring into `openrl-system` with the existing `open-rl-sa`. It uses the API-server image, whose Dockerfile builds the UI in a Node stage. Set the image tag in that directory's `kustomization.yaml`.
+On GKE, `kubectl apply -k k8s/deploy/dashboard` deploys it into `openrl-system` with the existing `open-rl-sa`. It uses the API-server image, whose Dockerfile builds the UI in a Node stage. Set the image tag in that directory's `kustomization.yaml`.
 
 The inspection API lists every run in the fleet, while the client-facing API server only answers for model IDs a client already holds. So the API server does not mount it by default. For a trusted local server without Redis, run `make dashboard-build`, then `OPEN_RL_INSPECTION_API=true make server` and open `http://127.0.0.1:9003/dashboard`. This shares the server's in-memory run and operation data. Missing Kubernetes does not prevent that data from refreshing.
 
@@ -37,7 +37,6 @@ Recent query responses are kept in a bounded, in-memory cache and shown while re
 | `GET /series` | GPU utilization and memory per device UUID, and worker CPU and memory, for one `node_id` or one `run_id`. With `run_id`, also the run's vLLM samplers: token throughput, running and waiting requests, KV cache use, preemptions, and p99 time to first token and request latency |
 | `GET /logs` | Worker and forwarded client logs from Cloud Logging, with filters and cursor paging; a retained client-log tail when Cloud Logging is unconfigured |
 | `GET /pods/{pod}/logs` | Current or previous container output from the kubelet |
-| `GET /run_metrics` | Distinct training steps reported by a client, ordered by step |
 | `GET /telemetry` | Discovered client/server gauges from the collector's Prometheus backend; scoped to a run or node, optionally filtered by metric name |
 
 `activity`, `series` and `logs` take ISO `since` and `until` bounds, up to seven days. An omitted end uses inventory's `observed_at`; an omitted start uses the preceding 30 minutes. Activity returns the resolved bounds for subsequent queries and a coverage note: missing completed records do not establish that no requests arrived or that workers were idle. Response schemas are generated from the same models used to validate responses; extra diagnostic fields are preserved. Invalid operation records are skipped and reported in `partial`, separately from `error`, which means a source could not be read.
@@ -162,30 +161,15 @@ Worker overflow warns with retained/dropped counts; existing series keep updatin
 Metric names are at most 200 characters. Keep names and scope labels stable.
 These producer limits bound memory; the chart limit only bounds rendering.
 
-## Legacy client metrics and Prometheus
+## Client logs
 
-The gateway/Redis path below remains available for retained per-step rows. It is
-separate from the Collector's sampled time series above.
-
-Send batches to the gateway with `POST /api/v1/runs/{run_id}/metrics`, or run the companion beside an unchanged cookbook example:
+A client's own output is sent with `POST /api/v1/runs/{run_id}/logs`, where `run_id` is the model ID it trains. The gateway emits each line as structured JSON for Cloud Logging, labelled with the run, and keeps the last 5,000 lines in its run store for a deployment without Cloud Logging. Beside an unchanged cookbook example, run:
 
 ```sh
-python -m server.scripts.forward_metrics /path/to/run --base-url http://gateway:8000 --run-id RUN_ID --follow
+python -m server.scripts.forward_logs /path/to/run --base-url http://gateway:8000 --run-id RUN_ID --follow
 ```
 
-The forwarder must be started explicitly where the files live, with the OpenRL modules and `httpx` installed. It reads `metrics.jsonl` every 15 seconds and sends batches of 200 rows. Metric names are discovered from finite numeric values; no per-metric registration is needed. Records require an integer `step` or `progress/batch`. The dashboard's metric filter finds custom names. Direct API callers send `{"rows": [{"step": 12, "metrics": {"custom_score": 0.8}}]}`.
-
-`RUN_ID` must be an existing model ID. If omitted, the forwarder waits for the first model path in `checkpoints.jsonl`. This still assumes one model per source file; repeated steps replace entire rows, and string fields such as `phase` are discarded.
-
-By default it also sends `logs.log` to `POST /api/v1/runs/{run_id}/logs`; use `--no-logs` for metrics only. The gateway emits structured client logs for Cloud Logging and retains the last 5,000 lines in its run store for local inspection. Log forwarding can duplicate lines after retries or restarts.
-
-Each batch atomically replaces rows by step and retains the highest `OPEN_RL_OPS_SAMPLE_LIMIT` distinct steps. Retrying an acknowledged batch cannot evict other steps. The forwarder filters nonfinite values before JSON encoding and retries only unacknowledged batches.
-
-History responses include an ETag. The browser revalidates its cached history: unchanged polls return `304` without reading, decoding or transferring the rows, and keep the existing chart data. Changed batches invalidate the revision, including corrections to older steps; replaying unchanged rows keeps it. Changed histories return the full retained rows. The standalone dashboard uses gzip level 1 for large responses.
-
-The dashboard's `/metrics` endpoint exposes the highest reported step as `openrl_run_metric{run_id="...",metric="..."}`, plus `openrl_run_step` and `openrl_run_metrics_received_timestamp_seconds`. Step numbers are values, never labels. Each scrape reads one latest-step snapshot per indexed run; dashboard charts read the step history directly. By default, export includes the first 64 metric names alphabetically from rows received within six hours (`OPEN_RL_METRICS_EXPORT_LIMIT` and `OPEN_RL_METRICS_EXPORT_HOURS`). Metrics absent from that row are not exported. The dashboard overlay includes its PodMonitoring; other Prometheus installations can scrape port 8000 at `/metrics`. History expires with the configured operation TTL.
-
-Earlier development builds used a list format. History reads fall back to those records when keyed step history is absent; replay the run's `metrics.jsonl` to populate keyed storage and Prometheus export.
+It reads `logs.log` every 15 seconds. Without `--run-id` it waits for the first model path in `checkpoints.jsonl`. Retries and restarts can duplicate lines. Client metrics go through OpenTelemetry, above.
 
 ## Progress
 

@@ -7,19 +7,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
 from server.dashboard import collector, inspection, metrics
-from server.dashboard.schema import Activity, CollectorMetrics, Inventory, Logs, Operation, PodLogs, RunMetrics, Series
+from server.dashboard.schema import Activity, CollectorMetrics, Inventory, Logs, Operation, PodLogs, Series
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.model_metadata import decode_model_metadata
 from server.store import get_state_store
 from server.telemetry import gke, kubernetes, ops, sdk_events
 from server.telemetry import run_logs as client_logs
-from server.telemetry import run_metrics as client_metrics
 
 REQUEST_SECONDS = 12
 # A long run holds tens of thousands of operation records; reading them needs more than a
@@ -324,32 +323,3 @@ async def pod_logs(pod: str, container: str | None = None, previous: bool = Fals
     return await asyncio.to_thread(kubernetes.pod_logs, pod, container, tail, previous)
   except Exception as exc:
     raise HTTPException(503, "Pod logs unavailable in the configured namespace") from exc
-
-
-@router.get("/api/v1/inspect/run_metrics", operation_id="run_metrics", response_model=RunMetrics, response_model_exclude_unset=True)
-async def run_metrics(run_id: str, response: Response, if_none_match: Annotated[str | None, Header()] = None):
-  """The run's own per-step metrics, such as rewards, eval pass rates and losses, when its
-  training client sends them to the gateway; empty for a run that never did."""
-  response.headers["Cache-Control"] = "private, no-cache"
-  tags = [tag.strip().removeprefix("W/") for tag in (if_none_match or "").split(",")]
-  known = tuple(tag[1:-1] for tag in tags if tag.startswith('"') and tag.endswith('"')) + (("*",) if "*" in tags else ())
-  try:
-    # Opened with the run page, this read shares the process with that page's activity work.
-    revision, rows = await asyncio.wait_for(client_metrics.read(get_state_store(), run_id, known), timeout=15)
-  except Exception:
-    return {"available": False, "error": "Run metrics unavailable", "run_id": run_id, "rows": []}
-  if revision:
-    response.headers["ETag"] = f'W/"{revision}"'
-  if rows is None:
-    return Response(status_code=304, headers=response.headers)
-  return {"available": True, "run_id": run_id, "rows": rows}
-
-
-@router.get("/metrics", include_in_schema=False)
-async def prometheus_metrics():
-  """Latest client metrics, without reading or replaying the step history."""
-  try:
-    body = await client_metrics.exposition(get_state_store())
-  except Exception as exc:
-    raise HTTPException(503, "Run metrics unavailable") from exc
-  return Response(body, headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})

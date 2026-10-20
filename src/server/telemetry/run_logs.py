@@ -9,14 +9,15 @@ without Cloud Logging.
 
 import hashlib
 import json
+import re
 import time
 from datetime import UTC, datetime
 
+from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from server.telemetry import ops
 from server.telemetry.gke import CLIENT, RUN_LABEL, SOURCE_LABEL
-from server.telemetry.run_metrics import known_run
 
 PREFIX = "open_rl:run_logs:"
 TAIL = 5000
@@ -24,6 +25,7 @@ MAX_MESSAGE = 16384
 SEVERITIES = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 # A client clock is trusted within this much of the gateway's.
 CLOCK_SKEW_SECONDS = 86400
+RUN_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 
 class Line(BaseModel):
@@ -38,6 +40,14 @@ class Request(BaseModel):
 
 def iso(at: float) -> str:
   return datetime.fromtimestamp(at, UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+async def known_run(store, run_id: str) -> None:
+  """A run is its model: the run id is the model id the client trains."""
+  if not RUN_ID.fullmatch(run_id):
+    raise HTTPException(400, "run_id must be 1-128 letters, digits, '.', '_', ':' or '-'")
+  if not await store.get_value(f"open_rl:model_meta:{run_id}"):
+    raise HTTPException(404, f"No run {run_id}; a run is its model, so send the model id the client trains")
 
 
 async def ingest(store, run_id: str, body: Request) -> dict:

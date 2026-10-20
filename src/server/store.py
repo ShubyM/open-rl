@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-import secrets
 import time
 from abc import ABC, abstractmethod
 from functools import cache
@@ -290,16 +289,6 @@ class StateStore(ABC):
     pass
 
   @abstractmethod
-  async def put_steps(self, key: str, rows: list[dict], limit: int, ttl_seconds: float | None) -> None:
-    """Replace rows by step, retain the highest `limit` steps, and publish latest:key and revision:key atomically."""
-    pass
-
-  @abstractmethod
-  async def read_steps(self, key: str, known_revisions: tuple[str, ...] = ()) -> tuple[str | None, list[dict] | None]:
-    """Atomic revision and retained rows in step order; rows=None when a known revision matches."""
-    pass
-
-  @abstractmethod
   async def list_length(self, key: str) -> int | None:
     """Items in a list, such as a request queue; None where this store holds no queues."""
     pass
@@ -316,7 +305,6 @@ class InMemoryStateStore(StateStore):
     self.expiries: dict[str, float] = {}
     self.sets: dict[str, set[str]] = {}
     self.samples: dict[str, list[str]] = {}
-    self.step_rows: dict[str, dict[int, str]] = {}
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
@@ -331,7 +319,6 @@ class InMemoryStateStore(StateStore):
     if key in self.expiries and time.monotonic() >= self.expiries[key]:
       self.kv_store.pop(key, None)
       self.expiries.pop(key, None)
-      self.step_rows.pop(key, None)
     return self.kv_store.get(key)
 
   async def delete_values(self, *keys: str) -> None:
@@ -340,7 +327,6 @@ class InMemoryStateStore(StateStore):
       self.expiries.pop(k, None)
       self.sets.pop(k, None)
       self.samples.pop(k, None)
-      self.step_rows.pop(k, None)
 
   async def add_to_set(self, key: str, member: str) -> None:
     self.sets.setdefault(key, set()).add(member)
@@ -362,32 +348,6 @@ class InMemoryStateStore(StateStore):
   async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
     return [json.loads(sample) for sample in self.samples.get(key, [])[-(last or 0) :]]
 
-  async def put_steps(self, key: str, rows: list[dict], limit: int, ttl_seconds: float | None) -> None:
-    if not rows:
-      return
-    self.get_value_sync(key)  # Expire previous rows before merging.
-    values = self.step_rows.setdefault(key, {})
-    unchanged = all(row["step"] in values and without_receipt(json.loads(values[row["step"]])) == without_receipt(row) for row in rows)
-    if not unchanged:  # A replay of what is stored keeps its revision, and only renews its lifetime.
-      values.update({row["step"]: json.dumps(row, allow_nan=False) for row in rows})
-      for step in sorted(values)[:-limit]:
-        del values[step]
-      self.kv_store["latest:" + key] = values[max(values)]
-      self.kv_store["revision:" + key] = secrets.token_hex(16)
-    expires = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
-    for stored in (key, "latest:" + key, "revision:" + key):
-      self.expiries.pop(stored, None)
-      if expires is not None:
-        self.expiries[stored] = expires
-
-  async def read_steps(self, key: str, known_revisions: tuple[str, ...] = ()) -> tuple[str | None, list[dict] | None]:
-    self.get_value_sync(key)
-    values = self.step_rows.get(key, {})
-    revision = self.get_value_sync("revision:" + key) if values else None
-    if revision and (revision in known_revisions or "*" in known_revisions):
-      return revision, None
-    return revision, [json.loads(value) for _, value in sorted(values.items())]
-
   async def list_length(self, key: str) -> int | None:
     return None  # the in-memory queues live in InMemoryStore
 
@@ -397,48 +357,7 @@ class InMemoryStateStore(StateStore):
     return value
 
 
-def without_receipt(row: dict) -> dict:
-  """A step row without its receipt time, which a replay changes."""
-  return {k: v for k, v in row.items() if k != "at"}
-
-
 class RedisStateStore(StateStore):
-  # One transaction per batch. Retries replace fields before retention is applied,
-  # and an old replay cannot replace the latest step exposed to Prometheus.
-  PUT_STEPS = """
-    local ttl = tonumber(ARGV[2])
-    -- A replayed batch carries a fresh receipt time; only a changed step makes a new revision.
-    local changed = false
-    for i = 4, #ARGV, 2 do
-      local old = redis.call('HGET', KEYS[1], ARGV[i])
-      if not old or string.gsub(old, '"at": [^,}]+', '') ~= string.gsub(ARGV[i + 1], '"at": [^,}]+', '') then
-        changed = true
-        break
-      end
-    end
-    if changed then
-      redis.call('HSET', KEYS[1], unpack(ARGV, 4))
-      local steps = redis.call('HKEYS', KEYS[1])
-      table.sort(steps, function(a, b) return tonumber(a) < tonumber(b) end)
-      for i = 1, #steps - tonumber(ARGV[1]) do redis.call('HDEL', KEYS[1], steps[i]) end
-      redis.call('SET', KEYS[2], redis.call('HGET', KEYS[1], steps[#steps]))
-      redis.call('SET', KEYS[3], ARGV[3])
-    end
-    for _, key in ipairs(KEYS) do
-      if ttl >= 0 then redis.call('PEXPIRE', key, ttl) else redis.call('PERSIST', key) end
-    end
-  """
-  READ_STEPS = """
-    local revision = redis.call('GET', KEYS[2])
-    if revision and redis.call('EXISTS', KEYS[1]) == 0 then revision = false end
-    if revision then
-      for _, known in ipairs(ARGV) do
-        if known == revision or known == '*' then return {revision} end
-      end
-    end
-    return {revision or '', redis.call('HGETALL', KEYS[1])}
-  """
-
   def __init__(self, client: redis.Redis, sync_client: sync_redis.Redis):
     self.redis = client
     self.sync_redis = sync_client
@@ -483,29 +402,6 @@ class RedisStateStore(StateStore):
     raw = await self.redis.lrange(key, -(last or 0), -1)
     # Decoded off the event loop: a dashboard read can be thousands of samples.
     return await asyncio.to_thread(lambda: [json.loads(sample) for sample in raw])
-
-  async def put_steps(self, key: str, rows: list[dict], limit: int, ttl_seconds: float | None) -> None:
-    if rows:
-      values = [value for row in rows for value in (str(row["step"]), json.dumps(row, allow_nan=False))]
-      await self.redis.eval(
-        self.PUT_STEPS,
-        3,
-        key,
-        "latest:" + key,
-        "revision:" + key,
-        limit,
-        int(ttl_seconds * 1000) if ttl_seconds is not None else -1,
-        secrets.token_hex(16),
-        *values,
-      )
-
-  async def read_steps(self, key: str, known_revisions: tuple[str, ...] = ()) -> tuple[str | None, list[dict] | None]:
-    revision, *changed = await self.redis.eval(self.READ_STEPS, 2, key, "revision:" + key, *known_revisions)
-    if not changed:
-      return revision, None
-    raw = changed[0]
-    rows = await asyncio.to_thread(lambda: [json.loads(value) for _, value in sorted(zip(raw[::2], raw[1::2]), key=lambda item: int(item[0]))])
-    return revision or None, rows
 
   async def list_length(self, key: str) -> int | None:
     return await self.redis.llen(key)

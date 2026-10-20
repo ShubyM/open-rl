@@ -19,7 +19,7 @@ class InspectionApiTest(unittest.TestCase):
     self.client = TestClient(app)
     self.state = state()
     self.state["runs"][0].update(shared_runtime=False)
-    self.store = mock.Mock(read_samples=mock.AsyncMock(return_value=[]), read_steps=mock.AsyncMock(return_value=(None, [])))
+    self.store = mock.Mock(read_samples=mock.AsyncMock(return_value=[]))
     patches = [
       mock.patch.object(router.snapshot, "current", mock.AsyncMock(return_value=self.state)),
       mock.patch.object(router.gke, "discover", mock.AsyncMock()),
