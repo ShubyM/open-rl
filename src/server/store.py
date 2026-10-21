@@ -42,12 +42,12 @@ class RequestStore(ABC):
     pass
 
   @abstractmethod
-  async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
+  async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     """Resolve a future by its request ID."""
     pass
 
   @abstractmethod
-  async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
+  async def get_result(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     """Block until the future resolves or the timeout is reached."""
     pass
 
@@ -129,14 +129,14 @@ class InMemoryStore(RequestStore):
       batch.append(queue.get_nowait())
     return batch
 
-  async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
+  async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
       return
     async with self.futures_cv:
       self.futures_store[req_id] = result
       self.futures_cv.notify_all()
 
-  async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
+  async def get_result(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     async with self.futures_cv:
       try:
         await asyncio.wait_for(self.futures_cv.wait_for(lambda: req_id in self.futures_store), timeout=timeout)
@@ -259,7 +259,7 @@ class RedisStore(RequestStore):
 
     return batch
 
-  async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
+  async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
       return
     key = f"open_rl:future:{req_id}"
@@ -270,7 +270,7 @@ class RedisStore(RequestStore):
       pipeline.expire(key, 300)
       await pipeline.execute()
 
-  async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
+  async def get_result(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     key = f"open_rl:future:{req_id}"
     deadline = time.monotonic() + timeout
     while True:

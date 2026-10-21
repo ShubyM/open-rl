@@ -17,7 +17,7 @@ class StoreStub:
   async def put_request(self, req_data: dict, active_set_id: str | None = None) -> None:
     self.forwarded_requests.append(req_data)
 
-  async def set_future(self, req_id: str, result: dict) -> None:
+  async def set_result(self, req_id: str, result: dict) -> None:
     self.futures[req_id] = result
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:

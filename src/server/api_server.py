@@ -575,7 +575,7 @@ async def launch_worker_and_enqueue(command: Command) -> str:
     await asyncio.to_thread(worker_manager.ensure, command.model_id, "trainer")
   except Exception as exc:
     traceback.print_exc()
-    await store.set_future(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
+    await store.set_result(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
     return request_id
   return await enqueue(command)
 
@@ -985,7 +985,7 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
   pending, failed, and every other result stay JSON.
   """
   request_id = req.request_id
-  result = await store.get_future(request_id, timeout=60.0)
+  result = await store.get_result(request_id, timeout=60.0)
   if result is None:
     return JSONResponse(status_code=400, content={"type": "RequestFailedResponse", "error_message": "Future not found"})
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
