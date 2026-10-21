@@ -1,11 +1,18 @@
 import json
+import os
+import sys
+import tempfile
+import time
 import unittest
+import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 from server import api_server
 from server.session_registry import SessionRegistry
 from server.worker_manager import LocalWorkerManager
 from tests.api_client import asgi_client, post_json
+from tests.redis_server import TEST_REDIS_URL
 
 
 class StoreStub:
@@ -201,20 +208,30 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "trainer-Model_A.1")
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "trainers")
 
-  async def test_local_sampler_launch_stamps_workload_tags_and_process_group(self) -> None:
+  async def test_local_sampler_is_vllm_serve_and_its_dispatcher_each_in_its_own_process_group(self) -> None:
+    base = {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}
     with (
-      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}, clear=True),
+      patch.dict("os.environ", {**base, "OPEN_RL_TIME_SLICING": "off"}, clear=True),
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
       manager.ensure("Model_A.1", "sampler")
 
-    _, kwargs = popen.call_args
-    self.assertTrue(kwargs["start_new_session"])
-    self.assertEqual(kwargs["env"]["OPEN_RL_ENABLE_FFT"], "true")
-    self.assertEqual(kwargs["env"]["OPEN_RL_MODEL_ID"], "Model_A.1")
-    self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], "sampler-Model_A.1")
-    self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "samplers")
+    (serve, serve_kwargs), (dispatch, dispatch_kwargs) = [(c[0][0], c[1]) for c in popen.call_args_list]
+    self.assertEqual((serve_kwargs["start_new_session"], dispatch_kwargs["start_new_session"]), (True, True))
+    self.assertEqual((serve[serve.index("serve") + 1], serve_kwargs["env"]["OPEN_RL_ENABLE_FFT"]), ("Model_A.1", "true"))
+    self.assertNotIn("OPEN_RL_TIME_SLICE_JOB_ID", serve_kwargs["env"])
+    self.assertEqual(dispatch[-1], "server.sampling_dispatcher")
+
+  async def test_a_local_fft_sampler_on_the_trainers_gpu_serves_its_pool_itself_in_the_trainers_claim(self) -> None:
+    with (
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}, clear=True),
+      patch("server.worker_manager.subprocess.Popen") as popen,
+    ):
+      LocalWorkerManager().ensure("fft-job", "sampler")
+    ((command, kwargs),) = [(c[0][0], c[1]) for c in popen.call_args_list]
+    self.assertEqual(command[command.index("-m") + 1 :], ["server.vllm_sampler", "--pool", "sampler-fft-job"])
+    self.assertEqual((kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"]), ("sampler-fft-job", "trainers"))
 
   async def test_launch_fetches_metadata_from_store(self) -> None:
     import json
@@ -242,7 +259,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
       self.assertEqual(kwargs["env"].get("OPEN_RL_WEIGHT_SYNC_STRATEGY"), "delta")
 
       manager.ensure("Model_A.1", "sampler")
-      _, kwargs_s = popen.call_args
+      _, kwargs_s = popen.call_args_list[-2]  # vllm serve; the last launch is its dispatcher
       self.assertEqual(kwargs_s["env"].get("BASE_MODEL"), "base-model-a")
       self.assertEqual(kwargs_s["env"].get("OPEN_RL_WEIGHT_SYNC_STRATEGY"), "delta")
 
@@ -349,11 +366,12 @@ class ApiServerFutureTranslationTest(unittest.TestCase):
 
 class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
   def setUp(self) -> None:
-    from pathlib import Path
 
     with patch.dict("os.environ", {"REDIS_URL": "redis://127.0.0.1:6379"}):
       self.manager = LocalWorkerManager(project_dir=Path("/tmp"))
     self.store = StoreStub()
+    # A LoRA launch creates its snapshot directory under OPEN_RL_TMP_DIR.
+    self.enterContext(patch.dict("os.environ", {"OPEN_RL_TMP_DIR": self.enterContext(tempfile.TemporaryDirectory())}))
 
   @patch("server.worker_manager.metadata_for")
   @patch("subprocess.Popen")
@@ -370,19 +388,25 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
       fine_tuning_type="lora",
     )
 
-    # Launch for first LoRA model ID
+    # Launch for first LoRA model ID: a vllm serve replica and its dispatcher
     self.manager.ensure("model-lora-1", "sampler")
-    self.assertIn(("sampler", "Qwen/Qwen2.5-0.5B"), self.manager.processes)
-    self.assertEqual(mock_popen.call_count, 1)
-
-    cmd_args = mock_popen.call_args[0][0]
-    self.assertIn("server.vllm_sampler", cmd_args)
-    self.assertIn("Qwen/Qwen2.5-0.5B", cmd_args)
+    self.assertEqual(set(self.manager.processes), {("sampler", "Qwen/Qwen2.5-0.5B"), ("dispatcher", "Qwen/Qwen2.5-0.5B")})
+    (serve, serve_kwargs), (dispatch, dispatch_kwargs) = [(c[0][0], c[1]) for c in mock_popen.call_args_list]
+    port = serve[serve.index("--port") + 1]
+    self.assertEqual(serve[serve.index("serve") + 1 : serve.index("serve") + 2], ["Qwen/Qwen2.5-0.5B"])
+    self.assertIn("--enable-lora", serve)
+    self.assertEqual(serve_kwargs["env"]["VLLM_ALLOW_RUNTIME_LORA_UPDATING"], "true")
+    # Triton kernels live under OPEN_RL_TMP_DIR; vLLM's own compile cache stays where vLLM puts it.
+    tmp = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+    self.assertEqual(serve_kwargs["env"]["TRITON_CACHE_DIR"], f"{tmp}/cache/triton")
+    self.assertEqual(serve_kwargs["env"].get("VLLM_CACHE_ROOT"), os.environ.get("VLLM_CACHE_ROOT"))
+    self.assertIn("server.sampling_dispatcher", dispatch)
+    self.assertEqual(dispatch_kwargs["env"]["OPEN_RL_SAMPLER_ENDPOINTS"], f"http://127.0.0.1:{port}")
 
     # Launch for second LoRA model ID sharing the same base model
     self.manager.ensure("model-lora-2", "sampler")
     # Should reuse existing process and NOT call popen again!
-    self.assertEqual(mock_popen.call_count, 1)
+    self.assertEqual(mock_popen.call_count, 2)
 
   @patch("server.worker_manager.metadata_for")
   @patch("subprocess.Popen")
@@ -397,15 +421,84 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
       base_model="Qwen/Qwen2.5-0.5B",
       created_at=100.0,
       fine_tuning_type="full",
+      exclusive=True,
     )
 
     self.manager.ensure("model-fft-1", "sampler")
-    self.assertIn(("sampler", "model-fft-1"), self.manager.processes)
-    self.assertEqual(mock_popen.call_count, 1)
+    self.assertEqual(set(self.manager.processes), {("sampler", "model-fft-1"), ("dispatcher", "model-fft-1")})
+    (serve, _), (_, dispatch_kwargs) = [(c[0][0], c[1]) for c in mock_popen.call_args_list]
+    self.assertEqual(serve[serve.index("serve") + 1], "Qwen/Qwen2.5-0.5B")
+    self.assertIn("--weight-transfer-config", serve)
+    self.assertEqual(dispatch_kwargs["env"]["OPEN_RL_SAMPLER_POOL"], "sampler-model-fft-1")
 
-    cmd_args = mock_popen.call_args[0][0]
-    self.assertIn("server.vllm_sampler", cmd_args)
-    self.assertIn("model-fft-1", cmd_args)
+
+# Stands in for vllm serve, which is not installed here. Like vLLM's filesystem LoRA resolver, it exits at startup when
+# VLLM_LORA_RESOLVER_CACHE_DIR names a directory that does not exist.
+VLLM_STAND_IN = (
+  "import os, sys, time\nd = os.environ.get('VLLM_LORA_RESOLVER_CACHE_DIR')\nsys.exit(3) if d and not os.path.isdir(d) else time.sleep(60)"
+)
+
+
+def stand_in_spawn(spawned: dict[str, dict[str, str]]):
+  """LocalWorkerManager.spawn with VLLM_STAND_IN for vllm serve and the dispatcher module on this interpreter, since
+  `uv run` would sync the environment. The env of each role lands in `spawned`."""
+  original = LocalWorkerManager.spawn
+
+  def spawn(manager: LocalWorkerManager, role: str, runtime: str, command: list[str], env: dict[str, str]) -> None:
+    spawned[role] = env
+    stand_in = [sys.executable, *command[command.index("-u") :]] if role == "dispatcher" else [sys.executable, "-c", VLLM_STAND_IN]
+    original(manager, role, runtime, stand_in, env)
+
+  return spawn
+
+
+@unittest.skipUnless(TEST_REDIS_URL, "needs OPEN_RL_TEST_REDIS_URL, for example from docker run -p 6411:6379 redis:7")
+class LocalPoolProcessTest(unittest.TestCase):
+  """A local pool's processes as LocalWorkerManager starts them, with the real dispatcher."""
+
+  def test_a_lora_pool_started_before_any_adapter_is_frozen_finds_its_snapshot_directory(self) -> None:
+    # Base-model sampling before the first LoRA save, as examples/harvey_labs/train.py does.
+    tmp = self.enterContext(tempfile.TemporaryDirectory())
+    self.enterContext(patch.dict(os.environ, {"REDIS_URL": TEST_REDIS_URL, "OPEN_RL_TMP_DIR": tmp, "OPEN_RL_ENABLE_FFT": "false"}))
+    spawned = {}
+    self.enterContext(patch.object(LocalWorkerManager, "spawn", stand_in_spawn(spawned)))
+    manager = LocalWorkerManager()
+    self.addCleanup(manager.close)
+    manager.ensure("Qwen/Qwen3-0.6B", "sampler")
+    time.sleep(1)
+    self.assertEqual(spawned["sampler"]["VLLM_LORA_RESOLVER_CACHE_DIR"], f"{tmp}/sampler_lora")
+    self.assertIsNone(manager.processes[("sampler", "Qwen/Qwen3-0.6B")].poll())
+
+  def test_ensure_restarts_a_dead_dispatcher_and_stops_a_live_one_before_it_starts_a_new_pair(self) -> None:
+    tmp = self.enterContext(tempfile.TemporaryDirectory())
+    self.enterContext(
+      patch.dict(os.environ, {"REDIS_URL": TEST_REDIS_URL, "OPEN_RL_TMP_DIR": tmp, "OPEN_RL_ENABLE_FFT": "true", "OPEN_RL_TIME_SLICING": "off"})
+    )
+    stand_ins = {"sampler": ["sleep", "300"], "dispatcher": [sys.executable, "-c", "import sys; sys.exit(1)"]}
+    original = LocalWorkerManager.spawn
+
+    def spawn(manager: LocalWorkerManager, role: str, runtime: str, command: list[str], env: dict[str, str]) -> None:
+      original(manager, role, runtime, stand_ins[role], env)
+
+    self.enterContext(patch.object(LocalWorkerManager, "spawn", spawn))
+    manager, model_id = LocalWorkerManager(), f"pool-{uuid.uuid4().hex[:8]}"
+    self.addCleanup(manager.close)
+    manager.ensure(model_id, "sampler")
+    vllm, dead = manager.processes[("sampler", model_id)], manager.processes[("dispatcher", model_id)]
+    self.assertEqual(dead.wait(timeout=10), 1)
+    # The next save_weights_for_sampler or sampling session finds the dispatcher dead and starts it again.
+    stand_ins["dispatcher"] = ["sleep", "300"]
+    manager.ensure(model_id, "sampler")
+    live = manager.processes[("dispatcher", model_id)]
+    self.addCleanup(live.kill)
+    self.assertEqual((manager.processes[("sampler", model_id)] is vllm, live is dead, live.poll()), (True, False, None))
+    # Once vLLM dies, its dispatcher is stopped before a new pair starts, so two dispatchers never read one stream.
+    vllm.kill()
+    vllm.wait()
+    manager.ensure(model_id, "sampler")
+    sampler, dispatcher = manager.processes[("sampler", model_id)], manager.processes[("dispatcher", model_id)]
+    self.assertIsNotNone(live.poll())
+    self.assertEqual((sampler is vllm, sampler.poll(), dispatcher is live, dispatcher.poll()), (False, None, False, None))
 
 
 if __name__ == "__main__":
