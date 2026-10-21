@@ -170,9 +170,9 @@ class _FutureStoreStub:
     self.results = {}
     self.events = events
 
-  async def set_future(self, req_id, result):
+  async def set_result(self, req_id, result):
     if self.events is not None:
-      self.events.append(("set_future", req_id))
+      self.events.append(("set_result", req_id))
     self.results[req_id] = result
 
 
@@ -597,7 +597,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       processor = training_requests_processor_module.TrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
       await processor.run_once()
 
-    self.assertEqual([event[0] for event in events], ["acquire", "release", "set_future"])
+    self.assertEqual([event[0] for event in events], ["acquire", "release", "set_result"])
     self.assertEqual(store.results["req-a"]["type"], "model_created")
 
 
