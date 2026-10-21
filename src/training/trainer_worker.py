@@ -5,6 +5,7 @@ import os
 from typing import Any
 
 import torch
+from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
@@ -20,10 +21,23 @@ def shard_datum_indices(count: int, shard_rank: int, shard_count: int) -> list[i
   return list(range(shard_rank, count, shard_count))
 
 
+def chunk_target_logprobs(head: torch.nn.Module, softcap: float | None, hidden: torch.Tensor, target_token_ids: torch.Tensor) -> torch.Tensor:
+  """logit[target] - logsumexp(logits) for one chunk of positions."""
+  logits = head(hidden)
+  if softcap is not None:
+    logits = torch.tanh(logits / softcap) * softcap
+  # fp32 for an accurate logsumexp over a large vocab; this copy is only chunk-sized.
+  logits = logits.float()
+  return logits.gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
+
+
 class BaseTrainerWorker:
   # Whether backward runs collectives that every data-parallel rank must join
   # (FSDP). Such backends need equal pass counts across ranks.
   backward_runs_collectives = False
+  # Rows per output-head chunk in compute_target_logprobs. 1024 rows x a 262k
+  # vocab x fp32 is 1 GiB per live copy.
+  LOGPROB_CHUNK_TOKENS = 1024
 
   def __init__(self):
     self.tokenizer: PreTrainedTokenizerBase | None = None
@@ -270,10 +284,27 @@ class BaseTrainerWorker:
     attention_mask: torch.Tensor,
     target_token_ids: torch.Tensor,
   ) -> torch.Tensor:
-    """Return selected target logprobs with shape [batch, max_target_len]."""
-    outputs = model(input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
-    logits = outputs.logits[:, : target_token_ids.shape[1], :]
-    return torch.nn.functional.log_softmax(logits, dim=-1).gather(dim=-1, index=target_token_ids.unsqueeze(-1)).squeeze(-1)
+    """Return selected target logprobs with shape [batch, max_target_len].
+
+    The model returns its final hidden states instead of logits for every
+    position. The output head and logsumexp then run on LOGPROB_CHUNK_TOKENS
+    positions at a time under activation checkpointing, so the full
+    [tokens x vocab] logits are never held at once and loss memory scales with
+    the chunk size instead of the batch.
+    """
+    batch_size, target_len = target_token_ids.shape
+    outputs = model(input_ids, attention_mask=attention_mask, use_cache=False, logits_to_keep=1, output_hidden_states=True, return_dict=True)
+    hidden = outputs.hidden_states[-1][:, :target_len].reshape(batch_size * target_len, -1)
+    targets = target_token_ids.reshape(-1)
+    head = model.get_output_embeddings()
+    # Gemma caps its logits after the output head; other models leave this unset.
+    softcap = getattr(model.config.get_text_config(), "final_logit_softcapping", None)
+    size = self.LOGPROB_CHUNK_TOKENS
+    chunks = [
+      checkpoint(chunk_target_logprobs, head, softcap, hidden[start : start + size], targets[start : start + size], use_reentrant=False)
+      for start in range(0, hidden.shape[0], size)
+    ]
+    return torch.cat(chunks).reshape(batch_size, target_len)
 
   def generate(
     self,
