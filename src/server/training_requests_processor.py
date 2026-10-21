@@ -204,7 +204,7 @@ class TrainingRequestsProcessor:
   async def publish_result(self, request_id: str | None, result: dict[str, Any]) -> None:
     # Only rank 0 writes to the store; the other ranks computed the same result.
     if request_id is not None and is_primary():
-      await self.store.set_future(request_id, result)
+      await self.store.set_result(request_id, result)
 
   async def run_once(self) -> None:
     batch = await self.next_batch()

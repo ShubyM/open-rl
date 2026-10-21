@@ -257,11 +257,11 @@ class ProtobufWireTest(unittest.TestCase):
     from server.proto import tinker_public_pb2 as pb
 
     asyncio.run(
-      api_server.store.set_future(
+      api_server.store.set_result(
         "samp-1", {"type": "sample_completed", "sequences": [{"tokens": [1, 2], "logprobs": [-0.5, -1.0], "stop_reason": "stop"}]}
       )
     )
-    asyncio.run(api_server.store.set_future("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
+    asyncio.run(api_server.store.set_result("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
 
     as_json = self.client.post("/api/v1/retrieve_future", json={"request_id": "samp-1"})
     self.assertEqual(as_json.status_code, 200)

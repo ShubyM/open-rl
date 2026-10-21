@@ -1,4 +1,4 @@
-"""Sends one sampling pool's pending records through its router, Envoy in front of the llm-d EPP, and commits the first result."""
+"""Sends one sampling pool's pending records through its router, Envoy in front of the llm-d EPP, and saves the first result for each."""
 
 import asyncio
 import contextlib
@@ -64,7 +64,7 @@ class Dispatcher:
   def __init__(self, store: SamplingStore, pool: str, http: httpx.AsyncClient, router: str | None, urls: list[str], concurrency: int) -> None:
     self.store, self.pool, self.http, self.router, self.urls, self.concurrency = store, pool, http, router, urls, concurrency
     self.revision, self.k8s = "", None
-    # This dispatcher is the pool's only committer, so it reads each record once and drops it on commit.
+    # This dispatcher is the pool's only reader, so it reads each record once and drops it when its result is saved.
     self.records: dict[str, dict[str, Any]] = {}
     self.newest = "0-0"
     self.in_flight: dict[str, asyncio.Task] = {}
@@ -99,7 +99,7 @@ class Dispatcher:
     for r in list(self.records.values()):
       if (waited := time.time() - accepted_at(r)) > SAMPLE_DEADLINE_SECONDS:
         logger.warning("Failing %s after %.0fs without a result", r["request_id"], waited)
-        await self.commit(r, failed(f"No sampler answered in {waited:.0f}s; pool {self.pool} serves {self.revision or 'base weights'}"))
+        await self.set_result(r, failed(f"No sampler answered in {waited:.0f}s; pool {self.pool} serves {self.revision or 'base weights'}"))
         # A send still waiting on a replica that never answers would keep its slot forever.
         if task := self.in_flight.get(r["request_id"]):
           task.cancel()
@@ -117,14 +117,14 @@ class Dispatcher:
       if self.revision and isinstance(version, str) and version != target and url not in self.loading:
         self.loading[url] = asyncio.create_task(self.load_weights(url, self.revision))
     if target in versions:
-      # Read after the awaits above, so a request that committed meanwhile is not sent again.
+      # Read after the awaits above, so a request whose result was saved meanwhile is not sent again.
       to_send = [r for r in self.records.values() if r["revision"] == self.revision and r["request_id"] not in self.in_flight]
       for r in to_send[: self.concurrency - len(self.in_flight)]:
         self.in_flight[r["request_id"]] = task = asyncio.create_task(self.send(r))
         task.add_done_callback(lambda _, request_id=r["request_id"]: self.in_flight.pop(request_id))
 
-  async def commit(self, r: dict[str, Any], result: dict[str, Any]) -> None:
-    await self.store.commit(r, result)
+  async def set_result(self, r: dict[str, Any], result: dict[str, Any]) -> None:
+    await self.store.set_result(r, result)
     self.records.pop(r["entry_id"], None)
 
   async def send(self, r: dict[str, Any]) -> None:
@@ -141,13 +141,13 @@ class Dispatcher:
       # Envoy names the replica that answered. Its weights must still be the target, with no pause to load others since this was sent.
       replica = f"http://{name}" if (name := response.headers.get("x-openrl-upstream")) else url
       if response.status_code in (400, 404, 422):
-        await self.commit(r, failed(f"Sampler rejected the request ({response.status_code}): {response.text[:500]}"))
+        await self.set_result(r, failed(f"Sampler rejected the request ({response.status_code}): {response.text[:500]}"))
       elif response.status_code == 200 and await self.weight_version(replica) == target and self.paused.get(replica, 0.0) < sent:
         try:
           result = to_result(response.json(), r)
         except (KeyError, TypeError, ValueError) as exc:
           result = failed(f"Sampler response broke the contract: {exc!r}")
-        await self.commit(r, result)
+        await self.set_result(r, result)
     except httpx.HTTPError as exc:
       logger.info("Retrying %s after %r", r["request_id"], exc)
 
@@ -156,7 +156,7 @@ class Dispatcher:
       if not (path := Path(revision, "metadata.json")).is_file():
         # Retention can delete a revision between the API server's check and its pin.
         for r in [r for r in self.records.values() if r["revision"] == revision]:
-          await self.commit(r, failed(f"Sampler weights {revision} no longer exist"))
+          await self.set_result(r, failed(f"Sampler weights {revision} no longer exist"))
         return
       metadata, current = json.loads(path.read_text()), await self.weight_version(url)
       # A delta applies on any save at the weights it starts from or reaches. Deltas written before the trainer listed them name one parent.
@@ -242,8 +242,8 @@ class Dispatcher:
 
 
 def redis_client(url: str) -> redis.Redis:
-  """When replicas come up, every in-flight send commits at once. Past max_connections a
-  commit waits for a free connection; redis-py's default pool of 100 raises instead."""
+  """When replicas come up, every in-flight send saves its result at once. Past max_connections a
+  save waits for a free connection; redis-py's default pool of 100 raises instead."""
   return redis.Redis.from_pool(redis.BlockingConnectionPool.from_url(url, decode_responses=True, max_connections=64, timeout=30))
 
 
