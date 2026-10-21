@@ -355,7 +355,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(len(self.api.created), 2)
 
   def test_ensure_says_why_it_waits_for_a_released_pools_dispatcher(self) -> None:
-    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "exclusive": True})
     self.k8s.objects[("deployment", "sampler-fft-job")] = {"metadata": {"name": "sampler-fft-job"}}
     terminating = SimpleNamespace(metadata=SimpleNamespace(deletion_timestamp="2026-10-18T00:00:00Z"))
     self.k8s.read_namespaced_deployment = lambda name, namespace: terminating
@@ -413,7 +413,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
 
   def test_a_pool_replica_takes_ninety_percent_of_its_gpu_unless_the_env_says_otherwise(self) -> None:
     # vLLM's own 0.92 has run FFT delta applies out of memory on an L4. Its batch limits follow the device it lands on.
-    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "exclusive": True})
     with patch("server.worker_manager.get_state_store", return_value=s), patch.dict(os.environ):
       os.environ.pop("VLLM_GPU_MEMORY_UTILIZATION", None)
       default = pod_template(describe_worker("fft-job", "sampler"))["spec"]["containers"][0]["args"]
@@ -425,7 +425,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
   def test_without_open_rl_tmp_dir_the_probe_reads_the_revision_file_the_dispatcher_writes(self) -> None:
     # The API server renders the probe's path itself, and the dispatcher writes under the OPEN_RL_TMP_DIR its pod gets.
     os.environ.pop("OPEN_RL_TMP_DIR")
-    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "exclusive": True})
     with patch("server.worker_manager.get_state_store", return_value=s):
       worker = describe_worker("fft-job", "sampler")
     probe = pod_template(worker)["spec"]["containers"][0]["readinessProbe"]["exec"]["command"][2]
@@ -435,7 +435,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertIn(f"open({str(written)!r})", probe)
 
   def test_a_pool_is_vllm_samplers_ready_on_the_expected_version_behind_one_routed_cpu_pod_until_released(self) -> None:
-    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full"})
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "exclusive": True})
     k8s = FakeApi()
     manager = SchedulerWorkerManager(custom_api=self.api, apps_api=k8s, networking_api=k8s)
     with patch("server.worker_manager.get_state_store", return_value=s):
@@ -464,6 +464,21 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual((policy["podSelector"]["matchLabels"], policy["ingress"][0]["ports"]), (labels, [{"port": 8000}, {"port": 5557}]))
     self.assertEqual(manager.release_owner("fft-job"), {"fft-job"})
     self.assertEqual((k8s.objects, self.api.existing), ({}, {}))
+
+  def test_an_fft_sampler_on_its_trainers_gpu_serves_its_pool_itself(self) -> None:
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "sampler_replicas": 3})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("fft-job", "sampler")
+    # One replica, seated on the trainer's GPU, and nothing routes to it.
+    (sampler,) = self.api.created
+    container = sampler["spec"]["template"]["spec"]["containers"][0]
+    self.assertEqual(
+      (sampler["spec"]["exclusive"], container["command"][-1], container["args"]), (False, "server.vllm_sampler", ["--pool", "sampler-fft-job"])
+    )
+    self.assertNotIn("OPEN_RL_TIME_SLICING", {e["name"] for e in container["env"]})
+    self.assertEqual(self.k8s.objects, {})
+    self.assertEqual(self.manager.release_owner("fft-job"), {"fft-job"})
+    self.assertEqual(self.api.existing, {})
 
 
 class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):

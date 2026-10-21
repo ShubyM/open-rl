@@ -87,6 +87,11 @@ class Worker:
   pool: str | None = None
 
   @property
+  def time_sliced(self) -> bool:
+    """A sampler that shares its GPU with its trainer. It serves its pool itself, with vLLM in its own process."""
+    return self.role == "sampler" and not self.exclusive
+
+  @property
   def owner(self) -> str:
     return owner_id(self.runtime)
 
@@ -101,7 +106,8 @@ def replicas_of(model_id: str, role: str) -> int:
   if role != "sampler":
     return 1
   meta, _, _ = runtime_of(model_id)
-  return meta.sampler_replicas
+  # A sampler on its trainer's GPU is the pool's only reader, and only one fits beside the trainer.
+  return 1 if meta.shares_gpu() else meta.sampler_replicas
 
 
 def pool_labels(component: str, pool: str) -> dict[str, str]:
@@ -116,8 +122,7 @@ def describe_worker(model_id: str, role: str) -> Worker:
   meta, runtime, is_lora = runtime_of(model_id)
   base_model = base_model_of(meta, runtime)
   pool = meta.pool(runtime) if role == "sampler" else None
-  # A pool sampler keeps its GPUs between batches; nothing time-slices it.
-  exclusive = not meta.shares_gpu() or role == "sampler"
+  exclusive = not meta.shares_gpu()
   devices = meta.trainer_gpus if role == "trainer" else 1
   size = footprint(base_model, meta.fine_tuning_type, role)
   # Each torchrun rank is its own process with its own host memory.
@@ -200,9 +205,14 @@ def pod_template(worker: Worker) -> dict[str, Any]:
     template["spec"]["containers"][0]["volumeMounts"].append({"name": "dshm", "mountPath": "/dev/shm"})
     template["spec"]["volumes"].append({"name": "dshm", "emptyDir": {"medium": "Memory"}})
 
+  container = template["spec"]["containers"][0]
+  if worker.time_sliced:
+    container["command"] = ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"]
+    container["args"] = ["--pool", worker.pool]
+    container["readinessProbe"] = {"exec": {"command": ["test", "-f", "/tmp/open-rl-sampler-ready"]}, "periodSeconds": 2}
+    template["metadata"] = {"labels": pool_labels("sampler", worker.pool)}
   # A pool sampler is plain `vllm serve`, ready only while it serves the version the pool's dispatcher expects.
-  if worker.pool:
-    container = template["spec"]["containers"][0]
+  elif worker.pool:
     container["command"] = ["uv", "run", "vllm", "serve"]
     # The pool's EPP subscribes to these events at llm-d's default port and topic prefix; the topic names the pod and the served model.
     kv_events = {"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": "tcp://*:5557", "topic": f"kv@$(POD_IP):8000@{worker.base_model}"}
@@ -309,7 +319,9 @@ def accelerator_spec(worker: Worker) -> dict[str, Any]:
 
 
 def workload_body(worker: Worker) -> dict[str, Any]:
-  labels = {"app.kubernetes.io/managed-by": "open-rl-api-server", **(pool_labels("sampler", worker.pool) if worker.pool else {})}
+  # A pool label marks a Workload whose pool has a dispatcher, which release_owner deletes with it.
+  routed = worker.pool and not worker.time_sliced
+  labels = {"app.kubernetes.io/managed-by": "open-rl-api-server", **(pool_labels("sampler", worker.pool) if routed else {})}
   return {
     "apiVersion": f"{GROUP}/{VERSION}",
     "kind": "Workload",
@@ -352,7 +364,7 @@ class SchedulerWorkerManager:
       snapshot_root().mkdir(parents=True, exist_ok=True)
     for index in range(replicas_of(model_id, role)):
       self.ensure_workload(dataclasses.replace(worker, index=index))
-    if worker.pool:
+    if worker.pool and not worker.time_sliced:
       self.ensure_dispatcher(worker.pool)
 
   def ensure_dispatcher(self, pool: str) -> None:

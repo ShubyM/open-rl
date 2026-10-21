@@ -209,8 +209,9 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"], "trainers")
 
   async def test_local_sampler_is_vllm_serve_and_its_dispatcher_each_in_its_own_process_group(self) -> None:
+    base = {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}
     with (
-      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}, clear=True),
+      patch.dict("os.environ", {**base, "OPEN_RL_TIME_SLICING": "off"}, clear=True),
       patch("server.worker_manager.subprocess.Popen") as popen,
     ):
       manager = LocalWorkerManager()
@@ -221,6 +222,16 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual((serve[serve.index("serve") + 1], serve_kwargs["env"]["OPEN_RL_ENABLE_FFT"]), ("Model_A.1", "true"))
     self.assertNotIn("OPEN_RL_TIME_SLICE_JOB_ID", serve_kwargs["env"])
     self.assertEqual(dispatch[-1], "server.sampling_dispatcher")
+
+  async def test_a_local_fft_sampler_on_the_trainers_gpu_serves_its_pool_itself_in_the_trainers_claim(self) -> None:
+    with (
+      patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379", "SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}, clear=True),
+      patch("server.worker_manager.subprocess.Popen") as popen,
+    ):
+      LocalWorkerManager().ensure("fft-job", "sampler")
+    ((command, kwargs),) = [(c[0][0], c[1]) for c in popen.call_args_list]
+    self.assertEqual(command[command.index("-m") + 1 :], ["server.vllm_sampler", "--pool", "sampler-fft-job"])
+    self.assertEqual((kwargs["env"]["OPEN_RL_TIME_SLICE_JOB_ID"], kwargs["env"]["OPEN_RL_TIME_SLICE_GROUP"]), ("sampler-fft-job", "trainers"))
 
   async def test_launch_fetches_metadata_from_store(self) -> None:
     import json
@@ -411,6 +422,7 @@ class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):
       base_model="Qwen/Qwen2.5-0.5B",
       created_at=100.0,
       fine_tuning_type="full",
+      exclusive=True,
     )
 
     self.manager.ensure("model-fft-1", "sampler")
@@ -448,7 +460,9 @@ class LocalPoolProcessTest(unittest.TestCase):
   def test_with_the_documented_local_env_the_dispatcher_runs_and_keeps_its_revision_under_the_default_tmp_dir(self) -> None:
     # docs/setup/local-setup.md starts the server with REDIS_URL set and OPEN_RL_TMP_DIR unset.
     env = {name: value for name, value in os.environ.items() if name != "OPEN_RL_TMP_DIR"}
-    self.enterContext(patch.dict(os.environ, {**env, "REDIS_URL": TEST_REDIS_URL, "OPEN_RL_ENABLE_FFT": "true"}, clear=True))
+    self.enterContext(
+      patch.dict(os.environ, {**env, "REDIS_URL": TEST_REDIS_URL, "OPEN_RL_ENABLE_FFT": "true", "OPEN_RL_TIME_SLICING": "off"}, clear=True)
+    )
     spawned, model_id = {}, f"pool-{uuid.uuid4().hex[:8]}"
     self.enterContext(patch.object(LocalWorkerManager, "spawn", stand_in_spawn(spawned)))
     revision = Path("/tmp/open-rl/sampling", f"sampler-{model_id}", "revision")
@@ -485,7 +499,9 @@ class LocalPoolProcessTest(unittest.TestCase):
 
   def test_ensure_restarts_a_dead_dispatcher_and_stops_a_live_one_before_it_starts_a_new_pair(self) -> None:
     tmp = self.enterContext(tempfile.TemporaryDirectory())
-    self.enterContext(patch.dict(os.environ, {"REDIS_URL": TEST_REDIS_URL, "OPEN_RL_TMP_DIR": tmp, "OPEN_RL_ENABLE_FFT": "true"}))
+    self.enterContext(
+      patch.dict(os.environ, {"REDIS_URL": TEST_REDIS_URL, "OPEN_RL_TMP_DIR": tmp, "OPEN_RL_ENABLE_FFT": "true", "OPEN_RL_TIME_SLICING": "off"})
+    )
     stand_ins = {"sampler": ["sleep", "300"], "dispatcher": [sys.executable, "-c", "import sys; sys.exit(1)"]}
     original = LocalWorkerManager.spawn
 

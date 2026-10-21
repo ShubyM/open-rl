@@ -1,7 +1,8 @@
 """Serves one sampling pool's pending records with a sampler and saves the first result for each.
 
-The sampler loads a revision with ensure_weights and answers a record with generate. HttpSampler sends through the
-pool's router, Envoy in front of the llm-d EPP, to its vllm serve replicas."""
+The sampler is either vLLM in this process (vllm_sampler.Sampler), for a pool of one replica, or HttpSampler, which
+sends through the pool's router, Envoy in front of the llm-d EPP, to its vllm serve replicas. A replica that shares
+its GPU with its trainer takes a time-slicer turn around each batch it runs."""
 
 import asyncio
 import contextlib
@@ -12,12 +13,15 @@ import random
 import signal
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import httpx
 import redis.asyncio as redis
 
+from accel_timeslicer.time_slicer import TimeSlicerClient
+from accel_timeslicer.workload import WorkloadRef
 from server.sampling_store import SamplingStore
 
 logger = logging.getLogger(__name__)
@@ -58,6 +62,22 @@ def delta_applies(revision: str, current: str) -> bool:
   return metadata.get("format") != "sparse_delta" or current in bases
 
 
+@asynccontextmanager
+async def holding_gpu(time_slicer: TimeSlicerClient | None, workload: WorkloadRef | None, sampler: Any = None):
+  """Hold the time-slicer turn for the body, waking the sampler inside it. Without a slicer the GPU is ours."""
+  if time_slicer is None:
+    yield
+    return
+  async with time_slicer.acquire(workload):
+    if sampler is not None:
+      await sampler.wake()
+    try:
+      yield
+    finally:
+      if sampler is not None:
+        await sampler.sleep()
+
+
 def to_result(body: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
   """The old sampler's result shape, from a vLLM /inference/v1/generate response."""
   logprobs = [[e["logprob"] for e in c["logprobs"]["content"]] for c in body["choices"]]
@@ -70,10 +90,20 @@ def to_result(body: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
 
 
 class Dispatcher:
-  """Serves `pool` with `sampler`, which loads a revision with ensure_weights and answers a record with generate."""
+  """Serves `pool` with `sampler`, which loads a revision with ensure_weights and answers a record with generate. With a
+  time slicer every batch runs inside one GPU turn, so the sampler shares its GPU with the trainer."""
 
-  def __init__(self, store: SamplingStore, pool: str, sampler: Any, concurrency: int) -> None:
+  def __init__(
+    self,
+    store: SamplingStore,
+    pool: str,
+    sampler: Any,
+    concurrency: int,
+    time_slicer: TimeSlicerClient | None = None,
+    workload: WorkloadRef | None = None,
+  ) -> None:
     self.store, self.pool, self.sampler, self.concurrency = store, pool, sampler, concurrency
+    self.time_slicer, self.workload = time_slicer, workload
     self.revision = ""
     # This dispatcher is the pool's only reader, so it reads each record once and drops it when its result is saved.
     self.records: dict[str, dict[str, Any]] = {}
@@ -96,6 +126,13 @@ class Dispatcher:
 
   async def dispatch(self) -> None:
     await self.read()
+    if self.time_slicer is not None:
+      if self.to_send():
+        async with holding_gpu(self.time_slicer, self.workload, self.sampler):
+          await self.read()  # requests that arrived while the turn was pending join it
+          if await self.sampler.ensure_weights(self.revision):
+            await asyncio.gather(*(self.send(r) for r in self.to_send()[: self.concurrency]))
+      return
     if await self.sampler.ensure_weights(self.revision):
       # Read after the await above, so a request whose result was saved meanwhile is not sent again.
       for r in self.to_send()[: self.concurrency - len(self.in_flight)]:

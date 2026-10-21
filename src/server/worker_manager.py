@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+from accel_timeslicer.time_slicer import time_slicing_enabled
 from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.estimator import footprint
 from server.lora_snapshots import snapshot_root
@@ -188,7 +189,7 @@ class LocalWorkerManager:
       proc = self.processes.get((role, runtime))
       if proc is not None and proc.poll() is None:
         dispatcher = self.processes.get(("dispatcher", runtime))
-        if role == "sampler" and (dispatcher is None or dispatcher.poll() is not None):
+        if role == "sampler" and runtime in self.dispatchers and (dispatcher is None or dispatcher.poll() is not None):
           # A pool without its dispatcher answers nothing, so a dead one starts again against the running vLLM.
           self.spawn("dispatcher", runtime, *self.dispatchers[runtime])
         return
@@ -201,6 +202,15 @@ class LocalWorkerManager:
         env["OPEN_RL_TIME_SLICE_JOB_ID"] = workload_job_id(role, runtime)
         env["OPEN_RL_TIME_SLICE_GROUP"] = TRAINER_TIME_SLICE_GROUP
         self.spawn(role, runtime, python_command(["gpu"], worker_module(role), worker_args(runtime, role, is_lora)), env)
+        return
+      # The pool's stream and the revision files live under the same root the API server uses.
+      env["OPEN_RL_TMP_DIR"] = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+      if meta.shares_gpu() and time_slicing_enabled():
+        # The sampler takes turns on the one GPU with its trainer, so it is in the trainer's claim, and it serves
+        # its pool itself with vLLM in its own process.
+        env["OPEN_RL_TIME_SLICE_JOB_ID"] = workload_job_id(role, runtime)
+        env["OPEN_RL_TIME_SLICE_GROUP"] = TRAINER_TIME_SLICE_GROUP
+        self.spawn(role, runtime, python_command(["gpu", "vllm"], "server.vllm_sampler", ["--pool", meta.pool(runtime)]), env)
         return
       # A local pool is one vllm serve replica and the dispatcher that sends to it directly. The dispatcher of a vLLM
       # that died is stopped before a new pair starts, so two dispatchers never read one stream.
@@ -220,8 +230,7 @@ class LocalWorkerManager:
         snapshot_root().mkdir(parents=True, exist_ok=True)
       self.spawn(role, runtime, [*vllm, "serve", *serve_args(base_model, is_lora, env, port)], env)
       dispatcher_env = {**os.environ, "OPEN_RL_SAMPLER_POOL": meta.pool(runtime), "OPEN_RL_SAMPLER_ENDPOINTS": f"http://127.0.0.1:{port}"}
-      # The dispatcher keeps the pool's revision file under the same root the API server uses.
-      dispatcher_env["OPEN_RL_TMP_DIR"] = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+      dispatcher_env["OPEN_RL_TMP_DIR"] = env["OPEN_RL_TMP_DIR"]
       self.dispatchers[runtime] = (python_command([], "server.sampling_dispatcher", []), dispatcher_env)
       self.spawn("dispatcher", runtime, *self.dispatchers[runtime])
 
