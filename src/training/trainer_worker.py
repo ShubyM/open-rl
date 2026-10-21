@@ -13,6 +13,10 @@ from training.types import Datum
 
 # Position marker for a filler pass, see _run_batches.
 FILLER_DATUM_INDEX = -1
+# Largest share of a training pass that may be padding. Every sequence in a
+# pass is padded to the longest one, so a long sequence added to short ones
+# multiplies the work.
+MAX_PADDING_SHARE = 0.25
 
 
 def shard_datum_indices(count: int, shard_rank: int, shard_count: int) -> list[int]:
@@ -195,20 +199,25 @@ class BaseTrainerWorker:
     batches: list[list[tuple[int, Datum]]] = []
     batch: list[tuple[int, Datum]] = []
     batch_max_len = 0
+    batch_tokens = 0
 
     for item in ordered_data:
       length = len(item[1].model_input)
       next_max_len = max(batch_max_len, length)
       next_size = len(batch) + 1
-      over_token_budget = next_max_len * next_size > token_budget
+      next_padded_tokens = next_max_len * next_size
+      over_token_budget = next_padded_tokens > token_budget
+      over_padding = next_padded_tokens - (batch_tokens + length) > MAX_PADDING_SHARE * next_padded_tokens
 
-      if batch and over_token_budget:
+      if batch and (over_token_budget or over_padding):
         batches.append(batch)
         batch = []
         batch_max_len = 0
+        batch_tokens = 0
 
       batch.append(item)
       batch_max_len = max(batch_max_len, length)
+      batch_tokens += length
 
     if batch:
       batches.append(batch)
