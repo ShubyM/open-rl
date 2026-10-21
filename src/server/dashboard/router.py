@@ -14,8 +14,8 @@ from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
 from server import telemetry
-from server.dashboard import collector, inspection, metrics, sources
-from server.dashboard.schema import Activity, CollectorMetrics, History, Inventory, Logs, Operation, PodLogs, Series
+from server.dashboard import collector, inspection, metrics, queries, sources
+from server.dashboard.schema import Activity, CollectorMetrics, Commands, History, Inventory, Logs, Operation, PodLogs, QueryResult, Series, Steps
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.model_metadata import decode_model_metadata
 from server.store import get_state_store
@@ -224,6 +224,67 @@ async def series(
   if records.get("error") and run_id:
     result["samplers_reason"] = result.get("samplers_reason") or f"{records['error']}; samplers that are gone are not shown"
   return result
+
+
+@router.get("/api/v1/inspect/query", operation_id="query", response_model=QueryResult, response_model_exclude_unset=True)
+async def query(
+  name: Annotated[str, Query(description="One of the named queries; an unknown name lists them")],
+  run_id: str | None = None,
+  node_id: str | None = None,
+  since: TimeBound = None,
+  until: TimeBound = None,
+  points: int = Query(300, ge=1, le=1000),
+):
+  """A named PromQL query over a run's GPUs and samplers, or a node's GPUs, at `points` resolution.
+  points=1 evaluates once over the whole window, which is how a duty cycle is one number per GPU."""
+  if name not in queries.QUERIES:
+    raise HTTPException(400, f"Unknown query; use one of {sorted(queries.QUERIES)}")
+  if not (run_id or node_id):
+    raise HTTPException(400, "Name a run_id or a node_id")
+  validate_bounds(since, until)
+  await sources.discover()
+  state = await snapshot.current(get_state_store())
+  run = next((r for r in state["runs"] if r["run_id"] == run_id), None) if run_id else None
+  records = await read_operations(run_id, is_finished(run)) if run_id else {"samples": []}
+  return await queries.run(name, state, run_id, node_id, records["samples"], since, until or state["observed_at"], points)
+
+
+@router.get("/api/v1/inspect/runs/{run_id}/commands", operation_id="commands", response_model=Commands, response_model_exclude_unset=True)
+async def commands(
+  run_id: str,
+  since: TimeBound = None,
+  until: TimeBound = None,
+  role: Literal["trainer", "sampler"] | None = None,
+  limit: int = Query(100, ge=1, le=5000),
+):
+  """The run's command records in the window, newest first."""
+  validate_bounds(since, until)
+  state = await snapshot.current(get_state_store())
+  _, _, low, high = time_range(since, until or state["observed_at"])
+  run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
+  records = await read_operations(run_id, is_finished(run))
+  matched = [s for s in records["samples"] if low <= s["at"] <= high and (role is None or (s.get("role") == "sampler") == (role == "sampler"))]
+  matched.sort(key=lambda s: s["at"], reverse=True)
+  extra = {k: records[k] for k in ("error", "partial") if records.get(k)}
+  return {"run_id": run_id, "commands": matched[:limit], "truncated": len(matched) > limit, **extra}
+
+
+@router.get("/api/v1/inspect/runs/{run_id}/steps", operation_id="steps", response_model=Steps, response_model_exclude_unset=True)
+async def steps(
+  run_id: str,
+  last: int = Query(20, ge=1, le=1000),
+  fields: Annotated[str | None, Query(description="Comma-separated prefixes of client metrics to keep, e.g. env/all/reward")] = None,
+):
+  """The run's last `last` steps: each step's window and trainer ops, with the client's metrics where stored."""
+  state = await snapshot.current(get_state_store())
+  run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
+  records = await read_operations(run_id, is_finished(run))
+  found = inspection.steps(records["samples"])[-last:]
+  client = {row["step"]: row["metrics"] for row in (await history(run_id))["rows"]}
+  keep = tuple(p for p in (fields or "").split(",") if p)
+  for step in found:
+    step["client"] = {k: v for k, v in client.get(step["step"], {}).items() if not keep or k.startswith(keep)}
+  return {"run_id": run_id, "steps": found, **({"error": records["error"]} if records.get("error") else {})}
 
 
 # Client step history that gateways kept before OpenTelemetry; read only, nothing writes it now.

@@ -221,3 +221,21 @@ class InspectionActivityTest(unittest.TestCase):
       self.assertFalse(lane["exact"])
       self.assertTrue(all(120 <= low < high <= 190 for low, high in lane["intervals"]))
       self.assertTrue(all(a[1] < b[0] for a, b in zip(lane["intervals"], lane["intervals"][1:])))
+
+
+class StepsTest(unittest.TestCase):
+  def test_steps_group_trainer_ops_by_stamped_step_and_derive_it_for_older_records(self):
+    def op(at, operation, step=None, **fields):
+      return {"at": at, "started_at": at - 1, "operation": operation, "status": "succeeded", "elapsed_seconds": 1.0, "metrics": {}, **fields} | (
+        {"step": step} if step is not None else {}
+      )
+
+    older = [op(10, "forward_backward", metrics={"loss": 2.0}), op(11, "optim_step"), op(20, "forward_backward", metrics={"loss": 4.0})]
+    stamped = [op(30, "forward_backward", step=7, metrics={"loss": 1.0}), op(31, "optim_step", step=7, nonfinite=["grad_norm"])]
+    sample = {**op(15, "sample"), "role": "sampler"}
+    found = inspection.steps([*stamped, sample, *older])
+    self.assertEqual([s["step"] for s in found], [0, 1, 7])
+    self.assertEqual(found[0]["ops"]["forward_backward"]["metrics"]["loss"], {"min": 2.0, "max": 2.0, "mean": 2.0})
+    self.assertEqual((found[0]["started_at"], found[0]["ended_at"]), (9, 11))
+    self.assertEqual(found[2]["nonfinite"], ["grad_norm"])
+    self.assertNotIn("sample", {name for s in found for name in s["ops"]})

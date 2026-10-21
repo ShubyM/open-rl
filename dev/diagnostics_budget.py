@@ -33,7 +33,8 @@ def endpoints(run: str, since: str, until: str) -> dict[str, tuple[str, dict]]:
     "summary": (f"runs/{run}/summary", {}),
     "commands": (f"runs/{run}/commands", window),
     "steps": (f"runs/{run}/steps", {}),
-    "query run_gpu_busy": ("query", {"name": "run_gpu_busy", "run": run, "points": 1, **window}),
+    "steps reward": (f"runs/{run}/steps", {"fields": "env/all/reward"}),
+    "query gpu_busy": ("query", {"name": "gpu_busy", "run_id": run, "points": 1, **window}),
   }
 
 

@@ -97,7 +97,7 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | Route | Returns | Bound |
 |---|---|---|
 | `GET /query?name=&run=&node=&since=&until=&points=` | A named PromQL template from a server-side table (`run_gpu_util`, `run_gpu_busy`, `run_vllm_tokens`, `node_gpu_holders`, …), with `step = window / points` | `points` ≤ 1,000 per series |
-| `GET /logs/search?run=&q=&severity=&since=&until=` | Matching log lines with context; Cloud Logging's page token is the cursor | `limit` |
+| `GET /logs?run_id=&q=&severity=&pod=&since=&until=` | The existing log route already searches by text, severity and pod | `limit` |
 | `GET /runs/{id}/commands?since=&until=&role=` | Command records from Redis, raw | `limit` |
 | `GET /runs/{id}/steps?fields=&from=&to=` | Client step rows, raw | 50 steps per page |
 | `GET /runs/{id}/checks?only=` | Check results | About 4.7 KB for all 15 |

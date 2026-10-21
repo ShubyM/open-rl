@@ -293,6 +293,57 @@ class CollectorSeries(Record):
   points: list[tuple[float, float]]
 
 
+class QuerySeries(Record):
+  labels: dict[str, str]
+  points: list[list[float]] = Field(description="[unix seconds, value] pairs")
+
+
+class QueryResult(Record):
+  """A named query over a run's or node's GPUs or samplers. `query` is the PromQL that ran."""
+
+  name: str
+  since: str
+  until: str
+  query: str | None = None
+  source: str | None = None
+  series: list[QuerySeries] = Field(default_factory=list)
+  error: str | None = None
+
+
+class Commands(Record):
+  """A run's command records, newest first: every trainer op and every sample attempt the API took."""
+
+  run_id: str
+  commands: list[Operation]
+  truncated: bool = Field(False, description="More records matched than `limit`; narrow the window")
+  error: str | None = None
+  partial: str | None = None
+
+
+class StepOps(Record):
+  count: int
+  failed: int
+  seconds: float
+  metrics: dict[str, dict[str, float]] = Field(default_factory=dict, description="Per metric: min, max, mean over the step's ops")
+
+
+class Step(Record):
+  step: int
+  started_at: float
+  ended_at: float
+  ops: dict[str, StepOps]
+  nonfinite: list[str] = Field(default_factory=list)
+  client: dict[str, float] = Field(default_factory=dict, description="The client's metrics for this step, where stored")
+
+
+class Steps(Record):
+  """A run's steps from its trainer ops, oldest first, with the client's metrics where stored."""
+
+  run_id: str
+  steps: list[Step]
+  error: str | None = None
+
+
 class HistoryRow(Record):
   step: int
   metrics: dict[str, float]

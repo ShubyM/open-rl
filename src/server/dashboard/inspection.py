@@ -237,3 +237,27 @@ def lane_activity(lane: dict, start: float, end: float, operations: dict) -> dic
     "error": next(filter(None, errors), None),
     "partial": next(filter(None, partial), None),
   }
+
+
+def steps(samples: list[dict]) -> list[dict]:
+  """Trainer ops grouped by the step they belong to: the step's window, and per op its count, time and metric spread."""
+  found: dict[int, dict] = {}
+  completed = 0  # records from before ops carried their step count optim_steps instead
+  for s in sorted((s for s in samples if s.get("role") != "sampler"), key=lambda s: s["at"]):
+    number = s["step"] if isinstance(s.get("step"), int) else completed
+    completed += s["operation"] == "optim_step" and s.get("status") == "succeeded"
+    step = found.setdefault(number, {"step": number, "started_at": s["started_at"], "ended_at": s["at"], "ops": {}, "nonfinite": set()})
+    step["started_at"], step["ended_at"] = min(step["started_at"], s["started_at"]), max(step["ended_at"], s["at"])
+    op = step["ops"].setdefault(s["operation"], {"count": 0, "failed": 0, "seconds": 0.0, "metrics": {}})
+    op["count"] += 1
+    op["failed"] += s.get("status") != "succeeded"
+    op["seconds"] += s.get("elapsed_seconds", 0.0)
+    for name, value in s.get("metrics", {}).items():
+      spread = op["metrics"].setdefault(name, {"min": value, "max": value, "sum": 0.0})
+      spread.update(min=min(spread["min"], value), max=max(spread["max"], value), sum=spread["sum"] + value)
+    step["nonfinite"].update(s.get("nonfinite", ()))
+  for step in found.values():
+    step["nonfinite"] = sorted(step["nonfinite"])
+    for op in step["ops"].values():
+      op["metrics"] = {name: {"min": m["min"], "max": m["max"], "mean": m["sum"] / op["count"]} for name, m in op["metrics"].items()}
+  return [found[k] for k in sorted(found)]

@@ -438,11 +438,12 @@ class PromQL:
       headers.update(self.extra_headers())
     return headers
 
-  async def range_rows(self, query: str, start: float, end: float, *, limit: int | None = None) -> list[dict]:
-    """Prometheus matrix rows, labels kept for discovered application metrics."""
-    step = max(MIN_STEP_SECONDS, int((end - start) / MAX_POINTS))
+  async def range_rows(self, query: str, start: float, end: float, *, limit: int | None = None, points: int = MAX_POINTS) -> list[dict]:
+    """Prometheus matrix rows, labels kept for discovered application metrics. start == end evaluates once, at end."""
+    step = max(MIN_STEP_SECONDS, int((end - start) / points))
     # Samples land on multiples of step, so queries made at different moments share timestamps and add up sample by sample.
-    start -= start % step
+    if start < end:
+      start -= start % step
     if self.headers_task is None:  # share credential success or failure across this request's queries
       self.headers_task = asyncio.create_task(self.load_headers())
     params = {"query": query, "start": start, "end": end, "step": step, **({"limit": limit} if limit is not None else {})}
