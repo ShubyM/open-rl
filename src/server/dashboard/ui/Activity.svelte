@@ -48,7 +48,7 @@
     <div class="activity-timeline" aria-label="Recorded run activity">
       <div class="activity-header"><h3>{acrossNodes ? "Process" : "Run"}</h3>{#if acrossNodes}<h3>GPU</h3>{/if}<div class="activity-axis">{#each [0, 1, 2, 3, 4] as tick}<span>{axisTime(range.start + (range.now - range.start) * tick / 4, range)}</span>{/each}</div>{#if acrossNodes}<span class="node-duty" title="Duty cycle: mean GPU utilization (share of time a kernel was running) over this window, from DCGM">Duty</span>{/if}</div>
       {#each rows as { key, lane: p, device, first } (key)}
-        {@const name = acrossNodes ? processLabel(p, inventory.cluster.nodes) : p.label}
+        {@const name = acrossNodes ? processLabel(p, inventory.cluster.nodes, { gpus: false }) : p.label}
         {@const meta = acrossNodes ? p.node ? shortNodeName(p.node, inventory.cluster.nodes) : p.ended && p.pod ? p.pod : "Node unassigned" : p.role || "process"}
         {@const link = href(p)}
         {@const status = p.error ? "Ops unavailable" : !p.intervals.length ? "No recorded activity" : ""}

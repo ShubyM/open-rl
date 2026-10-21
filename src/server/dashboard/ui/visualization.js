@@ -20,12 +20,12 @@ export function activitySource(placements) {
   const source = placements.every((p) => p.exact) ? "GPU turns" : placements.some((p) => p.exact) ? "GPU turns and recorded operations" : "Recorded operations; may include GPU wait time";
   return `${source}. Gaps may include unrecorded activity.`;
 }
-export function processLabel(p, nodes) {
+export function processLabel(p, nodes, { gpus: named = true } = {}) {
   const node = nodes.find((n) => n.name === p.node), devices = p.devices.map((id) => node?.devices.find((d) => d.id === id));
   // A lane rebuilt from recorded ops has no known GPUs, which is not zero GPUs.
   const gpus = devices.length && devices.every(Boolean) ? `GPU${devices.length === 1 ? "" : "s"} ${devices.map((d) => deviceLabel(d.name)).join(", ")}` : p.device_count ? `${p.device_count} GPU${p.device_count === 1 ? "" : "s"}` : null;
   const role = p.role || "Process", accelerator = node && acceleratorLabel(node);
-  return [role[0].toUpperCase() + role.slice(1), accelerator === "GPU" ? null : accelerator, gpus].filter(Boolean).join(" · ");
+  return [role[0].toUpperCase() + role.slice(1), accelerator === "GPU" ? null : accelerator, named && gpus].filter(Boolean).join(" · ");
 }
 export const OP_ORDER = ["forward_backward", "forward", "optim_step", "sample", "init", "wake_up", "sleep", "weight_sync"];
 export const opRank = (name) => OP_ORDER.includes(name) ? OP_ORDER.indexOf(name) : OP_ORDER.length;
