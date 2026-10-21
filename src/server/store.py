@@ -32,22 +32,12 @@ class RequestStore(ABC):
     pass
 
   @abstractmethod
-  async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
-    """Push a sampling request into the queue for its model."""
-    pass
-
-  @abstractmethod
-  async def get_sampling_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    """Block until this model has at least 1 sampling request, then return all queued requests for it."""
-    pass
-
-  @abstractmethod
-  async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
+  async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     """Resolve a future by its request ID."""
     pass
 
   @abstractmethod
-  async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
+  async def get_result(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     """Block until the future resolves or the timeout is reached."""
     pass
 
@@ -61,7 +51,6 @@ class InMemoryStore(RequestStore):
     self.active_tenants_cv = asyncio.Condition()
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_cv = asyncio.Condition()
-    self.sampling_queues: dict[str, asyncio.Queue] = {}
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
@@ -112,31 +101,14 @@ class InMemoryStore(RequestStore):
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     raise RuntimeError("Per-model full fine-tuning workers require REDIS_URL; in-memory queues cannot be shared across processes")
 
-  async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
-    model_id = req_data.get("model_id", "default")
-    if model_id not in self.sampling_queues:
-      self.sampling_queues[model_id] = asyncio.Queue()
-    await self.sampling_queues[model_id].put(req_data)
-
-  async def get_sampling_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    if model_id not in self.sampling_queues:
-      return []
-    queue = self.sampling_queues[model_id]
-    if queue.empty():
-      return []
-    batch = [queue.get_nowait()]
-    while not queue.empty():
-      batch.append(queue.get_nowait())
-    return batch
-
-  async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
+  async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
       return
     async with self.futures_cv:
       self.futures_store[req_id] = result
       self.futures_cv.notify_all()
 
-  async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
+  async def get_result(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     async with self.futures_cv:
       try:
         await asyncio.wait_for(self.futures_cv.wait_for(lambda: req_id in self.futures_store), timeout=timeout)
@@ -234,18 +206,6 @@ class RedisStore(RequestStore):
 
     return batch
 
-  async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
-    model_id = req_data.get("model_id", "default")
-    queue_key = f"open_rl:sampler_queue:{model_id}"
-    await self.redis.rpush(queue_key, json.dumps(req_data))
-
-  async def get_sampling_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    queue_key = f"open_rl:sampler_queue:{model_id}"
-    try:
-      result = await self.redis.blpop(queue_key, timeout=5)
-    except RedisTimeoutError:
-      return []
-
     if not result:
       return []
 
@@ -259,7 +219,7 @@ class RedisStore(RequestStore):
 
     return batch
 
-  async def set_future(self, req_id: str, result: dict[str, Any]) -> None:
+  async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
       return
     key = f"open_rl:future:{req_id}"
@@ -270,7 +230,7 @@ class RedisStore(RequestStore):
       pipeline.expire(key, 300)
       await pipeline.execute()
 
-  async def get_future(self, req_id: str, timeout: float) -> dict[str, Any] | None:
+  async def get_result(self, req_id: str, timeout: float) -> dict[str, Any] | None:
     key = f"open_rl:future:{req_id}"
     deadline = time.monotonic() + timeout
     while True:

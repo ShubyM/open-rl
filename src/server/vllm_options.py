@@ -1,7 +1,9 @@
-"""Engine and sampling options shared by the two vLLM sampler workers."""
+"""Engine and sampling options for the vLLM samplers."""
 
+import json
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 
 def text_only_engine_kwargs() -> dict:
@@ -52,34 +54,47 @@ def gpu_memory_utilization() -> float:
   return 0.90
 
 
-def sampler_batch_limits(device_memory_bytes: int | None = None) -> dict[str, int]:
-  """vLLM's concurrency for this device: sequences in flight and prefill tokens per step.
+def sample_params(r: Mapping[str, Any]) -> dict[str, Any]:
+  """vLLM sampling params for a pool record, asking for the logprobs every result carries."""
+  return {**r["sampling_params"], "logprobs": 0, "prompt_logprobs": 0 if r["include_prompt_logprobs"] else None}
 
-  A sweep's sampler serves many groups at once, and the defaults (64
-  sequences, 2048 prefill tokens) leave most of an 80 GB card idle. Explicit
-  VLLM_MAX_NUM_SEQS / VLLM_MAX_NUM_BATCHED_TOKENS win; otherwise size by memory.
-  """
-  if device_memory_bytes is None:
-    device_memory_bytes = detected_device_memory_bytes()
-  gib = device_memory_bytes / 2**30
-  if gib >= 60:
-    seqs, tokens = 256, 16384
-  elif gib >= 36:
-    seqs, tokens = 128, 8192
+
+def sample_result(sequences: list[tuple[list[int], list[float], str]], prompt_logprobs: list[float | None] | None) -> dict[str, Any]:
+  """The result a pool saves for a record, from each sequence's tokens, logprobs and stop reason."""
+  result: dict[str, Any] = {"type": "sample", "sequences": [{"tokens": t, "logprobs": lp, "stop_reason": s} for t, lp, s in sequences]}
+  if prompt_logprobs is not None:
+    result["prompt_logprobs"] = prompt_logprobs
+  return result
+
+
+def engine_args(base_model: str, is_lora: bool, env: Mapping[str, str | None], sleep_mode: bool = False) -> dict[str, Any]:
+  """vLLM engine settings for a sampler, the same for a `vllm serve` replica and an engine in the sampler's process."""
+  args: dict[str, Any] = {"enable_prefix_caching": True}
+  # A checkpoint's generation_config.json could add sampling params the client never asked for, such as a repetition penalty.
+  args["generation_config"] = "vllm"
+  args["max_model_len"] = int(os.getenv("VLLM_MAX_MODEL_LEN", "8192"))
+  # vLLM's own default of 0.92 has run FFT delta applies out of memory on an L4.
+  args["gpu_memory_utilization"] = gpu_memory_utilization()
+  # These are set where the replica's device is unknown, so vLLM sizes the batch for the device it runs on unless told.
+  for name in ("VLLM_MAX_NUM_SEQS", "VLLM_MAX_NUM_BATCHED_TOKENS"):
+    if os.getenv(name):
+      args[name.removeprefix("VLLM_").lower()] = int(os.environ[name])
+  args.update(text_only_engine_kwargs())
+  if architecture := env.get("VLLM_ARCHITECTURE_OVERRIDE"):
+    args["hf_overrides"] = {"architectures": [architecture]}
+  if is_lora:
+    args.update(enable_lora=True, max_loras=int(os.getenv("VLLM_MAX_LORAS", "8")), max_lora_rank=int(os.getenv("VLLM_MAX_LORA_RANK", "64")))
   else:
-    seqs, tokens = 64, 4096
-  return {
-    "max_num_seqs": int(os.getenv("VLLM_MAX_NUM_SEQS", seqs)),
-    "max_num_batched_tokens": int(os.getenv("VLLM_MAX_NUM_BATCHED_TOKENS", tokens)),
-  }
+    args["weight_transfer_config"] = {"backend": "delta_snapshot"}
+  if sleep_mode:
+    args["enable_sleep_mode"] = True
+  return args
 
 
-def detected_device_memory_bytes() -> int:
-  try:
-    import torch
-
-    if torch.cuda.is_available():
-      return int(torch.cuda.get_device_properties(0).total_memory)
-  except Exception:
-    pass
-  return 0
+def serve_args(base_model: str, is_lora: bool, env: Mapping[str, str | None], port: int = 8000) -> list[str]:
+  """`vllm serve` flags for a sampling pool replica."""
+  args = [base_model, "--port", str(port), "--api-server-count", "1", "--enable-scale-out"]
+  for name, value in engine_args(base_model, is_lora, env).items():
+    flag = "--" + name.replace("_", "-")
+    args += [flag] if value is True else [flag, json.dumps(value) if isinstance(value, dict) else str(value)]
+  return args
