@@ -166,7 +166,7 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
   if run_id:
     result.update(
       run=run,
-      samples=[s for s in records[run_id]["samples"] if low <= s["at"] <= high],
+      samples=inspection.chart_samples(records[run_id]["samples"], low, high),
       error=records[run_id].get("error"),
       partial=records[run_id].get("partial"),
       incidents=sorted([*inspection.incidents(run, low, high), *await sdk_incidents(store, run_id, low, high)], key=lambda e: e["at"], reverse=True),

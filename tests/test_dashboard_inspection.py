@@ -171,6 +171,16 @@ class InspectionActivityTest(unittest.TestCase):
     recorded = inspection.activity(snapshot, 100, 220, {"r1": {"samples": samples}}, run_id="r1")["placements"][1]
     self.assertEqual((recorded["pod"], recorded["ended"], recorded["ops"]), ("deleted-sampler", True, {"sample": [[110, 120], [150, 160]]}))
 
+  def test_charts_get_every_trainer_op_and_the_slowest_sampler_request_per_bucket(self):
+    trainer = [operation(t, t + 5, metrics={"loss": 1.0}) for t in range(0, 1000, 10)]
+    sampler = [operation(t / 10, t / 10 + 0.05, role="sampler", operation="sample", elapsed_seconds=(t % 7) + 1.0) for t in range(10000)]
+    charted = inspection.chart_samples([*trainer, *sampler, operation(5000, 5001)], 0, 1000)
+    self.assertEqual(sum(s["role"] == "trainer" for s in charted), len(trainer))
+    slow = [s for s in charted if s["role"] == "sampler"]
+    self.assertLessEqual(len(slow), inspection.CHART_POINTS)
+    self.assertEqual(max(s["elapsed_seconds"] for s in slow), 7.0)
+    self.assertTrue(all(0 <= s["at"] <= 1000 for s in charted))
+
   def test_current_dispatcher_is_a_source_before_its_process_reports(self):
     pod = {"name": "pool-dispatcher", "uid": "d1", "node": "n1", "role": "dispatcher", "created_at": "1970-01-01T00:01:30Z"}
     snapshot = state(live=[], processes=[], runs=[{**RUN, "pods": [pod]}])

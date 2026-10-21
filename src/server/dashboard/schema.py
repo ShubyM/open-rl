@@ -208,7 +208,9 @@ class Activity(Record):
   since: str | None = Field(None, description="Resolved ISO query start; use the same window for series and logs")
   until: str | None = None
   run: Run | None = None
-  samples: list[Operation] = Field(default_factory=list)
+  samples: list[Operation] = Field(
+    default_factory=list, description="For charts: every non-sampler op, and the slowest sampler request per 1/1000 of the window"
+  )
   incidents: list[Incident] = Field(default_factory=list)
   error: str | None = None
   partial: str | None = None

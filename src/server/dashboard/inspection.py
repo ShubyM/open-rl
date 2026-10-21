@@ -158,6 +158,26 @@ def activity(state: dict, start: float, end: float, operations: dict, run_id=Non
   return {"placements": [lane_activity(p, start, end, operations) for p in lanes if p["start"] <= end and p["end"] >= start]}
 
 
+CHART_POINTS = 1000  # sampler requests per chart; a chart cannot show more apart
+
+
+def chart_samples(samples: list[dict], start: float, end: float) -> list[dict]:
+  """A run's op records for its charts: every trainer op, which carries the metrics, and the slowest sampler
+  request per time bucket, so a long run ships its peaks instead of tens of thousands of requests."""
+  keep = ("at", "started_at", "operation", "role", "status", "elapsed_seconds", "metrics", "nonfinite")
+  width = (end - start) / CHART_POINTS or 1
+  charted, slowest = [], {}
+  for sample in samples:
+    if start <= sample["at"] <= end:
+      sample = {k: sample[k] for k in keep if k in sample}
+      bucket = int((sample["at"] - start) / width)
+      if sample.get("role") != "sampler":
+        charted.append(sample)
+      elif sample.get("elapsed_seconds", 0) >= slowest.get(bucket, {}).get("elapsed_seconds", -1):
+        slowest[bucket] = sample
+  return sorted([*charted, *slowest.values()], key=lambda sample: sample["at"])
+
+
 def recorded_lanes(run_id: str, lanes: list[dict], samples: list[dict]) -> list[dict]:
   """A vllm serve replica keeps no process record, so once its pod is gone its lane
   comes from the ops the run recorded there, which name the pod."""
