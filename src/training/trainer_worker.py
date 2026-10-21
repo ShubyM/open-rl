@@ -192,8 +192,8 @@ class BaseTrainerWorker:
   # Share of the free device memory the automatic budget may fill.
   AUTO_TOKEN_BUDGET_MEMORY_SHARE = 0.5
   # Activation bytes per token as a multiple of one hidden vector per layer,
-  # which is what gradient checkpointing keeps. Measured 4.1x for gemma-4-E2B
-  # and 2.9x for Qwen3-0.6B with LoRA; the rest is margin.
+  # which is what gradient checkpointing keeps. The rest covers the layer being
+  # recomputed in backward, plus a margin.
   ACTIVATION_BYTES_FACTOR = 6
 
   def train_token_budget(self, model: PreTrainedModel) -> int:
