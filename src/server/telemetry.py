@@ -60,6 +60,16 @@ def ops_key(run_id: str) -> str:
   return f"open_rl:operations:{run_id}"
 
 
+def samples_key(run_id: str) -> str:
+  """Sample commands keep their own list, so a run's sampling never evicts its training ops."""
+  return f"open_rl:operations:{run_id}:samples"
+
+
+def ledger_key(run_id: str, event: str) -> str:
+  """Counts of a run's trainer requests by lifecycle event: enqueued, popped, answered."""
+  return f"open_rl:ledger:{run_id}:{event}"
+
+
 def steps_key(run_id: str) -> str:
   return f"open_rl:steps:{run_id}"
 
@@ -92,6 +102,7 @@ current: "Worker | None" = None  # this process's record while it serves
 writes: set[asyncio.Task] = set()  # in-flight writes, held so they are not collected mid-write
 op_metrics: ContextVar[dict | None] = ContextVar("op_metrics", default=None)
 warned: set[str] = set()
+steps_done: dict[str, int] = {}  # run id -> optim_steps it had completed, stamped on each of its trainer ops
 
 
 def warn_once(kind: str, message: str, *args) -> None:
@@ -122,6 +133,9 @@ def alive(record: dict, now: float) -> bool:
 
 
 def operation_name(request: dict, role: str) -> str:
+  # A forward-only call travels as forward_backward; its loss must not mix with training losses.
+  if request.get("forward_only"):
+    return "forward"
   return str(request.get("op") or ("sample" if role == "sampler" else "unknown"))
 
 
@@ -188,6 +202,7 @@ def popped(requests: list[dict]) -> None:
     for r in requests:
       if r.get("request_id"):
         current.outstanding[r["request_id"]] = {"op": operation_name(r, current.record["role"]), "run_id": run_of(r), "since": time.time()}
+        count("popped", run_of(r))
 
 
 class Answering:
@@ -201,8 +216,14 @@ class Answering:
 
   async def set_future(self, request_id: str, result: dict) -> None:
     await self.store.set_future(request_id, result)
-    if current is not None:
-      current.outstanding.pop(request_id, None)
+    if current is not None and (entry := current.outstanding.pop(request_id, None)):
+      count("answered", entry["run_id"])
+
+
+def count(event: str, run_id: str | None) -> None:
+  """One more request of this run reached `event`; a request enqueued but never popped shows up as a gap."""
+  if run_id:
+    write(get_state_store().increment(ledger_key(run_id, event), TTL_SECONDS))
 
 
 def write(coroutine: Coroutine) -> None:
@@ -229,6 +250,9 @@ def metrics(values: dict) -> None:
 
 async def observe_operation(request: dict, role: str, runtime_id: str | None, call: Callable[[], Awaitable[dict]]) -> dict:
   """Run one API op and record how it went; returns or raises exactly as the op does."""
+  if (run_id := run_of(request)) and run_id not in steps_done:
+    with suppress(Exception):
+      steps_done[run_id] = int(await get_state_store().get_value(steps_key(run_id)) or 0)
   started_at, status, error_type, result, collected = time.time(), "succeeded", None, {}, {}
   token = op_metrics.set(collected)
   try:
@@ -276,6 +300,8 @@ def record(
     **(worker_identity() if where is None else where),
     "metrics": {k: v for k, v in values.items() if math.isfinite(v)},
   }
+  if operation != "sample" and run_id in steps_done:
+    sample["step"] = steps_done[run_id]
   # JSON has no NaN or infinity; name them so a NaN grad norm is not just missing.
   if nonfinite := sorted(k for k, v in values.items() if not math.isfinite(v)):
     sample["nonfinite"] = nonfinite
@@ -283,9 +309,11 @@ def record(
     sample.update(trace_id=f"{span.trace_id:032x}", span_id=f"{span.span_id:016x}")
   with suppress(Exception):
     record_metrics(sample["metrics"], model_id=run_id if run_scoped else None, runtime_id=runtime_id, phase=operation)
-  write(get_state_store().append_sample(ops_key(run_id), sample, SAMPLE_LIMIT, TTL_SECONDS))
+  write(get_state_store().append_sample(samples_key(run_id) if operation == "sample" else ops_key(run_id), sample, SAMPLE_LIMIT, TTL_SECONDS))
   if operation == "optim_step" and status == "succeeded":
     write(get_state_store().increment(steps_key(run_id), TTL_SECONDS))
+    if run_id in steps_done:
+      steps_done[run_id] += 1
 
 
 @contextmanager

@@ -300,6 +300,15 @@ class ProtobufWireTest(unittest.TestCase):
     self.assertTrue(optim.headers["content-type"].startswith("application/json"))
     self.assertEqual(optim.json()["type"], "optim_step")
 
+  def test_a_nan_metric_reaches_the_client_as_json_it_can_parse(self) -> None:
+    # Workers now return the real value so telemetry can name it; the client keeps getting finite JSON.
+    asyncio.run(
+      api_server.store.set_future("optim-nan", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": float("nan"), "loss": float("-inf")}})
+    )
+    answer = self.client.post("/api/v1/retrieve_future", json={"request_id": "optim-nan"})
+    self.assertEqual(answer.status_code, 200, answer.text)
+    self.assertEqual(answer.json()["metrics"], {"grad_norm:mean": 0.0, "loss": -9999.0})
+
 
 class SampleSequenceIdsTest(ApiServerTest):
   """Tinker SDK >= 0.25 asserts that every asample promise carries one

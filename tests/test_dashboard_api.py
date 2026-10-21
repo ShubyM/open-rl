@@ -54,7 +54,7 @@ class InspectionApiTest(unittest.TestCase):
     response = self.client.get("/api/v1/inspect/activity", params=WINDOW)
     self.assertEqual(response.status_code, 200)
     keys = sorted(call.args[0] for call in self.store.read_samples.await_args_list)
-    self.assertEqual(keys, sorted(router.telemetry.ops_key(k) for k in ("r1", "r2", "base")))
+    self.assertEqual(keys, sorted(key(k) for k in ("r1", "r2", "base") for key in (router.telemetry.ops_key, router.telemetry.samples_key)))
     lanes = {p["id"]: p for p in response.json()["placements"]}
     self.assertEqual(set(lanes), {"p1:r1", "p1:r2"})
     self.assertEqual((lanes["p1:r1"]["intervals"], lanes["p1:r1"].get("error")), ([[120, 130]], None))
@@ -70,7 +70,7 @@ class InspectionApiTest(unittest.TestCase):
   def test_run_activity_keeps_metrics_and_incidents_without_placement_history(self):
     self.state.update(placements=[], processes=[])
     self.state["runs"][0]["pods"] = [{"name": "p", "events": [{"reason": "OOMKilled", "last_seen_at": "1970-01-01T00:02:30Z", "message": "OOM"}]}]
-    self.store.read_samples.return_value = [operation(125, 140), operation(150, 200)]
+    self.store.read_samples.side_effect = lambda key: [operation(125, 140), operation(150, 200)] if key == router.telemetry.ops_key("r1") else []
     response = self.client.get("/api/v1/inspect/activity", params={**WINDOW, "run_id": "r1"})
     self.assertEqual(response.status_code, 200)
     data = response.json()
@@ -78,7 +78,9 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual(data["placements"], [])
     self.assertEqual([s["at"] for s in data["samples"]], [140])
     self.assertEqual(data["incidents"][0]["reason"], "OOMKilled")
-    self.store.read_samples.assert_awaited_once_with(router.telemetry.ops_key("r1"))
+    self.assertEqual(
+      sorted(c.args[0] for c in self.store.read_samples.await_args_list), [router.telemetry.ops_key("r1"), router.telemetry.samples_key("r1")]
+    )
 
   def test_series_is_independently_callable_and_keeps_partial_data(self):
     backend = mock.Mock(name="hardware", slots={})

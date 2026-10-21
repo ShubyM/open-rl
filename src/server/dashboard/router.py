@@ -121,9 +121,15 @@ async def read_operations(identity: str, finished: bool = False) -> dict:
 
 async def load_operations(identity: str) -> dict:
   try:
-    records = await asyncio.wait_for(get_state_store().read_samples(telemetry.ops_key(identity)), timeout=OPERATIONS_READ_SECONDS)
-    if not isinstance(records, list):
+    store = get_state_store()
+    lists = await asyncio.wait_for(
+      asyncio.gather(store.read_samples(telemetry.ops_key(identity)), store.read_samples(telemetry.samples_key(identity))),
+      timeout=OPERATIONS_READ_SECONDS,
+    )
+    if not all(isinstance(records, list) for records in lists):
       raise ValueError("Expected telemetry records")
+    # Invalid records are skipped later, so the merge must not trust their timestamps.
+    records = sorted(lists[0] + lists[1], key=lambda r: r["at"] if isinstance(r, dict) and isinstance(r.get("at"), int | float) else 0)
   except Exception:
     return {"samples": [], "error": "Operation records unavailable"}
 

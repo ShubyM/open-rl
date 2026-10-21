@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -538,6 +539,7 @@ async def enqueue(command: Command) -> str:
   # One line per training request so a request that never reaches a worker can
   # be traced end to end (the workers log the same id when they pop it).
   print(f"[API_SERVER] enqueued op={command.op} request_id={command.request_id} model_id={command.model_id} active_set={active_set_id}")
+  telemetry.count("enqueued", command.model_id)
   return command.request_id
 
 
@@ -576,6 +578,17 @@ def check_single_process_backend() -> None:
       "SAMPLING_BACKEND=vllm needs REDIS_URL: the API server launches the vLLM sampler as a separate worker. "
       "Set REDIS_URL (for example redis://127.0.0.1:6379/0), or unset SAMPLING_BACKEND to sample with torch in one process."
     )
+
+
+def finite_metrics(result: dict) -> dict:
+  """The SDK reads JSON, which has no NaN or infinity: send 0 and +/-9999 as workers once did. Telemetry already named the real value."""
+  metrics = result.get("metrics")
+  if not isinstance(metrics, dict) or all(not isinstance(v, float) or math.isfinite(v) for v in metrics.values()):
+    return result
+  finite = {
+    k: (0.0 if math.isnan(v) else math.copysign(9999.0, v)) if isinstance(v, float) and not math.isfinite(v) else v for k, v in metrics.items()
+  }
+  return {**result, "metrics": finite}
 
 
 def translate_future_result(result: dict) -> dict:
@@ -979,6 +992,7 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
     return JSONResponse(status_code=400, content=result)
   if isinstance(result, dict):
+    result = finite_metrics(result)
     if proto_codec.PROTO_CONTENT_TYPE in accept:
       encoded = proto_codec.encode_future_result(result)
       if encoded is not None:

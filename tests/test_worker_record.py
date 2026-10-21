@@ -35,6 +35,7 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     self.store = InMemoryStateStore()
     self.enterContext(mock.patch.object(telemetry, "get_state_store", return_value=self.store))
     self.enterContext(mock.patch.dict("os.environ", {"POD_NAME": "pod", "POD_UID": "uid", "NODE_NAME": "node"}))
+    self.enterContext(mock.patch.dict(telemetry.steps_done, clear=True))
 
   async def saved(self, worker_id: str) -> dict:
     await asyncio.sleep(0)  # let the heartbeat run
@@ -107,6 +108,36 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     (sample,) = await self.recorded(telemetry.ops_key("r"))
     self.assertEqual((sample["metrics"], sample["nonfinite"]), ({"loss": 1.5}, ["grad_norm", "kl"]))
 
+  async def test_trainer_ops_carry_their_step_and_sampling_never_evicts_them(self) -> None:
+    await self.store.set_value(telemetry.steps_key("r"), "5")  # a restarted trainer resumes the run's count
+    for op in ("forward_backward", "optim_step", "forward_backward"):
+      await telemetry.observe_operation({"model_id": "r", "op": op}, "trainer", "r", mock.AsyncMock(return_value={}))
+    with mock.patch.object(telemetry, "SAMPLE_LIMIT", 3):
+      for i in range(5):
+        telemetry.record(
+          {"op": "sample", "logical_run_id": "r", "request_id": f"s{i}"}, "sampler", None, 0.0, "succeeded", None, {}, where={"pod": "p"}
+        )
+    trainer = await self.recorded(telemetry.ops_key("r"))
+    self.assertEqual([(s["operation"], s["step"]) for s in trainer], [("forward_backward", 5), ("optim_step", 5), ("forward_backward", 6)])
+    samples = await self.recorded(telemetry.samples_key("r"))
+    self.assertEqual([s["request_id"] for s in samples], ["s2", "s3", "s4"])
+    self.assertNotIn("step", samples[0])
+
+  async def test_forward_only_calls_are_recorded_apart_from_training(self) -> None:
+    await telemetry.observe_operation(
+      {"model_id": "r", "op": "forward_backward", "forward_only": True}, "trainer", "r", mock.AsyncMock(return_value={})
+    )
+    (sample,) = await self.recorded(telemetry.ops_key("r"))
+    self.assertEqual(sample["operation"], "forward")
+
+  async def test_the_ledger_counts_popped_and_answered_requests_per_run(self) -> None:
+    async with telemetry.serving("trainer", "r"):
+      telemetry.popped([{"request_id": "a", "model_id": "r", "op": "optim_step"}, {"request_id": "b", "model_id": "r", "op": "optim_step"}])
+      await telemetry.Answering(StoreStub()).set_future("a", {})
+      await asyncio.gather(*list(telemetry.writes))
+    counts = [await self.store.get_value(telemetry.ledger_key("r", event)) for event in ("popped", "answered")]
+    self.assertEqual(counts, ["2", "1"])
+
   async def test_store_failures_do_not_change_the_operation_result(self) -> None:
     result = {"type": "ok", "output": "private tokens"}
     with mock.patch.object(self.store, "append_sample", mock.AsyncMock(side_effect=ConnectionError("store offline"))):
@@ -138,7 +169,7 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     request = {"model_id": "base", "logical_run_id": "run-a", "lora_id": "tinker://run-a/sampler_weights/step-1"}
     await telemetry.observe_operation(request, "sampler", "base", mock.AsyncMock(return_value={}))
     self.assertEqual(await self.recorded(telemetry.ops_key("base")), [])
-    sample = (await self.recorded(telemetry.ops_key("run-a")))[0]
+    sample = (await self.recorded(telemetry.samples_key("run-a")))[0]
     self.assertEqual((sample["run_id"], sample["runtime_id"], sample["operation"], sample["pod_uid"]), ("run-a", "base", "sample", "uid"))
 
   async def test_thread_metrics_stay_with_concurrent_operations_without_changing_responses(self) -> None:

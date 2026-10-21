@@ -189,6 +189,9 @@ class Operation(TimedRecord):
   elapsed_seconds: float = Field(0, ge=0)
   metrics: dict[str, float] = Field(default_factory=dict)
   nonfinite: list[str] = Field(default_factory=list, description="Metrics the op returned as NaN or infinity")
+  step: int | None = Field(
+    None, description="Optimizer steps the run had completed when this trainer op ran; the op belongs to step `step`. Absent on sample ops"
+  )
 
 
 class Incident(Record):
