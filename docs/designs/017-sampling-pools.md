@@ -20,8 +20,8 @@ sampler:
 
 | Sampler | Used when | What runs |
 | --- | --- | --- |
-| `HttpSampler` | The pool has GPUs of its own: LoRA pools, exclusive FFT jobs, and FFT jobs with more than one trainer GPU. | A dispatcher pod (dispatcher, Envoy, llm-d EPP) sends through the router to N `vllm serve` replica pods. |
-| `vllm_sampler.Sampler` | An FFT job shares its one GPU with its trainer. | One replica pod with vLLM inside its process. It runs the dispatcher loop itself and takes a time-slicer turn around each batch. |
+| `HttpSampler` | The pool has two or more replicas. | A dispatcher pod (dispatcher, Envoy, llm-d EPP) sends through the router to N `vllm serve` replica pods. |
+| `vllm_sampler.Sampler` | The pool has one replica. | One replica pod with vLLM inside its process. It runs the dispatcher loop itself. When it shares its GPU with its trainer, it takes a time-slicer turn around each batch. |
 
 Both kinds use the same dispatcher loop, the same kind of stream, and the same
 rules for results.
@@ -92,13 +92,12 @@ The diagram shows a routed pool. The scheduler labels each replica pod with
 The EPP runs with `--endpoint-selector` set to the same labels and watches
 those pods itself, so it needs no registry and no InferencePool.
 
-**One-GPU FFT skips this.** The dispatcher pod, Envoy, the EPP, the
-NetworkPolicy and the label lookup spread work across sampler replicas that
-have GPUs of their own. An FFT job that shares its one GPU with its trainer
-has exactly one sampler, so there is nothing to route. Its one replica runs
-the dispatcher loop itself, with vLLM in its own process, and takes
-time-slicer turns. A routed pool with one replica still gets the router
-today; skipping the router below two replicas is a possible next step.
+**A pool of one replica skips this.** The dispatcher pod, Envoy, the EPP,
+the NetworkPolicy and the label lookup spread work across replicas. With one
+replica there is nothing to route, so that replica runs the dispatcher loop
+itself, with vLLM in its own process. An FFT job that shares its one GPU with
+its trainer always has one replica, and that replica also takes time-slicer
+turns.
 
 ### Installed once
 
@@ -125,8 +124,9 @@ depends on the job:
 
 | Job | Workloads | Other objects | Replica pod runs |
 | --- | --- | --- | --- |
-| LoRA, exclusive FFT, or FFT with more than one trainer GPU | `sampler_replicas` sampler Workloads, each on a GPU of its own | A dispatcher Deployment and a NetworkPolicy, both named after the pool | `vllm serve`, behind the router |
-| FFT that is not exclusive and has one trainer GPU | One sampler Workload, seated on the trainer's claim so the two share one GPU | None | `python -m server.vllm_sampler --pool <pool>` |
+| LoRA, exclusive FFT, or FFT with more than one trainer GPU, with two or more replicas | `sampler_replicas` sampler Workloads, each on a GPU of its own | A dispatcher Deployment and a NetworkPolicy, both named after the pool | `vllm serve`, behind the router |
+| One replica with a GPU of its own | One sampler Workload | None | `python -m server.vllm_sampler --pool <pool>` |
+| FFT that is not exclusive and has one trainer GPU | One sampler Workload, seated on the trainer's claim so the two share one GPU | None | `python -m server.vllm_sampler --pool <pool>`, taking time-slicer turns |
 
 `sampler_replicas` comes from the job's metadata (`openrl.sampler_replicas`,
 default 1). All LoRA jobs on one base model share one pool,
@@ -292,12 +292,10 @@ since each entry is deleted when its result is saved.
 
 | Situation | Pool shape | Router | Time slicer |
 | --- | --- | --- | --- |
-| LoRA jobs on one base model, sharing a pool | `vllm serve` replicas and a dispatcher pod | Yes | No |
-| Exclusive LoRA job | Its own replicas and dispatcher pod | Yes | No |
+| A pool of one replica with a GPU of its own, LoRA or FFT | One in-process `vllm_sampler` | No | No |
 | FFT on its trainer's one GPU | One in-process `vllm_sampler` | No | Yes |
-| Exclusive FFT job, or FFT with a multi-GPU trainer | `vllm serve` replicas and a dispatcher pod | Yes | No |
-| Many replicas per pool | N Workloads behind one router | Yes | No |
-| One machine, no Kubernetes | Processes: `vllm serve` and a dispatcher that sends direct, or one in-process sampler | No | FFT only |
+| Any pool of two or more replicas | N `vllm serve` Workloads and a dispatcher pod | Yes | No |
+| One machine, no Kubernetes | One `vllm_sampler` process | No | FFT only |
 
 Each part that is likely to change is one seam:
 
@@ -319,7 +317,7 @@ Each part that is likely to change is one seam:
 | Replicas competed for one list | The llm-d router picks a replica by prefix cache and load | Routing matters with two or more replicas. |
 | `create_sampling_session` waited up to 300 seconds | `asample` adds to the stream and returns | Requests wait in Redis, not in the API server. |
 | LoRA read a mutable directory | LoRA reads a frozen snapshot | A save cannot change an adapter while it serves. |
-| One sampler shape | Two samplers, one dispatcher loop | A shared GPU gets no benefit from a router. Many replicas do. |
+| One sampler shape | Two samplers, one dispatcher loop | One replica gets no benefit from a router. Many replicas do. |
 | Engine settings in two places | `engine_args` builds both | The two launch styles cannot drift. |
 
 ## 11. Results and open items

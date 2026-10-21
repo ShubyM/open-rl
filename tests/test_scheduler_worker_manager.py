@@ -107,7 +107,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     t_container = trainer["spec"]["template"]["spec"]["containers"][0]
     s_container = sampler["spec"]["template"]["spec"]["containers"][0]
     self.assertEqual(t_container["command"][-1], "server.training_requests_processor")
-    self.assertEqual(s_container["command"], ["uv", "run", "vllm", "serve"])
+    self.assertEqual(s_container["command"][-1], "server.vllm_sampler")
     self.assertIn("--active-tenant-set-id", t_container["args"])
 
   def test_an_exclusive_fft_worker_is_placed_alone_and_never_time_sliced(self) -> None:
@@ -246,7 +246,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(t_container["args"], ["--model-id", runtime, "--active-tenant-set-id", f"{runtime}-1"])
     self.assertEqual({e["name"]: e.get("value") for e in t_container["env"]}["OPEN_RL_TRAINER_BACKEND"], "automodel")
     self.assertNotEqual(s_container["image"], "am:1")
-    self.assertEqual(s_container["command"], ["uv", "run", "vllm", "serve"])
+    self.assertEqual(s_container["command"][-1], "server.vllm_sampler")
     # Like any shared LoRA runtime, deleting one job leaves it up.
     self.assertEqual(self.api.deleted, [])
 
@@ -393,7 +393,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
   def test_without_open_rl_tmp_dir_the_probe_reads_the_revision_file_the_dispatcher_writes(self) -> None:
     # The API server renders the probe's path itself, and the dispatcher writes under the OPEN_RL_TMP_DIR its pod gets.
     os.environ.pop("OPEN_RL_TMP_DIR")
-    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "exclusive": True})
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "exclusive": True, "sampler_replicas": 2})
     with patch("server.worker_manager.get_state_store", return_value=s):
       worker = describe_worker("fft-job", "sampler")
     probe = pod_template(worker)["spec"]["containers"][0]["readinessProbe"]["exec"]["command"][2]
@@ -402,13 +402,14 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       written = revision_file(worker.pool)
     self.assertIn(f"open({str(written)!r})", probe)
 
-  def test_a_pool_is_vllm_samplers_ready_on_the_expected_version_behind_one_routed_cpu_pod_until_released(self) -> None:
-    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "exclusive": True})
+  def test_a_pool_of_replicas_is_vllm_samplers_ready_on_the_expected_version_behind_one_routed_cpu_pod_until_released(self) -> None:
+    s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "exclusive": True, "sampler_replicas": 2})
     k8s = FakeApi()
     manager = SchedulerWorkerManager(custom_api=self.api, apps_api=k8s, networking_api=k8s)
     with patch("server.worker_manager.get_state_store", return_value=s):
       manager.ensure("fft-job", "sampler")
-    (sampler,) = self.api.created
+    sampler = self.api.created[0]
+    self.assertEqual(sampler["spec"]["template"]["spec"]["containers"][0]["command"], ["uv", "run", "vllm", "serve"])
     probe = sampler["spec"]["template"]["spec"]["containers"][0]["readinessProbe"]["exec"]["command"]
     self.assertIn(f"{self.tmp}/sampling/sampler-fft-job/revision", probe[2])  # the file the dispatcher writes
     self.assertEqual(sorted(k8s.objects), [("deployment", "sampler-fft-job"), ("network_policy", "sampler-fft-job")])
@@ -417,6 +418,16 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.assertEqual(epp["args"][:2], ["--endpoint-selector", selector])
     self.assertEqual(manager.release_owner("fft-job"), {"fft-job"})
     self.assertEqual((k8s.objects, self.api.existing), ({}, {}))
+
+  def test_a_pool_of_one_replica_serves_itself_with_no_router(self) -> None:
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora", "exclusive": True})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-lora-1", "sampler")
+    (sampler,) = self.api.created
+    container = sampler["spec"]["template"]["spec"]["containers"][0]
+    self.assertEqual((container["command"][-1], container["args"]), ("server.vllm_sampler", ["--pool", "sampler-job-lora-1"]))
+    self.assertEqual({e["name"]: e.get("value") for e in container["env"]}["OPEN_RL_TIME_SLICING"], "off")
+    self.assertEqual(self.k8s.objects, {})
 
   def test_an_fft_sampler_on_its_trainers_gpu_serves_its_pool_itself(self) -> None:
     s = self.store_with("fft-job", {"base_model": "Qwen/Qwen3-8B", "fine_tuning_type": "full", "sampler_replicas": 3})
@@ -457,7 +468,7 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(len(api.created), 2, "LoRA sessions should reuse one sampler while FFT gets its own")
     lora, fft = api.created
     self.assertEqual(lora["spec"]["trainingKind"], "lora")
-    self.assertEqual(lora["spec"]["template"]["spec"]["containers"][0]["command"], ["uv", "run", "vllm", "serve"])
+    self.assertEqual(lora["spec"]["template"]["spec"]["containers"][0]["command"][-1], "server.vllm_sampler")
     self.assertEqual(fft["spec"]["trainingKind"], "fft")
     self.assertEqual(fft["metadata"]["name"], "fft-fft-a-sampler")
 

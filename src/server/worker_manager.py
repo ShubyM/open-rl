@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import threading
@@ -19,8 +18,8 @@ from accel_timeslicer.workload import TRAINER_TIME_SLICE_GROUP, workload_job_id
 from server.estimator import footprint
 from server.lora_snapshots import snapshot_root
 from server.model_metadata import TrainingModelMetadata, decode_model_metadata
+from server.sampling_dispatcher import tmp_root
 from server.store import get_state_store
-from server.vllm_options import serve_args
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
@@ -177,8 +176,6 @@ class LocalWorkerManager:
     self.project_dir = project_dir
     self.processes: dict[tuple[str, str], subprocess.Popen] = {}
     self.started: dict[tuple[str, str], float] = {}
-    # Each local pool's dispatcher command and env, to start it again while its vLLM runs on.
-    self.dispatchers: dict[str, tuple[list[str], dict[str, str]]] = {}
     self.lock = threading.Lock()
 
   def ensure(self, model_id: str, role: str) -> None:
@@ -188,10 +185,6 @@ class LocalWorkerManager:
     with self.lock:
       proc = self.processes.get((role, runtime))
       if proc is not None and proc.poll() is None:
-        dispatcher = self.processes.get(("dispatcher", runtime))
-        if role == "sampler" and runtime in self.dispatchers and (dispatcher is None or dispatcher.poll() is not None):
-          # A pool without its dispatcher answers nothing, so a dead one starts again against the running vLLM.
-          self.spawn("dispatcher", runtime, *self.dispatchers[runtime])
         return
       base_model = base_model_of(meta, runtime)
       env = {**os.environ, **worker_env(meta, base_model, runtime, is_lora, role)}
@@ -203,36 +196,14 @@ class LocalWorkerManager:
         env["OPEN_RL_TIME_SLICE_GROUP"] = TRAINER_TIME_SLICE_GROUP
         self.spawn(role, runtime, python_command(["gpu"], worker_module(role), worker_args(runtime, role, is_lora)), env)
         return
-      # The pool's stream and the revision files live under the same root the API server uses.
-      env["OPEN_RL_TMP_DIR"] = os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl")
+      env["OPEN_RL_TMP_DIR"] = tmp_root()
       if meta.shares_gpu() and time_slicing_enabled():
-        # The sampler takes turns on the one GPU with its trainer, so it is in the trainer's claim, and it serves
-        # its pool itself with vLLM in its own process.
+        # The sampler takes turns on the one GPU with its trainer, so it is in the trainer's claim.
         env["OPEN_RL_TIME_SLICE_JOB_ID"] = workload_job_id(role, runtime)
         env["OPEN_RL_TIME_SLICE_GROUP"] = TRAINER_TIME_SLICE_GROUP
-        self.spawn(role, runtime, python_command(["gpu", "vllm"], "server.vllm_sampler", ["--pool", meta.pool(runtime)]), env)
-        return
-      # A local pool is one vllm serve replica and the dispatcher that sends to it directly. The dispatcher of a vLLM
-      # that died is stopped before a new pair starts, so two dispatchers never read one stream.
-      if (old := self.processes.get(("dispatcher", runtime))) is not None:
-        self.terminate(("dispatcher", runtime))
-        try:
-          old.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-          old.kill()
-          old.wait()
-      with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-      vllm = ["uv", "run", "--extra", "gpu", "--extra", "vllm", "vllm"] if shutil.which("uv") else [str(Path(sys.executable).with_name("vllm"))]
-      if is_lora:
-        # vLLM's filesystem LoRA resolver exits at startup without its directory, and no adapter may be frozen yet.
-        snapshot_root().mkdir(parents=True, exist_ok=True)
-      self.spawn(role, runtime, [*vllm, "serve", *serve_args(base_model, is_lora, env, port)], env)
-      dispatcher_env = {**os.environ, "OPEN_RL_SAMPLER_POOL": meta.pool(runtime), "OPEN_RL_SAMPLER_ENDPOINTS": f"http://127.0.0.1:{port}"}
-      dispatcher_env["OPEN_RL_TMP_DIR"] = env["OPEN_RL_TMP_DIR"]
-      self.dispatchers[runtime] = (python_command([], "server.sampling_dispatcher", []), dispatcher_env)
-      self.spawn("dispatcher", runtime, *self.dispatchers[runtime])
+      else:
+        env["OPEN_RL_TIME_SLICING"] = "off"
+      self.spawn(role, runtime, python_command(["gpu", "vllm"], "server.vllm_sampler", ["--pool", meta.pool(runtime)]), env)
 
   def spawn(self, role: str, runtime: str, command: list[str], env: dict[str, str]) -> None:
     log_dir = Path(os.getenv("OPEN_RL_TMP_DIR", "/tmp"))

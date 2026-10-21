@@ -87,9 +87,16 @@ class Worker:
   pool: str | None = None
 
   @property
-  def time_sliced(self) -> bool:
-    """A sampler that shares its GPU with its trainer. It serves its pool itself, with vLLM in its own process."""
-    return self.role == "sampler" and not self.exclusive
+  def replicas(self) -> int:
+    # A sampler on its trainer's GPU is its pool's only replica, since only one fits beside the trainer.
+    if self.role != "sampler" or self.meta.shares_gpu():
+      return 1
+    return self.meta.sampler_replicas
+
+  @property
+  def routed(self) -> bool:
+    # A pool of one replica has nothing to route, so that replica serves the pool itself.
+    return self.role == "sampler" and self.replicas > 1
 
   @property
   def owner(self) -> str:
@@ -98,16 +105,6 @@ class Worker:
   @property
   def name(self) -> str:
     return workload_name(self.role, self.owner, self.is_lora, self.index)
-
-
-def replicas_of(model_id: str, role: str) -> int:
-  """How many workers of this role the model asked for. Each sampler replica
-  is its own Workload in the model's sampling pool."""
-  if role != "sampler":
-    return 1
-  meta, _, _ = runtime_of(model_id)
-  # A sampler on its trainer's GPU is the pool's only reader, and only one fits beside the trainer.
-  return 1 if meta.shares_gpu() else meta.sampler_replicas
 
 
 def pool_labels(component: str, pool: str) -> dict[str, str]:
@@ -206,7 +203,7 @@ def pod_template(worker: Worker) -> dict[str, Any]:
     template["spec"]["volumes"].append({"name": "dshm", "emptyDir": {"medium": "Memory"}})
 
   container = template["spec"]["containers"][0]
-  if worker.time_sliced:
+  if worker.pool and not worker.routed:
     container["command"] = ["uv", "run", "python", "-u", "-m", "server.vllm_sampler"]
     container["args"] = ["--pool", worker.pool]
     container["readinessProbe"] = {"exec": {"command": ["test", "-f", "/tmp/open-rl-sampler-ready"]}, "periodSeconds": 2}
@@ -320,8 +317,7 @@ def accelerator_spec(worker: Worker) -> dict[str, Any]:
 
 def workload_body(worker: Worker) -> dict[str, Any]:
   # A pool label marks a Workload whose pool has a dispatcher, which release_owner deletes with it.
-  routed = worker.pool and not worker.time_sliced
-  labels = {"app.kubernetes.io/managed-by": "open-rl-api-server", **(pool_labels("sampler", worker.pool) if routed else {})}
+  labels = {"app.kubernetes.io/managed-by": "open-rl-api-server", **(pool_labels("sampler", worker.pool) if worker.routed else {})}
   return {
     "apiVersion": f"{GROUP}/{VERSION}",
     "kind": "Workload",
@@ -362,9 +358,9 @@ class SchedulerWorkerManager:
       # vLLM's filesystem LoRA resolver exits at startup without its directory, and no adapter may be frozen yet.
       # The API server mounts the shared volume the replicas read it from.
       snapshot_root().mkdir(parents=True, exist_ok=True)
-    for index in range(replicas_of(model_id, role)):
+    for index in range(worker.replicas):
       self.ensure_workload(dataclasses.replace(worker, index=index))
-    if worker.pool and not worker.time_sliced:
+    if worker.routed:
       self.ensure_dispatcher(worker.pool)
 
   def ensure_dispatcher(self, pool: str) -> None:

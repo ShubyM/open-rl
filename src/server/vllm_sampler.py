@@ -15,6 +15,7 @@ from typing import Any
 
 from accel_timeslicer.time_slicer import time_slicer_client_from_env, time_slicing_enabled, workload_from_env
 from accel_timeslicer.workload import SAMPLER_CLAIM, local_workload_name
+from server.lora_snapshots import snapshot_root
 from server.sampling_dispatcher import Dispatcher, delta_applies, failed, holding_gpu, redis_client
 from server.sampling_store import SamplingStore
 from server.vllm_options import engine_args
@@ -30,8 +31,9 @@ class Sampler:
   it holds, "" for the base model. A failed update leaves partial weights behind, so the sampler refuses work until
   the process is restarted."""
 
-  def __init__(self, engine: Any) -> None:
-    self.engine = engine
+  def __init__(self, engine: Any, base_model: str) -> None:
+    self.engine, self.base_model = engine, base_model
+    self.lora_ids: dict[str, int] = {}
     self.revision = ""
     self.update_failed = False
 
@@ -87,7 +89,8 @@ class Sampler:
       return failed(f"Sampler rejected the request: {exc}")
     request_id = f"{r['request_id']}-{uuid.uuid4().hex[:8]}"
     final = None
-    async for output in self.engine.generate(prompt={"prompt_token_ids": prompt}, sampling_params=params, request_id=request_id):
+    stream = self.engine.generate(prompt={"prompt_token_ids": prompt}, sampling_params=params, request_id=request_id, lora_request=self.adapter(r))
+    async for output in stream:
       final = output
     sequences = []
     for choice in final.outputs:
@@ -99,14 +102,23 @@ class Sampler:
       result["prompt_logprobs"] = [None if step is None else step[token].logprob for token, step in zip(prompt, final.prompt_logprobs)]
     return result
 
+  def adapter(self, r: dict[str, Any]) -> Any:
+    if r["model"] == self.base_model:
+      return None
+    from vllm.lora.request import LoRARequest
 
-def make_engine(sleep_mode: bool) -> Any:
+    lora_id = self.lora_ids.setdefault(r["model"], len(self.lora_ids) + 1)
+    return LoRARequest(r["model"], lora_id, str(snapshot_root() / r["model"]))
+
+
+def make_engine(sleep_mode: bool, is_lora: bool) -> Any:
   from vllm.config.weight_transfer import WeightTransferConfig
   from vllm.engine.arg_utils import AsyncEngineArgs
   from vllm.engine.async_llm_engine import AsyncLLMEngine
 
-  args = engine_args(os.environ["BASE_MODEL"], False, os.environ, sleep_mode=sleep_mode)
-  args["weight_transfer_config"] = WeightTransferConfig(**args["weight_transfer_config"])
+  args = engine_args(os.environ["BASE_MODEL"], is_lora, os.environ, sleep_mode=sleep_mode)
+  if transfer := args.get("weight_transfer_config"):
+    args["weight_transfer_config"] = WeightTransferConfig(**transfer)
   return AsyncLLMEngine.from_engine_args(AsyncEngineArgs(model=os.environ["BASE_MODEL"], **args))
 
 
@@ -121,7 +133,8 @@ async def run_sampling_worker(pool: str) -> None:
   sampler = None
   try:
     async with holding_gpu(time_slicer, workload):
-      sampler = Sampler(make_engine(sleep_mode=time_slicer is not None))
+      is_lora = os.environ.get("OPEN_RL_FINE_TUNING_TYPE") == "lora"
+      sampler = Sampler(make_engine(sleep_mode=time_slicer is not None, is_lora=is_lora), os.environ["BASE_MODEL"])
       if time_slicer is not None:
         await sampler.sleep()  # give the memory back before releasing the turn
     Path(READY_FILE).touch()
