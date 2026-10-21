@@ -23,6 +23,7 @@ import redis.asyncio as redis
 from accel_timeslicer.time_slicer import TimeSlicerClient
 from accel_timeslicer.workload import WorkloadRef
 from server.sampling_store import SamplingStore
+from server.vllm_options import sample_params, sample_result
 
 logger = logging.getLogger(__name__)
 
@@ -79,14 +80,13 @@ async def holding_gpu(time_slicer: TimeSlicerClient | None, workload: WorkloadRe
 
 
 def to_result(body: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
-  """The old sampler's result shape, from a vLLM /inference/v1/generate response."""
-  logprobs = [[e["logprob"] for e in c["logprobs"]["content"]] for c in body["choices"]]
-  sequences = [{"tokens": c["token_ids"], "logprobs": lp, "stop_reason": c["finish_reason"]} for c, lp in zip(body["choices"], logprobs)]
-  result: dict[str, Any] = {"type": "sample", "sequences": sequences}
+  """The result for a vLLM /inference/v1/generate response."""
+  sequences = [(c["token_ids"], [e["logprob"] for e in c["logprobs"]["content"]], c["finish_reason"]) for c in body["choices"]]
+  prompt_logprobs = None
   if record["include_prompt_logprobs"]:
     pairs = zip(record["prompt_token_ids"], body["prompt_logprobs"], strict=True)
-    result["prompt_logprobs"] = [None if e is None else e[str(token)]["logprob"] for token, e in pairs]
-  return result
+    prompt_logprobs = [None if e is None else e[str(token)]["logprob"] for token, e in pairs]
+  return sample_result(sequences, prompt_logprobs)
 
 
 class Dispatcher:
@@ -186,7 +186,7 @@ class Dispatcher:
 
 class HttpSampler:
   """Sends a pool's records through `router` to its vllm serve replicas, and keeps each replica on the pool's revision.
-  A run on one machine has no router and lists its replicas in `urls`."""
+  Without a router it sends to the replicas listed in `urls`."""
 
   def __init__(self, http: httpx.AsyncClient, pool: str, router: str | None, urls: list[str]) -> None:
     self.http, self.pool, self.router, self.urls = http, pool, router, urls
@@ -213,7 +213,7 @@ class HttpSampler:
   async def generate(self, r: dict[str, Any]) -> dict[str, Any] | None:
     """The result, or None when the answer did not come from the record's revision."""
     target, sent = r["revision"] or "default", time.monotonic()
-    params = {**r["sampling_params"], "logprobs": 0, "prompt_logprobs": 0 if r["include_prompt_logprobs"] else None}
+    params = sample_params(r)
     attempt_id = f"{r['request_id']}-{uuid.uuid4().hex[:8]}"
     # The store hands prompts back as array('I'), which JSON cannot encode.
     body = {"request_id": attempt_id, "token_ids": list(r["prompt_token_ids"]), "model": r["model"], "sampling_params": params}
@@ -337,11 +337,10 @@ def http_client() -> httpx.AsyncClient:
 async def main() -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
   logging.getLogger("httpx").setLevel(logging.WARNING)
-  urls = [url for url in os.getenv("OPEN_RL_SAMPLER_ENDPOINTS", "").split(",") if url]
-  router = None if urls else os.getenv("OPEN_RL_SAMPLER_ROUTER", "http://127.0.0.1:8081")
+  router = os.getenv("OPEN_RL_SAMPLER_ROUTER", "http://127.0.0.1:8081")
   store, pool = SamplingStore(redis_client(os.environ["REDIS_URL"])), os.environ["OPEN_RL_SAMPLER_POOL"]
   async with http_client() as http:
-    sampler = HttpSampler(http, pool, router, urls)
+    sampler = HttpSampler(http, pool, router, [])
     task = asyncio.create_task(Dispatcher(store, pool, sampler, int(os.getenv("OPEN_RL_DISPATCH_CONCURRENCY", "256"))).run())
     for sig in (signal.SIGTERM, signal.SIGINT):
       asyncio.get_running_loop().add_signal_handler(sig, task.cancel)

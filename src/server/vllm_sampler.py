@@ -18,7 +18,7 @@ from accel_timeslicer.workload import SAMPLER_CLAIM, local_workload_name
 from server.lora_snapshots import snapshot_root
 from server.sampling_dispatcher import Dispatcher, delta_applies, failed, holding_gpu, redis_client
 from server.sampling_store import SamplingStore
-from server.vllm_options import engine_args
+from server.vllm_options import engine_args, sample_params, sample_result
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +79,7 @@ class Sampler:
 
     prompt = list(r["prompt_token_ids"])
     try:
-      params = SamplingParams(
-        **r["sampling_params"],
-        logprobs=0,
-        prompt_logprobs=0 if r["include_prompt_logprobs"] else None,
-        output_kind=RequestOutputKind.FINAL_ONLY,
-      )
+      params = SamplingParams(**sample_params(r), output_kind=RequestOutputKind.FINAL_ONLY)
     except (TypeError, ValueError) as exc:
       return failed(f"Sampler rejected the request: {exc}")
     request_id = f"{r['request_id']}-{uuid.uuid4().hex[:8]}"
@@ -95,12 +90,11 @@ class Sampler:
     sequences = []
     for choice in final.outputs:
       tokens = list(choice.token_ids)
-      logprobs = [step[token].logprob for token, step in zip(tokens, choice.logprobs or [])]
-      sequences.append({"tokens": tokens, "logprobs": logprobs, "stop_reason": choice.finish_reason})
-    result: dict[str, Any] = {"type": "sample", "sequences": sequences}
+      sequences.append((tokens, [step[token].logprob for token, step in zip(tokens, choice.logprobs or [])], choice.finish_reason))
+    prompt_logprobs = None
     if r["include_prompt_logprobs"]:
-      result["prompt_logprobs"] = [None if step is None else step[token].logprob for token, step in zip(prompt, final.prompt_logprobs)]
-    return result
+      prompt_logprobs = [None if step is None else step[token].logprob for token, step in zip(prompt, final.prompt_logprobs)]
+    return sample_result(sequences, prompt_logprobs)
 
   def adapter(self, r: dict[str, Any]) -> Any:
     if r["model"] == self.base_model:
