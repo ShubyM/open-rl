@@ -234,6 +234,12 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .run-incident a { color: var(--dim); white-space: nowrap; }
 #app .run-metric-summary { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 16px; }
 #app .run-activity { border-top: 0; padding-top: 0; }
+#app .run-activity .activity-title { margin-top: 8px; margin-bottom: 4px; }
+#app .run-activity .activity-intro { margin: 0 0 12px; font-size: 12px; }
+#app .run-activity :is(.activity-header, .activity-row) { grid-template-columns: var(--activity-label-width) 88px minmax(0, 1fr) 48px; }
+#app .run-activity .activity-gpu { color: var(--dim); font: 11px var(--mono); overflow-wrap: anywhere; }
+#app .run-activity .activity-row[data-continued] { min-height: 30px; border-top-color: transparent; }
+#app .run-activity .activity-row[data-continued] .activity-track { height: 30px; }
 #app .activity-source { margin-top: 12px; color: var(--dim); font-size: 11px; }
 #app .run-metrics { margin-top: 8px; }
 #app .time-control.run-time-controls { grid-template-columns: 32px minmax(0, 1fr) 32px auto auto; width: 520px; }
@@ -310,6 +316,10 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
   #app .activity-track { height: 34px; }
   #app .op-legend { margin-left: 0; }
   #app .activity-axis span:not(:first-child):not(:last-child) { display: none; }
+  #app .run-activity :is(.activity-header, .activity-row) { grid-template-columns: 64px minmax(0, 1fr) 36px; }
+  #app .run-activity .activity-label { grid-column: 1 / -1; }
+  #app .run-activity .activity-axis { grid-column: 2; }
+  #app .run-activity .activity-row > span:empty { display: none; }
   #app .chart-tip { max-width: 230px; white-space: normal; width: max-content; }
   #app .run-toolbar { align-items: flex-start; }
   #app .run-time-controls { width: 100%; justify-content: space-between; }
