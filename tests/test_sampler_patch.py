@@ -36,7 +36,7 @@ class SamplerBatchTest(unittest.IsolatedAsyncioTestCase):
     self.sampler = Sampler(self.engine)
 
   def results(self):
-    return {call.args[0]: call.args[1] for call in self.store.set_future.call_args_list}
+    return {call.args[0]: call.args[1] for call in self.store.set_result.call_args_list}
 
   async def test_groups_drain_before_switching_weights(self):
     active = set()
@@ -163,7 +163,7 @@ class SamplerLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.slicer.unregister.assert_awaited_once_with(self.workload)
     self.slicer.close.assert_awaited_once()
     self.store.delete_values.assert_awaited_once_with("open_rl:sampler_ready:test")
-    self.assertEqual(self.store.set_future.call_args.args[0], "1")
+    self.assertEqual(self.store.set_result.call_args.args[0], "1")
 
   async def test_registration_failure_never_constructs_engine(self):
     self.slicer.register.side_effect = RuntimeError("registration failed")
@@ -208,7 +208,7 @@ class SamplerLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.engine.shutdown.assert_called_once()
 
   def results(self):
-    return {call.args[0]: call.args[1] for call in self.store.set_future.call_args_list}
+    return {call.args[0]: call.args[1] for call in self.store.set_result.call_args_list}
 
   async def test_dead_engine_fails_hanging_requests_and_exits(self):
     async def hang(request_id):

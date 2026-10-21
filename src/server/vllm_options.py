@@ -1,7 +1,9 @@
 """Engine and sampling options shared by the two vLLM sampler workers."""
 
+import json
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 
 def text_only_engine_kwargs() -> dict:
@@ -83,3 +85,38 @@ def detected_device_memory_bytes() -> int:
   except Exception:
     pass
   return 0
+
+
+def engine_args(base_model: str, is_lora: bool, env: Mapping[str, str | None], sleep_mode: bool = False) -> dict[str, Any]:
+  """vLLM engine settings for a sampler, the same for a `vllm serve` replica and an engine in the sampler's process."""
+  args: dict[str, Any] = {"enable_prefix_caching": True}
+  # A checkpoint's generation_config.json could add sampling params the client never asked for, such as a repetition penalty.
+  args["generation_config"] = "vllm"
+  args["max_model_len"] = int(os.getenv("VLLM_MAX_MODEL_LEN", "8192"))
+  # vLLM's own default of 0.92 has run FFT delta applies out of memory on an L4.
+  args["gpu_memory_utilization"] = gpu_memory_utilization()
+  # These are set where the replica's device is unknown, so vLLM sizes the batch for the device it runs on unless told.
+  for name in ("VLLM_MAX_NUM_SEQS", "VLLM_MAX_NUM_BATCHED_TOKENS"):
+    if os.getenv(name):
+      args[name.removeprefix("VLLM_").lower()] = int(os.environ[name])
+  if os.getenv("VLLM_ENFORCE_EAGER", "0") == "1":
+    args["enforce_eager"] = True
+  args.update(text_only_engine_kwargs())
+  if architecture := env.get("VLLM_ARCHITECTURE_OVERRIDE"):
+    args["hf_overrides"] = {"architectures": [architecture]}
+  if is_lora:
+    args.update(enable_lora=True, max_loras=int(os.getenv("VLLM_MAX_LORAS", "8")), max_lora_rank=int(os.getenv("VLLM_MAX_LORA_RANK", "64")))
+  else:
+    args["weight_transfer_config"] = {"backend": "delta_snapshot"}
+  if sleep_mode:
+    args["enable_sleep_mode"] = True
+  return args
+
+
+def serve_args(base_model: str, is_lora: bool, env: Mapping[str, str | None], port: int = 8000) -> list[str]:
+  """`vllm serve` flags for a sampling pool replica."""
+  args = [base_model, "--port", str(port), "--api-server-count", "1", "--enable-scale-out"]
+  for name, value in engine_args(base_model, is_lora, env).items():
+    flag = "--" + name.replace("_", "-")
+    args += [flag] if value is True else [flag, json.dumps(value) if isinstance(value, dict) else str(value)]
+  return args

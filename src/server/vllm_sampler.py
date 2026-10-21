@@ -233,7 +233,7 @@ async def process_batch(sampler: Sampler, store: RequestStore, requests: list[di
       await sampler.ensure_weights(weights_path)
     except Exception as exc:
       for request in batch:
-        await store.set_future(request["request_id"], failed_response(f"vLLM weight update failed: {exc}"))
+        await store.set_result(request["request_id"], failed_response(f"vLLM weight update failed: {exc}"))
       continue
     await serve_group(sampler, store, batch)
 
@@ -259,7 +259,7 @@ async def fail_requests(store: RequestStore, requests: list[dict[str, Any]], err
   """Best effort, so clients see the failure instead of waiting forever."""
   for request in requests:
     try:
-      await store.set_future(request["request_id"], failed_response(f"vLLM Worker Error: {error}"))
+      await store.set_result(request["request_id"], failed_response(f"vLLM Worker Error: {error}"))
     except Exception as exc:
       print(f"[vLLM Worker] Could not fail request {request['request_id']}: {exc}")
 
@@ -271,7 +271,7 @@ async def process_request(sampler: Sampler, store: RequestStore, request: dict[s
       result["type"] = "sample"
     except Exception as exc:
       result = failed_response(f"vLLM Worker Error: {exc}")
-    await store.set_future(request["request_id"], result)
+    await store.set_result(request["request_id"], result)
 
 
 async def mark_ready(state: StateStore, model_id: str) -> None:
