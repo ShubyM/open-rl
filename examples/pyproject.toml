@@ -22,7 +22,6 @@ dependencies = [
     "huggingface_hub>=0.28.1",
     "opentelemetry-instrumentation-httpx>=0.61b0",
     "opentelemetry-exporter-gcp-trace>=1.11.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.40.0",
     "opentelemetry-sdk>=1.40.0",
     "transformers>=5.16.1",
     "ipykernel",

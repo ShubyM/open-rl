@@ -80,11 +80,6 @@ session scope and separate phases; step and request IDs are not metric labels.
 Server metric export is enabled only when an OTLP endpoint is configured;
 `OTEL_METRICS_EXPORTER=none` disables it explicitly.
 
-Custom clients append the [cookbook logger adapter](../examples/README.md#custom-loop-telemetry)
-once, then use their existing `logger.log_metrics(...)` calls. Unchanged upstream
-cookbooks still have server telemetry without automatically forwarding arbitrary
-client metrics.
-
 The complete chart path is standard OTLP HTTP → Collector → Prometheus → the
 inspection API. The Collector exposes `openrl_client_metric` and
 `openrl_server_metric`; the original metric name is the `metric` label. The UI
@@ -101,48 +96,6 @@ OTLP JSON logs to stdout (collected by GKE logging in-cluster); the dashboard do
 not query those logs as exact step history. The Collector expires the latest
 value five minutes after its last update; historical chart retention belongs to
 Prometheus (seven days in the local configuration).
-
-### Local setup
-
-Start the shared monitoring services once, independently of any training command:
-
-```sh
-docker compose -f dev/monitoring/compose.yaml up -d
-```
-
-Configure custom clients and the API server before starting them:
-
-```sh
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
-export OTEL_METRIC_EXPORT_INTERVAL=5000
-export OPEN_RL_PROMETHEUS_URL=http://127.0.0.1:9090
-```
-
-Use the embedded dashboard with an in-memory server, or share `REDIS_URL` between
-the API server and standalone dashboard. No cloud credentials are needed locally.
-The server remains usable with export disabled or while the Collector is down;
-operation records still appear through the existing local/Redis path. The local
-Prometheus scrapes the Collector; hardware metrics require their usual exporters.
-
-### Kubernetes setup
-
-The optional overlay uses a stock Collector, a private Service and a GKE
-PodMonitoring for its Prometheus endpoint:
-
-```sh
-kubectl apply -k k8s/deploy/telemetry
-kubectl -n openrl-system set env deployment/open-rl-api-server \
-  OTEL_EXPORTER_OTLP_ENDPOINT=http://open-rl-collector:4318 \
-  OTEL_METRIC_EXPORT_INTERVAL=5000
-```
-
-New workers inherit the API server's `OTEL_*` configuration. Existing worker
-processes need restarting to pick up environment changes. The dashboard reads
-Managed Prometheus through its GKE workload identity with `roles/monitoring.viewer`, or an explicit
-`OPEN_RL_PROMETHEUS_URL`. The overlay does not create a public ingestion endpoint.
-For external clients, configure the deployment's authenticated HTTPS ingress and
-use standard `OTEL_EXPORTER_OTLP_HEADERS`; port-forwarding port 4318 is sufficient
-for development. There is no forwarding command per client run.
 
 ### Visible limits
 
