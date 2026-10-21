@@ -20,7 +20,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from server.sampling_dispatcher import UNKNOWN_WEIGHTS, Dispatcher, http_client, redis_client, revision_file, to_result
+from server.sampling_dispatcher import UNKNOWN_WEIGHTS, Dispatcher, HttpSampler, http_client, redis_client, revision_file, to_result
 from server.sampling_store import SamplingStore, future_key
 from tests.redis_server import RedisTestCase
 from tests.test_exclusive_trainer import tiny_worker
@@ -144,6 +144,21 @@ class FakeReplica:
     return JSONResponse({"choices": [CHOICE]})
 
 
+def routed_dispatcher(
+  store: SamplingStore, pool: str, http: httpx.AsyncClient, router_url: str | None, urls: list[str], concurrency: int
+) -> Dispatcher:
+  """The dispatcher of a pool of vllm serve replicas, as sampling_dispatcher.main builds it."""
+  return Dispatcher(store, pool, HttpSampler(http, pool, router_url, urls), concurrency)
+
+
+async def run_routed(dispatcher: Dispatcher) -> None:
+  """Runs it as sampling_dispatcher.main does, closing the sampler when it stops."""
+  try:
+    await dispatcher.run()
+  finally:
+    await dispatcher.sampler.close()
+
+
 def router(log: list, replicas: list[FakeReplica], http: httpx.AsyncClient) -> Starlette:
   # Forwards generate to a ready replica, one whose version is the expected one, like the EPP.
   async def route(request) -> Response:
@@ -195,8 +210,8 @@ class SamplingDispatcherTest(RedisTestCase):
 
   async def dispatcher(self, replicas: list[FakeReplica], concurrency: int = 4) -> asyncio.Task:
     router_url = await self.serve(router(self.log, replicas, self.http))
-    dispatcher = Dispatcher(self.store, self.pool, self.http, router_url, [r.url for r in replicas], concurrency=concurrency)
-    run = asyncio.create_task(dispatcher.run())
+    dispatcher = routed_dispatcher(self.store, self.pool, self.http, router_url, [r.url for r in replicas], concurrency=concurrency)
+    run = asyncio.create_task(run_routed(dispatcher))
     self.addAsyncCleanup(lambda: (run.cancel(), asyncio.gather(run, return_exceptions=True))[1])
     return run
 
@@ -237,8 +252,8 @@ class SamplingDispatcherTest(RedisTestCase):
     # The dispatcher's own clients, as main() builds them.
     self.store = SamplingStore(await self.enterAsyncContext(redis_client(self.url)))
     self.http = await self.enterAsyncContext(http_client())
-    dispatcher = Dispatcher(self.store, self.pool, self.http, None, [r.url for r in replicas], concurrency=256)
-    run = asyncio.create_task(dispatcher.run())
+    dispatcher = routed_dispatcher(self.store, self.pool, self.http, None, [r.url for r in replicas], concurrency=256)
+    run = asyncio.create_task(run_routed(dispatcher))
     self.addAsyncCleanup(lambda: (run.cancel(), asyncio.gather(run, return_exceptions=True))[1])
     await until(lambda: sum(entry[0] == "generate" for entry in self.log) == len(records), timeout=30)
     for replica in replicas:
@@ -272,8 +287,8 @@ class SamplingDispatcherTest(RedisTestCase):
 
     router_url = await self.serve(Starlette(routes=[Route("/inference/v1/generate", route, methods=["POST"])]))
     first = [await self.accepted() for _ in range(2)]
-    dispatcher = Dispatcher(self.store, self.pool, self.http, router_url, [hung.url, healthy.url], concurrency=2)
-    run = asyncio.create_task(dispatcher.run())
+    dispatcher = routed_dispatcher(self.store, self.pool, self.http, router_url, [hung.url, healthy.url], concurrency=2)
+    run = asyncio.create_task(run_routed(dispatcher))
     self.addAsyncCleanup(lambda: (run.cancel(), asyncio.gather(run, return_exceptions=True))[1])
     await until(lambda: self.log.count(("generate", "pod-0", "default")) == 2)
     await asyncio.sleep(1.1)
@@ -294,7 +309,7 @@ class SamplingDispatcherTest(RedisTestCase):
     self.enterContext(patch("server.sampling_dispatcher.SAMPLE_DEADLINE_SECONDS", 1))
     await self.accepted()
     [r] = await self.store.pending(self.pool)
-    dispatcher = Dispatcher(self.store, self.pool, self.http, None, [hung.url], concurrency=1)
+    dispatcher = routed_dispatcher(self.store, self.pool, self.http, None, [hung.url], concurrency=1)
     await asyncio.wait_for(dispatcher.send(r), 5)
     self.assertEqual(self.log, [("generate", "pod-0", "default")])
 
@@ -304,7 +319,7 @@ class SamplingDispatcherTest(RedisTestCase):
     prompt, count = [random.randrange(1000, 150000) for _ in range(20_000)], 50
     for _ in range(count):
       await self.accepted(prompt=prompt)
-    dispatcher = Dispatcher(self.store, self.pool, self.http, None, ["http://127.0.0.1:9"], concurrency=4)  # nothing answers
+    dispatcher = routed_dispatcher(self.store, self.pool, self.http, None, ["http://127.0.0.1:9"], concurrency=4)  # nothing answers
     tracemalloc.start()
     self.addCleanup(tracemalloc.stop)
     before, _ = tracemalloc.get_traced_memory()
@@ -346,8 +361,8 @@ class SamplingDispatcherTest(RedisTestCase):
     starting = "http://127.0.0.1:9"  # nothing listens here yet
     r = await self.accepted()
     router_url = await self.serve(router(self.log, replicas, self.http))
-    dispatcher = Dispatcher(self.store, self.pool, self.http, router_url, [starting, replica.url], concurrency=4)
-    run = asyncio.create_task(dispatcher.run())
+    dispatcher = routed_dispatcher(self.store, self.pool, self.http, router_url, [starting, replica.url], concurrency=4)
+    run = asyncio.create_task(run_routed(dispatcher))
     self.addAsyncCleanup(lambda: (run.cancel(), asyncio.gather(run, return_exceptions=True))[1])
     self.assertEqual(await self.results(r["request_id"]), [SAMPLE])
 
@@ -491,23 +506,23 @@ class SamplingDispatcherTest(RedisTestCase):
   async def test_a_replica_is_probed_for_an_open_update_on_first_sight_and_after_a_load_that_breaks_off_only(self):
     # The probe is a bare finish_weight_update, and vLLM logs a 500 traceback for each one that finds no update open.
     (replica,) = await self.replicas("default")
-    dispatcher = Dispatcher(self.store, self.pool, self.http, None, [replica.url], concurrency=1)
+    sampler = HttpSampler(self.http, self.pool, None, [replica.url])
 
     async def load(revision: str) -> None:
-      dispatcher.revision = revision
-      dispatcher.write_revision()
-      dispatcher.loading[replica.url] = task = asyncio.create_task(dispatcher.load_weights(replica.url, revision))
+      sampler.revision = revision
+      sampler.write_revision()
+      sampler.loading[replica.url] = task = asyncio.create_task(sampler.load_weights(replica.url, revision))
       await task
 
-    await dispatcher.inspect(replica.url)
+    await sampler.inspect(replica.url)
     w1, w2 = self.revision("w1"), self.revision("w2")
     await load(w1)
-    await dispatcher.inspect(replica.url)
+    await sampler.inspect(replica.url)
     self.assertEqual((replica.probes, replica.version), (1, w1))
     replica.fail_update = True
     await load(w2)
     probes = replica.probes  # the broken load closes its own update with a bare finish
-    await dispatcher.inspect(replica.url)
+    await sampler.inspect(replica.url)
     self.assertEqual((replica.probes, replica.version), (probes + 1, UNKNOWN_WEIGHTS))
 
   async def test_under_the_delta_strategy_a_replica_with_unknown_weights_stays_out_of_service(self):
