@@ -99,7 +99,7 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | `GET /query?name=&run=&node=&since=&until=&points=` | A named PromQL template from a server-side table (`run_gpu_util`, `run_gpu_busy`, `run_vllm_tokens`, `node_gpu_holders`, …), with `step = window / points` | `points` ≤ 1,000 per series |
 | `GET /logs?run_id=&q=&severity=&pod=&since=&until=` | The existing log route already searches by text, severity and pod | `limit` |
 | `GET /runs/{id}/commands?since=&until=&role=` | Command records from Redis, raw | `limit` |
-| `GET /runs/{id}/steps?fields=&from=&to=` | Client step rows, raw | 50 steps per page |
+| `GET /runs/{id}/steps?last=&fields=` | Trainer ops grouped by step, with stored client metrics (prefix filter) | 20 steps by default |
 | `GET /runs/{id}/checks?only=` | Check results | About 4.7 KB for all 15 |
 | `GET /runs/{id}/summary` | State, step, step time, last reward, per-GPU duty | About 1 KB |
 | `GET /inventory` | Runs and fleet, slimmed to what pages list | As today, smaller |

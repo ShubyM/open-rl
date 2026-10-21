@@ -2,9 +2,10 @@
 
 import asyncio
 import math
+import statistics
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -14,8 +15,22 @@ from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
 from server import telemetry
-from server.dashboard import collector, inspection, metrics, queries, sources
-from server.dashboard.schema import Activity, CollectorMetrics, Commands, History, Inventory, Logs, Operation, PodLogs, QueryResult, Series, Steps
+from server.dashboard import checks, collector, inspection, metrics, queries, sources
+from server.dashboard.schema import (
+  Activity,
+  Checks,
+  CollectorMetrics,
+  Commands,
+  History,
+  Inventory,
+  Logs,
+  Operation,
+  PodLogs,
+  QueryResult,
+  Series,
+  Steps,
+  Summary,
+)
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.model_metadata import decode_model_metadata
 from server.store import get_state_store
@@ -285,6 +300,83 @@ async def steps(
   for step in found:
     step["client"] = {k: v for k, v in client.get(step["step"], {}).items() if not keep or k.startswith(keep)}
   return {"run_id": run_id, "steps": found, **({"error": records["error"]} if records.get("error") else {})}
+
+
+async def check_context(run_id: str) -> dict:
+  state = await snapshot.current(get_state_store())
+  run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
+  if run is None:
+    raise HTTPException(404, f"No run {run_id}")
+  store, records = get_state_store(), await read_operations(run_id, is_finished(run))
+
+  async def counters():
+    found = {}
+    for event in ("enqueued", "popped", "answered"):
+      value = await store.get_value(telemetry.ledger_key(run_id, event))
+      found[event] = int(value) if value is not None else None
+    return found
+
+  ledger = await counters()
+  queued = ((run.get("progress") or {}).get("queued") or {}).get("trainer") or 0
+  if ledger["enqueued"] is not None and ledger["enqueued"] - (ledger["popped"] or 0) - queued > 0:
+    await asyncio.sleep(2)  # a pop in progress is counted a moment after it leaves the queue
+    ledger = await counters()
+  workers = [p for p in state.get("processes") or [] if p.get("runtime_id") in (run.get("runtime_id"), run_id) or p.get("pool") == run.get("pool")]
+  created = run.get("created_at")
+  return {
+    "run": run,
+    "samples": records["samples"],
+    "ledger": ledger,
+    "workers": workers,
+    "scheduler": bool(state["cluster"].get("scheduler", {}).get("installed")),
+    "finished": is_finished(run),
+    "now": datetime.fromisoformat(state["observed_at"]).timestamp(),
+    "since": created if isinstance(created, int | float) else 0.0,
+    "state": state,
+  }
+
+
+@router.get("/api/v1/inspect/runs/{run_id}/checks", operation_id="checks", response_model=Checks, response_model_exclude_unset=True)
+async def run_checks(run_id: str, only: Annotated[str | None, Query(description="Comma-separated check names; all when omitted")] = None):
+  """Diagnostic checks for the run: each a verdict (ok, warn, fail, unknown), a reason, a few numbers and evidence."""
+  names = [n for n in (only or "").split(",") if n]
+  if unknown := [n for n in names if n not in checks.CHECKS]:
+    raise HTTPException(400, f"Unknown checks {unknown}; use {sorted(checks.CHECKS)}")
+  return {"run_id": run_id, "checks": checks.run_checks(await check_context(run_id), names or None)}
+
+
+@router.get("/api/v1/inspect/runs/{run_id}/summary", operation_id="summary", response_model=Summary, response_model_exclude_unset=True)
+async def run_summary(run_id: str):
+  """The run in one answer: state, steps, step time, last trainer metrics, GPU duty by role, and which checks fail or warn."""
+  ctx = await check_context(run_id)
+  results = checks.run_checks(ctx)
+  steps_ = checks.optim_steps(ctx)
+  gaps = [b["at"] - a["at"] for a, b in zip(steps_, steps_[1:])]
+  last = {k: v for s in checks.trainer_ops(ctx)[-50:] for k, v in s.get("metrics", {}).items()}
+  run, state = ctx["run"], ctx["state"]
+  # Duty over the run's own span: averaging in the idle days after it ended would understate it.
+  ops = sorted(s["at"] for s in ctx["samples"])
+  window = {"since": None, "until": state["observed_at"]}
+  if ops:
+    end = min(ctx["now"], ops[-1] + 60)
+    window = {k: datetime.fromtimestamp(t, UTC).isoformat() for k, t in (("since", max(ops[0] - 60, end - 7 * 86400)), ("until", end))}
+  duty = await queries.run("gpu_busy", state, run_id, None, ctx["samples"], window["since"], window["until"], 1)
+  roles = {u: p.get("role") for p in inspection.sources(state, run_id=run_id, samples=ctx["samples"]) for u in (p.get("device_uuids") or {}).values()}
+  busy: dict[str, list[float]] = {}
+  for series_ in duty.get("series", []):
+    if series_["points"]:
+      busy.setdefault(roles.get(series_["labels"].get("UUID")) or "other", []).append(series_["points"][-1][1])
+  return {
+    "run_id": run_id,
+    "state": run.get("display_status") if ctx["finished"] else (run.get("progress") or {}).get("state") or run.get("display_status"),
+    "steps": len(steps_),
+    "step_seconds": {"median": statistics.median(gaps), "last": gaps[-1]} if gaps else None,
+    "last_metrics": last,
+    "gpu_busy": {role: round(sum(v) / len(v), 1) for role, v in busy.items()},
+    "failing": [r["check"] for r in results if r["verdict"] == checks.FAIL],
+    "warning": [r["check"] for r in results if r["verdict"] == checks.WARN],
+    "unknown": [r["check"] for r in results if r["verdict"] == checks.UNKNOWN],
+  }
 
 
 # Client step history that gateways kept before OpenTelemetry; read only, nothing writes it now.

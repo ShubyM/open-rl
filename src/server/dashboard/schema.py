@@ -1,5 +1,7 @@
 """Shared HTTP response contracts. Preserve extra source diagnostics and absent fields."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, JsonValue, model_validator
 
 
@@ -342,6 +344,33 @@ class Steps(Record):
   run_id: str
   steps: list[Step]
   error: str | None = None
+
+
+class CheckResult(Record):
+  check: str
+  verdict: Literal["ok", "warn", "fail", "unknown"] = Field(description="unknown: an input is missing; never read it as ok")
+  reason: str
+  numbers: dict[str, JsonValue] = Field(default_factory=dict)
+  evidence: str | None = Field(None, description="Where to look next: a route, a pod, or a Redis key")
+
+
+class Checks(Record):
+  run_id: str
+  checks: list[CheckResult]
+
+
+class Summary(Record):
+  """The run in one answer, for a status line or an agent's first call."""
+
+  run_id: str
+  state: str | None = None
+  steps: int
+  step_seconds: dict[str, float] | None = None
+  last_metrics: dict[str, float] = Field(default_factory=dict, description="Latest trainer metrics, from the newest ops")
+  gpu_busy: dict[str, float] = Field(default_factory=dict, description="Mean GPU duty cycle by role over the run, percent")
+  failing: list[str] = Field(default_factory=list)
+  warning: list[str] = Field(default_factory=list)
+  unknown: list[str] = Field(default_factory=list)
 
 
 class HistoryRow(Record):
