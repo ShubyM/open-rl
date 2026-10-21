@@ -81,7 +81,7 @@ class InspectionApiTest(unittest.TestCase):
     self.store.read_samples.assert_awaited_once_with(router.telemetry.ops_key("r1"))
 
   def test_series_is_independently_callable_and_keeps_partial_data(self):
-    backend = mock.Mock(name="hardware")
+    backend = mock.Mock(name="hardware", slots={})
     backend.name = "fake"
     backend.devices = mock.AsyncMock(return_value=({}, {"utilization": "GPU metrics query unavailable"}))
     backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"trainer-0": [[150, 2]]}}, {}))
@@ -118,7 +118,7 @@ class InspectionApiTest(unittest.TestCase):
   def test_historical_sampler_operations_feed_both_logs_and_series(self):
     self.state.update(placements=[], processes=[])
     self.store.read_samples.return_value = [operation(125, 170, role="sampler", pod="deleted-sampler", operation="sample")]
-    backend = mock.Mock(name="prometheus")
+    backend = mock.Mock(name="prometheus", slots={})
     backend.name = "prometheus"
     backend.samplers = mock.AsyncMock(return_value=({"requests_running": [[150, 2]]}, {"request_latency_p99_seconds": "Query unavailable"}))
     backend.devices = mock.AsyncMock()

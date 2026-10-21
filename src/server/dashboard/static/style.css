@@ -240,6 +240,10 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .run-activity .activity-gpu { color: var(--dim); font: 11px var(--mono); overflow-wrap: anywhere; }
 #app .run-activity .activity-row[data-continued] { min-height: 30px; border-top-color: transparent; }
 #app .run-activity .activity-row[data-continued] .activity-track { height: 30px; }
+#app .run-activity .activity-row[data-lead] { min-height: 30px; }
+#app .run-activity .activity-row[data-lead] .activity-track { height: 30px; }
+/* A group's label overhangs the empty label cells of its later rows, so every GPU row keeps one pitch. */
+#app .run-activity .activity-row[data-lead] .activity-label { align-self: start; align-items: flex-start; height: 30px; overflow: visible; }
 #app .activity-source { margin-top: 12px; color: var(--dim); font-size: 11px; }
 #app .run-metrics { margin-top: 8px; }
 #app .time-control.run-time-controls { grid-template-columns: 32px minmax(0, 1fr) 32px auto auto; width: 520px; }

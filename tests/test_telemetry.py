@@ -174,7 +174,7 @@ class PromQLTest(unittest.TestCase):
   def test_a_sampler_timeout_does_not_discard_other_charts(self):
     backend = PromQL("prometheus", "https://example", None, None, "openrl-system")
 
-    async def query(query, start, end):
+    async def query(query, start, end, by=None):
       if "num_requests_waiting" in query:
         raise TimeoutError
       return {"": [[1, 2]]}
@@ -235,7 +235,7 @@ class HardwareSeriesTest(unittest.TestCase):
       "placements": [],
       "processes": [],
     }
-    backend = mock.Mock()
+    backend = mock.Mock(slots={})
     backend.name = "fake"
     for errors in ({}, {"memory_mib": "Offline"}, dict.fromkeys(sources.GPU_METRICS, "Offline")):
       with self.subTest(errors=errors):
@@ -258,7 +258,7 @@ class HardwareSeriesTest(unittest.TestCase):
       ],
     }
     state["cluster"]["nodes"][0]["devices"].append({"id": "gone", "uuid": GPU})
-    backend = mock.Mock(name="source")
+    backend = mock.Mock(name="source", slots={})
     backend.name = "fake"
     backend.devices = mock.AsyncMock(return_value=({"utilization": {GPU: [[1, 80]]}}, {}))
     backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"old-pod": [[1, 2]]}}, {}))
@@ -283,6 +283,7 @@ class HardwareSeriesTest(unittest.TestCase):
 
     class Backend:
       name = "fake"
+      slots = {}
 
       async def devices(self, uuids, start, end):
         return {"utilization": {u: [[start, 90.0]] for u in uuids}, "memory_mib": {u: [[start, 1.0]] for u in uuids}}, {}
@@ -331,7 +332,7 @@ class HardwareSeriesTest(unittest.TestCase):
         }
       ],
     }
-    backend = mock.Mock()
+    backend = mock.Mock(slots={})
     backend.name = "fake"
     backend.devices = mock.AsyncMock(return_value=({"utilization": {GPU: [[3, 50]]}}, {}))
     backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"reused-name": [[1, 1], [3, 2], [9, 3]]}}, {}))

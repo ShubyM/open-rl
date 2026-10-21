@@ -425,6 +425,7 @@ class PromQL:
   def __init__(self, name, url, token: Callable[[], str] | None, cluster_name, namespace, extra_headers: Callable[[], dict] | None = None):
     self.name, self.url, self.token, self.extra_headers, self.cluster, self.namespace = name, url, token, extra_headers, cluster_name, namespace
     self.headers_task: asyncio.Task[dict] | None = None
+    self.slots: dict[str, str] = {}  # GPU UUID -> the slot DCGM reported it in, which outlives the node
 
   async def load_headers(self) -> dict:
     headers = {}
@@ -447,15 +448,19 @@ class PromQL:
       raise ValueError(payload.get("error") or "query failed")
     return payload["data"]["result"]
 
-  async def query_range(self, query: str, start: float, end: float) -> dict[str, list[list[float]]]:
-    """{series label value: points} for a query aggregated `by (<one label>)`."""
-    return {
-      next(iter(r["metric"].values()), ""): [[float(t), float(v)] for t, v in r.get("values", []) if v not in ("NaN", "+Inf", "-Inf")]
-      for r in await self.range_rows(query, start, end)
-    }
+  async def query_range(self, query: str, start: float, end: float, by: str | None = None) -> dict[str, list[list[float]]]:
+    """{series label value: points} for a query aggregated `by (<one label>)`, or keyed by the label `by` names."""
+    found = {}
+    for r in await self.range_rows(query, start, end):
+      labels = r["metric"]
+      if "UUID" in labels and "gpu" in labels:
+        self.slots[labels["UUID"]] = labels["gpu"]
+      key = labels.get(by, "") if by else next(iter(labels.values()), "")
+      found[key] = [[float(t), float(v)] for t, v in r.get("values", []) if v not in ("NaN", "+Inf", "-Inf")]
+    return found
 
-  async def query_many(self, queries: dict[str, str], start: float, end: float) -> tuple[dict, dict[str, str]]:
-    results = await asyncio.gather(*(self.query_range(q, start, end) for q in queries.values()), return_exceptions=True)
+  async def query_many(self, queries: dict[str, str], start: float, end: float, by: str | None = None) -> tuple[dict, dict[str, str]]:
+    results = await asyncio.gather(*(self.query_range(q, start, end, by) for q in queries.values()), return_exceptions=True)
     found, errors = {}, {}
     for name, result in zip(queries, results, strict=True):
       if isinstance(result, TimeoutError | httpx.TimeoutException):
@@ -473,8 +478,8 @@ class PromQL:
 
   async def devices(self, uuids: list[str], start: float, end: float) -> tuple[dict, dict[str, str]]:
     # max by UUID: a GPU scraped by two exporters must not double-count.
-    queries = {name: f"max by (UUID) ({metric}{{UUID=~{any_of(uuids)}{self.scope('cluster')}}})" for name, metric in GPU_METRICS.items()}
-    return await self.query_many(queries, start, end)
+    queries = {name: f"max by (UUID, gpu) ({metric}{{UUID=~{any_of(uuids)}{self.scope('cluster')}}})" for name, metric in GPU_METRICS.items()}
+    return await self.query_many(queries, start, end, by="UUID")
 
   async def workers_series(self, pods: list[str], start: float, end: float) -> tuple[dict, dict[str, str]]:
     # GKE system metrics, free on every GKE cluster; absent on other Prometheus servers.

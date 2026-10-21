@@ -1,13 +1,13 @@
 <script>
   import { nodeLink, viewLink, crosshair, crosshairOffset, timeAt } from "./state.svelte.js";
   import { axisTime, chartTime, valueText, placementColor, processLabel, shortNodeName, opRank, opLabel, activitySource, deviceLabel } from "./visualization.js";
-  let { placements = [], range, inventory, acrossNodes = false, activeOnly = false, selected = null, onselect, error = null, pending = false, showSource = true, back = null, navigating = false, onpick = null, duty = null } = $props();
+  let { placements = [], range, inventory, acrossNodes = false, activeOnly = false, selected = null, onselect, error = null, pending = false, showSource = true, back = null, navigating = false, onpick = null, duty = null, slots = null } = $props();
   let tooltip = $state(null), tip;
   const cursor = $derived(crosshairOffset(range));
   const activities = $derived(placements.toSorted((a, b) => (acrossNodes ? (({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""))) : 0) || a.start - b.start || a.id.localeCompare(b.id)));
   const shown = $derived(activeOnly ? activities.filter((p) => p.intervals.length || p.error) : activities);
   // The run view draws one row per GPU; a multi-GPU process runs each op on all its GPUs, so its rows repeat the lane.
-  const rows = $derived(shown.flatMap((p) => (acrossNodes && p.devices?.length ? p.devices : [null]).map((id, i) => ({ key: `${p.id}:${id ?? "none"}`, lane: p, device: id && gpuOf(p, id), first: i === 0 }))));
+  const rows = $derived(shown.flatMap((p) => (acrossNodes && p.devices?.length ? p.devices : [null]).map((id, i) => ({ key: `${p.id}:${id ?? "none"}`, lane: p, device: id && gpuOf(p, id), first: i === 0, lead: i === 0 && p.devices.length > 1 }))));
   const warnings = $derived([...new Set(activities.flatMap((p) => [p.partial, p.errorStatus !== 404 && p.error]).filter(Boolean))]);
   const ops = $derived([...new Set(shown.flatMap((p) => Object.keys(p.ops || {})))].sort((a, b) => opRank(a) - opRank(b) || a.localeCompare(b)));
   const empty = $derived(error ? `Activity unavailable: ${error}` : pending ? "Loading activity…" : acrossNodes && !activities.length ? "No worker processes for this run in this window" : "No recorded activity in this window");
@@ -17,7 +17,7 @@
   // A lane names its GPUs by DRA device or by UUID, and its node may no longer be reported.
   function gpuOf(p, id) {
     const uuid = p.device_uuids?.[id], device = inventory.cluster.nodes.find((n) => n.name === p.node)?.devices.find((d) => d.id === id || (uuid && d.uuid === uuid));
-    return { id, uuid, label: device ? `GPU ${deviceLabel(device.name)}` : id.includes("/") ? `GPU ${deviceLabel(id)}` : (uuid || id).slice(0, 12) };
+    return { id, uuid, label: device ? `GPU ${deviceLabel(device.name)}` : id.includes("/") ? `GPU ${deviceLabel(id)}` : slots?.[uuid || id] != null ? `GPU ${slots[uuid || id]}` : (uuid || id).slice(0, 12) };
   }
   const dutyText = (device) => { const value = device && (duty?.[device.uuid] ?? duty?.[device.id]); return Number.isFinite(value) ? `${value}%` : "—"; };
   $effect(() => { placements; range; navigating; tooltip = null; });
@@ -47,12 +47,12 @@
   {:else}
     <div class="activity-timeline" aria-label="Recorded run activity">
       <div class="activity-header"><h3>{acrossNodes ? "Process" : "Run"}</h3>{#if acrossNodes}<h3>GPU</h3>{/if}<div class="activity-axis">{#each [0, 1, 2, 3, 4] as tick}<span>{axisTime(range.start + (range.now - range.start) * tick / 4, range)}</span>{/each}</div>{#if acrossNodes}<span class="node-duty" title="Duty cycle: mean GPU utilization (share of time a kernel was running) over this window, from DCGM">Duty</span>{/if}</div>
-      {#each rows as { key, lane: p, device, first } (key)}
+      {#each rows as { key, lane: p, device, first, lead } (key)}
         {@const name = acrossNodes ? processLabel(p, inventory.cluster.nodes, { gpus: false }) : p.label}
         {@const meta = acrossNodes ? p.node ? shortNodeName(p.node, inventory.cluster.nodes) : p.ended && p.pod ? p.pod : "Node unassigned" : p.role || "process"}
         {@const link = href(p)}
         {@const status = p.error ? "Ops unavailable" : !p.intervals.length ? "No recorded activity" : ""}
-        <div class={`activity-row ${placementColor(p)}`} data-key={p.id} data-selected={!acrossNodes && p.id === selected} data-continued={first ? undefined : ""}>
+        <div class={`activity-row ${placementColor(p)}`} data-key={p.id} data-selected={!acrossNodes && p.id === selected} data-continued={first ? undefined : ""} data-lead={lead ? "" : undefined}>
           {#if first}<svelte:element this={link ? "a" : "span"} class={`activity-label ${placementColor(p)}`} data-key={`label:${p.id}`} href={link || undefined} aria-disabled={!link ? "true" : undefined} title={acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !link ? " · Node no longer reported" : ""}` : p.label}>
             <span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">{name}</span><span class="activity-meta">{meta}{p.ended ? " · Process ended" : p.phase && p.phase !== "ready" ? ` · ${p.phase.replace("_", " ")}` : ""}{!link ? acrossNodes ? p.node ? " · Node no longer reported" : "" : p.run_ids?.length ? " · Run record unavailable" : " · No linked run" : ""}</span></span>
           </svelte:element>{:else}<span></span>{/if}

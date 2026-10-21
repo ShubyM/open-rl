@@ -55,6 +55,8 @@
     const values = (d.utilization || []).filter(([at]) => at >= range.start && at <= range.now).map(([, v]) => v);
     return values.length ? [d.id, d.uuid].filter(Boolean).map((key) => [key, Math.round(values.reduce((a, b) => a + b, 0) / values.length)]) : [];
   })));
+  // DCGM's slot index names a GPU whose node is gone.
+  const slots = $derived(Object.fromEntries((gpus.data?.devices || []).filter((d) => d.slot != null).map((d) => [d.uuid, d.slot])));
   // The vLLM series the inspection API returns for a run's samplers, as vLLM's and llm-d's dashboards chart them.
   const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
     ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
@@ -116,7 +118,7 @@
     {#if view.tab === "logs"}
       {#if validEvent}<Logs {run} {view} {range} {navigating} allLogs={link("logs", { event: null, end: null })} />{/if}
     {:else if view.tab !== "metrics"}
-      <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} {duty} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
+      <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} {duty} {slots} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {:else}
       <div class="run-metrics" data-run-metrics={view.id}>
           <CollectorMetrics params={bounds} {view} {range} {navigating} />

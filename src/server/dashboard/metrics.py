@@ -81,7 +81,7 @@ async def series(state: dict, node_id=None, since=None, until=None, run_id=None,
     "error": reason or (error if not gpu_ok + cpu_ok + vllm_ok else None),
     "since": start,
     "until": end,
-    "devices": gpu,
+    "devices": [{**row, "slot": backend.slots.get(row["uuid"])} if backend and row["uuid"] in backend.slots else row for row in gpu],
     "workers": cpu,
     **(
       {
