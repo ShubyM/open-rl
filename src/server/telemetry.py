@@ -54,6 +54,8 @@ SEVERITIES = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 # The SDK attaches full request and response headers to fatal errors, and the request carries the API key.
 DROPPED = {"request_headers", "response_headers"}
 SECRET = re.compile(r"authorization|cookie|api[-_]?key|access[-_]?token|secret|password", re.I)
+CONFIG_ENV = ("OPEN_RL_", "OPENRL_", "VLLM_", "NCCL_", "CUDA_", "PYTORCH_", "TORCH_")
+PACKAGES = ("torch", "transformers", "peft", "vllm", "nemo_automodel", "megatron-core", "flash-attn", "open-rl")
 
 
 def ops_key(run_id: str) -> str:
@@ -115,17 +117,48 @@ def worker_identity() -> dict:
   return {field: value for field, env in (("pod", "POD_NAME"), ("pod_uid", "POD_UID"), ("node", "NODE_NAME")) if (value := os.getenv(env))}
 
 
+def visible_gpus() -> list:
+  """NVML handles of the GPUs this process can see, in CUDA order."""
+  import pynvml
+
+  pynvml.nvmlInit()
+  handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]
+  visible = os.getenv("CUDA_VISIBLE_DEVICES")
+  return [h for i, h in enumerate(handles) if visible is None or str(i) in visible.split(",") or pynvml.nvmlDeviceGetUUID(h) in visible]
+
+
 def gpu_uuids() -> list[str]:
   """The GPUs this process can see, as the UUIDs DCGM labels its series with."""
   try:
     import pynvml
 
-    pynvml.nvmlInit()
-    uuids = [pynvml.nvmlDeviceGetUUID(pynvml.nvmlDeviceGetHandleByIndex(i)) for i in range(pynvml.nvmlDeviceGetCount())]
+    return [pynvml.nvmlDeviceGetUUID(h) for h in visible_gpus()]
   except Exception:
     return []
-  visible = os.getenv("CUDA_VISIBLE_DEVICES")
-  return [u for i, u in enumerate(uuids) if visible is None or str(i) in visible.split(",") or u in visible]
+
+
+def gpu_now() -> list[dict]:
+  """Utilization and memory of each visible GPU now, so GPU checks work without a metrics backend."""
+  try:
+    import pynvml
+
+    readings = []
+    for h in visible_gpus():
+      util, memory = pynvml.nvmlDeviceGetUtilizationRates(h).gpu, pynvml.nvmlDeviceGetMemoryInfo(h).used >> 20
+      readings.append({"uuid": pynvml.nvmlDeviceGetUUID(h), "util": util, "mem_mib": memory})
+    return readings
+  except Exception:
+    return []
+
+
+def effective_config() -> dict:
+  """What this process actually runs with: the settings the scheduler passed as env, and the package versions installed."""
+  env = {k: v for k, v in os.environ.items() if k.startswith(CONFIG_ENV) and not SECRET.search(k)}
+  versions = {}
+  for package in PACKAGES:
+    with suppress(Exception):
+      versions[package] = importlib.metadata.version(package)
+  return {"env": dict(sorted(env.items())), "versions": versions}
 
 
 def alive(record: dict, now: float) -> bool:
@@ -164,7 +197,11 @@ async def serving(role: str, runtime_id: str | None, **fields):
   """Keep this process's record fresh while the body runs; a clean exit says so."""
   global current
   current = worker = Worker(role, runtime_id)
-  worker.record.update(fields)
+  worker.record.update(fields, config=effective_config())
+  # One structured line per process start: the effective-config check compares it with what the run asked for.
+  identity = {k: worker.record.get(k) for k in ("id", "role", "runtime_id", "pod", "pod_uid", "node", "gpus")}
+  echo = {"kind": "openrl.config", "v": 1, **identity, **worker.record["config"]}
+  print(json.dumps({"severity": "INFO", "message": "openrl.config", "openrl": echo}), flush=True)
 
   async def save():
     with suppress(Exception):
@@ -173,6 +210,7 @@ async def serving(role: str, runtime_id: str | None, **fields):
 
   async def heartbeat():
     while True:
+      worker.record["gpu_now"] = gpu_now()
       await save()
       await asyncio.sleep(HEARTBEAT_SECONDS)
 

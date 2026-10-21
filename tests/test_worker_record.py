@@ -57,6 +57,16 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     self.assertFalse(telemetry.alive(record, record["heartbeat_at"]))
     self.assertIsNone(telemetry.current)
 
+  async def test_each_process_echoes_its_settings_once_without_secrets(self) -> None:
+    env = {"OPEN_RL_FINE_TUNING_TYPE": "lora", "VLLM_MAX_LORAS": "8", "OPEN_RL_API_KEY": "sk-private", "HOME": "/root"}
+    with mock.patch.dict("os.environ", env), mock.patch("builtins.print") as printed:
+      async with telemetry.serving("trainer", "run-a") as worker:
+        record = await self.saved(worker.record["id"])
+    self.assertEqual(record["config"]["env"], {"OPEN_RL_FINE_TUNING_TYPE": "lora", "VLLM_MAX_LORAS": "8"})
+    (echo,) = [json.loads(c.args[0]) for c in printed.call_args_list if "openrl.config" in str(c.args[0])]
+    self.assertEqual((echo["openrl"]["role"], echo["openrl"]["env"]), ("trainer", record["config"]["env"]))
+    self.assertNotIn("sk-private", repr(printed.call_args_list))
+
   async def test_popped_requests_stay_outstanding_until_their_answer_is_written(self) -> None:
     async with telemetry.serving("trainer", "base") as worker:
       telemetry.popped([{"request_id": f"f{i}", "op": "forward_backward", "model_id": "run-a"} for i in range(3)] + [{"op": "no id"}])
