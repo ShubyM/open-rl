@@ -96,6 +96,7 @@ class _LogitModelStub:
   def __init__(self, vocab_size: int = 17):
     self.vocab_size = vocab_size
     self.calls = []
+    self.config = types.SimpleNamespace(get_text_config=lambda: types.SimpleNamespace())
 
   def train(self):
     return None
@@ -107,7 +108,11 @@ class _LogitModelStub:
     positions = torch.arange(input_tensor.shape[1], dtype=torch.float32, device=input_tensor.device).view(1, -1, 1)
     logits = torch.cos(input_tensor.float().unsqueeze(-1) * 0.11 + positions * 0.07 + vocab * 0.13)
     logits.requires_grad_()
-    return types.SimpleNamespace(logits=logits)
+    return types.SimpleNamespace(logits=logits, hidden_states=(logits,))
+
+  def get_output_embeddings(self):
+    # The stub's final hidden states are already its logits.
+    return torch.nn.Identity()
 
 
 class _FullModelStub:
