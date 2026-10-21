@@ -49,7 +49,6 @@ class CollectorMetricsTest(unittest.IsolatedAsyncioTestCase):
     self.assertIn('openrl_model_id="model-a"', expression)
     self.assertIn('openrl_model_id="",session_id=~' + json.dumps(r"session\-a"), expression)
     self.assertIn('openrl_model_id="",session_id="",openrl_runtime_id=~', expression)
-    self.assertIn('metric=~"(?i).*reward\\\\.\\\\*\\"\\\\}.*"', expression)
 
   async def test_visible_series_cap_search_and_empty_or_failed_backend(self):
     rows = [

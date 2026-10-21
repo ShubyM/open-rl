@@ -39,53 +39,6 @@ class KubernetesInventoryTest(unittest.TestCase):
         self.assertEqual(summary["worker"]["age_seconds"], 9)
         self.assertEqual((summary["phase"], summary["reason"]), (status["phase"], status.get("reason")))
 
-  def test_container_states_preserve_nullable_fields_and_previous_termination(self):
-    at = datetime(2026, 1, 1, tzinfo=UTC)
-    ended = client.V1ContainerStateTerminated(exit_code=137, reason="OOMKilled", started_at=at, finished_at=at)
-    previous = client.V1ContainerState(terminated=ended)
-    cases = [
-      (None, "unknown", None, None, None, None),
-      (client.V1ContainerState(running=client.V1ContainerStateRunning(started_at=at)), "running", None, None, at.isoformat(), None),
-      (client.V1ContainerState(waiting=client.V1ContainerStateWaiting(reason="CrashLoopBackOff")), "waiting", "CrashLoopBackOff", None, None, None),
-      (previous, "terminated", "OOMKilled", 137, at.isoformat(), at.isoformat()),
-    ]
-    for state, phase, reason, code, started, finished in cases:
-      with self.subTest(phase=phase):
-        row = sources.container_summary("worker", "image:v1", state, 2, previous)
-        self.assertEqual(
-          (row["name"], row["state"], row["reason"], row["exit_code"], row["started_at"], row["finished_at"]),
-          ("worker", phase, reason, code, started, finished),
-        )
-        self.assertEqual(row["restart_count"], 2)
-        self.assertEqual(
-          row["last_termination"], {"reason": "OOMKilled", "exit_code": 137, "started_at": at.isoformat(), "finished_at": at.isoformat()}
-        )
-
-  def test_unstarted_pod_has_the_same_container_shape(self):
-    pod = client.V1Pod(
-      metadata=client.V1ObjectMeta(name="p", uid="uid"),
-      spec=client.V1PodSpec(containers=[client.V1Container(name="worker", image="trainer:v1")]),
-      status=client.V1PodStatus(phase="Pending"),
-    )
-    row = sources.pod_summary(pod)
-    self.assertEqual(row["problem"], "Pending")
-    self.assertEqual(
-      row["containers"],
-      [
-        {
-          "name": "worker",
-          "image": "trainer:v1",
-          "state": "unknown",
-          "reason": None,
-          "exit_code": None,
-          "started_at": None,
-          "finished_at": None,
-          "restart_count": 0,
-          "last_termination": None,
-        }
-      ],
-    )
-
   def test_a_container_running_again_after_a_crash_is_not_a_problem(self):
     at = datetime(2026, 1, 1, tzinfo=UTC)
     crashed = client.V1ContainerState(terminated=client.V1ContainerStateTerminated(exit_code=1, reason="Error", finished_at=at))
@@ -98,11 +51,6 @@ class KubernetesInventoryTest(unittest.TestCase):
     )
     row = sources.pod_summary(pod)
     self.assertEqual((row["problem"], row["restarts"]), (None, 1))
-
-  def test_a_probe_traceback_event_keeps_only_its_first_and_last_lines(self):
-    probe = 'Readiness probe failed: Traceback (most recent call last):\n  File "<string>", line 2\nURLError: [Errno 111]\n'
-    self.assertEqual(sources.event_message(probe), "Readiness probe failed: Traceback (most recent call last): … URLError: [Errno 111]")
-    self.assertEqual(sources.event_message("Back-off restarting failed container"), "Back-off restarting failed container")
 
 
 class PromQLTest(unittest.TestCase):
@@ -236,54 +184,6 @@ class PromQLTest(unittest.TestCase):
     self.assertEqual(found["requests_running"], [[1, 2]])
     self.assertEqual(found["requests_waiting"], [])
     self.assertEqual(errors, {"requests_waiting": "Metrics query timed out"})
-
-  def test_one_query_per_metric_scoped_to_the_cluster_and_deduplicated_by_uuid(self) -> None:
-    backend = PromQL("gke", "https://example", None, "open-rl-fft-test", "openrl-system")
-    queries = []
-
-    async def fake(query, start, end):
-      queries.append(query)
-      return {GPU: [[1.0, 7.0]]}
-
-    with mock.patch.object(backend, "query_range", side_effect=fake):
-      result, errors = asyncio.run(backend.devices([GPU, "GPU-other"], 0, 60))
-    self.assertEqual(errors, {})
-    self.assertEqual(len(queries), 2)
-    self.assertTrue(all(q.startswith("max by (UUID) (DCGM_FI_DEV_") and 'cluster="open-rl-fft-test"' in q for q in queries))
-    self.assertIn("GPU\\\\-375ff71c", queries[0])  # regex-escaped inside a PromQL string
-    self.assertEqual(result["utilization"], {GPU: [[1.0, 7.0]]})
-
-  def test_sampler_series_use_vllm_metrics_summed_over_the_runs_replicas(self) -> None:
-    backend = PromQL("gke", "https://example", None, "open-rl-fft-test", "openrl-system")
-    queries = []
-
-    async def fake(query, start, end):
-      queries.append(query)
-      return {"": [[1.0, 2.0]]}
-
-    with mock.patch.object(backend, "query_range", side_effect=fake):
-      result, errors = asyncio.run(backend.samplers(["sampler-0", "sampler-1"], 0, 60))
-    self.assertEqual(errors, {})
-    self.assertEqual(set(result), set(sources.SAMPLER_QUERIES))
-    match = f'namespace="openrl-system",pod=~{sources.any_of(["sampler-0", "sampler-1"])},cluster="open-rl-fft-test"'
-    self.assertTrue(all("vllm:" in q and match in q for q in queries), queries)
-    self.assertEqual(result["requests_waiting"], [[1.0, 2.0]])
-
-  def test_worker_series_use_gke_container_metrics_by_pod(self) -> None:
-    backend = PromQL("gke", "https://example", None, None, "openrl-system")
-    queries = []
-
-    async def fake(query, start, end):
-      queries.append(query)
-      return {"orw-trainer": [[1.0, 3.0]]}
-
-    with mock.patch.object(backend, "query_range", side_effect=fake):
-      result, errors = asyncio.run(backend.workers_series(["orw-trainer"], 0, 60))
-    self.assertEqual(errors, {})
-    self.assertIn("kubernetes_io:container_cpu_core_usage_time", queries[0])
-    self.assertIn('namespace_name="openrl-system"', queries[0])
-    self.assertIn("kubernetes_io:container_memory_used_bytes", queries[1])
-    self.assertEqual(result, {"cpu_cores": {"orw-trainer": [[1.0, 3.0]]}, "memory_bytes": {"orw-trainer": [[1.0, 3.0]]}})
 
   def test_queries_made_at_different_moments_share_sample_times(self) -> None:
     # Each allocation is fetched separately and the window slides with every

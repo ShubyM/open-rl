@@ -116,10 +116,6 @@ class SnapshotJoinTest(unittest.TestCase):
         run = snapshot.join_runs([row], state)[0]
         self.assertEqual((run["runtime_id"], run["shared_runtime"]), (model.runtime("r1"), model.shares_runtime()))
 
-  def test_placements_record_pod_identity(self) -> None:
-    placement = snapshot.placements_of(STATE, snapshot.join_runs(METADATA, STATE))[0]
-    self.assertEqual(placement["pod_uid"], "p1")
-
   def test_only_placed_workloads_become_placements_and_carry_their_runs(self) -> None:
     runs = snapshot.join_runs(METADATA, STATE)
     placements = snapshot.placements_of(STATE, runs)

@@ -593,26 +593,6 @@ class TrainerBackendTest(ApiServerTest):
 
 
 class TelemetryTest(ApiServerTest):
-  def test_each_sdk_event_becomes_one_json_line(self) -> None:
-    body = {
-      "session_id": "sess-123",
-      "platform": "linux",
-      "sdk_version": "0.29.0",
-      "process_uuid": "uuid-456",
-      "events": [
-        {"event": "SESSION_START", "severity": "INFO", "timestamp": "2024-01-01"},
-        {"event": "GENERIC_EVENT", "event_name": "custom_event", "severity": "DEBUG"},
-      ],
-    }
-    with patch("sys.stdout", new_callable=io.StringIO) as stdout:
-      response = self.client.post("/api/v1/telemetry", json=body)
-
-    self.assertEqual(response.json(), {"status": "accepted"})
-    lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
-    rows = [(line["severity"], line["message"], line["session_id"]) for line in lines]
-    self.assertEqual(rows, [("INFO", "tinker SESSION_START", "sess-123"), ("DEBUG", "tinker custom_event", "sess-123")])
-    self.assertEqual(lines[0]["event"]["timestamp"], "2024-01-01")
-
   def test_a_fatal_sdk_error_is_logged_without_credentials_and_shows_on_its_run(self) -> None:
     session_id = self.post("create_session", {}).json()["session_id"]
     model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]

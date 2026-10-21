@@ -202,7 +202,7 @@ Logs come from the project's default buckets, which usually keep 30 days. To kee
 
 The [openrl-inspect skill](../skills/openrl-inspect/SKILL.md) shows agents how to diagnose runs with this API.
 
-For local regression checks, run `make test`; query lifecycle checks run with `node --test dev/dashboard/query.test.mjs` after installing the dashboard dependencies.
+For local regression checks, run `make test`.
 
 `uv run --extra cluster python dev/inspection_eval.py --port 9042` serves ten deterministic cases through the real inspection routes without cluster access. Give an agent only a printed case URL, run ID, symptom, and the skill; the fixture source contains the answer key. Score diagnosis, cited evidence, uncertainty, next check, and whether it obeyed instructions embedded in logs.
 

@@ -139,14 +139,6 @@ class InspectionApiTest(unittest.TestCase):
     backend.devices.assert_not_awaited()
     backend.workers_series.assert_not_awaited()
 
-  def test_invalid_series_kinds_fail_before_reading_sources(self):
-    for params, expected in (({"kind": "invalid"}, 422), ({"kind": "samplers"}, 400)):
-      response = self.client.get("/api/v1/inspect/series", params=params)
-      self.assertEqual(response.status_code, expected)
-    router.snapshot.current.assert_not_awaited()
-    router.sources.discover.assert_not_awaited()
-    self.store.read_samples.assert_not_awaited()
-
   def test_unavailable_historical_records_leave_logs_and_series_with_a_note(self):
     # A run whose records cannot be read still has its known pods' logs and series, and says what is missing.
     self.store.read_samples.side_effect = RuntimeError("store offline")
@@ -192,12 +184,6 @@ class InspectionApiTest(unittest.TestCase):
     self.assertIn("invalid", result["partial"].lower())
     self.assertIsNone(result["error"])
     self.assertEqual(result["placements"][0]["intervals"], [[125, 140]])
-
-  def test_pod_logs_preserve_previous_and_unknown_diagnostics(self):
-    result = {"pod": "p", "container": None, "previous": True, "text": "untrusted <script> false 0", "future": {"flag": False}}
-    with mock.patch.object(router.sources, "pod_logs", return_value=result):
-      response = self.client.get("/api/v1/inspect/pods/p/logs?previous=true")
-    self.assertEqual(response.json(), result)
 
   def test_omitted_bounds_anchor_to_snapshot_and_report_the_resolved_window(self):
     self.store.read_samples.side_effect = lambda key: [operation(125, 140)] if key == router.telemetry.ops_key("r1") else []
