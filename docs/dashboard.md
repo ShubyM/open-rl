@@ -198,12 +198,6 @@ Kubernetes queries use `OPEN_RL_WORKER_NAMESPACE`, then `POD_NAMESPACE`, then `o
 
 Logs come from the project's default buckets, which usually keep 30 days. To keep runs longer, route the namespace's container logs to a bucket with longer retention and set `OPEN_RL_LOG_VIEWS` to its view, for example `projects/<project>/locations/global/buckets/openrl-runs/views/_AllLogs`; the reader then needs `roles/logging.viewAccessor` on it. Each run's op records and each worker's record expire `OPEN_RL_OPS_TTL_DAYS` (default 7) after their last write, and `0` keeps them. A run keeps its newest `OPEN_RL_OPS_SAMPLE_LIMIT` op records (default 2000); a long RL run records about one per sample request. Pages and the API show windows of up to seven days.
 
-## Agents
-
-The [openrl-inspect skill](../skills/openrl-inspect/SKILL.md) shows agents how to diagnose runs with this API.
-
 For local regression checks, run `make test`.
-
-`uv run --extra cluster python dev/inspection_eval.py --port 9042` serves ten deterministic cases through the real inspection routes without cluster access. Give an agent only a printed case URL, run ID, symptom, and the skill; the fixture source contains the answer key. Score diagnosis, cited evidence, uncertainty, next check, and whether it obeyed instructions embedded in logs.
 
 Run-scoped logs join trainer, sampler and pool dispatcher pods with forwarded client output. A client Job's pod is not discovered automatically; the raw pod-log route can read a known client pod.
