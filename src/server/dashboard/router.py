@@ -177,13 +177,18 @@ history: dict[str, tuple[float, dict[int, dict[str, float]]]] = {}  # run -> (re
 async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, ...]) -> dict[int, dict[str, float]]:
   """The client's metrics by step: its OpenTelemetry gauges when progress/batch first read the step, or the older Redis history.
   A step's values never change, so each read asks Prometheus only for what came after the last one, at 15 s resolution."""
-  found = {}
-  for row in await get_state_store().read_samples(f"open_rl:run_metrics:{run['run_id']}"):
+  found, store = {}, get_state_store()
+  for row in await store.read_samples(f"open_rl:run_metrics:{run['run_id']}"):
     found[row["step"]] = {k: float(v) for k, v in row["metrics"].items() if isinstance(v, int | float) and math.isfinite(v)}
-  if not run["session_ids"] or high <= low or not sources.prometheus_source():
+  # The collector forwards each step's event with its step number; the gauges below are for runs from before that.
+  for session in run["session_ids"]:
+    for row in await store.read_samples(key("client_steps", session)):
+      if row.get("step") is not None and low <= row["at"] <= high:
+        found.setdefault(int(row["step"]), {}).update(row["metrics"])
+  if found or not run["session_ids"] or high <= low or not sources.prometheus_source():
     return found
-  key = f"{run['run_id']} {prefixes}"
-  seen, known = history.get(key, (low, {}))
+  memo = f"{run['run_id']} {prefixes}"
+  seen, known = history.get(memo, (low, {}))
   start = max(low, seen - 300)  # overlap, so a step that landed during the last read is not missed
   wanted = "|".join(re.escape(p) + ".*" for p in ("progress/batch", *prefixes)) if prefixes else ".+"
   where = f"session_id=~{sources.any_of(run['session_ids'])},metric=~{json.dumps(wanted)}{sources.scope()}"
@@ -193,7 +198,7 @@ async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, 
   for at, batch in sorted((series.pop("progress/batch", None) or {}).items()):
     first.setdefault(int(batch), at)
   known = {step: {name: points[at] for name, points in series.items() if at in points} for step, at in first.items()} | known
-  history[key] = (high, known)
+  history[memo] = (high, known)
   return found | known
 
 

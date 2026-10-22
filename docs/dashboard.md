@@ -40,6 +40,23 @@ Pages show their last response while they refresh.
 | `GET /sessions/{id}/summary` | The session record, whether it is live, its SDK errors, and a line per model |
 | `GET /logs` | Worker, sampling-pool and forwarded client logs from Cloud Logging, with filters and Cloud Logging's page token as the cursor |
 
+### Client metrics by step
+
+The cookbook client's OpenTelemetry logger emits one `openrl.training.metrics` log event per `log_metrics` call, carrying the step and every metric. The collector forwards those events to the API server, which keeps one row per step per session (`open_rl:client_steps:<session>`), so `/steps` reads them with no metrics backend and no step reconstruction. Add to the collector config:
+
+```yaml
+exporters:
+  otlphttp/openrl:
+    logs_endpoint: http://open-rl-gateway-service:8000/api/v1/otlp/logs
+    encoding: json
+service:
+  pipelines:
+    logs:
+      exporters: [file/events, otlphttp/openrl]
+```
+
+Runs from before the collector forwarded these events fall back to the `openrl_client_metric` gauges in Prometheus, aligned by `progress/batch`, which can miss a step when two steps land within one gauge export interval.
+
 `activity`, `query`, `accelerators` and `logs` take ISO `since` and `until` bounds of up to seven days; `since` also takes a span such as `1h`. An omitted end is now, and an omitted start the 30 minutes before it. Missing op records do not prove that no requests arrived or that workers were idle. `error` means a source could not be read. A log cursor is valid only with the same filters, `since` and `until` as the page that returned it.
 
 ## Checks
