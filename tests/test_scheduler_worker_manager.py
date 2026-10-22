@@ -160,7 +160,6 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       "MAX_JOBS": "4",
       "OTEL_TRACES_EXPORTER": "gcp_trace",
       "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318",
-      "OPEN_RL_SERVER_METRIC_SERIES_LIMIT": "4096",
       "OPEN_RL_OPS_TTL_DAYS": "0",
       "OPEN_RL_OPS_SAMPLE_LIMIT": "200000",
     }
@@ -179,7 +178,6 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       "OPEN_RL_OPS_SAMPLE_LIMIT": "200000",
       "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318",
       "OTEL_METRIC_EXPORT_INTERVAL": "5000",
-      "OPEN_RL_SERVER_METRIC_SERIES_LIMIT": "4096",
     }
     with patch.dict(os.environ, {"REDIS_URL": "redis://redis:6379", **settings}):
       body = dispatcher_body("sampler-pool")

@@ -10,26 +10,19 @@ what the op returns or raises. Nothing here reads the cluster; the dashboard doe
 import asyncio
 import importlib.metadata
 import json
-import logging
 import math
 import os
 import re
 import socket
-import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, contextmanager, suppress
-from contextvars import ContextVar
 from datetime import UTC, datetime
 from numbers import Real
 
 from fastapi import HTTPException
-from opentelemetry import metrics as otel
 from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -37,14 +30,12 @@ from pydantic import BaseModel, Field
 
 from server.store import get_state_store
 
-logger = logging.getLogger(__name__)
 SAMPLE_LIMIT = int(os.getenv("OPEN_RL_OPS_SAMPLE_LIMIT", "2000"))
 # How long a run's records outlive their last write; 0 keeps them.
 TTL_SECONDS = float(os.getenv("OPEN_RL_OPS_TTL_DAYS", "7")) * 86400 or None
 HEARTBEAT_SECONDS = 5
 STALE_SECONDS = 6 * HEARTBEAT_SECONDS  # a record not rewritten for this long belongs to a process that is gone
-MAX_TURNS, METRICS_PER_OPERATION = 200, 500
-SERIES_LIMIT = int(os.getenv("OPEN_RL_SERVER_METRIC_SERIES_LIMIT", "2048"))
+MAX_TURNS = 200
 # Cloud Logging labels on a client's lines, read back by the dashboard.
 CLIENT, RUN_LABEL, SOURCE_LABEL = "client", "openrl_run_id", "openrl_source"
 LOG_TAIL, MAX_LOG_LINE, SDK_ERROR_TAIL = 5000, 16384, 200
@@ -107,15 +98,7 @@ def numeric_values(values: dict) -> dict[str, float]:
 
 current: "Worker | None" = None  # this process's record while it serves
 writes: set[asyncio.Task] = set()  # in-flight writes, held so they are not collected mid-write
-op_metrics: ContextVar[dict | None] = ContextVar("op_metrics", default=None)
-warned: set[str] = set()
 steps_done: dict[str, int] = {}  # run id -> optim_steps it had completed, stamped on each of its trainer ops
-
-
-def warn_once(kind: str, message: str, *args) -> None:
-  if kind not in warned:
-    warned.add(kind)
-    logger.warning(message, *args)
 
 
 def worker_identity() -> dict:
@@ -294,28 +277,12 @@ def write(coroutine: Coroutine) -> None:
   task.add_done_callback(lambda t: (writes.discard(t), t.cancelled() or t.exception()))
 
 
-def metrics(values: dict) -> None:
-  """Add measurements to the current op, including from asyncio.to_thread; last value per name wins.
-  Outside an op there is no inferred run; use record_metrics with an explicit scope."""
-  if (collected := op_metrics.get()) is None:
-    return
-  dropped = 0
-  for name, value in numeric_values(values).items():
-    if name in collected or len(collected) < METRICS_PER_OPERATION:
-      collected[name] = value
-    else:
-      dropped += 1
-  if dropped:
-    warn_once("op", "Operation metric limit reached: retained %s, dropped %s names; limit=%s", len(collected), dropped, METRICS_PER_OPERATION)
-
-
 async def observe_operation(request: dict, role: str, runtime_id: str | None, call: Callable[[], Awaitable[dict]]) -> dict:
   """Run one API op and record how it went; returns or raises exactly as the op does."""
   if (run_id := run_of(request)) and run_id not in steps_done:
     with suppress(Exception):
       steps_done[run_id] = int(await get_state_store().get_value(steps_key(run_id)) or 0)
-  started_at, status, error_type, result, collected = time.time(), "succeeded", None, {}, {}
-  token = op_metrics.set(collected)
+  started_at, status, error_type, result = time.time(), "succeeded", None, {}
   try:
     result = await call()
     if result.get("type") == "RequestFailedResponse":
@@ -325,9 +292,8 @@ async def observe_operation(request: dict, role: str, runtime_id: str | None, ca
     status, error_type = "cancelled" if isinstance(error, asyncio.CancelledError) else "failed", type(error).__name__
     raise
   finally:
-    op_metrics.reset(token)
     with suppress(Exception):
-      record(request, role, runtime_id, started_at, status, error_type, {**result, "metrics": {**collected, **(result.get("metrics") or {})}})
+      record(request, role, runtime_id, started_at, status, error_type, result)
 
 
 def record(
@@ -368,8 +334,6 @@ def record(
     sample["nonfinite"] = nonfinite
   if (span := trace.get_current_span().get_span_context()).is_valid:
     sample.update(trace_id=f"{span.trace_id:032x}", span_id=f"{span.span_id:016x}")
-  with suppress(Exception):
-    record_metrics(sample["metrics"], model_id=run_id if run_scoped else None, runtime_id=runtime_id, phase=operation)
   write(get_state_store().append_sample(samples_key(run_id) if operation == "sample" else ops_key(run_id), sample, SAMPLE_LIMIT, TTL_SECONDS))
   if operation == "optim_step" and status == "succeeded":
     write(get_state_store().increment(steps_key(run_id), TTL_SECONDS))
@@ -380,17 +344,15 @@ def record(
 @contextmanager
 def record_op(name: str):
   """Record worker work that serves no one request (init, wake_up, sleep, weight_sync) under the worker's runtime."""
-  started_at, status, collected = time.time(), "failed", {}
-  token = op_metrics.set(collected)
+  started_at, status = time.time(), "failed"
   try:
     yield
     status = "succeeded"
   finally:
-    op_metrics.reset(token)
     if current is not None:
       runtime_id, role = current.record["runtime_id"], current.record["role"]
       with suppress(Exception):
-        record({"op": name, "model_id": runtime_id}, role, runtime_id, started_at, status, None, {"metrics": collected}, run_scoped=False)
+        record({"op": name, "model_id": runtime_id}, role, runtime_id, started_at, status, None, {}, run_scoped=False)
 
 
 @asynccontextmanager
@@ -487,14 +449,9 @@ async def ingest_sdk_events(store, body: dict) -> None:
 
 # *** OpenTelemetry ***
 
-provider: MeterProvider | None = None
-gauge = None
-series: set[tuple] = set()
-lock = threading.Lock()
-
 
 def configure_tracing(service_name: str) -> TracerProvider:
-  """Install the global TracerProvider with each exporter named in OTEL_TRACES_EXPORTER, then the gauges."""
+  """Install the global TracerProvider with each exporter named in OTEL_TRACES_EXPORTER."""
   tracer = TracerProvider(resource=Resource.create({SERVICE_NAME: service_name}))
   for name in filter(None, (n.strip() for n in os.environ.get("OTEL_TRACES_EXPORTER", "").split(","))):
     if name == "none":
@@ -503,54 +460,4 @@ def configure_tracing(service_name: str) -> TracerProvider:
       raise ValueError(f"Unknown OTEL_TRACES_EXPORTER: {name}")
     tracer.add_span_processor(BatchSpanProcessor(next(iter(eps)).load()()))
   trace.set_tracer_provider(tracer)
-  configure_metrics(service_name)
   return tracer
-
-
-def configure_metrics(service_name: str) -> None:
-  """Export gauges only when an OTLP endpoint is explicit; ordinary local runs need no collector."""
-  global provider, gauge
-  if os.getenv("OTEL_METRICS_EXPORTER", "").strip().lower() == "none" or gauge is not None:
-    return
-  if not (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")):
-    return
-  names = (("k8s.pod.name", "POD_NAME"), ("k8s.pod.uid", "POD_UID"), ("k8s.node.name", "NODE_NAME"))
-  pod = {k: os.environ[env] for k, env in names if os.getenv(env)}
-  resource = Resource.create({"service.name": os.getenv("OTEL_SERVICE_NAME", service_name), "service.instance.id": uuid.uuid4().hex, **pod})
-  if not isinstance(otel.get_meter_provider(), MeterProvider):
-    provider = MeterProvider(resource=resource, metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter())])
-    otel.set_meter_provider(provider)
-  gauge = otel.get_meter("openrl.server").create_gauge("openrl.server.metric", description="Latest reported server metric")
-
-
-def record_metrics(values: dict, *, model_id=None, runtime_id=None, session_id=None, phase=None) -> None:
-  """Latest values, without network I/O. Omitted identities mean process scope, never an inferred run.
-  Names and scopes must stay stable; at most SERIES_LIMIT name/scope combinations per process."""
-  if (g := gauge) is None:
-    return
-  scope = {"openrl.model.id": model_id, "openrl.runtime.id": runtime_id, "session.id": session_id, "openrl.phase": phase}
-  attributes = {k: v for k, v in scope.items() if v is not None}
-  if any(not isinstance(v, str) or not v or len(v) > 200 for v in attributes.values()):
-    return
-  dropped = 0
-  with lock:
-    for name, value in numeric_values(values).items():
-      if not math.isfinite(value):
-        continue
-      labels = {**attributes, "metric": name}
-      if (identity := tuple(labels.items())) not in series and len(series) >= SERIES_LIMIT:
-        dropped += 1
-        continue
-      series.add(identity)
-      g.set(value, labels)
-  if dropped:
-    message = "Server metric series limit reached: retained %s, dropped %s new series; limit=%s per process"
-    warn_once("series", message, len(series), dropped, SERIES_LIMIT)
-
-
-def shutdown() -> None:
-  """Drain our SDK provider; an externally configured one belongs to its owner."""
-  global provider, gauge
-  if provider is not None:
-    p, provider, gauge = provider, None, None
-    p.shutdown()

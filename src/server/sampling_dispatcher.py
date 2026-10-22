@@ -234,8 +234,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-  telemetry.configure_metrics("open-rl-dispatcher")
-  try:
-    asyncio.run(main())
-  finally:
-    telemetry.shutdown()
+  asyncio.run(main())

@@ -505,10 +505,7 @@ def start_request_processing_loop() -> None:
   try:
     asyncio.run(serve_trainer(args))
   finally:
-    try:
-      telemetry.shutdown()
-    finally:
-      provider.shutdown()
+    provider.shutdown()
 
 
 if __name__ == "__main__":

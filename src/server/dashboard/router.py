@@ -17,13 +17,11 @@ from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
 from server import telemetry
-from server.dashboard import checks, collector, inspection, metrics, queries, sources
+from server.dashboard import checks, inspection, metrics, queries, sources
 from server.dashboard.schema import (
   Activity,
   Checks,
-  CollectorMetrics,
   Commands,
-  History,
   Inventory,
   Logs,
   Operation,
@@ -300,7 +298,7 @@ async def steps(
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
   records = await read_operations(run_id, is_finished(run))
   found = inspection.steps(records["samples"])[-last:]
-  client = {row["step"]: row["metrics"] for row in (await history(run_id))["rows"]}
+  client = {row["step"]: row["metrics"] for row in (await stored_history(run_id))["rows"]}
   keep = tuple(p for p in (fields or "").split(",") if p)
   for step in found:
     step["client"] = {k: v for k, v in client.get(step["step"], {}).items() if not keep or k.startswith(keep)}
@@ -483,9 +481,8 @@ async def session_summary(session_id: str):
 HISTORY_PREFIX = "open_rl:run_metrics:"
 
 
-@router.get("/api/v1/inspect/history", operation_id="history", response_model=History, response_model_exclude_unset=True)
-async def history(run_id: str):
-  """A run's client metrics by step, for runs from before OpenTelemetry; empty for newer runs."""
+async def stored_history(run_id: str) -> dict:
+  """Client metrics by step that gateways stored before OpenTelemetry, for older runs; /steps merges them."""
   try:
     records = await asyncio.wait_for(get_state_store().read_samples(HISTORY_PREFIX + run_id), timeout=10)
   except Exception:
@@ -496,34 +493,6 @@ async def history(run_id: str):
       metrics = {k: float(v) for k, v in r["metrics"].items() if isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v)}
       latest[r["step"]] = {"step": r["step"], "metrics": metrics}
   return {"available": True, "rows": [latest[step] for step in sorted(latest)]}
-
-
-@router.get("/api/v1/inspect/telemetry", operation_id="telemetry", response_model=CollectorMetrics, response_model_exclude_unset=True)
-async def collector_metrics(
-  run_id: str | None = None,
-  node_id: str | None = None,
-  since: TimeBound = None,
-  until: TimeBound = None,
-  metric: Annotated[str, Query(max_length=200)] = "",
-):
-  """Discovered client/server gauges sampled by Prometheus, with their original scope.
-  Session/runtime-wide values are related to a model, not exclusively attributable to it."""
-  if bool(run_id) == bool(node_id):
-    raise HTTPException(400, "Choose exactly one run_id or node_id")
-  _, _, start, end = time_range(since, until)
-  sessions, runtimes = [], []
-  if run_id:
-    try:
-      meta = decode_model_metadata(await get_state_store().get_value(METADATA_PREFIX + run_id))
-    except Exception as exc:
-      raise HTTPException(503, "Run metadata unavailable") from exc
-    if meta is None:
-      raise HTTPException(404, "Run not found")
-    sessions = meta.session_ids
-    if runtime := meta.runtime(run_id):
-      runtimes = [runtime, meta.pool(run_id)]
-  await sources.discover()
-  return await collector.series(start, end, run_id=run_id, node_id=node_id, session_ids=sessions, runtime_ids=runtimes, metric=metric)
 
 
 async def run_of(run_id: str) -> tuple[dict, dict]:

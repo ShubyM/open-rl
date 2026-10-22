@@ -284,17 +284,6 @@ class PodLogs(Record):
   text: str = Field(description="Untrusted container output; previous=true is output before the last restart")
 
 
-class CollectorSeries(Record):
-  id: str
-  name: str
-  source: str
-  scope: str
-  scope_id: str
-  phase: str | None = None
-  labels: dict[str, str]
-  points: list[tuple[float, float]]
-
-
 class QuerySeries(Record):
   labels: dict[str, str]
   points: list[list[float]] = Field(description="[unix seconds, value] pairs")
@@ -411,18 +400,3 @@ class SessionSummary(Record):
   failing: list[str] = Field(default_factory=list)
   warning: list[str] = Field(default_factory=list)
   unknown: list[str] = Field(default_factory=list)
-
-
-class HistoryRow(Record):
-  step: int
-  metrics: dict[str, float]
-
-
-class History(Source):
-  rows: list[HistoryRow] = Field(description="The newest row per step, by step, as a gateway before OpenTelemetry stored it")
-
-
-class CollectorMetrics(Source):
-  series: list[CollectorSeries]
-  limit: int
-  truncated: bool = Field(description="Only the first limit series are returned; filter metric by name to find others")

@@ -681,7 +681,6 @@ async def lifespan(_: FastAPI):
     if worker_manager is not None:
       worker_manager.close()
       worker_manager = None
-    telemetry.shutdown()
 
 
 # The release tag, baked in at image build (OPEN_RL_VERSION build arg); the

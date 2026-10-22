@@ -35,31 +35,22 @@ Pages show their last response while they refresh. A failed source keeps its las
 | `GET /series` | GPU utilization and memory per device UUID, worker CPU and memory, for a `node_id` or `run_id`; with `run_id`, the run's vLLM sampler series. `kind=devices` without a node or run returns every node's GPUs |
 | `GET /logs` | Worker and forwarded client logs from Cloud Logging, with filters and cursor paging; the client-log tail when Cloud Logging is unconfigured |
 | `GET /pods/{pod}/logs` | Current or previous container output from the kubelet |
-| `GET /telemetry` | OpenTelemetry gauges `openrl_client_metric` and `openrl_server_metric` from Prometheus, for a run or node |
-| `GET /history` | A run's client metrics by step, for runs recorded before OpenTelemetry |
+| `GET /sessions` | Client sessions, newest first: start, last heartbeat, whether live, and the models each used |
+| `GET /sessions/{id}/checks` | `client-liveness` and `sdk-errors`, then each model check at its worst across the session's models |
+| `GET /sessions/{id}/summary` | A session in one answer: liveness, each model's state and pace, failing and warning checks |
+| `GET /runs/{id}/checks` | Diagnostic checks for one model: each a verdict (`ok`, `warn`, `fail`, `unknown`), a reason, numbers and evidence |
+| `GET /runs/{id}/summary` | A model in one answer: state, steps, step time, last trainer metrics, GPU duty by role |
+| `GET /runs/{id}/steps` | Trainer ops grouped by step, with stored client metrics; `fields` keeps client metrics by prefix |
+| `GET /runs/{id}/commands` | The model's command records, newest first, by window and role |
+| `GET /query` | A named PromQL query (`gpu_busy`, `gpu_util`, `vllm_*`, …) over a run's or node's GPUs and samplers at `points` resolution |
 
 `activity`, `series`, and `logs` take ISO `since` and `until` bounds of up to seven days. An omitted end uses inventory's `observed_at`, and an omitted start the 30 minutes before it. Missing op records do not prove that no requests arrived or that workers were idle. Invalid records are skipped and reported in `partial`; `error` means a source could not be read.
 
 Requests have a 12-second budget, below the browser's 15-second timeout. Identical concurrent Prometheus queries share one fetch. Log cursors keep the original bounds, pod lifetimes, and query for 15 minutes; set the same `OPEN_RL_LOG_CURSOR_SECRET` on every replica to keep cursors valid across replicas and restarts.
 
-## Metrics from code
+## Checks
 
-Inside a worker op, add measurements to the op's record:
-
-```python
-from server import telemetry
-
-telemetry.metrics({"tokens_per_second": tokens / elapsed})
-```
-
-The op record keeps the latest value per name, up to 500 names, and works inside `asyncio.to_thread`. Outside an op, record a gauge with an explicit scope:
-
-```python
-telemetry.record_metrics({"queue_depth": depth}, model_id=model_id)
-telemetry.record_metrics({"cache_entries": count}, runtime_id=shared_runtime_id)
-```
-
-Gauges export only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, up to 2,048 name and scope pairs per process (`OPEN_RL_SERVER_METRIC_SERIES_LIMIT`). The Collector exposes them to Prometheus with the original name in the `metric` label. Model, session, and runtime values stay separate, and a session-only value shows as session-wide on its models. Charts use sampled timestamps, not training steps.
+Each check answers one question with a verdict, a one-line reason, a few numbers and an evidence handle: a route, a pod or a Redis key. A check whose inputs are missing answers `unknown`, never `ok`. Thresholds come from past incidents; Design Doc 017 lists them. Worker metrics are what the trainer returns per op (`loss`, `grad_norm`); a NaN or infinity is named in the op's `nonfinite` and reaches the client as 0, as before.
 
 ## Client logs
 
