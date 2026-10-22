@@ -83,7 +83,7 @@ class GkeLogHelpersTest(unittest.TestCase):
       for insert, text in (("a", "\rLoading weights: 100%|"), ("b", "Traceback (most recent call last):"))
     ]
     with patch.object(sources, "gcp_request", AsyncMock(return_value={"entries": entries})):
-      result = asyncio.run(sources.run_logs(RUN, [], severity="ERROR", **WINDOW))
+      result = asyncio.run(sources.run_logs(RUN, [], severity="ERROR", span=sources.window(**WINDOW)))
     self.assertEqual([record["message"] for record in result["records"]], ["Traceback (most recent call last):"])
 
   def test_logs_come_from_the_configured_views_or_else_the_project(self) -> None:
@@ -95,15 +95,15 @@ class GkeLogHelpersTest(unittest.TestCase):
   def test_the_cursor_is_cloud_loggings_page_token_sent_with_the_same_query(self) -> None:
     pages = [{"nextPageToken": "provider-page-2"}, {"entries": [entry(textPayload="older")]}]
     with patch.object(sources, "gcp_request", AsyncMock(side_effect=pages)) as request:
-      first = asyncio.run(sources.run_logs(RUN, [], **WINDOW))
-      second = asyncio.run(sources.run_logs(RUN, [], cursor=first["next_cursor"], **WINDOW))
+      first = asyncio.run(sources.run_logs(RUN, [], span=sources.window(**WINDOW)))
+      second = asyncio.run(sources.run_logs(RUN, [], cursor=first["next_cursor"], span=sources.window(**WINDOW)))
     before, after = [call.kwargs["json"] for call in request.await_args_list]
     self.assertEqual((first["next_cursor"], after), ("provider-page-2", {**before, "pageToken": "provider-page-2"}))
     self.assertEqual((second["records"][0]["message"], second["next_cursor"], second["shared_runtime"]), ("older", None, True))
     rejected = httpx.Response(400, request=httpx.Request("POST", "https://logging.googleapis.com"))
     error = httpx.HTTPStatusError("bad token", request=rejected.request, response=rejected)
     with patch.object(sources, "gcp_request", AsyncMock(side_effect=error)), self.assertRaisesRegex(ValueError, "Invalid or expired"):
-      asyncio.run(sources.run_logs(RUN, [], cursor="stale", **WINDOW))
+      asyncio.run(sources.run_logs(RUN, [], cursor="stale", span=sources.window(**WINDOW)))
 
   def test_refused_credentials_back_off_without_repeating_the_request(self) -> None:
     response = httpx.Response(403, request=httpx.Request("POST", "https://logging.googleapis.com"))
@@ -113,7 +113,7 @@ class GkeLogHelpersTest(unittest.TestCase):
       patch.object(sources.time, "monotonic", return_value=100),
       patch.object(sources, "gcp_request", AsyncMock(side_effect=error)) as request,
     ):
-      first = asyncio.run(sources.run_logs(RUN, [], **WINDOW))
-      second = asyncio.run(sources.run_logs(RUN, [], **WINDOW))
+      first = asyncio.run(sources.run_logs(RUN, [], span=sources.window(**WINDOW)))
+      second = asyncio.run(sources.run_logs(RUN, [], span=sources.window(**WINDOW)))
       self.assertEqual((first["error"], second["error"]), (sources.REFUSED, sources.REFUSED))
       self.assertEqual(request.await_count, 1)

@@ -70,8 +70,7 @@ TimeBound = Annotated[
   str | None,
   Query(
     max_length=64,
-    description="ISO-8601 timestamp, e.g. 2026-01-02T12:00:00Z; not Unix seconds. "
-    "Defaults to the 30 minutes ending at inventory.observed_at. Maximum window: seven days.",
+    description="ISO-8601 timestamp, e.g. 2026-01-02T12:00:00Z; not Unix seconds. Defaults to the 30 minutes ending now. Maximum window: seven days.",
   ),
 ]
 
@@ -90,23 +89,11 @@ async def dashboard_asset(name: str):
   return FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
-def time_range(since, until):
+def time_range(since, until) -> sources.Window:
   try:
-    start, end = sources.log_window(since, until)
-    return start, end, datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
+    return sources.window(since, until)
   except (ValueError, OverflowError, OSError) as exc:
     raise HTTPException(400, "Use ISO-8601 since/until timestamps and a positive window of at most seven days") from exc
-
-
-def validate_bounds(since, until):
-  # Validate before touching sources, but resolve an omitted end against the snapshot.
-  if until is not None:
-    time_range(since, until)
-  elif since is not None:
-    try:
-      sources.timestamp(since)
-    except (ValueError, OverflowError, OSError) as exc:
-      raise HTTPException(400, "since must be an ISO-8601 timestamp") from exc
 
 
 @router.get("/api/v1/inspect/inventory", operation_id="inventory", response_model=Inventory, response_model_exclude_unset=True)
@@ -153,10 +140,9 @@ async def load_operations(identity: str) -> dict:
 async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str | None = None, node_id: str | None = None):
   """Per-process GPU turns and completed-op intervals, in Unix seconds.
   With run_id, also the run, its recorded ops and recent pod incidents."""
-  validate_bounds(since, until)
+  start, end, low, high = time_range(since, until)
   store = get_state_store()
   state, run = await run_of(run_id) if run_id else (await snapshot.current(store), None)
-  start, end, low, high = time_range(since, until or state["observed_at"])
   finished = is_finished(run)
   selected = [p for p in inspection.lanes(state, run_id, node_id) if p["start"] <= high and p["end"] >= low]
   # Each lane's runs, and its runtime for the worker-level ops recorded there.
@@ -202,11 +188,10 @@ async def series(
   """GPU utilization/memory and worker CPU/memory over time, including idle devices and past placements.
   With run_id, the run's own GPUs and workers. kind=devices is the GPUs alone, for every node when no node or run is named.
   vLLM sampler charts are named queries: /query?name=vllm_..."""
-  validate_bounds(since, until)
+  span = time_range(since, until)
   await sources.discover()
   state = await snapshot.current(get_state_store())
-  start, end, _, _ = time_range(since, until or state["observed_at"])
-  return await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id, kind=kind)
+  return await metrics.series(state, span, node_id=node_id, run_id=run_id, kind=kind)
 
 
 @router.get("/api/v1/inspect/query", operation_id="query", response_model=QueryResult, response_model_exclude_unset=True)
@@ -224,10 +209,10 @@ async def query(
     raise HTTPException(400, f"Unknown query; use one of {sorted(queries.QUERIES)}")
   if not (run_id or node_id):
     raise HTTPException(400, "Name a run_id or a node_id")
-  validate_bounds(since, until)
+  span = time_range(since, until)
   await sources.discover()
   state = await snapshot.current(get_state_store())
-  return await queries.run(name, state, run_id, node_id, since, until or state["observed_at"], points)
+  return await queries.run(name, state, run_id, node_id, span, points)
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/commands", operation_id="commands", response_model=Commands, response_model_exclude_unset=True)
@@ -239,9 +224,8 @@ async def commands(
   limit: int = Query(100, ge=1, le=5000),
 ):
   """The run's command records in the window, newest first; without bounds, all of them."""
-  validate_bounds(since, until)
+  _, _, low, high = time_range(since, until) if since or until else (None, None, 0.0, float("inf"))
   state = await snapshot.current(get_state_store())
-  _, _, low, high = time_range(since, until or state["observed_at"]) if since or until else (None, None, 0.0, float("inf"))
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
   records = await read_operations(run_id, is_finished(run))
   matched = [s for s in records["samples"] if low <= s["at"] <= high and (role is None or (s.get("role") == "sampler") == (role == "sampler"))]
@@ -350,7 +334,7 @@ async def run_summary(run_id: str):
   if ops:
     end = min(ctx["now"], ops[-1] + 60)
     window = {k: datetime.fromtimestamp(t, UTC).isoformat() for k, t in (("since", max(ops[0] - 60, end - 7 * 86400)), ("until", end))}
-  duty = await queries.run("gpu_busy", state, run_id, None, window["since"], window["until"], 1)
+  duty = await queries.run("gpu_busy", state, run_id, None, sources.window(window["since"], window["until"]), 1)
   roles = {uuid: p["role"] for p in inspection.lanes(state, run_id=run_id) for uuid in p["devices"]}
   busy: dict[str, list[float]] = {}
   for series_ in duty.get("series", []):
@@ -521,13 +505,12 @@ async def run_logs(
   cursor: Annotated[str | None, Query(max_length=sources.MAX_CURSOR, description="next_cursor of a page with the same filters and window")] = None,
 ):
   """Cloud Logging for the run: its worker pods by owner label, its sampling pool's pods, and its client."""
-  validate_bounds(since, until)
+  span = time_range(since, until)
   await sources.discover()
   state, run = await run_of(run_id)
-  since, until, _, _ = time_range(since, until or state["observed_at"])
   pods = {lane["pod"]: {"pod": lane["pod"], "node": lane["node"], "role": lane["role"]} for lane in inspection.lanes(state, run_id) if lane["pod"]}
   try:
-    result = await sources.run_logs(run, list(pods.values()), since=since, until=until, cursor=cursor, limit=limit, q=q, pod=pod, severity=severity)
+    result = await sources.run_logs(run, list(pods.values()), span, cursor=cursor, limit=limit, q=q, pod=pod, severity=severity)
   except ValueError as exc:
     raise HTTPException(400, str(exc)) from exc
   if not sources.configuration()["configured"] and pod in (None, sources.CLIENT) and not cursor:

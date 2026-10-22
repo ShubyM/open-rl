@@ -167,7 +167,7 @@ class HardwareSeriesTest(unittest.TestCase):
       with self.subTest(errors=errors):
         backend.devices = mock.AsyncMock(return_value=({}, errors))
         with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
-          result = asyncio.run(metrics.series(state, node_id="node", kind="hardware", **WINDOW))
+          result = asyncio.run(metrics.series(state, sources.window(**WINDOW), node_id="node", kind="hardware"))
         self.assertEqual(result["error"], "Offline" if len(errors) == 2 else None)
         self.assertEqual(result["devices"][0]["errors"], errors)
         self.assertFalse(result["available"])
@@ -179,7 +179,7 @@ class HardwareSeriesTest(unittest.TestCase):
     backend.devices = mock.AsyncMock(return_value=({"utilization": {GPU: [[1, 80]]}}, {}))
     backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"old-pod": [[1, 2], [8, 3]]}}, {}))
     with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
-      result = asyncio.run(metrics.series(state, node_id="node", **WINDOW))
+      result = asyncio.run(metrics.series(state, sources.window(**WINDOW), node_id="node"))
     self.assertCountEqual(backend.devices.await_args.args[0], ["GPU-idle", GPU])
     self.assertEqual(backend.workers_series.await_args.args[0], ["old-pod"])
     self.assertCountEqual([(d["id"], d["uuid"]) for d in result["devices"]], [("GPU-idle", "GPU-idle"), (GPU, GPU)])
@@ -202,7 +202,7 @@ class HardwareSeriesTest(unittest.TestCase):
         return {"cpu_cores": {p: [[start, 4.0]] for p in pods}, "memory_bytes": {p: [[start, 8.0]] for p in pods}}, {}
 
     with mock.patch.object(metrics, "hardware", return_value=(Backend(), None)):
-      result = asyncio.run(metrics.series(state, run_id="r", **WINDOW))
+      result = asyncio.run(metrics.series(state, sources.window(**WINDOW), run_id="r"))
     self.assertEqual((result["source"], [d["uuid"] for d in result["devices"]]), ("fake", [GPU]))
     self.assertEqual(result["devices"][0]["utilization"][0][1], 90.0)
     self.assertEqual((result["workers"][0]["pod"], result["workers"][0]["cpu_cores"][0][1]), ("orw-trainer", 4.0))

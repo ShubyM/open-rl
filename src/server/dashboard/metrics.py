@@ -3,7 +3,6 @@
 import asyncio
 import os
 import time
-from datetime import datetime
 
 from server.dashboard import inspection, sources
 from server.dashboard.sources import PromQL
@@ -35,10 +34,9 @@ async def node_gpus() -> dict[str, list[dict]] | None:
   return {node: sorted(gpus, key=lambda d: (len(d["name"]), d["name"])) for node, gpus in found.items()}
 
 
-async def series(state: dict, node_id=None, since=None, until=None, run_id=None, kind="hardware") -> dict:
+async def series(state: dict, span: sources.Window, node_id=None, run_id=None, kind="hardware") -> dict:
   """A node's GPUs and workers, idle GPUs included; or a run's. kind=devices is the GPUs alone. Sampler charts are named queries."""
-  start, end = sources.log_window(since, until)
-  low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
+  start, end, low, high = span
   placements = [p for p in inspection.lanes(state, run_id=run_id, node_id=node_id) if p["start"] <= high and p["end"] >= low]
   devices = {uuid: None for p in placements for uuid in p["devices"]}
   if not run_id:

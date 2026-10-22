@@ -1,5 +1,7 @@
 import asyncio
+import time
 import unittest
+from datetime import datetime
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -143,11 +145,10 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual(cancelled, [True])
     self.assertIn("Inspection timed out", response.json()["detail"])
 
-  def test_omitted_bounds_anchor_to_snapshot_and_report_the_resolved_window(self):
-    self.store.read_samples.side_effect = lambda key: [operation(125, 140)] if key == router.telemetry.ops_key("r1") else []
-    for params in ({"run_id": "r1"}, {"run_id": "r1", "since": WINDOW["since"]}):
-      data = self.client.get("/api/v1/inspect/activity", params=params).json()
-      self.assertEqual(data["until"], "1970-01-01T00:03:20.000000+00:00")
-      self.assertEqual(data["observed_at"], self.state["observed_at"])
-      self.assertEqual(data["placements"][0]["intervals"], [[125, 140]])
-      self.assertEqual(len(data["samples"]), 1)
+  def test_omitted_bounds_default_to_the_30_minutes_ending_now(self):
+    before = time.time()
+    data = self.client.get("/api/v1/inspect/activity", params={"run_id": "r1"}).json()
+    since, until = (datetime.fromisoformat(data[k]).timestamp() for k in ("since", "until"))
+    self.assertTrue(before <= until <= time.time())
+    self.assertAlmostEqual(until - since, 1800, places=3)
+    self.assertEqual(data["observed_at"], self.state["observed_at"])

@@ -16,7 +16,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 import google.auth
 import google.oauth2.credentials
@@ -463,20 +463,25 @@ async def gcp_request(method: str, url: str, **kwargs) -> dict:
   return (await send(method, url, headers={"Authorization": f"Bearer {token}", **quota_headers()}, **kwargs)).json()
 
 
-def timestamp(value) -> str:
-  """ISO-8601 in UTC with microseconds, the form Cloud Logging filters compare."""
-  if isinstance(value, int | float):
-    return datetime.fromtimestamp(value, UTC).isoformat(timespec="microseconds")
-  parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-  return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC).isoformat(timespec="microseconds")
+class Window(NamedTuple):
+  since: str  # ISO-8601 in UTC with microseconds, the form Cloud Logging filters compare
+  until: str
+  low: float  # the same bounds in Unix seconds
+  high: float
 
 
-def log_window(since=None, until=None) -> tuple[str, str]:
-  end = datetime.fromisoformat(timestamp(until)) if until else datetime.now(UTC)
-  start = datetime.fromisoformat(timestamp(since)) if since else end - timedelta(minutes=30)
+def window(since: str | None = None, until: str | None = None) -> Window:
+  """The query window: until defaults to now, since to 30 minutes before until; at most seven days."""
+
+  def parse(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
+
+  end = parse(until) if until else datetime.now(UTC)
+  start = parse(since) if since else end - timedelta(minutes=30)
   if start >= end or end - start > timedelta(days=7):
     raise ValueError("Time range must be positive and no longer than seven days")
-  return start.isoformat(timespec="microseconds"), end.isoformat(timespec="microseconds")
+  return Window(start.isoformat(timespec="microseconds"), end.isoformat(timespec="microseconds"), start.timestamp(), end.timestamp())
 
 
 def scope_filter() -> list[str]:
@@ -539,10 +544,10 @@ def entry_record(entry: dict, run_id: str) -> dict:
   }
 
 
-async def run_logs(run: dict, pods: list[dict], *, since=None, until=None, cursor=None, limit=200, q="", pod=None, severity=None) -> dict:
+async def run_logs(run: dict, pods: list[dict], span: Window, *, cursor=None, limit=200, q="", pod=None, severity=None) -> dict:
   """A page of the run's logs, newest first. The cursor is Cloud Logging's own page token, valid for the same filters."""
   global refused_until
-  start, end = log_window(since, until)
+  start, end = span.since, span.until
   result = {
     "run_id": run["run_id"],
     "source": "gke",

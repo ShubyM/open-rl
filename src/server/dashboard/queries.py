@@ -4,11 +4,9 @@ A template names its subject with {gpus} (a run's or node's GPU UUIDs) or {pods}
 {window}, the span in seconds. A query asked for one point is evaluated once at the end of the window.
 """
 
-from datetime import datetime
-
 from server.dashboard import inspection
 from server.dashboard.metrics import hardware
-from server.dashboard.sources import SAMPLER_QUERIES, any_of, log_window
+from server.dashboard.sources import SAMPLER_QUERIES, Window, any_of
 
 GPU = "{{UUID=~{gpus}{scope}}}"
 QUERIES = {
@@ -30,9 +28,8 @@ def subject(state: dict, run_id: str | None, node_id: str | None, low: float, hi
   return sorted({uuid for p in held for uuid in p["devices"]}), sorted({p["pod"] for p in held if p["role"] == "sampler" and p["pod"]})
 
 
-async def run(name: str, state: dict, run_id: str | None, node_id: str | None, since, until, points: int) -> dict:
-  start, end = log_window(since, until)
-  low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
+async def run(name: str, state: dict, run_id: str | None, node_id: str | None, span: Window, points: int) -> dict:
+  start, end, low, high = span
   result = {"name": name, "since": start, "until": end, "series": []}
   backend, reason = hardware()
   if backend is None:
