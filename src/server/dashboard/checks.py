@@ -300,10 +300,11 @@ def storage(ctx: dict) -> dict:
   since = sum(s["at"] > last_save for s in optim_steps(ctx))
   numbers.update(steps_since_save=since, threshold_steps=5)
   if since > 5:
-    return answer(name, WARN, f"{since} steps since the last successful save_state; a crash loses them", evidence, **numbers)
+    reason = f"{since} steps since the last successful save_state" if last_save else f"no save_state in {since} steps; a crash loses the whole run"
+    return answer(name, WARN, reason if not last_save else f"{reason}; a crash loses them", evidence, **numbers)
   if slow:
     return answer(name, WARN, f"a save_state took {slow[-1]['elapsed_seconds'] / 60:.0f} min, over the 10 min deadline", evidence, **numbers)
-  return answer(name, UNKNOWN, "saves succeed; volume usage is not recorded", **numbers)
+  return answer(name, OK, f"{len(saves)} saves, the last {since} steps ago" if saves else "fewer than 6 steps, nothing to save yet", **numbers)
 
 
 CHECKS = {
