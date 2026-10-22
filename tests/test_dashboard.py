@@ -95,6 +95,28 @@ class StepsTest(unittest.TestCase):
     self.assertEqual((found[0]["started_at"], found[0]["ended_at"], found[2]["nonfinite"]), (9, 11, ["grad_norm"]))
 
 
+class CachedTest(unittest.TestCase):
+  def test_a_stale_read_is_served_while_its_refresh_runs_and_the_refresh_replaces_it(self):
+    reads, release = iter(["first", "second"]), asyncio.Event()
+
+    async def read():
+      value = next(reads)
+      if value == "second":
+        await release.wait()
+      return value
+
+    async def scenario():
+      fleet.cache.clear()
+      first = await fleet.cached("k", 0, read)
+      await asyncio.sleep(0.01)  # older than 0 s, so the next call starts a refresh
+      during = await asyncio.wait_for(fleet.cached("k", 0, read), 1)
+      release.set()
+      await asyncio.sleep(0.01)
+      return first, during, await fleet.cached("k", 60, read)
+
+    self.assertEqual(asyncio.run(scenario()), ("first", "first", "second"))
+
+
 class RunJoinTest(unittest.TestCase):
   CLUSTER = {
     "pods": [
