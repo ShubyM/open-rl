@@ -5,11 +5,10 @@
   import TimeControl from "./TimeControl.svelte";
   import Status from "./Status.svelte";
   import Metrics from "./Metrics.svelte";
-  import Checks from "./Checks.svelte";
   import Activity from "./Activity.svelte";
   import Logs from "./Logs.svelte";
   import CopyLink from "./CopyLink.svelte";
-  import { KINDS, runDescription, isFinished, finishedAt, runLabel, flaggedChecks } from "./format.js";
+  import { KINDS, runDescription, isFinished, finishedAt, runLabel } from "./format.js";
   let { inventory, view } = $props();
   // Draw gestures immediately, but fetch only once the user settles on a window.
   let navigating = $state(false);
@@ -20,7 +19,7 @@
   const bounds = $derived({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString(), run_id: view.id });
   const url = $derived(inspectUrl("activity", bounds));
   const selection = () => !navigating && `${view.id} ${view.duration} ${view.end}`;
-  const tab = $derived(["metrics", "checks", "logs"].includes(view.tab) ? view.tab : "activity");
+  const tab = $derived(["metrics", "logs"].includes(view.tab) ? view.tab : "activity");
   // Activity and Metrics draw from the run's activity; the other tabs need it only for a run the inventory no longer lists.
   const timed = $derived(tab === "activity" || tab === "metrics");
   const inventoryRun = $derived(inventory.runs.find((r) => r.run_id === view.id));
@@ -48,9 +47,6 @@
   const slots = $derived(Object.fromEntries((busy.data?.series || []).filter((s) => s.labels.gpu != null).map((s) => [s.labels.UUID, s.labels.gpu])));
   // A finished run opens on its own lifetime rather than the last 30 minutes, unless the link names a window.
   const finished = $derived(isFinished(run));
-  // The checks label the run and list what fails or warns; the Checks tab shows them all.
-  const checks = createQuery(() => inspectUrl(`runs/${encodeURIComponent(view.id)}/checks`), { poll: 15000, pollWhen: () => !finished });
-  const flagged = $derived(flaggedChecks(checks.data?.checks));
   let opened = false;
   $effect(() => {
     if (!run || opened) return;
@@ -72,12 +68,11 @@
   {#if error}<p class="source-error" role="status">{error}</p>{:else}<p class="empty-state">{view.id ? "Loading run…" : "Choose a run from Overview"}</p>{/if}
   {#if detail.error}<button type="button" class="chip" onclick={detail.retry}>Retry</button>{/if}
 {:else}
-  <div class="run-heading"><h1 class="heading" title={run.run_id}>{title}</h1><Status value={runLabel(run, checks.data?.verdict)} /></div>
+  <div class="run-heading"><h1 class="heading" title={run.run_id}>{title}</h1><Status value={runLabel(run)} /></div>
   {#if error}<p class="source-error" role="status">{error}</p>{/if}
   {#if description}<p class="run-description">{description}</p>{/if}
   <section class="run-state" aria-label="Run state">
     {#each (run.pods || []).filter((p) => p.problem) as pod}<p class="source-error" role="status">{pod.name}: {pod.problem}</p>{/each}
-    {#each flagged as check (check.check)}<p class={check.verdict === "fail" ? "source-error" : ""} role="status"><span class="check-badge" data-verdict={check.verdict}>{check.check}</span> {check.reason}</p>{/each}
     {#if !finished && run.shared_runtime}<p class="muted">Shared runtime: its workers also serve other runs</p>{/if}
   </section>
   <div use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => navigating = !!value }}>
@@ -85,7 +80,6 @@
     <nav class="workspace-tabs" aria-label="Run views">
       <a href={link("activity")} aria-current={tab === "activity" ? "page" : undefined}>Activity</a>
       <a href={link("metrics")} aria-current={tab === "metrics" ? "page" : undefined}>Metrics</a>
-      <a href={link("checks")} aria-current={tab === "checks" ? "page" : undefined}>Checks</a>
       <a href={link("logs")} aria-current={tab === "logs" ? "page" : undefined}>Logs</a>
     </nav>
     <div class="time-control run-time-controls" aria-label="Run time range"><TimeControl {view} {range} {observed} /><CopyLink /><a href={url}>Agent JSON ↗</a></div>
@@ -94,7 +88,6 @@
     {#if tab === "logs"}
       {#if validEvent}<Logs {run} {view} {range} {navigating} allLogs={link("logs", { event: null, end: null })} />{/if}
     {:else if tab === "metrics"}<Metrics {run} {view} {range} {bounds} {selection} {detail} {finished} {navigating} />
-    {:else if tab === "checks"}<Checks {checks} />
     {:else}
       <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} {duty} {slots} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {/if}
