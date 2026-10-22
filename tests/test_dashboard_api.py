@@ -15,7 +15,6 @@ WINDOW = {"since": "1970-01-01T00:02:00Z", "until": "1970-01-01T00:03:10Z"}
 class InspectionApiTest(unittest.TestCase):
   def setUp(self):
     router.operations.clear()
-    router.finished_activity.clear()
     self.client = TestClient(app)
     self.state = state()
     self.state["runs"][0].update(shared_runtime=False)
@@ -144,33 +143,11 @@ class InspectionApiTest(unittest.TestCase):
     self.assertEqual(cancelled, [True])
     self.assertIn("Inspection timed out", response.json()["detail"])
 
-  def test_corrupt_telemetry_keeps_valid_records_and_reports_partial_failure(self):
-    bad = [
-      None,
-      [],
-      {},
-      {"at": "oops"},
-      operation(140, float("nan")),
-      operation(140, float("inf")),
-      operation(160, 150),
-      operation(140, 150, metrics={"loss": float("inf")}),
-      operation(140, 150, role=[]),
-    ]
-    self.store.read_samples.side_effect = lambda key: [operation(125, 140), *bad] if key == router.telemetry.ops_key("r1") else []
-    response = self.client.get("/api/v1/inspect/activity", params={**WINDOW, "run_id": "r1"})
-    self.assertEqual(response.status_code, 200)
-    result = response.json()
-    self.assertEqual([s["at"] for s in result["samples"]], [140])
-    self.assertIn("invalid", result["partial"].lower())
-    self.assertIsNone(result["error"])
-    self.assertEqual(result["placements"][0]["intervals"], [[125, 140]])
-
   def test_omitted_bounds_anchor_to_snapshot_and_report_the_resolved_window(self):
     self.store.read_samples.side_effect = lambda key: [operation(125, 140)] if key == router.telemetry.ops_key("r1") else []
     for params in ({"run_id": "r1"}, {"run_id": "r1", "since": WINDOW["since"]}):
       data = self.client.get("/api/v1/inspect/activity", params=params).json()
       self.assertEqual(data["until"], "1970-01-01T00:03:20.000000+00:00")
       self.assertEqual(data["observed_at"], self.state["observed_at"])
-      self.assertIn("Missing records do not prove no requests arrived", data["coverage"])
       self.assertEqual(data["placements"][0]["intervals"], [[125, 140]])
       self.assertEqual(len(data["samples"]), 1)

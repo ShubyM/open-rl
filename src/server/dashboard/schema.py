@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, JsonValue, model_validator
+from pydantic import BaseModel, Field, JsonValue
 
 
 class Record(BaseModel, extra="allow", allow_inf_nan=False):
@@ -125,21 +125,11 @@ class PlacementActivity(Placement):
   )
   phase: str | None = Field(None, description="The process's own phase: starting, ready, waiting_gpu, on_gpu or exited")
   error: str | None = Field(None, description="Operation records unavailable")
-  partial: str | None = Field(None, description="Some operation records were invalid and skipped")
 
 
-class TimedRecord(Record):
+class Operation(Record):
   at: float = Field(description="Completion time, Unix seconds")
   started_at: float = 0
-
-  @model_validator(mode="after")
-  def ordered(self):
-    if self.started_at > self.at:
-      raise ValueError("Record ends before it starts")
-    return self
-
-
-class Operation(TimedRecord):
   operation: str
   run_id: str | None = None
   role: str | None = None
@@ -147,7 +137,7 @@ class Operation(TimedRecord):
   pod_uid: str | None = None
   status: str | None = None
   error_type: str | None = None
-  elapsed_seconds: float = Field(0, ge=0)
+  elapsed_seconds: float = 0
   metrics: dict[str, float] = Field(default_factory=dict)
   nonfinite: list[str] = Field(default_factory=list, description="Metrics the op returned as NaN or infinity")
   step: int | None = Field(
@@ -164,10 +154,10 @@ class Incident(Record):
 
 
 class Activity(Record):
-  """Bounded, best-effort completed records; absence does not establish idleness."""
+  """Bounded, best-effort completed records; absence does not establish idleness.
+  The request-ledger check accounts for queued and in-flight requests."""
 
   placements: list[PlacementActivity]
-  coverage: str = Field(description="Limits on what missing activity can establish")
   observed_at: str | None = None
   since: str | None = Field(None, description="Resolved ISO query start; use the same window for series and logs")
   until: str | None = None
@@ -177,7 +167,6 @@ class Activity(Record):
   )
   incidents: list[Incident] = Field(default_factory=list)
   error: str | None = None
-  partial: str | None = None
 
 
 class DeviceSeries(Record):
@@ -263,7 +252,6 @@ class Commands(Record):
   total: int = Field(0, description="Records that matched before `limit`")
   truncated: bool = Field(False, description="More records matched than `limit`; narrow the window")
   error: str | None = None
-  partial: str | None = None
 
 
 class StepOps(Record):

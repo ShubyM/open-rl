@@ -44,7 +44,7 @@ Pages show their last response while they refresh. A failed source keeps its las
 | `GET /runs/{id}/commands` | The model's command records, newest first, by window and role |
 | `GET /query` | A named PromQL query (`gpu_busy`, `gpu_util`, `vllm_*`, …) over a run's or node's GPUs and samplers at `points` resolution |
 
-`activity`, `series`, and `logs` take ISO `since` and `until` bounds of up to seven days. An omitted end uses inventory's `observed_at`, and an omitted start the 30 minutes before it. Missing op records do not prove that no requests arrived or that workers were idle. Invalid records are skipped and reported in `partial`; `error` means a source could not be read.
+`activity`, `series`, and `logs` take ISO `since` and `until` bounds of up to seven days. An omitted end uses inventory's `observed_at`, and an omitted start the 30 minutes before it. Missing op records do not prove that no requests arrived or that workers were idle. `error` means a source could not be read.
 
 Requests have a 12-second budget, below the browser's 15-second timeout. Identical concurrent Prometheus queries share one fetch. A log cursor is valid only with the same filters, `since` and `until` as the page that returned it.
 

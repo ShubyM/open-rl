@@ -8,7 +8,7 @@
   const shown = $derived(activeOnly ? activities.filter((p) => p.intervals.length || p.error) : activities);
   // The run view draws one row per GPU; a multi-GPU process runs each op on all its GPUs, so its rows repeat the lane.
   const rows = $derived(shown.flatMap((p) => (acrossNodes && p.devices?.length ? p.devices : [null]).map((id, i) => ({ key: `${p.id}:${id ?? "none"}`, lane: p, device: id && gpuOf(p, id), first: i === 0, lead: i === 0 && p.devices.length > 1 }))));
-  const warnings = $derived([...new Set(activities.flatMap((p) => [p.partial, p.errorStatus !== 404 && p.error]).filter(Boolean))]);
+  const warnings = $derived([...new Set(activities.map((p) => p.errorStatus !== 404 && p.error).filter(Boolean))]);
   const ops = $derived([...new Set(shown.flatMap((p) => Object.keys(p.ops || {})))].sort((a, b) => opRank(a) - opRank(b) || a.localeCompare(b)));
   const empty = $derived(error ? `Activity unavailable: ${error}` : pending ? "Loading activity…" : acrossNodes && !activities.length ? "No worker processes for this run in this window" : "No recorded activity in this window");
   const href = (p) => acrossNodes ? inventory.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : inventory.runs.some((r) => r.run_id === p.run_ids?.[0]) ? viewLink(`run/${encodeURIComponent(p.run_ids[0])}/activity`, { duration: range.now - range.start, end: range.now, back }) : null;

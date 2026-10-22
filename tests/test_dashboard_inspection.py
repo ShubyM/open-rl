@@ -183,11 +183,6 @@ class InspectionActivityTest(unittest.TestCase):
     result = inspection.activity(state(processes=[record]), 160, 190, {"r1": {"samples": [operation(170, 180)]}})["placements"][0]
     self.assertEqual((result["intervals"], result["exact"]), ([[170, 180]], False))
 
-  def test_source_errors_and_partial_records_stay_distinct(self):
-    operations = {"r1": {"samples": [operation(120, 130)], "partial": "Skipped 1 invalid operation records"}}
-    result = inspection.activity(state(), 100, 200, operations)["placements"][0]
-    self.assertEqual((result["intervals"], result["error"], result["partial"]), ([[120, 130]], None, operations["r1"]["partial"]))
-
   def test_seeded_interval_fuzz_preserves_clipping_and_pod_attribution(self):
     import random
 

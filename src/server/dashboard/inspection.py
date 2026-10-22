@@ -128,7 +128,7 @@ def chart_samples(samples: list[dict], start: float, end: float) -> list[dict]:
 def lane_activity(lane: dict, start: float, end: float, operations: dict) -> dict:
   """A shared lane shows only its run's ops; a dedicated one also its GPU turns and worker-level ops."""
   shared = bool(lane.get("shared_runtime"))
-  intervals, named, errors, partial = [], {}, [], []
+  intervals, named, errors = [], {}, []
 
   def add(name, low, high):
     span = [max(start, lane["start"], low), min(end, lane["end"], high)]
@@ -143,7 +143,6 @@ def lane_activity(lane: dict, start: float, end: float, operations: dict) -> dic
   for identity in lane["run_ids"] if shared else {*lane["run_ids"], lane.get("runtime_id")} - {None}:
     result = operations.get(identity, {})
     errors.append(result.get("error"))
-    partial.append(result.get("partial"))
     for sample in result.get("samples", []):
       if sample.get("role") == lane.get("role") and matches(sample, lane):
         add(sample["operation"], sample.get("started_at") or sample["at"] - sample.get("elapsed_seconds", 0), sample["at"])
@@ -153,7 +152,6 @@ def lane_activity(lane: dict, start: float, end: float, operations: dict) -> dic
     "ops": {name: merge(spans) for name, spans in named.items()},
     "exact": bool(turns),
     "error": next(filter(None, errors), None),
-    "partial": next(filter(None, partial), None),
   }
 
 

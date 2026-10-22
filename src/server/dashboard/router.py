@@ -14,7 +14,6 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
-from pydantic import ValidationError
 
 from server import telemetry
 from server.dashboard import checks, inspection, metrics, queries, sources
@@ -25,7 +24,6 @@ from server.dashboard.schema import (
   Commands,
   Inventory,
   Logs,
-  Operation,
   PodLogs,
   QueryResult,
   Series,
@@ -46,11 +44,10 @@ REQUEST_SECONDS = 12
 OPERATIONS_READ_SECONDS = 15
 # One read and check of a run's or worker's records serves every page asking within this
 # long, and a retry after a timeout joins the read still running instead of starting another.
-# A finished run's records no longer change, so they, and its activity, are kept longer.
+# A finished run's records no longer change, so they are kept longer.
 OPERATIONS_SECONDS = 10
 FINISHED_SECONDS = 300
 operations: OrderedDict[str, tuple[float, asyncio.Task]] = OrderedDict()
-finished_activity: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
 
 
 class InspectionRoute(APIRoute):
@@ -143,28 +140,13 @@ async def read_operations(identity: str, finished: bool = False) -> dict:
 async def load_operations(identity: str) -> dict:
   try:
     store = get_state_store()
-    lists = await asyncio.wait_for(
+    ops, samples = await asyncio.wait_for(
       asyncio.gather(store.read_samples(telemetry.ops_key(identity)), store.read_samples(telemetry.samples_key(identity))),
       timeout=OPERATIONS_READ_SECONDS,
     )
-    if not all(isinstance(records, list) for records in lists):
-      raise ValueError("Expected telemetry records")
-    # Invalid records are skipped later, so the merge must not trust their timestamps.
-    records = sorted(lists[0] + lists[1], key=lambda r: r["at"] if isinstance(r, dict) and isinstance(r.get("at"), int | float) else 0)
   except Exception:
     return {"samples": [], "error": "Operation records unavailable"}
-
-  def validate():
-    samples, invalid = [], 0
-    for record in records:
-      try:
-        Operation.model_validate(record, strict=True)
-        samples.append(record)
-      except ValidationError:
-        invalid += 1
-    return {"samples": samples, **({"partial": f"Skipped {invalid} invalid operation records"} if invalid else {})}
-
-  return await asyncio.to_thread(validate)
+  return {"samples": sorted(ops + samples, key=lambda r: r["at"])}
 
 
 @router.get("/api/v1/inspect/activity", operation_id="activity", response_model=Activity, response_model_exclude_unset=True)
@@ -176,9 +158,6 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
   state, run = await run_of(run_id) if run_id else (await snapshot.current(store), None)
   start, end, low, high = time_range(since, until or state["observed_at"])
   finished = is_finished(run)
-  cached = finished_activity.get((run_id, node_id, start, end)) if finished else None
-  if cached and cached[0] > time.monotonic():
-    return {**cached[1], "run": run, "observed_at": state["observed_at"]}
   selected = [p for p in inspection.lanes(state, run_id, node_id) if p["start"] <= high and p["end"] >= low]
   # Each lane's runs, and its runtime for the worker-level ops recorded there.
   keys = sorted({k for p in selected for k in [*p["run_ids"], p.get("runtime_id")] if k} | ({run_id} if run_id else set()))
@@ -186,22 +165,13 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
   records = dict(zip(keys, await asyncio.gather(*(read_operations(k, finished) for k in keys))))
   result = await asyncio.to_thread(inspection.activity, state, low, high, records, run_id, node_id)
   result.update(since=start, until=end, observed_at=state["observed_at"])
-  result["coverage"] = (
-    f"At most {telemetry.SAMPLE_LIMIT} completed records per run/worker, best effort. "
-    "Missing records do not prove no requests arrived or that workers were idle. The request-ledger check accounts for queued and in-flight requests."
-  )
   if run_id:
     result.update(
       run=run,
       samples=inspection.chart_samples(records[run_id]["samples"], low, high),
       error=records[run_id].get("error"),
-      partial=records[run_id].get("partial"),
       incidents=sorted([*inspection.incidents(run, low, high), *await sdk_incidents(store, run_id, low, high)], key=lambda e: e["at"], reverse=True),
     )
-  if finished and not result.get("error"):
-    finished_activity[(run_id, node_id, start, end)] = (time.monotonic() + FINISHED_SECONDS, result)
-    while len(finished_activity) > 16:
-      finished_activity.popitem(last=False)
   return result
 
 
@@ -276,7 +246,7 @@ async def commands(
   records = await read_operations(run_id, is_finished(run))
   matched = [s for s in records["samples"] if low <= s["at"] <= high and (role is None or (s.get("role") == "sampler") == (role == "sampler"))]
   matched.sort(key=lambda s: s["at"], reverse=True)
-  extra = {k: records[k] for k in ("error", "partial") if records.get(k)}
+  extra = {"error": records["error"]} if records.get("error") else {}
   return {"run_id": run_id, "commands": matched[:limit], "total": len(matched), "truncated": len(matched) > limit, **extra}
 
 
