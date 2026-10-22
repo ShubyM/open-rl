@@ -53,12 +53,6 @@ class SamplingStore:
     entries = await self.redis.xrange(stream_key(pool), min=f"({after}" if after else "-", count=limit)
     return [{**json.loads(fields["record"]), "entry_id": entry_id} for entry_id, fields in entries]
 
-  async def backlog(self, pool: str) -> tuple[int, float | None]:
-    """How many requests wait in the pool, and when the oldest arrived (Unix seconds, from its stream id)."""
-    async with self.redis.pipeline(transaction=False) as pipe:
-      count, oldest = await pipe.xlen(stream_key(pool)).xrange(stream_key(pool), count=1).execute()
-    return count, int(oldest[0][0].split("-")[0]) / 1000 if oldest else None
-
   async def wait_for_new(self, pool: str, after: str, timeout_ms: int) -> None:
     """Returns once a request newer than stream id `after` arrives, or after timeout_ms."""
     await self.redis.xread({stream_key(pool): after}, count=1, block=timeout_ms)

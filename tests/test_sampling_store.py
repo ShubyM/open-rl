@@ -25,17 +25,6 @@ class SamplingStoreTest(RedisTestCase):
     await self.store.commit(pending[first["request_id"]], {"type": "sample"})
     self.assertEqual(await self.store.accept(self.record(key="session:7")), first["request_id"])
 
-  async def test_backlog_counts_waiting_requests_and_dates_the_oldest_by_its_stream_id(self) -> None:
-    self.assertEqual(await self.store.backlog(self.pool), (0, None))
-    before = await self.redis.time()
-    for _ in range(3):
-      await self.store.accept(self.record())
-    count, oldest = await self.store.backlog(self.pool)
-    self.assertEqual(count, 3)
-    self.assertAlmostEqual(oldest, before[0] + before[1] / 1e6, delta=1)
-    await self.store.commit((await self.store.pending(self.pool))[0], {"type": "sample"})
-    self.assertEqual((await self.store.backlog(self.pool))[0], 2)
-
   async def test_concurrent_commits_save_exactly_one_result_and_clear_pending(self) -> None:
     r = self.record()
     await self.store.accept(r)
