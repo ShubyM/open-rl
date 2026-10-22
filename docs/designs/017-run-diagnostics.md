@@ -107,7 +107,8 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | `GET /sessions/{id}/checks` | Session checks (`client-liveness`, `sdk-errors`), then each model check at its worst across the session's models | About 1 KB plus 1 KB per model |
 | `GET /sessions/{id}/summary` | Liveness, each model's state and pace, failing and warning checks | Under 1 KB |
 | `GET /runs/{id}/checks?only=` | One model's check results | About 1.1 KB for 8 |
-| `GET /runs/{id}/summary` | State, step, step time, last reward, per-GPU duty | About 1 KB |
+| `GET /runs/{id}/summary` | Verdict, goodput, state, step, step time, last reward, per-GPU duty | About 1 KB |
+| `GET /catalog` | What each check and named query means | About 2.5 KB |
 | `GET /inventory` | Runs and fleet, slimmed to what pages list | As today, smaller |
 
 Named queries keep one copy of each PromQL expression for checks and UI, and keep agent calls bounded.
@@ -117,14 +118,18 @@ Named queries keep one copy of each PromQL expression for checks and UI, and kee
 A check reads the stores for one run, applies thresholds taken from incidents, and returns:
 
 ```json
-{"check": "request-ledger", "verdict": "fail",
- "reason": "3 forward_backward held by trainer incarnation 7f2c (restarted 2.4 d ago)",
- "numbers": {"outstanding": 3, "oldest_s": 207360, "median_step_s": 1450, "lost": 3},
- "evidence": "open_rl:worker:7f2c… outstanding[0]; pod harvey-trainer-0 lastState=Error(134)",
- "data_age_s": 4}
+{"check": "request-ledger", "verdict": "fail", "kind": "cause", "explains": "progress",
+ "reason": "1 create_model held by orw-lora-97532d40-…-0-trainer, which stopped reporting",
+ "numbers": {"outstanding": 1},
+ "evidence": [{"read": "logs", "args": {"run_id": "97532d40-…", "pod": "orw-lora-97532d40-…-0-trainer",
+                                        "since": "2026-10-21T06:44:27+00:00", "until": "2026-10-21T07:49:27+00:00"}}]}
 ```
 
 Verdicts are `ok`, `warn`, `fail` and `unknown`. `unknown` carries the age of the stalest input whenever an input is missing or older than two collection intervals.
+
+Each check is a symptom or a cause. Symptoms (`progress`, `optimizer-health`, `client-liveness`) say whether the user is hurt; causes say why. The run verdict is the worst symptom, so a warning from a cause alone never marks a run as failing. Evidence is a list of reads the caller can run as they stand: a route under 4.4, its arguments, and the window of the run, so an agent follows a failing check to the raw records in one call. Numbers carry what was observed next to the threshold it was compared with.
+
+`/runs/{id}/summary` reports goodput, the share of the run's span the trainer spent in training steps, and splits the rest into checkpoint, forward-only and other time. This is the first number to read when a run is slow rather than broken.
 
 | Check | Question | Incidents |
 |---|---|---|
