@@ -18,6 +18,7 @@ from fastapi.routing import APIRoute
 from server import telemetry
 from server.dashboard import checks, inspection, metrics, queries, sources
 from server.dashboard.schema import (
+  FleetChecks,
   Accelerators,
   Activity,
   Catalog,
@@ -71,7 +72,8 @@ TimeBound = Annotated[
   str | None,
   Query(
     max_length=64,
-    description="ISO-8601 timestamp, e.g. 2026-01-02T12:00:00Z; not Unix seconds. Defaults to the 30 minutes ending now. Maximum window: seven days.",
+    description="ISO-8601 timestamp, e.g. 2026-01-02T12:00:00Z, not Unix seconds; since also takes a span before until, e.g. 1h, 30m, 2d. "
+    "Defaults to the 30 minutes ending now. Maximum window: seven days.",
   ),
 ]
 
@@ -320,6 +322,21 @@ async def catalog():
     for fn in (checks.client_liveness, checks.sdk_errors)
   ]
   return {"checks": found, "queries": [{"name": name, "meaning": query} for name, query in queries.QUERIES.items()]}
+
+
+@router.get("/api/v1/inspect/checks", operation_id="fleet_checks", response_model=FleetChecks, response_model_exclude_unset=True)
+async def fleet_checks(ended: bool = False):
+  """Every live run's verdict with its failing and warning checks and their reasons: is anything stuck, in one read.
+  ended=true includes ended runs."""
+  state = await snapshot.current(get_state_store())
+  runs = [r for r in state["runs"] if ended or not is_finished(r)]
+  found = []
+  for run, results in zip(runs, await asyncio.gather(*(check_context(r["run_id"]) for r in runs))):
+    results = checks.run_checks(results)
+    flagged = [{k: r[k] for k in ("check", "verdict", "reason")} for r in results if r["verdict"] in (checks.FAIL, checks.WARN)]
+    found.append({"run_id": run["run_id"], "name": run.get("name"), "lifecycle": run.get("lifecycle"), "verdict": checks.verdict(results), "flagged": flagged})
+  found.sort(key=lambda r: -checks.RANK[r["verdict"]])
+  return {"runs": found}
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/checks", operation_id="checks", response_model=Checks, response_model_exclude_unset=True)

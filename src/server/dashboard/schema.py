@@ -244,6 +244,18 @@ class QueryResult(Record):
   error: str | None = None
 
 
+class FleetRun(Record):
+  run_id: str
+  name: str | None = None
+  lifecycle: str | None = None
+  verdict: str
+  flagged: list[dict[str, str]] = Field(default_factory=list, description="Failing and warning checks with their reasons")
+
+
+class FleetChecks(Record):
+  runs: list[FleetRun] = Field(default_factory=list, description="Worst verdict first")
+
+
 class Holder(Record):
   run_ids: list[str] = Field(default_factory=list)
   role: str | None = None

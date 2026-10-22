@@ -109,6 +109,7 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | `GET /runs/{id}/checks?only=` | One model's check results | About 1.1 KB for 8 |
 | `GET /runs/{id}/summary` | Verdict, goodput, state, step, step time, last reward, per-GPU duty | About 1 KB |
 | `GET /catalog` | What each check and named query means | About 2.5 KB |
+| `GET /checks?ended=` | Every live run's verdict with its failing and warning checks and their reasons, worst first | Under 1 KB per run |
 | `GET /accelerators?run_id=&node_id=&since=&until=` | One row per GPU: node, model, holder, utilization now and over the window (last hour by default), memory used of total | About 9 KB for 30 GPUs |
 | `GET /inventory` | What the pages list: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, and pods with problems. No health judgment; that is `/runs/{id}/checks` | About 17 KB on the demo store, against 112 KB |
 

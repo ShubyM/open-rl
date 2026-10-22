@@ -105,7 +105,7 @@ def progress(ctx: dict) -> dict:
     return answer(name, FAIL, reason, read(f"runs/{run_id}/commands", limit=5), **{**numbers, "quiet_s": round(quiet), "quiet_threshold_s": QUIET_SECONDS})
   if median and idle > max(600, 2 * median):
     return answer(name, WARN, f"no optimizer step for {idle / 60:.0f} min, over 2x the median", evidence, **numbers)
-  return answer(name, OK, f"{len(steps)} steps; the last {idle / 60:.0f} min ago", **numbers)
+  return answer(name, OK, f"{len(steps)} steps, the last {idle / 60:.0f} min ago; an op finished {quiet:.0f} s ago", **{**numbers, "quiet_s": round(quiet)})
 
 
 def request_ledger(ctx: dict) -> dict:
@@ -155,8 +155,10 @@ def worker_health(ctx: dict) -> dict:
   if restarts and held:
     if relaunched:
       p = relaunched[0]
-      logs = read("logs", run_id=run_id, pod=p["pod"], since=iso(p["started_at"] - 120), until=iso(p["started_at"] + 60))
-      return answer(name, FAIL, f"the worker in {p['pod']} restarted at {iso(p['started_at'])} with a request in flight", logs, **numbers)
+      gone = p["previous_heartbeat_at"]
+      logs = read("logs", run_id=run_id, pod=p["pod"], since=iso(gone - 120), until=iso(p["started_at"] + 60))
+      reason = f"the worker in {p['pod']} stopped reporting at {iso(gone)} and restarted at {iso(p['started_at'])} with a request in flight"
+      return answer(name, FAIL, reason, logs, **numbers)
     errors = read("logs", run_id=run_id, severity="ERROR", **span(ctx))
     return answer(name, FAIL, f"{restarts} restarts while requests were in flight", errors, **numbers)
   if failed or restarts or events:
@@ -176,7 +178,11 @@ def relaunches(ctx: dict) -> list[dict]:
   for p in ctx["workers"]:
     if p.get("pod") and p.get("role") != "dispatcher" and p.get("started_at", 0) >= ctx["since"] - 60:
       by_pod.setdefault(p["pod"], []).append(p)
-  return sorted((p for procs in by_pod.values() for p in sorted(procs, key=lambda p: p["started_at"])[1:]), key=lambda p: p["started_at"])
+  found = []
+  for procs in by_pod.values():
+    procs.sort(key=lambda p: p["started_at"])
+    found += [{**later, "previous_heartbeat_at": earlier.get("heartbeat_at", later["started_at"])} for earlier, later in zip(procs, procs[1:])]
+  return sorted(found, key=lambda p: p["started_at"])
 
 
 def placement(ctx: dict) -> dict:
@@ -355,8 +361,8 @@ def waiting(ctx: dict) -> dict | None:
     "trainer_idle_s": round(now - trainer[-1]["at"]) if trainer else None,
     "trainer_requests": sum(o.get("count", 0) for o in held),
     "oldest_trainer_request_s": round(max(o.get("age_seconds", 0) for o in held)) if held else None,
-    "samples_queued": pool.get("waiting", 0),
-    "oldest_sample_queued_s": round(now - pool["oldest"]) if pool.get("oldest") else None,
+    "samples_unanswered": pool.get("waiting", 0),
+    "oldest_unanswered_sample_s": round(now - pool["oldest"]) if pool.get("oldest") else None,
   }
 
 

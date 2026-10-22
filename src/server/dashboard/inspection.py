@@ -174,6 +174,7 @@ def steps(samples: list[dict]) -> list[dict]:
     step["nonfinite"].update(s.get("nonfinite", ()))
   for step in found.values():
     step["nonfinite"] = sorted(step["nonfinite"])
+    step["complete"] = step["ops"].get("optim_step", {}).get("count", 0) > step["ops"].get("optim_step", {}).get("failed", 0)
     for op in step["ops"].values():
       op["metrics"] = {name: {"min": m["min"], "max": m["max"], "mean": m["sum"] / op["count"]} for name, m in op["metrics"].items()}
   return [found[k] for k in sorted(found)]

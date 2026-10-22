@@ -94,10 +94,11 @@ class ChecksReplayTest(unittest.TestCase):
 
   def test_a_worker_restarted_in_its_pod_with_a_request_in_flight_fails_worker_health(self):
     held = {"op": "create_model", "count": 1, "since": NOW - 900, "age_seconds": 900, "pod": "t-0", "process_alive": False}
-    workers = [{"pod": "t-0", "role": "trainer", "started_at": NOW - 1000}, {"pod": "t-0", "role": "trainer", "started_at": NOW - 880}]
+    first = {"pod": "t-0", "role": "trainer", "started_at": NOW - 1000, "heartbeat_at": NOW - 905}
+    workers = [first, {"pod": "t-0", "role": "trainer", "started_at": NOW - 880, "heartbeat_at": NOW}]
     result = checks.worker_health(context(outstanding=[held], workers=workers))
     self.assertEqual(result["verdict"], checks.FAIL)
-    self.assertIn("t-0 restarted", result["reason"])
+    self.assertIn(f"stopped reporting at {checks.iso(NOW - 905)}", result["reason"])
 
   def test_a_healthy_run_is_ok_and_missing_inputs_are_unknown_never_ok(self):
     healthy = context(healthy_steps(), ledger={"enqueued": 5, "popped": 5, "answered": 5})

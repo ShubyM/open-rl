@@ -471,14 +471,15 @@ class Window(NamedTuple):
 
 
 def window(since: str | None = None, until: str | None = None) -> Window:
-  """The query window: until defaults to now, since to 30 minutes before until; at most seven days."""
+  """The query window: until defaults to now, since to 30 minutes before until, or a span before it such as 1h; at most seven days."""
 
   def parse(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
 
   end = parse(until) if until else datetime.now(UTC)
-  start = parse(since) if since else end - timedelta(minutes=30)
+  ago = re.fullmatch(r"(\d+)([mhd])", since or "")
+  start = end - timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[ago[2]]: int(ago[1])}) if ago else parse(since) if since else end - timedelta(minutes=30)
   if start >= end or end - start > timedelta(days=7):
     raise ValueError("Time range must be positive and no longer than seven days")
   return Window(start.isoformat(timespec="microseconds"), end.isoformat(timespec="microseconds"), start.timestamp(), end.timestamp())
