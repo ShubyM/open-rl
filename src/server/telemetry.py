@@ -372,6 +372,66 @@ async def gpu_turn(time_slicer, workload):
     set_phase("ready")
 
 
+# *** placements, recorded from the scheduler's Workloads ***
+
+OPEN_PLACEMENTS = "open_rl:placements:open"  # models that hold a placement not yet released
+
+
+def placements_key(model_id: str) -> str:
+  """Where a Workload's model ran: one record per placement, kept after the Workload is gone."""
+  return f"open_rl:placements:{model_id}"
+
+
+def epoch(stamp: str | None) -> float | None:
+  return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() if stamp else None
+
+
+def placement_of(item: dict) -> dict | None:
+  """A Workload as a placement record, or None until the scheduler stamps placedAt."""
+  spec, status = item["spec"], item.get("status") or {}
+  if not status.get("placedAt"):
+    return None
+  return {
+    "workload": item["metadata"]["name"],
+    "role": spec["role"],
+    "model_id": spec["modelID"],
+    "owner": spec.get("ownerID"),
+    "pod": status.get("podName"),
+    "node": status.get("nodeName"),
+    "gpu_uuids": status.get("gpuUUIDs") or [],
+    "placed_at": epoch(status["placedAt"]),
+    "released_at": epoch(status.get("releasedAt")),
+  }
+
+
+async def record_placements(store, workloads: list[dict]) -> None:
+  """Upsert one record per (workload, placedAt). An open record whose Workload is gone or placed again is
+  released now. A list is rewritten only when it changes, so a repeated sweep writes nothing."""
+  now, live = time.time(), {}
+  for item in workloads:
+    if placement := placement_of(item):
+      live[placement["workload"]] = placement
+  opened = await store.set_members(OPEN_PLACEMENTS)
+  for model_id in opened | {p["model_id"] for p in live.values()}:
+    records = await store.read_samples(placements_key(model_id))
+    fresh = {name: p for name, p in live.items() if p["model_id"] == model_id}
+    updated = []
+    for record in records:
+      if (current := fresh.get(record["workload"])) and current["placed_at"] == record["placed_at"]:
+        record = fresh.pop(record["workload"])
+      elif record["released_at"] is None:
+        record = {**record, "released_at": now}
+      updated.append(record)
+    updated += fresh.values()
+    if updated != records:
+      await store.replace_samples(placements_key(model_id), updated, TTL_SECONDS)
+    held = any(r["released_at"] is None for r in updated)
+    if held and model_id not in opened:
+      await store.add_to_set(OPEN_PLACEMENTS, model_id)
+    elif not held and model_id in opened:
+      await store.remove_from_set(OPEN_PLACEMENTS, model_id)
+
+
 # *** client logs and SDK errors, through the gateway ***
 
 

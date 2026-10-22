@@ -289,6 +289,11 @@ class StateStore(ABC):
     pass
 
   @abstractmethod
+  async def replace_samples(self, key: str, samples: list[dict[str, Any]], ttl_seconds: float | None) -> None:
+    """Replace a list's samples in one step; it expires ttl_seconds later, or never."""
+    pass
+
+  @abstractmethod
   async def list_length(self, key: str) -> int | None:
     """Items in a list, such as a request queue; None where this store holds no queues."""
     pass
@@ -348,6 +353,9 @@ class InMemoryStateStore(StateStore):
   async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
     return [json.loads(sample) for sample in self.samples.get(key, [])[-(last or 0) :]]
 
+  async def replace_samples(self, key: str, samples: list[dict[str, Any]], ttl_seconds: float | None) -> None:
+    self.samples[key] = [json.dumps(sample, allow_nan=False) for sample in samples]
+
   async def list_length(self, key: str) -> int | None:
     return None  # the in-memory queues live in InMemoryStore
 
@@ -402,6 +410,15 @@ class RedisStateStore(StateStore):
     raw = await self.redis.lrange(key, -(last or 0), -1)
     # Decoded off the event loop: a dashboard read can be thousands of samples.
     return await asyncio.to_thread(lambda: [json.loads(sample) for sample in raw])
+
+  async def replace_samples(self, key: str, samples: list[dict[str, Any]], ttl_seconds: float | None) -> None:
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.delete(key)
+      if samples:
+        pipeline.rpush(key, *(json.dumps(sample, allow_nan=False) for sample in samples))
+        if ttl_seconds:
+          pipeline.expire(key, int(ttl_seconds))
+      await pipeline.execute()
 
   async def list_length(self, key: str) -> int | None:
     return await self.redis.llen(key)

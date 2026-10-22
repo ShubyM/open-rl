@@ -10,10 +10,12 @@ import socket
 import subprocess
 import time
 import unittest
+from unittest import mock
 
 import redis as sync_redis
 import redis.asyncio as redis
 
+from server import telemetry
 from server.store import InMemoryStateStore, RedisStateStore, RedisStore
 
 TEST_REDIS_URL = os.getenv("OPEN_RL_TEST_REDIS_URL")
@@ -26,7 +28,40 @@ def free_port() -> int:
     return sock.getsockname()[1]
 
 
+def workload(name: str, placed_at: str | None = "1970-01-01T00:01:40Z", released_at: str | None = None) -> dict:
+  status = {"podName": f"orw-{name}", "nodeName": "n1", "gpuUUIDs": ["GPU-1"], "placedAt": placed_at, "releasedAt": released_at}
+  return {"metadata": {"name": name}, "spec": {"role": "trainer", "modelID": "m1", "ownerID": "m1"}, "status": status}
+
+
 class SampleStoreContract:
+  async def test_placements_are_upserted_released_and_rewritten_only_on_change(self) -> None:
+    async def sweep(*workloads, now=1000.0):
+      with mock.patch.object(telemetry.time, "time", return_value=now):
+        await telemetry.record_placements(self.state, list(workloads))
+      return await self.state.read_samples(telemetry.placements_key("m1"))
+
+    self.assertEqual(await sweep(workload("unplaced", placed_at=None)), [])
+    (placed,) = await sweep(workload("a"))
+    self.assertEqual(
+      placed,
+      {"workload": "a", "role": "trainer", "model_id": "m1", "owner": "m1", "pod": "orw-a", "node": "n1", "gpu_uuids": ["GPU-1"]}
+      | {"placed_at": 100.0, "released_at": None},
+    )
+    self.assertEqual(await self.state.set_members(telemetry.OPEN_PLACEMENTS), {"m1"})
+    with mock.patch.object(self.state, "replace_samples", wraps=self.state.replace_samples) as rewrite:
+      self.assertEqual(await sweep(workload("a")), [placed])
+    rewrite.assert_not_awaited()
+
+    released, moved = await sweep(workload("a", released_at="1970-01-01T00:02:30Z"), workload("b"))
+    self.assertEqual((released["released_at"], moved["workload"], moved["released_at"]), (150.0, "b", None))
+    # A Workload placed again starts a new record and releases the old one; one that is gone is released at the sweep.
+    records = await sweep(workload("b", placed_at="1970-01-01T00:03:00Z"), now=2000.0)
+    self.assertEqual([(r["workload"], r["placed_at"], r["released_at"]) for r in records], [("a", 100, 150), ("b", 100, 2000), ("b", 180, None)])
+    records = await sweep(now=3000.0)
+    self.assertEqual([r["released_at"] for r in records], [150, 2000, 3000])
+    self.assertEqual(await self.state.set_members(telemetry.OPEN_PLACEMENTS), set())
+    self.assertEqual(await sweep(now=4000.0), records)
+
   async def test_sample_lists_keep_the_newest(self) -> None:
     for step in range(3):
       await self.state.append_sample("samples", {"step": step}, limit=2, ttl_seconds=60)

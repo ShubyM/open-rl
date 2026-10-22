@@ -635,6 +635,10 @@ async def reap_dead_sessions():
     await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
     # Nothing in a sweep may end the loop. A failed call is retried next sweep.
     try:
+      await telemetry.record_placements(state, await asyncio.to_thread(worker_manager.workloads))
+    except Exception:
+      traceback.print_exc()
+    try:
       owners = await session_registry.owners()
     except Exception:
       traceback.print_exc()

@@ -497,10 +497,13 @@ class SchedulerWorkerManager:
     """Our Workloads, one entry per worker, in the client vocabulary. The pod
     is the scheduler's; what the API server knows about it is what the
     scheduler wrote into Workload status."""
-    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
-    found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
     now = time.time()
-    return [workload_worker(item, now) for item in found["items"]]
+    return [workload_worker(item, now) for item in self.workloads()]
+
+  def workloads(self) -> list[dict[str, Any]]:
+    """Our Workload objects as the API returns them."""
+    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
+    return self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)["items"]
 
 
 def workload_worker(item: dict[str, Any], now: float) -> dict[str, Any]:
