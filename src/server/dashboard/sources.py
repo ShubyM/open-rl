@@ -22,6 +22,11 @@ detected: dict = {}
 discovered_at = -60.0
 credentials = None
 credentials_lock = threading.Lock()
+RESYNC_SECONDS = 300
+watched: dict[str, dict[str, dict] | None] = {}  # pods, nodes and workloads by name; None when the kind is not served
+watch_errors: dict[str, str | None] = {kind: f"{kind} read failed: no answer yet" for kind in ("pods", "nodes", "workloads")}
+attempted = {kind: asyncio.Event() for kind in watch_errors}  # set once the kind's first list answered
+watchers: list[asyncio.Task] = []  # the loop holds tasks weakly
 
 
 async def send(method: str, url: str, **kwargs) -> httpx.Response:
@@ -104,35 +109,66 @@ def incidents(pod: str, statuses: list[dict]) -> list[dict]:
   ]
 
 
-async def kubernetes() -> dict:
-  """Pods, nodes and scheduler Workloads; workloads is None when the scheduler cannot be read or is not installed."""
-  try:
-    from kubernetes import client, config  # the cluster extra installs it
+async def follow(api, kind: str, resource, namespace: str | None) -> None:
+  """List, then apply each change from the list's resourceVersion. An expired version (410), a failure and every
+  RESYNC_SECONDS list again; a silently dropped connection costs at most that long. The last list serves meanwhile."""
+  from httpx2 import HTTPStatusError  # lightkube's HTTP client
 
+  while True:
+    try:
+      async with asyncio.timeout(RESYNC_SECONDS):
+        listed = api.list(resource, namespace=namespace)
+        objects = {o.metadata.name: o.to_dict() async for o in listed}
+        watched[kind], watch_errors[kind] = objects, None
+        attempted[kind].set()
+        async for change, obj in api.watch(resource, namespace=namespace, resource_version=listed.resourceVersion):
+          if change == "DELETED":
+            objects.pop(obj.metadata.name, None)
+          else:
+            objects[obj.metadata.name] = obj.to_dict()
+    except TimeoutError:
+      continue
+    except HTTPStatusError as exc:  # lightkube's ApiError too, which carries no response when a watch stream sent it
+      code = exc.status.code if exc.response is None else exc.response.status_code
+      if code == 410:
+        continue
+      if code == 404:  # no scheduler CRD on a local stack
+        watched[kind], watch_errors[kind] = None, None
+      else:
+        watch_errors[kind] = f"{kind} read failed: {exc}"
+    except Exception as exc:
+      watch_errors[kind] = f"{kind} read failed: {exc}"
+    attempted[kind].set()
+    await asyncio.sleep(5)
+
+
+def watch_cluster() -> None:
+  """One watch per kind for the life of the process, from the in-cluster service account or else the kubeconfig."""
+  if watchers:
+    return
+  from lightkube import AsyncClient  # the cluster extra installs it
+  from lightkube.generic_resource import create_namespaced_resource
+  from lightkube.resources.core_v1 import Node, Pod
+
+  api, ns = AsyncClient(), namespace()
+  workload = create_namespaced_resource("openrl.io", "v1alpha1", "Workload", "workloads")
+  for kind, resource, scope in (("pods", Pod, ns), ("nodes", Node, None), ("workloads", workload, ns)):
+    watchers.append(asyncio.create_task(follow(api, kind, resource, scope)))
+
+
+async def kubernetes() -> dict:
+  """Pods, nodes and scheduler Workloads from the watch cache; workloads is None when the scheduler cannot be read or
+  is not installed. The first call waits up to 6 s for each kind's first list."""
+  try:
     from server.scheduler_worker_manager import workload_worker
 
-    try:
-      config.load_incluster_config()
-    except Exception:
-      config.load_kube_config()
+    watch_cluster()
   except Exception as exc:
     return {"pods": [], "nodes": [], "workloads": None, "errors": [f"Kubernetes unavailable: {exc}"]}
-  core, custom, ns, errors = client.CoreV1Api(), client.CustomObjectsApi(), namespace(), []
-
-  async def items(name: str, call, *args) -> list[dict] | None:
-    try:
-      found = await asyncio.to_thread(call, *args, _preload_content=False, _request_timeout=6)
-      return json.loads(found.data)["items"]
-    except Exception as exc:
-      if getattr(exc, "status", None) != 404:  # no scheduler CRD on a local stack
-        errors.append(f"{name} read failed: {exc}")
-      return None
-
-  pods, nodes, workloads = await asyncio.gather(
-    items("pods", core.list_namespaced_pod, ns),
-    items("nodes", core.list_node),
-    items("workloads", custom.list_namespaced_custom_object, "openrl.io", "v1alpha1", ns, "workloads"),
-  )
+  await asyncio.wait([asyncio.ensure_future(event.wait()) for event in attempted.values()], timeout=6)
+  errors = [error for error in watch_errors.values() if error]
+  # In a list's order, by name.
+  pods, nodes, workloads = (None if (found := watched.get(kind)) is None else [found[name] for name in sorted(found)] for kind in attempted)
   result, now = {"pods": [], "nodes": [], "workloads": None if workloads is None else [], "errors": errors}, time.time()
   for pod in pods or []:
     name, labels, statuses = pod["metadata"]["name"], pod["metadata"].get("labels") or {}, pod["status"].get("containerStatuses") or []

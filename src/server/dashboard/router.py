@@ -1,6 +1,7 @@
 """The operator UI and the same read-only JSON API for agents, under /api/v1/inspect."""
 
 import asyncio
+import contextlib
 import json
 import math
 import re
@@ -18,7 +19,15 @@ from server.dashboard import facts, fleet, sources
 from server.store import get_state_store
 from server.telemetry import key
 
-router = APIRouter(tags=["inspection"])
+
+@contextlib.asynccontextmanager
+async def lifespan(_):
+  with contextlib.suppress(Exception):  # without a cluster the rest still serves; reads report why
+    sources.watch_cluster()
+  yield
+
+
+router = APIRouter(tags=["inspection"], lifespan=lifespan)
 STATIC = Path(__file__).parent / "static"
 BOUNDS = "ISO-8601, e.g. 2026-01-02T12:00:00Z; since also takes a span before until, e.g. 1h. Default: the 30 minutes ending now; at most 7 days."
 Bound = Annotated[str | None, Query(max_length=64, description=BOUNDS)]

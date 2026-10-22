@@ -75,7 +75,7 @@ The pages label a run from its lifecycle and show `Unhealthy` when its checks fa
 | Worker processes | Each trainer and dispatcher rewrites a record every 5 seconds: pod, node, GPU UUIDs, phase, unanswered requests, and recent GPU turns. A record unchanged for 30 seconds belongs to a gone process. Samplers are plain `vllm serve` and keep none |
 | Ops and step counts | Recorded by workers, newest `OPEN_RL_OPS_SAMPLE_LIMIT` (2,000) per run. The dispatcher records each sample on the replica that answered |
 | Placements | The API server lists the scheduler's Workloads every 30 seconds and keeps one record per placement in `open_rl:placements:<model_id>`: pod, node, GPU UUIDs, placed and released times. Runs from before these records need `dev/backfill_placements.py` once |
-| Nodes, pods, events, scheduler | Kubernetes API, cached for 5 seconds |
+| Nodes, pods, scheduler | Kubernetes API: one watch per kind keeps them in memory from the first read or server start, and lists again every 5 minutes and whenever a watch fails |
 | Each node's GPUs | DCGM's UUID and slot labels, from the metrics source below |
 | GPU, worker, and sampler series | DCGM, container, and vLLM metrics from `OPEN_RL_PROMETHEUS_URL`, or Cloud Monitoring's PromQL API on GKE |
 | Run logs | Cloud Logging: the worker pods with the run's `timeslice.io/owner` label, its sampling pool's pods, and its forwarded client lines; a stderr line takes the level it prints |

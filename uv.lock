@@ -940,6 +940,19 @@ wheels = [
 ]
 
 [[package]]
+name = "h2"
+version = "4.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "hpack" },
+    { name = "hyperframe" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e7/85/7c366e69d84c17bb778fe41419e1fbcce3033d5b7ce29bbffff0a98b859f/h2-4.4.1.tar.gz", hash = "sha256:4e866ffb1a869ae14dd9b5e6beb5c24a13da0495ad72b65925ded182521c1516", size = 2157281, upload-time = "2026-08-03T11:45:09.509Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7e/22/e85faf23bd72a92d1921e37d674ca56eb298a3c8be31fdecef0ff2b3aaac/h2-4.4.1-py3-none-any.whl", hash = "sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6", size = 62636, upload-time = "2026-08-03T11:44:59.164Z" },
+]
+
+[[package]]
 name = "hf-xet"
 version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -987,6 +1000,15 @@ wheels = [
 ]
 
 [[package]]
+name = "hpack"
+version = "4.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/26/5b/fcabf6028144a8723726318b07a32c2f3314acdff6265743cf08a344b18e/hpack-4.2.0.tar.gz", hash = "sha256:0895cfa3b5531fc65fe439c05eb65144f123bf7a394fcaa56aa423548d8e45c0", size = 51300, upload-time = "2026-06-23T18:34:46.667Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/71/b4/4a9fcfb2aef6ba44d9073ecd301443aa00b3dac95de5619f2a7de7ec8a91/hpack-4.2.0-py3-none-any.whl", hash = "sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986", size = 34246, upload-time = "2026-06-23T18:34:45.472Z" },
+]
+
+[[package]]
 name = "httpcore"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
@@ -1004,8 +1026,8 @@ name = "httpcore2"
 version = "2.13.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "h11", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "truststore", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
+    { name = "h11", marker = "sys_platform != 'emscripten' or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-gpu') or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-vllm') or (extra != 'extra-7-open-rl-cpu' and extra != 'extra-7-open-rl-gpu')" },
+    { name = "truststore", marker = "sys_platform != 'emscripten' or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-gpu') or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-vllm') or (extra != 'extra-7-open-rl-cpu' and extra != 'extra-7-open-rl-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cb/f3/1db7aa2bc2524062192bb0e0323969492d1883152a232fe36eea65f4e35c/httpcore2-2.13.1.tar.gz", hash = "sha256:e0aa977abe17e69a3b820a24542a6fa88702676d83880b8d194dcd18408e5103", size = 68071, upload-time = "2026-09-23T07:47:22.372Z" }
 wheels = [
@@ -1047,16 +1069,24 @@ name = "httpx2"
 version = "2.13.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "httpcore2", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "httpx2-jsfetch", marker = "sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu'" },
-    { name = "idna", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "truststore", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
-    { name = "typing-extensions", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
+    { name = "anyio", marker = "sys_platform != 'emscripten' or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-gpu') or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-vllm')" },
+    { name = "httpcore2", marker = "sys_platform != 'emscripten' or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-gpu') or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-vllm')" },
+    { name = "httpx2-jsfetch", marker = "sys_platform == 'emscripten' or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-gpu') or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-vllm')" },
+    { name = "idna" },
+    { name = "truststore", marker = "sys_platform != 'emscripten' or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-gpu') or (extra == 'extra-7-open-rl-cpu' and extra == 'extra-7-open-rl-vllm')" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d5/44/474bef2a0e9d90f1715d32cb98b0738695ca17ba324095fb2497ed7fbd59/httpx2-2.13.1.tar.gz", hash = "sha256:e48744a19e3af5ee48313d0ce5fe941d5422fae5705ea922a4aabf94d7800dfa", size = 100405, upload-time = "2026-09-23T07:47:23.052Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d8/9c/6fe8931fd9f381042a9e4c7d5a7b4cbf7016b252bec0c99a49fce42c3326/httpx2-2.13.1-py3-none-any.whl", hash = "sha256:6dff50fabc270ee5fd25d845d0b078ed20564579744d6d962850975996d2f9a4", size = 95597, upload-time = "2026-09-23T07:47:20.995Z" },
+]
+
+[package.optional-dependencies]
+http2 = [
+    { name = "h2" },
+]
+ws = [
+    { name = "wsproto" },
 ]
 
 [[package]]
@@ -1151,6 +1181,15 @@ cu12 = [
     { name = "nvidia-cuda-nvcc-cu12", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
     { name = "nvidia-cuda-nvrtc-cu12", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
     { name = "nvidia-cuda-runtime-cu12", marker = "(sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra != 'extra-7-open-rl-gpu') or (sys_platform == 'win32' and extra != 'extra-7-open-rl-gpu')" },
+]
+
+[[package]]
+name = "hyperframe"
+version = "6.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/02/e7/94f8232d4a74cc99514c13a9f995811485a6903d48e5d952771ef6322e30/hyperframe-6.1.0.tar.gz", hash = "sha256:f630908a00854a7adeabd6382b43923a4c4cd4b821fcb527e6ab9e15382a3b08", size = 26566, upload-time = "2025-01-22T21:41:49.302Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/30/47d0bf6072f7252e6521f3447ccfa40b421b6824517f82854703d0f5a98b/hyperframe-6.1.0-py3-none-any.whl", hash = "sha256:b03380493a519fce58ea5af42e4a42317bf9bd425596f7a0835ffce80f1a42e5", size = 13007, upload-time = "2025-01-22T21:41:47.295Z" },
 ]
 
 [[package]]
@@ -1304,6 +1343,30 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/af/60/bc7622aefb2aee1c0b4ba23c1446d3e30225c8770b38d7aedbfb65ca9d5a/lark-1.2.2.tar.gz", hash = "sha256:ca807d0162cd16cef15a8feecb862d7319e7a09bdb13aef927968e45040fed80", size = 252132, upload-time = "2024-08-13T19:49:00.652Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2d/00/d90b10b962b4277f5e64a78b6609968859ff86889f5b898c1a778c06ec00/lark-1.2.2-py3-none-any.whl", hash = "sha256:c2276486b02f0f1b90be155f2c8ba4a8e194d42775786db622faccd652d8e80c", size = 111036, upload-time = "2024-08-13T19:48:58.603Z" },
+]
+
+[[package]]
+name = "lightkube"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx2", extra = ["http2", "ws"] },
+    { name = "lightkube-models" },
+    { name = "msgspec" },
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c8/f7/5d244d5964f9fce76600eedb8abb5aa4c8db76184f70e63334fd4c7a6480/lightkube-1.0.1.tar.gz", hash = "sha256:5f1577487be7d44c847f88a656574154e8f5dec0045d959b8328b88d7adb518a", size = 38783, upload-time = "2026-08-12T11:13:58.854Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/a0/9cf2061cb19c3c732408a5d28bca61774fefdb7ea67105ff2bed4b01defa/lightkube-1.0.1-py3-none-any.whl", hash = "sha256:094a6ae6a2fa895189450865915964d03336d1561fc9fc6f48786a075073c782", size = 49276, upload-time = "2026-08-12T11:14:01.806Z" },
+]
+
+[[package]]
+name = "lightkube-models"
+version = "1.37.0.8"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b9/0b/d2210e371f27f9485143c11024b8ed9cf464be0ee113e5cb8e1be90aad9c/lightkube_models-1.37.0.8.tar.gz", hash = "sha256:07a350c76cbf290dd794075ea8e0147ac6cd35297755b391b72676ceef17c858", size = 289486, upload-time = "2026-08-29T09:57:43.42Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2b/98/71f1f7d80b825b2cf16571ad969ee8fcfc12ffc246a3b85531b81b08443c/lightkube_models-1.37.0.8-py3-none-any.whl", hash = "sha256:fe5a16a2a266fd1a5a1472d6f1ee873dbc85d690bc8d60512b1e01157a3d6745", size = 353256, upload-time = "2026-08-29T09:57:41.957Z" },
 ]
 
 [[package]]
@@ -1965,6 +2028,7 @@ dependencies = [
 [package.optional-dependencies]
 cluster = [
     { name = "kubernetes" },
+    { name = "lightkube" },
     { name = "timeslice" },
 ]
 cpu = [
@@ -2018,6 +2082,7 @@ requires-dist = [
     { name = "flashinfer-jit-cache", marker = "sys_platform == 'linux' and extra == 'vllm'", specifier = "==0.6.18.post1", index = "https://flashinfer.ai/whl/cu129", conflict = { package = "open-rl", extra = "vllm" } },
     { name = "httpx" },
     { name = "kubernetes", marker = "extra == 'cluster'", specifier = ">=29" },
+    { name = "lightkube", marker = "extra == 'cluster'", specifier = ">=1.0.1" },
     { name = "numpy", marker = "extra == 'cpu'" },
     { name = "numpy", marker = "extra == 'gpu'" },
     { name = "openai", marker = "extra == 'cpu'" },
@@ -3724,6 +3789,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ef/cb/99450668dd3502d62a54a1c8aa56e44f34cb8c1261b381cfe2e7926c3b75/wrapt-2.2.1-cp312-cp312-win_amd64.whl", hash = "sha256:6ce32763ac31ce94fe9aada947e479b1975012bff166da409b4b9e4e376cf7e5", size = 80825, upload-time = "2026-05-22T14:48:13.046Z" },
     { url = "https://files.pythonhosted.org/packages/e6/3a/87512881be64e743f9ee4c66f4cbe8e884974bef2a5989af71f999653ac7/wrapt-2.2.1-cp312-cp312-win_arm64.whl", hash = "sha256:8d1b4d0e0c2119587a31f5c029abd547e0c81d93b89d394566fe1588659eb579", size = 79087, upload-time = "2026-05-22T14:48:14.323Z" },
     { url = "https://files.pythonhosted.org/packages/53/46/29ac9daf11a86c22a8c38cd9236c62928ccae83f7ceb06bd3b0467cf9d05/wrapt-2.2.1-py3-none-any.whl", hash = "sha256:3aafea2975caef8ca49400640dde02cc7426e798f24870ed01f490bc3cffd32f", size = 61000, upload-time = "2026-05-22T14:49:41.593Z" },
+]
+
+[[package]]
+name = "wsproto"
+version = "1.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "h11" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c7/79/12135bdf8b9c9367b8701c2c19a14c913c120b882d50b014ca0d38083c2c/wsproto-1.3.2.tar.gz", hash = "sha256:b86885dcf294e15204919950f666e06ffc6c7c114ca900b060d6e16293528294", size = 50116, upload-time = "2025-11-20T18:18:01.871Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/f5/10b68b7b1544245097b2a1b8238f66f2fc6dcaeb24ba5d917f52bd2eed4f/wsproto-1.3.2-py3-none-any.whl", hash = "sha256:61eea322cdf56e8cc904bd3ad7573359a242ba65688716b0710a5eb12beab584", size = 24405, upload-time = "2025-11-20T18:18:00.454Z" },
 ]
 
 [[package]]
