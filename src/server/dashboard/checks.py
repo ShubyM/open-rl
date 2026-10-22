@@ -41,6 +41,11 @@ def holder_logs(run_id: str, held: dict) -> dict:
   return read("logs", run_id=run_id, pod=held["pod"], since=iso(held["since"] - 300), until=iso(held["since"] + 3600))
 
 
+def failure_logs(run_id: str, op: dict) -> dict:
+  """The failing pod's log lines naming the error, around the op: where the message and traceback are."""
+  return read("logs", run_id=run_id, pod=op.get("pod"), q=op.get("error_type"), since=iso(op["started_at"] - 60), until=iso(op["at"] + 60))
+
+
 def iso(at: float) -> str:
   return datetime.fromtimestamp(at, UTC).isoformat(timespec="seconds")
 
@@ -67,6 +72,10 @@ def progress(ctx: dict) -> dict:
     if not steps and waiting:
       reason = f"the run ended without a step, with {waiting[0]['op']} never answered"
       return answer(name, FAIL, reason, holder_logs(run_id, waiting[0]), steps=0, unanswered=len(waiting))
+    failed = [o for o in ops if o.get("status") == "failed"]
+    if not steps and failed:
+      reason = f"the run ended without a step after {failed[0]['operation']} failed ({failed[0].get('error_type') or 'error'})"
+      return answer(name, FAIL, reason, failure_logs(run_id, failed[0]), steps=0, failed_ops=len(failed))
     return answer(name, OK, "the run finished", steps=len(steps))
   if not ops:
     # Nothing ever completed, but the client is waiting: a run that never started is a failed run, not missing data.
@@ -139,7 +148,8 @@ def worker_health(ctx: dict) -> dict:
     kinds = sorted({s.get("error_type") or "failed" for s in failed})
     reason = f"{len(failed)} failed ops ({', '.join(kinds) or 'none'}), {restarts} restarts"
     failures = read(f"runs/{run_id}/commands", role="trainer", **span(ctx))
-    return answer(name, WARN, reason, failures, read("logs", run_id=run_id, severity="ERROR", **span(ctx)), **numbers)
+    logs = failure_logs(run_id, failed[-1]) if failed else read("logs", run_id=run_id, severity="ERROR", **span(ctx))
+    return answer(name, WARN, reason, failures, logs, **numbers)
   if not run.get("pods") and not ctx["samples"]:
     return answer(name, UNKNOWN, "no pods or ops recorded for this run", **numbers)
   return answer(name, OK, "no failures, restarts or OOMs recorded", **numbers)

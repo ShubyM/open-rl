@@ -66,6 +66,13 @@ class ChecksReplayTest(unittest.TestCase):
     slow = context([op(s["at"] - 800, "optim_step") for s in steps])  # last step 1,400 s ago: past 2x, under 3x
     self.assertEqual(verdict("progress", slow), checks.WARN)
 
+  def test_a_run_that_ended_on_a_failed_create_model_fails_progress(self):
+    crashed = context([op(NOW - 600, "create_model", status="failed", error_type="ValueError")], finished=True)
+    result = checks.progress(crashed)
+    self.assertEqual(result["verdict"], checks.FAIL)
+    self.assertIn("ValueError", result["reason"])
+    self.assertEqual(verdict("progress", context([op(NOW - 600, "create_model")], finished=True)), checks.OK)
+
   def test_a_healthy_run_is_ok_and_missing_inputs_are_unknown_never_ok(self):
     healthy = context(healthy_steps(), ledger={"enqueued": 5, "popped": 5, "answered": 5})
     for name in ("progress", "request-ledger", "worker-health", "optimizer-health"):

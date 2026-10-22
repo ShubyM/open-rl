@@ -270,10 +270,10 @@ async def commands(
   role: Literal["trainer", "sampler"] | None = None,
   limit: int = Query(100, ge=1, le=5000),
 ):
-  """The run's command records in the window, newest first."""
+  """The run's command records in the window, newest first; without bounds, all of them."""
   validate_bounds(since, until)
   state = await snapshot.current(get_state_store())
-  _, _, low, high = time_range(since, until or state["observed_at"])
+  _, _, low, high = time_range(since, until or state["observed_at"]) if since or until else (None, None, 0.0, float("inf"))
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
   records = await read_operations(run_id, is_finished(run))
   matched = [s for s in records["samples"] if low <= s["at"] <= high and (role is None or (s.get("role") == "sampler") == (role == "sampler"))]
