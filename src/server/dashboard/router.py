@@ -1,6 +1,7 @@
 """The read-only JSON API for operators and agents, under /api/v1/inspect."""
 
 import asyncio
+import contextlib
 import json
 import math
 import re
@@ -12,11 +13,20 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from server import kube
 from server.dashboard import facts, fleet, sources
 from server.store import get_state_store
 from server.telemetry import key
 
-router = APIRouter(tags=["inspection"])
+
+@contextlib.asynccontextmanager
+async def lifespan(_):
+  with contextlib.suppress(Exception):  # without a cluster the rest still serves; reads report why
+    kube.watch()
+  yield
+
+
+router = APIRouter(tags=["inspection"], lifespan=lifespan)
 BOUNDS = "ISO-8601, e.g. 2026-01-02T12:00:00Z; since also takes a span before until, e.g. 1h. Default: the 30 minutes ending now; at most 7 days."
 Bound = Annotated[str | None, Query(max_length=64, description=BOUNDS)]
 

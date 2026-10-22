@@ -13,6 +13,7 @@ import google.oauth2.credentials
 import httpx
 from google.auth.transport.requests import Request
 
+from server import kube
 from server.telemetry import CLIENT, RUN_LABEL, SOURCE_LABEL, epoch
 from server.worker_manager import owner_id
 
@@ -28,10 +29,6 @@ async def send(method: str, url: str, **kwargs) -> httpx.Response:
   global client
   client = client or httpx.AsyncClient(timeout=10)
   return (await client.request(method, url, **kwargs)).raise_for_status()
-
-
-def namespace() -> str:
-  return os.getenv("OPEN_RL_WORKER_NAMESPACE") or os.getenv("POD_NAMESPACE") or "openrl-system"
 
 
 def configuration() -> dict:
@@ -105,34 +102,18 @@ def incidents(pod: str, statuses: list[dict]) -> list[dict]:
 
 
 async def kubernetes() -> dict:
-  """Pods, nodes and scheduler Workloads; workloads is None when the scheduler cannot be read or is not installed."""
+  """Pods, nodes and scheduler Workloads from the watch cache; workloads is None when the scheduler cannot be read or
+  is not installed. The first call waits up to 6 s for each kind's first list."""
   try:
-    from kubernetes import client, config  # the cluster extra installs it
-
     from server.scheduler_worker_manager import workload_worker
 
-    try:
-      config.load_incluster_config()
-    except Exception:
-      config.load_kube_config()
+    kube.watch()
   except Exception as exc:
     return {"pods": [], "nodes": [], "workloads": None, "errors": [f"Kubernetes unavailable: {exc}"]}
-  core, custom, ns, errors = client.CoreV1Api(), client.CustomObjectsApi(), namespace(), []
-
-  async def items(name: str, call, *args) -> list[dict] | None:
-    try:
-      found = await asyncio.to_thread(call, *args, _preload_content=False, _request_timeout=6)
-      return json.loads(found.data)["items"]
-    except Exception as exc:
-      if getattr(exc, "status", None) != 404:  # no scheduler CRD on a local stack
-        errors.append(f"{name} read failed: {exc}")
-      return None
-
-  pods, nodes, workloads = await asyncio.gather(
-    items("pods", core.list_namespaced_pod, ns),
-    items("nodes", core.list_node),
-    items("workloads", custom.list_namespaced_custom_object, "openrl.io", "v1alpha1", ns, "workloads"),
-  )
+  await asyncio.to_thread(kube.wait, kube.attempted)
+  errors = [error for error in kube.watch_errors.values() if error]
+  # In a list's order, by name.
+  pods, nodes, workloads = (None if (found := kube.watched.get(kind)) is None else [found[name] for name in sorted(found)] for kind in kube.attempted)
   result, now = {"pods": [], "nodes": [], "workloads": None if workloads is None else [], "errors": errors}, time.time()
   for pod in pods or []:
     name, labels, statuses = pod["metadata"]["name"], pod["metadata"].get("labels") or {}, pod["status"].get("containerStatuses") or []
@@ -193,7 +174,7 @@ LEVEL, PROGRESS = re.compile(r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\b"), r
 def logs_filter(run: dict, start: str, end: str, severity: str | None, q: str, pod: str | None = None) -> str:
   """The run's worker pods by the scheduler's owner label and its client's lines in the window, or one of them."""
   config = configuration()
-  labels = {"project_id": config["project"], "location": config["location"], "cluster_name": config["cluster"], "namespace_name": namespace()}
+  labels = {"project_id": config["project"], "location": config["location"], "cluster_name": config["cluster"], "namespace_name": kube.namespace()}
   clauses = ['resource.type="k8s_container"', *(f"resource.labels.{label}={json.dumps(value)}" for label, value in labels.items())]
   if pod and pod != CLIENT:
     clauses.append(f"resource.labels.pod_name={json.dumps(pod)}")
