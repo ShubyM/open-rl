@@ -113,14 +113,15 @@ def validate_bounds(since, until):
 
 @router.get("/api/v1/inspect/inventory", operation_id="inventory", response_model=Inventory, response_model_exclude_unset=True)
 async def inventory():
-  """Current runs, placements, nodes and scheduler state, with an error field per unavailable source."""
+  """Runs with their lifecycle, nodes with their GPUs, the GPUs held now, and pods with problems; an error field per unavailable source.
+  Whether a run is healthy is /runs/{id}/checks."""
   await sources.discover()
   state = await snapshot.current(get_state_store())
-  return {key: value for key, value in state.items() if key not in ("processes", "placement_records")}
+  return {**state, "cluster": {**state["cluster"], "pods": [pod for pod in state["cluster"]["pods"] if pod["problem"]]}}
 
 
 def is_finished(run: dict | None) -> bool:
-  return bool(run) and (run.get("status") != "active" or run.get("display_status") in ("Ended", "Stopped"))
+  return bool(run) and run.get("lifecycle") == "ended"
 
 
 async def read_operations(identity: str, finished: bool = False) -> dict:
@@ -186,7 +187,7 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
   result.update(since=start, until=end, observed_at=state["observed_at"])
   result["coverage"] = (
     f"At most {telemetry.SAMPLE_LIMIT} completed records per run/worker, best effort. "
-    "Missing records do not prove no requests arrived or that workers were idle. Queued and in-flight requests are in inventory runs[].progress."
+    "Missing records do not prove no requests arrived or that workers were idle. The request-ledger check accounts for queued and in-flight requests."
   )
   if run_id:
     result.update(
@@ -379,7 +380,7 @@ async def run_summary(run_id: str):
     "run_id": run_id,
     "verdict": checks.verdict(results),
     "goodput": checks.goodput(ctx),
-    "state": run.get("display_status") if ctx["finished"] else (run.get("progress") or {}).get("state") or run.get("display_status"),
+    "state": run.get("lifecycle"),
     "steps": len(steps_),
     "step_seconds": {"median": statistics.median(gaps), "last": gaps[-1]} if gaps else None,
     "last_metrics": last,
@@ -471,12 +472,11 @@ async def session_summary(session_id: str):
   for model_id, ctx in session["models"].items():
     steps_ = checks.optim_steps(ctx)
     gaps = [b["at"] - a["at"] for a, b in zip(steps_, steps_[1:])]
-    run = ctx["run"]
-    state = run.get("display_status") if ctx["finished"] else (run.get("progress") or {}).get("state")
     verdicts = checks.run_checks(ctx)
     failing, warning = ([r["check"] for r in verdicts if r["verdict"] == v] for v in (checks.FAIL, checks.WARN))
     median = statistics.median(gaps) if gaps else None
-    models.append({"model_id": model_id, "state": state, "steps": len(steps_), "median_step_s": median, "failing": failing, "warning": warning})
+    model = {"model_id": model_id, "state": ctx["run"].get("lifecycle"), "verdict": checks.verdict(verdicts), "steps": len(steps_)}
+    models.append({**model, "median_step_s": median, "failing": failing, "warning": warning})
   record = session["record"]
   return {
     "session_id": session_id,

@@ -2,12 +2,10 @@ import asyncio
 import copy
 import json
 import unittest
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 
-from server import openrl_status
 from server.dashboard import router, snapshot
 from server.model_metadata import TrainingModelMetadata
 from server.session_registry import SessionRegistry
@@ -132,7 +130,7 @@ class SnapshotJoinTest(unittest.TestCase):
     self.assertEqual((runs["r0"]["pods"], runs["r0"]["workloads"]), ([], []))
 
 
-RUN = {"run_id": "r1", "runtime_id": "base", "pool": "sampler-base", "created_at": 1}
+RUN = {"run_id": "r1", "runtime_id": "base"}
 NOW = 10_000
 
 
@@ -141,114 +139,55 @@ def process(*groups, heartbeat_at=NOW, phase="ready"):
   return {"id": "p", "pod": "trainer-0", "runtime_id": "base", "heartbeat_at": heartbeat_at, "phase": phase, "outstanding": outstanding}
 
 
-def steps(*ats):
-  return [{"at": at, "operation": "optim_step", "status": "succeeded"} for at in ats]
+class OutstandingTest(unittest.TestCase):
+  """What request-ledger and progress read: the run's unanswered requests and whether their holder still reports."""
 
-
-class ProgressTest(unittest.TestCase):
-  """Progress comes from what completes and what is still waiting, not from which processes are up."""
-
-  def verdict(self, processes=(), recent=(), queued=None, backlog=(0, None)):
-    return snapshot.progress(RUN, list(processes), list(recent), queued or {"trainer": 0}, NOW, backlog)
-
-  def test_completing_requests_are_ok(self):
-    result = self.verdict([process(("forward_backward", "r1", NOW - 60))], steps(NOW - 300, NOW - 200, NOW - 100))
-    self.assertEqual((result["state"], result["step_seconds"], result["last_completed_at"]), ("OK", 100, NOW - 100))
-    self.assertEqual(result["outstanding"][0]["age_seconds"], 60)
-
-  def test_requests_taken_by_a_process_that_stopped_reporting_are_dead(self):
+  def test_a_holder_that_stopped_reporting_is_not_alive(self):
+    live = snapshot.outstanding(RUN, [process(("forward_backward", "r1", NOW - 60))], NOW)
+    self.assertEqual([(o["pod"], o["process_alive"], o["age_seconds"]) for o in live], [("trainer-0", True, 60)])
     for gone in (process(("optim_step", "r1", NOW - 60), heartbeat_at=NOW - 120), process(("optim_step", "r1", NOW - 60), phase="exited")):
-      result = self.verdict([gone], steps(NOW - 30))
-      self.assertEqual(result["state"], "DEAD")
-      self.assertIn("trainer-0", result["reason"])
+      self.assertIs(snapshot.outstanding(RUN, [gone], NOW)[0]["process_alive"], False)
 
-  def test_a_request_on_a_worker_longer_than_three_steps_is_stalled(self):
-    recent = steps(*range(NOW - 10_000, NOW - 4_000, 300))  # 300 s steps: patience 900 s
-    self.assertEqual(self.verdict([process(("forward_backward", "r1", NOW - 600))], recent)["state"], "OK")
-    result = self.verdict([process(("forward_backward", "r1", NOW - 1000))], recent)
-    self.assertEqual(result["state"], "STALLED")
-    self.assertIn("forward_backward", result["reason"])
-
-  def test_queued_requests_with_nothing_completing_are_stalled(self):
-    result = self.verdict(recent=steps(NOW - 3600), queued={"trainer": 4})
-    self.assertEqual(result["state"], "STALLED")
-    self.assertIn("4 request(s) queued", result["reason"])
-
-  def test_nothing_queued_or_outstanding_for_long_is_idle(self):
-    self.assertEqual(self.verdict(recent=steps(NOW - 3600))["state"], "IDLE")
-    self.assertEqual(self.verdict(recent=steps(NOW - 60))["state"], "OK")
-    self.assertEqual(self.verdict(queued={"trainer": None})["state"], "IDLE")
-
-  def test_samples_waiting_in_the_pool_are_judged_by_their_dispatcher(self):
-    dispatcher = {"id": "d", "pod": "sampler-base-0", "role": "dispatcher", "pool": "sampler-base", "phase": "ready", "heartbeat_at": NOW}
-    recent = steps(NOW - 30)
-    result = self.verdict([dispatcher], recent, backlog=(3, NOW - 60))
-    self.assertEqual((result["state"], result["outstanding"][0]["count"], result["dispatcher"]["pod"]), ("OK", 3, "sampler-base-0"))
-    loading = {**dispatcher, "last_error": "loading /ckpt/7 on sampler-0: HTTPStatusError"}
-    result = self.verdict([loading], recent, backlog=(3, NOW - 1200))
-    self.assertEqual(result["state"], "STALLED")
-    self.assertIn("waiting in pool sampler-base", result["reason"])
-    self.assertIn("loading /ckpt/7", result["reason"])
-    self.assertEqual(self.verdict([{**dispatcher, "heartbeat_at": NOW - 120}], recent, backlog=(3, NOW - 60))["state"], "DEAD")
-    # A pool whose dispatcher has not reported yet is waiting, not dead.
-    result = self.verdict([], recent, backlog=(3, NOW - 60))
-    self.assertEqual((result["state"], result["outstanding"][0]["process_alive"]), ("OK", None))
-
-  def test_only_this_runs_requests_on_a_shared_runtime_count(self):
+  def test_only_this_runs_requests_on_its_runtime_count(self):
     other = process(("sample", "r2", NOW - 5000), heartbeat_at=0)
     elsewhere = {**process(("sample", "r1", NOW - 5000)), "runtime_id": "other"}
-    result = self.verdict([other, elsewhere], steps(NOW - 30))
-    self.assertEqual((result["state"], result["outstanding"]), ("OK", []))
+    self.assertEqual(snapshot.outstanding(RUN, [other, elsewhere], NOW), [])
 
 
-class StatusTest(unittest.IsolatedAsyncioTestCase):
-  """Each run reports what the gateway's model status reports for it."""
+class LifecycleTest(unittest.IsolatedAsyncioTestCase):
+  """The label the pages give a run, and whether it counts as finished, before its checks say whether it is healthy."""
 
-  async def asyncSetUp(self) -> None:
-    self.state = copy.deepcopy(STATE)
-    self.store = InMemoryStateStore()
-    for run_id, record in RECORDS.items():
-      await self.store.set_value(f"open_rl:model_meta:{run_id}", json.dumps({**record, "session_ids": [run_id]}))
-    await SessionRegistry(self.store).attach("r1", "qwen-qwen3-8b")
+  def test_lifecycle_follows_the_workers_and_the_session(self) -> None:
+    placed, waiting = STATE["scheduler"]["workloads"]
+    stopped = {**placed, "worker": {**placed["worker"], "state": "stopped"}}
+    scheduler, unreadable, absent = STATE["scheduler"], {"installed": True, "available": False}, {"installed": False, "available": False}
+    cases = [
+      ("placed", [placed], True, scheduler),
+      ("waiting", [placed, waiting], True, scheduler),
+      ("waiting", [], True, scheduler),
+      ("ended", [], False, scheduler),
+      ("ended", [stopped], True, scheduler),
+      ("active", [], False, unreadable),
+      ("active", [], True, absent),
+      ("ended", [], False, absent),
+    ]
+    for expected, workloads, live, source in cases:
+      with self.subTest(expected=expected, workloads=len(workloads), live=live, scheduler=source):
+        self.assertEqual(snapshot.lifecycle({"status": "active", "workloads": workloads}, live, source), expected)
+    self.assertEqual(snapshot.lifecycle({"status": "completed", "workloads": [placed]}, True, scheduler), "ended")
 
-  async def runs(self) -> dict:
-    runs = snapshot.join_runs(await snapshot.metadata_of(self.store), self.state)
-    ctx = snapshot.cluster_status_context(self.store, self.state)
+  async def test_the_session_decides_for_a_run_without_workers(self) -> None:
+    store = InMemoryStateStore()
+    await SessionRegistry(store).attach("s1", "owner")
+    state = {**STATE, "pods": [], "scheduler": {**STATE["scheduler"], "workloads": []}}
+    runs = snapshot.join_runs([{**METADATA[2], "session_ids": ["s1"]}, {**METADATA[2], "model_id": "gone", "session_ids": ["s2"]}], state)
     for run in runs:
-      await snapshot.add_status(ctx, run)
-    return {run["run_id"]: run for run in runs}
+      await snapshot.enrich(store, run, [], state["scheduler"], NOW)
+    self.assertEqual({r["run_id"]: r["lifecycle"] for r in runs}, {"r2": "waiting", "gone": "ended"})
 
-  async def test_status_matches_the_gateway_as_the_worker_loads_then_announces_ready(self) -> None:
-    manager = SimpleNamespace(inspect_owner=lambda _: [self.state["scheduler"]["workloads"][0]["worker"]])
-    gateway = openrl_status.StatusContext(self.store, SessionRegistry(self.store), manager, "scheduler")
-    for announced, label in ((False, "Starting"), (True, "Ready")):
-      if announced:
-        await self.store.set_value("open_rl:trainer_ready:Qwen/Qwen3-8B", "1")
-      run = (await self.runs())["r1"]
-      expected = await openrl_status.model_status(gateway, "r1")
-      self.assertEqual({key: run[key] for key in expected}, expected)
-      self.assertEqual(run["display_status"], label)
 
-  async def test_a_pod_still_pulling_its_image_is_starting_not_unhealthy(self) -> None:
-    self.state["pods"][0].update(phase="Pending", problem="Pending")
-    self.assertEqual((await self.runs())["r1"]["display_status"], "Starting")
-
-  async def test_a_failing_pod_is_unhealthy_while_its_workload_still_reports_running(self) -> None:
-    await self.store.set_value("open_rl:trainer_ready:Qwen/Qwen3-8B", "1")
-    self.state["pods"][0]["problem"] = "CrashLoopBackOff"
-    run = (await self.runs())["r1"]
-    self.assertEqual(run["display_status"], "Unhealthy")
-    self.assertIn("CrashLoopBackOff", run["summary"])
-
-  async def test_unreadable_sources_are_unknown_not_unassigned(self) -> None:
-    self.state["scheduler"].update(available=False, error="scheduler read failed", workloads=[])
-    run = (await self.runs())["r1"]
-    self.assertEqual(run["display_status"], "Unknown")
-    self.assertIn("scheduler read failed", run["workers_error"])
-    self.state = copy.deepcopy(STATE)
-    with patch.object(self.store, "get_value", side_effect=TimeoutError):
-      run = (await self.runs())["r1"]
-    self.assertEqual((run["display_status"], run["session_live"]), ("Unknown", None))
+def held(state: dict) -> list[bool | None]:
+  return [o["process_alive"] for run in state["runs"] for o in (run.get("progress") or {}).get("outstanding", [])]
 
 
 class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
@@ -304,18 +243,12 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     # The last records are aged as of their read, so live work stays live while the read is failing.
     self.assertGreater(stale["observed_at"], first["observed_at"])
     self.assertIsNone(stale["processes_error"])
-    self.assertEqual([r.get("progress", {}).get("state") for r in stale["runs"]], [r.get("progress", {}).get("state") for r in first["runs"]])
+    self.assertEqual((held(first), held(stale)), ([True], [True]))
     with patch.object(snapshot.time, "time", return_value=1200), patch.object(snapshot, "GRACE_SECONDS", 0):
       self.snapshot.invalidate()
       lasting = await self.snapshot.current(self.store)
     self.assertTrue(lasting["processes_error"])
-    self.assertTrue(all(r.get("progress", {}).get("state") != "DEAD" for r in [*stale["runs"], *lasting["runs"]]))
-
-  async def test_status_reuses_the_metadata_already_read_by_the_snapshot(self) -> None:
-    with patch.object(self.store, "get_value", wraps=self.store.get_value) as read:
-      result = await self.snapshot.current(self.store)
-    self.assertFalse(any(call.args[0].startswith(snapshot.METADATA_PREFIX) for call in read.await_args_list))
-    self.assertTrue(all("_metadata" not in run for run in result["runs"]))
+    self.assertNotIn(False, held(lasting))
 
   async def test_cluster_failure_preserves_placements_and_reports_the_error(self) -> None:
     first = await self.snapshot.current(self.store)
@@ -346,7 +279,7 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     with patch.object(snapshot.time, "time", return_value=1001):
       updated, run = await router.run_of("new-run")
     self.assertEqual(run["run_id"], "new-run")
-    self.assertEqual({r["display_status"] for r in updated["runs"] if r["run_id"] != "new-run"}, {"Completed"})
+    self.assertEqual({r["lifecycle"] for r in updated["runs"] if r["run_id"] != "new-run"}, {"ended"})
     self.assertEqual(updated["processes"], [{"id": "new-process"}])
     self.assertNotEqual(updated["observed_at"], first["observed_at"])
     self.assertFalse(updated["cluster"]["available"])

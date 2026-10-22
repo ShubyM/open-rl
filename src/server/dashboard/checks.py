@@ -168,7 +168,7 @@ def placement(ctx: dict) -> dict:
     w = pending[0]
     why = w.get("placed_message") or w.get("reason") or "waiting for a GPU"
     detail = f"{w['name']} ({w.get('role')}) unplaced for {age[w['name']] / 60:.0f} min: {why}"
-    return answer(name, FAIL, detail, read("inventory", why), **numbers)
+    return answer(name, FAIL, detail, **numbers)
   if ctx["finished"] or workloads:
     return answer(name, OK, f"{len(workloads)} workloads, all placed", **numbers)
   return answer(name, UNKNOWN, "no workloads recorded for this run", **numbers)

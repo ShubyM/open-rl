@@ -170,7 +170,6 @@ def pod_summary(pod: Any) -> dict:
   return {
     "name": pod.metadata.name,
     "uid": str(pod.metadata.uid),
-    "phase": pod.status.phase or "Unknown",
     "node": pod.spec.node_name,
     "worker": labels.get("openrl.io/worker"),
     # Sampling pool pods: their role in the pool and the pool's name.
@@ -178,7 +177,6 @@ def pod_summary(pod: Any) -> dict:
     "pool": labels.get("app.kubernetes.io/instance"),
     "owner_uids": [str(owner.uid) for owner in pod.metadata.owner_references or []],
     "restarts": sum(cs.restart_count or 0 for cs in statuses),
-    "created_at": stamp(pod.metadata.creation_timestamp),
     "problem": pod_problem(pod),
     "containers": containers or [container_summary(c.name, c.image) for c in pod.spec.containers or []],
     "events": [],
@@ -213,7 +211,6 @@ def node_summary(node: Any) -> dict:
     "gpu_capacity": int((node.status.capacity or {}).get("nvidia.com/gpu", 0)),
     # The scheduler places workers only on nodes labelled openrl.io/enabled=true.
     "openrl_enabled": labels.get("openrl.io/enabled") == "true",
-    "openrl_labels": {key: value for key, value in labels.items() if key.startswith("openrl.io/")},
     "devices": [],
   }
 
@@ -229,12 +226,10 @@ def workload_summary(item: dict) -> dict:
     "role": spec.get("role"),
     "model_id": spec.get("modelID"),
     "training_kind": spec.get("trainingKind"),
-    "requested_memory": (spec.get("accelerator") or {}).get("memory"),
     "phase": status.get("phase") or "Pending",
     "reason": status.get("reason"),
     "pod_name": status.get("podName"),
     "node_name": status.get("nodeName"),
-    "placed_reason": placed.get("reason"),
     "placed_message": placed.get("message"),
     "worker": workload_worker(item, time.time()),
   }

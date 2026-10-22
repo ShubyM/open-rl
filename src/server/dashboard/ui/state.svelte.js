@@ -24,7 +24,7 @@ export function parseView(hash = location.hash) {
     back: back?.startsWith("#nodes?") ? back : null,
     node: params.get("node"), placement: params.get("placement"), gpu: params.get("gpu") || "all",
     q: params.get("q") || "", pod: params.get("pod") || "",
-    status: ["active", "unassigned", "finished"].includes(params.get("status")) ? params.get("status") : "all" };
+    status: ["active", "queued", "finished"].includes(params.get("status")) ? params.get("status") : "all" };
 }
 export const view = $state(parseView());
 export const rangeOf = (inventory, selection = view) => {

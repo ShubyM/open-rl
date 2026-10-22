@@ -1,7 +1,7 @@
 <script>
-  import { createQuery, inspectUrl } from "./state.svelte.js";
-  let { id, finished } = $props();
-  const checks = createQuery(() => inspectUrl(`runs/${encodeURIComponent(id)}/checks`), { poll: 15000, pollWhen: () => !finished });
+  import { inspectUrl } from "./state.svelte.js";
+  // The run page's query, which also labels the run.
+  let { checks } = $props();
   // Symptoms first, then the causes that explain them.
   const ordered = $derived([...(checks.data?.checks || [])].sort((a, b) => (a.kind === "cause") - (b.kind === "cause")));
   const link = (e) => inspectUrl(e.read, e.args);

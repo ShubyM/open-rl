@@ -1,23 +1,25 @@
 <script>
   import Status from "./Status.svelte";
   import RunChecks from "./RunChecks.svelte";
+  import RunHealth from "./RunHealth.svelte";
   import { createQuery, inspectUrl, now, viewLink } from "./state.svelte.js";
-  import { duration, elapsedTime, KINDS, runDescription, isFinished } from "./format.js";
+  import { duration, elapsedTime, KINDS, runDescription, runLabel } from "./format.js";
 
   let { inventory, view = $bindable() } = $props();
-  const GROUPS = { unassigned: ["Unassigned"] };
   const FILTERS = [
     ["all", "All", "Every recorded run"],
-    ["active", "Active", "Runs with workers, or whose workers cannot be checked"],
-    ["unassigned", "Unassigned", "Recorded as active, but no workers are assigned; usually a client that exited without finishing"],
-    ["finished", "Finished", "Completed, ended or stopped"],
+    ["active", "Active", "Runs whose workers are placed, or whose placement cannot be read"],
+    ["queued", "Queued", "Waiting for a worker to be placed, or for the server to create one"],
+    ["finished", "Finished", "Completed, or nothing serves the run and its session is gone"],
   ];
-  const group = (run) => isFinished(run) ? "finished" : Object.keys(GROUPS).find((key) => GROUPS[key].includes(run.display_status)) || "active";
+  const group = (run) => ({ ended: "finished", waiting: "queued" })[run.lifecycle] || "active";
+  // Each run's verdict, from its session's summary.
+  const verdicts = $state({});
   const runLink = (run, tab = "activity") => viewLink(`run/${encodeURIComponent(run.run_id)}/${tab}`);
   const shown = $derived.by(() => {
     const terms = view.q.toLowerCase().split(/\s+/).filter(Boolean);
     return inventory.runs.filter((run) => {
-      const text = [run.run_id, run.name, run.model, run.recipe_name, run.display_status, run.summary, KINDS[run.fine_tuning_type], ...run.nodes, ...run.pods.map((pod) => pod.name)].filter(Boolean).join(" ").toLowerCase();
+      const text = [run.run_id, run.name, run.model, run.recipe_name, runLabel(run, verdicts[run.run_id]), KINDS[run.fine_tuning_type], ...run.nodes, ...run.pods.map((pod) => pod.name)].filter(Boolean).join(" ").toLowerCase();
       return (view.status === "all" || group(run) === view.status) && terms.every((term) => text.includes(term));
     }).sort((a, b) => Number(group(b) === "active") - Number(group(a) === "active"));
   });
@@ -29,20 +31,20 @@
     return Number.isFinite(created) && created > 0 ? `${duration(Math.max(0, now(inventory) - created))} ago` : "—";
   }
 
-  const FAILED_WAITING = new Set(["CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError", "CreateContainerError", "RunContainerError", "InvalidImageName", "ContainerCannotRun", "StartError"]);
-  function podTone(pod) {
-    const failing = (pod.containers || []).some((c) => (c.state === "waiting" && FAILED_WAITING.has(c.reason)) || (c.state === "terminated" && ((c.exit_code != null && c.exit_code !== 0) || (c.reason && c.reason !== "Completed"))));
-    const reason = String(pod.problem || "").split(":", 1)[0];
-    return pod.phase === "Failed" || failing || reason === "Failed" || FAILED_WAITING.has(reason) ? "error" : "warning";
-  }
   const errors = $derived([...new Set([inventory.store_error, inventory.processes_error, inventory.cluster.error, inventory.cluster.nodes_error, inventory.cluster.events_error, inventory.cluster.devices?.error, inventory.cluster.scheduler?.error].filter(Boolean))]);
+  const active = $derived(inventory.runs.filter((run) => run.lifecycle !== "ended"));
+  const flagged = $state({});
+  const anyFlagged = $derived(active.some((run) => flagged[run.run_id]));
+  const allClear = $derived(active.every((run) => flagged[run.run_id] === 0));
   const issues = $derived.by(() => {
-    const pods = (inventory.cluster.pods || []).filter((pod) => pod.problem).map((pod) => {
-      const run = inventory.runs.find((r) => r.pods.some((p) => p.uid === pod.uid));
+    const pods = inventory.cluster.pods.map((pod) => {
+      const run = inventory.runs.find((r) => r.pods.some((p) => p.name === pod.name));
       // A problem reads "Reason: detail". The reason is the status; the detail and restarts are the evidence.
       const [reason, detail = ""] = pod.problem.split(/:\s*(.*)/s);
       const evidence = [detail, pod.restarts ? `${pod.restarts} restarts` : ""].filter(Boolean).join(" · ") || "—";
-      return { issue: reason, resource: pod.name, evidence, tone: podTone(pod), link: run ? runLink(run, "logs") : inspectUrl(`pods/${encodeURIComponent(pod.name)}/logs`), label: "Logs" };
+      // Only a pod waiting for a node is not failing.
+      const tone = ["Pending", "Unschedulable"].includes(reason) ? "warning" : "error";
+      return { issue: reason, resource: pod.name, evidence, tone, link: run ? runLink(run, "logs") : inspectUrl(`pods/${encodeURIComponent(pod.name)}/logs`), label: "Logs" };
     });
     return [...pods, ...(inventory.cluster.nodes || []).filter((node) => node.ready !== true).map((node) => ({ issue: "Node not ready", resource: node.name, evidence: "Ready condition is false or unknown", tone: "error", link: viewLink("nodes", { node: node.name }), label: "Nodes" }))];
   });
@@ -74,8 +76,8 @@
           {@const model = (run.model || "Run").split("/").at(-1)}
           {@const session = sessionOf(run)}
           <div class="job-list-row run-row" data-key={run.run_id}>
-            <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span></a>{#if label}<span class="muted micro">{label}</span>{/if}{#if session}<RunChecks {session} model={run.run_id} />{/if}</span>
-            <span title={run.summary || undefined}><Status value={run.display_status || run.status} /></span><span>{KINDS[run.fine_tuning_type] || run.fine_tuning_type || "—"}</span><span>{run.steps ?? "—"}</span><span>{age(run)}</span><span>{group(run) === "unassigned" ? "—" : elapsedTime(run, inventory.observed_at)}</span>
+            <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span></a>{#if label}<span class="muted micro">{label}</span>{/if}{#if session}<RunChecks {session} model={run.run_id} bind:verdict={verdicts[run.run_id]} />{/if}</span>
+            <span><Status value={runLabel(run, verdicts[run.run_id])} /></span><span>{KINDS[run.fine_tuning_type] || run.fine_tuning_type || "—"}</span><span>{run.steps ?? "—"}</span><span>{age(run)}</span><span>{elapsedTime(run, inventory.observed_at)}</span>
             <span class="mono micro run-session" title={(run.session_ids || []).join(", ") || undefined}>{session ?? "—"}</span>
           </div>
         {/each}
@@ -86,10 +88,13 @@
 {:else if view.page === "health"}
   <h1 class="heading">Health</h1>
   {#each errors as error}<p class="health-message" role="status">{@render healthStatus("Source unavailable", "warning")}<span>{error}</span></p>{/each}
-  {#if issues.length}
-    <div class="scheduler-table-wrap"><table class="scheduler-table"><thead><tr><th>Issue</th><th>Resource</th><th>Evidence</th><th></th></tr></thead><tbody>
-      {#each issues as issue}<tr><td>{@render healthStatus(issue.issue, issue.tone)}</td><td>{issue.resource}</td><td>{issue.evidence}</td><td><a href={issue.link}>{issue.label} ↗</a></td></tr>{/each}
-    </tbody></table></div>
-  {:else if inventory.cluster.available === true && !errors.length}<p class="health-message">{@render healthStatus("Healthy", "success")}<span>No pod problems, node problems or source errors.</span></p>{/if}
+  {#snippet checkRow(run, check)}
+    <tr><td>{@render healthStatus(check.check, check.verdict === "fail" ? "error" : "warning")}</td><td><a href={runLink(run)} title={run.run_id}>{(run.model || "Run").split("/").at(-1)} · <span class="mono">{run.run_id.slice(0, 8)}</span></a></td><td>{check.reason}</td><td><a href={runLink(run, "checks")}>Checks ↗</a></td></tr>
+  {/snippet}
+  <div class="scheduler-table-wrap" hidden={!issues.length && !anyFlagged}><table class="scheduler-table"><thead><tr><th>Issue</th><th>Resource</th><th>Evidence</th><th></th></tr></thead><tbody>
+    {#each active as run (run.run_id)}<RunHealth {run} row={checkRow} bind:flagged={flagged[run.run_id]} />{/each}
+    {#each issues as issue}<tr><td>{@render healthStatus(issue.issue, issue.tone)}</td><td>{issue.resource}</td><td>{issue.evidence}</td><td><a href={issue.link}>{issue.label} ↗</a></td></tr>{/each}
+  </tbody></table></div>
+  {#if !issues.length && allClear && inventory.cluster.available === true && !errors.length}<p class="health-message">{@render healthStatus("Healthy", "success")}<span>No failing or warning checks on {active.length} active run{active.length === 1 ? "" : "s"}, and no pod problems, node problems or source errors.</span></p>{/if}
   <p class="run-json-link"><a href={inspectUrl("inventory")}>Diagnostic JSON ↗</a> · <a href="/docs">API reference ↗</a></p>
 {/if}

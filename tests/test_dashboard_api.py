@@ -30,10 +30,12 @@ class InspectionApiTest(unittest.TestCase):
       self.addCleanup(patch.stop)
 
   def test_inventory_is_the_snapshot_without_history_and_the_api_is_read_only(self):
+    self.state["cluster"]["pods"] = [{"name": "trainer-0", "problem": None}, {"name": "stuck", "problem": "Pending"}]
     response = self.client.get("/api/v1/inspect/inventory")
     self.assertEqual(response.status_code, 200)
     inventory = response.json()
     self.assertEqual(inventory["placements"][0]["devices"], RECORD["gpu_uuids"])
+    self.assertEqual([pod["name"] for pod in inventory["cluster"]["pods"]], ["stuck"])
     self.assertNotIn("processes", inventory)
     self.assertNotIn("placement_records", inventory)
     paths = self.client.get("/openapi.json").json()["paths"]
@@ -73,7 +75,7 @@ class InspectionApiTest(unittest.TestCase):
     response = self.client.get("/api/v1/inspect/activity", params={**WINDOW, "run_id": "r1"})
     self.assertEqual(response.status_code, 200)
     data = response.json()
-    self.assertEqual(data["run"], self.state["runs"][0])
+    self.assertEqual(data["run"], self.client.get("/api/v1/inspect/inventory").json()["runs"][0])
     self.assertEqual(data["placements"], [])
     self.assertEqual([s["at"] for s in data["samples"]], [140])
     self.assertEqual(data["incidents"][0]["reason"], "OOMKilled")

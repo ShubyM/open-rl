@@ -101,6 +101,8 @@ RUN = {
   "created_at": 0,
   "completed_at": None,
   "shared_runtime": False,
+  "status": "active",
+  "lifecycle": "placed",
 }
 
 
@@ -110,6 +112,7 @@ def state(records=None, processes=None, runs=None):
     "cluster": {
       "available": True,
       "scheduler": {"available": True},
+      "pods": [],
       "nodes": [{"name": "n1", "devices": [{"id": "GPU-1", "uuid": "GPU-1", "name": "gpu-0"}]}],
     },
     "placement_records": [RECORD] if records is None else records,

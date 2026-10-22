@@ -9,7 +9,7 @@
   import Activity from "./Activity.svelte";
   import Logs from "./Logs.svelte";
   import CopyLink from "./CopyLink.svelte";
-  import { duration, shortNodeName, KINDS, runDescription, isFinished, finishedAt } from "./format.js";
+  import { KINDS, runDescription, isFinished, finishedAt, runLabel, flaggedChecks } from "./format.js";
   let { inventory, view } = $props();
   // Draw gestures immediately, but fetch only once the user settles on a window.
   let navigating = $state(false);
@@ -48,6 +48,9 @@
   const slots = $derived(Object.fromEntries((busy.data?.series || []).filter((s) => s.labels.gpu != null).map((s) => [s.labels.UUID, s.labels.gpu])));
   // A finished run opens on its own lifetime rather than the last 30 minutes, unless the link names a window.
   const finished = $derived(isFinished(run));
+  // The checks label the run and list what fails or warns; the Checks tab shows them all.
+  const checks = createQuery(() => inspectUrl(`runs/${encodeURIComponent(view.id)}/checks`), { poll: 15000, pollWhen: () => !finished });
+  const flagged = $derived(flaggedChecks(checks.data?.checks));
   let opened = false;
   $effect(() => {
     if (!run || opened) return;
@@ -69,27 +72,13 @@
   {#if error}<p class="source-error" role="status">{error}</p>{:else}<p class="empty-state">{view.id ? "Loading run…" : "Choose a run from Overview"}</p>{/if}
   {#if detail.error}<button type="button" class="chip" onclick={detail.retry}>Retry</button>{/if}
 {:else}
-  <div class="run-heading"><h1 class="heading" title={run.run_id}>{title}</h1><Status value={run.display_status || run.status} /></div>
+  <div class="run-heading"><h1 class="heading" title={run.run_id}>{title}</h1><Status value={runLabel(run, checks.data?.verdict)} /></div>
   {#if error}<p class="source-error" role="status">{error}</p>{/if}
   {#if description}<p class="run-description">{description}</p>{/if}
   <section class="run-state" aria-label="Run state">
-    <!-- The summary is the agent-facing one-liner; when the workers are listed below, only pod problems add to it. -->
-    {#if run.workers?.length}
-      {#each (run.pods || []).filter((p) => p.problem) as pod}<p class="source-error" role="status">{pod.name}: {pod.problem}</p>{/each}
-    {:else if !finished}<p>{run.summary || "Run state unavailable"}</p>{/if}
-    {#if run.progress && !finished}<p class={run.progress.state === "OK" ? "muted" : "source-error"} role="status">Progress: {run.progress.state} · {run.progress.reason}</p>{/if}
-    <!-- A finished run has no session or workers by definition; saying so is noise. -->
-    {#if !finished}<p class="muted">Model session: {run.session_live == null ? "Unknown" : run.session_live ? "Live" : "No live session"}{run.shared_runtime ? " · Shared runtime" : ""}</p>{/if}
-    {#if run.workers_error}<p class="source-error" role="status">Workers: {run.workers_error}</p>{/if}
-    {#if run.workers?.length}
-      <div class="table-scroll"><table class="run-table worker-table" aria-label="Workers"><thead><tr><th>Worker</th><th>State</th><th>Node</th><th>Restarts</th><th>Age</th></tr></thead><tbody>
-        {#each run.workers as worker}
-          {@const pod = (run.pods || []).find((p) => p.worker === worker.workload)}
-          <tr><td>{worker.role} <span class="muted micro">{worker.workload || ""}</span></td><td title={worker.detail}><Status value={worker.state} /></td>
-            <td title={worker.node}>{worker.node ? shortNodeName(worker.node, inventory.cluster.nodes) : "—"}</td><td>{pod?.restarts ?? "—"}</td><td>{worker.age_seconds == null ? "—" : duration(worker.age_seconds)}</td></tr>
-        {/each}
-      </tbody></table></div>
-    {:else if !run.workers_error && !finished}<p class="muted">No workers reported</p>{/if}
+    {#each (run.pods || []).filter((p) => p.problem) as pod}<p class="source-error" role="status">{pod.name}: {pod.problem}</p>{/each}
+    {#each flagged as check (check.check)}<p class={check.verdict === "fail" ? "source-error" : ""} role="status"><span class="check-badge" data-verdict={check.verdict}>{check.check}</span> {check.reason}</p>{/each}
+    {#if !finished && run.shared_runtime}<p class="muted">Shared runtime: its workers also serve other runs</p>{/if}
   </section>
   <div use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => navigating = !!value }}>
   <div class="run-toolbar">
@@ -105,7 +94,7 @@
     {#if tab === "logs"}
       {#if validEvent}<Logs {run} {view} {range} {navigating} allLogs={link("logs", { event: null, end: null })} />{/if}
     {:else if tab === "metrics"}<Metrics {run} {view} {range} {bounds} {selection} {detail} {finished} {navigating} />
-    {:else if tab === "checks"}<Checks id={view.id} {finished} />
+    {:else if tab === "checks"}<Checks {checks} />
     {:else}
       <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} {duty} {slots} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {/if}

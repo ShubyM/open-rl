@@ -2,9 +2,13 @@ export const duration = (total) => total < 90 ? `${Math.round(total)}s` : total 
 const seconds = (value) => value === null || value === undefined || value === "" ? NaN : typeof value === "number" ? value : Date.parse(value) / 1000;
 // A run is finished once the gateway marks it so, or once nothing serves it any more; a client
 // that never deletes its model leaves the status active.
-export const isFinished = (run) => !!run && (run.status !== "active" || ["Ended", "Stopped"].includes(run.display_status));
+export const isFinished = (run) => run?.lifecycle === "ended";
 // When a finished run stopped: when it was marked complete, else its last completed work.
-export const finishedAt = (run) => [seconds(run.completed_at), run.progress?.last_completed_at].find(Number.isFinite) ?? NaN;
+export const finishedAt = (run) => [seconds(run.completed_at), run.last_completed_at].find(Number.isFinite) ?? NaN;
+// One label: the gateway's status once it is final, else the lifecycle, unless the run's checks fail.
+export const runLabel = (run, verdict) => run.status !== "active" ? run.status : run.lifecycle === "ended" ? "ended" : verdict === "fail" ? "unhealthy" : { waiting: "queued", placed: "running" }[run.lifecycle] || "active";
+// Failing then warning checks, symptoms before the causes that explain them.
+export const flaggedChecks = (checks = []) => checks.filter((c) => c.verdict === "fail" || c.verdict === "warn").sort((a, b) => (a.verdict === "warn") - (b.verdict === "warn") || (a.kind === "cause") - (b.kind === "cause"));
 export function elapsedTime(run, observedAt) {
   const stop = isFinished(run) ? finishedAt(run) : NaN;
   const start = seconds(run.created_at), end = Number.isFinite(stop) ? stop : seconds(observedAt);

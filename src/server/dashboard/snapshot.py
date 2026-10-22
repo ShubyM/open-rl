@@ -1,21 +1,19 @@
-"""The one view of the cluster the pages and agents read: runs joined to their
-workers and their progress, where each run's workers were placed, nodes with
-their GPUs, and the records worker processes keep about themselves."""
+"""The one view of the cluster the pages and checks read: runs joined to their
+workers, the requests each still waits on, where each run's workers were placed,
+nodes with their GPUs, and the records worker processes keep about themselves."""
 
 import asyncio
 import json
-import statistics
 import time
-from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 
 from server import openrl_status, telemetry
 from server.dashboard import inspection, metrics, sources
 from server.model_metadata import decode_model_metadata
-from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import StateStore, request_queue
-from server.worker_manager import FAILED, READY, STARTING, STOPPED, WAITING_FOR_PLACEMENT
+from server.worker_manager import STOPPED, WAITING_FOR_PLACEMENT
 
 CACHE_SECONDS = 5
 # A source that fails briefly, say over a dropped tunnel, is ridden out on its last good
@@ -24,63 +22,6 @@ GRACE_SECONDS = 30
 # The longest window the dashboard shows, matching the logs API's seven-day limit.
 HISTORY_WINDOW_SECONDS = 7 * 86400
 METADATA_PREFIX = "open_rl:model_meta:"
-# A request on a worker longer than this, or three median steps, is stalled.
-STALL_SECONDS = 600
-
-
-class InventoryWorkers:
-  """The worker manager's inspect_owner, answered from the inventory already read."""
-
-  def __init__(self, scheduler: dict) -> None:
-    self.scheduler = scheduler
-
-  def inspect_owner(self, owner: str) -> list[dict]:
-    if not self.scheduler["available"]:
-      raise RuntimeError(self.scheduler["error"] or "worker inventory unavailable")
-    return [w["worker"] for w in self.scheduler["workloads"] if w["worker"]["owner"] == owner]
-
-
-def cluster_status_context(store: StateStore, cluster: dict) -> openrl_status.StatusContext:
-  """The gateway's status semantics over the dashboard's own inventory."""
-  if cluster["scheduler"]["installed"] is False:
-    return openrl_status.StatusContext(store, SessionRegistry(store), None, "none")
-  return openrl_status.StatusContext(store, SessionRegistry(store), InventoryWorkers(cluster["scheduler"]), "scheduler")
-
-
-def display_status(run: dict, launcher: str) -> str:
-  """One label for the run list. Ready means the model is loaded, not that an op is running."""
-  if run["status"] != "active":
-    return run["status"].capitalize()
-  if run["workers_error"]:
-    return "Unknown"
-  # A pod that is only pending is starting, not sick; the worker states below say which.
-  if any(pod["problem"] and pod["problem"] != "Pending" for pod in run["pods"]):
-    return "Unhealthy"
-  if launcher == "single_process":
-    return "Active"
-  states = {worker["state"] for worker in run["workers"]}
-  for state, label in ((FAILED, "Unhealthy"), (WAITING_FOR_PLACEMENT, "Queued"), (STARTING, "Starting")):
-    if state in states:
-      return label
-  if states == {READY}:
-    return "Ready"
-  if states == {STOPPED}:
-    return "Stopped"
-  if states:
-    return "Unknown"
-  return "Unassigned" if run["session_live"] else "Ended"
-
-
-async def add_status(ctx: openrl_status.StatusContext, run: dict) -> None:
-  """Worker and session state as the gateway reports it, for runs that may still have workers."""
-  meta = run.pop("_metadata")
-  if run["status"] == "active":
-    try:
-      run.update(await asyncio.wait_for(openrl_status.model_status(ctx, run["run_id"], meta), timeout=5) or {})
-    except Exception as exc:
-      run.update(workers_error=f"status unavailable: {type(exc).__name__}", summary="status unavailable")
-  run["summary"] = "; ".join([run["summary"], *(pod["problem"] for pod in run["pods"] if pod["problem"])])
-  run["display_status"] = display_status(run, ctx.worker_launcher)
 
 
 async def metadata_of(store: StateStore) -> list[dict]:
@@ -115,13 +56,11 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
         pods.append(pod)
     runs.append(
       {
-        "_metadata": meta,
         "run_id": run_id,
         "name": row.get("name") or row.get("run_name") or f"{(meta.base_model or 'Run').split('/')[-1]} · {run_id[:8]}",
         "model": meta.base_model,
         "display_name": row.get("name") or row.get("run_name"),
         "recipe_name": row.get("recipe_name"),
-        "git_rev": row.get("git_rev"),
         "session_ids": meta.session_ids,
         "fine_tuning_type": meta.fine_tuning_type,
         "runtime_id": runtime,
@@ -134,100 +73,51 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
         "pods": pods,
         "workloads": matched,
         "nodes": sorted({p["node"] for p in pods if p.get("node")}),
-        # Until add_status: what the record alone says.
-        "session_live": None,
         "settings": openrl_status.settings_of(meta),
-        "workers": [],
-        "workers_error": None,
-        "summary": f"model {meta.status}",
+        "last_completed_at": None,
       }
     )
   return sorted(runs, key=lambda r: r["created_at"], reverse=True)
 
 
-def progress(run: dict, processes: list[dict], recent: list, queued: dict, now: float, backlog: tuple = (0, None)) -> dict:
-  """Whether an active run is moving, judged by what completes rather than by which processes are up.
+def lifecycle(run: dict, live: bool | None, scheduler: dict) -> str:
+  """ended: marked finished, or nothing serves it and no session is live. waiting: a worker is not placed yet.
+  placed: every worker is placed. active: the scheduler cannot be read, so placement is unknown."""
+  states = {(w.get("worker") or {}).get("state") for w in run["workloads"]}
+  if run["status"] != "active" or (states and states <= {STOPPED}):
+    return "ended"
+  if scheduler["available"]:
+    if states:
+      return "waiting" if WAITING_FOR_PLACEMENT in states else "placed"
+    return "ended" if live is False else "waiting"
+  return "ended" if live is False and scheduler["installed"] is False else "active"
 
-  DEAD: requests are held by a process that stopped reporting: a trainer that popped them, or the
-  dispatcher of the pool whose stream they wait in. STALLED: a request has been on a trainer, waited
-  in the sampling pool, or sat in the trainer queue for longer than three median steps (at least
-  STALL_SECONDS). IDLE: nothing is queued or running and nothing completed for that long, so the
-  client is not sending work. OK otherwise."""
-  outstanding = [
-    {
-      **group,
-      "pod": process.get("pod") or process["id"],
-      "phase": process.get("phase"),
-      "process_alive": telemetry.alive(process, now),
-      "age_seconds": now - group["since"],
-      "where": f"on {process.get('pod') or process['id']} ({process.get('phase')})",
-    }
+
+def outstanding(run: dict, processes: list[dict], now: float) -> list[dict]:
+  """The run's requests that trainers took and have not answered, with whether the holder still reports."""
+  return [
+    {**group, "pod": process.get("pod") or process["id"], "process_alive": telemetry.alive(process, now), "age_seconds": now - group["since"]}
     for process in processes
     if process.get("runtime_id") == run["runtime_id"] and process.get("role") != "dispatcher"
     for group in process.get("outstanding", [])
     if group.get("run_id") == run["run_id"]
   ]
-  # The pool's stream holds every sample not yet answered; its dispatcher is what answers them.
-  dispatchers = [p for p in processes if p.get("role") == "dispatcher" and p.get("pool") == run["pool"]]
-  dispatcher = max(dispatchers, key=lambda p: p.get("heartbeat_at", 0), default=None)
-  count, since = backlog
-  if count:
-    pod, phase = (dispatcher.get("pod") or dispatcher["id"], dispatcher.get("phase")) if dispatcher else ("no dispatcher", None)
-    error = f"; last error: {dispatcher['last_error']}" if dispatcher and dispatcher.get("last_error") else ""
-    outstanding.append(
-      {
-        "op": "sample",
-        "pool": run["pool"],
-        "count": count,
-        "since": since,
-        "pod": pod,
-        "phase": phase,
-        "process_alive": telemetry.alive(dispatcher, now) if dispatcher else None,
-        "age_seconds": now - since,
-        "where": f"waiting in pool {run['pool']} for dispatcher {pod} ({phase}{error})",
-      }
-    )
-  done = [sample for sample in recent if isinstance(sample, dict) and isinstance(sample.get("at"), int | float)]
-  last = max((sample["at"] for sample in done), default=None)
-  steps = sorted(sample["at"] for sample in done if sample.get("operation") == "optim_step" and sample.get("status") == "succeeded")
-  step_seconds = statistics.median(b - a for a, b in zip(steps, steps[1:])) if len(steps) > 2 else None
-  patience = max(STALL_SECONDS, 3 * (step_seconds or 0))
-  quiet = now - (last if last is not None else run["created_at"] or now)
-  waiting = sum(count for count in queued.values() if count)
-  lost = [o for o in outstanding if o["process_alive"] is False]
-  oldest = max(outstanding, key=lambda o: o["age_seconds"], default=None)
-  held = oldest and f"{oldest['op']} has been {oldest['where']} for {oldest['age_seconds'] / 60:.0f} min"
-  if lost:
-    holder = f"waiting in pool {lost[0]['pool']} for dispatcher" if lost[0]["op"] == "sample" else "held by"
-    state, reason = "DEAD", f"{lost[0]['count']} {lost[0]['op']} request(s) {holder} {lost[0]['pod']}, which stopped reporting"
-  elif oldest and oldest["age_seconds"] > patience:
-    state, reason = "STALLED", held
-  elif waiting and quiet > patience:
-    state, reason = "STALLED", f"{waiting} request(s) queued and nothing completed for {quiet / 60:.0f} min"
-  elif not outstanding and not waiting and quiet > patience:
-    state, reason = "IDLE", f"nothing queued or running, and nothing completed for {quiet / 60:.0f} min: the client is not sending work"
-  else:
-    state, reason = "OK", held or (f"last op completed {quiet / 60:.0f} min ago" if last is not None else "no ops yet")
-  result = {"state": state, "reason": reason, "last_completed_at": last, "step_seconds": step_seconds, "outstanding": outstanding, "queued": queued}
-  if dispatcher:
-    result["dispatcher"] = {key: value for key, value in dispatcher.items() if key not in ("turns", "outstanding")}
-  return result
 
 
-async def pool_backlog(store: StateStore, pool: str) -> tuple[int, float | None]:
-  redis = getattr(store, "redis", None)  # pools need Redis; the in-memory store has none
-  return await SamplingStore(redis).backlog(pool) if redis is not None else (0, None)
-
-
-async def add_progress(store: StateStore, run: dict, processes: list[dict], now: float) -> None:
-  run_id = run["run_id"]
-  reads = (store.read_samples(telemetry.ops_key(run_id), last=50), store.list_length(request_queue(run_id)), pool_backlog(store, run["pool"]))
-  try:
-    recent, trainer, backlog = await asyncio.wait_for(asyncio.gather(*reads), timeout=5)
-  except Exception as exc:
-    run["progress"] = {"state": "UNKNOWN", "reason": f"progress unavailable: {type(exc).__name__}"}
+async def enrich(store: StateStore, run: dict, processes: list[dict] | None, scheduler: dict, now: float) -> None:
+  """The run's lifecycle; for an active run, also what it waits on and when work last completed. A failed read leaves them unknown."""
+  registry, run_id, live = SessionRegistry(store), run["run_id"], None
+  with suppress(Exception):
+    live = any(await asyncio.wait_for(asyncio.gather(*(registry.live(session) for session in run["session_ids"])), timeout=5))
+  run["lifecycle"] = lifecycle(run, live, scheduler)
+  if run["status"] != "active":
     return
-  run["progress"] = progress(run, processes, recent, {"trainer": trainer}, now, backlog)
+  with suppress(Exception):
+    reads = (store.read_samples(telemetry.ops_key(run_id), last=50), store.list_length(request_queue(run_id)))
+    recent, queued = await asyncio.wait_for(asyncio.gather(*reads), timeout=5)
+    run["last_completed_at"] = max((s["at"] for s in recent if isinstance(s, dict) and isinstance(s.get("at"), int | float)), default=None)
+    if processes is not None:
+      run["progress"] = {"outstanding": outstanding(run, processes, now), "queued": {"trainer": queued}}
 
 
 async def processes_of(store: StateStore, since: float) -> list[dict]:
@@ -250,8 +140,6 @@ class Snapshot:
     self.metadata: list[dict] | None = None
     self.processes_at = 0.0
     self.failing: dict[str, float] = {}
-    # The gateway mount swaps in its own worker manager's context.
-    self.status_context: Callable[[StateStore, dict], openrl_status.StatusContext] = cluster_status_context
 
   async def current(self, store: StateStore) -> dict:
     if self.latest is not None and time.monotonic() - self.updated < CACHE_SECONDS:
@@ -306,20 +194,7 @@ class Snapshot:
     # must not make the browser reject fresh run data when no cluster was read.
     if cluster["available"]:
       errors.extend([cluster.get("error"), cluster.get("nodes_error"), cluster["scheduler"].get("error"), gpus_error])
-    ctx = self.status_context(store, cluster)
-
-    async def enrich(run):
-      tasks = [add_status(ctx, run)]
-      if run["status"] == "active":
-        if processes_error:
-          run["progress"] = {"state": "UNKNOWN", "reason": processes_error}
-        else:
-          tasks.append(add_progress(store, run, processes, now))
-      await asyncio.gather(*tasks)
-      if run.get("progress", {}).get("state") in ("DEAD", "STALLED") and run["display_status"] in ("Ready", "Active"):
-        run["display_status"] = "Stalled"
-
-    await asyncio.gather(*(enrich(run) for run in runs))
+    await asyncio.gather(*(enrich(store, run, None if processes_error else processes, cluster["scheduler"], now) for run in runs))
     state = {
       "observed_at": datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds"),
       "cluster": cluster,

@@ -1,4 +1,4 @@
-"""Shared HTTP response contracts. Preserve extra source diagnostics and absent fields."""
+"""Shared HTTP response contracts. A Record keeps extra source diagnostics; a Shown model keeps only what the pages render."""
 
 from typing import Literal
 
@@ -9,122 +9,96 @@ class Record(BaseModel, extra="allow", allow_inf_nan=False):
   pass
 
 
-class Worker(Record):
-  role: str | None = None
-  state: str | None = Field(None, description="Ready means loaded, not executing an operation")
-  detail: str | None = None
-  workload: str | None = None
-  node: str | None = None
-  age_seconds: float | None = None
-  summary: str | None = None
+class Shown(BaseModel, extra="ignore", allow_inf_nan=False):
+  """Ships only its declared fields: what the pages render. Checks read the full records server-side."""
 
 
-class Workload(Record):
+class RunPod(Shown):
   name: str
-  role: str | None = None
-  model_id: str | None = None
-  phase: str | None = None
-  reason: str | None = None
-  placed_reason: str | None = None
-  placed_message: str | None = None
-  requested_memory: str | None = None
-  node_name: str | None = None
-  pod_name: str | None = None
-  worker: Worker | None = None
+  problem: str | None = Field(None, description="Why the pod is not simply running")
 
 
-class Pod(Record):
-  name: str
-  uid: str | None = None
-  role: str | None = None
-  node: str | None = None
-  phase: str | None = None
-  problem: str | None = None
-  restarts: int | None = None
-  containers: list[dict[str, JsonValue]] = Field(default_factory=list)
-  events: list[dict[str, JsonValue]] = Field(default_factory=list)
-
-
-class Outstanding(Record):
-  op: str
-  run_id: str | None = None
-  pool: str | None = Field(None, description="For sample: the pool's whole backlog, shared by every run on the pool")
-  count: int
-  since: float = Field(description="When the oldest of these was popped or accepted, Unix seconds")
-  age_seconds: float
-  pod: str = Field(description="The trainer holding these, or the dispatcher of the pool they wait in")
-  phase: str | None = Field(None, description="That process's phase: starting, ready, waiting_gpu, on_gpu or exited")
-  process_alive: bool | None = Field(None, description="False: it stopped rewriting its record, so nothing will answer these. Null: no record yet")
-  where: str
-
-
-class Progress(Record):
-  state: str = Field(
-    description="OK; STALLED: a request on a trainer, waiting in its sampling pool, or queued for longer than three median steps "
-    "(at least 10 minutes); DEAD: requests held by a process that stopped reporting; IDLE: nothing queued or running, so the client "
-    "is not sending work; UNKNOWN"
-  )
-  reason: str
-  last_completed_at: float | None = Field(None, description="Newest completed op, Unix seconds")
-  step_seconds: float | None = Field(None, description="Median time between successful optim_steps")
-  outstanding: list[Outstanding] = Field(default_factory=list, description="Requests not yet answered, by where they are")
-  queued: dict[str, int | None] = Field(default_factory=dict, description="Requests waiting in the trainer queue; null when unknown")
-  dispatcher: dict[str, JsonValue] | None = Field(
-    None,
-    description="The pool dispatcher's own record: revision, each replica's weight version, replicas loading weights, "
-    "in_flight, last_commit_at, last_error",
-  )
-
-
-class Run(Record):
-  session_ids: list[str] = Field(default_factory=list, description="The client sessions that created or attached this model, oldest first")
+class Run(Shown):
   run_id: str
+  name: str
   model: str | None = None
-  runtime_id: str | None = None
-  pool: str | None = Field(None, description="The sampling pool that serves this run's samples")
-  shared_runtime: bool | None = Field(None, description="Workers may serve other logical runs; device utilization is not per-run utilization")
-  status: str | None = None
-  display_status: str | None = None
-  summary: str | None = None
-  session_live: bool | None = Field(None, description="Null means unknown, false means no live session")
-  settings: dict[str, JsonValue] | None = Field(None, description="Saved model settings; excludes worker environment and per-step parameters")
+  display_name: str | None = None
+  recipe_name: str | None = None
+  fine_tuning_type: str | None = None
+  status: str = Field(description="As the gateway recorded it: active until the client completes or deletes the model")
+  lifecycle: Literal["ended", "waiting", "placed", "active"] = Field(
+    description="ended: finished, or nothing serves it and no session is live; waiting: a worker is not placed yet; "
+    "placed: every worker is placed; active: placement unknown. Health is /runs/{id}/checks"
+  )
+  created_at: float
+  completed_at: float | None = None
+  last_completed_at: float | None = Field(None, description="Newest of the run's last 50 ops, Unix seconds; active runs only")
   steps: int | None = Field(None, description="Best-effort observed completed optimizer steps, not an authoritative total")
-  progress: Progress | None = Field(None, description="Active runs only. Read this first for a run that is not advancing")
-  git_rev: str | None = None
-  workers: list[Worker] = Field(default_factory=list)
-  workers_error: str | None = None
-  pods: list[Pod] = Field(default_factory=list)
-  workloads: list[Workload] = Field(default_factory=list)
+  settings: dict[str, JsonValue] | None = Field(None, description="Saved model settings; excludes worker environment and per-step parameters")
+  session_ids: list[str] = Field(default_factory=list, description="The client sessions that created or attached this model, oldest first")
+  shared_runtime: bool | None = Field(None, description="Workers may serve other logical runs; device utilization is not per-run utilization")
+  nodes: list[str] = Field(default_factory=list)
+  pods: list[RunPod] = Field(default_factory=list)
 
 
-class Source(Record):
+class Source(Shown):
   available: bool
   error: str | None = None
 
 
 class Scheduler(Source):
   installed: bool | None = None
-  workloads: list[Workload] = Field(default_factory=list)
 
 
-class Device(Record):
+class Device(Shown):
   id: str
-  uuid: str | None = None
+  name: str | None = Field(None, description="DCGM's slot, gpu-<n>")
 
 
-class Node(Record):
+class Node(Shown):
   name: str
   ready: bool | None = None
+  accelerator: str | None = None
+  gpu_capacity: int = 0
+  openrl_enabled: bool | None = Field(None, description="The scheduler places workers only on enabled nodes")
   devices: list[Device] = Field(default_factory=list)
+
+
+class ProblemPod(Shown):
+  name: str
+  problem: str
+  restarts: int | None = None
 
 
 class Cluster(Source):
   nodes: list[Node] = Field(default_factory=list)
-  pods: list[Pod] = Field(default_factory=list)
+  pods: list[ProblemPod] = Field(default_factory=list, description="Pods that are not simply running, with why")
   nodes_error: str | None = None
   events_error: str | None = None
   scheduler: Scheduler
   devices: Source | None = Field(None, description="Each node's GPUs, from DCGM")
+
+
+class Held(Shown):
+  id: str
+  run_ids: list[str]
+  role: str | None = None
+  node: str
+  pod: str | None = None
+  devices: list[str] = Field(description="GPU UUIDs, as DCGM labels its series")
+  device_count: int
+
+
+class Inventory(Shown):
+  """Current observations, slimmed to what the pages list. Check source errors before interpreting empty collections."""
+
+  observed_at: str = Field(description="ISO timestamp; anchor queries to this, not the client's wall clock")
+  error: str | None = Field(None, description="A critical source failed; this is the previous observation")
+  cluster: Cluster
+  runs: list[Run]
+  placements: list[Held] = Field(description="GPUs held now")
+  store_error: str | None = None
+  processes_error: str | None = None
 
 
 class Placement(Record):
@@ -140,18 +114,6 @@ class Placement(Record):
   shared_runtime: bool | None = None
 
 
-class Inventory(Record):
-  """Current observations. Check source errors before interpreting empty collections."""
-
-  observed_at: str = Field(description="ISO timestamp; anchor queries to this, not the client's wall clock")
-  error: str | None = Field(None, description="A critical source failed; this is the previous observation")
-  cluster: Cluster
-  runs: list[Run]
-  placements: list[Placement]
-  store_error: str | None = None
-  processes_error: str | None = None
-
-
 class PlacementActivity(Placement):
   start: float = Field(description="When the scheduler placed the workload; Unix seconds")
   end: float = Field(description="When it released the placement, or the snapshot time while held; Unix seconds")
@@ -161,7 +123,7 @@ class PlacementActivity(Placement):
   exact: bool = Field(
     description="True: intervals include GPU turns. False: completed ops only, which may include waiting. Gaps do not prove idleness"
   )
-  phase: str | None = Field(None, description="The process's own phase; see Outstanding.phase")
+  phase: str | None = Field(None, description="The process's own phase: starting, ready, waiting_gpu, on_gpu or exited")
   error: str | None = Field(None, description="Operation records unavailable")
   partial: str | None = Field(None, description="Some operation records were invalid and skipped")
 
@@ -218,7 +180,9 @@ class Activity(Record):
   partial: str | None = None
 
 
-class DeviceSeries(Device):
+class DeviceSeries(Record):
+  id: str
+  uuid: str | None = None
   utilization: list[tuple[float, float]] = Field(description="[Unix seconds, percent]; physical GPU, not per-run")
   memory_mib: list[tuple[float, float]]
   reason: str | None = None
@@ -354,7 +318,7 @@ class Summary(Record):
 
   run_id: str
   verdict: str = Field(description="The worst symptom check")
-  state: str | None = None
+  state: str | None = Field(None, description="The run's lifecycle, as in inventory")
   steps: int
   step_seconds: dict[str, float] | None = None
   goodput: dict[str, JsonValue] | None = Field(None, description="Share of the run the trainer spent training, with where the rest went, in seconds")
@@ -391,7 +355,8 @@ class SessionChecks(Record):
 
 class SessionModel(Record):
   model_id: str
-  state: str | None = None
+  state: str | None = Field(None, description="The model's lifecycle, as in inventory")
+  verdict: str = Field(description="This model's worst symptom check")
   steps: int
   median_step_s: float | None = None
   failing: list[str] = Field(default_factory=list, description="This model's checks that fail")
