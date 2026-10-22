@@ -8773,6 +8773,14 @@ spec:
                   the pools registered.
                 format: int32
                 type: integer
+              gpuUUIDs:
+                description: |-
+                  GPUUUIDs are the UUIDs of the devices DRA allocated to the claim, as the
+                  driver's ResourceSlices publish them. They join this worker to the GPU
+                  metrics, which are keyed by UUID.
+                items:
+                  type: string
+                type: array
               memoryPerDevice:
                 description: |-
                   MemoryPerDevice is what each of those devices must provide, i.e. Memory
@@ -8797,12 +8805,24 @@ spec:
                 - Succeeded
                 - Failed
                 type: string
+              placedAt:
+                description: PlacedAt is when the controller observed the allocation
+                  and set NodeName.
+                format: date-time
+                type: string
               podName:
                 description: PodName is the worker pod, once created.
                 type: string
               reason:
                 description: Reason is the most recent human-readable explanation
                   of Phase.
+                type: string
+              releasedAt:
+                description: |-
+                  ReleasedAt is when the worker stopped holding its devices, because its
+                  claim was abandoned or replaced or because the workload was torn down
+                  after its pod was gone. Cleared by the next placement.
+                format: date-time
                 type: string
             type: object
         required:

@@ -171,6 +171,22 @@ type WorkloadStatus struct {
 	// the node is genuinely unknown.
 	NodeName string `json:"nodeName,omitempty"`
 
+	// GPUUUIDs are the UUIDs of the devices DRA allocated to the claim, as the
+	// driver's ResourceSlices publish them. They join this worker to the GPU
+	// metrics, which are keyed by UUID.
+	// +optional
+	GPUUUIDs []string `json:"gpuUUIDs,omitempty"`
+
+	// PlacedAt is when the controller observed the allocation and set NodeName.
+	// +optional
+	PlacedAt *metav1.Time `json:"placedAt,omitempty"`
+
+	// ReleasedAt is when the worker stopped holding its devices, because its
+	// claim was abandoned or replaced or because the workload was torn down
+	// after its pod was gone. Cleared by the next placement.
+	// +optional
+	ReleasedAt *metav1.Time `json:"releasedAt,omitempty"`
+
 	// Reason is the most recent human-readable explanation of Phase.
 	Reason string `json:"reason,omitempty"`
 
