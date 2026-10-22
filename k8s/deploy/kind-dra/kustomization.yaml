@@ -79,6 +79,15 @@ patches:
       kind: PodMonitoring
       metadata:
         name: open-rl-sampler-routers
+  - target:
+      kind: PodMonitoring
+      name: open-rl-scheduler
+    patch: |
+      $patch: delete
+      apiVersion: monitoring.googleapis.com/v1
+      kind: PodMonitoring
+      metadata:
+        name: open-rl-scheduler
 
   # The vendored llm-d chart mounts COS's driver bundle,
   # /home/kubernetes/bin/nvidia, and reads its libraries through

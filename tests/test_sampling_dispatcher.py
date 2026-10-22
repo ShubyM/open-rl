@@ -159,10 +159,8 @@ class SamplingDispatcherTest(RedisTestCase):
     self.assertEqual(await self.committed(r["request_id"]), [SAMPLE])
     self.assertFalse(run.done())
 
-  async def test_the_dispatcher_records_its_state_and_each_send_for_the_run(self):
+  async def test_the_dispatcher_records_each_send_for_the_run(self):
     replicas = await self.replicas("default")
-    worker = telemetry.Worker("dispatcher", None)
-    self.enterContext(patch.object(telemetry, "current", worker))
     sends = self.enterContext(patch.object(telemetry, "record"))
     r = await self.accepted(run_id="run-a")
     await self.dispatcher(replicas)
@@ -173,8 +171,6 @@ class SamplingDispatcherTest(RedisTestCase):
       (request["logical_run_id"], request["op"], role, runtime, status, retry), ("run-a", "sample", "sampler", None, "succeeded", None)
     )
     self.assertEqual(kwargs["where"], {"pod": replicas[0].url})
-    self.assertEqual((worker.record["revision"], worker.record["replicas"]), ("default", {replicas[0].url: "default"}))
-    self.assertIn("last_commit_at", worker.record)
 
   async def test_a_replica_that_is_still_starting_fails_nothing(self):
     (replica,) = replicas = await self.replicas("default")

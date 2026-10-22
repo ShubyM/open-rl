@@ -3,13 +3,14 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
 import traceback
 import uuid
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -24,7 +25,6 @@ from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, C
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import openrl_status, proto_codec, telemetry
-from server.dashboard import sources as dashboard_sources
 from server.lora_snapshots import snapshot_name, snapshot_root
 from server.model_metadata import (
   TrainingModelMetadata,
@@ -64,6 +64,8 @@ async def bind_session(session_id: str | None, model_id: str) -> None:
     if meta is not None and session_id not in meta.session_ids:
       meta.session_ids.append(session_id)
       await persist_model_metadata(state, model_id, meta)
+    with suppress(Exception):
+      await telemetry.note_session(state, session_id, model_id=model_id)
     # On the owner, for the reaper: workers stay while any attached session lives.
     if worker_manager is not None:
       await session_registry.attach(session_id, owner)
@@ -538,6 +540,7 @@ async def enqueue(command: Command) -> str:
   # One line per training request so a request that never reaches a worker can
   # be traced end to end (the workers log the same id when they pop it).
   print(f"[API_SERVER] enqueued op={command.op} request_id={command.request_id} model_id={command.model_id} active_set={active_set_id}")
+  telemetry.count("enqueued", command.model_id)
   return command.request_id
 
 
@@ -576,6 +579,17 @@ def check_single_process_backend() -> None:
       "SAMPLING_BACKEND=vllm needs REDIS_URL: the API server launches the vLLM sampler as a separate worker. "
       "Set REDIS_URL (for example redis://127.0.0.1:6379/0), or unset SAMPLING_BACKEND to sample with torch in one process."
     )
+
+
+def finite_metrics(result: dict) -> dict:
+  """The SDK reads JSON, which has no NaN or infinity: send 0 and +/-9999 as workers once did. Telemetry already named the real value."""
+  metrics = result.get("metrics")
+  if not isinstance(metrics, dict) or all(not isinstance(v, float) or math.isfinite(v) for v in metrics.values()):
+    return result
+  finite = {
+    k: (0.0 if math.isnan(v) else math.copysign(9999.0, v)) if isinstance(v, float) and not math.isfinite(v) else v for k, v in metrics.items()
+  }
+  return {**result, "metrics": finite}
 
 
 def translate_future_result(result: dict) -> dict:
@@ -620,6 +634,10 @@ async def reap_dead_sessions():
     await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
     # Nothing in a sweep may end the loop. A failed call is retried next sweep.
     try:
+      await telemetry.record_placements(state, await asyncio.to_thread(worker_manager.workloads))
+    except Exception:
+      traceback.print_exc()
+    try:
       owners = await session_registry.owners()
     except Exception:
       traceback.print_exc()
@@ -656,8 +674,7 @@ async def lifespan(_: FastAPI):
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
   reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
   try:
-    async with dashboard_sources.lifespan():
-      yield
+    yield
   finally:
     if reap_task is not None:
       reap_task.cancel()
@@ -666,7 +683,6 @@ async def lifespan(_: FastAPI):
     if worker_manager is not None:
       worker_manager.close()
       worker_manager = None
-    telemetry.shutdown()
 
 
 # The release tag, baked in at image build (OPEN_RL_VERSION build arg); the
@@ -707,9 +723,7 @@ app.openapi = openapi_with_settings
 # Fleet inspection belongs on the operator dashboard, not the model-capability API.
 if os.getenv("OPEN_RL_INSPECTION_API", "").lower() == "true":
   from server.dashboard.router import router as dashboard_router
-  from server.dashboard.snapshot import snapshot as dashboard_snapshot
 
-  dashboard_snapshot.status_context = lambda *_: openrl_status.StatusContext(state, session_registry, worker_manager, worker_launcher_mode())
   app.include_router(dashboard_router)
 FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
 
@@ -851,6 +865,8 @@ async def create_session(req: CreateSessionRequest):
     raise HTTPException(status_code=400, detail=str(exc)) from exc
   session_id = f"sess-{uuid.uuid4().hex[:12]}"
   await session_registry.update_metadata(session_id, user_metadata)
+  with suppress(Exception):
+    await telemetry.note_session(state, session_id, created=True, metadata=user_metadata)
   return {"session_id": session_id, "type": "create_session"}
 
 
@@ -858,6 +874,8 @@ async def create_session(req: CreateSessionRequest):
 async def session_heartbeat(req: SessionHeartbeatRequest):
   if req.session_id:
     await session_registry.heartbeat(req.session_id)
+    with suppress(Exception):
+      await telemetry.note_session(state, req.session_id)
   return {"type": "session_heartbeat"}
 
 
@@ -979,6 +997,7 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
     return JSONResponse(status_code=400, content=result)
   if isinstance(result, dict):
+    result = finite_metrics(result)
     if proto_codec.PROTO_CONTENT_TYPE in accept:
       encoded = proto_codec.encode_future_result(result)
       if encoded is not None:

@@ -332,7 +332,7 @@ class LoraTrainingWorker(BaseTrainerWorker):
 
     return {
       "metrics": {
-        "grad_norm:mean": self.sanitize_float(total_norm.item()),
+        "grad_norm:mean": float(total_norm.item()),
       },
     }
 

@@ -158,9 +158,9 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   ):
     if os.getenv(name):
       values[name] = os.environ[name]
-  # OpenTelemetry settings, so workers export to the same collector as the API.
+  # OpenTelemetry settings, so workers export traces where the API does.
   for name, value in os.environ.items():
-    if name.startswith("OTEL_") or name == "OPEN_RL_SERVER_METRIC_SERIES_LIMIT":
+    if name.startswith("OTEL_"):
       values[name] = value
   # No other worker shares an exclusive worker's GPUs, so it never parks.
   if worker.exclusive:
@@ -265,9 +265,7 @@ def dispatcher_body(pool: str) -> dict[str, Any]:
   if concurrency := os.getenv("OPEN_RL_DISPATCH_CONCURRENCY"):
     env.append({"name": "OPEN_RL_DISPATCH_CONCURRENCY", "value": concurrency})
   env += [{"name": name, "value": os.environ[name]} for name in OPS_SETTINGS if os.getenv(name)]
-  env += [
-    {"name": name, "value": value} for name, value in os.environ.items() if name.startswith("OTEL_") or name == "OPEN_RL_SERVER_METRIC_SERIES_LIMIT"
-  ]
+  env += [{"name": name, "value": value} for name, value in os.environ.items() if name.startswith("OTEL_")]
   dispatcher = {
     "name": "dispatcher",
     # The dispatcher is a small CPU process; the API-server image carries it without the GPU stack.
@@ -499,10 +497,13 @@ class SchedulerWorkerManager:
     """Our Workloads, one entry per worker, in the client vocabulary. The pod
     is the scheduler's; what the API server knows about it is what the
     scheduler wrote into Workload status."""
-    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
-    found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
     now = time.time()
-    return [workload_worker(item, now) for item in found["items"]]
+    return [workload_worker(item, now) for item in self.workloads()]
+
+  def workloads(self) -> list[dict[str, Any]]:
+    """Our Workload objects as the API returns them."""
+    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
+    return self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)["items"]
 
 
 def workload_worker(item: dict[str, Any], now: float) -> dict[str, Any]:

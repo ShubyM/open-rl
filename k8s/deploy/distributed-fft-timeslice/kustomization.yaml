@@ -16,6 +16,7 @@ resources:
   - 01-shared-pvc.yaml
   - 10-dcgm-monitoring.yaml
   - 11-sampler-monitoring.yaml
+  - 12-scheduler-monitoring.yaml
 
 generatorOptions:
   disableNameSuffixHash: true

@@ -1,0 +1,17 @@
+# The scheduler's controller metrics, including openrl_gpu_held, the
+# placement info metric that joins GPU metrics to runs by UUID.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: open-rl-scheduler
+spec:
+  selector:
+    matchLabels:
+      app: open-rl-scheduler
+  endpoints:
+  - port: metrics
+    interval: 15s
+  # openrl_gpu_held carries the worker's pod and node as its own labels. The
+  # default target labels would overwrite pod with the scheduler's own.
+  targetLabels:
+    metadata: []
