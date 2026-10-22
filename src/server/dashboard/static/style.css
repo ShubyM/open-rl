@@ -43,6 +43,7 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .overview-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-bottom: 14px; }
 #app #run-search { flex: 1 1 280px; max-width: 420px; }
 #app .run-filters { display: flex; flex-wrap: wrap; gap: 6px; }
+#app .metric-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; } #app .metric-filters input { width: 28ch; }
 #app .run-filter-count { margin-left: 4px; color: var(--dim); font-variant-numeric: tabular-nums; }
 #app :is(.job-list-head, .job-list-row).run-row { position: relative; grid-template-columns: minmax(0, 1fr) 128px 100px 112px 90px 80px 150px; }
 /* The run link covers its row. */

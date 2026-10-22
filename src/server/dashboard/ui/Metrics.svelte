@@ -14,9 +14,20 @@
     .sort(([a, x], [b, y]) => opRank(a) - opRank(b) || x.localeCompare(y)));
   const FIRST = [["env/all/reward/total", "Reward"], ["test/env/all/reward/total", "Held-out reward"], ["env/all/lab/criteria_pass_fraction", "Criteria pass rate"],
     ["test/env/all/lab/criteria_pass_fraction", "Held-out criteria pass rate"], ["optim/kl_sample_train_v2", "Sampler-trainer KL"], ["optim/entropy", "Entropy"], ["time/total", "Step time", "s"]];
-  const clientCharts = $derived.by(() => {
+  const allClient = $derived.by(() => {
     const names = new Set(rows.flatMap((row) => Object.keys(row.client || {})));
     return [...FIRST.filter(([name]) => names.has(name)), ...[...names].filter((name) => !FIRST.some(([first]) => first === name)).sort().map((name) => [name, name])];
+  });
+  // A client can report a hundred metrics; show the headline ones first and let the rest be picked by group or name.
+  const groupOf = (name) => (name.includes("/") ? name.split("/")[0] : "other");
+  const groups = $derived([...new Set(allClient.map(([name]) => groupOf(name)))].sort());
+  let group = $state("key");
+  let search = $state("");
+  const clientCharts = $derived.by(() => {
+    const terms = search.toLowerCase().split(/\s+/).filter(Boolean);
+    if (terms.length) return allClient.filter(([name, title]) => terms.every((term) => `${name} ${title}`.toLowerCase().includes(term)));
+    if (group === "key") return allClient.filter(([name]) => FIRST.some(([first]) => first === name));
+    return group === "all" ? allClient : allClient.filter(([name]) => groupOf(name) === group);
   });
   const samples = $derived((detail.data?.samples || []).filter((s) => s.at >= range.start && s.at <= range.now));
   const roles = $derived([...new Set(samples.map((s) => s.role || "process"))]);
@@ -29,9 +40,15 @@
 <div class="run-metrics" data-run-metrics={view.id}>
   {#if steps.error}<p class="source-error" role="status">{steps.error}{rows.length ? " · Showing previously fetched steps" : ""}</p>{/if}
   <h2 class="scheduler-title">Client metrics</h2>
+  {#if allClient.length}<div class="metric-filters">
+    <input type="search" placeholder={`Filter ${allClient.length} metrics by name`} aria-label="Filter client metrics" bind:value={search} />
+    <div class="run-filters" role="group" aria-label="Client metric group">
+      {#each ["key", ...groups, "all"] as key (key)}<button type="button" class="chip" aria-pressed={!search && group === key} onclick={() => { group = key; search = ""; }}>{{ key: "Key", all: "All" }[key] || key} <span class="run-filter-count">{key === "key" ? allClient.filter(([name]) => FIRST.some(([first]) => first === name)).length : key === "all" ? allClient.length : allClient.filter(([name]) => groupOf(name) === key).length}</span></button>{/each}
+    </div>
+  </div>{/if}
   {#if clientCharts.length}<div class="chart-grid">
     {#each clientCharts as [key, title, unit = ""] (key)}<Chart {title} {unit} steps points={byStep((row) => row.client?.[key])} start={stepRange.start} end={stepRange.end} empty="No values" />{/each}
-  </div>{:else if steps.data}<p class="muted">0 metrics</p>{:else if !steps.error}<p class="muted">Loading…</p>{/if}
+  </div>{:else if allClient.length}<p class="muted">No client metric matches</p>{:else if steps.data}<p class="muted">0 metrics</p>{:else if !steps.error}<p class="muted">Loading…</p>{/if}
   <h2 class="scheduler-title">Trainer metrics</h2>
   {#if trainerCharts.length}<div class="chart-grid">
     {#each trainerCharts as [op, name] (`${op} ${name}`)}<Chart title={`${name} · ${opLabel(op)}`} steps points={byStep((row) => row.ops[op]?.metrics[name]?.mean)} start={stepRange.start} end={stepRange.end} tone="accent" empty="No values" />{/each}
