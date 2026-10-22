@@ -10,7 +10,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -65,6 +65,8 @@ async def bind_session(session_id: str | None, model_id: str) -> None:
     if meta is not None and session_id not in meta.session_ids:
       meta.session_ids.append(session_id)
       await persist_model_metadata(state, model_id, meta)
+    with suppress(Exception):
+      await telemetry.note_session(state, session_id, model_id=model_id)
     # On the owner, for the reaper: workers stay while any attached session lives.
     if worker_manager is not None:
       await session_registry.attach(session_id, owner)
@@ -864,6 +866,8 @@ async def create_session(req: CreateSessionRequest):
     raise HTTPException(status_code=400, detail=str(exc)) from exc
   session_id = f"sess-{uuid.uuid4().hex[:12]}"
   await session_registry.update_metadata(session_id, user_metadata)
+  with suppress(Exception):
+    await telemetry.note_session(state, session_id, created=True, metadata=user_metadata)
   return {"session_id": session_id, "type": "create_session"}
 
 
@@ -871,6 +875,8 @@ async def create_session(req: CreateSessionRequest):
 async def session_heartbeat(req: SessionHeartbeatRequest):
   if req.session_id:
     await session_registry.heartbeat(req.session_id)
+    with suppress(Exception):
+      await telemetry.note_session(state, req.session_id)
   return {"type": "session_heartbeat"}
 
 

@@ -464,6 +464,15 @@ class ExclusiveMetadataTest(ApiServerTest):
     model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
     self.assertTrue(self.metadata(model_id)["exclusive"])
 
+  def test_a_session_keeps_a_record_of_its_lifetime_and_models_after_its_live_key_expires(self) -> None:
+    session_id = self.post("create_session", {"user_metadata": {"recipe_name": "harvey", "api_key": "sk-private"}}).json()["session_id"]
+    model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
+    self.post("session_heartbeat", {"session_id": session_id})
+    record = json.loads(asyncio.run(api_server.state.get_value(api_server.telemetry.session_key(session_id))))
+    self.assertEqual((record["model_ids"], record["metadata"]["recipe_name"]), ([model_id], "harvey"))
+    self.assertGreaterEqual(record["last_seen_at"], record["created_at"])
+    self.assertNotIn("sk-private", json.dumps(record))
+
   def test_a_server_without_a_worker_manager_refuses_exclusive(self) -> None:
     with patch.object(api_server, "worker_manager", None):
       response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}})

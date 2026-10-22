@@ -83,5 +83,28 @@ class ChecksReplayTest(unittest.TestCase):
     self.assertLess(len(repr(checks.run_checks(ctx))), 5000)
 
 
+class SessionChecksTest(unittest.TestCase):
+  def session(self, live=True, quiet=60.0, finished=False, resumed=False, errors=()):
+    model = context([op(NOW - quiet, "optim_step")], finished=finished)
+    record = {"session_id": "s", "created_at": 0.0, "last_seen_at": NOW - (5 if live else 900), "model_ids": ["m"]}
+    return {"record": record, "now": NOW, "live": live, "models": {"m": model}, "resumed": {"m": resumed}, "errors": list(errors)}
+
+  def test_a_client_that_heartbeats_but_sends_nothing_fails(self):  # client waiting on itself
+    self.assertEqual(checks.client_liveness(self.session(quiet=1200))["verdict"], checks.FAIL)
+    self.assertEqual(checks.client_liveness(self.session(quiet=60))["verdict"], checks.OK)
+
+  def test_a_client_that_exited_with_its_model_unfinished_warns_unless_another_session_resumed_it(self):
+    self.assertEqual(checks.client_liveness(self.session(live=False))["verdict"], checks.WARN)
+    self.assertEqual(checks.client_liveness(self.session(live=False, resumed=True))["verdict"], checks.OK)
+    self.assertEqual(checks.client_liveness(self.session(live=False, finished=True))["verdict"], checks.OK)
+
+  def test_session_checks_roll_each_model_check_up_to_its_worst_verdict(self):
+    session = self.session(errors=[{"severity": "ERROR", "reason": "timeout"}])
+    session["models"]["n"] = context([*healthy_steps(), op(NOW - 5, "optim_step", nonfinite=["loss"])])
+    found = {c["check"]: c for c in checks.session_checks(session)}
+    self.assertEqual(found["sdk-errors"]["verdict"], checks.WARN)
+    self.assertEqual((found["optimizer-health"]["verdict"], found["optimizer-health"]["numbers"]["model"]), (checks.FAIL, "n"))
+
+
 if __name__ == "__main__":
   unittest.main()

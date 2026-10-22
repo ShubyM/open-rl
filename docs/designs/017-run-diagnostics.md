@@ -58,7 +58,9 @@ Measured on 2026-10-21 against the Qwen3.8-27B LoRA run `43b3ebb3` (37 steps ove
 
 ### 4.2 The join key
 
-Every question narrows to **run, place, window, step**.
+The top-level unit is the **session**: one client process, with its lifetime, logs, heartbeat and SDK errors. A session owns the models it created or attached; sessions and models are many-to-many, because a model resumed after a restart is attached to a new session. Under a session, every question narrows to **model, place, window, step**.
+
+- *Session* is the client's `session_id`, with a durable record of when it started, when it was last heard from, and its models.
 
 - *Place* is the pod (name and UID), node and GPU UUIDs, from the placement record.
 - *Window* is `[t0, t1]` of a command or a step, from command records.
@@ -70,6 +72,7 @@ With those known, Prometheus is queried by GPU UUID or pod, Cloud Logging by pod
 
 | Record | Writer | Where | Size | Checks it feeds |
 |---|---|---|---|---|
+| Session record: started, last heard from, models used, client metadata (redacted) | API server on `create_session`, each heartbeat, and each model attach | `open_rl:session_record:<id>` (telemetry retention); one `openrl.session` JSON line per create and attach | About 300 B per session | `client-liveness`, `sdk-errors`, the session rollup |
 | Placement: run ids, role, runtime, pod and UID, node, GPU UUIDs, start, end | The scheduler, on bind and release; workers echo it at start | Workload status; `openrl_gpu_held{run_id, role, pod, UUID}` info metric; one JSON log line per change | About 300 B per process lifetime | `placement`, `worker-health`, every check's place |
 | Step ordinal on every command record | Trainer | Redis command records | About 8 B per record | `progress`, `optimizer-health`, per-step views |
 | Sampler command records in their own list | Dispatcher | `open_rl:operations:<run>:samples` | Unchanged | `sampler-flow`; keeps trainer ops under the cap |
@@ -100,7 +103,10 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | `GET /logs?run_id=&q=&severity=&pod=&since=&until=` | The existing log route already searches by text, severity and pod | `limit` |
 | `GET /runs/{id}/commands?since=&until=&role=` | Command records from Redis, raw | `limit` |
 | `GET /runs/{id}/steps?last=&fields=` | Trainer ops grouped by step, with stored client metrics (prefix filter) | 20 steps by default |
-| `GET /runs/{id}/checks?only=` | Check results | About 4.7 KB for all 15 |
+| `GET /sessions` | Client sessions, newest first, with their models | `limit` |
+| `GET /sessions/{id}/checks` | Session checks (`client-liveness`, `sdk-errors`), then each model check at its worst across the session's models | About 1 KB plus 1 KB per model |
+| `GET /sessions/{id}/summary` | Liveness, each model's state and pace, failing and warning checks | Under 1 KB |
+| `GET /runs/{id}/checks?only=` | One model's check results | About 1.1 KB for 8 |
 | `GET /runs/{id}/summary` | State, step, step time, last reward, per-GPU duty | About 1 KB |
 | `GET /inventory` | Runs and fleet, slimmed to what pages list | As today, smaller |
 

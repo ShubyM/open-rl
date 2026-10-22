@@ -1,10 +1,12 @@
 """The operator UI and the same read-only JSON API for agents."""
 
 import asyncio
+import json
 import math
 import statistics
 import time
 from collections import OrderedDict
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -28,6 +30,9 @@ from server.dashboard.schema import (
   PodLogs,
   QueryResult,
   Series,
+  SessionChecks,
+  Sessions,
+  SessionSummary,
   Steps,
   Summary,
 )
@@ -302,7 +307,7 @@ async def steps(
   return {"run_id": run_id, "steps": found, **({"error": records["error"]} if records.get("error") else {})}
 
 
-async def check_context(run_id: str) -> dict:
+async def check_context(run_id: str, window: tuple[float, float] | None = None) -> dict:
   state = await snapshot.current(get_state_store())
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
   if run is None:
@@ -323,9 +328,10 @@ async def check_context(run_id: str) -> dict:
     ledger = await counters()
   workers = [p for p in state.get("processes") or [] if p.get("runtime_id") in (run.get("runtime_id"), run_id) or p.get("pool") == run.get("pool")]
   created = run.get("created_at")
+  low, high = window or (0.0, float("inf"))
   return {
     "run": run,
-    "samples": records["samples"],
+    "samples": [s for s in records["samples"] if low <= s["at"] <= high],
     "ledger": ledger,
     "workers": workers,
     "scheduler": bool(state["cluster"].get("scheduler", {}).get("installed")),
@@ -373,6 +379,100 @@ async def run_summary(run_id: str):
     "step_seconds": {"median": statistics.median(gaps), "last": gaps[-1]} if gaps else None,
     "last_metrics": last,
     "gpu_busy": {role: round(sum(v) / len(v), 1) for role, v in busy.items()},
+    "failing": [r["check"] for r in results if r["verdict"] == checks.FAIL],
+    "warning": [r["check"] for r in results if r["verdict"] == checks.WARN],
+    "unknown": [r["check"] for r in results if r["verdict"] == checks.UNKNOWN],
+  }
+
+
+async def derived_session(session_id: str) -> dict:
+  """A session from before session records, rebuilt from the models whose metadata names it."""
+  models = {}
+  for key, value in (await get_state_store().scan_values(METADATA_PREFIX)).items():
+    meta = decode_model_metadata(value)
+    if meta and session_id in meta.session_ids:
+      models[key.removeprefix(METADATA_PREFIX)] = meta
+  if not models:
+    raise HTTPException(404, f"No session {session_id}")
+  last = []
+  for model_id in models:
+    with suppress(HTTPException):
+      last += [s["at"] for s in (await check_context(model_id))["samples"]]
+  created = min(meta.created_at for meta in models.values())
+  return {"session_id": session_id, "created_at": created, "last_seen_at": max(last, default=created), "model_ids": list(models), "derived": True}
+
+
+async def session_context(session_id: str) -> dict:
+  store = get_state_store()
+  record = json.loads(await store.get_value(telemetry.session_key(session_id)) or "null")
+  if record is None:
+    record = await derived_session(session_id)
+  now = time.time()
+  # A model's ops belong to this session while the session was alive.
+  window = (record["created_at"], record["last_seen_at"] + checks.SESSION_LIVE_SECONDS)
+  models, resumed = {}, {}
+  for model_id in record["model_ids"]:
+    with suppress(HTTPException):
+      models[model_id] = await check_context(model_id, window)
+      meta = decode_model_metadata(await store.get_value(METADATA_PREFIX + model_id))
+      resumed[model_id] = bool(meta and meta.session_ids and meta.session_ids[-1] != session_id)
+  return {
+    "record": record,
+    "now": now,
+    "live": now - record["last_seen_at"] < checks.SESSION_LIVE_SECONDS,
+    "models": models,
+    "resumed": resumed,
+    "errors": await store.read_samples(telemetry.sdk_errors_key(session_id)),
+  }
+
+
+@router.get("/api/v1/inspect/sessions", operation_id="sessions", response_model=Sessions, response_model_exclude_unset=True)
+async def sessions(limit: int = Query(50, ge=1, le=500)):
+  """Client sessions, newest first: when each started and was last heard from, and the models it used."""
+  now, found = time.time(), []
+  for value in (await get_state_store().scan_values("open_rl:session_record:")).values():
+    with suppress(ValueError, KeyError, TypeError):
+      record = json.loads(value)
+      live = now - record["last_seen_at"] < checks.SESSION_LIVE_SECONDS
+      metadata = record.get("metadata") or {}
+      found.append(
+        {**{k: record[k] for k in ("session_id", "created_at", "last_seen_at", "model_ids")}, "live": live, "recipe": metadata.get("recipe_name")}
+      )
+  found.sort(key=lambda r: r["created_at"], reverse=True)
+  return {"sessions": found[:limit]}
+
+
+@router.get(
+  "/api/v1/inspect/sessions/{session_id}/checks", operation_id="session_checks", response_model=SessionChecks, response_model_exclude_unset=True
+)
+async def session_checks(session_id: str):
+  """The session's checks: client liveness, SDK errors, and each model check at its worst across the session's models."""
+  session = await session_context(session_id)
+  per_model = {model: checks.run_checks(ctx) for model, ctx in session["models"].items()}
+  return {"session_id": session_id, "live": session["live"], "checks": checks.session_checks(session), "models": per_model}
+
+
+@router.get(
+  "/api/v1/inspect/sessions/{session_id}/summary", operation_id="session_summary", response_model=SessionSummary, response_model_exclude_unset=True
+)
+async def session_summary(session_id: str):
+  """The session in one answer: liveness, its models' state and pace, and which checks fail, warn or are unknown."""
+  session = await session_context(session_id)
+  results = checks.session_checks(session)
+  models = []
+  for model_id, ctx in session["models"].items():
+    steps_ = checks.optim_steps(ctx)
+    gaps = [b["at"] - a["at"] for a, b in zip(steps_, steps_[1:])]
+    run = ctx["run"]
+    state = run.get("display_status") if ctx["finished"] else (run.get("progress") or {}).get("state")
+    models.append({"model_id": model_id, "state": state, "steps": len(steps_), "median_step_s": statistics.median(gaps) if gaps else None})
+  record = session["record"]
+  return {
+    "session_id": session_id,
+    "live": session["live"],
+    "created_at": record["created_at"],
+    "last_seen_at": record["last_seen_at"],
+    "models": models,
     "failing": [r["check"] for r in results if r["verdict"] == checks.FAIL],
     "warning": [r["check"] for r in results if r["verdict"] == checks.WARN],
     "unknown": [r["check"] for r in results if r["verdict"] == checks.UNKNOWN],

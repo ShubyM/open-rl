@@ -373,6 +373,46 @@ class Summary(Record):
   unknown: list[str] = Field(default_factory=list)
 
 
+class SessionRow(Record):
+  session_id: str
+  created_at: float
+  last_seen_at: float
+  model_ids: list[str]
+  live: bool
+  recipe: str | None = None
+
+
+class Sessions(Record):
+  """Client sessions, newest first. A session is one client process; it owns the models it created or attached."""
+
+  sessions: list[SessionRow]
+
+
+class SessionChecks(Record):
+  session_id: str
+  live: bool
+  checks: list[CheckResult] = Field(description="Session checks, then each model check at its worst across the session's models")
+  models: dict[str, list[CheckResult]] = Field(default_factory=dict)
+
+
+class SessionModel(Record):
+  model_id: str
+  state: str | None = None
+  steps: int
+  median_step_s: float | None = None
+
+
+class SessionSummary(Record):
+  session_id: str
+  live: bool
+  created_at: float
+  last_seen_at: float
+  models: list[SessionModel]
+  failing: list[str] = Field(default_factory=list)
+  warning: list[str] = Field(default_factory=list)
+  unknown: list[str] = Field(default_factory=list)
+
+
 class HistoryRow(Record):
   step: int
   metrics: dict[str, float]

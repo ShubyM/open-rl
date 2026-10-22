@@ -202,3 +202,46 @@ CHECKS = {
 
 def run_checks(ctx: dict, only: list[str] | None = None) -> list[dict]:
   return [CHECKS[name](ctx) for name in only or CHECKS]
+
+
+SESSION_LIVE_SECONDS = 120  # the live session key's expiry: a session silent this long is gone
+
+
+def client_liveness(session: dict) -> dict:
+  """Is the client alive, and sending work while it is?"""
+  name, record, now = "client-liveness", session["record"], session["now"]
+  requests = [s["at"] for ctx in session["models"].values() for s in ctx["samples"]]
+  quiet = now - max(requests) if requests else None
+  heard = now - record["last_seen_at"]
+  unfinished = [m for m, ctx in session["models"].items() if not ctx["finished"] and not session["resumed"].get(m)]
+  numbers = {"since_heartbeat_s": round(heard), "since_request_s": round(quiet) if quiet is not None else None, "models": len(session["models"])}
+  evidence = f"sessions/{record['session_id']}/summary"
+  if session["live"] and unfinished and quiet is not None and quiet > 600:
+    return answer(name, FAIL, f"the client heartbeats but sent nothing for {quiet / 60:.0f} min", evidence, **numbers)
+  if not session["live"] and unfinished:
+    return answer(name, WARN, f"the client stopped {heard / 60:.0f} min ago with {unfinished[0]} unfinished", evidence, **numbers)
+  return answer(name, OK, "heartbeating and sending work" if session["live"] else "the session ended", **numbers)
+
+
+def sdk_errors(session: dict) -> dict:
+  """Did the client's SDK report errors in this session?"""
+  name, errors = "sdk-errors", session["errors"]
+  if not errors:
+    return answer(name, OK, "no SDK errors reported", errors=0)
+  worst = FAIL if any(e.get("severity") == "CRITICAL" for e in errors) else WARN
+  reasons = statistics.mode(e.get("reason") or "error" for e in errors)
+  return answer(
+    name, worst, f"{len(errors)} SDK errors, mostly {reasons}", f"open_rl:sdk_errors:{session['record']['session_id']}", errors=len(errors)
+  )
+
+
+def session_checks(session: dict) -> list[dict]:
+  """The session's own checks, then each model check rolled up to its worst verdict across the session's models."""
+  per_model = {model: run_checks(ctx) for model, ctx in session["models"].items()}
+  rolled = {}
+  for model, results in per_model.items():
+    for result in results:
+      held = rolled.get(result["check"])
+      if held is None or RANK[result["verdict"]] > RANK[held["verdict"]]:
+        rolled[result["check"]] = {**result, "reason": f"{model[:8]}: {result['reason']}", "numbers": {**result["numbers"], "model": model}}
+  return [client_liveness(session), sdk_errors(session), *rolled.values()]

@@ -67,6 +67,11 @@ def samples_key(run_id: str) -> str:
   return f"open_rl:operations:{run_id}:samples"
 
 
+def session_key(session_id: str) -> str:
+  """A session's durable record; the live open_rl:session:<id> key expires two minutes after its last heartbeat."""
+  return f"open_rl:session_record:{session_id}"
+
+
 def ledger_key(run_id: str, event: str) -> str:
   """Counts of a run's trainer requests by lifecycle event: enqueued, popped, answered."""
   return f"open_rl:ledger:{run_id}:{event}"
@@ -256,6 +261,24 @@ class Answering:
     await self.store.set_future(request_id, result)
     if current is not None and (entry := current.outstanding.pop(request_id, None)):
       count("answered", entry["run_id"])
+
+
+async def note_session(store, session_id: str, *, created: bool = False, model_id: str | None = None, metadata: dict | None = None) -> None:
+  """When a session started and was last heard from, and every model it created or attached; one log line per change."""
+  key, now = session_key(session_id), time.time()
+  record = json.loads(await store.get_value(key) or "null") or {"session_id": session_id, "created_at": now, "model_ids": []}
+  record["last_seen_at"] = now
+  if metadata is not None:
+    record["metadata"] = redact(metadata)
+  event = "created" if created else None
+  if model_id and model_id not in record["model_ids"]:
+    record["model_ids"].append(model_id)
+    event = "attached"
+  await store.set_value(key, json.dumps(record), ttl_seconds=TTL_SECONDS)
+  if event:
+    labels = {SOURCE_LABEL: "openrl_event", **({RUN_LABEL: model_id} if model_id else {})}
+    line = {"kind": "openrl.session", "v": 1, "event": event, "session_id": session_id, "model_id": model_id, "time": iso(now)}
+    print(json.dumps({"severity": "INFO", "message": "openrl.session", "openrl": line, "logging.googleapis.com/labels": labels}), flush=True)
 
 
 def count(event: str, run_id: str | None) -> None:
