@@ -117,29 +117,25 @@ class InspectionApiTest(unittest.TestCase):
     before, after = [call.kwargs["json"] for call in request.await_args_list]
     self.assertEqual(after, {**before, "pageToken": "next-provider-page"})
 
-  def test_historical_sampler_operations_feed_both_logs_and_series(self):
+  def test_historical_sampler_operations_feed_both_logs_and_sampler_queries(self):
     self.state.update(placements=[], processes=[])
     self.store.read_samples.return_value = [operation(125, 170, role="sampler", pod="deleted-sampler", operation="sample")]
     backend = mock.Mock(name="prometheus", slots={})
     backend.name = "prometheus"
-    backend.samplers = mock.AsyncMock(return_value=({"requests_running": [[150, 2]]}, {"request_latency_p99_seconds": "Query unavailable"}))
-    backend.devices = mock.AsyncMock()
-    backend.workers_series = mock.AsyncMock()
+    backend.scope.return_value = ""
+    backend.range_rows = mock.AsyncMock(return_value=[{"metric": {}, "values": [[150, "2"]]}])
     with (
       mock.patch.object(router.sources, "configuration", return_value=CONFIG),
       mock.patch.object(router.sources, "gcp_request", mock.AsyncMock(return_value={})) as request,
-      mock.patch.object(router.metrics, "hardware", return_value=(backend, None)),
+      mock.patch.object(router.queries, "hardware", return_value=(backend, None)),
     ):
       logs = self.client.get("/api/v1/inspect/logs", params={"run_id": "r1", **WINDOW})
-      series = self.client.get("/api/v1/inspect/series", params={"run_id": "r1", "kind": "samplers", **WINDOW})
+      running = self.client.get("/api/v1/inspect/query", params={"name": "vllm_requests_running", "run_id": "r1", **WINDOW})
     self.assertEqual(logs.status_code, 200)
     self.assertIn('resource.labels.pod_name="deleted-sampler"', request.await_args.kwargs["json"]["filter"])
-    self.assertEqual(series.status_code, 200)
-    self.assertTrue(series.json()["available"])
-    self.assertEqual(series.json()["samplers_errors"], {"request_latency_p99_seconds": "Query unavailable"})
-    self.assertEqual(backend.samplers.await_args.args[0], ["deleted-sampler"])
-    backend.devices.assert_not_awaited()
-    backend.workers_series.assert_not_awaited()
+    self.assertEqual(running.status_code, 200, running.text)
+    self.assertEqual(running.json()["series"][0]["points"], [[150, 2]])
+    self.assertIn("deleted\\\\-sampler", backend.range_rows.await_args.args[0])
 
   def test_unavailable_historical_records_leave_logs_and_series_with_a_note(self):
     # A run whose records cannot be read still has its known pods' logs and series, and says what is missing.

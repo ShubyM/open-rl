@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 
 from server.dashboard import inspection, sources
-from server.dashboard.sources import SAMPLER_QUERIES, PromQL
+from server.dashboard.sources import PromQL
 
 
 def hardware() -> tuple[PromQL | None, str | None]:
@@ -20,15 +20,15 @@ def hardware() -> tuple[PromQL | None, str | None]:
   return None, "No GPU metrics source: not on GKE and OPEN_RL_PROMETHEUS_URL is unset"
 
 
-async def series(state: dict, node_id=None, since=None, until=None, run_id=None, kind="all", samples=()) -> dict:
-  """A node's devices and workers, idle GPUs included; or a run's, with its samplers' vLLM series."""
+async def series(state: dict, node_id=None, since=None, until=None, run_id=None, kind="hardware", samples=()) -> dict:
+  """A node's devices and workers, idle GPUs included; or a run's. kind=devices is the GPUs alone. Sampler charts are named queries."""
   start, end = sources.log_window(since, until)
   low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
   placements = [p for p in inspection.sources(state, run_id=run_id, node_id=node_id, samples=samples) if p["start"] <= high and p["end"] >= low]
   nodes = [n for n in state["cluster"]["nodes"] if not node_id or n.get("name") == node_id]
   current = {d["id"]: d.get("uuid") for n in nodes for d in n["devices"]}
   devices, workers = {}, {}
-  for placement in placements if kind != "samplers" else []:
+  for placement in placements:
     for identity in placement["devices"]:
       uuid = (placement.get("device_uuids") or {}).get(identity) or (None if placement["ended"] else current.get(identity))
       devices[identity, uuid] = None
@@ -41,7 +41,7 @@ async def series(state: dict, node_id=None, since=None, until=None, run_id=None,
   known = {identity for identity, _ in devices}
   # The browser serializes snapshot timestamps to milliseconds.
   live_window = high >= datetime.fromisoformat(state["observed_at"]).timestamp() - 0.001
-  if not run_id and kind != "samplers":
+  if not run_id:
     devices.update({(identity, uuid): None for identity, uuid in current.items() if live_window or identity not in known})
   backend, reason = hardware()
 
@@ -60,40 +60,19 @@ async def series(state: dict, node_id=None, since=None, until=None, run_id=None,
         row[field] = [p for p in found.get(field, {}).get(row[key], []) if row.get("first_seen", low) <= p[0] <= row.get("last_seen", high)]
     return rows, errors, succeeded
 
-  async def samplers():
-    pods = sorted({p["pod"] for p in placements if p.get("role") == "sampler" and p.get("pod")})
-    if kind in ("hardware", "devices") or not run_id or not pods:
-      return {}, {}, 0
-    if backend is None:
-      return {}, dict.fromkeys(SAMPLER_QUERIES, reason), 0
-    found, errors = await backend.samplers(pods, low, high)
-    return found, errors, len(SAMPLER_QUERIES) - len(errors)
-
-  (gpu, gpu_errors, gpu_ok), (cpu, cpu_errors, cpu_ok), (vllm, vllm_errors, vllm_ok) = await asyncio.gather(
+  (gpu, gpu_errors, gpu_ok), (cpu, cpu_errors, cpu_ok) = await asyncio.gather(
     query("devices", [{"id": identity, "uuid": uuid} for identity, uuid in devices], "uuid", ("utilization", "memory_mib")),
     query("workers_series", list(workers.values()) if kind != "devices" else [], "pod", ("cpu_cores", "memory_bytes")),
-    samplers(),
   )
-  error = next(iter([*gpu_errors.values(), *cpu_errors.values(), *vllm_errors.values()]), None)
+  error = next(iter([*gpu_errors.values(), *cpu_errors.values()]), None)
   result = {
     "source": backend.name if backend else None,
     "reason": reason or error,
-    "error": reason or (error if not gpu_ok + cpu_ok + vllm_ok else None),
+    "error": reason or (error if not gpu_ok + cpu_ok else None),
     "since": start,
     "until": end,
     "devices": [{**row, "slot": backend.slots.get(row["uuid"])} if backend and row["uuid"] in backend.slots else row for row in gpu],
     "workers": cpu,
-    **(
-      {
-        "samplers": vllm,
-        "samplers_errors": vllm_errors,
-        "samplers_reason": next(iter(vllm_errors.values()), reason) or (None if vllm else "No sampler pods for this run in this window"),
-      }
-      if run_id and kind not in ("hardware", "devices")
-      else {}
-    ),
   }
-  result["available"] = (
-    any(d["utilization"] or d["memory_mib"] for d in gpu) or any(w["cpu_cores"] or w["memory_bytes"] for w in cpu) or any(vllm.values())
-  )
+  result["available"] = any(d["utilization"] or d["memory_mib"] for d in gpu) or any(w["cpu_cores"] or w["memory_bytes"] for w in cpu)
   return result

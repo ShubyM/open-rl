@@ -224,24 +224,18 @@ async def series(
   run_id: str | None = None,
   since: TimeBound = None,
   until: TimeBound = None,
-  kind: Literal["all", "hardware", "devices", "samplers"] = "all",
+  kind: Literal["hardware", "devices"] = "hardware",
 ):
   """GPU utilization/memory and worker CPU/memory over time, including idle devices and past placements.
-  With run_id, the run's own GPUs and workers, plus throughput, queue, KV cache and latency of its vLLM samplers.
-  kind=devices is the GPUs alone, for every node when no node or run is named."""
+  With run_id, the run's own GPUs and workers. kind=devices is the GPUs alone, for every node when no node or run is named.
+  vLLM sampler charts are named queries: /query?name=vllm_..."""
   validate_bounds(since, until)
-  if kind == "samplers" and not run_id:
-    raise HTTPException(400, "Sampler series require run_id")
   await sources.discover()
   state = await snapshot.current(get_state_store())
   start, end, _, _ = time_range(since, until or state["observed_at"])
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None) if run_id else None
   records = await read_operations(run_id, is_finished(run)) if run_id else {"samples": []}
-  result = await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id, kind=kind, samples=records["samples"])
-  # Without its sampler records a run still has its current pods' series; say what is missing.
-  if records.get("error") and run_id:
-    result["samplers_reason"] = result.get("samplers_reason") or f"{records['error']}; samplers that are gone are not shown"
-  return result
+  return await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id, kind=kind, samples=records["samples"])
 
 
 @router.get("/api/v1/inspect/query", operation_id="query", response_model=QueryResult, response_model_exclude_unset=True)

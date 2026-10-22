@@ -171,20 +171,6 @@ class PromQLTest(unittest.TestCase):
         self.assertTrue(connection.is_closed)
         self.assertIsNone(sources.pool)
 
-  def test_a_sampler_timeout_does_not_discard_other_charts(self):
-    backend = PromQL("prometheus", "https://example", None, None, "openrl-system")
-
-    async def query(query, start, end, by=None):
-      if "num_requests_waiting" in query:
-        raise TimeoutError
-      return {"": [[1, 2]]}
-
-    with mock.patch.object(backend, "query_range", side_effect=query):
-      found, errors = asyncio.run(backend.samplers(["sampler"], 0, 60))
-    self.assertEqual(found["requests_running"], [[1, 2]])
-    self.assertEqual(found["requests_waiting"], [])
-    self.assertEqual(errors, {"requests_waiting": "Metrics query timed out"})
-
   def test_queries_made_at_different_moments_share_sample_times(self) -> None:
     # Each allocation is fetched separately and the window slides with every
     # refresh; unaligned starts gave every response its own timestamps, so the
@@ -245,7 +231,6 @@ class HardwareSeriesTest(unittest.TestCase):
         self.assertEqual(result["error"], "Offline" if len(errors) == 2 else None)
         self.assertEqual(result["devices"][0]["errors"], errors)
         self.assertFalse(result["available"])
-        backend.samplers.assert_not_called()
 
   def test_node_query_batches_idle_gpus_and_historical_workers(self) -> None:
     state = {

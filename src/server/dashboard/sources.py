@@ -494,12 +494,6 @@ class PromQL:
     }
     return await self.query_many(queries, start, end)
 
-  async def samplers(self, pods: list[str], start: float, end: float) -> tuple[dict, dict[str, str]]:
-    """Summed over a run's vLLM replicas."""
-    match = f"{{namespace={json.dumps(self.namespace)},pod=~{any_of(pods)}{self.scope('cluster')}}}"
-    found, errors = await self.query_many({name: query.replace("{M}", match) for name, query in SAMPLER_QUERIES.items()}, start, end)
-    return {name: found.get(name, {}).get("", []) for name in SAMPLER_QUERIES}, errors
-
 
 # *** GKE identity and Cloud Logging ***
 

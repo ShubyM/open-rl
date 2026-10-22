@@ -248,13 +248,6 @@ class Series(Record):
   until: str
   devices: list[DeviceSeries]
   workers: list[WorkerSeries]
-  samplers: dict[str, list[tuple[float, float]]] | None = Field(
-    None,
-    description="With run_id: the run's vLLM replicas, summed (latency is p99, kv_cache_usage the fullest replica, 0-1). "
-    "A shared pool includes other runs",
-  )
-  samplers_reason: str | None = None
-  samplers_errors: dict[str, str] = Field(default_factory=dict)
 
 
 class LogRecord(Record):
