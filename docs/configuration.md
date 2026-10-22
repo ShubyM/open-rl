@@ -100,3 +100,20 @@ On Kubernetes the release bundles set these variables. The API server runs with
 each trainer and sampler, and the OpenRL scheduler starts their pods. The API
 server writes each worker's environment into the `Workload`'s pod template, so
 there are no worker deployments to configure by hand.
+
+## Run telemetry
+
+Trainers, samplers and the API server record what each run did in the store:
+command records, worker records, session records, placements and request
+counters. `python -m server.dashboard` serves them read only under
+`/api/v1/inspect`, with `/docs` describing each route. Design Doc 018 explains
+the records and the facts read from them.
+
+| Env var | Default | What it does |
+| --- | --- | --- |
+| `OPEN_RL_OPS_SAMPLE_LIMIT` | `2000` | Newest command records kept per run, for trainer ops and samples separately. The scheduler passes it to worker pods. |
+| `OPEN_RL_OPS_TTL_DAYS` | `7` | Days a record lives after its last write. `0` keeps records. The scheduler passes it to worker pods. |
+| `OPEN_RL_INSPECTION_API` | unset | `true` mounts `/api/v1/inspect` on the API server too. It lists every run, so leave it off on a server clients reach. |
+| `OPEN_RL_PROMETHEUS_URL` | unset | Prometheus for GPU and vLLM metrics. Unset, the dashboard uses Managed Prometheus on GKE. |
+| `OPEN_RL_GKE_PROJECT` / `OPEN_RL_GKE_CLUSTER` / `OPEN_RL_GKE_LOCATION` | from the metadata server | The cluster whose metrics and logs the dashboard reads. `OPEN_RL_GKE_TELEMETRY=false` turns GKE reads off. |
+| `OPEN_RL_LOG_VIEWS` | the project | Comma-separated Cloud Logging views to read run logs from, such as a long-retention bucket's view. |
