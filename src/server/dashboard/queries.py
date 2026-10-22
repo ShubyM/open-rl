@@ -1,4 +1,4 @@
-"""Named PromQL queries: one copy of each expression for the dashboard, agents and checks.
+"""Named PromQL queries: one copy of each expression for the dashboard and agents.
 
 A template names its subject with {gpus} (a run's or node's GPU UUIDs) or {pods} (a run's sampler pods), and may use
 {window}, the span in seconds. A query asked for one point is evaluated once at the end of the window.

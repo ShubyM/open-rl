@@ -10,7 +10,7 @@ class Record(BaseModel, extra="allow", allow_inf_nan=False):
 
 
 class Shown(BaseModel, extra="ignore", allow_inf_nan=False):
-  """Ships only its declared fields: what the pages render. Checks read the full records server-side."""
+  """Ships only its declared fields: what the pages render. Summaries read the full records server-side."""
 
 
 class RunPod(Shown):
@@ -28,7 +28,7 @@ class Run(Shown):
   status: str = Field(description="As the gateway recorded it: active until the client completes or deletes the model")
   lifecycle: Literal["ended", "waiting", "placed", "active"] = Field(
     description="ended: finished, or nothing serves it and no session is live; waiting: a worker is not placed yet; "
-    "placed: every worker is placed; active: placement unknown. Health is /runs/{id}/checks"
+    "placed: every worker is placed; active: placement unknown. The run's facts are /runs/{id}/summary"
   )
   created_at: float
   completed_at: float | None = None
@@ -155,7 +155,7 @@ class Incident(Record):
 
 class Activity(Record):
   """Bounded, best-effort completed records; absence does not establish idleness.
-  The request-ledger check accounts for queued and in-flight requests."""
+  /runs/{id}/summary accounts for queued and in-flight requests."""
 
   placements: list[PlacementActivity]
   observed_at: str | None = None
@@ -244,16 +244,24 @@ class QueryResult(Record):
   error: str | None = None
 
 
-class FleetRun(Record):
-  run_id: str
+class RunLine(Record):
+  """A run in one line, enough to see which run to open."""
+
+  run_id: str | None = None
+  model_id: str | None = None
   name: str | None = None
   lifecycle: str | None = None
-  verdict: str
-  flagged: list[dict[str, str]] = Field(default_factory=list, description="Failing and warning checks with their reasons")
+  steps: int
+  since_last_op_s: int | None = Field(None, description="Seconds since any trainer op or sample completed; null when none did")
+  since_last_step_s: int | None = None
+  unanswered: int = Field(description="Trainer requests taken and not answered")
+  held_by_dead_worker: int = Field(description="Of those, requests whose holding worker stopped reporting")
+  failures: int = Field(description="Failed trainer ops")
+  relaunches: int = Field(description="Worker processes that replaced an earlier one in the same pod")
 
 
-class FleetChecks(Record):
-  runs: list[FleetRun] = Field(default_factory=list, description="Worst verdict first")
+class FleetRuns(Record):
+  runs: list[RunLine] = Field(default_factory=list, description="Longest since the last op first; a run with no op first of all")
 
 
 class Holder(Record):
@@ -322,46 +330,46 @@ class Steps(Record):
   error: str | None = None
 
 
-class Evidence(Record):
+class Read(Record):
   read: str = Field(description="A route under /api/v1/inspect; run it with args as query parameters")
   args: dict[str, JsonValue] = Field(default_factory=dict)
-  head: str | None = Field(None, description="One verbatim line of what the read returns")
-
-
-class CheckResult(Record):
-  check: str
-  verdict: Literal["ok", "warn", "fail", "unknown"] = Field(description="unknown: an input is missing; never read it as ok")
-  reason: str
-  kind: Literal["symptom", "cause"] = Field(description="Symptoms set the run's verdict; a cause names where to look when its symptom fails")
-  explains: str | None = Field(None, description="For a cause, the symptom it explains")
-  numbers: dict[str, JsonValue] = Field(default_factory=dict, description="observed, expected and threshold where they apply")
-  evidence: list[Evidence] = Field(default_factory=list)
-
-
-class Checks(Record):
-  run_id: str
-  verdict: Literal["ok", "warn", "fail", "unknown"] = Field(description="The worst symptom")
-  checks: list[CheckResult]
 
 
 class Summary(Record):
-  """The run in one answer, for a status line or an agent's first call."""
+  """The run's facts, each block only when it has content. No verdict. An absent block means nothing of its kind was recorded."""
 
   run_id: str
-  verdict: str = Field(description="The worst symptom check")
-  state: str | None = Field(None, description="The run's lifecycle, as in inventory")
+  lifecycle: str | None = Field(None, description="As in inventory")
   steps: int
-  step_seconds: dict[str, float] | None = None
-  goodput: dict[str, JsonValue] | None = Field(None, description="Share of the run the trainer spent training, with where the rest went, in seconds")
+  step_seconds: dict[str, float] | None = Field(None, description="median and last gap between optimizer steps")
+  since_last_step_s: int | None = Field(None, description="Live runs only")
+  last_op: dict[str, JsonValue] | None = Field(None, description="The newest trainer op: operation, status, at")
   last_metrics: dict[str, float] = Field(default_factory=dict, description="Latest trainer metrics, from the newest ops")
+  goodput: dict[str, JsonValue] | None = Field(None, description="Share of the run the trainer spent training, with where the rest went, in seconds")
+  waiting: dict[str, float | int | None] | None = Field(
+    None, description="Live runs: seconds since any op finished, trainer idle time, trainer requests in flight, samples unanswered in the pool"
+  )
+  requests: dict[str, JsonValue] | None = Field(
+    None,
+    description="Unanswered trainer requests with the holding pod and whether it reports; ledger counters, lost = enqueued - popped - queued",
+  )
+  failures: dict[str, JsonValue] | None = Field(None, description="Failed trainer ops: count, the 5 newest, and a log read around the newest")
+  relaunches: dict[str, JsonValue] | None = Field(
+    None, description="Workers that stopped reporting and restarted in the same pod, with a log read around the first"
+  )
+  pool: dict[str, JsonValue] | None = Field(None, description="Samples unanswered in the run's pool, the oldest's age, and its dispatcher")
+  saves: dict[str, JsonValue] | None = Field(None, description="save_state calls: count, failed, last success, steps since, slowest")
+  optimizer: dict[str, JsonValue] | None = Field(None, description="Ops that returned non-finite metrics, and the last 5 grad norms")
+  samplers: dict[str, JsonValue] | None = Field(
+    None, description="Sample sends, retries, failures, median latency; slowest and fastest replica with 20 or more answers"
+  )
+  config: list[dict[str, JsonValue]] | str | None = Field(
+    None, description="Workers whose echoed settings differ from the run's; 'no echo' when none echoed"
+  )
+  placement: dict[str, JsonValue] | None = Field(None, description="Placements recorded, and workloads with no node yet")
+  incidents: list[dict[str, JsonValue]] | None = Field(None, description="Kubernetes incidents on the run's pods, newest first, at most 5")
   gpu_busy: dict[str, float] = Field(default_factory=dict, description="Mean GPU duty cycle by role over gpu_busy_window, percent")
   gpu_busy_window: dict[str, str | None] | None = Field(None, description="since and until of gpu_busy: the run's span of recorded ops")
-  waiting: dict[str, float | int | None] | None = Field(
-    None, description="For a live run: seconds since any op finished, trainer idle time, trainer requests in flight, samples queued in the pool"
-  )
-  failing: list[str] = Field(default_factory=list)
-  warning: list[str] = Field(default_factory=list)
-  unknown: list[str] = Field(default_factory=list)
 
 
 class SessionRow(Record):
@@ -380,44 +388,12 @@ class Sessions(Record):
   sessions: list[SessionRow]
 
 
-class SessionChecks(Record):
-  session_id: str
-  live: bool
-  verdict: str = Field(description="The worst symptom across the session")
-  checks: list[CheckResult] = Field(description="Session checks, then each model check at its worst across the session's models")
-  models: dict[str, list[CheckResult]] = Field(default_factory=dict)
-
-
-class SessionModel(Record):
-  model_id: str
-  state: str | None = Field(None, description="The model's lifecycle, as in inventory")
-  verdict: str = Field(description="This model's worst symptom check")
-  steps: int
-  median_step_s: float | None = None
-  failing: list[str] = Field(default_factory=list, description="This model's checks that fail")
-  warning: list[str] = Field(default_factory=list)
-
-
 class SessionSummary(Record):
+  """The session record, whether its registry key is live, its SDK errors, and each model in one line."""
+
   session_id: str
   live: bool
-  verdict: str
   created_at: float
   last_seen_at: float
-  models: list[SessionModel]
-  failing: list[str] = Field(default_factory=list)
-  warning: list[str] = Field(default_factory=list)
-  unknown: list[str] = Field(default_factory=list)
-
-
-class CatalogEntry(Record):
-  name: str
-  meaning: str
-  kind: str | None = None
-
-
-class Catalog(Record):
-  """What each check and named query means, for reading answers without guessing."""
-
-  checks: list[CatalogEntry]
-  queries: list[CatalogEntry]
+  sdk_errors: dict[str, JsonValue] | None = Field(None, description="count and the last message")
+  models: list[RunLine]

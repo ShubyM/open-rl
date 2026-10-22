@@ -29,7 +29,6 @@ def endpoints(run: str, since: str, until: str) -> dict[str, tuple[str, dict]]:
     "logs page": ("logs", {"run_id": run, "limit": 200, **window}),
     "telemetry": ("telemetry", {"run_id": run, **window}),
     "history": ("history", {"run_id": run}),
-    "checks": (f"runs/{run}/checks", {}),
     "summary": (f"runs/{run}/summary", {}),
     "commands": (f"runs/{run}/commands", window),
     "steps": (f"runs/{run}/steps", {}),

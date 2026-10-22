@@ -1,4 +1,4 @@
-"""The one view of the cluster the pages and checks read: runs joined to their
+"""The one view of the cluster the pages and summaries read: runs joined to their
 workers, the requests each still waits on, where each run's workers were placed,
 nodes with their GPUs, and the records worker processes keep about themselves."""
 

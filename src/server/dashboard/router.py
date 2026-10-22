@@ -3,7 +3,6 @@
 import asyncio
 import json
 import math
-import statistics
 import time
 from collections import OrderedDict
 from contextlib import suppress
@@ -16,20 +15,17 @@ from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
 
 from server import telemetry
-from server.dashboard import checks, inspection, metrics, queries, sources
+from server.dashboard import facts, inspection, metrics, queries, sources
 from server.dashboard.schema import (
-  FleetChecks,
   Accelerators,
   Activity,
-  Catalog,
-  Checks,
   Commands,
+  FleetRuns,
   Inventory,
   Logs,
   PodLogs,
   QueryResult,
   Series,
-  SessionChecks,
   Sessions,
   SessionSummary,
   Steps,
@@ -44,7 +40,7 @@ REQUEST_SECONDS = 12
 # A long run holds tens of thousands of operation records; reading them needs more than a
 # few seconds over a port-forward.
 OPERATIONS_READ_SECONDS = 15
-# One read and check of a run's or worker's records serves every page asking within this
+# One read of a run's or worker's records serves every page asking within this
 # long, and a retry after a timeout joins the read still running instead of starting another.
 # A finished run's records no longer change, so they are kept longer.
 OPERATIONS_SECONDS = 10
@@ -102,7 +98,7 @@ def time_range(since, until) -> sources.Window:
 @router.get("/api/v1/inspect/inventory", operation_id="inventory", response_model=Inventory, response_model_exclude_unset=True)
 async def inventory():
   """Runs with their lifecycle, nodes with their GPUs, the GPUs held now, and pods with problems; an error field per unavailable source.
-  Whether a run is healthy is /runs/{id}/checks."""
+  A run's facts are /runs/{id}/summary."""
   await sources.discover()
   state = await snapshot.current(get_state_store())
   return {**state, "cluster": {**state["cluster"], "pods": [pod for pod in state["cluster"]["pods"] if pod["problem"]]}}
@@ -268,7 +264,7 @@ async def steps(
   return {"run_id": run_id, "total": len(every), "steps": found, **({"error": records["error"]} if records.get("error") else {})}
 
 
-async def check_context(run_id: str, window: tuple[float, float] | None = None) -> dict:
+async def run_context(run_id: str, window: tuple[float, float] | None = None) -> dict:
   state = await snapshot.current(get_state_store())
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
   if run is None:
@@ -312,80 +308,47 @@ async def check_context(run_id: str, window: tuple[float, float] | None = None) 
   }
 
 
-@router.get("/api/v1/inspect/catalog", operation_id="catalog", response_model=Catalog, response_model_exclude_unset=True)
-async def catalog():
-  """What each check and named query means; read once, not in every answer."""
-  kinds = {name: "symptom" if name in checks.SYMPTOMS else "cause" for name in checks.CHECKS}
-  found = [{"name": name, "meaning": (fn.__doc__ or "").strip(), "kind": kinds[name]} for name, fn in checks.CHECKS.items()]
-  found += [
-    {"name": fn.__name__.replace("_", "-"), "meaning": (fn.__doc__ or "").strip(), "kind": "symptom" if fn is checks.client_liveness else "cause"}
-    for fn in (checks.client_liveness, checks.sdk_errors)
-  ]
-  return {"checks": found, "queries": [{"name": name, "meaning": query} for name, query in queries.QUERIES.items()]}
-
-
-@router.get("/api/v1/inspect/checks", operation_id="fleet_checks", response_model=FleetChecks, response_model_exclude_unset=True)
-async def fleet_checks(ended: bool = False):
-  """Every live run's verdict with its failing and warning checks and their reasons: is anything stuck, in one read.
-  ended=true includes ended runs."""
+@router.get("/api/v1/inspect/runs", operation_id="runs", response_model=FleetRuns, response_model_exclude_unset=True)
+async def fleet_runs(ended: bool = False):
+  """Every live run in one line each, longest since its last op first, so a stuck run is one read away.
+  ended=true adds ended runs."""
   state = await snapshot.current(get_state_store())
   runs = [r for r in state["runs"] if ended or not is_finished(r)]
-  found = []
-  for run, results in zip(runs, await asyncio.gather(*(check_context(r["run_id"]) for r in runs))):
-    results = checks.run_checks(results)
-    flagged = [{k: r[k] for k in ("check", "verdict", "reason")} for r in results if r["verdict"] in (checks.FAIL, checks.WARN)]
-    found.append({"run_id": run["run_id"], "name": run.get("name"), "lifecycle": run.get("lifecycle"), "verdict": checks.verdict(results), "flagged": flagged})
-  found.sort(key=lambda r: -checks.RANK[r["verdict"]])
+  found = [
+    {"run_id": run["run_id"], "name": run.get("name"), **facts.line(ctx)}
+    for run, ctx in zip(runs, await asyncio.gather(*(run_context(r["run_id"]) for r in runs)))
+  ]
+  # A run with no op at all waits longest of all.
+  found.sort(key=lambda r: -(r["since_last_op_s"] if r["since_last_op_s"] is not None else math.inf))
   return {"runs": found}
-
-
-@router.get("/api/v1/inspect/runs/{run_id}/checks", operation_id="checks", response_model=Checks, response_model_exclude_unset=True)
-async def run_checks(run_id: str, only: Annotated[str | None, Query(description="Comma-separated check names; all when omitted")] = None):
-  """Diagnostic checks for the run: each a verdict (ok, warn, fail, unknown), a reason, a few numbers and evidence."""
-  names = [n for n in (only or "").split(",") if n]
-  if unknown := [n for n in names if n not in checks.CHECKS]:
-    raise HTTPException(400, f"Unknown checks {unknown}; use {sorted(checks.CHECKS)}")
-  results = checks.run_checks(await check_context(run_id), names or None)
-  return {"run_id": run_id, "verdict": checks.verdict(results), "checks": results}
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/summary", operation_id="summary", response_model=Summary, response_model_exclude_unset=True)
 async def run_summary(run_id: str):
-  """The run in one answer: state, steps, step time, goodput, what a live run waits on, last trainer metrics,
-  GPU duty by role over the run's span (per GPU over any window: /accelerators?run_id=), and which checks fail or warn."""
-  ctx = await check_context(run_id)
-  results = checks.run_checks(ctx)
-  steps_ = checks.optim_steps(ctx)
-  gaps = [b["at"] - a["at"] for a, b in zip(steps_, steps_[1:])]
-  last = {k: v for s in checks.trainer_ops(ctx)[-50:] for k, v in s.get("metrics", {}).items()}
-  run, state = ctx["run"], ctx["state"]
-  # Duty over the run's own span: averaging in the idle days after it ended would understate it.
+  """The run's facts in one read, each block only when it has content: steps and pace, goodput, what a live run waits on,
+  unanswered requests and the request ledger, failed ops, worker relaunches, the sampling pool, saves, optimizer values,
+  sampler latency, config drift, placement and Kubernetes incidents, with log reads for failures and relaunches.
+  GPU duty by role covers the run's span; per GPU over any window is /accelerators?run_id=. No verdict; reason from the facts."""
+  ctx = await run_context(run_id)
+  state, found = ctx["state"], {"run_id": run_id, **facts.summary(ctx)}
   ops = sorted(s["at"] for s in ctx["samples"])
-  window = {"since": None, "until": state["observed_at"]}
-  if ops:
-    end = min(ctx["now"], ops[-1] + 60)
-    window = {k: datetime.fromtimestamp(t, UTC).isoformat() for k, t in (("since", max(ops[0] - 60, end - 7 * 86400)), ("until", end))}
+  if not ops:
+    return found
+  # Duty over the run's own span: averaging in the idle days after it ended would understate it.
+  end = min(ctx["now"], ops[-1] + 60)
+  window = {k: datetime.fromtimestamp(t, UTC).isoformat() for k, t in (("since", max(ops[0] - 60, end - 7 * 86400)), ("until", end))}
   duty = await queries.run("gpu_busy", state, run_id, None, sources.window(window["since"], window["until"]), 1)
   roles = {uuid: p["role"] for p in inspection.lanes(state, run_id=run_id) for uuid in p["devices"]}
   busy: dict[str, list[float]] = {}
   for series_ in duty.get("series", []):
     if series_["points"]:
       busy.setdefault(roles.get(series_["labels"].get("UUID")) or "other", []).append(series_["points"][-1][1])
-  return {
-    "run_id": run_id,
-    "verdict": checks.verdict(results),
-    "goodput": checks.goodput(ctx),
-    "state": run.get("lifecycle"),
-    "steps": len(steps_),
-    "step_seconds": {"median": statistics.median(gaps), "last": gaps[-1]} if gaps else None,
-    "last_metrics": last,
-    "gpu_busy": {role: round(sum(v) / len(v), 1) for role, v in busy.items()},
-    "gpu_busy_window": window,
-    "waiting": checks.waiting(ctx),
-    "failing": [r["check"] for r in results if r["verdict"] == checks.FAIL],
-    "warning": [r["check"] for r in results if r["verdict"] == checks.WARN],
-    "unknown": [r["check"] for r in results if r["verdict"] == checks.UNKNOWN],
-  }
+  if busy:
+    found.update(gpu_busy={role: round(sum(v) / len(v), 1) for role, v in busy.items()}, gpu_busy_window=window)
+  return found
+
+
+SESSION_LIVE_SECONDS = 120  # the live session key's expiry: a session silent this long is gone
 
 
 async def session_context(session_id: str) -> dict:
@@ -393,21 +356,17 @@ async def session_context(session_id: str) -> dict:
   record = json.loads(await store.get_value(telemetry.session_key(session_id)) or "null")
   if record is None:
     raise HTTPException(404, f"No session {session_id}")
-  now = time.time()
-  # A model's ops belong to this session while the session was alive.
-  window = (record["created_at"], record["last_seen_at"] + checks.SESSION_LIVE_SECONDS)
-  models, resumed = {}, {}
+  live = await store.get_value(f"open_rl:session:{session_id}") is not None
+  # A model's ops belong to this session while the session was alive; a backfilled record's last_seen_at is stale.
+  window = (record["created_at"], math.inf if live else record["last_seen_at"] + SESSION_LIVE_SECONDS)
+  models = {}
   for model_id in record["model_ids"]:
     with suppress(HTTPException):
-      models[model_id] = await check_context(model_id, window)
-      meta = decode_model_metadata(await store.get_value(METADATA_PREFIX + model_id))
-      resumed[model_id] = bool(meta and meta.session_ids and meta.session_ids[-1] != session_id)
+      models[model_id] = await run_context(model_id, window)
   return {
     "record": record,
-    "now": now,
-    "live": await store.get_value(f"open_rl:session:{session_id}") is not None,  # expires two minutes after the last heartbeat
+    "live": live,
     "models": models,
-    "resumed": resumed,
     "errors": await store.read_samples(telemetry.sdk_errors_key(session_id)),
   }
 
@@ -430,43 +389,17 @@ async def sessions(limit: int = Query(50, ge=1, le=500)):
 
 
 @router.get(
-  "/api/v1/inspect/sessions/{session_id}/checks", operation_id="session_checks", response_model=SessionChecks, response_model_exclude_unset=True
-)
-async def session_checks(session_id: str):
-  """The session's checks: client liveness, SDK errors, and each model check at its worst across the session's models."""
-  session = await session_context(session_id)
-  per_model = {model: checks.run_checks(ctx) for model, ctx in session["models"].items()}
-  results = checks.session_checks(session)
-  return {"session_id": session_id, "live": session["live"], "verdict": checks.verdict(results), "checks": results, "models": per_model}
-
-
-@router.get(
   "/api/v1/inspect/sessions/{session_id}/summary", operation_id="session_summary", response_model=SessionSummary, response_model_exclude_unset=True
 )
 async def session_summary(session_id: str):
-  """The session in one answer: liveness, its models' state and pace, and which checks fail, warn or are unknown."""
+  """The session's record, whether its registry key is live, its SDK errors, and each of its models in one line."""
   session = await session_context(session_id)
-  results = checks.session_checks(session)
-  models = []
-  for model_id, ctx in session["models"].items():
-    steps_ = checks.optim_steps(ctx)
-    gaps = [b["at"] - a["at"] for a, b in zip(steps_, steps_[1:])]
-    verdicts = checks.run_checks(ctx)
-    failing, warning = ([r["check"] for r in verdicts if r["verdict"] == v] for v in (checks.FAIL, checks.WARN))
-    median = statistics.median(gaps) if gaps else None
-    model = {"model_id": model_id, "state": ctx["run"].get("lifecycle"), "verdict": checks.verdict(verdicts), "steps": len(steps_)}
-    models.append({**model, "median_step_s": median, "failing": failing, "warning": warning})
-  record = session["record"]
+  errors = session["errors"]
   return {
-    "session_id": session_id,
+    **session["record"],
     "live": session["live"],
-    "verdict": checks.verdict(results),
-    "created_at": record["created_at"],
-    "last_seen_at": record["last_seen_at"],
-    "models": models,
-    "failing": [r["check"] for r in results if r["verdict"] == checks.FAIL],
-    "warning": [r["check"] for r in results if r["verdict"] == checks.WARN],
-    "unknown": [r["check"] for r in results if r["verdict"] == checks.UNKNOWN],
+    **({"sdk_errors": {"count": len(errors), "last": errors[-1].get("message")}} if errors else {}),
+    "models": [{"model_id": model_id, **facts.line(ctx)} for model_id, ctx in session["models"].items()],
   }
 
 

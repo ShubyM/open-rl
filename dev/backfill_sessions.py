@@ -1,7 +1,7 @@
 """Write session records for sessions from before the API server recorded them, so older runs keep their sessions.
 
 A session's models are those whose metadata names it. It started when the first of them was created and was last heard
-from at their last recorded op. Records are marked derived: the client's heartbeats were never stored, so checks do not
+from at their last recorded op. Records are marked derived: the client's heartbeats were never stored, so readers do not
 read a stale last_seen_at as a client that stopped. Records already in the store are kept, so a rerun adds nothing.
 
   OPEN_RL_OPS_TTL_DAYS=0 PYTHONPATH=src REDIS_URL=redis://HOST:PORT/0 python dev/backfill_sessions.py
