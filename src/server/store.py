@@ -145,6 +145,10 @@ class InMemoryStore(RequestStore):
       return self.futures_store[req_id]
 
 
+def request_queue(model_id: str) -> str:
+  return f"open_rl:queue:{model_id}"
+
+
 class RedisStore(RequestStore):
   def __init__(self, client: redis.Redis):
     self.redis = client
@@ -154,7 +158,7 @@ class RedisStore(RequestStore):
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
-    queue_key = f"open_rl:queue:{model_id}"
+    queue_key = request_queue(model_id)
 
     active_set = f"open_rl:active_tenants_set:{active_set_id}" if active_set_id else self.active_set
     active_list = f"open_rl:active_tenants:{active_set_id}" if active_set_id else self.active_list
@@ -185,7 +189,7 @@ class RedisStore(RequestStore):
       else:
         model_id = model_id_bytes.decode() if isinstance(model_id_bytes, bytes) else str(model_id_bytes)
 
-      queue_key = f"open_rl:queue:{model_id}"
+      queue_key = request_queue(model_id)
       # Snapshot the depth before draining: requests this tenant enqueues while
       # we drain belong to its next turn, otherwise a producer that outruns the
       # consumer keeps the drain loop alive and never yields the head slot.
@@ -210,7 +214,7 @@ class RedisStore(RequestStore):
         return batch
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    queue_key = f"open_rl:queue:{model_id}"
+    queue_key = request_queue(model_id)
     try:
       result = await self.redis.blpop(queue_key, timeout=5)
     except RedisTimeoutError:
@@ -322,12 +326,43 @@ class StateStore(ABC):
   async def set_members(self, key: str) -> set[str]:
     pass
 
+  @abstractmethod
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    """Every live value whose key starts with prefix."""
+    pass
+
+  @abstractmethod
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float | None) -> None:
+    """Append to a list that keeps the newest `limit` samples and expires ttl_seconds after the last append, or never."""
+    pass
+
+  @abstractmethod
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
+    """The samples in order, or only the newest `last`."""
+    pass
+
+  @abstractmethod
+  async def replace_samples(self, key: str, samples: list[dict[str, Any]], ttl_seconds: float | None) -> None:
+    """Replace a list's samples in one step; it expires ttl_seconds later, or never."""
+    pass
+
+  @abstractmethod
+  async def list_length(self, key: str) -> int | None:
+    """Items in a list, such as a request queue; None where this store holds no queues."""
+    pass
+
+  @abstractmethod
+  async def increment(self, key: str, ttl_seconds: float | None) -> int:
+    """Atomically count up from zero; the counter expires ttl_seconds after the last increment, or never."""
+    pass
+
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
     self.kv_store: dict[str, str] = {}
     self.expiries: dict[str, float] = {}
     self.sets: dict[str, set[str]] = {}
+    self.samples: dict[str, list[str]] = {}
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
@@ -349,6 +384,7 @@ class InMemoryStateStore(StateStore):
       self.kv_store.pop(k, None)
       self.expiries.pop(k, None)
       self.sets.pop(k, None)
+      self.samples.pop(k, None)
 
   async def add_to_set(self, key: str, member: str) -> None:
     self.sets.setdefault(key, set()).add(member)
@@ -358,6 +394,28 @@ class InMemoryStateStore(StateStore):
 
   async def set_members(self, key: str) -> set[str]:
     return set(self.sets.get(key, set()))
+
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    return {key: value for key in list(self.kv_store) if key.startswith(prefix) and (value := self.get_value_sync(key)) is not None}
+
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float | None) -> None:
+    samples = self.samples.setdefault(key, [])
+    samples.append(json.dumps(sample, allow_nan=False))
+    del samples[:-limit]
+
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
+    return [json.loads(sample) for sample in self.samples.get(key, [])[-(last or 0) :]]
+
+  async def replace_samples(self, key: str, samples: list[dict[str, Any]], ttl_seconds: float | None) -> None:
+    self.samples[key] = [json.dumps(sample, allow_nan=False) for sample in samples]
+
+  async def list_length(self, key: str) -> int | None:
+    return None  # the in-memory queues live in InMemoryStore
+
+  async def increment(self, key: str, ttl_seconds: float | None) -> int:
+    value = int(self.get_value_sync(key) or 0) + 1
+    await self.set_value(key, str(value), ttl_seconds)
+    return value
 
 
 class RedisStateStore(StateStore):
@@ -386,6 +444,47 @@ class RedisStateStore(StateStore):
 
   async def set_members(self, key: str) -> set[str]:
     return set(await self.redis.smembers(key))
+
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    keys = [key async for key in self.redis.scan_iter(match=prefix + "*", count=1000)]
+    return {key: value for key, value in zip(keys, await self.redis.mget(keys)) if value is not None} if keys else {}
+
+  async def append_sample(self, key: str, sample: dict[str, Any], limit: int, ttl_seconds: float | None) -> None:
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.rpush(key, json.dumps(sample, allow_nan=False))
+      pipeline.ltrim(key, -limit, -1)
+      if ttl_seconds:
+        pipeline.expire(key, int(ttl_seconds))
+      else:
+        pipeline.persist(key)
+      await pipeline.execute()
+
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
+    raw = await self.redis.lrange(key, -(last or 0), -1)
+    # Decoded off the event loop: a dashboard read can be thousands of samples.
+    return await asyncio.to_thread(lambda: [json.loads(sample) for sample in raw])
+
+  async def replace_samples(self, key: str, samples: list[dict[str, Any]], ttl_seconds: float | None) -> None:
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.delete(key)
+      if samples:
+        pipeline.rpush(key, *(json.dumps(sample, allow_nan=False) for sample in samples))
+        if ttl_seconds:
+          pipeline.expire(key, int(ttl_seconds))
+      await pipeline.execute()
+
+  async def list_length(self, key: str) -> int | None:
+    return await self.redis.llen(key)
+
+  async def increment(self, key: str, ttl_seconds: float | None) -> int:
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.incr(key)
+      if ttl_seconds:
+        pipeline.expire(key, int(ttl_seconds))
+      else:
+        pipeline.persist(key)
+      value, _ = await pipeline.execute()
+    return value
 
 
 @cache

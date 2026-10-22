@@ -21,6 +21,7 @@ from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_fr
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.model_metadata import get_model_metadata
 from server.store import RequestStore, StateStore, get_state_store, get_store
+from server.telemetry import answered, gpu_turn, observe_operation, popped, serving, set_phase
 from training import commands
 from training.commands import parse_command
 from training.distributed import broadcast_object, is_distributed, is_primary, local_rank
@@ -123,6 +124,7 @@ class TrainingRequestsProcessor:
       if self.time_slicer is not None:
         await self.time_slicer.register(self.workload)
         self.snapshot_registered = True
+      set_phase("ready")
       while True:
         try:
           await self.announce_readiness()
@@ -202,6 +204,7 @@ class TrainingRequestsProcessor:
     # Only rank 0 writes to the store; the other ranks computed the same result.
     if request_id is not None and is_primary():
       await self.store.set_result(request_id, result)
+      answered(request_id)
 
   async def run_once(self) -> None:
     batch = await self.next_batch()
@@ -211,6 +214,7 @@ class TrainingRequestsProcessor:
 
     shutdown = any(req.get("op") == "shutdown_workers" for req in batch)
     work = [req for req in batch if req.get("op") != "shutdown_workers"]
+    popped(work)
     model_id = batch[0].get("model_id", "default")
 
     results: list[tuple[str | None, dict[str, Any]]] = []
@@ -265,7 +269,7 @@ class TrainingRequestsProcessor:
     save_reqs = [r for r in requests if r.get("op") in save_ops]
 
     if gpu_reqs:
-      async with self.time_slicer.acquire(self.workload):
+      async with gpu_turn(self.time_slicer, self.workload):
         await asyncio.to_thread(self.worker.wake_up)
         try:
           for request in gpu_reqs:
@@ -279,7 +283,7 @@ class TrainingRequestsProcessor:
       for request in save_reqs:
         results.append(await self.handle_request(request))
     else:
-      async with self.time_slicer.acquire(self.workload):
+      async with gpu_turn(self.time_slicer, self.workload):
         for request in save_reqs:
           results.append(await self.handle_request(request))
 
@@ -298,7 +302,10 @@ class TrainingRequestsProcessor:
       ctx = propagate.extract(command.trace_context) if command.trace_context else None
       token = otel_context.attach(ctx) if ctx else None
 
-      result = await self.dispatch_operation(command)
+      if is_primary():
+        result = await observe_operation(raw_request, "trainer", self.model_id, lambda: self.dispatch_operation(command))
+      else:
+        result = await self.dispatch_operation(command)
       return request_id, result
     except Exception as exc:
       traceback.print_exc()
@@ -464,6 +471,13 @@ async def main_async(args: argparse.Namespace) -> None:
   )
 
 
+async def serve_trainer(args: argparse.Namespace) -> None:
+  if not is_primary():
+    return await main_async(args)
+  async with serving("trainer", os.getenv("OPEN_RL_MODEL_ID") or args.model_id):
+    await main_async(args)
+
+
 def start_request_processing_loop() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--model-id", help="Model id whose per-model request queue this dedicated trainer worker drains.")
@@ -477,7 +491,7 @@ def start_request_processing_loop() -> None:
   cuda_devs = os.getenv("CUDA_VISIBLE_DEVICES", "ALL")
   print(f"-> Hardware : CUDA_VISIBLE_DEVICES={cuda_devs}")
 
-  asyncio.run(main_async(args))
+  asyncio.run(serve_trainer(args))
 
 
 if __name__ == "__main__":

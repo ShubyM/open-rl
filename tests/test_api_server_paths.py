@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -33,6 +34,10 @@ class ApiServerTest(unittest.TestCase):
 
 
 class GetInfoTest(ApiServerTest):
+  def test_default_gateway_does_not_expose_fleet_inspection(self) -> None:
+    self.assertEqual(self.client.get("/api/v1/inspect/inventory").status_code, 404)
+    self.assertFalse(any(path.startswith("/api/v1/inspect/") for path in self.client.get("/openapi.json").json()["paths"]))
+
   def test_get_info_uses_base_model_env(self) -> None:
     with patch.dict(os.environ, {"BASE_MODEL": "env-model"}, clear=True):
       info = self.post("get_info", {"model_id": "model-a"}).json()
@@ -80,6 +85,21 @@ class GetInfoTest(ApiServerTest):
     self.assertEqual(queued[0]["payload"]["base_model"], "my-model")
     meta = json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta["base_model"], "my-model")
+
+  def test_create_persists_only_bounded_display_labels(self) -> None:
+    # The registry uses the API's configured state; this test replaces it with
+    # the same isolated store as the request handlers.
+    with patch.object(api_server.session_registry, "state", api_server.state):
+      asyncio.run(api_server.session_registry.update_metadata("session", {"name": "session name", "recipe_name": "recipe", "private": "secret"}))
+      response = self.post(
+        "create_model",
+        {"base_model": "my-model", "session_id": "session", "user_metadata": {"name": "  run name  ", "git_rev": "x" * 2000, "private": "secret"}},
+      )
+    model_id = response.json()["request_id"]
+    metadata = json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    self.assertEqual((metadata["name"], metadata["recipe_name"]), ("run name", "recipe"))
+    self.assertEqual(len(metadata["git_rev"]), 1024)
+    self.assertNotIn("private", metadata)
 
 
 class ErrorShapeTest(ApiServerTest):
@@ -279,6 +299,15 @@ class ProtobufWireTest(unittest.TestCase):
     self.assertTrue(optim.headers["content-type"].startswith("application/json"))
     self.assertEqual(optim.json()["type"], "optim_step")
 
+  def test_a_nan_metric_reaches_the_client_as_json_it_can_parse(self) -> None:
+    # Workers now return the real value so telemetry can name it; the client keeps getting finite JSON.
+    asyncio.run(
+      api_server.store.set_result("optim-nan", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": float("nan"), "loss": float("-inf")}})
+    )
+    answer = self.client.post("/api/v1/retrieve_future", json={"request_id": "optim-nan"})
+    self.assertEqual(answer.status_code, 200, answer.text)
+    self.assertEqual(answer.json()["metrics"], {"grad_norm:mean": 0.0, "loss": -9999.0})
+
 
 class SampleSequenceIdsTest(ApiServerTest):
   """Tinker SDK >= 0.25 asserts that every asample promise carries one
@@ -434,6 +463,15 @@ class ExclusiveMetadataTest(ApiServerTest):
     model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
     self.assertTrue(self.metadata(model_id)["exclusive"])
 
+  def test_a_session_keeps_a_record_of_its_lifetime_and_models_after_its_live_key_expires(self) -> None:
+    session_id = self.post("create_session", {"user_metadata": {"recipe_name": "harvey", "api_key": "sk-private"}}).json()["session_id"]
+    model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
+    self.post("session_heartbeat", {"session_id": session_id})
+    record = json.loads(asyncio.run(api_server.state.get_value(api_server.telemetry.key("session_record", session_id))))
+    self.assertEqual((record["model_ids"], record["metadata"]["recipe_name"]), ([model_id], "harvey"))
+    self.assertGreaterEqual(record["last_seen_at"], record["created_at"])
+    self.assertNotIn("sk-private", json.dumps(record))
+
   def test_a_server_without_a_worker_manager_refuses_exclusive(self) -> None:
     with patch.object(api_server, "worker_manager", None):
       response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}})
@@ -569,6 +607,28 @@ class TrainerBackendTest(ApiServerTest):
       response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.sampler_replicas": "4"}})
     self.assertEqual(response.status_code, 400)
     self.assertIn("openrl.sampler_replicas above 1", response.json()["error"])
+
+
+class TelemetryTest(ApiServerTest):
+  def test_a_fatal_sdk_error_is_logged_and_kept_for_its_session_without_credentials(self) -> None:
+    session_id = self.post("create_session", {}).json()["session_id"]
+    data = {
+      "status_code": 401,
+      "detail": "invalid key",
+      "request_headers": {"authorization": "Bearer tml-secret"},
+      "response_headers": {"set-cookie": "s=tml-secret"},
+      "response_body": {"x-api-key": "tml-secret"},
+    }
+    event = {"event": "GENERIC_EVENT", "event_name": "APIFuture.result_async.api_status_error", "severity": "ERROR", "event_data": data}
+    with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+      self.post("telemetry", {"session_id": session_id, "events": [{**event, "timestamp": "2026-10-19T12:00:00+00:00"}]})
+
+    self.assertIn("invalid key", stdout.getvalue())
+    self.assertNotIn("tml-secret", stdout.getvalue())
+    [error] = asyncio.run(api_server.state.read_samples(api_server.telemetry.key("sdk_errors", session_id)))
+    self.assertEqual((error["reason"], error["at"]), ("SDK api_status_error", 1792411200.0))
+    self.assertIn("invalid key", error["message"])
+    self.assertNotIn("tml-secret", repr(error))
 
 
 if __name__ == "__main__":

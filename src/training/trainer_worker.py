@@ -199,7 +199,7 @@ class BaseTrainerWorker:
       completed_loss_fn_outputs.append(output)
 
     return {
-      "metrics": {"loss:mean": self.sanitize_float(mean_loss), "loss:sum": self.sanitize_float(total_loss)},
+      "metrics": {"loss:mean": float(mean_loss), "loss:sum": float(total_loss)},
       "loss_fn_outputs": completed_loss_fn_outputs,
       "loss_fn_output_type": "ArrayRecord",
     }

@@ -26,6 +26,7 @@ from vllm.sampling_params import RequestOutputKind
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, time_slicing_enabled, workload_from_env
 from accel_timeslicer.workload import SAMPLER_CLAIM, WorkloadRef, local_workload_name
 from server.store import RequestStore, StateStore, get_state_store, get_store
+from server.telemetry import gpu_turn, observe_operation, serving, set_phase
 from server.vllm_options import gpu_memory_utilization, sampler_batch_limits, split_stop, text_only_engine_kwargs
 
 tracer = trace.get_tracer("vllm.inference.worker")
@@ -215,7 +216,7 @@ async def holding_gpu(time_slicer: TimeSlicerClient | None, workload: WorkloadRe
   if time_slicer is None:
     yield
     return
-  async with time_slicer.acquire(workload):
+  async with gpu_turn(time_slicer, workload):
     if sampler is not None:
       await sampler.wake()
     try:
@@ -267,7 +268,7 @@ async def fail_requests(store: RequestStore, requests: list[dict[str, Any]], err
 async def process_request(sampler: Sampler, store: RequestStore, request: dict[str, Any]) -> None:
   with tracer.start_as_current_span("process_sampling_request", context=propagate.extract(request.get("trace_context", {}))):
     try:
-      result = await sampler.generate(request)
+      result = await observe_operation(request, "sampler", request.get("model_id"), lambda: sampler.generate(request))
       result["type"] = "sample"
     except Exception as exc:
       result = failed_response(f"vLLM Worker Error: {exc}")
@@ -295,6 +296,7 @@ async def serve(
     sampler = Sampler(make_engine())
     if time_slicer is not None:
       await sampler.sleep()  # give the memory back before releasing the slot
+  set_phase("ready")
   state = get_state_store()
   try:
     try:
@@ -368,10 +370,11 @@ async def run_sampling_worker(model_id: str) -> None:
       except NotImplementedError:
         break
     # An exclusive sampler is alone on its GPU, so it serves awake like a LoRA one.
-    if fft_enabled and time_slicing_enabled():
-      await serve_time_sliced(model_id, get_store(), make_engine)
-    else:
-      await serve(model_id, get_store(), make_engine)
+    async with serving("sampler", model_id):
+      if fft_enabled and time_slicing_enabled():
+        await serve_time_sliced(model_id, get_store(), make_engine)
+      else:
+        await serve(model_id, get_store(), make_engine)
   except asyncio.CancelledError:
     pass  # serve has completed cleanup before cancellation reaches here.
   finally:

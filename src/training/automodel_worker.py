@@ -486,7 +486,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     total_norm = self.clip_gradients(max_grad_norm if max_grad_norm > 0 else math.inf)
     state.optimizer.step()
     state.optimizer.zero_grad(set_to_none=True)
-    return {"metrics": {"grad_norm:mean": self.sanitize_float(total_norm)}}
+    return {"metrics": {"grad_norm:mean": float(total_norm)}}
 
   def new_optimizer(self, adam_params: dict[str, Any]) -> torch.optim.Optimizer:
     return torch.optim.AdamW(

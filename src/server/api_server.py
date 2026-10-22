@@ -3,13 +3,14 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
 import traceback
 import uuid
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -25,11 +26,12 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from server import openrl_status, proto_codec
+from server import openrl_status, proto_codec, telemetry
 from server.lora_snapshots import snapshot_name, snapshot_root
 from server.model_metadata import (
   TrainingModelMetadata,
   WeightSyncConfig,
+  display_metadata,
   get_model_metadata,
   persist_model_metadata,
 )
@@ -64,6 +66,8 @@ async def bind_session(session_id: str | None, model_id: str) -> None:
     if meta is not None and session_id not in meta.session_ids:
       meta.session_ids.append(session_id)
       await persist_model_metadata(state, model_id, meta)
+    with suppress(Exception):
+      await telemetry.note_session(state, session_id, model_id=model_id)
     # On the owner, for the reaper: workers stay while any attached session lives.
     if worker_manager is not None:
       await session_registry.attach(session_id, owner)
@@ -480,7 +484,8 @@ async def _extract_and_persist_model_metadata(
   lora_config = req.lora_config.model_dump()
 
   # The model's own user_metadata wins over what the session was opened with.
-  settings = resolve_settings(req.user_metadata or {}, await session_registry.user_metadata(req.session_id))
+  session_meta = await session_registry.user_metadata(req.session_id)
+  settings = resolve_settings(req.user_metadata or {}, session_meta)
   if checkpoint_kind is not None and settings.fine_tuning_type not in (None, checkpoint_kind):
     raise ValueError(f"{SETTINGS_PREFIX}fine_tuning_type={settings.fine_tuning_type} does not match the {checkpoint_kind} checkpoint")
   fine_tuning_type = settings.fine_tuning_type or checkpoint_kind or "lora"
@@ -523,6 +528,7 @@ async def _extract_and_persist_model_metadata(
     trainer_backend=settings.trainer_backend,
     trainer_gpus=settings.trainer_gpus,
     trainer_cp=settings.trainer_cp,
+    **display_metadata({**session_meta, **(req.user_metadata or {})}),
   )
   await persist_model_metadata(state, model_id, meta_obj)
 
@@ -558,6 +564,7 @@ async def enqueue(command: Command) -> str:
   # One line per training request so a request that never reaches a worker can
   # be traced end to end (the workers log the same id when they pop it).
   print(f"[API_SERVER] enqueued op={command.op} request_id={command.request_id} model_id={command.model_id} active_set={active_set_id}")
+  telemetry.count("enqueued", command.model_id)
   return command.request_id
 
 
@@ -596,6 +603,17 @@ def check_single_process_backend() -> None:
       "SAMPLING_BACKEND=vllm needs REDIS_URL: the API server launches the vLLM sampler as a separate worker. "
       "Set REDIS_URL (for example redis://127.0.0.1:6379/0), or unset SAMPLING_BACKEND to sample with torch in one process."
     )
+
+
+def finite_metrics(result: dict) -> dict:
+  """The SDK reads JSON, which has no NaN or infinity: send 0 and +/-9999 as workers once did. Telemetry already named the real value."""
+  metrics = result.get("metrics")
+  if not isinstance(metrics, dict) or all(not isinstance(v, float) or math.isfinite(v) for v in metrics.values()):
+    return result
+  finite = {
+    k: (0.0 if math.isnan(v) else math.copysign(9999.0, v)) if isinstance(v, float) and not math.isfinite(v) else v for k, v in metrics.items()
+  }
+  return {**result, "metrics": finite}
 
 
 def translate_future_result(result: dict) -> dict:
@@ -639,6 +657,10 @@ async def reap_dead_sessions():
   while True:
     await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
     # Nothing in a sweep may end the loop. A failed call is retried next sweep.
+    try:
+      await telemetry.record_placements(state, await asyncio.to_thread(worker_manager.workloads))
+    except Exception:
+      traceback.print_exc()
     try:
       owners = await session_registry.owners()
     except Exception:
@@ -862,6 +884,8 @@ async def create_session(req: CreateSessionRequest):
     raise HTTPException(status_code=400, detail=str(exc)) from exc
   session_id = f"sess-{uuid.uuid4().hex[:12]}"
   await session_registry.update_metadata(session_id, user_metadata)
+  with suppress(Exception):
+    await telemetry.note_session(state, session_id, created=True, metadata=user_metadata)
   return {"session_id": session_id, "type": "create_session"}
 
 
@@ -869,6 +893,8 @@ async def create_session(req: CreateSessionRequest):
 async def session_heartbeat(req: SessionHeartbeatRequest):
   if req.session_id:
     await session_registry.heartbeat(req.session_id)
+    with suppress(Exception):
+      await telemetry.note_session(state, req.session_id)
   return {"type": "session_heartbeat"}
 
 
@@ -991,6 +1017,7 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
     return JSONResponse(status_code=400, content=result)
   if isinstance(result, dict):
+    result = finite_metrics(result)
     if proto_codec.PROTO_CONTENT_TYPE in accept:
       encoded = proto_codec.encode_future_result(result)
       if encoded is not None:
@@ -1306,6 +1333,8 @@ async def asample(req: AsampleRequest):
     "weights_path": weights_path,
     "include_prompt_logprobs": req.prompt_logprobs,
     "model_id": queue_id,
+    # The queue may be a shared runtime's; the run is the model the client samples.
+    "logical_run_id": lookup_id,
     "trace_context": carrier,
   }
 
@@ -1342,6 +1371,14 @@ async def list_adapters():
 # *** Internal ***
 
 
+@app.post("/api/v1/runs/{run_id}/logs")
+async def run_logs(run_id: str, body: telemetry.LogRequest):
+  """Keep a client's own output with its run, beside the run's worker logs. run_id is the
+  model id the client trains."""
+  return await telemetry.ingest_logs(state, run_id, body)
+
+
 @app.post("/api/v1/telemetry")
-async def telemetry(_: dict):
+async def sdk_telemetry(body: dict):
+  await telemetry.ingest_sdk_events(state, body)
   return {"status": "accepted"}

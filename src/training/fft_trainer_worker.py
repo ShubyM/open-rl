@@ -431,10 +431,10 @@ class FFTTrainingWorker(BaseTrainerWorker):
 
     return {
       "metrics": {
-        "grad_norm:mean": self.sanitize_float(total_norm.item()),
-        "time/compute_delta_diff": self.sanitize_float(delta_compute_time),
-        "time/optimizer_step": self.sanitize_float(step_time),
-        "time/clip_grad_norm": self.sanitize_float(clip_time),
+        "grad_norm:mean": float(total_norm.item()),
+        "time/compute_delta_diff": float(delta_compute_time),
+        "time/optimizer_step": float(step_time),
+        "time/clip_grad_norm": float(clip_time),
       },
     }
 
