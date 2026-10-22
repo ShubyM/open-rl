@@ -18,6 +18,7 @@ from fastapi.routing import APIRoute
 from server import telemetry
 from server.dashboard import checks, inspection, metrics, queries, sources
 from server.dashboard.schema import (
+  Accelerators,
   Activity,
   Catalog,
   Checks,
@@ -215,6 +216,18 @@ async def query(
   return await queries.run(name, state, run_id, node_id, span, points)
 
 
+@router.get("/api/v1/inspect/accelerators", operation_id="accelerators", response_model=Accelerators, response_model_exclude_unset=True)
+async def accelerators(run_id: str | None = None, node_id: str | None = None, since: TimeBound = None, until: TimeBound = None):
+  """Every GPU in the fleet, or a node's, or those a run held in the window: node, model, holder, utilization now,
+  mean utilization over the window (the last hour by default) and memory used of total."""
+  if since is None and until is None:
+    since = datetime.fromtimestamp(time.time() - 3600, UTC).isoformat()
+  span = time_range(since, until)
+  await sources.discover()
+  state = await snapshot.current(get_state_store())
+  return await queries.accelerators(state, run_id, node_id, span)
+
+
 @router.get("/api/v1/inspect/runs/{run_id}/commands", operation_id="commands", response_model=Commands, response_model_exclude_unset=True)
 async def commands(
   run_id: str,
@@ -321,7 +334,8 @@ async def run_checks(run_id: str, only: Annotated[str | None, Query(description=
 
 @router.get("/api/v1/inspect/runs/{run_id}/summary", operation_id="summary", response_model=Summary, response_model_exclude_unset=True)
 async def run_summary(run_id: str):
-  """The run in one answer: state, steps, step time, last trainer metrics, GPU duty by role, and which checks fail or warn."""
+  """The run in one answer: state, steps, step time, goodput, what a live run waits on, last trainer metrics,
+  GPU duty by role over the run's span (per GPU over any window: /accelerators?run_id=), and which checks fail or warn."""
   ctx = await check_context(run_id)
   results = checks.run_checks(ctx)
   steps_ = checks.optim_steps(ctx)
@@ -349,6 +363,8 @@ async def run_summary(run_id: str):
     "step_seconds": {"median": statistics.median(gaps), "last": gaps[-1]} if gaps else None,
     "last_metrics": last,
     "gpu_busy": {role: round(sum(v) / len(v), 1) for role, v in busy.items()},
+    "gpu_busy_window": window,
+    "waiting": checks.waiting(ctx),
     "failing": [r["check"] for r in results if r["verdict"] == checks.FAIL],
     "warning": [r["check"] for r in results if r["verdict"] == checks.WARN],
     "unknown": [r["check"] for r in results if r["verdict"] == checks.UNKNOWN],

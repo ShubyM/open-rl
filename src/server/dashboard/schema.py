@@ -244,6 +244,37 @@ class QueryResult(Record):
   error: str | None = None
 
 
+class Holder(Record):
+  run_ids: list[str] = Field(default_factory=list)
+  role: str | None = None
+  pod: str | None = None
+  start: float | None = Field(None, description="When this placement began, Unix seconds")
+  end: float | None = Field(None, description="When it was released, or now")
+  ended: bool | None = None
+
+
+class Accelerator(Record):
+  """One GPU. util is the sample at the end of the window; busy is the mean utilization over the window, percent."""
+
+  uuid: str | None = None
+  node: str | None = None
+  slot: str | None = None
+  model: str | None = None
+  util: float | None = None
+  busy: float | None = None
+  memory_used_mib: float | None = None
+  memory_total_mib: float | None = None
+  holder: Holder | None = Field(None, description="The last placement on this GPU in the window; absent when none held it")
+
+
+class Accelerators(Record):
+  since: str
+  until: str
+  source: str | None = None
+  gpus: list[Accelerator] = Field(default_factory=list)
+  error: str | None = None
+
+
 class Commands(Record):
   """A run's command records, newest first: every trainer op and every sample attempt the API took."""
 
@@ -311,7 +342,11 @@ class Summary(Record):
   step_seconds: dict[str, float] | None = None
   goodput: dict[str, JsonValue] | None = Field(None, description="Share of the run the trainer spent training, with where the rest went, in seconds")
   last_metrics: dict[str, float] = Field(default_factory=dict, description="Latest trainer metrics, from the newest ops")
-  gpu_busy: dict[str, float] = Field(default_factory=dict, description="Mean GPU duty cycle by role over the run, percent")
+  gpu_busy: dict[str, float] = Field(default_factory=dict, description="Mean GPU duty cycle by role over gpu_busy_window, percent")
+  gpu_busy_window: dict[str, str | None] | None = Field(None, description="since and until of gpu_busy: the run's span of recorded ops")
+  waiting: dict[str, float | int | None] | None = Field(
+    None, description="For a live run: seconds since any op finished, trainer idle time, trainer requests in flight, samples queued in the pool"
+  )
   failing: list[str] = Field(default_factory=list)
   warning: list[str] = Field(default_factory=list)
   unknown: list[str] = Field(default_factory=list)

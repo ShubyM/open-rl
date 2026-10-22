@@ -343,6 +343,23 @@ def goodput(ctx: dict) -> dict | None:
   }
 
 
+def waiting(ctx: dict) -> dict | None:
+  """For a live run, what is in flight now and how long since anything finished: what a stuck run waits on."""
+  if ctx["finished"] or not ctx["samples"]:
+    return None
+  now, trainer = ctx["now"], trainer_ops(ctx)
+  held = [o for o in (ctx["run"].get("progress") or {}).get("outstanding") or [] if o.get("op") != "sample"]
+  pool = ctx.get("pool") or {}
+  return {
+    "since_last_op_s": round(now - max(s["at"] for s in ctx["samples"])),
+    "trainer_idle_s": round(now - trainer[-1]["at"]) if trainer else None,
+    "trainer_requests": sum(o.get("count", 0) for o in held),
+    "oldest_trainer_request_s": round(max(o.get("age_seconds", 0) for o in held)) if held else None,
+    "samples_queued": pool.get("waiting", 0),
+    "oldest_sample_queued_s": round(now - pool["oldest"]) if pool.get("oldest") else None,
+  }
+
+
 def covered(records: list[dict], low: float, high: float) -> float:
   """Seconds of [low, high] during which at least one of the records was in flight."""
   return sum(b - a for a, b in inspection.merge([(max(r["started_at"], low), min(r["at"], high)) for r in records if r["at"] > low and r["started_at"] < high]))
