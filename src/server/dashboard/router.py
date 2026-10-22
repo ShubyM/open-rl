@@ -257,8 +257,11 @@ async def steps(
   records = await read_operations(run_id, is_finished(run))
   every = inspection.steps(records["samples"])
   found = every[-last:]
-  client = {row["step"]: row["metrics"] for row in (await stored_history(run_id))["rows"]}
   keep = tuple(p for p in (fields or "").split(",") if p)
+  client = {row["step"]: row["metrics"] for row in (await stored_history(run_id))["rows"]}
+  if run and every:
+    with suppress(Exception):  # client metrics are optional; steps stand without them
+      client |= await queries.client_steps(run, every[0]["started_at"] - 300, (run.get("completed_at") or time.time()) + 300, keep)
   for step in found:
     step["client"] = {k: v for k, v in client.get(step["step"], {}).items() if not keep or k.startswith(keep)}
   return {"run_id": run_id, "total": len(every), "steps": found, **({"error": records["error"]} if records.get("error") else {})}

@@ -5,6 +5,8 @@ A template names its subject with {gpus} (a run's or node's GPU UUIDs) or {pods}
 """
 
 import asyncio
+import json
+import re
 
 from server.dashboard import inspection
 from server.dashboard.metrics import hardware
@@ -90,3 +92,20 @@ async def accelerators(state: dict, run_id: str | None, node_id: str | None, spa
     })
   result["gpus"].sort(key=lambda g: (g["node"] or "", int(g["slot"] or 0)))
   return {**result, "source": backend.name}
+
+
+async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, ...] = ()) -> dict[int, dict[str, float]]:
+  """The client's metrics by step, from the gauges its SDK exports through OpenTelemetry. A gauge holds the latest
+  value, so each step's values are the gauges at the first moment progress/batch read that step."""
+  backend, _ = hardware()
+  sessions = run.get("session_ids") or []
+  if backend is None or not sessions or high <= low:
+    return {}
+  wanted = "|".join(re.escape(p) + ".*" for p in ("progress/batch", *prefixes)) if prefixes else ".+"
+  where = f"session_id=~{any_of(sessions)},metric=~{json.dumps(wanted)}{backend.scope('cluster')}"
+  rows = await backend.range_rows(f"max by (metric) (openrl_client_metric{{{where}}})", low, high, points=1000)
+  series = {r["metric"].get("metric"): {float(t): float(v) for t, v in r.get("values", []) if v not in ("NaN", "+Inf", "-Inf")} for r in rows}
+  first_seen: dict[int, float] = {}
+  for at, batch in sorted((series.pop("progress/batch", None) or {}).items()):
+    first_seen.setdefault(int(batch), at)
+  return {step: {name: points[at] for name, points in series.items() if at in points} for step, at in first_seen.items()}
