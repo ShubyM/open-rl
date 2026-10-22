@@ -383,6 +383,8 @@ class SessionModel(Record):
   state: str | None = None
   steps: int
   median_step_s: float | None = None
+  failing: list[str] = Field(default_factory=list, description="This model's checks that fail")
+  warning: list[str] = Field(default_factory=list)
 
 
 class SessionSummary(Record):

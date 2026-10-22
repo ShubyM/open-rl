@@ -44,15 +44,13 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app #run-search { flex: 1 1 280px; max-width: 420px; }
 #app .run-filters { display: flex; flex-wrap: wrap; gap: 6px; }
 #app .run-filter-count { margin-left: 4px; color: var(--dim); font-variant-numeric: tabular-nums; }
-#app :is(.job-list-head, .job-list-row).run-row { position: relative; grid-template-columns: minmax(0, 1fr) 128px 100px 112px 90px 80px; }
+#app :is(.job-list-head, .job-list-row).run-row { position: relative; grid-template-columns: minmax(0, 1fr) 128px 100px 112px 90px 80px 150px; }
 /* The run link covers its row. */
 #app .run-row .job-identity a::after { content: ""; position: absolute; inset: 0; }
 #app .run-row:hover .job-identity a { text-decoration: underline; text-underline-offset: 3px; }
+#app .run-row > .run-session, #app .job-list-head.run-row > :nth-child(7) { text-align: right; overflow: hidden; text-overflow: ellipsis; }
 /* Sessions group the run rows; a session's runs are indented under its header. */
-#app .session-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 16px 0 10px; border-top: 1px solid var(--line); font-size: 12px; }
-#app .session-id { font-weight: 600; font-size: 13px; }
-#app .session-model { color: var(--dim); font-variant-numeric: tabular-nums; }
-#app .session-group .job-list-row { padding-left: 18px; }
+#app .run-checks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 #app .check-badge { --check-tone: var(--dim); display: inline-block; padding: 1px 7px; border-radius: var(--radius); font-size: 11px; line-height: 18px; white-space: nowrap; color: var(--check-tone); background: color-mix(in srgb, var(--check-tone) 10%, var(--ground)); }
 #app .check-badge[data-verdict="ok"] { --check-tone: var(--status-success); }
 #app .check-badge[data-verdict="warn"] { --check-tone: var(--status-warning); }
@@ -295,7 +293,7 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .scheduler-table :is(th, td):not(:nth-child(3)) { white-space: nowrap; }
 /* Keep the identity readable before switching to compact rows. */
 @media (min-width: 761px) and (max-width: 1100px) {
-  #app :is(.job-list-head, .job-list-row).run-row { grid-template-columns: minmax(0, 1fr) 128px 68px 76px 76px 68px; gap: 12px; }
+  #app :is(.job-list-head, .job-list-row).run-row { grid-template-columns: minmax(0, 1fr) 128px 68px 76px 76px 68px 132px; gap: 12px; }
 }
 @media (max-width: 760px) {
   #app :is(.job-list-head, .job-list-row).run-row { grid-template-columns: minmax(0, 1fr) minmax(100px, auto); gap: 6px 12px; }
@@ -307,6 +305,7 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
   #app .job-list-row.run-row > :nth-child(4)::after { content: " steps"; }
   #app .job-list-row.run-row > :nth-child(5)::before { content: "Created "; }
   #app .job-list-row.run-row > :nth-child(6)::before { content: "Elapsed "; }
+  #app .job-list-row.run-row > .run-session { grid-column: 1 / -1; text-align: left; }
 }
 @media (max-width: 580px) {
   #app .time-control { width: 100%; }

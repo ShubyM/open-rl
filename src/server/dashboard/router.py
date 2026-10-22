@@ -459,7 +459,10 @@ async def session_summary(session_id: str):
     gaps = [b["at"] - a["at"] for a, b in zip(steps_, steps_[1:])]
     run = ctx["run"]
     state = run.get("display_status") if ctx["finished"] else (run.get("progress") or {}).get("state")
-    models.append({"model_id": model_id, "state": state, "steps": len(steps_), "median_step_s": statistics.median(gaps) if gaps else None})
+    verdicts = checks.run_checks(ctx)
+    failing, warning = ([r["check"] for r in verdicts if r["verdict"] == v] for v in (checks.FAIL, checks.WARN))
+    median = statistics.median(gaps) if gaps else None
+    models.append({"model_id": model_id, "state": state, "steps": len(steps_), "median_step_s": median, "failing": failing, "warning": warning})
   record = session["record"]
   return {
     "session_id": session_id,
