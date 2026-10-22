@@ -388,28 +388,11 @@ async def run_summary(run_id: str):
   }
 
 
-async def derived_session(session_id: str) -> dict:
-  """A session from before session records, rebuilt from the models whose metadata names it."""
-  models = {}
-  for key, value in (await get_state_store().scan_values(METADATA_PREFIX)).items():
-    meta = decode_model_metadata(value)
-    if meta and session_id in meta.session_ids:
-      models[key.removeprefix(METADATA_PREFIX)] = meta
-  if not models:
-    raise HTTPException(404, f"No session {session_id}")
-  last = []
-  for model_id in models:
-    with suppress(HTTPException):
-      last += [s["at"] for s in (await check_context(model_id))["samples"]]
-  created = min(meta.created_at for meta in models.values())
-  return {"session_id": session_id, "created_at": created, "last_seen_at": max(last, default=created), "model_ids": list(models), "derived": True}
-
-
 async def session_context(session_id: str) -> dict:
   store = get_state_store()
   record = json.loads(await store.get_value(telemetry.session_key(session_id)) or "null")
   if record is None:
-    record = await derived_session(session_id)
+    raise HTTPException(404, f"No session {session_id}")
   now = time.time()
   # A model's ops belong to this session while the session was alive.
   window = (record["created_at"], record["last_seen_at"] + checks.SESSION_LIVE_SECONDS)
@@ -419,12 +402,10 @@ async def session_context(session_id: str) -> dict:
       models[model_id] = await check_context(model_id, window)
       meta = decode_model_metadata(await store.get_value(METADATA_PREFIX + model_id))
       resumed[model_id] = bool(meta and meta.session_ids and meta.session_ids[-1] != session_id)
-  # The registry's live key is written by every gateway version; a record alone may be stale or derived.
-  live_key = await store.get_value(f"open_rl:session:{session_id}") is not None
   return {
     "record": record,
     "now": now,
-    "live": live_key or (not record.get("derived") and now - record["last_seen_at"] < checks.SESSION_LIVE_SECONDS),
+    "live": await store.get_value(f"open_rl:session:{session_id}") is not None,  # expires two minutes after the last heartbeat
     "models": models,
     "resumed": resumed,
     "errors": await store.read_samples(telemetry.sdk_errors_key(session_id)),
@@ -434,11 +415,12 @@ async def session_context(session_id: str) -> dict:
 @router.get("/api/v1/inspect/sessions", operation_id="sessions", response_model=Sessions, response_model_exclude_unset=True)
 async def sessions(limit: int = Query(50, ge=1, le=500)):
   """Client sessions, newest first: when each started and was last heard from, and the models it used."""
-  now, found = time.time(), []
-  for value in (await get_state_store().scan_values("open_rl:session_record:")).values():
+  store, found = get_state_store(), []
+  live_ids = {key.removeprefix("open_rl:session:") for key in await store.scan_values("open_rl:session:sess")}
+  for value in (await store.scan_values("open_rl:session_record:")).values():
     with suppress(ValueError, KeyError, TypeError):
       record = json.loads(value)
-      live = now - record["last_seen_at"] < checks.SESSION_LIVE_SECONDS
+      live = record["session_id"] in live_ids
       metadata = record.get("metadata") or {}
       found.append(
         {**{k: record[k] for k in ("session_id", "created_at", "last_seen_at", "model_ids")}, "live": live, "recipe": metadata.get("recipe_name")}
