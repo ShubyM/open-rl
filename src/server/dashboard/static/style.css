@@ -48,6 +48,18 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 /* The run link covers its row. */
 #app .run-row .job-identity a::after { content: ""; position: absolute; inset: 0; }
 #app .run-row:hover .job-identity a { text-decoration: underline; text-underline-offset: 3px; }
+/* Sessions group the run rows; a session's runs are indented under its header. */
+#app .session-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 16px 0 10px; border-top: 1px solid var(--line); font-size: 12px; }
+#app .session-id { font-weight: 600; font-size: 13px; }
+#app .session-model { color: var(--dim); font-variant-numeric: tabular-nums; }
+#app .session-group .job-list-row { padding-left: 18px; }
+#app .check-badge { --check-tone: var(--dim); display: inline-block; padding: 1px 7px; border-radius: var(--radius); font-size: 11px; line-height: 18px; white-space: nowrap; color: var(--check-tone); background: color-mix(in srgb, var(--check-tone) 10%, var(--ground)); }
+#app .check-badge[data-verdict="ok"] { --check-tone: var(--status-success); }
+#app .check-badge[data-verdict="warn"] { --check-tone: var(--status-warning); }
+#app .check-badge[data-verdict="fail"] { --check-tone: var(--status-error); }
+#app .run-table.check-table th:first-child { width: 80px; }
+#app .run-table.check-table th:nth-child(2) { width: 160px; }
+#app .run-table.check-table :is(th, td):last-child { text-align: left; }
 #app .state { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 #app :is(.state-dot, .health-dot) { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
 #app .state-running { color: var(--status-success); }

@@ -1,6 +1,7 @@
 <script>
   import Status from "./Status.svelte";
-  import { inspectUrl, now, viewLink } from "./state.svelte.js";
+  import SessionHead from "./SessionHead.svelte";
+  import { createQuery, inspectUrl, now, viewLink } from "./state.svelte.js";
   import { duration, elapsedTime, KINDS, runDescription, isFinished } from "./format.js";
 
   let { inventory, view = $bindable() } = $props();
@@ -19,6 +20,14 @@
       const text = [run.run_id, run.name, run.model, run.recipe_name, run.display_status, run.summary, KINDS[run.fine_tuning_type], ...run.nodes, ...run.pods.map((pod) => pod.name)].filter(Boolean).join(" ").toLowerCase();
       return (view.status === "all" || group(run) === view.status) && terms.every((term) => text.includes(term));
     }).sort((a, b) => Number(group(b) === "active") - Number(group(a) === "active"));
+  });
+  const recorded = createQuery(() => view.page === "overview" ? inspectUrl("sessions") : null, { poll: 10000 });
+  // A run sits under the newest session that attached it: the last one its metadata names, else the newest
+  // recorded session listing it (the API sorts them newest first). Groups follow the order of their first shown run.
+  const sessionOf = (run) => run.session_ids?.at(-1) ?? recorded.data?.sessions.find((s) => s.model_ids.includes(run.run_id))?.session_id ?? null;
+  const sessions = $derived.by(() => {
+    const groups = Map.groupBy(shown, sessionOf);
+    return [...groups].map(([id, runs]) => ({ id, runs })).sort((a, b) => (a.id === null) - (b.id === null));
   });
   function age(run) {
     const created = typeof run.created_at === "number" ? run.created_at : Date.parse(run.created_at) / 1000;
@@ -65,13 +74,18 @@
         <div class="job-list-head run-row">
           <span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Created</span><span>Elapsed</span>
         </div>
-        {#each shown as run (run.run_id)}
-          {@const label = runDescription(run, null)}
-          {@const model = (run.model || "Run").split("/").at(-1)}
-          <div class="job-list-row run-row" data-key={run.run_id}>
-            <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span></a>{#if label}<span class="muted micro">{label}</span>{/if}</span>
-            <span title={run.summary || undefined}><Status value={run.display_status || run.status} /></span><span>{KINDS[run.fine_tuning_type] || run.fine_tuning_type || "—"}</span><span>{run.steps ?? "—"}</span><span>{age(run)}</span><span>{group(run) === "unassigned" ? "—" : elapsedTime(run, inventory.observed_at)}</span>
-          </div>
+        {#each sessions as session (session.id)}
+          <section class="session-group" aria-label={session.id ? `Session ${session.id}` : "No session"}>
+            {#if session.id}<SessionHead id={session.id} {inventory} />{:else}<div class="session-head"><span class="session-id">No session</span><span class="muted">No client session is recorded for these runs</span></div>{/if}
+            {#each session.runs as run (run.run_id)}
+              {@const label = runDescription(run, null)}
+              {@const model = (run.model || "Run").split("/").at(-1)}
+              <div class="job-list-row run-row" data-key={run.run_id}>
+                <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span></a>{#if label}<span class="muted micro">{label}</span>{/if}</span>
+                <span title={run.summary || undefined}><Status value={run.display_status || run.status} /></span><span>{KINDS[run.fine_tuning_type] || run.fine_tuning_type || "—"}</span><span>{run.steps ?? "—"}</span><span>{age(run)}</span><span>{group(run) === "unassigned" ? "—" : elapsedTime(run, inventory.observed_at)}</span>
+              </div>
+            {/each}
+          </section>
         {/each}
       {/if}
     </div>
