@@ -474,22 +474,9 @@ async def stored_history(run_id: str) -> dict:
 
 
 async def run_of(run_id: str) -> tuple[dict, dict]:
-  store = get_state_store()
-  state = await snapshot.current(store)
-  run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
-  if run is None:
-    # A run created since the cached snapshot: read again rather than wait out the cache.
-    try:
-      created = await store.get_value(METADATA_PREFIX + run_id)
-    except Exception as exc:
-      raise HTTPException(503, "Run store unavailable") from exc
-    if not created:
-      raise HTTPException(404, "Run record not found")
-    snapshot.invalidate()
-    state = await snapshot.current(store)
-    run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
-    if run is None:
-      raise HTTPException(503, "Run store unavailable")
+  state = await snapshot.current(get_state_store())
+  if (run := next((r for r in state["runs"] if r["run_id"] == run_id), None)) is None:
+    raise HTTPException(404, "Run record not found")
   return state, run
 
 

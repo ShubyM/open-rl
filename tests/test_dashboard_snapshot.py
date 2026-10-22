@@ -276,9 +276,10 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.metadata.return_value = [{**row, "status": "completed"} for row in METADATA] + [{**METADATA[0], "model_id": "new-run"}]
     self.processes.return_value = [{"id": "new-process"}]
     await self.store.set_value("open_rl:model_meta:new-run", json.dumps(RECORDS["r1"]))
+    self.snapshot.invalidate()
     with patch.object(snapshot.time, "time", return_value=1001):
-      updated, run = await router.run_of("new-run")
-    self.assertEqual(run["run_id"], "new-run")
+      updated = await self.snapshot.current(self.store)
+    self.assertIn("new-run", [r["run_id"] for r in updated["runs"]])
     self.assertEqual({r["lifecycle"] for r in updated["runs"] if r["run_id"] != "new-run"}, {"ended"})
     self.assertEqual(updated["processes"], [{"id": "new-process"}])
     self.assertNotEqual(updated["observed_at"], first["observed_at"])
@@ -349,19 +350,6 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(len(result["runs"]), 3)
     self.metadata.assert_awaited_once()
     self.cluster.assert_called_once()
-
-  async def test_a_run_created_since_the_cached_snapshot_is_found(self) -> None:
-    await self.snapshot.current(self.store)
-    self.metadata.return_value = [*METADATA, {**METADATA[0], "model_id": "new-run"}]
-    await self.store.set_value("open_rl:model_meta:new-run", json.dumps(RECORDS["r1"]))
-    _, run = await router.run_of("new-run")
-    self.assertEqual(run["run_id"], "new-run")
-
-  async def test_a_store_outage_is_not_a_missing_run(self) -> None:
-    self.metadata.side_effect = TimeoutError()
-    with patch.object(self.store, "get_value", side_effect=TimeoutError), self.assertRaises(HTTPException) as error:
-      await router.run_of("missing")
-    self.assertEqual(error.exception.status_code, 503)
 
   async def test_a_missing_run_is_not_found(self) -> None:
     with self.assertRaises(HTTPException) as error:
