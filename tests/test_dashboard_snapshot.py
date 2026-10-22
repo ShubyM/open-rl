@@ -20,6 +20,7 @@ def worker(name: str, owner: str, model_id: str, state: str, node: str | None) -
 
 STATE = {
   "available": True,
+  "nodes": [],
   "pods": [
     {
       "name": "orw-lora-trainer",
@@ -81,7 +82,6 @@ STATE = {
       },
     ],
   },
-  "devices": {"claims": {"c1": ["gpu.nvidia.com/n1/gpu-0"]}},
 }
 # Stored model records, and the rows metadata_of makes of them.
 RECORDS = {
@@ -98,7 +98,6 @@ class SnapshotJoinTest(unittest.TestCase):
     for run_id in ("r1", "r3"):
       self.assertEqual((runs[run_id]["runtime_id"], runs[run_id]["shared_runtime"]), ("Qwen/Qwen3-8B", True))
       self.assertEqual([p["name"] for p in runs[run_id]["pods"]], ["orw-lora-trainer"])
-    self.assertEqual(runs["r1"]["pods"][0]["devices"], ["gpu.nvidia.com/n1/gpu-0"])
     self.assertEqual((runs["r2"]["runtime_id"], runs["r2"]["shared_runtime"]), ("r2", False))
     self.assertEqual([w["uid"] for w in runs["r2"]["workloads"]], ["w2"])
 
@@ -116,15 +115,6 @@ class SnapshotJoinTest(unittest.TestCase):
         run = snapshot.join_runs([row], state)[0]
         self.assertEqual((run["runtime_id"], run["shared_runtime"]), (model.runtime("r1"), model.shares_runtime()))
 
-  def test_only_placed_workloads_become_placements_and_carry_their_runs(self) -> None:
-    runs = snapshot.join_runs(METADATA, STATE)
-    placements = snapshot.placements_of(STATE, runs)
-    self.assertEqual(len(placements), 1)
-    self.assertEqual(placements[0]["id"], "w1")
-    self.assertEqual(sorted(placements[0]["run_ids"]), ["r1", "r3"])
-    self.assertEqual(placements[0]["label"], "Qwen/Qwen3-8B")
-    self.assertEqual(placements[0]["devices"], ["gpu.nvidia.com/n1/gpu-0"])
-
   def test_the_pool_dispatcher_pod_belongs_to_the_runs_it_samples_for(self) -> None:
     state = copy.deepcopy(STATE)
     pool = TrainingModelMetadata.model_validate(RECORDS["r1"]).pool("r1")
@@ -140,8 +130,6 @@ class SnapshotJoinTest(unittest.TestCase):
     done = {**METADATA[0], "model_id": "r0", "status": "completed", "created_at": 0}
     runs = {r["run_id"]: r for r in snapshot.join_runs([*METADATA, done], STATE)}
     self.assertEqual((runs["r0"]["pods"], runs["r0"]["workloads"]), ([], []))
-    placements = snapshot.placements_of(STATE, list(runs.values()))
-    self.assertEqual(sorted(placements[0]["run_ids"]), ["r1", "r3"])
 
 
 RUN = {"run_id": "r1", "runtime_id": "base", "pool": "sampler-base", "created_at": 1}
@@ -270,6 +258,7 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.metadata = self.enterContext(patch.object(snapshot, "metadata_of", AsyncMock(return_value=copy.deepcopy(METADATA))))
     self.cluster = self.enterContext(patch.object(snapshot.sources, "read_cluster", return_value=STATE))
     self.processes = self.enterContext(patch.object(snapshot, "processes_of", AsyncMock(return_value=[{"id": "past"}])))
+    self.gpus = self.enterContext(patch.object(snapshot.metrics, "node_gpus", AsyncMock(return_value=None)))
     self.enterContext(patch.object(router, "snapshot", self.snapshot))
     self.enterContext(patch.object(router, "get_state_store", return_value=self.store))
 
@@ -378,22 +367,33 @@ class SnapshotRecoveryTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(recovered["cluster"]["available"])
     self.assertEqual([pod["name"] for pod in run["pods"]], ["orw-lora-trainer"])
 
-  async def test_dra_failure_preserves_idle_gpu_devices_without_claims(self) -> None:
-    self.cluster.return_value = {**copy.deepcopy(STATE), "nodes": [{"name": "n1", "devices": [{"id": "gpu0"}]}]}
-    self.cluster.return_value["devices"] = {"available": True, "claims": {}}
+  async def test_inventory_placements_are_the_open_placement_records(self) -> None:
+    record = {"workload": "lora-qwen-0-trainer", "role": "trainer", "model_id": "Qwen/Qwen3-8B", "owner": "qwen-qwen3-8b", "pod": "orw-lora-trainer"}
+    record |= {"node": "n1", "gpu_uuids": ["GPU-1"], "placed_at": 5.0, "released_at": None}
+    for placement in ({**record, "placed_at": 1.0, "released_at": 4.0}, record):
+      await self.store.append_sample(snapshot.telemetry.placements_key("Qwen/Qwen3-8B"), placement, 10, None)
+    # The runtime is shared by r1 and r3, so its one open placement is a lane for each.
+    placements = (await self.snapshot.current(self.store))["placements"]
+    self.assertEqual(
+      [(p["run_ids"], p["allocation_id"], p["devices"], p["start"]) for p in placements],
+      [(["r1"], "lora-qwen-0-trainer@5", ["GPU-1"], 5.0), (["r3"], "lora-qwen-0-trainer@5", ["GPU-1"], 5.0)],
+    )
+
+  async def test_a_gpu_inventory_failure_keeps_each_nodes_last_gpus(self) -> None:
+    gpus = {"n1": [{"id": "GPU-1", "uuid": "GPU-1", "name": "gpu-0"}]}
+    self.cluster.return_value = {**copy.deepcopy(STATE), "nodes": [{"name": "n1", "gpu_capacity": 0, "devices": []}]}
+    self.gpus.return_value = gpus
     first = await self.snapshot.current(self.store)
-    self.cluster.return_value = copy.deepcopy(self.cluster.return_value)
-    self.cluster.return_value["devices"].update(available=False, error="DRA read failed")
-    self.cluster.return_value["nodes"][0]["devices"] = []
+    self.assertEqual((first["cluster"]["nodes"][0]["devices"], first["cluster"]["nodes"][0]["gpu_capacity"]), (gpus["n1"], 1))
+    self.gpus.side_effect = TimeoutError()
     self.snapshot.invalidate()
     stale = await self.snapshot.current(self.store)
-    self.assertEqual(stale["cluster"]["nodes"], first["cluster"]["nodes"])
-    self.assertGreater(stale["observed_at"], first["observed_at"])
+    self.assertEqual((stale["cluster"]["nodes"], stale["error"]), (first["cluster"]["nodes"], None))
     with patch.object(snapshot, "GRACE_SECONDS", 0):
       self.snapshot.invalidate()
       lasting = await self.snapshot.current(self.store)
     self.assertEqual(lasting["cluster"]["nodes"], first["cluster"]["nodes"])
-    self.assertIn("DRA read failed", lasting["error"])
+    self.assertIn("GPU inventory unavailable", lasting["error"])
 
   async def test_cancelled_request_does_not_restart_the_shared_source_read(self) -> None:
     entered, release = asyncio.Event(), asyncio.Event()

@@ -1,6 +1,6 @@
 """The one view of the cluster the pages and agents read: runs joined to their
-workers and their progress, current placements on GPUs, nodes with their
-devices, and the records worker processes keep about themselves."""
+workers and their progress, where each run's workers were placed, nodes with
+their GPUs, and the records worker processes keep about themselves."""
 
 import asyncio
 import json
@@ -10,7 +10,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from server import openrl_status, telemetry
-from server.dashboard import sources
+from server.dashboard import inspection, metrics, sources
 from server.model_metadata import decode_model_metadata
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
@@ -96,7 +96,6 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
   """LoRA workers serve a base-model runtime shared by every unfinished LoRA
   run on it; an FFT worker's modelID is the run itself."""
   workloads = state["scheduler"]["workloads"]
-  claims = state["devices"]["claims"]
   runs = []
   for row in metadata:
     run_id = row["model_id"]
@@ -113,7 +112,6 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
       if owned or dispatcher:
         pod = pod.copy()
         pod.update(role=owned[0].get("role") if owned else "dispatcher", shared_runtime=shared, runtime_id=runtime)
-        pod["devices"] = sorted({device for w in owned for device in claims.get(w.get("claim_name"), [])})
         pods.append(pod)
     runs.append(
       {
@@ -237,35 +235,9 @@ async def processes_of(store: StateStore, since: float) -> list[dict]:
   return [record for record in records if record.get("heartbeat_at", 0) >= since]
 
 
-def placements_of(state: dict, runs: list[dict]) -> list[dict]:
-  """Every placed workload as one allocation: who, where, on which devices."""
-  claims = state["devices"]["claims"]
-  pods = {pod["name"]: pod for pod in state["pods"]}
-  placements = []
-  for workload in state["scheduler"]["workloads"]:
-    if not workload.get("node_name"):
-      continue
-    associated = [r for r in runs if workload in r["workloads"]]
-    placements.append(
-      {
-        "id": workload.get("uid") or workload["name"],
-        "name": workload["name"],
-        "label": associated[0]["name"] if len(associated) == 1 else workload.get("model_id") or workload["name"],
-        "run_ids": [r["run_id"] for r in associated],
-        "runtime_id": workload.get("model_id"),
-        "shared_runtime": associated[0]["shared_runtime"] if associated else None,
-        "node": workload["node_name"],
-        "pod": workload.get("pod_name"),
-        "pod_uid": pods.get(workload.get("pod_name"), {}).get("uid"),
-        "created_at": pods.get(workload.get("pod_name"), {}).get("created_at") or workload.get("created_at"),
-        "role": workload.get("role"),
-        "owner_id": workload.get("owner_id"),
-        "phase": workload.get("phase"),
-        "device_count": workload.get("device_count", 0),
-        "devices": claims.get(workload.get("claim_name"), []),
-      }
-    )
-  return placements
+async def placement_records(store: StateStore, runtimes: set[str]) -> list[dict]:
+  lists = await asyncio.gather(*(store.read_samples(telemetry.placements_key(runtime)) for runtime in runtimes))
+  return [record for records in lists for record in records]
 
 
 class Snapshot:
@@ -292,16 +264,25 @@ class Snapshot:
 
   async def read(self, store: StateStore) -> dict:
     now = time.time()
-    cluster, metadata, processes = await asyncio.gather(
+    cluster, metadata, processes, gpus = await asyncio.gather(
       asyncio.to_thread(sources.read_cluster),
       asyncio.wait_for(metadata_of(store), timeout=5),
       asyncio.wait_for(processes_of(store, now - HISTORY_WINDOW_SECONDS), timeout=5),
+      asyncio.wait_for(metrics.node_gpus(), timeout=10),
       return_exceptions=True,
     )
     if isinstance(cluster, Exception):
       cluster = sources.cluster_unavailable(sources.namespace(), "Cluster inventory unavailable")
     # Each failed source falls back to its own last good section; the rest refreshes.
     cluster = self.merge(cluster, self.latest["cluster"] if self.latest else None)
+    known = {node["name"]: node["devices"] for node in self.latest["cluster"]["nodes"]} if self.latest else {}
+    if isinstance(gpus, Exception):
+      gpus, gpus_error = known, self.lasting("gpus", "GPU inventory unavailable", not known)
+    else:
+      gpus, gpus_error = gpus or {}, self.lasting("gpus", None)
+    nodes = [{**node, "devices": gpus.get(node["name"], [])} for node in cluster["nodes"]]
+    cluster["nodes"] = [{**node, "gpu_capacity": max(node["gpu_capacity"], len(node["devices"]))} for node in nodes]
+    cluster["devices"] = {"available": bool(gpus), "error": gpus_error}
     if isinstance(metadata, Exception):
       metadata, store_error = self.metadata or [], self.lasting("store", "Run store unavailable", self.metadata is None)
     else:
@@ -314,12 +295,17 @@ class Snapshot:
       processes_error = self.lasting("processes", "Worker process records unavailable", previous is None)
     else:
       self.processes_at, processes_error = now, self.lasting("processes", None)
-    errors = [store_error, processes_error]
+    runs = join_runs(metadata, cluster)
+    try:
+      records, records_error = await asyncio.wait_for(placement_records(store, {r["runtime_id"] for r in runs}), timeout=5), None
+    except Exception:
+      records, records_error = self.latest["placement_records"] if self.latest else [], "Placement records unavailable"
+    records_error = self.lasting("placements", records_error, not self.latest)
+    errors = [store_error, processes_error, records_error]
     # Kubernetes is optional locally. Section diagnostics remain visible, but
     # must not make the browser reject fresh run data when no cluster was read.
     if cluster["available"]:
-      errors.extend([cluster.get("error"), cluster.get("nodes_error"), cluster["scheduler"].get("error"), cluster["devices"].get("error")])
-    runs = join_runs(metadata, cluster)
+      errors.extend([cluster.get("error"), cluster.get("nodes_error"), cluster["scheduler"].get("error"), gpus_error])
     ctx = self.status_context(store, cluster)
 
     async def enrich(run):
@@ -334,16 +320,17 @@ class Snapshot:
         run["display_status"] = "Stalled"
 
     await asyncio.gather(*(enrich(run) for run in runs))
-    self.latest = {
+    state = {
       "observed_at": datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds"),
       "cluster": cluster,
       "runs": runs,
       "store_error": store_error,
-      "placements": placements_of(cluster, runs),
+      "placement_records": records,
       "processes": processes,
       "processes_error": processes_error,
       "error": "; ".join(dict.fromkeys(error for error in errors if error)) or None,
     }
+    self.latest = {**state, "placements": [lane for lane in inspection.lanes(state) if not lane["ended"]]}
     self.updated = time.monotonic()
     return self.latest
 
@@ -369,11 +356,6 @@ class Snapshot:
     if cluster["scheduler"].get("error") and previous["scheduler"].get("workloads"):
       merged["scheduler"] = previous["scheduler"]
     merged["scheduler"] = {**merged["scheduler"], "error": self.lasting("scheduler", cluster["scheduler"].get("error"))}
-    if cluster["devices"].get("error") and any(node.get("devices") for node in previous.get("nodes", [])):
-      known = {node["name"]: node.get("devices", []) for node in previous["nodes"]}
-      merged["nodes"] = [{**node, "devices": node.get("devices") or known.get(node["name"], [])} for node in merged["nodes"]]
-      merged["devices"] = {**previous["devices"], "error": cluster["devices"]["error"]}
-    merged["devices"] = {**merged["devices"], "error": self.lasting("devices", cluster["devices"].get("error"))}
     return merged
 
   def invalidate(self) -> None:

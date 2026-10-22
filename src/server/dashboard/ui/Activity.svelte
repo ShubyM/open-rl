@@ -14,12 +14,12 @@
   const href = (p) => acrossNodes ? inventory.cluster.nodes.some((n) => n.name === p.node) ? nodeLink(p.id, range) : null : inventory.runs.some((r) => r.run_id === p.run_ids?.[0]) ? viewLink(`run/${encodeURIComponent(p.run_ids[0])}/activity`, { duration: range.now - range.start, end: range.now, back }) : null;
   const blocks = (spans) => spans.map(([a, b]) => `M${1000 * (a - range.start) / (range.now - range.start)},0 H${1000 * (b - range.start) / (range.now - range.start)} V24 H${1000 * (a - range.start) / (range.now - range.start)} Z`).join(" ");
   const rowLabel = (p) => acrossNodes ? `${p.label} · ${processLabel(p, inventory.cluster.nodes)} · ${p.node}` : p.label;
-  // A lane names its GPUs by DRA device or by UUID, and its node may no longer be reported.
+  // A lane names its GPUs by UUID; a node no longer reported leaves DCGM's slot as the name.
   function gpuOf(p, id) {
-    const uuid = p.device_uuids?.[id], device = inventory.cluster.nodes.find((n) => n.name === p.node)?.devices.find((d) => d.id === id || (uuid && d.uuid === uuid));
-    return { id, uuid, label: device ? `GPU ${deviceLabel(device.name)}` : id.includes("/") ? `GPU ${deviceLabel(id)}` : slots?.[uuid || id] != null ? `GPU ${slots[uuid || id]}` : (uuid || id).slice(0, 12) };
+    const device = inventory.cluster.nodes.find((n) => n.name === p.node)?.devices.find((d) => d.id === id);
+    return { id, label: device ? `GPU ${deviceLabel(device.name)}` : slots?.[id] != null ? `GPU ${slots[id]}` : id.slice(0, 12) };
   }
-  const dutyText = (device) => { const value = device && (duty?.[device.uuid] ?? duty?.[device.id]); return Number.isFinite(value) ? `${value}%` : "—"; };
+  const dutyText = (device) => { const value = device && duty?.[device.id]; return Number.isFinite(value) ? `${value}%` : "—"; };
   $effect(() => { placements; range; navigating; tooltip = null; });
   function trackMove(event) {
     if (navigating || event.buttons) { tooltip = crosshair.at = null; return; }
@@ -56,7 +56,7 @@
           {#if first}<svelte:element this={link ? "a" : "span"} class={`activity-label ${placementColor(p)}`} data-key={`label:${p.id}`} href={link || undefined} aria-disabled={!link ? "true" : undefined} title={acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !link ? " · Node no longer reported" : ""}` : p.label}>
             <span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">{name}</span><span class="activity-meta">{meta}{p.ended ? " · Process ended" : p.phase && p.phase !== "ready" ? ` · ${p.phase.replace("_", " ")}` : ""}{!link ? acrossNodes ? p.node ? " · Node no longer reported" : "" : p.run_ids?.length ? " · Run record unavailable" : " · No linked run" : ""}</span></span>
           </svelte:element>{:else}<span></span>{/if}
-          {#if acrossNodes}<span class="activity-gpu" title={device ? device.uuid || device.id : "This process recorded no GPUs"}>{device?.label ?? "GPUs not recorded"}</span>{/if}
+          {#if acrossNodes}<span class="activity-gpu" title={device ? device.id : "This process recorded no GPUs"}>{device?.label ?? "GPUs not recorded"}</span>{/if}
           <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events (Pointer location follows the shared time axis. Incident links and the Logs tab reach the same logs by keyboard.) -->
           <div class="activity-track" onpointermove={trackMove} onclick={onpick && ((event) => onpick(Math.round(timeAt(event, range))))}>
             <svg viewBox="0 0 1000 24" preserveAspectRatio="none" role="img" aria-label="Recorded activity">

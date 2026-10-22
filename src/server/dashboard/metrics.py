@@ -1,7 +1,8 @@
-"""Physical GPU, worker and vLLM sampler series, independent of allocation lookup."""
+"""Physical GPU and worker series, and each node's GPUs as DCGM reports them."""
 
 import asyncio
 import os
+import time
 from datetime import datetime
 
 from server.dashboard import inspection, sources
@@ -20,29 +21,35 @@ def hardware() -> tuple[PromQL | None, str | None]:
   return None, "No GPU metrics source: not on GKE and OPEN_RL_PROMETHEUS_URL is unset"
 
 
-async def series(state: dict, node_id=None, since=None, until=None, run_id=None, kind="hardware", samples=()) -> dict:
-  """A node's devices and workers, idle GPUs included; or a run's. kind=devices is the GPUs alone. Sampler charts are named queries."""
+async def node_gpus() -> dict[str, list[dict]] | None:
+  """Each node's GPUs now, by UUID and DCGM slot; None without a metrics source. DCGM names the slot DRA does."""
+  await sources.discover()
+  backend, _ = hardware()
+  if backend is None:
+    return None
+  now = time.time()
+  found: dict[str, list[dict]] = {}
+  for row in await backend.range_rows(f'max by (Hostname, UUID, gpu) (DCGM_FI_DEV_GPU_UTIL{{UUID!=""{backend.scope("cluster")}}})', now, now):
+    labels = row["metric"]
+    found.setdefault(labels.get("Hostname"), []).append({"id": labels["UUID"], "uuid": labels["UUID"], "name": f"gpu-{labels.get('gpu')}"})
+  return {node: sorted(gpus, key=lambda d: (len(d["name"]), d["name"])) for node, gpus in found.items()}
+
+
+async def series(state: dict, node_id=None, since=None, until=None, run_id=None, kind="hardware") -> dict:
+  """A node's GPUs and workers, idle GPUs included; or a run's. kind=devices is the GPUs alone. Sampler charts are named queries."""
   start, end = sources.log_window(since, until)
   low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
-  placements = [p for p in inspection.sources(state, run_id=run_id, node_id=node_id, samples=samples) if p["start"] <= high and p["end"] >= low]
-  nodes = [n for n in state["cluster"]["nodes"] if not node_id or n.get("name") == node_id]
-  current = {d["id"]: d.get("uuid") for n in nodes for d in n["devices"]}
-  devices, workers = {}, {}
+  placements = [p for p in inspection.lanes(state, run_id=run_id, node_id=node_id) if p["start"] <= high and p["end"] >= low]
+  devices = {uuid: None for p in placements for uuid in p["devices"]}
+  if not run_id:
+    devices.update({d["uuid"]: None for n in state["cluster"]["nodes"] if not node_id or n.get("name") == node_id for d in n["devices"]})
+  workers = {}
   for placement in placements:
-    for identity in placement["devices"]:
-      uuid = (placement.get("device_uuids") or {}).get(identity) or (None if placement["ended"] else current.get(identity))
-      devices[identity, uuid] = None
-    identity, pod = placement.get("allocation_id") or placement["id"], placement.get("pod")
-    uid = placement.get("pod_uid")
-    if pod:
-      worker = workers.setdefault((identity, uid, pod), {"id": identity, "pod": pod, "pod_uid": uid, "first_seen": high, "last_seen": low})
+    if pod := placement.get("pod"):
+      identity = placement.get("allocation_id") or placement["id"]
+      worker = workers.setdefault(identity, {"id": identity, "pod": pod, "first_seen": high, "last_seen": low})
       worker["first_seen"] = min(worker["first_seen"], placement["start"])
       worker["last_seen"] = max(worker["last_seen"], placement["end"])
-  known = {identity for identity, _ in devices}
-  # The browser serializes snapshot timestamps to milliseconds.
-  live_window = high >= datetime.fromisoformat(state["observed_at"]).timestamp() - 0.001
-  if not run_id:
-    devices.update({(identity, uuid): None for identity, uuid in current.items() if live_window or identity not in known})
   backend, reason = hardware()
 
   async def query(method, rows, key, fields):
@@ -61,7 +68,7 @@ async def series(state: dict, node_id=None, since=None, until=None, run_id=None,
     return rows, errors, succeeded
 
   (gpu, gpu_errors, gpu_ok), (cpu, cpu_errors, cpu_ok) = await asyncio.gather(
-    query("devices", [{"id": identity, "uuid": uuid} for identity, uuid in devices], "uuid", ("utilization", "memory_mib")),
+    query("devices", [{"id": uuid, "uuid": uuid} for uuid in devices], "uuid", ("utilization", "memory_mib")),
     query("workers_series", list(workers.values()) if kind != "devices" else [], "pod", ("cpu_cores", "memory_bytes")),
   )
   error = next(iter([*gpu_errors.values(), *cpu_errors.values()]), None)

@@ -21,25 +21,23 @@ QUERIES = {
 }
 
 
-def subject(state: dict, run_id: str | None, node_id: str | None, samples: list, low: float, high: float) -> tuple[list[str], list[str]]:
-  """The GPUs and sampler pods a run held, or a node's GPUs, during the window."""
+def subject(state: dict, run_id: str | None, node_id: str | None, low: float, high: float) -> tuple[list[str], list[str]]:
+  """The GPUs and sampler pods a run's placements held during the window, or a node's GPUs."""
   if node_id and not run_id:
     node = next((n for n in state["cluster"]["nodes"] if n.get("name") == node_id), None)
-    return [d["uuid"] for d in (node or {}).get("devices", []) if d.get("uuid")], []
-  held = [p for p in inspection.sources(state, run_id=run_id, samples=samples) if p["start"] <= high and p["end"] >= low]
-  gpus = {uuid for p in held for uuid in (p.get("device_uuids") or {}).values() if uuid}
-  pods = {p["pod"] for p in held if p.get("role") == "sampler" and p.get("pod")}
-  return sorted(gpus), sorted(pods)
+    return [d["uuid"] for d in (node or {}).get("devices", [])], []
+  held = [p for p in inspection.lanes(state, run_id=run_id) if p["start"] <= high and p["end"] >= low]
+  return sorted({uuid for p in held for uuid in p["devices"]}), sorted({p["pod"] for p in held if p["role"] == "sampler" and p["pod"]})
 
 
-async def run(name: str, state: dict, run_id: str | None, node_id: str | None, samples: list, since, until, points: int) -> dict:
+async def run(name: str, state: dict, run_id: str | None, node_id: str | None, since, until, points: int) -> dict:
   start, end = log_window(since, until)
   low, high = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
   result = {"name": name, "since": start, "until": end, "series": []}
   backend, reason = hardware()
   if backend is None:
     return {**result, "error": reason}
-  gpus, pods = subject(state, run_id, node_id, samples, low, high)
+  gpus, pods = subject(state, run_id, node_id, low, high)
   template = QUERIES[name]
   if ("{gpus}" in template and not gpus) or ("{pods}" in template and not pods):
     return {**result, "error": "No GPUs or sampler pods recorded for this subject in this window"}

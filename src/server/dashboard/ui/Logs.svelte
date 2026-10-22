@@ -48,8 +48,8 @@
     pending = true;
     failedCursor = page;
     try {
-      // The signed cursor already pins the query window and pod lifetimes.
-      const { data: response } = await get(inspectUrl("logs", { ...query, ...(page ? { since: null, until: null, cursor: page } : {}) }), active.signal);
+      // Cloud Logging's page token is valid only with the same filters and window, which a paused view keeps.
+      const { data: response } = await get(inspectUrl("logs", { ...query, ...(page ? { cursor: page } : {}) }), active.signal);
       if (active.signal.aborted) return;
       if (response.error) throw new Error(response.error);
       fromBottom = page ? lines.scrollHeight - lines.clientHeight - lines.scrollTop : 0;

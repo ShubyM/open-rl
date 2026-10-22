@@ -116,7 +116,7 @@ async def inventory():
   """Current runs, placements, nodes and scheduler state, with an error field per unavailable source."""
   await sources.discover()
   state = await snapshot.current(get_state_store())
-  return {key: value for key, value in state.items() if key != "processes"}
+  return {key: value for key, value in state.items() if key not in ("processes", "placement_records")}
 
 
 def is_finished(run: dict | None) -> bool:
@@ -177,7 +177,7 @@ async def activity(since: TimeBound = None, until: TimeBound = None, run_id: str
   cached = finished_activity.get((run_id, node_id, start, end)) if finished else None
   if cached and cached[0] > time.monotonic():
     return {**cached[1], "run": run, "observed_at": state["observed_at"]}
-  selected = [p for p in inspection.segments(state, run_id, node_id) if p["start"] <= high and p["end"] >= low]
+  selected = [p for p in inspection.lanes(state, run_id, node_id) if p["start"] <= high and p["end"] >= low]
   # Each lane's runs, and its runtime for the worker-level ops recorded there.
   keys = sorted({k for p in selected for k in [*p["run_ids"], p.get("runtime_id")] if k} | ({run_id} if run_id else set()))
 
@@ -234,9 +234,7 @@ async def series(
   await sources.discover()
   state = await snapshot.current(get_state_store())
   start, end, _, _ = time_range(since, until or state["observed_at"])
-  run = next((r for r in state["runs"] if r["run_id"] == run_id), None) if run_id else None
-  records = await read_operations(run_id, is_finished(run)) if run_id else {"samples": []}
-  return await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id, kind=kind, samples=records["samples"])
+  return await metrics.series(state, node_id=node_id, since=start, until=end, run_id=run_id, kind=kind)
 
 
 @router.get("/api/v1/inspect/query", operation_id="query", response_model=QueryResult, response_model_exclude_unset=True)
@@ -257,9 +255,7 @@ async def query(
   validate_bounds(since, until)
   await sources.discover()
   state = await snapshot.current(get_state_store())
-  run = next((r for r in state["runs"] if r["run_id"] == run_id), None) if run_id else None
-  records = await read_operations(run_id, is_finished(run)) if run_id else {"samples": []}
-  return await queries.run(name, state, run_id, node_id, records["samples"], since, until or state["observed_at"], points)
+  return await queries.run(name, state, run_id, node_id, since, until or state["observed_at"], points)
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/commands", operation_id="commands", response_model=Commands, response_model_exclude_unset=True)
@@ -373,8 +369,8 @@ async def run_summary(run_id: str):
   if ops:
     end = min(ctx["now"], ops[-1] + 60)
     window = {k: datetime.fromtimestamp(t, UTC).isoformat() for k, t in (("since", max(ops[0] - 60, end - 7 * 86400)), ("until", end))}
-  duty = await queries.run("gpu_busy", state, run_id, None, ctx["samples"], window["since"], window["until"], 1)
-  roles = {u: p.get("role") for p in inspection.sources(state, run_id=run_id, samples=ctx["samples"]) for u in (p.get("device_uuids") or {}).values()}
+  duty = await queries.run("gpu_busy", state, run_id, None, window["since"], window["until"], 1)
+  roles = {uuid: p["role"] for p in inspection.lanes(state, run_id=run_id) for uuid in p["devices"]}
   busy: dict[str, list[float]] = {}
   for series_ in duty.get("series", []):
     if series_["points"]:
@@ -538,41 +534,20 @@ async def run_logs(
   run_id: str,
   q: str = Query("", max_length=1024),
   pod: str | None = None,
-  node: str | None = None,
   severity: str | None = Query(None, pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL|UNKNOWN)$"),
   since: TimeBound = None,
   until: TimeBound = None,
   limit: int = Query(200, ge=1, le=1000),
-  cursor: str | None = Query(None, max_length=sources.MAX_CURSOR),
+  cursor: Annotated[str | None, Query(max_length=sources.MAX_CURSOR, description="next_cursor of a page with the same filters and window")] = None,
 ):
-  """Cloud Logging for every pod the run has owned, live or gone."""
+  """Cloud Logging for the run: its worker pods by owner label, its sampling pool's pods, and its client."""
   validate_bounds(since, until)
   await sources.discover()
-  lifetimes, shared_runtime = [], False
-  if not cursor:
-    state, run = await run_of(run_id)
-    records = await read_operations(run_id, is_finished(run))
-    since, until, _, _ = time_range(since, until or state["observed_at"])
-    lifetimes = sources.pod_sources(run, inspection.sources(state, run_id, samples=records["samples"]), state["observed_at"])
-    shared_runtime = run["shared_runtime"]
-    # Without its records a run's logs still cover the pods it is known to have had.
-    note = f"{records['error']}; logs of pods known only from those records are not shown" if records.get("error") else None
-  else:
-    note = None
+  state, run = await run_of(run_id)
+  since, until, _, _ = time_range(since, until or state["observed_at"])
+  pods = {lane["pod"]: {"pod": lane["pod"], "node": lane["node"], "role": lane["role"]} for lane in inspection.lanes(state, run_id) if lane["pod"]}
   try:
-    result = await sources.run_logs(
-      run_id,
-      lifetimes,
-      since=since,
-      until=until,
-      cursor=cursor,
-      limit=limit,
-      q=q,
-      pod=pod,
-      node=node,
-      severity=severity,
-      shared_runtime=shared_runtime,
-    )
+    result = await sources.run_logs(run, list(pods.values()), since=since, until=until, cursor=cursor, limit=limit, q=q, pod=pod, severity=severity)
   except ValueError as exc:
     raise HTTPException(400, str(exc)) from exc
   if not sources.configuration()["configured"] and pod in (None, sources.CLIENT) and not cursor:
@@ -583,8 +558,6 @@ async def run_logs(
       client = []
     if client:
       result.update(records=client, available=True, error=None, note="Cloud Logging is not configured; showing the run's recent client output")
-  if note and not result.get("note"):
-    result["note"] = note
   return result
 
 

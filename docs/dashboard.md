@@ -30,10 +30,10 @@ Pages show their last response while they refresh. A failed source keeps its las
 
 | Route under `/api/v1/inspect` | Returns |
 |---|---|
-| `GET /inventory` | Runs with status, progress, workers, pods, and scheduler workloads; nodes, devices, and placements; an error per unavailable source |
-| `GET /activity` | One lane per worker process with its GPU turns and completed ops. With `run_id`, also the run, its incidents, and chart samples: every trainer op and the slowest sampler request per 1/1000 of the window |
+| `GET /inventory` | Runs with status, progress, workers, pods, and scheduler workloads; nodes with their GPUs, and current placements; an error per unavailable source |
+| `GET /activity` | One lane per placement with its worker's GPU turns and completed ops. With `run_id`, also the run, its incidents, and chart samples: every trainer op and the slowest sampler request per 1/1000 of the window |
 | `GET /series` | GPU utilization and memory per device UUID, worker CPU and memory, for a `node_id` or `run_id`; with `run_id`, the run's vLLM sampler series. `kind=devices` without a node or run returns every node's GPUs |
-| `GET /logs` | Worker and forwarded client logs from Cloud Logging, with filters and cursor paging; the client-log tail when Cloud Logging is unconfigured |
+| `GET /logs` | Worker, sampling-pool and forwarded client logs from Cloud Logging, with filters and Cloud Logging's page token as the cursor; the client-log tail when Cloud Logging is unconfigured |
 | `GET /pods/{pod}/logs` | Current or previous container output from the kubelet |
 | `GET /sessions` | Client sessions, newest first: start, last heartbeat, whether live, and the models each used |
 | `GET /sessions/{id}/checks` | `client-liveness` and `sdk-errors`, then each model check at its worst across the session's models |
@@ -46,7 +46,7 @@ Pages show their last response while they refresh. A failed source keeps its las
 
 `activity`, `series`, and `logs` take ISO `since` and `until` bounds of up to seven days. An omitted end uses inventory's `observed_at`, and an omitted start the 30 minutes before it. Missing op records do not prove that no requests arrived or that workers were idle. Invalid records are skipped and reported in `partial`; `error` means a source could not be read.
 
-Requests have a 12-second budget, below the browser's 15-second timeout. Identical concurrent Prometheus queries share one fetch. Log cursors keep the original bounds, pod lifetimes, and query for 15 minutes; set the same `OPEN_RL_LOG_CURSOR_SECRET` on every replica to keep cursors valid across replicas and restarts.
+Requests have a 12-second budget, below the browser's 15-second timeout. Identical concurrent Prometheus queries share one fetch. A log cursor is valid only with the same filters, `since` and `until` as the page that returned it.
 
 ## Checks
 
@@ -80,9 +80,11 @@ Each active run has a `progress` verdict, judged by what completes:
 | Runs and sessions | API-server metadata in Redis |
 | Worker processes | Each trainer and dispatcher rewrites a record every 5 seconds: pod, node, GPU UUIDs, phase, unanswered requests, and recent GPU turns. A record unchanged for 30 seconds belongs to a gone process. Samplers are plain `vllm serve` and keep none |
 | Ops and step counts | Recorded by workers, newest `OPEN_RL_OPS_SAMPLE_LIMIT` (2,000) per run. The dispatcher records each sample on the replica that answered |
-| Nodes, pods, devices, scheduler | Kubernetes API, cached for 5 seconds |
+| Placements | The API server lists the scheduler's Workloads every 30 seconds and keeps one record per placement in `open_rl:placements:<model_id>`: pod, node, GPU UUIDs, placed and released times. Runs from before these records need `dev/backfill_placements.py` once |
+| Nodes, pods, events, scheduler | Kubernetes API, cached for 5 seconds |
+| Each node's GPUs | DCGM's UUID and slot labels, from the metrics source below |
 | GPU, worker, and sampler series | DCGM, container, and vLLM metrics from `OPEN_RL_PROMETHEUS_URL`, or Cloud Monitoring's PromQL API on GKE |
-| Run logs | Cloud Logging, scoped to the run's pods and their lifetimes; a stderr line takes the level it prints |
+| Run logs | Cloud Logging: the worker pods with the run's `timeslice.io/owner` label, its sampling pool's pods, and its forwarded client lines; a stderr line takes the level it prints |
 
 Records expire `OPEN_RL_OPS_TTL_DAYS` (default 7) after their last write; `0` keeps them. Logs come from the project's default buckets, usually kept 30 days; to keep them longer, route the namespace's logs to a bucket and set `OPEN_RL_LOG_VIEWS` to its view, which needs `roles/logging.viewAccessor`. Kubernetes queries use `OPEN_RL_WORKER_NAMESPACE`, then `POD_NAMESPACE`, then `openrl-system`. On GKE, the metadata server supplies project, cluster, and location; override them with `OPEN_RL_GKE_PROJECT`, `OPEN_RL_GKE_CLUSTER`, and `OPEN_RL_GKE_LOCATION`, or set `OPEN_RL_GKE_TELEMETRY=false`.
 

@@ -30,7 +30,6 @@ class Workload(Record):
   requested_memory: str | None = None
   node_name: str | None = None
   pod_name: str | None = None
-  claim_name: str | None = None
   worker: Worker | None = None
 
 
@@ -106,7 +105,6 @@ class Source(Record):
 class Scheduler(Source):
   installed: bool | None = None
   workloads: list[Workload] = Field(default_factory=list)
-  ledgers: list[dict[str, JsonValue]] = Field(default_factory=list)
 
 
 class Device(Record):
@@ -126,7 +124,7 @@ class Cluster(Source):
   nodes_error: str | None = None
   events_error: str | None = None
   scheduler: Scheduler
-  devices: Source | None = None
+  devices: Source | None = Field(None, description="Each node's GPUs, from DCGM")
 
 
 class Placement(Record):
@@ -135,13 +133,11 @@ class Placement(Record):
   label: str
   run_ids: list[str]
   node: str
-  devices: list[str]
+  devices: list[str] = Field(description="GPU UUIDs, as DCGM labels its series")
   runtime_id: str | None = None
   role: str | None = None
   pod: str | None = None
-  pod_uid: str | None = None
   shared_runtime: bool | None = None
-  device_uuids: dict[str, str] = Field(default_factory=dict)
 
 
 class Inventory(Record):
@@ -157,9 +153,9 @@ class Inventory(Record):
 
 
 class PlacementActivity(Placement):
-  start: float = Field(description="Process start, or workload creation before the process reports; Unix seconds")
-  end: float = Field(description="The process's last heartbeat, or the snapshot time while it runs; Unix seconds")
-  ended: bool = Field(description="The process exited or stopped reporting")
+  start: float = Field(description="When the scheduler placed the workload; Unix seconds")
+  end: float = Field(description="When it released the placement, or the snapshot time while held; Unix seconds")
+  ended: bool = Field(description="The placement was released")
   intervals: list[tuple[float, float]]
   ops: dict[str, list[tuple[float, float]]]
   exact: bool = Field(
@@ -263,7 +259,7 @@ class LogRecord(Record):
 class Logs(Source):
   run_id: str
   records: list[LogRecord]
-  next_cursor: str | None = Field(description="Pass back as cursor with the same filters for older records")
+  next_cursor: str | None = Field(description="Cloud Logging's page token; pass back as cursor with the same filters and window")
   shared_runtime: bool
   since: str | None = None
   until: str | None = None

@@ -1,8 +1,6 @@
-"""Joins of worker records, placements, ops and pod events behind the activity view."""
+"""Joins of placement records, worker records, ops and pod events behind the activity view."""
 
 from datetime import datetime
-
-from server.telemetry import alive
 
 
 def incidents(run: dict, start: float, end: float) -> list[dict]:
@@ -49,89 +47,43 @@ def incidents(run: dict, start: float, end: float) -> list[dict]:
   return list(unique.values())
 
 
-def sources(state: dict, run_id=None, node_id=None, samples=()) -> list[dict]:
-  """Pod lifetimes shared by activity, logs and series. Historical sampler identity
-  is limited to retained operations; dispatcher identity comes from its process record."""
+def lanes(state: dict, run_id=None, node_id=None) -> list[dict]:
+  """One lane per placement record, with its worker process's phase and GPU turns. A lane on a shared runtime
+  becomes one lane per run, which shows only that run's ops."""
   observed = datetime.fromisoformat(state["observed_at"]).timestamp()
-  runs = state["runs"]
-  uuids = {d["uuid"]: d["id"] for node in state["cluster"]["nodes"] for d in node["devices"] if d.get("uuid")}
-  placed = {p["pod_uid"]: p for p in state["placements"] if p.get("pod_uid")}
-  found = []
-  for record in state["processes"]:
-    placement = placed.pop(record.get("pod_uid"), {})
-    live = alive(record, observed)
-    end = observed if live else record["heartbeat_at"]
-    owner = "pool" if record.get("role") == "dispatcher" else "runtime_id"
-    members = [r for r in runs if r.get(owner) == record.get(owner) and r["created_at"] <= end and (r["completed_at"] or end) >= record["started_at"]]
-    ids, gpus = [r["run_id"] for r in members], record.get("gpus") or []
-    # A GPU no current device slot reports keeps its UUID as its identity, so its series stay queryable.
-    found.append(
-      {
-        **record,
-        "name": placement.get("name") or record.get("pod") or record["id"],
-        "label": members[0]["name"] if len(members) == 1 else record["runtime_id"] or record["id"],
-        "run_ids": ids,
-        "shared_runtime": record["runtime_id"] not in ids if ids else None,
-        "devices": placement.get("devices") or [uuids.get(uuid, uuid) for uuid in gpus],
-        "device_uuids": {uuids.get(uuid, uuid): uuid for uuid in gpus},
-        "device_count": placement.get("device_count") or len(gpus),
-        "start": record["started_at"],
-        "end": end,
-        "ended": not live,
-      }
-    )
-  for placement in [*placed.values(), *(p for p in state["placements"] if not p.get("pod_uid"))]:
-    started = datetime.fromisoformat(placement["created_at"]).timestamp() if placement.get("created_at") else observed
-    found.append({**placement, "start": started, "end": observed, "ended": False})
-  # Dispatchers are Deployments, not scheduler Workloads. Include their current
-  # pods even before the process's first record, and retain every associated run.
-  by_pod = {(p.get("pod"), p.get("pod_uid")): p for p in found}
-  for run in runs:
-    for pod in run.get("pods", []):
-      if pod.get("role") != "dispatcher":
-        continue
-      key = pod["name"], pod.get("uid")
-      if key not in by_pod:
-        lane = {
-          "id": pod.get("uid") or pod["name"],
-          "pod": pod["name"],
-          "pod_uid": pod.get("uid"),
-          "role": pod.get("role"),
-          "node": pod.get("node") or "",
-          "run_ids": [],
-          "devices": pod.get("devices", []),
-          "start": datetime.fromisoformat(pod["created_at"]).timestamp() if pod.get("created_at") else observed,
-          "end": observed,
-          "ended": False,
-        }
-        found.append(lane)
-        by_pod[key] = lane
-      if run["run_id"] not in by_pod[key]["run_ids"]:
-        by_pod[key]["run_ids"].append(run["run_id"])
-  lanes = []
-  for lane in found:
-    if lane.get("shared_runtime") and lane["run_ids"]:
-      for member in lane["run_ids"]:
-        model = next((r["model"] for r in runs if r["run_id"] == member), None) or lane["label"]
-        lanes.append(
-          {
-            **lane,
-            "id": f"{lane['id']}:{member}",
-            "allocation_id": lane["id"],
-            "run_ids": [member],
-            "label": f"{model.split('/')[-1]} · {member[:8]}",
-          }
-        )
+  runs, found = state["runs"], []
+  for record in state["placement_records"]:
+    start, end = record["placed_at"], record["released_at"] or observed
+    members = [r for r in runs if r["runtime_id"] == record["model_id"] and r["created_at"] <= end and (r["completed_at"] or end) >= start]
+    # Pod names repeat across placements of one Workload; the process ran inside this placement's span.
+    pod = record["pod"]
+    processes = [p for p in state["processes"] if pod and p.get("pod") == pod and p["started_at"] <= end and p["heartbeat_at"] >= start]
+    ids = [r["run_id"] for r in members]
+    lane = {
+      "id": f"{record['workload']}@{record['placed_at']:.0f}",
+      "name": record["workload"],
+      "label": members[0]["name"] if len(members) == 1 else record["model_id"],
+      "run_ids": ids,
+      "runtime_id": record["model_id"],
+      "shared_runtime": record["model_id"] not in ids if ids else None,
+      "role": record["role"],
+      "node": record["node"] or "",
+      "pod": record["pod"],
+      "devices": record["gpu_uuids"],
+      "device_count": len(record["gpu_uuids"]),
+      "phase": max(processes, key=lambda p: p["started_at"])["phase"] if processes else None,
+      "turns": [turn for p in processes for turn in p.get("turns") or []],
+      "start": start,
+      "end": end,
+      "ended": record["released_at"] is not None,
+    }
+    if lane["shared_runtime"]:
+      for member in members:
+        label = f"{(member['model'] or lane['label']).split('/')[-1]} · {member['run_id'][:8]}"
+        found.append({**lane, "id": f"{lane['id']}:{member['run_id']}", "allocation_id": lane["id"], "run_ids": [member["run_id"]], "label": label})
     else:
-      lanes.append(lane)
-  if run_id and not node_id:
-    lanes += recorded_lanes(run_id, lanes, samples)
-  return [p for p in lanes if (not run_id or run_id in p["run_ids"]) and (not node_id or p["node"] == node_id)]
-
-
-def segments(state: dict, run_id=None, node_id=None, samples=()) -> list[dict]:
-  """Activity's GPU lanes are the canonical sources without pool CPU processes."""
-  return [p for p in sources(state, run_id, node_id, samples) if p.get("role") != "dispatcher"]
+      found.append(lane)
+  return [p for p in found if (not run_id or run_id in p["run_ids"]) and (not node_id or p["node"] == node_id)]
 
 
 def merge(intervals: list) -> list:
@@ -145,17 +97,12 @@ def merge(intervals: list) -> list:
 
 
 def matches(sample: dict, placement: dict) -> bool:
-  # A plain loop: activity calls this once per record per lane.
-  for key in ("role", "node", "runtime_id", "pod", "pod_uid"):
-    if (mine := sample.get(key)) and (theirs := placement.get(key)) and mine != theirs:
-      return False
-  return True
+  return all(sample[key] == placement[key] for key in ("role", "node", "runtime_id", "pod") if sample.get(key) and placement.get(key))
 
 
 def activity(state: dict, start: float, end: float, operations: dict, run_id=None, node_id=None) -> dict:
   """GPU turns and recorded ops for each lane in the window. Never utilization."""
-  lanes = segments(state, run_id, node_id, operations.get(run_id, {}).get("samples", []))
-  return {"placements": [lane_activity(p, start, end, operations) for p in lanes if p["start"] <= end and p["end"] >= start]}
+  return {"placements": [lane_activity(p, start, end, operations) for p in lanes(state, run_id, node_id) if p["start"] <= end and p["end"] >= start]}
 
 
 CHART_POINTS = 1000  # sampler requests per chart; a chart cannot show more apart
@@ -176,35 +123,6 @@ def chart_samples(samples: list[dict], start: float, end: float) -> list[dict]:
       elif sample.get("elapsed_seconds", 0) >= slowest.get(bucket, {}).get("elapsed_seconds", -1):
         slowest[bucket] = sample
   return sorted([*charted, *slowest.values()], key=lambda sample: sample["at"])
-
-
-def recorded_lanes(run_id: str, lanes: list[dict], samples: list[dict]) -> list[dict]:
-  """A vllm serve replica keeps no process record, so once its pod is gone its lane
-  comes from the ops the run recorded there, which name the pod."""
-  shown, pods = {p.get("pod") for p in lanes}, {}
-  for sample in samples:
-    # A request no replica answered is recorded against the pool router's URL, which is not a pod.
-    if sample.get("role") == "sampler" and sample.get("pod") and "://" not in sample["pod"] and sample["pod"] not in shown:
-      pods.setdefault(sample["pod"], []).append(sample)
-  return [
-    {
-      "id": f"recorded:{pod}",
-      "name": pod,
-      "label": pod,
-      "pod": pod,
-      "role": ops[0].get("role"),
-      "node": "",  # not recorded for a replica
-      "run_ids": [run_id],
-      "runtime_id": None,
-      "shared_runtime": True,
-      "devices": [],
-      "device_count": 0,
-      "start": min(o.get("started_at") or o["at"] for o in ops),
-      "end": max(o["at"] for o in ops),
-      "ended": True,
-    }
-    for pod, ops in pods.items()
-  ]
 
 
 def lane_activity(lane: dict, start: float, end: float, operations: dict) -> dict:

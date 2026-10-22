@@ -211,16 +211,48 @@ class HardwareSourceTest(unittest.TestCase):
       self.assertIsNone(source)
       self.assertIn("OPEN_RL_PROMETHEUS_URL", reason)
 
+  def test_node_gpus_come_from_dcgm_by_uuid_in_slot_order(self) -> None:
+    backend = mock.Mock(slots={})
+    backend.scope.return_value = ',cluster="c"'
+    rows = [{"metric": {"Hostname": "n1", "UUID": f"GPU-{slot}", "gpu": str(slot)}} for slot in (10, 2, 0)]
+    backend.range_rows = mock.AsyncMock(return_value=[*rows, {"metric": {"Hostname": "n2", "UUID": "GPU-x", "gpu": "0"}}])
+    with mock.patch.object(metrics, "hardware", return_value=(backend, None)), mock.patch.object(metrics.sources, "discover", mock.AsyncMock()):
+      found = asyncio.run(metrics.node_gpus())
+    self.assertEqual(
+      [(d["id"], d["uuid"], d["name"]) for d in found["n1"]],
+      [("GPU-0", "GPU-0", "gpu-0"), ("GPU-2", "GPU-2", "gpu-2"), ("GPU-10", "GPU-10", "gpu-10")],
+    )
+    self.assertIn('cluster="c"', backend.range_rows.await_args.args[0])
+    with mock.patch.object(metrics, "hardware", return_value=(None, "no source")), mock.patch.object(metrics.sources, "discover", mock.AsyncMock()):
+      self.assertIsNone(asyncio.run(metrics.node_gpus()))
+
+
+def placement(pod: str, gpus: list[str], placed_at: float, released_at: float | None) -> dict:
+  return {
+    "workload": pod,
+    "role": "trainer",
+    "model_id": "r",
+    "pod": pod,
+    "node": "node",
+    "gpu_uuids": gpus,
+    "placed_at": placed_at,
+    "released_at": released_at,
+  }
+
+
+def hardware_state(records: list[dict], devices: list[dict], observed_at: str = WINDOW["until"]) -> dict:
+  return {
+    "observed_at": observed_at,
+    "runs": [],
+    "cluster": {"nodes": [{"name": "node", "devices": devices}]},
+    "placement_records": records,
+    "processes": [],
+  }
+
 
 class HardwareSeriesTest(unittest.TestCase):
   def test_total_failure_is_distinct_from_successful_empty_series(self):
-    state = {
-      "observed_at": WINDOW["until"],
-      "runs": [],
-      "cluster": {"nodes": [{"name": "node", "devices": [{"id": "d0", "uuid": GPU}]}]},
-      "placements": [],
-      "processes": [],
-    }
+    state = hardware_state([], [{"id": GPU, "uuid": GPU}])
     backend = mock.Mock(slots={})
     backend.name = "fake"
     for errors in ({}, {"memory_mib": "Offline"}, dict.fromkeys(sources.GPU_METRICS, "Offline")):
@@ -232,39 +264,24 @@ class HardwareSeriesTest(unittest.TestCase):
         self.assertEqual(result["devices"][0]["errors"], errors)
         self.assertFalse(result["available"])
 
-  def test_node_query_batches_idle_gpus_and_historical_workers(self) -> None:
-    state = {
-      "observed_at": WINDOW["since"],
-      "runs": [],
-      "cluster": {"available": True, "scheduler": {}, "nodes": [{"name": "node", "devices": [{"id": "idle", "uuid": "GPU-idle"}]}]},
-      "placements": [],
-      "processes": [
-        {"id": "worker", "pod_uid": "uid", "node": "node", "pod": "old-pod", "runtime_id": None, "gpus": [GPU], "started_at": 0, "heartbeat_at": 10}
-      ],
-    }
-    state["cluster"]["nodes"][0]["devices"].append({"id": "gone", "uuid": GPU})
+  def test_node_query_batches_idle_gpus_and_released_placements(self) -> None:
+    state = hardware_state([placement("old-pod", [GPU], 0, 6)], [{"id": "GPU-idle", "uuid": "GPU-idle"}])
     backend = mock.Mock(name="source", slots={})
     backend.name = "fake"
     backend.devices = mock.AsyncMock(return_value=({"utilization": {GPU: [[1, 80]]}}, {}))
-    backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"old-pod": [[1, 2]]}}, {}))
+    backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"old-pod": [[1, 2], [8, 3]]}}, {}))
     with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
       result = asyncio.run(metrics.series(state, node_id="node", **WINDOW))
     self.assertCountEqual(backend.devices.await_args.args[0], ["GPU-idle", GPU])
     self.assertEqual(backend.workers_series.await_args.args[0], ["old-pod"])
-    self.assertCountEqual([(d["id"], d["uuid"]) for d in result["devices"]], [("idle", "GPU-idle"), ("gone", GPU)])
-    self.assertEqual([(w["id"], w["pod_uid"]) for w in result["workers"]], [("worker", "uid")])
+    self.assertCountEqual([(d["id"], d["uuid"]) for d in result["devices"]], [("GPU-idle", "GPU-idle"), (GPU, GPU)])
+    # A worker's series stop when its placement was released.
+    self.assertEqual([(w["id"], w["cpu_cores"]) for w in result["workers"]], [("old-pod@0", [[1, 2]])])
     self.assertTrue(result["available"])
 
-  def test_fresh_worker_series_include_its_lifetime_before_first_snapshot(self) -> None:
-    state = {
-      "observed_at": "1970-01-01T00:00:20+00:00",
-      "runs": [],
-      "cluster": {"available": True, "scheduler": {}, "nodes": [{"devices": [{"id": "d0", "uuid": GPU}, {"id": "d1", "uuid": None}]}]},
-      "placements": [
-        {"id": "w1", "label": "worker", "run_ids": [], "node": "node", "devices": ["d0", "d1"], "pod": "orw-trainer", "created_at": WINDOW["since"]}
-      ],
-      "processes": [],
-    }
+  def test_a_runs_series_cover_only_the_gpus_its_placements_held(self) -> None:
+    state = hardware_state([placement("orw-trainer", [GPU], 0, None)], [{"id": GPU, "uuid": GPU}, {"id": "GPU-other", "uuid": "GPU-other"}])
+    state["runs"] = [{"run_id": "r", "runtime_id": "r", "name": "Run", "model": None, "created_at": 0, "completed_at": None}]
 
     class Backend:
       name = "fake"
@@ -277,59 +294,7 @@ class HardwareSeriesTest(unittest.TestCase):
         return {"cpu_cores": {p: [[start, 4.0]] for p in pods}, "memory_bytes": {p: [[start, 8.0]] for p in pods}}, {}
 
     with mock.patch.object(metrics, "hardware", return_value=(Backend(), None)):
-      result = asyncio.run(metrics.series(state, **WINDOW))
-    self.assertTrue(result["available"])
-    self.assertEqual(result["source"], "fake")
+      result = asyncio.run(metrics.series(state, run_id="r", **WINDOW))
+    self.assertEqual((result["source"], [d["uuid"] for d in result["devices"]]), ("fake", [GPU]))
     self.assertEqual(result["devices"][0]["utilization"][0][1], 90.0)
-    self.assertEqual(result["devices"][1]["reason"], "GPU UUID unavailable")
     self.assertEqual((result["workers"][0]["pod"], result["workers"][0]["cpu_cores"][0][1]), ("orw-trainer", 4.0))
-
-  def test_a_previous_process_keeps_its_own_gpu_after_the_slot_changes(self) -> None:
-    state = {
-      "observed_at": "1970-01-01T00:00:20+00:00",
-      "runs": [],
-      "cluster": {"available": True, "scheduler": {}, "nodes": [{"name": "node", "devices": [{"id": "d0", "uuid": "GPU-new"}]}]},
-      "placements": [
-        {
-          "id": "w",
-          "label": "worker",
-          "run_ids": [],
-          "node": "node",
-          "pod": "reused-name",
-          "pod_uid": "new",
-          "devices": ["d0"],
-          "device_uuids": {"d0": "GPU-new"},
-          "created_at": "1970-01-01T00:00:15+00:00",
-        }
-      ],
-      # The previous pod of the same name ran on the slot's earlier GPU.
-      "processes": [
-        {
-          "id": "old",
-          "node": "node",
-          "pod": "reused-name",
-          "pod_uid": "old",
-          "runtime_id": None,
-          "gpus": [GPU],
-          "started_at": 2,
-          "heartbeat_at": 8,
-          "phase": "exited",
-        }
-      ],
-    }
-    backend = mock.Mock(slots={})
-    backend.name = "fake"
-    backend.devices = mock.AsyncMock(return_value=({"utilization": {GPU: [[3, 50]]}}, {}))
-    backend.workers_series = mock.AsyncMock(return_value=({"cpu_cores": {"reused-name": [[1, 1], [3, 2], [9, 3]]}}, {}))
-    with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
-      result = asyncio.run(metrics.series(state, node_id="node", **WINDOW))
-    self.assertCountEqual(backend.devices.await_args.args[0], [GPU, "GPU-new"])
-    self.assertEqual(next(d for d in result["devices"] if d["uuid"] == GPU)["utilization"], [[3, 50]])
-    self.assertEqual(result["workers"][0]["pod_uid"], "old")
-    self.assertEqual(result["workers"][0]["cpu_cores"], [[3, 2]])
-    state["placements"] = []
-    with mock.patch.object(metrics, "hardware", return_value=(backend, None)):
-      result = asyncio.run(metrics.series(state, node_id="node", since=WINDOW["since"], until="1970-01-01T00:00:19.999Z"))
-    self.assertCountEqual(backend.devices.await_args.args[0], [GPU, "GPU-new"])
-    self.assertCountEqual([(d["id"], d["uuid"]) for d in result["devices"]], [(GPU, GPU), ("d0", "GPU-new")])
-    self.assertEqual([w["pod_uid"] for w in result["workers"]], ["old"])

@@ -3,22 +3,17 @@
 Kubernetes reads block and run in a thread; a missing client, credentials or scheduler CRD come back as explicit
 errors, never exceptions. Prometheus is any compatible query API; on GKE that is Managed Service for Prometheus,
 with DCGM GPU metrics and GKE's own container metrics. Cloud Logging is the run-log source on GKE: identity from
-the metadata server, Application Default Credentials, and stateless paging through a signed cursor that keeps
-the query and pod lifetimes fixed while the live inventory changes.
+the metadata server, Application Default Credentials, and the worker pods' owner label as the run's filter.
 """
 
 import asyncio
-import base64
 import concurrent.futures
 import hashlib
-import hmac
 import json
 import os
 import re
-import secrets
 import threading
 import time
-import zlib
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -30,6 +25,7 @@ import httpx
 from google.auth.transport.requests import Request
 
 from server.telemetry import CLIENT, RUN_LABEL, SOURCE_LABEL, iso, logs_key
+from server.worker_manager import owner_id
 
 # *** http: one connection pool, owned by the server lifespan ***
 
@@ -230,35 +226,18 @@ def workload_summary(item: dict) -> dict:
   return {
     "name": metadata.get("name"),
     "uid": metadata.get("uid"),
-    "created_at": metadata.get("creationTimestamp"),
     "role": spec.get("role"),
     "model_id": spec.get("modelID"),
-    "owner_id": spec.get("ownerID"),
     "training_kind": spec.get("trainingKind"),
-    "exclusive": spec.get("exclusive", False),
     "requested_memory": (spec.get("accelerator") or {}).get("memory"),
     "phase": status.get("phase") or "Pending",
     "reason": status.get("reason"),
-    "claim_name": status.get("claimName"),
     "pod_name": status.get("podName"),
     "node_name": status.get("nodeName"),
-    "device_count": status.get("deviceCount", 0),
-    "gpu_uuids": status.get("gpuUUIDs") or [],
-    "placed_at": status.get("placedAt"),
-    "released_at": status.get("releasedAt"),
     "placed_reason": placed.get("reason"),
     "placed_message": placed.get("message"),
     "worker": workload_worker(item, time.time()),
   }
-
-
-def ledger_summary(item: dict) -> dict:
-  spec = item.get("spec") or {}
-  seats = [
-    {"workload": s.get("workload"), "workload_uid": s.get("workloadUID"), "owner": s.get("ownerID"), "exclusive": s.get("exclusive", False)}
-    for s in spec.get("seats") or []
-  ]
-  return {"name": (item.get("metadata") or {}).get("name"), "claim_name": spec.get("claimName"), "seats": seats}
 
 
 def scheduler_state(custom: Any, ns: str) -> dict:
@@ -267,62 +246,11 @@ def scheduler_state(custom: Any, ns: str) -> dict:
 
   try:
     workloads = [workload_summary(item) for item in listing("workloads")]
-    ledgers = [ledger_summary(item) for item in listing("claimledgers")]
   except Exception as exc:
     if getattr(exc, "status", None) == 404:
-      return {"installed": False, "available": False, "error": None, "workloads": [], "ledgers": []}
-    return {"installed": True, "available": False, "error": f"scheduler read failed: {exc}", "workloads": [], "ledgers": []}
-  return {"installed": True, "available": True, "error": None, "workloads": workloads, "ledgers": ledgers}
-
-
-def complete_slices(slices: list[dict], driver: str) -> tuple[list[dict], bool]:
-  """Only the latest complete generation of each DRA pool describes its devices."""
-  pools: dict[tuple, list[dict]] = {}
-  for item in slices:
-    spec = item.get("spec", {})
-    if spec.get("driver") == driver and spec.get("nodeName"):
-      pools.setdefault((spec["nodeName"], spec["pool"]["name"]), []).append(spec)
-  complete, incomplete = [], False
-  for specs in pools.values():
-    generation = max(spec["pool"].get("generation", -1) for spec in specs)
-    current = [spec for spec in specs if spec["pool"].get("generation", -1) == generation]
-    if generation < 0 or any(spec["pool"].get("resourceSliceCount") != len(current) for spec in current):
-      incomplete = True
-    else:
-      complete.extend(current)
-  return complete, incomplete
-
-
-def device_uuid(attributes: dict) -> str | None:
-  return next((v.get("string") for k, v in attributes.items() if k.rsplit("/", 1)[-1].lower() == "uuid" and isinstance(v, dict)), None)
-
-
-def device_inventory(custom: Any, ns: str) -> dict:
-  """GPUs per node from ResourceSlices, and the devices each ResourceClaim holds."""
-  driver = os.getenv("OPEN_RL_GPU_DRA_DRIVER", "gpu.nvidia.com")
-  for version in ("v1", "v1beta1"):
-    try:
-      claims = custom.list_namespaced_custom_object("resource.k8s.io", version, ns, "resourceclaims", _request_timeout=K8S_SECONDS)["items"]
-      slices = custom.list_cluster_custom_object("resource.k8s.io", version, "resourceslices", _request_timeout=K8S_SECONDS)["items"]
-    except Exception as exc:
-      if getattr(exc, "status", None) == 404:
-        continue
-      return {"available": False, "error": f"DRA discovery failed (status {getattr(exc, 'status', 'unavailable')})", "nodes": {}, "claims": {}}
-    slices, incomplete = complete_slices(slices, driver)
-    nodes: dict[str, list[dict]] = {}
-    for spec in slices:
-      for device in spec.get("devices", []):
-        attributes = device.get("attributes") or device.get("basic", {}).get("attributes", {})
-        identity = "/".join((spec["driver"], spec["pool"]["name"], device["name"]))
-        nodes.setdefault(spec["nodeName"], []).append({"id": identity, "name": device["name"], "uuid": device_uuid(attributes)})
-    held = {
-      item["metadata"]["name"]: [
-        "/".join((d["driver"], d["pool"], d["device"])) for d in item.get("status", {}).get("allocation", {}).get("devices", {}).get("results", [])
-      ]
-      for item in claims
-    }
-    return {"available": True, "error": "Some DRA pools have incomplete device inventory" if incomplete else None, "nodes": nodes, "claims": held}
-  return {"available": False, "error": "DRA API unavailable", "nodes": {}, "claims": {}}
+      return {"installed": False, "available": False, "error": None, "workloads": []}
+    return {"installed": True, "available": False, "error": f"scheduler read failed: {exc}", "workloads": []}
+  return {"installed": True, "available": True, "error": None, "workloads": workloads}
 
 
 def cluster_unavailable(ns: str, error: str) -> dict:
@@ -334,13 +262,12 @@ def cluster_unavailable(ns: str, error: str) -> dict:
     "nodes": [],
     "nodes_error": None,
     "events_error": None,
-    "scheduler": {"installed": None, "available": False, "error": error, "workloads": [], "ledgers": []},
-    "devices": {"available": False, "error": error, "nodes": {}, "claims": {}},
+    "scheduler": {"installed": None, "available": False, "error": error, "workloads": []},
   }
 
 
 def read_cluster() -> dict:
-  """Pods, nodes, events, scheduler objects and DRA devices in one pass."""
+  """Pods, nodes, events and scheduler Workloads in one pass."""
   core, custom, error = k8s_clients()
   ns = namespace()
   if core is None:
@@ -352,20 +279,17 @@ def read_cluster() -> dict:
     except Exception as exc:
       return None, str(exc)
 
-  with concurrent.futures.ThreadPoolExecutor(max_workers=5) as threads:
+  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as threads:
     pods_f = threads.submit(attempt, core.list_namespaced_pod, ns, _request_timeout=K8S_SECONDS)
     nodes_f = threads.submit(attempt, core.list_node, _request_timeout=K8S_SECONDS)
     events_f = threads.submit(attempt, core.list_namespaced_event, ns, field_selector="involvedObject.kind=Pod", _request_timeout=K8S_SECONDS)
-    scheduler_f, devices_f = threads.submit(scheduler_state, custom, ns), threads.submit(device_inventory, custom, ns)
+    scheduler_f = threads.submit(scheduler_state, custom, ns)
     (node_list, nodes_error), (event_list, events_error) = nodes_f.result(), events_f.result()
-    scheduler, devices, (pod_list, pods_error) = scheduler_f.result(), devices_f.result(), pods_f.result()
+    scheduler, (pod_list, pods_error) = scheduler_f.result(), pods_f.result()
   if pods_error:
     return cluster_unavailable(ns, f"pod list failed: {pods_error}")
-  pods, device_nodes = [pod_summary(p) for p in pod_list.items], devices.pop("nodes")
+  pods = [pod_summary(p) for p in pod_list.items]
   nodes = [node_summary(n) for n in node_list.items] if node_list else []
-  for node in nodes:
-    node["devices"] = device_nodes.get(node["name"], [])
-    node["gpu_capacity"] = max(node["gpu_capacity"], len(node["devices"]))
   events_by_pod: dict[str, list[dict]] = {}
   for event in event_list.items if event_list else []:
     summary = event_summary(event)
@@ -381,7 +305,6 @@ def read_cluster() -> dict:
     "nodes_error": f"node list failed: {nodes_error}" if nodes_error else None,
     "events_error": f"event list failed: {events_error}" if events_error else None,
     "scheduler": scheduler,
-    "devices": devices,
   }
 
 
@@ -497,11 +420,15 @@ class PromQL:
 
 # *** GKE identity and Cloud Logging ***
 
-MAX_MESSAGE, MAX_SOURCES, MAX_CURSOR, MAX_PLAN_BYTES = 16 * 1024, 64, 16 * 1024, 128 * 1024
-CURSOR_SECONDS, TOKEN_SECONDS = 900, 10
-# Share this secret between dashboard replicas to keep cursors valid across them.
-cursor_secret = os.getenv("OPEN_RL_LOG_CURSOR_SECRET", "").encode() or None
-CURSOR_KEY_RECORD = "open_rl:dashboard:log_cursor_key"
+MAX_MESSAGE, MAX_CURSOR, TOKEN_SECONDS = 16 * 1024, 16 * 1024, 10
+# GKE copies each pod label onto its log entries as k8s-pod/<key>, with the dots in the key as underscores.
+OWNER, POOL, ROLE, COMPONENT, NODE = (
+  'labels."k8s-pod/timeslice_io/owner"',
+  'labels."k8s-pod/app_kubernetes_io/instance"',
+  "k8s-pod/openrl_io/role",
+  "k8s-pod/app_kubernetes_io/component",
+  "compute.googleapis.com/resource_name",
+)
 REFUSED = "Cloud Logging refused this gateway's credentials (missing logging read scope or IAM role)"
 UNAVAILABLE = "Cloud Logging unavailable; check credentials, IAM and telemetry configuration"
 METADATA = {"project": "project/project-id", "cluster": "instance/attributes/cluster-name", "location": "instance/attributes/cluster-location"}
@@ -517,23 +444,6 @@ PROCESS_PREFIX = re.compile(r"^\([\w ]+ pid=\d+\)\s*")  # vLLM's "(EngineCore pi
 PROGRESS = re.compile(r"\r|\d+%(\||\s+Completed)")
 LEVEL = re.compile(r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\b")
 WARNING_TEXT = re.compile(r"Warning\b|warnings\.warn\(")
-
-
-async def cursor_key() -> bytes:
-  """One signing key for every dashboard on the run store, so a log cursor survives a restart and works on both
-  the standalone and the gateway-mounted dashboard. Without the store it is random to this process."""
-  global cursor_secret
-  if cursor_secret is None:
-    try:
-      from server.store import get_state_store
-
-      store = get_state_store()
-      if not await store.get_value(CURSOR_KEY_RECORD):
-        await store.set_value(CURSOR_KEY_RECORD, secrets.token_hex(32))
-      cursor_secret = bytes.fromhex(await store.get_value(CURSOR_KEY_RECORD))  # read back, so two dashboards settle on one key
-    except Exception:
-      cursor_secret = secrets.token_bytes(32)
-  return cursor_secret
 
 
 def log_views() -> list[str]:
@@ -615,83 +525,20 @@ def log_window(since=None, until=None) -> tuple[str, str]:
   return start.isoformat(timespec="microseconds"), end.isoformat(timespec="microseconds")
 
 
-def pod_sources(run: dict | None, lanes: list[dict], observed_at: str) -> list[dict]:
-  """The pods a run's logs can come from: live ones until now, and each worker process of the run for its lifetime.
-  Names are bound to lifetimes, since Cloud Logging labels carry pod names and not UIDs."""
-  sources: dict[tuple, dict] = {}
-  for lane in lanes:
-    if lane.get("pod"):
-      sources[lane["pod"], lane.get("pod_uid") or lane["start"]] = {
-        "pod": lane["pod"],
-        "node": lane.get("node"),
-        "role": lane.get("role") or "unknown",
-        "created_at": timestamp(lane["start"]),
-        "until": timestamp(lane["end"] + 60),
-      }
-  for pod in (run or {}).get("pods", []):
-    if pod.get("created_at"):
-      sources[pod["name"], pod.get("uid") or pod["created_at"]] = {
-        "pod": pod["name"],
-        "node": pod.get("node"),
-        "role": pod.get("role", "unknown"),
-        "created_at": timestamp(pod["created_at"]),
-        "until": timestamp(observed_at),
-        "shared_runtime": pod.get("shared_runtime", False),
-      }
-  return sorted(sources.values(), key=lambda source: source["created_at"], reverse=True)
-
-
-def page_cursor(plan: dict) -> str:
-  raw = json.dumps({**plan, "expires": time.time() + CURSOR_SECONDS}, separators=(",", ":")).encode()
-  if len(raw) > MAX_PLAN_BYTES:
-    raise ValueError("Log query is too large to page; narrow the pod filter")
-  payload = zlib.compress(raw)
-  token = base64.urlsafe_b64encode(hmac.digest(cursor_secret, payload, "sha256") + payload).decode()
-  if len(token) > MAX_CURSOR:
-    raise ValueError("Log query is too large to page; narrow the pod filter")
-  return token
-
-
-def page_plan(cursor: str, selection: list, since, until) -> dict:
-  try:
-    if len(cursor) > MAX_CURSOR:
-      raise ValueError
-    signed = base64.urlsafe_b64decode(cursor)
-    signature, payload = signed[:32], signed[32:]
-    if not hmac.compare_digest(signature, hmac.digest(cursor_secret, payload, "sha256")):
-      raise ValueError
-    decoder = zlib.decompressobj()
-    raw = decoder.decompress(payload, MAX_PLAN_BYTES + 1)
-    if len(raw) > MAX_PLAN_BYTES or not decoder.eof:
-      raise ValueError
-    plan = json.loads(raw)
-    if plan["expires"] < time.time() or plan["selection"] != selection:
-      raise ValueError
-    if any(value is not None and timestamp(value) != bound for value, bound in zip((since, until), plan["window"], strict=True)):
-      raise ValueError
-    return plan
-  except (ValueError, KeyError, TypeError, zlib.error):
-    raise ValueError("Invalid or expired log cursor; repeat the query without it") from None
-
-
 def scope_filter() -> list[str]:
   config = configuration()
   labels = (("project_id", config["project"]), ("location", config["location"]), ("cluster_name", config["cluster"]), ("namespace_name", namespace()))
   return ['resource.type="k8s_container"', *[f"resource.labels.{label}={json.dumps(value)}" for label, value in labels]]
 
 
-def source_filter(sources: list[dict], client_of: str | None = None) -> str:
-  clauses = [
-    f"(resource.labels.pod_name={json.dumps(s['pod'])} AND timestamp>={json.dumps(s['created_at'])} AND timestamp<={json.dumps(s['until'])})"
-    for s in sources
-  ]
-  if client_of:
-    clauses.append(f"(labels.{RUN_LABEL}={json.dumps(client_of)} AND labels.{SOURCE_LABEL}={json.dumps(CLIENT)})")
-  return "(" + " OR ".join(clauses) + ")"
-
-
-def logs_filter(sources: list[dict], start: str, end: str, severity: str | None, q: str, client_of: str | None = None) -> str:
-  clauses = scope_filter() + [source_filter(sources, client_of), f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
+def logs_filter(run: dict, start: str, end: str, severity: str | None, q: str, pod: str | None = None) -> str:
+  """The run's worker pods by the scheduler's owner label, its pool's pods, and its client's lines, in the window."""
+  client = f"(labels.{RUN_LABEL}={json.dumps(run['run_id'])} AND labels.{SOURCE_LABEL}={json.dumps(CLIENT)})"
+  owner = owner_id(run["runtime_id"]).rstrip("-")  # the scheduler trims a truncated label value as well
+  pods = f"({OWNER}={json.dumps(owner)} OR {POOL}={json.dumps(run['pool'])} OR {client})"
+  if pod:
+    pods = client if pod == CLIENT else f"resource.labels.pod_name={json.dumps(pod)}"
+  clauses = scope_filter() + [pods, f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
   if severity in RELABELED:
     stderr = json.dumps(f"projects/{configuration()['project']}/logs/stderr")
     clauses.append(f'(severity={json.dumps(severity)} OR (severity="ERROR" AND logName={stderr}))')
@@ -711,15 +558,10 @@ def stderr_severity(text: str) -> str:
   return "WARNING" if WARNING_TEXT.search(body) else "ERROR"
 
 
-def entry_record(entry: dict, sources: list[dict], run_id: str) -> dict | None:
-  """One log entry as a dashboard record, or None when it belongs to no source lifetime."""
-  labels, at = entry.get("resource", {}).get("labels", {}), timestamp(entry["timestamp"])
-  if entry.get("labels", {}).get(SOURCE_LABEL) == CLIENT and entry["labels"].get(RUN_LABEL) == run_id:
-    match = {"pod": CLIENT, "role": CLIENT}
-  else:
-    match = next((s for s in sources if s["pod"] == labels.get("pod_name") and s["created_at"] <= at <= s["until"]), None)
-  if match is None:
-    return None
+def entry_record(entry: dict, run_id: str) -> dict:
+  """One log entry as a dashboard record; the pod's labels say its role and node."""
+  resource, labels = entry.get("resource", {}).get("labels", {}), entry.get("labels", {})
+  client = labels.get(SOURCE_LABEL) == CLIENT
   fields = entry.get("jsonPayload") or {}
   text = entry.get("textPayload")
   if text is None:
@@ -731,10 +573,10 @@ def entry_record(entry: dict, sources: list[dict], run_id: str) -> dict | None:
     "id": hashlib.sha256(json.dumps([entry.get("logName"), entry.get("insertId"), entry.get("timestamp"), text]).encode()).hexdigest(),
     "run_id": run_id,
     "timestamp": entry.get("timestamp"),
-    "pod": match["pod"],
-    "container": labels.get("container_name"),
-    "node": match.get("node"),
-    "role": match.get("role", "unknown"),
+    "pod": CLIENT if client else resource.get("pod_name"),
+    "container": resource.get("container_name"),
+    "node": labels.get(NODE),
+    "role": CLIENT if client else labels.get(ROLE) or labels.get(COMPONENT) or "unknown",
     "severity": severity,
     "rank": fields.get("rank"),
     "request_id": fields.get("request_id"),
@@ -743,48 +585,29 @@ def entry_record(entry: dict, sources: list[dict], run_id: str) -> dict | None:
   }
 
 
-async def run_logs(
-  run_id: str, sources: list[dict], *, since=None, until=None, cursor=None, limit=200, q="", pod=None, node=None, severity=None, shared_runtime=False
-) -> dict:
+async def run_logs(run: dict, pods: list[dict], *, since=None, until=None, cursor=None, limit=200, q="", pod=None, severity=None) -> dict:
+  """A page of the run's logs, newest first. The cursor is Cloud Logging's own page token, valid for the same filters."""
   global refused_until
-  await cursor_key()
-  selection = [run_id, limit, q, pod, node, severity]
-  plan = page_plan(cursor, selection, since, until) if cursor else None
+  start, end = log_window(since, until)
   result = {
-    "run_id": run_id,
+    "run_id": run["run_id"],
     "source": "gke",
     "records": [],
-    "sources": sources,
+    "sources": pods,
     "order": "newest_first",
     "next_cursor": None,
     "available": False,
-    "shared_runtime": plan["shared_runtime"] if plan else shared_runtime,
+    "shared_runtime": bool(run["shared_runtime"]),
+    "since": start,
+    "until": end,
   }
   if not configuration()["configured"]:
     return {**result, "error": "GKE telemetry is not configured"}
   if time.monotonic() < refused_until:
     return {**result, "error": REFUSED}
-  if plan is None:
-    start, end = log_window(since, until)
-    selected = [s for s in sources if (pod is None or s["pod"] == pod) and (node is None or s.get("node") == node)]
-    client_of = run_id if pod in (None, CLIENT) and node is None else None  # the client's output is one more source, unless a filter names another
-    if not selected and not client_of:
-      return {**result, "available": True, "note": "No pod lifetimes match this run and filter"}
-    if len(selected) > MAX_SOURCES:
-      raise ValueError(f"Select a pod to narrow this query to at most {MAX_SOURCES} pod lifetimes")
-    query = {
-      "resourceNames": log_views(),
-      "filter": logs_filter(selected, start, end, severity, q, client_of),
-      "orderBy": "timestamp desc",
-      "pageSize": limit,
-    }
-    plan = {"selection": selection, "shared_runtime": shared_runtime, "window": [start, end], "sources": selected, "request": query}
-  result.update(sources=plan["sources"], since=plan["window"][0], until=plan["window"][1])
+  query = {"resourceNames": log_views(), "filter": logs_filter(run, start, end, severity, q, pod), "orderBy": "timestamp desc", "pageSize": limit}
   try:
-    payload = await gcp_request("POST", "https://logging.googleapis.com/v2/entries:list", json=plan["request"])
-    records = [record for entry in payload.get("entries", []) if (record := entry_record(entry, plan["sources"], run_id))]
-    if severity in (*RELABELED, "ERROR"):
-      records = [record for record in records if record["severity"] == severity]
+    payload = await gcp_request("POST", "https://logging.googleapis.com/v2/entries:list", json={**query, **({"pageToken": cursor} if cursor else {})})
   except httpx.HTTPStatusError as exc:
     if exc.response.status_code in (401, 403):
       refused_until = time.monotonic() + 600  # a scope or IAM refusal does not clear itself; stop asking for a while
@@ -794,9 +617,10 @@ async def run_logs(
     return {**result, "error": UNAVAILABLE}
   except Exception:
     return {**result, "error": UNAVAILABLE}
-  token = payload.get("nextPageToken")
-  next_cursor = page_cursor({**plan, "request": {**plan["request"], "pageToken": token}}) if token else None
-  return {**result, "records": records, "available": True, "next_cursor": next_cursor}
+  records = [entry_record(entry, run["run_id"]) for entry in payload.get("entries", [])]
+  if severity in (*RELABELED, "ERROR"):
+    records = [record for record in records if record["severity"] == severity]
+  return {**result, "records": records, "available": True, "next_cursor": payload.get("nextPageToken")}
 
 
 async def client_tail(store, run_id: str, limit: int) -> list[dict]:
