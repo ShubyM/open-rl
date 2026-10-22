@@ -117,3 +117,29 @@ the records and the facts read from them.
 | `OPEN_RL_PROMETHEUS_URL` | unset | Prometheus for GPU and vLLM metrics. Unset, the dashboard uses Managed Prometheus on GKE. |
 | `OPEN_RL_GKE_PROJECT` / `OPEN_RL_GKE_CLUSTER` / `OPEN_RL_GKE_LOCATION` | from the metadata server | The cluster whose metrics and logs the dashboard reads. `OPEN_RL_GKE_TELEMETRY=false` turns GKE reads off. |
 | `OPEN_RL_LOG_VIEWS` | the project | Comma-separated Cloud Logging views to read run logs from, such as a long-retention bucket's view. |
+
+### Client metrics by step
+
+A client that logs through an OpenTelemetry logger emits one
+`openrl.training.metrics` log event per `log_metrics` call, with the step, every
+finite metric and a `session.id` attribute. An OpenTelemetry Collector can
+forward those events to the API server's `POST /api/v1/otlp/logs`, which keeps
+one row per step per session in `open_rl:client_steps:<session>`.
+`/runs/{id}/steps` reads these rows first, so it needs no metrics backend and
+does not rebuild steps from gauges. Add an exporter to the collector's logs
+pipeline:
+
+```yaml
+exporters:
+  otlphttp/openrl:
+    logs_endpoint: http://open-rl-api-server-service:8000/api/v1/otlp/logs
+    encoding: json
+service:
+  pipelines:
+    logs:
+      exporters: [otlphttp/openrl]
+```
+
+Runs with no forwarded events fall back to the `openrl_client_metric` gauges in
+Prometheus, aligned by `progress/batch`. A gauge keeps only the latest value per
+export interval, so it can miss a step when two steps land within one interval.

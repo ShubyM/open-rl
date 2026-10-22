@@ -164,12 +164,17 @@ history: dict[str, tuple[float, dict[int, dict[str, float]]]] = {}  # run -> (re
 
 
 async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, ...]) -> dict[int, dict[str, float]]:
-  """The client's metrics by step: its OpenTelemetry gauges when progress/batch first read the step, or the older Redis history.
-  A step's values never change, so each read asks Prometheus only for what came after the last one, at 15 s resolution."""
-  found = {}
-  for row in await get_state_store().read_samples(f"open_rl:run_metrics:{run['run_id']}"):
+  """The client's metrics by step: the per-step events the collector forwards, else its OpenTelemetry gauges when
+  progress/batch first read the step, and the older Redis history. A step's values never change, so each gauge read asks
+  Prometheus only for what came after the last one, at 15 s resolution."""
+  found, store = {}, get_state_store()
+  for row in await store.read_samples(f"open_rl:run_metrics:{run['run_id']}"):
     found[row["step"]] = {k: float(v) for k, v in row["metrics"].items() if isinstance(v, int | float) and math.isfinite(v)}
-  if not run["session_ids"] or high <= low or not sources.prometheus_source():
+  for session in run["session_ids"]:
+    for row in await store.read_samples(key("client_steps", session)):
+      if row.get("step") is not None and low <= row["at"] <= high:
+        found.setdefault(int(row["step"]), {}).update(row["metrics"])
+  if found or not run["session_ids"] or high <= low or not sources.prometheus_source():
     return found
   memo = f"{run['run_id']} {prefixes}"
   seen, known = history.get(memo, (low, {}))

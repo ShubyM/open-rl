@@ -287,6 +287,35 @@ def redact(value):
   return [redact(v) for v in value] if isinstance(value, list) else value
 
 
+def otlp_value(value: dict):
+  """An OTLP JSON AnyValue as a plain value; a kvlist becomes a dict."""
+  if "kvlistValue" in value:
+    return {kv["key"]: otlp_value(kv["value"]) for kv in value["kvlistValue"].get("values", [])}
+  for kind in ("doubleValue", "intValue", "stringValue", "boolValue"):
+    if kind in value:
+      return float(value[kind]) if kind == "intValue" else value[kind]
+  return None
+
+
+async def ingest_client_steps(store, body: dict) -> None:
+  """Keep the client's per-step metric events, which the collector forwards as OTLP JSON logs, one row per step per session.
+  The step is in the event, so nothing has to be rebuilt from gauges later."""
+  for resource in body.get("resourceLogs", []):
+    for scope in resource.get("scopeLogs", []):
+      for record in scope.get("logRecords", []):
+        attributes = {kv["key"]: otlp_value(kv["value"]) for kv in record.get("attributes", [])}
+        event = otlp_value(record.get("body", {}))
+        session = attributes.get("session.id")
+        if record.get("eventName") != "openrl.training.metrics" or not session or not isinstance(event, dict):
+          continue
+        values = {k: float(v) for k, v in (event.get("metrics") or {}).items() if isinstance(v, int | float) and math.isfinite(v)}
+        step = int(event["step"]) if event.get("step") is not None else None
+        row = {"step": step, "at": int(record.get("timeUnixNano", 0)) / 1e9, "metrics": values}
+        if attributes.get("openrl.phase"):
+          row["phase"] = attributes["openrl.phase"]
+        await store.append_sample(key("client_steps", session), row, SAMPLE_LIMIT, TTL_SECONDS)
+
+
 async def ingest_sdk_events(store, body: dict) -> None:
   """The tinker SDK's own telemetry: one redacted JSON line per event, and error events kept per session."""
   context = {k: body.get(k) for k in ("session_id", "process_uuid", "sdk_version", "platform")}

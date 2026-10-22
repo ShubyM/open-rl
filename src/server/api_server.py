@@ -1383,6 +1383,13 @@ async def run_logs(run_id: str, body: telemetry.LogRequest):
   return await telemetry.ingest_logs(state, run_id, body)
 
 
+@app.post("/api/v1/otlp/logs")
+async def otlp_logs(body: dict):
+  """OTLP/HTTP JSON logs from the collector; the client's per-step metric events are kept by session."""
+  await telemetry.ingest_client_steps(state, body)
+  return {}
+
+
 @app.post("/api/v1/telemetry")
 async def sdk_telemetry(body: dict):
   await telemetry.ingest_sdk_events(state, body)

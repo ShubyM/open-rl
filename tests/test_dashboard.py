@@ -95,7 +95,35 @@ class StepsTest(unittest.TestCase):
     self.assertEqual((found[0]["started_at"], found[0]["ended_at"], found[2]["nonfinite"]), (9, 11, ["grad_norm"]))
 
 
+def step_event(step: int, reward: float, at_ns: int) -> dict:
+  """An OTLP JSON log export as the collector forwards it, in the shape the cookbook logger emits."""
+  values = [{"key": "progress/batch", "value": {"doubleValue": step}}, {"key": "env/all/reward/total", "value": {"doubleValue": reward}}]
+  body = {
+    "kvlistValue": {"values": [{"key": "metrics", "value": {"kvlistValue": {"values": values}}}, {"key": "step", "value": {"intValue": str(step)}}]}
+  }
+  record = {
+    "timeUnixNano": str(at_ns),
+    "eventName": "openrl.training.metrics",
+    "body": body,
+    "attributes": [{"key": "session.id", "value": {"stringValue": "sess-1"}}],
+  }
+  return {"resourceLogs": [{"resource": {"attributes": []}, "scopeLogs": [{"logRecords": [record]}]}]}
+
+
 class ClientStepsTest(unittest.TestCase):
+  def test_forwarded_step_events_become_the_runs_client_metrics_by_step_with_no_metrics_backend(self):
+    from server import telemetry
+    from server.dashboard import router
+
+    store = InMemoryStateStore()
+    for step, reward in ((0, 0.2), (1, 0.5)):
+      asyncio.run(telemetry.ingest_client_steps(store, step_event(step, reward, (1000 + step) * 10**9)))
+    asyncio.run(telemetry.ingest_client_steps(store, {"resourceLogs": [{"scopeLogs": [{"logRecords": [{"eventName": "other"}]}]}]}))
+    run = {"run_id": "m", "session_ids": ["sess-1"]}
+    with mock.patch.object(router, "get_state_store", return_value=store), mock.patch.object(sources, "prometheus_source", return_value=None):
+      found = asyncio.run(router.client_steps(run, 900, 2000, ()))
+    self.assertEqual({step: m["env/all/reward/total"] for step, m in found.items()}, {0: 0.2, 1: 0.5})
+
   def test_a_later_read_asks_prometheus_only_for_new_time_and_keeps_the_earlier_steps(self):
     from server.dashboard import router
 
