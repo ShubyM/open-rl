@@ -202,7 +202,8 @@ async def commands(run_id: str, since: Bound = None, until: Bound = None, role: 
   """The run's raw command records (trainer ops and samples), newest first; without bounds, all of them."""
   await run_of(run_id)
   low, high = span(since, until)[2:] if since or until else (0, math.inf)
-  found = [r for r in reversed(await fleet.operations(run_id)) if low <= r["at"] <= high and (role is None or (r.get("role") == "sampler") == (role == "sampler"))]
+  wanted = (lambda r: True) if role is None else (lambda r: (r.get("role") == "sampler") == (role == "sampler"))
+  found = [r for r in reversed(await fleet.operations(run_id)) if low <= r["at"] <= high and wanted(r)]
   return {"run_id": run_id, "total": len(found), "commands": found[:limit]}
 
 
