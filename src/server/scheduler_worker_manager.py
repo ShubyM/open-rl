@@ -123,6 +123,12 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
     if os.getenv(name):
       values[name] = os.environ[name]
+  # vLLM keys its torch.compile artifacts by model, GPU type and engine config.
+  # Inside the container they die with the pod and every sampler compiles
+  # again; on the shared volume the first sampler of a key compiles and the
+  # rest load the result.
+  if worker.role == "sampler":
+    values["VLLM_CACHE_ROOT"] = f"{tmp_dir}/vllm-cache"
   # No other worker shares an exclusive worker's GPUs, so it never parks.
   if worker.exclusive:
     values["OPEN_RL_TIME_SLICING"] = "off"
