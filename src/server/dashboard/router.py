@@ -37,6 +37,7 @@ from server.dashboard.schema import (
 )
 from server.dashboard.snapshot import METADATA_PREFIX, snapshot
 from server.model_metadata import decode_model_metadata
+from server.sampling_store import SamplingStore
 from server.store import get_state_store
 
 REQUEST_SECONDS = 12
@@ -318,6 +319,13 @@ async def check_context(run_id: str, window: tuple[float, float] | None = None) 
     await asyncio.sleep(2)  # a pop in progress is counted a moment after it leaves the queue
     ledger = await counters()
   workers = [p for p in state.get("processes") or [] if p.get("runtime_id") in (run.get("runtime_id"), run_id) or p.get("pool") == run.get("pool")]
+  now = datetime.fromisoformat(state["observed_at"]).timestamp()
+  redis = getattr(store, "redis", None)  # pools need Redis; the in-memory store has none
+  waiting, oldest = await SamplingStore(redis).backlog(run["pool"]) if redis is not None and run.get("pool") else (0, None)
+  dispatcher = max((p for p in workers if p.get("role") == "dispatcher"), key=lambda p: p.get("heartbeat_at", 0), default=None)
+  pool = {"name": run.get("pool"), "waiting": waiting, "oldest": oldest}
+  if dispatcher:
+    pool.update(dispatcher=dispatcher.get("pod") or dispatcher.get("id"), alive=telemetry.alive(dispatcher, now))
   created = run.get("created_at")
   low, high = window or (0.0, float("inf"))
   return {
@@ -327,7 +335,8 @@ async def check_context(run_id: str, window: tuple[float, float] | None = None) 
     "workers": workers,
     "scheduler": bool(state["cluster"].get("scheduler", {}).get("installed")),
     "finished": is_finished(run),
-    "now": datetime.fromisoformat(state["observed_at"]).timestamp(),
+    "now": now,
+    "pool": pool,
     "since": created if isinstance(created, int | float) else 0.0,
     "state": state,
   }

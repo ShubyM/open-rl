@@ -222,6 +222,13 @@ def sampler_flow(ctx: dict) -> dict:
   name, run_id = "sampler-flow", ctx["run"]["run_id"]
   sends = [s for s in ctx["samples"] if s.get("role") == "sampler"]
   evidence = read(f"runs/{run_id}/commands", role="sampler", **span(ctx))
+  pool = ctx.get("pool") or {}
+  if pool.get("waiting") and not ctx["finished"] and not pool.get("alive") and ctx["now"] - pool["oldest"] > 120:
+    holder = f"dispatcher {pool['dispatcher']}, which stopped reporting" if pool.get("dispatcher") else "a dispatcher, and none is recorded"
+    reason = f"{pool['waiting']} samples wait in pool {pool['name']} for {holder}"
+    since = pool["oldest"]
+    logs = read("logs", run_id=run_id, pod=pool.get("dispatcher"), since=iso(since - 300), until=iso(since + 3600))
+    return answer(name, FAIL, reason, logs, waiting=pool["waiting"], observed_s=round(ctx["now"] - since), threshold_s=120)
   if not sends:
     return answer(name, OK if ctx["finished"] else UNKNOWN, "no sample requests recorded")
   retried = sum(s.get("status") == "retried" for s in sends)

@@ -73,6 +73,15 @@ class ChecksReplayTest(unittest.TestCase):
     self.assertIn("ValueError", result["reason"])
     self.assertEqual(verdict("progress", context([op(NOW - 600, "create_model")], finished=True)), checks.OK)
 
+  def test_samples_waiting_on_a_dispatcher_that_stopped_reporting_fail_sampler_flow(self):
+    ctx = context(healthy_steps())
+    ctx["pool"] = {"name": "p", "waiting": 32, "oldest": NOW - 900, "dispatcher": "p-dispatcher-0", "alive": False}
+    result = checks.sampler_flow(ctx)
+    self.assertEqual(result["verdict"], checks.FAIL)
+    self.assertIn("p-dispatcher-0", result["reason"])
+    ctx["pool"]["alive"] = True
+    self.assertNotEqual(checks.sampler_flow(ctx)["verdict"], checks.FAIL)
+
   def test_a_healthy_run_is_ok_and_missing_inputs_are_unknown_never_ok(self):
     healthy = context(healthy_steps(), ledger={"enqueued": 5, "popped": 5, "answered": 5})
     for name in ("progress", "request-ledger", "worker-health", "optimizer-health"):
