@@ -64,7 +64,8 @@ async def accelerators(state: dict, run_id: str | None, node_id: str | None, spa
     return {**result, "error": "No GPUs recorded for this subject in this window"}
   where = f"{{UUID=~{any_of(gpus)}{backend.scope('cluster')}}}" if gpus else f"{{{backend.scope('cluster')[1:]}}}"
   expressions = {
-    "util": f"max by (Hostname, UUID, gpu, modelName) (DCGM_FI_DEV_GPU_UTIL{where})",
+    # Utilization comes in bursts; the last two minutes say whether a GPU is working now better than one sample.
+    "util": f"max by (Hostname, UUID, gpu, modelName) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{where}[2m]))",
     "busy": f"max by (UUID) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{where}[{max(1, int(high - low))}s]))",
     "memory_used_mib": f"max by (UUID) (DCGM_FI_DEV_FB_USED{where})",
     "memory_total_mib": f"max by (UUID) (DCGM_FI_DEV_FB_TOTAL{where})",

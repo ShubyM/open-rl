@@ -277,6 +277,7 @@ def line(ctx: dict) -> dict:
     "steps": len(steps),
     "since_last_op_s": since_last_op(ctx),
     "since_last_step_s": round(now - steps[-1]["at"]) if steps else None,
+    "median_step_s": round(statistics.median(b["at"] - a["at"] for a, b in zip(steps, steps[1:]))) if len(steps) > 1 else None,
     "unanswered": sum(o["count"] for o in held),
     "held_by_dead_worker": sum(o["count"] for o in held if o["holder_alive"] is False),
     "failures": sum(s.get("status") == "failed" for s in trainer_ops(ctx)),

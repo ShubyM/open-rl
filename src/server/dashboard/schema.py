@@ -254,6 +254,7 @@ class RunLine(Record):
   steps: int
   since_last_op_s: int | None = Field(None, description="Seconds since any trainer op or sample completed; null when none did")
   since_last_step_s: int | None = None
+  median_step_s: int | None = Field(None, description="Median time between optimizer steps, to read since_last_step_s against")
   unanswered: int = Field(description="Trainer requests taken and not answered")
   held_by_dead_worker: int = Field(description="Of those, requests whose holding worker stopped reporting")
   failures: int = Field(description="Failed trainer ops")
@@ -274,7 +275,7 @@ class Holder(Record):
 
 
 class Accelerator(Record):
-  """One GPU. util is the sample at the end of the window; busy is the mean utilization over the window, percent."""
+  """One GPU. util is the mean utilization over the two minutes ending the window; busy is the mean over the whole window, percent."""
 
   uuid: str | None = None
   node: str | None = None
