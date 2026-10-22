@@ -12,8 +12,8 @@
 OpenRL's telemetry exists to answer one question for a person or an agent: why is this run not behaving? This design reorganizes it around that question.
 
 - **Record where each process ran, and which step each command belonged to.** Every diagnostic question then narrows to *run, place, window, step*, and each existing store answers with one bounded query.
-- **Answer with checks.** Fifteen server-side checks, derived from 84 incidents in this project's history, each return a verdict, a one-line reason, a few numbers and an evidence handle, in a few hundred bytes.
-- **Serve the dashboard and agents from the same generic endpoints.** Named PromQL queries, log search, command records, step rows and checks. The Svelte UI composes its views from them instead of the backend shaping data per page.
+- **Answer with facts, not verdicts.** One read returns a run's joined facts (unanswered requests and who holds them, failed ops, worker relaunches, the pool backlog, saves, sampler latency, config drift), each with a log read where one helps, in about 1 KB. The reader, a person or an agent, draws the conclusion.
+- **Serve the dashboard and agents from the same generic endpoints.** Named PromQL queries, log search, command records, step rows and run facts. The Svelte UI composes its views from them instead of the backend shaping data per page.
 
 The backend shrinks from 2,770 lines (`src/server/telemetry.py` and `src/server/dashboard/*.py` today) to a target of about 1,000.
 
@@ -35,9 +35,9 @@ Measured on 2026-10-21 against the Qwen3.8-27B LoRA run `43b3ebb3` (37 steps ove
 
 **Goals**
 - Every run can be diagnosed from the server: is it moving, are requests accounted for, is the reward real, are workers healthy and placed where they fit.
-- Every answer is small: under 5 KB for all checks of a run, well under the 25,000-token default Claude Code applies to tool responses.
+- Every answer is small: under 3 KB for a run's facts, well under the 25,000-token default Claude Code applies to tool responses.
 - One set of endpoints serves the dashboard and agents.
-- Works on GKE and on a local stack; a check whose inputs are absent answers `unknown`.
+- Works on GKE and on a local stack; a fact whose inputs are absent is left out, never shown as healthy.
 - The backend gets smaller.
 
 **Non-goals**
@@ -103,73 +103,70 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | `GET /logs?run_id=&q=&severity=&pod=&since=&until=` | The existing log route already searches by text, severity and pod | `limit` |
 | `GET /runs/{id}/commands?since=&until=&role=` | Command records from Redis, raw | `limit` |
 | `GET /runs/{id}/steps?last=&fields=` | Trainer ops grouped by step, with stored client metrics (prefix filter) | 20 steps by default |
+| `GET /runs/{id}/summary` | The run's facts (section 4.5) and GPU duty by role over its span | 0.6 to 1.5 KB on the 8 recorded runs |
+| `GET /runs?ended=` | Every live run in one line (lifecycle, steps, seconds since the last op and step, unanswered requests, how many a dead worker holds, failed ops, relaunches), longest since its last op first | About 240 B per run |
 | `GET /sessions` | Client sessions, newest first, with their models | `limit` |
-| `GET /sessions/{id}/checks` | Session checks (`client-liveness`, `sdk-errors`), then each model check at its worst across the session's models | About 1 KB plus 1 KB per model |
-| `GET /sessions/{id}/summary` | Liveness, each model's state and pace, failing and warning checks | Under 1 KB |
-| `GET /runs/{id}/checks?only=` | One model's check results | About 1.1 KB for 8 |
-| `GET /runs/{id}/summary` | Verdict, goodput, state, step, step time, last reward, per-GPU duty | About 1 KB |
-| `GET /catalog` | What each check and named query means | About 2.5 KB |
-| `GET /checks?ended=` | Every live run's verdict with its failing and warning checks and their reasons, worst first | Under 1 KB per run |
+| `GET /sessions/{id}/summary` | The session record, whether its registry key is live, its SDK errors, and each model in the one-line form of `/runs` | About 400 B for one model |
 | `GET /accelerators?run_id=&node_id=&since=&until=` | One row per GPU: node, model, holder, utilization now and over the window (last hour by default), memory used of total | About 9 KB for 30 GPUs |
-| `GET /inventory` | What the pages list: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, and pods with problems. No health judgment; that is `/runs/{id}/checks` | About 17 KB on the demo store, against 112 KB |
+| `GET /inventory` | What the pages list: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, and pods with problems. No health judgment | About 17 KB on the demo store, against 112 KB |
 
-Named queries keep one copy of each PromQL expression for checks and UI, and keep agent calls bounded.
+Named queries keep one copy of each PromQL expression for the UI and agents, and keep agent calls bounded.
 
-### 4.5 Checks
+### 4.5 Run facts
 
-A check reads the stores for one run, applies thresholds taken from incidents, and returns:
+An earlier version of this design answered with checks: each read the stores, compared what it saw with a threshold taken from incidents, and returned a verdict (`ok`, `warn`, `fail`, `unknown`). An A/B of two agents on recorded runs showed that checks bought speed and bytes, not correctness. Both arms diagnosed every run; the checks arm read 392 KB in 21 calls against 3.4 MB in 30. One check read run `fca5a3a9` as `ok` after its `create_model` failed, and the agent had to see past the verdict. Two later probes found that what helped was never the verdict but the facts behind it: who holds an unanswered request and whether that worker still reports, when a worker relaunched, which op failed and where its traceback is, what a live run waits on. So the server joins the facts and the reader judges them.
+
+`/runs/{id}/summary` returns them in one read. Each block appears only when it has content, so an absent block means nothing of its kind was recorded. There are no thresholds. Run `97532d40`, which ended waiting on a `create_model` that its trainer never answered:
 
 ```json
-{"check": "request-ledger", "verdict": "fail", "kind": "cause", "explains": "progress",
- "reason": "1 create_model held by orw-lora-97532d40-…-0-trainer, which stopped reporting",
- "numbers": {"outstanding": 1},
- "evidence": [{"read": "logs", "args": {"run_id": "97532d40-…", "pod": "orw-lora-97532d40-…-0-trainer",
-                                        "since": "2026-10-21T06:44:27+00:00", "until": "2026-10-21T07:49:27+00:00"}}]}
+{"run_id": "97532d40-…", "lifecycle": "ended", "steps": 0,
+ "requests": {"unanswered": [{"op": "create_model", "count": 1, "age_s": 88391,
+                              "pod": "orw-lora-97532d40-…-0-trainer", "holder_alive": false}]},
+ "relaunches": {"workers": [{"pod": "orw-lora-97532d40-…-0-trainer",
+                             "stopped_reporting_at": "2026-10-21T06:49:40+00:00", "restarted_at": "2026-10-21T06:50:01+00:00"}],
+                "logs": {"read": "logs", "args": {"run_id": "97532d40-…", "pod": "orw-lora-97532d40-…-0-trainer",
+                                                  "since": "2026-10-21T06:47:40+00:00", "until": "2026-10-21T06:51:01+00:00"}}},
+ "config": "no echo", "placement": {"recorded": 2}}
 ```
 
-Verdicts are `ok`, `warn`, `fail` and `unknown`. `unknown` carries the age of the stalest input whenever an input is missing or older than two collection intervals.
+A log pointer is a read under 4.4 with its arguments, so an agent follows a failure or a relaunch to the raw lines in one call.
 
-Each check is a symptom or a cause. Symptoms (`progress`, `optimizer-health`, `client-liveness`) say whether the user is hurt; causes say why. The run verdict is the worst symptom, so a warning from a cause alone never marks a run as failing. Evidence is a list of reads the caller can run as they stand: a route under 4.4, its arguments, and the window of the run, so an agent follows a failing check to the raw records in one call. Numbers carry what was observed next to the threshold it was compared with.
-
-`/runs/{id}/summary` reports goodput, the share of the run's span the trainer spent in training steps, and splits the rest into checkpoint and forward-only time, rollout time (the trainer idle with a sample in flight) and client time (nothing in flight). This is the first number to read when a run is slow rather than broken.
-
-| Check | Question | Incidents |
+| Block | Holds | Answers |
 |---|---|---|
-| `progress` | Is the run completing optimizer steps at its normal pace? | 23 |
-| `worker-health` | Has any worker crashed, restarted, OOMed or started slowly? | 12 |
-| `sampler-flow` | Are samplers answering at the expected speed with the expected weights? | 11 |
-| `effective-config` | Is each worker running the code and settings the run asked for? | 10 |
-| `request-ledger` | Is every request accounted for, held by a live worker, younger than 3 median steps? | 9 |
-| `placement` | Does every needed worker exist, on a GPU that fits it? | 8 |
-| `dependencies` | Are the judge and sandboxes healthy enough to grade? | 8 |
-| `client-liveness` | Is the client alive, and waiting on the server or on itself? | 7 |
-| `episode-endings` | How did episodes end, and is a failure bucket growing? | 7 |
-| `reward-validity` | Is this step's reward real? | 6 |
-| `control-plane` | Are the API server, dispatcher and client event loops responsive? | 6 |
-| `optimizer-health` | Are gradients finite and in range? | 5 |
-| `policy-movement` | Is the policy moving, from the weights the run claims? | 5 |
-| `storage` | Will the volume last, and how much would a crash lose? | 4 |
-| `ownership` | Is every GPU-holding Workload owned by a live session? | 3 |
+| `steps`, `step_seconds`, `since_last_step_s`, `last_op`, `last_metrics` | Optimizer steps, the median and last gap between them, the newest trainer op | Is the run making progress? What did it do last? |
+| `goodput` | The share of the run's span the trainer spent in training steps; the rest split into checkpoint, forward-only, rollout (the trainer idle with a sample in flight) and client time (nothing in flight) | Where does a slow run's time go? |
+| `waiting` | For a live run, seconds since any op finished, trainer idle time, trainer requests in flight, samples unanswered in the pool | What is a stuck run waiting on? |
+| `requests` | Unanswered trainer requests with the holding pod and whether its worker still reports; the ledger counters, with `lost = enqueued - popped - queued` when the queue length is known | Is a request held by a dead worker, or lost between push and pop? |
+| `failures` | Failed trainer ops: count, the 5 newest, a log read around the newest naming its error type | Which op failed, and where is the traceback? |
+| `relaunches` | Workers that stopped reporting and restarted in the same pod, from worker records, with a log read around the first | Did a worker crash or restart mid-run? |
+| `pool` | Samples unanswered in the run's pool, the oldest's age, its dispatcher and whether it reports | Are samples waiting on a dispatcher that stopped? |
+| `saves` | `save_state` calls: count, failures, the last success, steps since, the slowest | How much would a crash lose? |
+| `optimizer` | Ops that returned non-finite metrics (count and the first), the last 5 grad norms | Are gradients finite? |
+| `samplers` | Sends, retries, failures, median latency; the slowest and fastest replica with 20 or more answered sends | Is a sampler replica slow or failing? |
+| `config` | Workers whose echoed settings differ from the run's, or `no echo` | Does each worker run what the run asked for? |
+| `placement` | Placements recorded, and workloads with no node yet | Does every worker exist and have a GPU? |
+| `incidents` | Kubernetes incidents on the run's pods (OOMKilled, CrashLoopBackOff, restarts, scheduling failures), newest 5 | Did Kubernetes kill or fail to place a pod? |
+| `gpu_busy` | Mean GPU duty by role over the run's span of recorded ops | Are the GPUs working? |
 
-Together they cover 83 of 84 recorded incidents; the `unknown` rule covers the last (missing telemetry). Thresholds are per-run overridable.
+These cover the incident classes the checks covered: progress (23 incidents), worker health (12), sampler flow (11), effective config (10), the request ledger (9), placement (8), optimizer health (5) and storage (4). Questions that need client signals, such as reward validity, episode endings, policy movement and dependency health, wait for the client step row (rollout step 8) and become facts the same way.
 
 ### 4.6 The UI
 
-The Svelte dashboard becomes a client of 4.4:
+The Svelte dashboard is a client of 4.4. It shows no verdicts and no facts blocks; those are for agents, through the API.
 
 | View | Built from |
 |---|---|
-| Overview | `/inventory` for runs and lifecycle; `/sessions/{id}/summary` for each model's verdict and check badges. The label is the lifecycle, or `Unhealthy` when the verdict fails |
-| Run · header | `/runs/{id}/checks`: the label, and each failing or warning check with its reason |
+| Overview | `/inventory` for runs. The label is the gateway's status once it is final, else the lifecycle (`ended`, `queued`, `running`, `active`) |
+| Run · header | The same label, and pod problems from `/inventory` |
 | Run · Activity | `/runs/{id}/commands` for lanes; `/query?name=run_gpu_busy&points=1` for Duty |
 | Run · Metrics | `/runs/{id}/steps` charted by step; `/query` for vLLM and GPU charts at chart width |
 | Run · Logs | `/logs/search` |
 | Nodes | `/query?name=node_gpu_holders`, `/query` per GPU |
-| Health | `/runs/{id}/checks` across active runs, then pod problems, nodes not ready and source errors from `/inventory` |
+| Health | Pod problems, nodes not ready and source errors from `/inventory` |
 
 ### 4.7 GKE and local
 
-Checks and endpoints are written against four source functions: metrics (PromQL), logs, placements and commands. GKE provides Managed Prometheus, Cloud Logging and Workload status. A local stack provides a plain Prometheus if present, JSON log files, and placement records written by the local launcher. Missing inputs make checks answer `unknown`.
+Facts and endpoints are written against four source functions: metrics (PromQL), logs, placements and commands. GKE provides Managed Prometheus, Cloud Logging and Workload status. A local stack provides a plain Prometheus if present, JSON log files, and placement records written by the local launcher. A missing input leaves its block out of a run's facts.
 
 In the cluster, credentials come from the metadata server and the mounted service account, so no credential code is needed beyond library defaults. Laptop access to the cluster is a small adapter.
 
@@ -185,11 +182,11 @@ In the cluster, credentials come from the metadata server and the mounted servic
 | `inspection.py` | 239 | 60 |
 | `metrics.py` | 99 | 70 |
 | `collector.py` | 80 | 0 |
-| `checks.py` | 0 | 250 |
+| `facts.py` | 0 | 250 |
 | `__main__.py` | 35 | 35 |
 | **Total** | **2,770** | **about 1,300**, stretch 1,000 |
 
-`dev/diagnostics_budget.py` measures this and the payload sizes on every PR in the stack.
+`dev/diagnostics_budget.py` measures this and the payload sizes on every PR in the stack. On `diag/facts` the backend is 2,867 lines: `sources.py` 593, `telemetry.py` 494, `router.py` 468, `schema.py` 399, `facts.py` 284, `snapshot.py` 241, `inspection.py` 180, `queries.py` 91, `metrics.py` 83, `__main__.py` 34.
 
 ## 6. Rollout
 
@@ -199,18 +196,17 @@ Each PR is one row in the instrumentation ledger, with the signal it adds, the c
 2. **Correctness.** NaN as `null`; sampler records in their own list; step ordinal on command records; lost-request detection.
 3. **Placement.** Workload status gains GPU UUIDs and start and end times; the scheduler exports `openrl_gpu_held`; workers echo placement and config.
 4. **Generic reads.** `/query` with named templates, `/logs/search`, `/runs/{id}/commands`, `/runs/{id}/steps`.
-5. **Checks.** The eight with partial data today first, then `/checks` and `/summary`.
+5. **Facts.** The run summary, then `/runs` and session summaries.
 6. **UI migration.** Page by page onto the generic reads.
 7. **Delete.** Placement reconstruction, `/telemetry`, `/history`, OTel metric gauges, per-page schema.
-8. **Client signals.** Step row and heartbeat, then the client-side checks.
+8. **Client signals.** Step row and heartbeat, then the client-side facts.
 9. **Noise.** Sampler access-log flag (`--disable-access-log-for-endpoints /metrics,/weight_info`), one log bucket, one sampler PodMonitoring. Cluster changes need an owner's approval.
 
 ## 7. Risks and open questions
 
 - **Scheduler change.** GPU UUIDs in Workload status and the info metric are Go changes to `scheduler/controller` and a CRD update, deployed to a shared cluster.
 - **Historical runs.** Runs recorded before placement records exist keep today's reconstruction until they age out, or are backfilled once.
-- **Thresholds.** Taken from incidents; they need per-run overrides and the dashboard should show which fired.
-- **Checks on request or on a timer.** On request is simpler; a timer enables alerts.
+- **Facts on request or on a timer.** On request is simpler; a timer enables alerts, which would bring back thresholds.
 - **Client contract.** The step row needs a small cookbook logger sink; the laptop path needs a Collector exporter that writes one log entry per event.
 
 ## 8. Alternatives considered
