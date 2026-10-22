@@ -54,89 +54,6 @@ class KubernetesInventoryTest(unittest.TestCase):
 
 
 class PromQLTest(unittest.TestCase):
-  def test_identical_requests_share_work_without_sharing_waiter_cancellation(self):
-    async def exercise():
-      entered, release = asyncio.Event(), asyncio.Event()
-      calls = 0
-
-      async def respond(request):
-        nonlocal calls
-        calls += 1
-        entered.set()
-        await release.wait()
-        return httpx.Response(200, json={"answer": 42})
-
-      connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-      with mock.patch.object(httpx, "AsyncClient", return_value=connection):
-        async with sources.lifespan():
-          first = asyncio.create_task(sources.get_json("https://example/query", params={"query": "up"}, headers={}))
-          await entered.wait()
-          second = asyncio.create_task(sources.get_json("https://example/query", params={"query": "up"}, headers={}))
-          await asyncio.sleep(0)
-          first.cancel()
-          with self.assertRaises(asyncio.CancelledError):
-            await first
-          release.set()
-          self.assertEqual(await second, {"answer": 42})
-          self.assertEqual(calls, 1)
-          await sources.get_json("https://example/query", params={"query": "up"}, headers={})
-          self.assertEqual(calls, 2)  # Completed results are not cached.
-          entered.clear()
-          release.clear()
-          abandoned = asyncio.create_task(sources.get_json("https://example/query", params={"query": "up"}, headers={}))
-          await entered.wait()
-        with self.assertRaises(asyncio.CancelledError):
-          await abandoned  # Shutdown cancels and drains the outstanding request.
-      self.assertTrue(connection.is_closed)
-
-    asyncio.run(exercise())
-
-  def test_shared_requests_isolate_credentials_and_queries_and_do_not_cache_errors(self):
-    async def exercise():
-      entered, release = asyncio.Event(), asyncio.Event()
-      calls = 0
-
-      async def respond(request):
-        nonlocal calls
-        calls += 1
-        if calls == 6:
-          entered.set()
-        await release.wait()
-        return httpx.Response(503)
-
-      url, params, headers = "https://example/query", {"query": "up", "end": 60}, {"Authorization": "Bearer a", "x-goog-user-project": "p"}
-      requests = [
-        (url, params, headers),
-        (url, params, headers),
-        (url, params, {**headers, "Authorization": "Bearer b"}),
-        (url, params, {**headers, "x-goog-user-project": "other"}),
-        (url, {**params, "query": "down"}, headers),
-        (url, {**params, "end": 90}, headers),
-        (url + "/other", params, headers),
-      ]
-      connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-      with (
-        mock.patch.object(httpx, "AsyncClient", return_value=connection),
-        mock.patch.object(sources, "MAX_INFLIGHT", 1),
-        mock.patch.object(sources, "RETRY_SECONDS", 0),
-      ):
-        async with sources.lifespan():
-          tasks = [asyncio.create_task(sources.get_json(u, params=p, headers=h)) for u, p, h in requests]
-          await asyncio.wait_for(entered.wait(), timeout=1)
-          release.set()
-          errors = await asyncio.gather(*tasks, return_exceptions=True)
-          self.assertTrue(all(isinstance(error, httpx.HTTPStatusError) for error in errors))
-          # Six distinct requests, each retried once after its 503.
-          self.assertEqual(calls, 12)
-          with self.assertRaises(httpx.HTTPStatusError):
-            await sources.get_json(url, params=params, headers=headers)
-          self.assertEqual(calls, 14)
-          release.clear()
-          with mock.patch.object(sources, "HTTP_SECONDS", 0.01), self.assertRaises(TimeoutError):
-            await sources.get_json(url, params=params, headers=headers)
-
-    asyncio.run(exercise())
-
   def test_partial_failure_keeps_successful_fields_after_one_retry(self):
     calls = []
 
@@ -154,22 +71,14 @@ class PromQLTest(unittest.TestCase):
         backend = PromQL("gke", "https://example", token, None, "openrl-system")
         connection = httpx.AsyncClient(transport=httpx.MockTransport(respond))
 
-        async def query(backend=backend, connection=connection):
-          async with sources.lifespan():
-            self.assertIs(sources.http_client(), connection)
-            return await backend.devices([GPU], 0, 60)
-
-        with mock.patch.object(httpx, "AsyncClient", return_value=connection) as factory, mock.patch.object(sources, "RETRY_SECONDS", 0):
-          found, errors = asyncio.run(query())
+        with mock.patch.object(sources, "client", connection), mock.patch.object(sources, "RETRY_SECONDS", 0):
+          found, errors = asyncio.run(backend.devices([GPU], 0, 60))
         self.assertEqual(found, {} if denied else {"utilization": {GPU: [[1.0, 80.0]]}})
         expected = dict.fromkeys(sources.GPU_METRICS, "Metrics query unavailable") if denied else {"memory_mib": "Metrics source returned HTTP 503"}
         self.assertEqual(errors, expected)
         # The failed query is retried once; denied credentials make no request at all.
         self.assertEqual(len(calls), 0 if denied else 3)
         token.assert_called_once()
-        factory.assert_called_once()
-        self.assertTrue(connection.is_closed)
-        self.assertIsNone(sources.pool)
 
   def test_queries_made_at_different_moments_share_sample_times(self) -> None:
     # Each allocation is fetched separately and the window slides with every
@@ -183,11 +92,10 @@ class PromQLTest(unittest.TestCase):
       return httpx.Response(200, json={"status": "success", "data": {"result": []}}, request=httpx.Request("GET", url))
 
     async def query():
-      async with sources.lifespan():
-        for start in (1000.4, 1010.4):
-          await backend.query_range("q", start, start + 1800)
+      for start in (1000.4, 1010.4):
+        await backend.query_range("q", start, start + 1800)
 
-    with mock.patch.object(httpx.AsyncClient, "request", request):
+    with mock.patch.object(sources, "client", None), mock.patch.object(httpx.AsyncClient, "request", request):
       asyncio.run(query())
     self.assertEqual([p["step"] for p in sent], [15, 15])
     self.assertEqual([p["start"] % 15 for p in sent], [0, 0])

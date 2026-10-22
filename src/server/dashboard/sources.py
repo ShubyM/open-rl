@@ -15,7 +15,6 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -27,64 +26,24 @@ from google.auth.transport.requests import Request
 from server.telemetry import CLIENT, RUN_LABEL, SOURCE_LABEL, iso, logs_key
 from server.worker_manager import owner_id
 
-# *** http: one connection pool, owned by the server lifespan ***
+# *** http: one lazily created client ***
 
-pool: httpx.AsyncClient | None = None
-fallback: httpx.AsyncClient | None = None  # outside the lifespan, for a script or a test
-inflight: dict[tuple, asyncio.Task] = {}
-MAX_INFLIGHT, HTTP_SECONDS = 128, 10
+client: httpx.AsyncClient | None = None
+HTTP_SECONDS = 10
 RETRY_SECONDS = 1  # a quota refusal or server error is usually momentary; one retry spares the page an error
-
-
-@asynccontextmanager
-async def lifespan(app=None):
-  global pool
-  async with httpx.AsyncClient(timeout=HTTP_SECONDS) as connection:
-    pool = connection
-    try:
-      yield
-    finally:
-      pending = list(inflight.values())
-      for task in pending:
-        task.cancel()
-      await asyncio.gather(*pending, return_exceptions=True)
-      inflight.clear()
-      pool = None
-
-
-def http_client() -> httpx.AsyncClient:
-  global fallback
-  if pool is not None:
-    return pool
-  if fallback is None or fallback.is_closed:
-    fallback = httpx.AsyncClient(timeout=HTTP_SECONDS)
-  return fallback
 
 
 async def send(method: str, url: str, **kwargs) -> httpx.Response:
   """One request, retried once after a transient refusal."""
-  response = await http_client().request(method, url, **kwargs)
+  global client
+  if client is None:
+    client = httpx.AsyncClient(timeout=HTTP_SECONDS)
+  response = await client.request(method, url, **kwargs)
   if response.status_code == 429 or response.status_code >= 500:
     await asyncio.sleep(RETRY_SECONDS)
-    response = await http_client().request(method, url, **kwargs)
+    response = await client.request(method, url, **kwargs)
   response.raise_for_status()
   return response
-
-
-async def fetch_json(url: str, params: dict, headers: dict) -> dict:
-  async with asyncio.timeout(HTTP_SECONDS + RETRY_SECONDS):  # a shared request can outlive its callers
-    return (await send("GET", url, params=params, headers=headers)).json()
-
-
-async def get_json(url: str, *, params: dict, headers: dict) -> dict:
-  """Share only overlapping identical requests, including their actual credentials."""
-  key = (url, tuple(sorted(params.items())), tuple(sorted(headers.items())))
-  if (task := inflight.get(key)) is None:
-    if len(inflight) >= MAX_INFLIGHT:
-      return await fetch_json(url, params, headers)
-    task = inflight[key] = asyncio.create_task(fetch_json(url, params, headers))
-    task.add_done_callback(lambda t: (inflight.pop(key, None), t.cancelled() or t.exception()))  # observed even with no waiter left
-  return await asyncio.shield(task)
 
 
 # *** Kubernetes ***
@@ -365,7 +324,7 @@ class PromQL:
     if self.headers_task is None:  # share credential success or failure across this request's queries
       self.headers_task = asyncio.create_task(self.load_headers())
     params = {"query": query, "start": start, "end": end, "step": step, **({"limit": limit} if limit is not None else {})}
-    payload = await get_json(f"{self.url}/api/v1/query_range", params=params, headers=await self.headers_task)
+    payload = (await send("GET", f"{self.url}/api/v1/query_range", params=params, headers=await self.headers_task)).json()
     if payload.get("status") != "success":
       raise ValueError(payload.get("error") or "query failed")
     return payload["data"]["result"]
