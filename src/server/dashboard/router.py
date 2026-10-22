@@ -197,6 +197,15 @@ async def steps(
   return result | {"run_id": run_id, "total": len(every), "steps": every[-last:]}
 
 
+@router.get("/api/v1/inspect/runs/{run_id}/commands", response_model=Doc)
+async def commands(run_id: str, since: Bound = None, until: Bound = None, role: str | None = None, limit: int = Query(100, ge=1, le=5000)):
+  """The run's raw command records (trainer ops and samples), newest first; without bounds, all of them."""
+  await run_of(run_id)
+  low, high = span(since, until)[2:] if since or until else (0, math.inf)
+  found = [r for r in reversed(await fleet.operations(run_id)) if low <= r["at"] <= high and (role is None or (r.get("role") == "sampler") == (role == "sampler"))]
+  return {"run_id": run_id, "total": len(found), "commands": found[:limit]}
+
+
 @router.get("/api/v1/inspect/runs", response_model=Doc)
 async def runs(ended: bool = False):
   """Every live run in one line, longest since its last op first, so a stuck run is one read away. ended=true adds ended runs."""

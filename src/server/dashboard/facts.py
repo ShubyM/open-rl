@@ -81,7 +81,7 @@ def relaunches(ctx: dict) -> list[dict]:
 def pool(ctx: dict) -> dict | None:
   if not (p := ctx["pool"])["waiting"]:
     return None
-  found = present(name=p["name"], unanswered=p["waiting"], oldest_s=round(ctx["now"] - p["oldest"]) if p["oldest"] else None)
+  found = present(name=p["name"], samples_unanswered=p["waiting"], oldest_s=round(ctx["now"] - p["oldest"]) if p["oldest"] else None)
   if dispatcher := max(p["dispatchers"], key=lambda w: w.get("heartbeat_at", 0), default=None):
     found.update(dispatcher=dispatcher.get("pod") or dispatcher["id"], dispatcher_alive=alive(dispatcher, ctx["now"]))
   return found
@@ -194,6 +194,7 @@ def summary(ctx: dict) -> dict:
     step_seconds={"median": round(statistics.median(gaps), 1), "last": round(gaps[-1], 1)} if gaps else None,
     since_last_step_s=round(ctx["now"] - steps[-1]["at"]) if steps and not ctx["finished"] else None,
     since_last_op_s=since_last_op(ctx) if not ctx["finished"] else None,
+    trainer_idle_s=max(0, round(ctx["now"] - ops[-1]["at"])) if ops and not ctx["finished"] else None,
     last_op={"operation": ops[-1]["operation"], "status": ops[-1].get("status"), "at": iso(ops[-1]["at"])} if ops else None,
     last_metrics={k: float(f"{v:.6g}") for s in ops[-50:] for k, v in s.get("metrics", {}).items()},
     goodput=goodput(ctx),
@@ -219,7 +220,7 @@ def line(ctx: dict) -> dict:
     "since_last_op_s": since_last_op(ctx),
     "since_last_step_s": round(ctx["now"] - steps[-1]["at"]) if steps else None,
     "median_step_s": round(statistics.median(b["at"] - a["at"] for a, b in zip(steps, steps[1:]))) if len(steps) > 1 else None,
-    "unanswered": sum(o["count"] for o in held),
+    "trainer_requests_unanswered": sum(o["count"] for o in held),
     "held_by_dead_worker": sum(o["count"] for o in held if not o["holder_alive"]),
     "failures": sum(s.get("status") == "failed" for s in ctx["trainer"]),
     "relaunches": len(relaunches(ctx)),

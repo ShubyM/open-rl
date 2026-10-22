@@ -99,13 +99,13 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 
 | Route | Returns | Bound |
 |---|---|---|
-| `GET /query?name=&run=&node=&since=&until=&points=` | A named PromQL template from a server-side table (`run_gpu_util`, `run_gpu_busy`, `run_vllm_tokens`, `node_gpu_holders`, …), with `step = window / points` | `points` ≤ 1,000 per series |
+| `GET /query?name=&run_id=&node_id=&since=&until=&points=` | A named PromQL template (`gpu_util`, `gpu_util_now`, `gpu_busy`, `gpu_memory_mib`, `gpu_memory_total_mib`, eight `vllm_*`) over a run's or node's GPUs and pods, or the fleet's GPUs, with `step = window / points` | `points` ≤ 1,000 per series |
+| `GET /activity?run_id=&node_id=&since=&until=` | One lane per placement with its GPU turns and recorded op intervals, for the Activity and Nodes pages | The window |
 | `GET /logs?run_id=&q=&severity=&pod=&since=&until=` | The existing log route already searches by text, severity and pod | `limit` |
 | `GET /runs/{id}/commands?since=&until=&role=` | Command records from Redis, raw | `limit` |
-| `GET /runs/{id}/steps?last=&fields=` | Trainer ops grouped by step, with stored client metrics (prefix filter) | 20 steps by default |
+| `GET /runs/{id}/steps?last=&fields=` | Trainer ops grouped by step, with the client's metrics from its `openrl_client_metric` OTel gauges, aligned by `progress/batch` (prefix filter) | 20 steps by default |
 | `GET /runs/{id}/summary` | The run's facts (section 4.5) and GPU duty by role over its span | 0.6 to 1.5 KB on the 8 recorded runs |
 | `GET /runs?ended=` | Every live run in one line (lifecycle, steps, seconds since the last op and step, unanswered requests, how many a dead worker holds, failed ops, relaunches), longest since its last op first | About 240 B per run |
-| `GET /sessions` | Client sessions, newest first, with their models | `limit` |
 | `GET /sessions/{id}/summary` | The session record, whether its registry key is live, its SDK errors, and each model in the one-line form of `/runs` | About 400 B for one model |
 | `GET /accelerators?run_id=&node_id=&since=&until=` | One row per GPU: node, model, holder, utilization now and over the window (last hour by default), memory used of total | About 9 KB for 30 GPUs |
 | `GET /inventory` | What the pages list: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, and pods with problems. No health judgment | About 17 KB on the demo store, against 112 KB |
@@ -172,21 +172,18 @@ In the cluster, credentials come from the metadata server and the mounted servic
 
 ## 5. Size budget
 
-| Module | Today | Target |
-|---|---|---|
-| `sources.py` | 811 | 300 |
-| `telemetry.py` | 467 | 250 |
-| `snapshot.py` | 383 | 80 |
-| `router.py` | 351 | 150 |
-| `schema.py` | 305 | 100 |
-| `inspection.py` | 239 | 60 |
-| `metrics.py` | 99 | 70 |
-| `collector.py` | 80 | 0 |
-| `facts.py` | 0 | 250 |
-| `__main__.py` | 35 | 35 |
-| **Total** | **2,770** | **about 1,300**, stretch 1,000 |
+PR #23 had 2,770 backend lines (`src/server/telemetry.py` and `src/server/dashboard/*.py`). Trimming that structure bottomed out near 2,900 with this feature set, so it was rewritten from the requirements in two independent builds against one contract. The smaller one, about 1,300 lines, was kept:
 
-`dev/diagnostics_budget.py` measures this and the payload sizes on every PR in the stack. On `diag/facts` the backend is 2,867 lines: `sources.py` 593, `telemetry.py` 494, `router.py` 468, `schema.py` 399, `facts.py` 284, `snapshot.py` 241, `inspection.py` 180, `queries.py` 91, `metrics.py` 83, `__main__.py` 34.
+| Module | Lines | Job |
+|---|---|---|
+| `telemetry.py` | 325 | The writers: command, worker, placement and session records, request counters, settings echo |
+| `dashboard/sources.py` | 275 | Kubernetes, Managed Prometheus and Cloud Logging reads, GKE discovery |
+| `dashboard/router.py` | 280 | The routes in 4.4 and one response model |
+| `dashboard/facts.py` | 227 | The run facts in 4.5 and the one-line form |
+| `dashboard/fleet.py` | 174 | One snapshot shared for 5 s, lanes, steps |
+| `dashboard/__main__.py` | 23 | The standalone server |
+
+About 250 of those lines are the blank lines `ruff format` requires between definitions. `dev/diagnostics_budget.py` measures the total and the payload sizes.
 
 ## 6. Rollout
 

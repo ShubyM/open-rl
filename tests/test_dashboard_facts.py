@@ -94,7 +94,7 @@ class RunFactsTest(unittest.TestCase):
     ctx, _, _ = self.facts_of(healthy_steps(), workers=[dispatcher])
     ctx["pool"].update(waiting=32, oldest=NOW - 900)  # the in-memory store has no sampling streams
     pool = facts.pool(ctx)
-    self.assertEqual((pool["unanswered"], pool["oldest_s"], pool["dispatcher"], pool["dispatcher_alive"]), (32, 900, "p-dispatcher-0", False))
+    self.assertEqual((pool["samples_unanswered"], pool["oldest_s"], pool["dispatcher"], pool["dispatcher_alive"]), (32, 900, "p-dispatcher-0", False))
 
   def test_a_slow_sampler_replica_is_named_beside_the_fastest(self):
     sends = [op(NOW - i, "sample", role="sampler", pod=pod, elapsed_seconds=s) for i in range(20) for pod, s in (("fast", 10.0), ("slow", 40.0))]
