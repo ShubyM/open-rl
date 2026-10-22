@@ -6,7 +6,8 @@ export const isFinished = (run) => run?.lifecycle === "ended";
 // When a finished run stopped: when it was marked complete, else its last completed work.
 export const finishedAt = (run) => [seconds(run.completed_at), run.last_completed_at].find(Number.isFinite) ?? NaN;
 // One label: the gateway's status once it is final, else the lifecycle, unless the run's checks fail.
-export const runLabel = (run, verdict) => run.status !== "active" ? run.status : run.lifecycle === "ended" ? "ended" : verdict === "fail" ? "unhealthy" : { waiting: "queued", placed: "running" }[run.lifecycle] || "active";
+export const runLabel = (run, verdict) =>
+  run.status !== "active" ? run.status : verdict === "fail" ? (run.lifecycle === "ended" ? "failed" : "unhealthy") : run.lifecycle === "ended" ? "ended" : { waiting: "queued", placed: "running" }[run.lifecycle] || "active";
 // Failing then warning checks, symptoms before the causes that explain them.
 export const flaggedChecks = (checks = []) => checks.filter((c) => c.verdict === "fail" || c.verdict === "warn").sort((a, b) => (a.verdict === "warn") - (b.verdict === "warn") || (a.kind === "cause") - (b.kind === "cause"));
 export function elapsedTime(run, observedAt) {

@@ -76,6 +76,9 @@ def progress(ctx: dict) -> dict:
     if not steps and failed:
       reason = f"the run ended without a step after {failed[0]['operation']} failed ({failed[0].get('error_type') or 'error'})"
       return answer(name, FAIL, reason, failure_logs(run_id, failed[0]), steps=0, failed_ops=len(failed))
+    if not steps and not any(s["operation"] == "sample" for s in ctx["samples"]):
+      reason = f"the run ended without a step or a sample; the client stopped after {ops[-1]['operation']}" if ops else "the run ended with no ops"
+      return answer(name, WARN, reason, read(f"runs/{run_id}/commands"), steps=0)
     return answer(name, OK, "the run finished", steps=len(steps))
   if not ops:
     # Nothing ever completed, but the client is waiting: a run that never started is a failed run, not missing data.

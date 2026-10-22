@@ -71,7 +71,9 @@ class ChecksReplayTest(unittest.TestCase):
     result = checks.progress(crashed)
     self.assertEqual(result["verdict"], checks.FAIL)
     self.assertIn("ValueError", result["reason"])
-    self.assertEqual(verdict("progress", context([op(NOW - 600, "create_model")], finished=True)), checks.OK)
+    self.assertEqual(verdict("progress", context([op(NOW - 600, "create_model")], finished=True)), checks.WARN)  # abandoned
+    sampled_only = context([op(NOW - 600, "create_model"), op(NOW - 500, "sample", role="sampler")], finished=True)
+    self.assertEqual(verdict("progress", sampled_only), checks.OK)
 
   def test_samples_waiting_on_a_dispatcher_that_stopped_reporting_fail_sampler_flow(self):
     ctx = context(healthy_steps())
