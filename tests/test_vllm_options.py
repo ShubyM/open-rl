@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from server.vllm_options import gpu_memory_utilization, split_stop
+from server.vllm_options import cudagraph_capture_sizes, gpu_memory_utilization, split_stop
 
 
 class SplitStopTest(unittest.TestCase):
@@ -46,3 +46,9 @@ class GpuMemoryUtilizationTest(unittest.TestCase):
   def test_without_a_budget_the_default_holds(self) -> None:
     with patch.dict(os.environ, {}, clear=True):
       self.assertEqual(gpu_memory_utilization(), 0.90)
+
+
+class CudagraphCaptureSizesTest(unittest.TestCase):
+  def test_powers_of_two_up_to_max_num_seqs(self) -> None:
+    self.assertEqual(cudagraph_capture_sizes(256), [1, 2, 4, 8, 16, 32, 64, 128, 256])
+    self.assertEqual(cudagraph_capture_sizes(96), [1, 2, 4, 8, 16, 32, 64])
