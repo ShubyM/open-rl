@@ -132,7 +132,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
 
   def test_workers_get_the_deployment_settings(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
-    settings = {"VLLM_MAX_MODEL_LEN": "131072", "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072", "MAX_JOBS": "4"}
+    settings = {"VLLM_MAX_MODEL_LEN": "131072", "VLLM_ENABLE_MULTIMODAL": "1", "OPEN_RL_TRAIN_TOKEN_BUDGET": "131072", "MAX_JOBS": "4"}
     with patch.dict(os.environ, settings), patch("server.worker_manager.get_state_store", return_value=s):
       self.manager.ensure("job-lora-1", "sampler")
       self.manager.ensure("job-lora-1", "trainer")
@@ -159,6 +159,16 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     for pod in self.api.created:
       env = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
       self.assertEqual(env.get("VLLM_ARCHITECTURE_OVERRIDE"), "Gemma4ForCausalLM")
+
+  def test_multimodal_gemma_4_samplers_keep_the_full_model(self) -> None:
+    s = self.store_with("job-lora-1", {"base_model": "google/gemma-4-E2B", "fine_tuning_type": "lora"})
+    with patch.dict(os.environ, {"VLLM_ENABLE_MULTIMODAL": "1"}), patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-lora-1", "sampler")
+
+    (pod,) = self.api.created
+    env = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
+    self.assertNotIn("VLLM_ARCHITECTURE_OVERRIDE", env)
+    self.assertEqual(env.get("VLLM_ENABLE_MULTIMODAL"), "1")
 
   def test_placement_knowledge_stays_out_of_the_template(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
