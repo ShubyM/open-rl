@@ -58,11 +58,6 @@ export function capacityBars(devices, placements, range, selected) {
   }
   return bars;
 }
-export function sumSeries(workers, field) {
-  const byTime = new Map();
-  for (const worker of workers) for (const [at, value] of worker[field] || []) byTime.set(at, (byTime.get(at) || 0) + value);
-  return [...byTime].sort((a, b) => a[0] - b[0]);
-}
 // sortedPoints must be in time order; unsorted input gives wrong gaps without an error.
 export function gapFor(sortedPoints, floor) {
   const spacings = sortedPoints.slice(1).map(([at], i) => at - sortedPoints[i][0]).filter((d) => d > 0).sort((a, b) => a - b);

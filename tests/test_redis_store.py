@@ -38,7 +38,7 @@ class SampleStoreContract:
     async def sweep(*workloads, now=1000.0):
       with mock.patch.object(telemetry.time, "time", return_value=now):
         await telemetry.record_placements(self.state, list(workloads))
-      return await self.state.read_samples(telemetry.placements_key("m1"))
+      return await self.state.read_samples(telemetry.key("placements", "m1"))
 
     self.assertEqual(await sweep(workload("unplaced", placed_at=None)), [])
     (placed,) = await sweep(workload("a"))

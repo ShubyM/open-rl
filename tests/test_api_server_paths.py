@@ -9,7 +9,6 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from server import api_server
-from server.dashboard.router import sdk_incidents
 from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import LocalWorkerManager
 from tests.test_session_lifecycle import RuntimeManager
@@ -468,7 +467,7 @@ class ExclusiveMetadataTest(ApiServerTest):
     session_id = self.post("create_session", {"user_metadata": {"recipe_name": "harvey", "api_key": "sk-private"}}).json()["session_id"]
     model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
     self.post("session_heartbeat", {"session_id": session_id})
-    record = json.loads(asyncio.run(api_server.state.get_value(api_server.telemetry.session_key(session_id))))
+    record = json.loads(asyncio.run(api_server.state.get_value(api_server.telemetry.key("session_record", session_id))))
     self.assertEqual((record["model_ids"], record["metadata"]["recipe_name"]), ([model_id], "harvey"))
     self.assertGreaterEqual(record["last_seen_at"], record["created_at"])
     self.assertNotIn("sk-private", json.dumps(record))
@@ -611,10 +610,8 @@ class TrainerBackendTest(ApiServerTest):
 
 
 class TelemetryTest(ApiServerTest):
-  def test_a_fatal_sdk_error_is_logged_without_credentials_and_shows_on_its_run(self) -> None:
+  def test_a_fatal_sdk_error_is_logged_and_kept_for_its_session_without_credentials(self) -> None:
     session_id = self.post("create_session", {}).json()["session_id"]
-    model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
-    other_id = self.post("create_model", {"base_model": "m", "session_id": self.post("create_session", {}).json()["session_id"]}).json()["request_id"]
     data = {
       "status_code": 401,
       "detail": "invalid key",
@@ -628,10 +625,10 @@ class TelemetryTest(ApiServerTest):
 
     self.assertIn("invalid key", stdout.getvalue())
     self.assertNotIn("tml-secret", stdout.getvalue())
-    [incident] = asyncio.run(sdk_incidents(api_server.state, model_id, 0, float("inf")))
-    self.assertEqual((incident["tone"], incident["at"]), ("error", 1792411200.0))
-    self.assertIn("invalid key", incident["message"])
-    self.assertEqual(asyncio.run(sdk_incidents(api_server.state, other_id, 0, float("inf"))), [])
+    [error] = asyncio.run(api_server.state.read_samples(api_server.telemetry.key("sdk_errors", session_id)))
+    self.assertEqual((error["reason"], error["at"]), ("SDK api_status_error", 1792411200.0))
+    self.assertIn("invalid key", error["message"])
+    self.assertNotIn("tml-secret", repr(error))
 
 
 if __name__ == "__main__":

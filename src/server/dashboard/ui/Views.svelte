@@ -1,6 +1,6 @@
 <script>
   import Status from "./Status.svelte";
-  import { createQuery, inspectUrl, now, viewLink } from "./state.svelte.js";
+  import { inspectUrl, now, viewLink } from "./state.svelte.js";
   import { duration, elapsedTime, KINDS, runDescription, runLabel } from "./format.js";
 
   let { inventory, view = $bindable() } = $props();
@@ -19,15 +19,14 @@
       return (view.status === "all" || group(run) === view.status) && terms.every((term) => text.includes(term));
     }).sort((a, b) => Number(group(b) === "active") - Number(group(a) === "active"));
   });
-  const recorded = createQuery(() => view.page === "overview" ? inspectUrl("sessions") : null, { poll: 10000 });
-  // A run's session is the newest one that attached it: the last its metadata names, else the newest recorded session listing it.
-  const sessionOf = (run) => run.session_ids?.at(-1) ?? recorded.data?.sessions.find((s) => s.model_ids.includes(run.run_id))?.session_id ?? null;
+  // A run's session is the newest one that attached it, the last its metadata names.
+  const sessionOf = (run) => run.session_ids?.at(-1) ?? null;
   function age(run) {
     const created = typeof run.created_at === "number" ? run.created_at : Date.parse(run.created_at) / 1000;
     return Number.isFinite(created) && created > 0 ? `${duration(Math.max(0, now(inventory) - created))} ago` : "—";
   }
 
-  const errors = $derived([...new Set([inventory.store_error, inventory.processes_error, inventory.cluster.error, inventory.cluster.nodes_error, inventory.cluster.events_error, inventory.cluster.devices?.error, inventory.cluster.scheduler?.error].filter(Boolean))]);
+  const errors = $derived([...new Set(inventory.errors)]);
   const issues = $derived.by(() => {
     const pods = inventory.cluster.pods.map((pod) => {
       const run = inventory.runs.find((r) => r.pods.some((p) => p.name === pod.name));
@@ -36,7 +35,7 @@
       const evidence = [detail, pod.restarts ? `${pod.restarts} restarts` : ""].filter(Boolean).join(" · ") || "—";
       // Only a pod waiting for a node is not failing.
       const tone = ["Pending", "Unschedulable"].includes(reason) ? "warning" : "error";
-      return { issue: reason, resource: pod.name, evidence, tone, link: run ? runLink(run, "logs") : inspectUrl(`pods/${encodeURIComponent(pod.name)}/logs`), label: "Logs" };
+      return { issue: reason, resource: pod.name, evidence, tone, link: run && runLink(run, "logs"), label: "Logs" };
     });
     return [...pods, ...(inventory.cluster.nodes || []).filter((node) => node.ready !== true).map((node) => ({ issue: "Node not ready", resource: node.name, evidence: "Ready condition is false or unknown", tone: "error", link: viewLink("nodes", { node: node.name }), label: "Nodes" }))];
   });
@@ -48,41 +47,38 @@
 
 {#if view.page === "overview"}
   <h1 class="heading">Overview</h1>
-  {#if inventory.store_error}<p class="source-error" role="status">{inventory.store_error}</p>{/if}
-  {#if !inventory.store_error || inventory.runs.length}
-    <div class="overview-toolbar">
-      <input id="run-search" type="search" placeholder="Search by run ID, model, name, recipe, node or pod" aria-label="Search runs" bind:value={view.q} autocomplete="off">
-      <div class="run-filters" role="group" aria-label="Filter by status">
-        {#each FILTERS as [key, label, title]}
-          <button type="button" class="chip" data-run-filter={key} {title} aria-pressed={view.status === key} onclick={() => view.status = key}>{label} <span class="run-filter-count">{key === "all" ? inventory.runs.length : inventory.runs.filter((run) => group(run) === key).length}</span></button>
-        {/each}
+  <div class="overview-toolbar">
+    <input id="run-search" type="search" placeholder="Search by run ID, model, name, recipe, node or pod" aria-label="Search runs" bind:value={view.q} autocomplete="off">
+    <div class="run-filters" role="group" aria-label="Filter by status">
+      {#each FILTERS as [key, label, title]}
+        <button type="button" class="chip" data-run-filter={key} {title} aria-pressed={view.status === key} onclick={() => view.status = key}>{label} <span class="run-filter-count">{key === "all" ? inventory.runs.length : inventory.runs.filter((run) => group(run) === key).length}</span></button>
+      {/each}
+    </div>
+  </div>
+  <div class="job-list run-list">
+    {#if shown.length}
+      <div class="job-list-head run-row">
+        <span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Created</span><span>Elapsed</span><span>Session</span>
       </div>
-    </div>
-    <div class="job-list run-list">
-      {#if shown.length}
-        <div class="job-list-head run-row">
-          <span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Created</span><span>Elapsed</span><span>Session</span>
+      {#each shown as run (run.run_id)}
+        {@const label = runDescription(run, null)}
+        {@const model = (run.model || "Run").split("/").at(-1)}
+        {@const session = sessionOf(run)}
+        <div class="job-list-row run-row" data-key={run.run_id}>
+          <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span></a>{#if label}<span class="muted micro">{label}</span>{/if}</span>
+          <span><Status value={runLabel(run)} /></span><span>{KINDS[run.fine_tuning_type] || run.fine_tuning_type || "—"}</span><span>{run.steps ?? "—"}</span><span>{age(run)}</span><span>{elapsedTime(run, inventory.observed_at)}</span>
+          <span class="mono micro run-session" title={(run.session_ids || []).join(", ") || undefined}>{session ?? "—"}</span>
         </div>
-        {#each shown as run (run.run_id)}
-          {@const label = runDescription(run, null)}
-          {@const model = (run.model || "Run").split("/").at(-1)}
-          {@const session = sessionOf(run)}
-          <div class="job-list-row run-row" data-key={run.run_id}>
-            <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span></a>{#if label}<span class="muted micro">{label}</span>{/if}</span>
-            <span><Status value={runLabel(run)} /></span><span>{KINDS[run.fine_tuning_type] || run.fine_tuning_type || "—"}</span><span>{run.steps ?? "—"}</span><span>{age(run)}</span><span>{elapsedTime(run, inventory.observed_at)}</span>
-            <span class="mono micro run-session" title={(run.session_ids || []).join(", ") || undefined}>{session ?? "—"}</span>
-          </div>
-        {/each}
-      {/if}
-    </div>
-    {#if !shown.length}<div class="empty-state">{inventory.runs.length ? "No runs match the search and status filter" : "No runs recorded"}</div>{/if}
-  {/if}
+      {/each}
+    {/if}
+  </div>
+  {#if !shown.length}<div class="empty-state">{inventory.runs.length ? "No runs match the search and status filter" : "No runs recorded"}</div>{/if}
 {:else if view.page === "health"}
   <h1 class="heading">Health</h1>
   {#each errors as error}<p class="health-message" role="status">{@render healthStatus("Source unavailable", "warning")}<span>{error}</span></p>{/each}
   {#if issues.length}
     <div class="scheduler-table-wrap"><table class="scheduler-table"><thead><tr><th>Issue</th><th>Resource</th><th>Evidence</th><th></th></tr></thead><tbody>
-      {#each issues as issue}<tr><td>{@render healthStatus(issue.issue, issue.tone)}</td><td>{issue.resource}</td><td>{issue.evidence}</td><td><a href={issue.link}>{issue.label} ↗</a></td></tr>{/each}
+      {#each issues as issue}<tr><td>{@render healthStatus(issue.issue, issue.tone)}</td><td>{issue.resource}</td><td>{issue.evidence}</td><td>{#if issue.link}<a href={issue.link}>{issue.label} ↗</a>{/if}</td></tr>{/each}
     </tbody></table></div>
   {:else if inventory.cluster.available === true && !errors.length}<p class="health-message">{@render healthStatus("Healthy", "success")}<span>No pod problems, node problems or source errors.</span></p>{/if}
   <p class="run-json-link"><a href={inspectUrl("inventory")}>Diagnostic JSON ↗</a> · <a href="/docs">API reference ↗</a></p>

@@ -23,7 +23,7 @@ from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
 from server.sampling_store import SamplingStore
 from server.store import RedisStore, RequestStore, StateStore, get_state_store, get_store
-from server.telemetry import Answering, gpu_turn, observe_operation, popped, record_op, serving, set_phase
+from server.telemetry import answered, gpu_turn, observe_operation, popped, serving, set_phase
 from training import commands
 from training.commands import parse_command
 from training.distributed import broadcast_object, is_distributed, is_primary, local_rank
@@ -208,6 +208,7 @@ class TrainingRequestsProcessor:
     # Only rank 0 writes to the store; the other ranks computed the same result.
     if request_id is not None and is_primary():
       await self.store.set_future(request_id, result)
+      answered(request_id)
 
   async def run_once(self) -> None:
     batch = await self.next_batch()
@@ -273,14 +274,12 @@ class TrainingRequestsProcessor:
 
     if gpu_reqs:
       async with gpu_turn(self.time_slicer, self.workload):
-        with record_op("wake_up"):
-          await asyncio.to_thread(self.worker.wake_up)
+        await asyncio.to_thread(self.worker.wake_up)
         try:
           for request in gpu_reqs:
             results.append(await self.handle_request(request))
         finally:
-          with record_op("sleep"):
-            await asyncio.to_thread(self.worker.sleep)
+          await asyncio.to_thread(self.worker.sleep)
 
     if not save_reqs:
       return
@@ -418,7 +417,7 @@ async def run_training_requests_processor(
   *,
   store: RequestStore | None = None,
 ) -> None:
-  store = Answering(get_store() if store is None else store)
+  store = get_store() if store is None else store
   pin_worker_threads_to_this_rank()
   if isinstance(worker, FFTTrainingWorker) and time_slicing_enabled():
     time_slicer = time_slicer or time_slicer_client_from_env()

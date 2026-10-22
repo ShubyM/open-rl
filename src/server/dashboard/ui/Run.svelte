@@ -20,12 +20,10 @@
   const url = $derived(inspectUrl("activity", bounds));
   const selection = () => !navigating && `${view.id} ${view.duration} ${view.end}`;
   const tab = $derived(["metrics", "logs"].includes(view.tab) ? view.tab : "activity");
-  // Activity and Metrics draw from the run's activity; the other tabs need it only for a run the inventory no longer lists.
-  const timed = $derived(tab === "activity" || tab === "metrics");
-  const inventoryRun = $derived(inventory.runs.find((r) => r.run_id === view.id));
-  const detail = createQuery(() => url, { poll: 15000, remember: () => view.end !== null, pollWhen: () => view.end === null && timed, key: () => (timed || !inventoryRun) && selection() });
-  const run = $derived(inventoryRun || (detail.status !== 404 ? detail.data?.run : null));
-  const error = $derived(inventory.store_error || inventory.processes_error || detail.error);
+  // Only the Activity tab draws from the run's activity.
+  const detail = createQuery(() => url, { poll: 15000, remember: () => view.end !== null, pollWhen: () => view.end === null && tab === "activity", key: () => tab === "activity" && selection() });
+  const run = $derived(inventory.runs.find((r) => r.run_id === view.id));
+  const error = $derived(detail.error);
   const title = $derived(run ? [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), KINDS[run.fine_tuning_type]].filter(Boolean).join(" · ") : "Run");
   // The saved settings worth reading, after the recipe; the title already names the training type.
   function setupOf(s) {
@@ -87,23 +85,10 @@
   <div id="run-panel">
     {#if tab === "logs"}
       {#if validEvent}<Logs {run} {view} {range} {navigating} allLogs={link("logs", { event: null, end: null })} />{/if}
-    {:else if tab === "metrics"}<Metrics {run} {view} {range} {bounds} {selection} {detail} {finished} {navigating} />
+    {:else if tab === "metrics"}<Metrics {run} {view} {range} {bounds} {selection} {finished} {navigating} />
     {:else}
       <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} {duty} {slots} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {/if}
   </div>
   </div>
-  {#if detail.data?.incidents?.length}
-    <section class="run-incidents" aria-label="Significant events">
-      {#each detail.data.incidents.slice(0, 3) as event}
-        {@const at = new Date(event.at * 1000).toISOString()}
-        {@const label = event.reason === "WorkerRestarted" ? "Worker restarted" : event.reason}
-        <div class={`run-incident incident-${event.tone}`}>
-          <time class="incident-time" datetime={at} title={at}>{at.slice(11, 19)}</time><span class="incident-label">{label}</span>
-          <span class="incident-context" title={event.message}>{event.pod}{event.container ? ` / ${event.container}` : ""}{event.restart_count ? ` · ${event.restart_count} total restarts` : event.count > 1 ? ` · ${event.count} reported occurrences` : ""}</span>
-          <a href={link("logs", { event: event.at, end: range.now })} aria-label={`View logs near ${label} on ${event.pod}`}>View logs</a>
-        </div>
-      {/each}
-    </section>
-  {/if}
 {/if}

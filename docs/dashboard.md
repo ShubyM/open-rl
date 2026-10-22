@@ -15,38 +15,32 @@ On GKE, `kubectl apply -k k8s/deploy/dashboard` deploys it into `openrl-system` 
 
 The API lists every run in the fleet, so the client-facing API server does not mount it by default. For a trusted local server without Redis, run `make dashboard-build`, then `OPEN_RL_INSPECTION_API=true make server`, and open `http://127.0.0.1:9003/dashboard`.
 
-Locally, worker log history needs Cloud Logging, nodes and pod logs need Kubernetes, and hardware and sampler charts need a metrics backend. Forwarded client logs keep a tail without Cloud Logging. A missing source shows as an unavailable-source message, never as an empty cluster.
+Locally, worker log history needs Cloud Logging, nodes and pod logs need Kubernetes, and hardware and sampler charts need a metrics backend. A missing source shows as an unavailable-source message, never as an empty cluster.
 
 ## Pages
 
-- **Overview** lists runs with a status label, failing and warning check badges, search, and status filters.
-- **Run** shows status, settings, the checks that fail or warn, an activity timeline, incidents, metrics, sampler charts, checks, and logs. Click the timeline to open the logs around that time.
-- **Nodes** shows accelerator nodes: which process held which GPU and when, each node's GPU duty cycle, and GPU and CPU charts. Drag or press A/D to pan; use Ctrl/⌘ + wheel, pinch, or W/S to zoom.
-- **Health** lists each active run's failing and warning checks, pod and node problems, and unavailable sources.
+- **Overview** lists runs with a status label, search, and status filters.
+- **Run** shows status, settings, an activity timeline with GPU rows and duty, metrics by step, sampler charts, and logs. Click the timeline to open the logs around that time.
+- **Nodes** shows accelerator nodes: which process held which GPU and when, each node's GPU duty cycle, and GPU utilization and memory. Drag or press A/D to pan; use Ctrl/⌘ + wheel, pinch, or W/S to zoom.
+- **Health** lists pod and node problems and unavailable sources.
 
-Pages show their last response while they refresh. A failed source keeps its last data for 30 seconds, then reports its error.
+Pages show their last response while they refresh.
 
 ## API
 
 | Route under `/api/v1/inspect` | Returns |
 |---|---|
-| `GET /inventory` | What the pages list: runs with their lifecycle, nodes with their GPUs, the GPUs held now, and pods with problems; an error per unavailable source |
-| `GET /activity` | One lane per placement with its worker's GPU turns and completed ops. With `run_id`, also the run, its incidents, and chart samples: every trainer op and the slowest sampler request per 1/1000 of the window |
-| `GET /series` | GPU utilization and memory per device UUID, worker CPU and memory, for a `node_id` or `run_id`; with `run_id`, the run's vLLM sampler series. `kind=devices` without a node or run returns every node's GPUs |
-| `GET /logs` | Worker, sampling-pool and forwarded client logs from Cloud Logging, with filters and Cloud Logging's page token as the cursor; the client-log tail when Cloud Logging is unconfigured |
-| `GET /pods/{pod}/logs` | Current or previous container output from the kubelet |
-| `GET /sessions` | Client sessions, newest first: start, last heartbeat, whether live, and the models each used |
-| `GET /sessions/{id}/checks` | `client-liveness` and `sdk-errors`, then each model check at its worst across the session's models |
-| `GET /sessions/{id}/summary` | A session in one answer: liveness, each model's state and pace, failing and warning checks |
-| `GET /runs/{id}/checks` | Diagnostic checks for one model: each a verdict (`ok`, `warn`, `fail`, `unknown`), a reason, numbers and evidence |
-| `GET /runs/{id}/summary` | A model in one answer: state, steps, step time, last trainer metrics, GPU duty by role |
-| `GET /runs/{id}/steps` | Trainer ops grouped by step, with stored client metrics; `fields` keeps client metrics by prefix |
-| `GET /runs/{id}/commands` | The model's command records, newest first, by window and role |
-| `GET /query` | A named PromQL query (`gpu_busy`, `gpu_util`, `vllm_*`, …) over a run's or node's GPUs and samplers at `points` resolution |
+| `GET /inventory` | What the pages list: runs with their lifecycle, nodes with their GPUs, the GPUs held now, pods with problems, and an error per unavailable source |
+| `GET /activity` | One lane per placement, fleet-wide, a node's or a run's, with its worker's GPU turns and completed ops in the window |
+| `GET /query` | A named PromQL query (`gpu_busy`, `gpu_util`, `gpu_memory_mib`, `vllm_*`, ...) over a run's or node's GPUs and pods, or the fleet's GPUs, at `points` resolution |
+| `GET /accelerators` | One row per GPU: node, slot, model, holder, utilization now and over the window, memory used of total |
+| `GET /runs` | Every live run in one line, longest since its last op first; `ended=true` adds ended runs |
+| `GET /runs/{id}/summary` | The run's facts: pace, goodput, unanswered requests and their holders, the request ledger, failures and relaunches with log reads, the pool, saves, optimizer, samplers, config, placement, incidents and GPU duty by role |
+| `GET /runs/{id}/steps` | Trainer ops grouped by step, with the client's metrics; `fields` keeps client metrics by prefix |
+| `GET /sessions/{id}/summary` | The session record, whether it is live, its SDK errors, and a line per model |
+| `GET /logs` | Worker, sampling-pool and forwarded client logs from Cloud Logging, with filters and Cloud Logging's page token as the cursor |
 
-`activity`, `series`, and `logs` take ISO `since` and `until` bounds of up to seven days. An omitted end is now, and an omitted start the 30 minutes before it. Missing op records do not prove that no requests arrived or that workers were idle. `error` means a source could not be read.
-
-Requests have a 12-second budget, below the browser's 15-second timeout. Identical concurrent Prometheus queries share one fetch. A log cursor is valid only with the same filters, `since` and `until` as the page that returned it.
+`activity`, `query`, `accelerators` and `logs` take ISO `since` and `until` bounds of up to seven days; `since` also takes a span such as `1h`. An omitted end is now, and an omitted start the 30 minutes before it. Missing op records do not prove that no requests arrived or that workers were idle. `error` means a source could not be read. A log cursor is valid only with the same filters, `since` and `until` as the page that returned it.
 
 ## Checks
 

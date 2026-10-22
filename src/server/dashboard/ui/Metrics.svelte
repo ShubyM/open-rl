@@ -3,7 +3,7 @@
   import QueryChart from "./QueryChart.svelte";
   import { createQuery, inspectUrl, viewLink } from "./state.svelte.js";
   import { opLabel, opRank } from "./visualization.js";
-  let { run, view, range, bounds, selection, detail, finished, navigating = false } = $props();
+  let { run, view, range, bounds, selection, finished, navigating = false } = $props();
   // Every recorded step of the run, charted by step rather than by the time window.
   const steps = createQuery(() => inspectUrl(`runs/${encodeURIComponent(view.id)}/steps`, { last: 1000 }), { poll: 30000, pollWhen: () => !finished });
   const rows = $derived(steps.data?.steps || []);
@@ -29,9 +29,8 @@
     if (group === "key") return allClient.filter(([name]) => FIRST.some(([first]) => first === name));
     return group === "all" ? allClient : allClient.filter(([name]) => groupOf(name) === group);
   });
-  const samples = $derived((detail.data?.samples || []).filter((s) => s.at >= range.start && s.at <= range.now));
-  const roles = $derived([...new Set(samples.map((s) => s.role || "process"))]);
-  const metricStatus = $derived(detail.error ? `${detail.error}${samples.length ? " · Showing previously fetched metrics" : ""}` : detail.pending ? "Updating…" : "");
+  // Each op's mean duration per step, from the same step rows.
+  const opNames = $derived([...new Set(rows.flatMap((row) => Object.keys(row.ops)))].sort((a, b) => opRank(a) - opRank(b) || a.localeCompare(b)));
   // The vLLM series of a run's samplers, as vLLM's and llm-d's dashboards chart them.
   const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
     ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
@@ -54,10 +53,10 @@
     {#each trainerCharts as [op, name] (`${op} ${name}`)}<Chart title={`${name} · ${opLabel(op)}`} steps points={byStep((row) => row.ops[op]?.metrics[name]?.mean)} start={stepRange.start} end={stepRange.end} tone="accent" empty="No values" />{/each}
   </div>{:else if steps.data}<p class="muted">0 metrics</p>{/if}
   <h2 class="scheduler-title">Operations</h2>
-  <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span>{#if metricStatus}<span class={detail.error ? "source-error" : "muted"} role="status">{metricStatus}</span>{/if}</div>
+  <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span></div>
   <div class="chart-grid">
-    {#each roles as role (role)}<Chart title={{ trainer: "Trainer operation duration", sampler: "Slowest sampler request" }[role] || `${role} operation duration`} unit="s" points={samples.filter((s) => (s.role || "process") === role).map((s) => [s.at, s.elapsed_seconds])} start={range.start} end={range.now} min={0} tone="accent" {navigating} />{/each}
-    {#if !samples.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">No operations recorded in this time range</p>{/if}
+    {#each opNames as op (op)}<Chart title={`${opLabel(op)} duration`} unit="s" steps points={byStep((row) => row.ops[op] && row.ops[op].seconds / row.ops[op].count)} start={stepRange.start} end={stepRange.end} min={0} tone="accent" empty="No values" />{/each}
+    {#if steps.data && !rows.length}<p class="empty-state">No operations recorded</p>{/if}
   </div>
   <h2 class="scheduler-title">Samplers</h2>
   <!-- A shared pool's load is every run's, so it is charted on Nodes rather than here. -->
