@@ -183,8 +183,11 @@ def storage(ctx: dict) -> dict:
   numbers = {"saves": len(saves), "failed": len(failed)}
   if failed:
     return answer(name, FAIL, f"{len(failed)} of {len(saves)} save_state calls failed", f"runs/{run_id}/commands", **numbers)
-  if not saves and len(optim_steps(ctx)) > 2:
-    return answer(name, WARN, "no successful save_state after 2 steps", **numbers)
+  last_save = max((s["at"] for s in saves if s.get("status") == "succeeded"), default=0.0)
+  since = sum(s["at"] > last_save for s in optim_steps(ctx))
+  numbers["steps_since_save"] = since
+  if since > 5:
+    return answer(name, WARN, f"{since} steps since the last successful save_state; a crash loses them", f"runs/{run_id}/commands", **numbers)
   return answer(name, UNKNOWN, "saves succeed; volume usage is not recorded", **numbers)
 
 
@@ -214,6 +217,8 @@ def client_liveness(session: dict) -> dict:
   quiet = now - max(requests) if requests else None
   heard = now - record["last_seen_at"]
   unfinished = [m for m, ctx in session["models"].items() if not ctx["finished"] and not session["resumed"].get(m)]
+  if record.get("derived") and not session["live"] and unfinished:
+    return answer(name, UNKNOWN, "no session record, and no live heartbeat key; its gateway predates session records")
   numbers = {"since_heartbeat_s": round(heard), "since_request_s": round(quiet) if quiet is not None else None, "models": len(session["models"])}
   evidence = f"sessions/{record['session_id']}/summary"
   if session["live"] and unfinished and quiet is not None and quiet > 600:

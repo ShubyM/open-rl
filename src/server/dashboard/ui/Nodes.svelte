@@ -1,7 +1,6 @@
 <script>
   import { tick, onDestroy } from "svelte";
   import Chart from "./Chart.svelte";
-  import CollectorMetrics from "./CollectorMetrics.svelte";
   import Activity from "./Activity.svelte";
   import CopyLink from "./CopyLink.svelte";
   import TimeControl from "./TimeControl.svelte";
@@ -136,7 +135,6 @@
             {#if series.error}<button type="button" class="chip" onclick={series.retry}>Retry GPU metrics</button>{/if}
           </div><div class="allocation-detail-footer"><span>{activitySource(visible)}</span><span class="allocation-memory">GPU memory <strong>{Number.isFinite(gpuMemory) ? `${(gpuMemory / 1024).toFixed(1)} GiB` : "—"}</strong>{#if gpuMemoryError}<span class="source-error" role="status"> · {Number.isFinite(gpuMemory) ? "Stale" : "Unavailable"}: {gpuMemoryError}</span>{/if}</span></div></div>{/if}
           {#if placements.length || metrics.workers?.length}<div class="node-gpu-detail" data-key="node-worker-detail"><Chart title={`Worker CPU${metrics.workers.length ? ` · ${metrics.workers.length} process${metrics.workers.length === 1 ? "" : "es"}` : ""}`} unit="cores" points={cpuPoints} start={range.start} end={range.now} min={0} gapSeconds={gapFor(cpuPoints, 180)} empty={cpuError || (!series.data && metrics.reason) || "No CPU samples for these workers"} note={cpuError ? `${cpuError} · Showing previously fetched samples` : ""} {navigating} /><div class="allocation-detail-footer"><span>{sourceNote}</span><span class="allocation-memory">Worker memory <strong>{Number.isFinite(workerMemory) ? `${(workerMemory / 2 ** 30).toFixed(1)} GiB` : "—"}</strong>{#if workerMemoryError}<span class="source-error" role="status"> · {Number.isFinite(workerMemory) ? "Stale" : "Unavailable"}: {workerMemoryError}</span>{/if}</span></div></div>{/if}
-          <CollectorMetrics params={{ ...bounds, node_id: node.name }} {view} {range} {navigating} />
         </section>
       {/if}
     </div>

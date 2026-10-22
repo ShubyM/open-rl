@@ -44,6 +44,8 @@
   // Duty is one number per GPU over the window, keyed by UUID.
   const busy = createQuery(() => inspectUrl("query", { name: "gpu_busy", ...bounds, points: 1 }), { scope: () => view.id, poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: () => tab === "activity" && selection() });
   const duty = $derived(Object.fromEntries((busy.data?.series || []).filter((s) => s.points.length).map((s) => [s.labels.UUID, Math.round(s.points.at(-1)[1])])));
+  // DCGM's slot index names a GPU whose node is gone.
+  const slots = $derived(Object.fromEntries((busy.data?.series || []).filter((s) => s.labels.gpu != null).map((s) => [s.labels.UUID, s.labels.gpu])));
   // A finished run opens on its own lifetime rather than the last 30 minutes, unless the link names a window.
   const finished = $derived(isFinished(run));
   let opened = false;
@@ -105,7 +107,7 @@
     {:else if tab === "metrics"}<Metrics {run} {view} {range} {bounds} {selection} {detail} {finished} {navigating} />
     {:else if tab === "checks"}<Checks id={view.id} {finished} />
     {:else}
-      <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} {duty} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
+      <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} {duty} {slots} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {/if}
   </div>
   </div>

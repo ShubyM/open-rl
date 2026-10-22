@@ -1,7 +1,7 @@
 <script>
   import { nodeLink, viewLink, crosshair, crosshairOffset, timeAt } from "./state.svelte.js";
   import { axisTime, chartTime, valueText, placementColor, processLabel, shortNodeName, opRank, opLabel, activitySource, deviceLabel } from "./visualization.js";
-  let { placements = [], range, inventory, acrossNodes = false, activeOnly = false, selected = null, onselect, error = null, pending = false, showSource = true, back = null, navigating = false, onpick = null, duty = null } = $props();
+  let { placements = [], range, inventory, acrossNodes = false, activeOnly = false, selected = null, onselect, error = null, pending = false, showSource = true, back = null, navigating = false, onpick = null, duty = null, slots = null } = $props();
   let tooltip = $state(null), tip;
   const cursor = $derived(crosshairOffset(range));
   const activities = $derived(placements.toSorted((a, b) => (acrossNodes ? (({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""))) : 0) || a.start - b.start || a.id.localeCompare(b.id)));
@@ -17,7 +17,7 @@
   // A lane names its GPUs by DRA device or by UUID, and its node may no longer be reported.
   function gpuOf(p, id) {
     const uuid = p.device_uuids?.[id], device = inventory.cluster.nodes.find((n) => n.name === p.node)?.devices.find((d) => d.id === id || (uuid && d.uuid === uuid));
-    return { id, uuid, label: device ? `GPU ${deviceLabel(device.name)}` : id.includes("/") ? `GPU ${deviceLabel(id)}` : (uuid || id).slice(0, 12) };
+    return { id, uuid, label: device ? `GPU ${deviceLabel(device.name)}` : id.includes("/") ? `GPU ${deviceLabel(id)}` : slots?.[uuid || id] != null ? `GPU ${slots[uuid || id]}` : (uuid || id).slice(0, 12) };
   }
   const dutyText = (device) => { const value = device && (duty?.[device.uuid] ?? duty?.[device.id]); return Number.isFinite(value) ? `${value}%` : "—"; };
   $effect(() => { placements; range; navigating; tooltip = null; });

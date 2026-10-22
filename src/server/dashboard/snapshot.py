@@ -124,6 +124,7 @@ def join_runs(metadata: list[dict], state: dict) -> list[dict]:
         "display_name": row.get("name") or row.get("run_name"),
         "recipe_name": row.get("recipe_name"),
         "git_rev": row.get("git_rev"),
+        "session_ids": meta.session_ids,
         "fine_tuning_type": meta.fine_tuning_type,
         "runtime_id": runtime,
         "pool": pool,

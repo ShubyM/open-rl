@@ -78,6 +78,7 @@ class Progress(Record):
 
 
 class Run(Record):
+  session_ids: list[str] = Field(default_factory=list, description="The client sessions that created or attached this model, oldest first")
   run_id: str
   model: str | None = None
   runtime_id: str | None = None

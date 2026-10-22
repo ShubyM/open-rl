@@ -414,10 +414,12 @@ async def session_context(session_id: str) -> dict:
       models[model_id] = await check_context(model_id, window)
       meta = decode_model_metadata(await store.get_value(METADATA_PREFIX + model_id))
       resumed[model_id] = bool(meta and meta.session_ids and meta.session_ids[-1] != session_id)
+  # The registry's live key is written by every gateway version; a record alone may be stale or derived.
+  live_key = await store.get_value(f"open_rl:session:{session_id}") is not None
   return {
     "record": record,
     "now": now,
-    "live": now - record["last_seen_at"] < checks.SESSION_LIVE_SECONDS,
+    "live": live_key or (not record.get("derived") and now - record["last_seen_at"] < checks.SESSION_LIVE_SECONDS),
     "models": models,
     "resumed": resumed,
     "errors": await store.read_samples(telemetry.sdk_errors_key(session_id)),

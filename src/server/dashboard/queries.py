@@ -12,10 +12,11 @@ from server.dashboard.sources import SAMPLER_QUERIES, any_of, log_window
 
 GPU = "{{UUID=~{gpus}{scope}}}"
 QUERIES = {
-  "gpu_util": f"max by (UUID) (DCGM_FI_DEV_GPU_UTIL{GPU})",
-  "gpu_memory_mib": f"max by (UUID) (DCGM_FI_DEV_FB_USED{GPU})",
+  # By UUID and gpu: DCGM's slot index names a GPU after its node is gone.
+  "gpu_util": f"max by (UUID, gpu) (DCGM_FI_DEV_GPU_UTIL{GPU})",
+  "gpu_memory_mib": f"max by (UUID, gpu) (DCGM_FI_DEV_FB_USED{GPU})",
   # Duty cycle over the window: the share of time a kernel ran, one number per GPU.
-  "gpu_busy": f"max by (UUID) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{GPU}[{{window}}s]))",
+  "gpu_busy": f"max by (UUID, gpu) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{GPU}[{{window}}s]))",
   **{f"vllm_{name}": expression.replace("{M}", "{{pod=~{pods}{scope}}}") for name, expression in SAMPLER_QUERIES.items()},
 }
 
