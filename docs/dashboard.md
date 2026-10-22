@@ -19,10 +19,10 @@ Locally, worker log history needs Cloud Logging, nodes and pod logs need Kuberne
 
 ## Pages
 
-- **Overview** lists runs with status, search, and status filters.
-- **Run** shows status, settings, workers, an activity timeline, incidents, metrics, sampler charts, and logs. Click the timeline to open the logs around that time.
+- **Overview** lists runs with a status label, failing and warning check badges, search, and status filters.
+- **Run** shows status, settings, the checks that fail or warn, an activity timeline, incidents, metrics, sampler charts, checks, and logs. Click the timeline to open the logs around that time.
 - **Nodes** shows accelerator nodes: which process held which GPU and when, each node's GPU duty cycle, and GPU and CPU charts. Drag or press A/D to pan; use Ctrl/⌘ + wheel, pinch, or W/S to zoom.
-- **Health** lists pod and node problems and unavailable sources.
+- **Health** lists each active run's failing and warning checks, pod and node problems, and unavailable sources.
 
 Pages show their last response while they refresh. A failed source keeps its last data for 30 seconds, then reports its error.
 
@@ -30,7 +30,7 @@ Pages show their last response while they refresh. A failed source keeps its las
 
 | Route under `/api/v1/inspect` | Returns |
 |---|---|
-| `GET /inventory` | Runs with status, progress, workers, pods, and scheduler workloads; nodes with their GPUs, and current placements; an error per unavailable source |
+| `GET /inventory` | What the pages list: runs with their lifecycle, nodes with their GPUs, the GPUs held now, and pods with problems; an error per unavailable source |
 | `GET /activity` | One lane per placement with its worker's GPU turns and completed ops. With `run_id`, also the run, its incidents, and chart samples: every trainer op and the slowest sampler request per 1/1000 of the window |
 | `GET /series` | GPU utilization and memory per device UUID, worker CPU and memory, for a `node_id` or `run_id`; with `run_id`, the run's vLLM sampler series. `kind=devices` without a node or run returns every node's GPUs |
 | `GET /logs` | Worker, sampling-pool and forwarded client logs from Cloud Logging, with filters and Cloud Logging's page token as the cursor; the client-log tail when Cloud Logging is unconfigured |
@@ -62,16 +62,16 @@ python -m server.scripts.forward_logs /path/to/run --base-url http://gateway:800
 
 It reads `logs.log` every 15 seconds and, without `--run-id`, waits for the first model path in `checkpoints.jsonl`. Retries and restarts can duplicate lines.
 
-## Progress
+## Lifecycle
 
-Each active run has a `progress` verdict, judged by what completes:
+Each run in `/inventory` has a `lifecycle`, which says where it is, not whether it is healthy:
 
-- **OK**: requests are completing.
-- **STALLED**: a request has been on a trainer, in the run's sampling pool, or in the trainer queue for longer than three median steps, and at least 10 minutes.
-- **DEAD**: a process that stopped reporting holds requests, either the trainer that popped them or the dispatcher of their pool.
-- **IDLE**: nothing is queued or running and nothing has completed for that long.
+- **ended**: the gateway marked it finished, its workers stopped, or it has no workers and no live session.
+- **waiting**: a worker is not placed yet, or the server has not created one for a live session.
+- **placed**: every worker is placed.
+- **active**: the scheduler cannot be read, so placement is unknown.
 
-`progress.outstanding` lists unanswered requests with their age and holder; `progress.queued` counts the trainer queue; `progress.dispatcher` is the pool dispatcher's record, with replica weight versions, loads in flight, and its last error.
+The pages label a run from its lifecycle and show `Unhealthy` when its checks fail. Whether a run is healthy, and why, is `/runs/{id}/checks`.
 
 ## Sources
 

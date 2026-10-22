@@ -109,7 +109,7 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | `GET /runs/{id}/checks?only=` | One model's check results | About 1.1 KB for 8 |
 | `GET /runs/{id}/summary` | Verdict, goodput, state, step, step time, last reward, per-GPU duty | About 1 KB |
 | `GET /catalog` | What each check and named query means | About 2.5 KB |
-| `GET /inventory` | Runs and fleet, slimmed to what pages list | As today, smaller |
+| `GET /inventory` | What the pages list: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, and pods with problems. No health judgment; that is `/runs/{id}/checks` | About 17 KB on the demo store, against 112 KB |
 
 Named queries keep one copy of each PromQL expression for checks and UI, and keep agent calls bounded.
 
@@ -157,12 +157,13 @@ The Svelte dashboard becomes a client of 4.4:
 
 | View | Built from |
 |---|---|
-| Overview | `/inventory`, `/runs/{id}/summary`, check verdict badges |
+| Overview | `/inventory` for runs and lifecycle; `/sessions/{id}/summary` for each model's verdict and check badges. The label is the lifecycle, or `Unhealthy` when the verdict fails |
+| Run · header | `/runs/{id}/checks`: the label, and each failing or warning check with its reason |
 | Run · Activity | `/runs/{id}/commands` for lanes; `/query?name=run_gpu_busy&points=1` for Duty |
 | Run · Metrics | `/runs/{id}/steps` charted by step; `/query` for vLLM and GPU charts at chart width |
 | Run · Logs | `/logs/search` |
 | Nodes | `/query?name=node_gpu_holders`, `/query` per GPU |
-| Health | `/runs/{id}/checks` across active runs |
+| Health | `/runs/{id}/checks` across active runs, then pod problems, nodes not ready and source errors from `/inventory` |
 
 ### 4.7 GKE and local
 
