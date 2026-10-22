@@ -45,11 +45,12 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .run-filters { display: flex; flex-wrap: wrap; gap: 6px; }
 #app .metric-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; } #app .metric-filters input { width: 28ch; }
 #app .run-filter-count { margin-left: 4px; color: var(--dim); font-variant-numeric: tabular-nums; }
-#app :is(.job-list-head, .job-list-row).run-row { position: relative; grid-template-columns: minmax(0, 1fr) 128px 100px 112px 80px 150px; }
+#app :is(.job-list-head, .job-list-row).run-row { position: relative; grid-template-columns: minmax(0, 1fr) 120px 72px 88px 160px; gap: 24px; }
 /* The run link covers its row. */
 #app .run-row .job-identity a::after { content: ""; position: absolute; inset: 0; }
 #app .run-row:hover .job-identity a { text-decoration: underline; text-underline-offset: 3px; }
-#app .run-row > .run-session, #app .job-list-head.run-row > :nth-child(6) { text-align: right; overflow: hidden; text-overflow: ellipsis; }
+#app :is(.job-list-head, .job-list-row).run-row > :is(:nth-child(3), :nth-child(4)) { text-align: right; font-variant-numeric: tabular-nums; }
+#app .run-row > .run-session, #app .job-list-head.run-row > :nth-child(5) { text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Sessions group the run rows; a session's runs are indented under its header. */
 #app .state { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 #app :is(.state-dot, .health-dot) { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
@@ -283,17 +284,17 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .scheduler-table :is(th, td):not(:nth-child(3)) { white-space: nowrap; }
 /* Keep the identity readable before switching to compact rows. */
 @media (min-width: 761px) and (max-width: 1100px) {
-  #app :is(.job-list-head, .job-list-row).run-row { grid-template-columns: minmax(0, 1fr) 128px 68px 76px 76px 68px 132px; gap: 12px; }
+  #app :is(.job-list-head, .job-list-row).run-row { grid-template-columns: minmax(0, 1fr) 112px 56px 72px 140px; gap: 16px; }
 }
 @media (max-width: 760px) {
   #app :is(.job-list-head, .job-list-row).run-row { grid-template-columns: minmax(0, 1fr) minmax(100px, auto); gap: 6px 12px; }
   #app .job-list-head.run-row > :nth-child(n + 3) { display: none; }
   #app .run-row > :nth-child(2) { justify-self: end; }
   #app .run-row > :nth-child(n + 3) { color: var(--dim); font-size: 12px; }
-  #app .run-row > :is(:nth-child(3), :nth-child(5)) { grid-column: 1; text-align: left; }
+  #app .run-row > :nth-child(3) { grid-column: 1; text-align: left; }
   #app .run-row > :nth-child(4) { grid-column: 2; text-align: right; }
-  #app .job-list-row.run-row > :nth-child(4)::after { content: " steps"; }
-  #app .job-list-row.run-row > :nth-child(5)::before { content: "Elapsed "; }
+  #app .job-list-row.run-row > :nth-child(3)::after { content: " steps"; }
+  #app .job-list-row.run-row > :nth-child(4)::before { content: "Elapsed "; }
   #app .job-list-row.run-row > .run-session { grid-column: 1 / -1; text-align: left; }
 }
 @media (max-width: 580px) {
