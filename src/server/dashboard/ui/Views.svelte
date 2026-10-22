@@ -61,7 +61,7 @@
         {@const model = (run.model || "Run").split("/").at(-1)}
         {@const session = sessionOf(run)}
         <div class="job-list-row run-row" data-key={run.run_id}>
-          <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span>{#if KINDS[run.fine_tuning_type] || run.fine_tuning_type} · {KINDS[run.fine_tuning_type] || run.fine_tuning_type}{/if}</a>{#if label}<span class="muted micro">{label}</span>{/if}</span>
+          <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span>{#if KINDS[run.fine_tuning_type] || run.fine_tuning_type}{` · ${KINDS[run.fine_tuning_type] || run.fine_tuning_type}`}{/if}</a>{#if label}<span class="muted micro">{label}</span>{/if}</span>
           <span><Status value={runLabel(run)} /></span><span>{run.steps ?? "—"}</span><span>{elapsedTime(run, inventory.observed_at)}</span>
           <span class="mono micro run-session" title={(run.session_ids || []).join(", ") || undefined}>{session ?? "—"}</span>
         </div>
