@@ -149,6 +149,17 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       self.manager.ensure("job-lora-1", "trainer")
     self.assertEqual(len(self.api.created), 1)
 
+  def test_gemma_4_samplers_load_the_text_only_model(self) -> None:
+    for model_id, tuning in (("job-lora-1", "lora"), ("job-fft-1", "full")):
+      s = self.store_with(model_id, {"base_model": "google/gemma-4-E2B", "fine_tuning_type": tuning})
+      with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}), patch("server.worker_manager.get_state_store", return_value=s):
+        self.manager.ensure(model_id, "sampler")
+
+    self.assertEqual(len(self.api.created), 2)
+    for pod in self.api.created:
+      env = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
+      self.assertEqual(env.get("VLLM_ARCHITECTURE_OVERRIDE"), "Gemma4ForCausalLM")
+
   def test_placement_knowledge_stays_out_of_the_template(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.worker_manager.get_state_store", return_value=s):
