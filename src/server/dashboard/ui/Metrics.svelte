@@ -1,0 +1,51 @@
+<script>
+  import Chart from "./Chart.svelte";
+  import QueryChart from "./QueryChart.svelte";
+  import { createQuery, inspectUrl, viewLink } from "./state.svelte.js";
+  import { opLabel, opRank } from "./visualization.js";
+  let { run, view, range, bounds, selection, detail, finished, navigating = false } = $props();
+  // Every recorded step of the run, charted by step rather than by the time window.
+  const steps = createQuery(() => inspectUrl(`runs/${encodeURIComponent(view.id)}/steps`, { last: 1000 }), { poll: 30000, pollWhen: () => !finished });
+  const rows = $derived(steps.data?.steps || []);
+  const stepRange = $derived(rows.length ? { start: rows[0].step, end: rows.at(-1).step } : null);
+  const byStep = (value) => rows.map((row) => [row.step, value(row)]).filter(([, v]) => Number.isFinite(v));
+  // Each op's metrics arrive as min, max and mean over the step's calls; the means of the per-call means are charted.
+  const trainerCharts = $derived([...new Map(rows.flatMap((row) => Object.entries(row.ops).flatMap(([op, entry]) => Object.keys(entry.metrics).filter((name) => name.endsWith(":mean")).map((name) => [`${op} ${name}`, [op, name]])))).values()]
+    .sort(([a, x], [b, y]) => opRank(a) - opRank(b) || x.localeCompare(y)));
+  const FIRST = [["env/all/reward/total", "Reward"], ["test/env/all/reward/total", "Held-out reward"], ["env/all/lab/criteria_pass_fraction", "Criteria pass rate"],
+    ["test/env/all/lab/criteria_pass_fraction", "Held-out criteria pass rate"], ["optim/kl_sample_train_v2", "Sampler-trainer KL"], ["optim/entropy", "Entropy"], ["time/total", "Step time", "s"]];
+  const clientCharts = $derived.by(() => {
+    const names = new Set(rows.flatMap((row) => Object.keys(row.client || {})));
+    return [...FIRST.filter(([name]) => names.has(name)), ...[...names].filter((name) => !FIRST.some(([first]) => first === name)).sort().map((name) => [name, name])];
+  });
+  const samples = $derived((detail.data?.samples || []).filter((s) => s.at >= range.start && s.at <= range.now));
+  const roles = $derived([...new Set(samples.map((s) => s.role || "process"))]);
+  const metricStatus = $derived(detail.error ? `${detail.error}${samples.length ? " · Showing previously fetched metrics" : ""}` : detail.pending ? "Updating…" : "");
+  // The vLLM series of a run's samplers, as vLLM's and llm-d's dashboards chart them.
+  const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
+    ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
+</script>
+
+<div class="run-metrics" data-run-metrics={view.id}>
+  {#if steps.error}<p class="source-error" role="status">{steps.error}{rows.length ? " · Showing previously fetched steps" : ""}</p>{/if}
+  <h2 class="scheduler-title">Client metrics</h2>
+  {#if clientCharts.length}<div class="chart-grid">
+    {#each clientCharts as [key, title, unit = ""] (key)}<Chart {title} {unit} steps points={byStep((row) => row.client?.[key])} start={stepRange.start} end={stepRange.end} empty="No values" />{/each}
+  </div>{:else if steps.data}<p class="muted">0 metrics</p>{:else if !steps.error}<p class="muted">Loading…</p>{/if}
+  <h2 class="scheduler-title">Trainer metrics</h2>
+  {#if trainerCharts.length}<div class="chart-grid">
+    {#each trainerCharts as [op, name] (`${op} ${name}`)}<Chart title={`${name} · ${opLabel(op)}`} steps points={byStep((row) => row.ops[op]?.metrics[name]?.mean)} start={stepRange.start} end={stepRange.end} tone="accent" empty="No values" />{/each}
+  </div>{:else if steps.data}<p class="muted">0 metrics</p>{/if}
+  <h2 class="scheduler-title">Operations</h2>
+  <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span>{#if metricStatus}<span class={detail.error ? "source-error" : "muted"} role="status">{metricStatus}</span>{/if}</div>
+  <div class="chart-grid">
+    {#each roles as role (role)}<Chart title={{ trainer: "Trainer operation duration", sampler: "Slowest sampler request" }[role] || `${role} operation duration`} unit="s" points={samples.filter((s) => (s.role || "process") === role).map((s) => [s.at, s.elapsed_seconds])} start={range.start} end={range.now} min={0} tone="accent" {navigating} />{/each}
+    {#if !samples.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">No operations recorded in this time range</p>{/if}
+  </div>
+  <h2 class="scheduler-title">Samplers</h2>
+  <!-- A shared pool's load is every run's, so it is charted on Nodes rather than here. -->
+  {#if run.shared_runtime}<p class="muted">The pool's samplers serve every run on this base model; see their load on <a href={viewLink("nodes")}>Nodes</a>.</p>
+  {:else}<div class="chart-grid">
+    {#each SAMPLER_CHARTS as [key, title, unit, scale = 1] (key)}<QueryChart name={`vllm_${key}`} params={bounds} {view} {range} {selection} {title} {unit} {scale} {navigating} />{/each}
+  </div>{/if}
+</div>

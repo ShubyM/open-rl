@@ -1,20 +1,16 @@
 <script>
   import { createQuery, inspectUrl, now, rangeOf, viewLink, saved, MAX_WINDOW } from "./state.svelte.js";
   import { nodeTime } from "./node-time.js";
-  import { mergeSeries } from "./series.js";
   import { clipPlacements } from "./visualization.js";
   import TimeControl from "./TimeControl.svelte";
   import Status from "./Status.svelte";
-  import Chart from "./Chart.svelte";
-  import CollectorMetrics from "./CollectorMetrics.svelte";
+  import Metrics from "./Metrics.svelte";
+  import Checks from "./Checks.svelte";
   import Activity from "./Activity.svelte";
   import Logs from "./Logs.svelte";
   import CopyLink from "./CopyLink.svelte";
   import { duration, shortNodeName, KINDS, runDescription, isFinished, finishedAt } from "./format.js";
   let { inventory, view } = $props();
-  function metricNames(rows) {
-    return [...new Set(rows.flatMap((row) => Object.entries(row.metrics || {}).filter(([, value]) => Number.isFinite(value)).map(([name]) => name)))];
-  }
   // Draw gestures immediately, but fetch only once the user settles on a window.
   let navigating = $state(false);
   const observed = $derived(now(inventory));
@@ -24,8 +20,11 @@
   const bounds = $derived({ since: new Date(range.start * 1000).toISOString(), until: new Date(range.now * 1000).toISOString(), run_id: view.id });
   const url = $derived(inspectUrl("activity", bounds));
   const selection = () => !navigating && `${view.id} ${view.duration} ${view.end}`;
+  const tab = $derived(["metrics", "checks", "logs"].includes(view.tab) ? view.tab : "activity");
+  // Activity and Metrics draw from the run's activity; the other tabs need it only for a run the inventory no longer lists.
+  const timed = $derived(tab === "activity" || tab === "metrics");
   const inventoryRun = $derived(inventory.runs.find((r) => r.run_id === view.id));
-  const detail = createQuery(() => url, { poll: 15000, remember: () => view.end !== null, pollWhen: () => view.end === null && view.tab !== "logs", key: () => (view.tab !== "logs" || !inventoryRun) && selection() });
+  const detail = createQuery(() => url, { poll: 15000, remember: () => view.end !== null, pollWhen: () => view.end === null && timed, key: () => (timed || !inventoryRun) && selection() });
   const run = $derived(inventoryRun || (detail.status !== 404 ? detail.data?.run : null));
   const error = $derived(inventory.store_error || inventory.processes_error || detail.error);
   const title = $derived(run ? [(run.model || "Run").split("/").at(-1), run.run_id.slice(0, 8), KINDS[run.fine_tuning_type]].filter(Boolean).join(" · ") : "Run");
@@ -42,24 +41,9 @@
     ];
   }
   const description = $derived(run ? [runDescription(run, title), ...setupOf(run.settings || {})].filter(Boolean).join(" · ") : "");
-  const samples = $derived((detail.data?.samples || []).filter((s) => s.at >= range.start && s.at <= range.now));
-  const roles = $derived([...new Set(samples.map((s) => s.role || "process"))]);
-  const trained = $derived(samples.filter((s) => s.role === "trainer"));
-  const names = $derived(metricNames(trained));
-  const metricStatus = $derived(detail.error ? `${detail.error}${samples.length ? " · Showing previously fetched metrics" : ""}` : detail.pending ? "Updating…" : "");
-  // A shared pool's load is every run's, so it is charted on Nodes rather than here.
-  const vllm = createQuery(() => inspectUrl("series", { ...bounds, kind: "samplers" }), { scope: () => view.id, merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: () => view.tab === "metrics" && run && !run.shared_runtime && selection() });
-  const gpus = createQuery(() => inspectUrl("series", { ...bounds, kind: "devices" }), { scope: () => view.id, merge: mergeSeries, poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: () => view.tab !== "logs" && view.tab !== "metrics" && selection() });
-  // Keyed by both UUID and device id because a lane may know its GPU by either.
-  const duty = $derived(Object.fromEntries((gpus.data?.devices || []).flatMap((d) => {
-    const values = (d.utilization || []).filter(([at]) => at >= range.start && at <= range.now).map(([, v]) => v);
-    return values.length ? [d.id, d.uuid].filter(Boolean).map((key) => [key, Math.round(values.reduce((a, b) => a + b, 0) / values.length)]) : [];
-  })));
-  // DCGM's slot index names a GPU whose node is gone.
-  const slots = $derived(Object.fromEntries((gpus.data?.devices || []).filter((d) => d.slot != null).map((d) => [d.uuid, d.slot])));
-  // The vLLM series the inspection API returns for a run's samplers, as vLLM's and llm-d's dashboards chart them.
-  const SAMPLER_CHARTS = [["generation_tokens_per_second", "Generated tokens", "tok/s"], ["prompt_tokens_per_second", "Prompt tokens", "tok/s"], ["requests_running", "Running requests", ""], ["requests_waiting", "Waiting requests", ""],
-    ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
+  // Duty is one number per GPU over the window, keyed by UUID.
+  const busy = createQuery(() => inspectUrl("query", { name: "gpu_busy", ...bounds, points: 1 }), { scope: () => view.id, poll: 15000, pollWhen: () => view.end === null, remember: () => view.end !== null, key: () => tab === "activity" && selection() });
+  const duty = $derived(Object.fromEntries((busy.data?.series || []).filter((s) => s.points.length).map((s) => [s.labels.UUID, Math.round(s.points.at(-1)[1])])));
   // A finished run opens on its own lifetime rather than the last 30 minutes, unless the link names a window.
   const finished = $derived(isFinished(run));
   let opened = false;
@@ -108,43 +92,20 @@
   <div use:nodeTime={{ view, getRange: () => range, getNow: () => observed, onGesture: (value) => navigating = !!value }}>
   <div class="run-toolbar">
     <nav class="workspace-tabs" aria-label="Run views">
-      <a href={link("activity")} aria-current={view.tab === "activity" ? "page" : undefined}>Activity</a>
-      <a href={link("metrics")} aria-current={view.tab === "metrics" ? "page" : undefined}>Metrics</a>
-      <a href={link("logs")} aria-current={view.tab === "logs" ? "page" : undefined}>Logs</a>
+      <a href={link("activity")} aria-current={tab === "activity" ? "page" : undefined}>Activity</a>
+      <a href={link("metrics")} aria-current={tab === "metrics" ? "page" : undefined}>Metrics</a>
+      <a href={link("checks")} aria-current={tab === "checks" ? "page" : undefined}>Checks</a>
+      <a href={link("logs")} aria-current={tab === "logs" ? "page" : undefined}>Logs</a>
     </nav>
     <div class="time-control run-time-controls" aria-label="Run time range"><TimeControl {view} {range} {observed} /><CopyLink /><a href={url}>Agent JSON ↗</a></div>
   </div>
   <div id="run-panel">
-    {#if view.tab === "logs"}
+    {#if tab === "logs"}
       {#if validEvent}<Logs {run} {view} {range} {navigating} allLogs={link("logs", { event: null, end: null })} />{/if}
-    {:else if view.tab !== "metrics"}
-      <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} {duty} {slots} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
+    {:else if tab === "metrics"}<Metrics {run} {view} {range} {bounds} {selection} {detail} {finished} {navigating} />
+    {:else if tab === "checks"}<Checks id={view.id} {finished} />
     {:else}
-      <div class="run-metrics" data-run-metrics={view.id}>
-          <CollectorMetrics params={bounds} {view} {range} {navigating} />
-          <h2 class="scheduler-title">Operations</h2>
-          <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span>{#if metricStatus}<span class={detail.error ? "source-error" : "muted"} role="status">{metricStatus}</span>{/if}</div>
-          <div class="chart-grid">
-            {#each roles as role (role)}<Chart title={{ trainer: "Trainer operation duration", sampler: "Slowest sampler request" }[role] || `${role} operation duration`} unit="s" points={samples.filter((s) => (s.role || "process") === role).map((s) => [s.at, s.elapsed_seconds])} start={range.start} end={range.now} min={0} tone="accent" {navigating} />{/each}
-            {#if !samples.length && detail.data && !detail.error && !detail.pending}<p class="empty-state">No operations recorded in this time range</p>{/if}
-          </div>
-          <h2 class="scheduler-title">Trainer metrics</h2>
-          {#if names.length}<div class="chart-grid">
-            {#each names as name (name)}<Chart title={name} points={trained.filter((s) => Number.isFinite(s.metrics?.[name])).map((s) => [s.at, s.metrics[name]])} start={range.start} end={range.now} tone="accent" {navigating} />{/each}
-          </div>{:else if detail.data}<p class="muted">0 metrics</p>{/if}
-          <h2 class="scheduler-title">Samplers</h2>
-          {#if vllm.error && !run.shared_runtime}<p class="source-error" role="status">{vllm.error}{vllm.data ? " · Showing previously fetched metrics" : ""}</p>{/if}
-          {#if run.shared_runtime}<p class="muted">The pool's samplers serve every run on this base model; see their load on <a href={viewLink("nodes")}>Nodes</a>.</p>
-          {:else if !vllm.data}{#if !vllm.error}<p class="muted">Loading…</p>{/if}
-          {:else if !Object.values(vllm.data.samplers || {}).some((points) => points.length)}<p class="muted">{vllm.data.samplers_reason || "No sampler samples in this time range"}</p>
-          {:else}<div class="chart-grid">
-            {#each SAMPLER_CHARTS as [key, title, unit, scale = 1] (key)}
-              {@const error = vllm.error || vllm.data.samplers_errors?.[key]}
-              {@const points = vllm.data.samplers[key] || []}
-              <Chart {title} {unit} points={scale === 1 ? points : points.map(([at, value]) => [at, value * scale])} start={range.start} end={range.now} min={0} {navigating} empty={error || "No samples in this time range"} note={error ? `${error} · Showing previously fetched samples` : ""} />
-            {/each}
-          </div>{/if}
-      </div>
+      <div class="run-activity"><Activity placements={clipped} {range} {inventory} acrossNodes={true} {duty} error={detail.error} pending={detail.pending} {navigating} onpick={(at) => location.hash = link("logs", { event: at, end: range.now })} /></div>
     {/if}
   </div>
   </div>
