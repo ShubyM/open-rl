@@ -129,7 +129,7 @@ Verdicts are `ok`, `warn`, `fail` and `unknown`. `unknown` carries the age of th
 
 Each check is a symptom or a cause. Symptoms (`progress`, `optimizer-health`, `client-liveness`) say whether the user is hurt; causes say why. The run verdict is the worst symptom, so a warning from a cause alone never marks a run as failing. Evidence is a list of reads the caller can run as they stand: a route under 4.4, its arguments, and the window of the run, so an agent follows a failing check to the raw records in one call. Numbers carry what was observed next to the threshold it was compared with.
 
-`/runs/{id}/summary` reports goodput, the share of the run's span the trainer spent in training steps, and splits the rest into checkpoint, forward-only and other time. This is the first number to read when a run is slow rather than broken.
+`/runs/{id}/summary` reports goodput, the share of the run's span the trainer spent in training steps, and splits the rest into checkpoint and forward-only time, rollout time (the trainer idle with a sample in flight) and client time (nothing in flight). This is the first number to read when a run is slow rather than broken.
 
 | Check | Question | Incidents |
 |---|---|---|

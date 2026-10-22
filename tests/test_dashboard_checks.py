@@ -87,6 +87,12 @@ class ChecksReplayTest(unittest.TestCase):
     blind = {"role": "trainer", "pod": "t0", "gpus": [], "config": {"env": {}}}
     self.assertEqual(verdict("effective-config", context(workers=[blind])), checks.FAIL)
 
+  def test_goodput_splits_trainer_idle_time_into_rollout_and_waiting_on_the_client(self):
+    train = op(NOW - 100, "optim_step")  # 10 s of 110 s training
+    send = {**op(NOW - 50, "sample", role="sampler"), "elapsed_seconds": 10.0}  # 10 s with a sample in flight
+    result = checks.goodput(context([train, send]))
+    self.assertEqual({k: result["seconds"][k] for k in ("wall", "train", "rollout", "client")}, {"wall": 110, "train": 10, "rollout": 10, "client": 90})
+
   def test_answers_stay_small(self):
     ctx = context(healthy_steps(), ledger={"enqueued": 5, "popped": 5, "answered": 5})
     self.assertLess(len(repr(checks.run_checks(ctx))), 5000)

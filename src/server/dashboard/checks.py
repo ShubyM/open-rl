@@ -297,15 +297,24 @@ def goodput(ctx: dict) -> dict | None:
   start = ops[0]["started_at"]
   wall = max((ops[-1]["at"] if ctx["finished"] else ctx["now"]) - start, 1.0)
   spent = {kind: sum(s.get("elapsed_seconds", 0) for s in ops if s["operation"] in names) for kind, names in BUCKETS.items()}
+  idle = max(0.0, wall - sum(spent.values()))
+  # Trainer idle time with a sample in flight is rollout; with nothing in flight the server waits on the client.
+  sends = [s for s in ctx["samples"] if s["operation"] == "sample"]
+  rollout = min(idle, max(0.0, covered(ops + sends, start, start + wall) - covered(ops, start, start + wall))) if sends else None
   steps = optim_steps(ctx)
+  split = {"rollout": round(rollout), "client": round(idle - rollout)} if rollout is not None else {"other": round(idle)}
   return {
     "goodput": round(spent["train"] / wall, 3),
-    "seconds": {"wall": round(wall), **{k: round(v) for k, v in spent.items()}, "other": round(max(0.0, wall - sum(spent.values())))},
+    "seconds": {"wall": round(wall), **{k: round(v) for k, v in spent.items()}, **split},
     "first_step_after_s": round(steps[0]["at"] - start) if steps else None,
   }
 
 
-# "other" is the trainer idle between ops: waiting for the client to sample, grade and send the next batch.
+def covered(records: list[dict], low: float, high: float) -> float:
+  """Seconds of [low, high] during which at least one of the records was in flight."""
+  return sum(b - a for a, b in inspection.merge([(max(r["started_at"], low), min(r["at"], high)) for r in records if r["at"] > low and r["started_at"] < high]))
+
+
 BUCKETS = {"train": {"forward_backward", "optim_step"}, "checkpoint": {"save_state", "save_weights_for_sampler"}, "forward": {"forward"}}
 SESSION_LIVE_SECONDS = 120  # the live session key's expiry: a session silent this long is gone
 
