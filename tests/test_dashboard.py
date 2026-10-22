@@ -95,6 +95,30 @@ class StepsTest(unittest.TestCase):
     self.assertEqual((found[0]["started_at"], found[0]["ended_at"], found[2]["nonfinite"]), (9, 11, ["grad_norm"]))
 
 
+class ClientStepsTest(unittest.TestCase):
+  def test_a_later_read_asks_prometheus_only_for_new_time_and_keeps_the_earlier_steps(self):
+    from server.dashboard import router
+
+    def gauges(*points):
+      return [{"metric": {"metric": name}, "values": [[at, value] for at, value in values]} for name, values in points]
+
+    answers = [
+      gauges(("progress/batch", [(1000, 0)]), ("reward", [(1000, 0.2)])),
+      gauges(("progress/batch", [(2500, 1)]), ("reward", [(2500, 0.5)])),
+    ]
+    run = {"run_id": "m-incremental", "session_ids": ["s1"]}
+    with (
+      mock.patch.object(router, "get_state_store", return_value=InMemoryStateStore()),
+      mock.patch.object(sources, "prometheus_source", return_value="prom"),
+      mock.patch.object(sources, "configuration", return_value={**CONFIG, "cluster": ""}),
+      mock.patch.object(sources, "prom", mock.AsyncMock(side_effect=answers)) as prom,
+    ):
+      asyncio.run(router.client_steps(run, 900, 2000, ()))
+      found = asyncio.run(router.client_steps(run, 900, 3000, ()))
+    self.assertEqual([call.args[1:3] for call in prom.await_args_list], [(900, 2000), (1700, 3000)])
+    self.assertEqual({step: m["reward"] for step, m in found.items()}, {0: 0.2, 1: 0.5})
+
+
 class CachedTest(unittest.TestCase):
   def test_a_stale_read_is_served_while_its_refresh_runs_and_the_refresh_replaces_it(self):
     reads, release = iter(["first", "second"]), asyncio.Event()

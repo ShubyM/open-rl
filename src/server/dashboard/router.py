@@ -160,21 +160,30 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
   return result
 
 
+history: dict[str, tuple[float, dict[int, dict[str, float]]]] = {}  # run -> (read up to, client metrics by step)
+
+
 async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, ...]) -> dict[int, dict[str, float]]:
-  """The client's metrics by step: its OpenTelemetry gauges when progress/batch first read the step, or the older Redis history."""
+  """The client's metrics by step: its OpenTelemetry gauges when progress/batch first read the step, or the older Redis history.
+  A step's values never change, so each read asks Prometheus only for what came after the last one, at 15 s resolution."""
   found = {}
   for row in await get_state_store().read_samples(f"open_rl:run_metrics:{run['run_id']}"):
     found[row["step"]] = {k: float(v) for k, v in row["metrics"].items() if isinstance(v, int | float) and math.isfinite(v)}
   if not run["session_ids"] or high <= low or not sources.prometheus_source():
     return found
+  memo = f"{run['run_id']} {prefixes}"
+  seen, known = history.get(memo, (low, {}))
+  start = max(low, seen - 300)  # overlap, so a step that landed during the last read is not missed
   wanted = "|".join(re.escape(p) + ".*" for p in ("progress/batch", *prefixes)) if prefixes else ".+"
   where = f"session_id=~{sources.any_of(run['session_ids'])},metric=~{json.dumps(wanted)}{sources.scope()}"
-  rows = await sources.prom(f"max by (metric) (openrl_client_metric{{{where}}})", low, high, points=1000)
+  rows = await sources.prom(f"max by (metric) (openrl_client_metric{{{where}}})", start, high, points=max(2, min(1000, int((high - start) / 15))))
   series = {r["metric"].get("metric"): {float(t): float(v) for t, v in r["values"] if math.isfinite(float(v))} for r in rows}
   first: dict[int, float] = {}
   for at, batch in sorted((series.pop("progress/batch", None) or {}).items()):
     first.setdefault(int(batch), at)
-  return found | {step: {name: points[at] for name, points in series.items() if at in points} for step, at in first.items()}
+  known = {step: {name: points[at] for name, points in series.items() if at in points} for step, at in first.items()} | known
+  history[memo] = (high, known)
+  return found | known
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/steps", response_model=Doc)
@@ -187,7 +196,8 @@ async def steps(
   _, run = await run_of(run_id)
   every, keep, result = fleet.steps(await fleet.operations(run_id)), tuple(p for p in (fields or "").split(",") if p), {}
   try:
-    client = await client_steps(run, every[0]["started_at"] - 300, (run["completed_at"] or time.time()) + 300, keep) if every else {}
+    read = lambda: client_steps(run, every[0]["started_at"] - 300, (run["completed_at"] or time.time()) + 300, keep)  # noqa: E731
+    client = await fleet.cached(f"client {run_id} {keep}", 30, read) if every else {}
   except Exception as exc:  # steps stand without the client's metrics
     client, result["error"] = {}, f"Client metrics unavailable: {type(exc).__name__}"
   for step in every[-last:]:
