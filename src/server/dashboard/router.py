@@ -297,12 +297,6 @@ async def logs(
   cursor: Annotated[str | None, Query(max_length=16384, description="next_cursor of a page with the same filters and window")] = None,
 ):
   """Cloud Logging, newest first: the run's worker pods by owner label and its client."""
-  return await read_logs(run_id, pod, q, severity, since, until, limit, cursor)
-
-
-async def read_logs(
-  run_id: str, pod: str | None, q: str, severity: str | None, since: str | None, until: str | None, limit: int, cursor: str | None
-) -> dict:
   since, until, low, high = span(since, until)
   await sources.discover()
   state, run = await run_of(run_id)

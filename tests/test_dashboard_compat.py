@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from server.dashboard import facts, fleet, router, sources, views
 from server.dashboard.__main__ import app
 from server.store import InMemoryStateStore
-from server.telemetry import LogRequest, ingest_logs, key
+from server.telemetry import key
 
 NOW = 2000
 BOUNDS = {"since": "1970-01-01T00:16:40Z", "until": "1970-01-01T00:33:20Z"}
@@ -310,20 +310,27 @@ class DashboardCompatibilityTest(unittest.TestCase):
     for params in ({}, {"run_id": "r1", "node_id": "n1"}):
       self.assertEqual(self.client.get("/api/v1/dashboard/telemetry", params=params).status_code, 400)
 
-  def test_logs_forward_filters_and_cloud_cursor_without_changing_the_inspection_response(self):
+  def test_inspection_logs_keep_filters_cursor_and_explicit_source_errors(self):
     params = {**BOUNDS, "run_id": "r1", "pod": "trainer-0", "q": "oom", "severity": "ERROR", "limit": 7, "cursor": "page-2"}
     page = {"records": [{"id": "entry-2", "message": "out of memory"}], "next_cursor": "page-3"}
     with mock.patch.object(sources, "log_page", mock.AsyncMock(return_value=page)) as read:
-      inspected = self.get("inspect/logs", **params)
-      shown = self.get("dashboard/logs", **params)
-    self.assertEqual(shown, inspected)
+      shown = self.get("inspect/logs", **params)
+    read.assert_awaited_once()
     self.assertEqual(read.await_args.kwargs, {"pod": "trainer-0", "q": "oom", "severity": "ERROR", "limit": 7, "cursor": "page-2"})
     self.assertEqual(shown["next_cursor"], "page-3")
     error = httpx.HTTPStatusError("expired", request=httpx.Request("POST", "https://logging"), response=httpx.Response(400))
     with mock.patch.object(sources, "log_page", mock.AsyncMock(side_effect=error)):
-      response = self.client.get("/api/v1/dashboard/logs", params=params)
+      response = self.client.get("/api/v1/inspect/logs", params=params)
     self.assertEqual(response.status_code, 400)
     self.assertEqual(response.json(), {"detail": "Invalid or expired log cursor; repeat the query without it"})
+    for failure, message in (
+      (LookupError("GKE telemetry is not configured"), "GKE telemetry is not configured"),
+      (RuntimeError("provider unavailable"), "Cloud Logging unavailable"),
+    ):
+      with self.subTest(failure=type(failure).__name__), mock.patch.object(sources, "log_page", mock.AsyncMock(side_effect=failure)):
+        shown = self.get("inspect/logs", run_id="r1", **BOUNDS)
+      self.assertFalse(shown["available"])
+      self.assertEqual((shown["error"], shown["records"], shown["next_cursor"]), (message, [], None))
 
   def test_previous_pod_logs_keep_the_selected_container_and_report_source_failure(self):
     result = {"pod": "trainer-0", "container": "trainer", "previous": True, "text": "previous process failed\n"}
@@ -334,59 +341,6 @@ class DashboardCompatibilityTest(unittest.TestCase):
       response = self.client.get("/api/v1/dashboard/pods/trainer-0/logs")
     self.assertEqual(response.status_code, 503)
     self.assertEqual(response.json(), {"detail": "Pod logs unavailable in the configured namespace"})
-
-  def test_cloud_unavailable_falls_back_to_the_client_tail_only_on_the_first_client_page(self):
-    asyncio.run(
-      self.store.replace_samples(
-        "open_rl:run_logs:r1",
-        [
-          {"at": 1500, "message": "old progress", "severity": "INFO"},
-          {"at": 1600, "message": "latest progress", "severity": "WARNING"},
-        ],
-        None,
-      )
-    )
-    with mock.patch.object(sources, "log_page", mock.AsyncMock(side_effect=LookupError("GKE telemetry is not configured"))):
-      shown = self.get("dashboard/logs", run_id="r1", pod="client", limit=1, **BOUNDS)
-      for selection in ({"pod": "trainer-0"}, {"pod": "client", "cursor": "page-2"}):
-        self.assertFalse(self.get("dashboard/logs", run_id="r1", **selection, **BOUNDS)["available"])
-      self.assertFalse(self.get("inspect/logs", run_id="r1", **BOUNDS)["available"])
-    self.assertTrue(shown["available"])
-    self.assertIsNone(shown["error"])
-    self.assertEqual([(r["message"], r["pod"], r["severity"]) for r in shown["records"]], [("latest progress", "client", "WARNING")])
-    self.assertIn("recent client output", shown["note"])
-
-  def test_ingested_client_logs_reach_the_bounded_local_tail_with_normalized_time_and_severity(self):
-    asyncio.run(self.store.set_value("open_rl:model_meta:r1", "{}"))
-    asyncio.run(self.store.replace_samples("open_rl:run_logs:r1", [{"at": 1000, "message": f"old-{n}"} for n in range(4999)], None))
-    body = LogRequest(
-      lines=[
-        {"at": 1500.25, "message": "client debug", "severity": "debug"},
-        {"at": 1600.125, "message": "client warning", "severity": "warning"},
-        {"at": 1000000, "message": "client clock outside tolerance", "severity": "invalid"},
-      ]
-    )
-    with mock.patch("builtins.print"):
-      self.assertEqual(asyncio.run(ingest_logs(self.store, "r1", body)), {"accepted": 3})
-    stored = asyncio.run(self.store.read_samples("open_rl:run_logs:r1"))
-    self.assertEqual(len(stored), 5000)
-    with mock.patch.object(sources, "log_page", mock.AsyncMock(side_effect=LookupError("Cloud logs unavailable"))):
-      shown = self.get("dashboard/logs", run_id="r1", pod="client", limit=2, **BOUNDS)
-      with mock.patch.object(self.store, "read_samples", wraps=self.store.read_samples) as tail:
-        self.assertFalse(self.get("dashboard/logs", run_id="r1", cursor="page-2", **BOUNDS)["available"])
-        with mock.patch.object(sources, "configuration", return_value={"configured": True}):
-          self.assertFalse(self.get("dashboard/logs", run_id="r1", **BOUNDS)["available"])
-        tail.assert_not_called()
-    self.assertTrue(shown["available"])
-    self.assertEqual(
-      [(r["timestamp"], r["severity"], r["message"]) for r in shown["records"]],
-      [
-        ("1970-01-01T00:33:20.000000Z", "INFO", "client clock outside tolerance"),
-        ("1970-01-01T00:26:40.125000Z", "WARNING", "client warning"),
-      ],
-    )
-    self.assertTrue(all(r["run_id"] == "r1" and r["pod"] == r["role"] == "client" for r in shown["records"]))
-    self.assertIsNone(shown["next_cursor"])
 
   def test_restored_routes_keep_the_existing_window_and_page_validation(self):
     for scope in ("inspect", "dashboard"):
@@ -399,13 +353,13 @@ class DashboardCompatibilityTest(unittest.TestCase):
           self.assertEqual(response.status_code, 400)
         self.assertEqual(self.client.get(f"/api/v1/{scope}/activity", params={"run_id": "missing"}).status_code, 404)
     for route, params in (
-      ("logs", {"run_id": "r1", "limit": 1001}),
-      ("logs", {"run_id": "r1", "severity": "WARN"}),
-      ("pods/trainer-0/logs", {"tail": 0}),
-      ("pods/trainer-0/logs", {"tail": 1001}),
+      ("inspect/logs", {"run_id": "r1", "limit": 1001}),
+      ("inspect/logs", {"run_id": "r1", "severity": "WARN"}),
+      ("dashboard/pods/trainer-0/logs", {"tail": 0}),
+      ("dashboard/pods/trainer-0/logs", {"tail": 1001}),
     ):
       with self.subTest(route=route, params=params):
-        self.assertEqual(self.client.get("/api/v1/dashboard/" + route, params=params).status_code, 422)
+        self.assertEqual(self.client.get("/api/v1/" + route, params=params).status_code, 422)
 
 
 class KubernetesCompatibilityTest(unittest.TestCase):

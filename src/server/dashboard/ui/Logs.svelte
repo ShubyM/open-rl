@@ -1,6 +1,6 @@
 <script>
   import { untrack, tick } from "svelte";
-  import { get, dashboardUrl } from "./state.svelte.js";
+  import { get, inspectUrl } from "./state.svelte.js";
   import { escapeRegExp } from "./format.js";
   let { run, view, range, allLogs, navigating = false } = $props();
   let data = $state.raw(null), pending = $state(true), error = $state(null);
@@ -49,7 +49,7 @@
     failedCursor = page;
     try {
       // Cloud Logging's page token is valid only with the same filters and window, which a paused view keeps.
-      const { data: response } = await get(dashboardUrl("logs", { ...query, ...(page ? { cursor: page } : {}) }), active.signal);
+      const { data: response } = await get(inspectUrl("logs", { ...query, ...(page ? { cursor: page } : {}) }), active.signal);
       if (active.signal.aborted) return;
       if (response.error) throw new Error(response.error);
       fromBottom = page ? lines.scrollHeight - lines.clientHeight - lines.scrollTop : 0;

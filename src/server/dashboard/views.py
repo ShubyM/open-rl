@@ -12,9 +12,9 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from server.dashboard import facts, fleet, sources
-from server.dashboard.router import Bound, inventory_data, read_logs, read_steps, run_of, span
+from server.dashboard.router import Bound, inventory_data, read_steps, run_of, span
 from server.store import get_state_store
-from server.telemetry import CLIENT, iso, key
+from server.telemetry import CLIENT, key
 
 router = APIRouter(tags=["dashboard"])
 STATIC = Path(__file__).parent / "static"
@@ -155,42 +155,6 @@ async def pod_logs(pod: str, container: str | None = None, previous: bool = Fals
     return await sources.pod_logs(pod, container, tail, previous)
   except Exception as exc:
     raise HTTPException(503, "Pod logs unavailable in the configured namespace") from exc
-
-
-@router.get("/api/v1/dashboard/logs")
-async def logs(
-  run_id: str,
-  pod: str | None = None,
-  q: str = Query("", max_length=1024),
-  severity: str | None = Query(None, pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL|UNKNOWN)$"),
-  since: Bound = None,
-  until: Bound = None,
-  limit: int = Query(200, ge=1, le=1000),
-  cursor: str | None = Query(None, max_length=16384),
-):
-  result = await read_logs(run_id, pod, q, severity, since, until, limit, cursor)
-  if not sources.configuration()["configured"] and pod in (None, CLIENT) and not cursor:
-    try:
-      lines = await asyncio.wait_for(get_state_store().read_samples(f"open_rl:run_logs:{run_id}", last=limit), timeout=5)
-    except Exception:
-      lines = []
-    if lines:
-      records = []
-      for line in reversed(lines):
-        identity = hashlib.sha256(json.dumps([run_id, line.get("at"), line.get("message")]).encode()).hexdigest()
-        records.append(
-          {
-            "id": identity,
-            "run_id": run_id,
-            "timestamp": iso(line.get("at", 0)),
-            "pod": CLIENT,
-            "role": CLIENT,
-            "severity": line.get("severity", "INFO"),
-            "message": line.get("message", ""),
-          }
-        )
-      result.update(records=records, available=True, error=None, note="Cloud Logging is not configured; showing the run's recent client output")
-  return result
 
 
 @router.get("/api/v1/dashboard/telemetry")

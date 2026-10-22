@@ -39,7 +39,7 @@ Pages show their last response while they refresh.
 | `GET /runs/{id}/steps` | Trainer ops grouped by step, with the client's metrics; `fields` keeps client metrics by prefix |
 | `GET /runs/{id}/commands` | Raw operation records, newest first; optional window and role, `limit=100` by default, at most 5,000 |
 | `GET /sessions/{id}/summary` | The session record, whether it is live, its SDK errors, and a line per model |
-| `GET /logs` | Worker and forwarded client logs from Cloud Logging, with filters and Cloud Logging's page token as the cursor |
+| `GET /logs` | Worker and run-correlated client output from Cloud Logging, with filters and Cloud Logging's page token as the cursor |
 
 `activity`, `query`, `accelerators` and `logs` take ISO `since` and `until` bounds of up to seven days; `since` also takes a span such as `1h`. An omitted end is now, and an omitted start the 30 minutes before it. With both bounds omitted, `/accelerators` uses the last hour. Missing op records do not prove that no requests arrived or that workers were idle. `error` means a source could not be read. A log cursor is valid only with the same filters, `since` and `until` as the page that returned it.
 
@@ -52,20 +52,15 @@ For a small first read, use `/runs`, then `/runs/{id}/summary` or `/sessions/{id
 | `GET /runs/{id}/steps` | The same step records, with client-source failure reported separately so trainer charts remain usable |
 | `GET /history` | Legacy Redis client metrics for `run_id`, latest finite metrics per step |
 | `GET /telemetry` | Generic collector gauges for exactly one `run_id` or `node_id`, optional metric-name filter, at most 200 series with truncation reported |
-| `GET /logs` | The same Cloud Logging filters and pagination; without GKE configuration, forwarded client output falls back to its retained local tail |
 | `GET /pods/{pod}/logs` | Kubelet output for any pod in the configured namespace; optional `container`, `previous=true`, and `tail` (default 200, at most 1,000 lines and 128 KiB) |
 
-The pages share `/inspect/query` for named metrics. `diag/backend-main` does not expose a vLLM metrics HTTP endpoint or configure a collector-gauge producer in this repository. These charts require an existing exporter and scrape configuration; the dashboard does not create those metrics. Worker metrics are what the trainer returns per op (`loss`, `grad_norm`); a NaN or infinity is named in the op's `nonfinite` and reaches the client as 0, as before.
+The pages share `/inspect/query` for named metrics and `/inspect/logs` for Cloud Logging filters and pagination. `diag/backend-main` does not expose a vLLM metrics HTTP endpoint or configure a collector-gauge producer in this repository. These charts require an existing exporter and scrape configuration; the dashboard does not create those metrics. Worker metrics are what the trainer returns per op (`loss`, `grad_norm`); a NaN or infinity is named in the op's `nonfinite` and reaches the client as 0, as before.
 
 ## Client logs
 
-A client sends its output with `POST /api/v1/runs/{run_id}/logs`, where `run_id` is the model ID it trains. The gateway writes each line as structured JSON for Cloud Logging, labelled with the run, and keeps the last 5,000 lines in its store. Beside an unchanged cookbook example, run:
+Client and tinker jobs are assumed to run in the configured worker namespace in the cluster, where Cloud Logging collects their stdout/stderr. Local file forwarding and a Redis log tail are deferred.
 
-```sh
-python -m server.scripts.forward_logs /path/to/run --base-url http://gateway:8000 --run-id RUN_ID --follow
-```
-
-It reads `logs.log` every 15 seconds and, without `--run-id`, waits for the first model path in `checkpoints.jsonl`. Retries and restarts can duplicate lines.
+Collection alone does not associate output with a run. The existing run selector matches worker pods by their runtime's `timeslice.io/owner` label, or structured log entries whose `logging.googleapis.com/labels` contains `openrl_run_id` (the model ID) and `openrl_source=client`. Client output needs that correlation to appear in the run's Logs tab. Shared-runtime views also default to searching for the run ID in the message; “Include other runs’ lines” removes that text filter. The existing `POST /api/v1/runs/{run_id}/logs` endpoint still emits those structured lines; this PR adds no forwarding process.
 
 ## Lifecycle
 
@@ -89,7 +84,7 @@ The pages label a run from its lifecycle and show pod problems separately. The s
 | Nodes, pods, events, scheduler | Kubernetes API, cached for 5 seconds |
 | Each node's GPUs | DCGM's UUID and slot labels, from the metrics source below |
 | GPU, worker, and sampler series | DCGM, container, and vLLM metrics from `OPEN_RL_PROMETHEUS_URL`, or Cloud Monitoring's PromQL API on GKE |
-| Run logs | Cloud Logging: the worker pods with the run runtime's `timeslice.io/owner` label and its forwarded client lines; a stderr line takes the level it prints |
+| Run logs | Cloud Logging: the worker pods with the run runtime's `timeslice.io/owner` label and client entries labelled with the run; a stderr line takes the level it prints |
 
 Records expire `OPEN_RL_OPS_TTL_DAYS` (default 7) after their last write; `0` keeps them. Logs come from the project's default buckets, usually kept 30 days; to keep them longer, route the namespace's logs to a bucket and set `OPEN_RL_LOG_VIEWS` to its view, which needs `roles/logging.viewAccessor`. Kubernetes queries use `OPEN_RL_WORKER_NAMESPACE`, then `POD_NAMESPACE`, then `openrl-system`. On GKE, the metadata server supplies project, cluster, and location; override them with `OPEN_RL_GKE_PROJECT`, `OPEN_RL_GKE_CLUSTER`, and `OPEN_RL_GKE_LOCATION`, or set `OPEN_RL_GKE_TELEMETRY=false`.
 
