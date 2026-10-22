@@ -56,10 +56,10 @@ async def follow(api, kind: str, resource, namespace: str | None) -> None:
 def watch(kinds=tuple(watch_errors)) -> None:
   """Start each kind's watch once, on the running loop, from the in-cluster service account or else the kubeconfig."""
   from lightkube import AsyncClient
-  from lightkube.generic_resource import create_namespaced_resource
   from lightkube.resources.core_v1 import Node, Pod
 
-  Workload = create_namespaced_resource("openrl.io", "v1alpha1", "Workload", "workloads")
+  from server.scheduler_worker_manager import Workload
+
   global client
   client = client or AsyncClient()
   scopes = {"pods": (Pod, namespace()), "nodes": (Node, None), "workloads": (Workload, namespace())}

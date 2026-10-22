@@ -6,17 +6,18 @@ port-forward would see, without a cluster."""
 
 import asyncio
 import os
+import threading
 import unittest
 from collections import defaultdict
 from unittest.mock import patch
 
-from server import api_server
+from server import api_server, kube
 from server.scheduler_worker_manager import SchedulerWorkerManager, worker_state
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import WORKER_STATES
 from tests.api_client import asgi_client, post_json
-from tests.test_scheduler_worker_manager import FakeCustomObjectsApi
+from tests.test_scheduler_worker_manager import FakeClient
 from tests.test_session_lifecycle import RuntimeManager
 
 
@@ -241,8 +242,7 @@ class SchedulerViewTest(unittest.TestCase):
 
   def setUp(self):
     self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://test"}))
-    self.custom = FakeCustomObjectsApi()
-    self.custom.existing = {
+    watched = {
       "lora-base-0-trainer": workload(
         "lora-base-0-trainer", "trainer", "base", "base", {"phase": "Running", "podName": "orw-t", "nodeName": "node-a", "reason": "PodCreated"}
       ),
@@ -251,7 +251,12 @@ class SchedulerViewTest(unittest.TestCase):
       ),
       "fft-job-trainer": workload("fft-job-trainer", "trainer", "job", "job", {"phase": "Pending", "reason": "NoCapacity: needs 40Gi"}),
     }
-    self.manager = SchedulerWorkerManager(custom_api=self.custom)
+    # The watch has answered with these Workloads.
+    self.enterContext(patch.dict(kube.watched, {"workloads": watched}))
+    self.enterContext(patch.dict(kube.watch_errors, {"workloads": None}))
+    self.enterContext(patch.dict(kube.attempted, {"workloads": threading.Event()}))
+    kube.attempted["workloads"].set()
+    self.manager = SchedulerWorkerManager(FakeClient())
 
   def test_workers_come_from_workload_status_alone(self):
     by_name = {w["workload"]: w for w in self.manager.inspect_owner("base")}
@@ -267,13 +272,6 @@ class SchedulerViewTest(unittest.TestCase):
     self.assertEqual(self.manager.inspect_owner("nobody"), [])
     # No pod names or other pod facts leak into the entry.
     self.assertNotIn("pod", trainer)
-
-  def test_the_view_is_cached_briefly(self):
-    first = self.manager.inspect_owner("base")
-    self.custom.existing.clear()
-    self.assertEqual(self.manager.inspect_owner("base"), first)
-    self.manager.view_cache_seconds = 0
-    self.assertEqual(self.manager.inspect_owner("base"), [])
 
 
 if __name__ == "__main__":

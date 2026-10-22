@@ -63,10 +63,9 @@ vllm = [
     # fresh pod, ~30 minutes at MAX_JOBS=4.
     "flashinfer-jit-cache==0.6.18.post1; sys_platform == 'linux'",
 ]
-# Kubernetes cluster mode: the k8s API client used to launch FFT worker pods.
+# Kubernetes cluster mode: the k8s API client that launches worker pods and
+# watches pods, nodes and Workloads.
 cluster = [
-    "kubernetes>=29",
-    # The watch cache of pods, nodes and Workloads.
     "lightkube>=1.0.1",
     # Kept in step with the snapshot-agent image deployed in
     # docs/setup/gke-fft-timeslice.md: both come from this upstream release.

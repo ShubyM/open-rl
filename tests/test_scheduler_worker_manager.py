@@ -4,61 +4,57 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
+from lightkube import ApiError
+from lightkube.models.meta_v1 import Status
+
 from server import api_server
 from server.estimator import footprint
-from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager
+from server.scheduler_worker_manager import SchedulerWorkerManager
 from server.store import InMemoryStateStore, InMemoryStore
 from tests.api_client import asgi_client, post_json
 
 
-class ApiError(Exception):
-  def __init__(self, status: int):
-    super().__init__(f"api error {status}")
-    self.status = status
+def api_error(code: int) -> ApiError:
+  return ApiError(status=Status(code=code))
 
 
-class FakeCustomObjectsApi:
+class FakeClient:
+  """lightkube's Client over one namespace's Workloads in memory."""
+
   def __init__(self):
     self.created: list[dict[str, Any]] = []
     self.deleted: list[str] = []
     self.existing: dict[str, dict] = {}
     self.deleting: set[str] = set()
 
-  def create_namespaced_custom_object(self, group: str, version: str, namespace: str, plural: str, body: dict) -> dict:
-    assert (group, version, plural) == (GROUP, VERSION, PLURAL)
+  def create(self, obj: Any, namespace: str) -> None:
+    body = obj.to_dict()
     name = body["metadata"]["name"]
     if name in self.existing:
-      raise ApiError(409)
+      raise api_error(409)
     self.existing[name] = body
     self.created.append(body)
-    return body
 
-  def get_namespaced_custom_object(self, group: str, version: str, namespace: str, plural: str, name: str) -> dict:
+  def get(self, resource: Any, name: str, namespace: str) -> Any:
     if name not in self.existing:
-      raise ApiError(404)
-    metadata = dict(self.existing[name]["metadata"])
-    if name in self.deleting:
-      metadata["deletionTimestamp"] = "2026-09-08T00:00:00Z"
-    return {"metadata": metadata}
+      raise api_error(404)
+    metadata = self.existing[name]["metadata"] | ({"deletionTimestamp": "2026-09-08T00:00:00Z"} if name in self.deleting else {})
+    return resource.from_dict({**self.existing[name], "metadata": metadata})
 
-  def delete_namespaced_custom_object(self, group: str, version: str, namespace: str, plural: str, name: str) -> dict:
-    if name not in self.existing:
-      raise ApiError(404)
-    del self.existing[name]
+  def list(self, resource: Any, namespace: str, labels: dict[str, str]) -> list[Any]:
+    return [resource.from_dict(body) for _, body in sorted(self.existing.items()) if labels.items() <= body["metadata"]["labels"].items()]
+
+  def delete(self, resource: Any, name: str, namespace: str) -> None:
+    if self.existing.pop(name, None) is None:
+      raise api_error(404)
     self.deleted.append(name)
-    return {}
-
-  def list_namespaced_custom_object(self, group: str, version: str, namespace: str, plural: str, label_selector: str = "") -> dict:
-    key, _, value = label_selector.partition("=")
-    items = [body for name, body in sorted(self.existing.items()) if not key or body["metadata"]["labels"].get(key) == value]
-    return {"items": items}
 
 
 class SchedulerWorkerManagerTest(unittest.TestCase):
   def setUp(self) -> None:
     self.enterContext(patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379"}))
-    self.api = FakeCustomObjectsApi()
-    self.manager = SchedulerWorkerManager(custom_api=self.api)
+    self.api = FakeClient()
+    self.manager = SchedulerWorkerManager(self.api)
 
   def store_with(self, model_id: str, meta: dict) -> InMemoryStore:
     s = InMemoryStateStore()
@@ -370,14 +366,14 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
     state = InMemoryStateStore()
     for model_id, kind in (("lora-a", "lora"), ("lora-b", "lora"), ("fft-a", "full")):
       await state.set_value(f"open_rl:model_meta:{model_id}", json.dumps({"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": kind}))
-    api = FakeCustomObjectsApi()
+    api = FakeClient()
     with (
       patch.dict(os.environ, {"REDIS_URL": "redis://localhost:6379", "OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}),
       patch("server.worker_manager.get_state_store", return_value=state),
       patch.object(api_server, "store", store),
       patch.object(api_server, "state", state),
       patch.object(api_server, "get_store", return_value=store),
-      patch.object(api_server, "worker_manager", SchedulerWorkerManager(custom_api=api)),
+      patch.object(api_server, "worker_manager", SchedulerWorkerManager(api)),
     ):
       async with asgi_client() as client:
         for model_id in ("lora-a", "fft-a", "lora-b"):

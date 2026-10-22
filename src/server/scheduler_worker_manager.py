@@ -1,6 +1,6 @@
 """Worker manager that creates one Workload per worker process and lets the
-scheduler place it. Part of the cluster extra: importing it assumes the
-Kubernetes client is installed.
+scheduler place it. Part of the cluster extra: importing it assumes
+lightkube is installed.
 
 Two FFT jobs and two LoRA jobs on the same base model come in:
 
@@ -25,8 +25,10 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any
 
-from kubernetes import client, config
+from lightkube import ApiError, Client
+from lightkube.generic_resource import create_namespaced_resource
 
+from server import kube
 from server.estimator import Footprint, footprint
 from server.worker_manager import (
   FAILED,
@@ -47,6 +49,7 @@ logger = logging.getLogger(__name__)
 GROUP = "openrl.io"
 VERSION = "v1alpha1"
 PLURAL = "workloads"
+Workload = create_namespaced_resource(GROUP, VERSION, "Workload", PLURAL)
 OPS_SETTINGS = ("OPEN_RL_OPS_TTL_DAYS", "OPEN_RL_OPS_SAMPLE_LIMIT")
 
 
@@ -215,48 +218,47 @@ def workload_body(worker: Worker) -> dict[str, Any]:
 class SchedulerWorkerManager:
   """Runs trainer and sampler workers by creating Workload objects."""
 
-  def __init__(self, custom_api: Any = None):
+  def __init__(self, api: Any = None):
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("OPEN_RL_ENABLE_FFT=true requires REDIS_URL so launched workers can share queues and futures")
-    self.namespace = os.getenv("OPEN_RL_WORKER_NAMESPACE", "openrl-system")
-    if custom_api is None:
-      config.load_incluster_config()
-      custom_api = client.CustomObjectsApi()
-    self.custom_api = custom_api
-    # The model view may be polled; one read per few seconds is plenty.
-    self._workers_cache: tuple[float, list[dict[str, Any]]] | None = None
-    self.view_cache_seconds = 5.0
+    self.namespace = kube.namespace()
+    if api is None:
+      api = Client()
+      kube.watch(["workloads"])
+    self.api = api
 
   def ensure(self, model_id: str, role: str) -> None:
     for index in range(replicas_of(model_id, role)):
       self.ensure_workload(dataclasses.replace(describe_worker(model_id, role), index=index))
 
   def ensure_workload(self, worker: Worker) -> None:
-    role = worker.role
     deadline = time.monotonic() + 180
-    while True:
-      try:
-        self.custom_api.create_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, workload_body(worker))
-        logger.info("requested %s workload %s (%s, owner %s)", role, worker.name, worker.footprint.accelerator, worker.owner)
-        return
-      except Exception as exc:
-        if getattr(exc, "status", None) != 409:
-          raise
+    while not self.create_once(Workload.from_dict(workload_body(worker))):
       # AlreadyExists is the reuse, unless the old one is still being deleted.
       if not self.still_deleting(worker.name):
         return
       if time.monotonic() > deadline:
         raise RuntimeError(f"workload {worker.name} has been terminating for over three minutes")
       time.sleep(2)
+    logger.info("requested %s workload %s (%s, owner %s)", worker.role, worker.name, worker.footprint.accelerator, worker.owner)
+
+  def create_once(self, obj: Any) -> bool:
+    try:
+      self.api.create(obj, namespace=self.namespace)
+      return True
+    except ApiError as exc:
+      if exc.status.code != 409:
+        raise
+      return False
 
   def still_deleting(self, name: str) -> bool:
     try:
-      workload = self.custom_api.get_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, name)
-    except Exception as exc:
-      if getattr(exc, "status", None) == 404:
+      workload = self.api.get(Workload, name, namespace=self.namespace)
+    except ApiError as exc:
+      if exc.status.code == 404:
         return True  # gone since the create failed, so the next create will go through
       raise
-    return bool(workload["metadata"].get("deletionTimestamp"))
+    return bool(workload.metadata.deletionTimestamp)
 
   def release(self, model_id: str) -> None:
     try:
@@ -270,47 +272,40 @@ class SchedulerWorkerManager:
 
   def release_owner(self, owner: str) -> set[str]:
     """Delete the owner's workloads. The scheduler's finalizer frees the seats."""
-    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
-    found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
-    ours = [item for item in found["items"] if item["spec"]["ownerID"] == owner]
+    found = self.api.list(Workload, namespace=self.namespace, labels={"app.kubernetes.io/managed-by": "open-rl-api-server"})
+    ours = [item for item in found if item.spec["ownerID"] == owner]
     for item in ours:
-      self.delete_workload(item["metadata"]["name"])
-    return {item["spec"]["modelID"] for item in ours}
+      self.delete_workload(item.metadata.name)
+    return {item.spec["modelID"] for item in ours}
 
   def close(self) -> None:
     pass  # Workloads outlive the API server; the scheduler owns them from here
 
   def delete_workload(self, name: str) -> None:
     try:
-      self.custom_api.delete_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, name)
-    except Exception as exc:
-      if getattr(exc, "status", None) != 404:
+      self.api.delete(Workload, name, namespace=self.namespace)
+    except ApiError as exc:
+      if exc.status.code != 404:
         raise
 
   # -- the read-only model view (design 016, section 5.2) ---------------------
 
   def inspect_owner(self, owner: str) -> list[dict[str, Any]]:
-    return [worker for worker in self.workers() if worker["owner"] == owner]
-
-  def workers(self) -> list[dict[str, Any]]:
-    now = time.monotonic()
-    if self._workers_cache is not None and now - self._workers_cache[0] < self.view_cache_seconds:
-      return self._workers_cache[1]
-    workers = self.load_workers()
-    self._workers_cache = (now, workers)
-    return workers
-
-  def load_workers(self) -> list[dict[str, Any]]:
-    """Our Workloads, one entry per worker, in the client vocabulary. The pod
+    """The owner's Workloads, one entry per worker, in the client vocabulary. The pod
     is the scheduler's; what the API server knows about it is what the
     scheduler wrote into Workload status."""
     now = time.time()
-    return [workload_worker(item, now) for item in self.workloads()]
+    return [worker for item in self.workloads() if (worker := workload_worker(item, now))["owner"] == owner]
 
   def workloads(self) -> list[dict[str, Any]]:
-    """Our Workload objects as the API returns them."""
-    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
-    return self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)["items"]
+    """Our Workload objects, from the process's watch."""
+    kube.wait(["workloads"])
+    if error := kube.watch_errors["workloads"]:
+      raise RuntimeError(error)
+    found = kube.watched.get("workloads") or {}
+    return [
+      item for _, item in sorted(found.items()) if item["metadata"].get("labels", {}).get("app.kubernetes.io/managed-by") == "open-rl-api-server"
+    ]
 
 
 def workload_worker(item: dict[str, Any], now: float) -> dict[str, Any]:
