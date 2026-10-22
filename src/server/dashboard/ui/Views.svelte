@@ -1,7 +1,7 @@
 <script>
   import Status from "./Status.svelte";
-  import { inspectUrl, now, viewLink } from "./state.svelte.js";
-  import { duration, elapsedTime, KINDS, runDescription, runLabel } from "./format.js";
+  import { inspectUrl, viewLink } from "./state.svelte.js";
+  import { elapsedTime, KINDS, runDescription, runLabel } from "./format.js";
 
   let { inventory, view = $bindable() } = $props();
   const FILTERS = [
@@ -21,10 +21,6 @@
   });
   // A run's session is the newest one that attached it, the last its metadata names.
   const sessionOf = (run) => run.session_ids?.at(-1) ?? null;
-  function age(run) {
-    const created = typeof run.created_at === "number" ? run.created_at : Date.parse(run.created_at) / 1000;
-    return Number.isFinite(created) && created > 0 ? `${duration(Math.max(0, now(inventory) - created))} ago` : "—";
-  }
 
   const errors = $derived([...new Set(inventory.errors)]);
   const issues = $derived.by(() => {
@@ -58,7 +54,7 @@
   <div class="job-list run-list">
     {#if shown.length}
       <div class="job-list-head run-row">
-        <span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Created</span><span>Elapsed</span><span>Session</span>
+        <span>Job</span><span>Status</span><span>Training kind</span><span>Completed steps</span><span>Elapsed</span><span>Session</span>
       </div>
       {#each shown as run (run.run_id)}
         {@const label = runDescription(run, null)}
@@ -66,7 +62,7 @@
         {@const session = sessionOf(run)}
         <div class="job-list-row run-row" data-key={run.run_id}>
           <span class="job-identity"><a href={runLink(run)} title={run.run_id}>{model} · <span class="mono">{run.run_id.slice(0, 8)}</span></a>{#if label}<span class="muted micro">{label}</span>{/if}</span>
-          <span><Status value={runLabel(run)} /></span><span>{KINDS[run.fine_tuning_type] || run.fine_tuning_type || "—"}</span><span>{run.steps ?? "—"}</span><span>{age(run)}</span><span>{elapsedTime(run, inventory.observed_at)}</span>
+          <span><Status value={runLabel(run)} /></span><span>{KINDS[run.fine_tuning_type] || run.fine_tuning_type || "—"}</span><span>{run.steps ?? "—"}</span><span>{elapsedTime(run, inventory.observed_at)}</span>
           <span class="mono micro run-session" title={(run.session_ids || []).join(", ") || undefined}>{session ?? "—"}</span>
         </div>
       {/each}

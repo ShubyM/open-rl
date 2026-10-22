@@ -45,11 +45,11 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .run-filters { display: flex; flex-wrap: wrap; gap: 6px; }
 #app .metric-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; } #app .metric-filters input { width: 28ch; }
 #app .run-filter-count { margin-left: 4px; color: var(--dim); font-variant-numeric: tabular-nums; }
-#app :is(.job-list-head, .job-list-row).run-row { position: relative; grid-template-columns: minmax(0, 1fr) 128px 100px 112px 90px 80px 150px; }
+#app :is(.job-list-head, .job-list-row).run-row { position: relative; grid-template-columns: minmax(0, 1fr) 128px 100px 112px 80px 150px; }
 /* The run link covers its row. */
 #app .run-row .job-identity a::after { content: ""; position: absolute; inset: 0; }
 #app .run-row:hover .job-identity a { text-decoration: underline; text-underline-offset: 3px; }
-#app .run-row > .run-session, #app .job-list-head.run-row > :nth-child(7) { text-align: right; overflow: hidden; text-overflow: ellipsis; }
+#app .run-row > .run-session, #app .job-list-head.run-row > :nth-child(6) { text-align: right; overflow: hidden; text-overflow: ellipsis; }
 /* Sessions group the run rows; a session's runs are indented under its header. */
 #app .state { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 #app :is(.state-dot, .health-dot) { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
@@ -291,10 +291,9 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
   #app .run-row > :nth-child(2) { justify-self: end; }
   #app .run-row > :nth-child(n + 3) { color: var(--dim); font-size: 12px; }
   #app .run-row > :is(:nth-child(3), :nth-child(5)) { grid-column: 1; text-align: left; }
-  #app .run-row > :is(:nth-child(4), :nth-child(6)) { grid-column: 2; text-align: right; }
+  #app .run-row > :nth-child(4) { grid-column: 2; text-align: right; }
   #app .job-list-row.run-row > :nth-child(4)::after { content: " steps"; }
-  #app .job-list-row.run-row > :nth-child(5)::before { content: "Created "; }
-  #app .job-list-row.run-row > :nth-child(6)::before { content: "Elapsed "; }
+  #app .job-list-row.run-row > :nth-child(5)::before { content: "Elapsed "; }
   #app .job-list-row.run-row > .run-session { grid-column: 1 / -1; text-align: left; }
 }
 @media (max-width: 580px) {
