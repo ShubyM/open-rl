@@ -337,6 +337,7 @@ async def check_context(run_id: str, window: tuple[float, float] | None = None) 
     "finished": is_finished(run),
     "now": now,
     "pool": pool,
+    "placements": inspection.lanes(state, run_id=run_id),
     "since": created if isinstance(created, int | float) else 0.0,
     "state": state,
   }

@@ -63,7 +63,8 @@ class ChecksReplayTest(unittest.TestCase):
     steps = healthy_steps(every=600.0)
     stalled = context([op(at - 2000, "optim_step") for at in (s["at"] for s in steps)])
     self.assertEqual(verdict("progress", stalled), checks.FAIL)
-    slow = context([op(s["at"] - 800, "optim_step") for s in steps])  # last step 1,400 s ago: past 2x, under 3x
+    # Last step 1,400 s ago: past 2x, under 3x; samples still completing.
+    slow = context([*(op(s["at"] - 800, "optim_step") for s in steps), op(NOW - 30, "sample", role="sampler")])
     self.assertEqual(verdict("progress", slow), checks.WARN)
 
   def test_a_run_that_ended_on_a_failed_create_model_fails_progress(self):
@@ -83,6 +84,20 @@ class ChecksReplayTest(unittest.TestCase):
     self.assertIn("p-dispatcher-0", result["reason"])
     ctx["pool"]["alive"] = True
     self.assertNotEqual(checks.sampler_flow(ctx)["verdict"], checks.FAIL)
+
+  def test_a_live_run_where_nothing_completes_fails_progress_before_three_median_steps(self):
+    steps = healthy_steps(every=3000.0)  # a 50 min median puts the step threshold at 2.5 h
+    quiet = context([op(s["at"] - 1500, "optim_step") for s in steps])  # last step and last op 25 min ago
+    self.assertEqual(verdict("progress", quiet), checks.FAIL)
+    sampling = context([*quiet["samples"], op(NOW - 30, "sample", role="sampler")])
+    self.assertEqual(verdict("progress", sampling), checks.OK)
+
+  def test_a_worker_restarted_in_its_pod_with_a_request_in_flight_fails_worker_health(self):
+    held = {"op": "create_model", "count": 1, "since": NOW - 900, "age_seconds": 900, "pod": "t-0", "process_alive": False}
+    workers = [{"pod": "t-0", "role": "trainer", "started_at": NOW - 1000}, {"pod": "t-0", "role": "trainer", "started_at": NOW - 880}]
+    result = checks.worker_health(context(outstanding=[held], workers=workers))
+    self.assertEqual(result["verdict"], checks.FAIL)
+    self.assertIn("t-0 restarted", result["reason"])
 
   def test_a_healthy_run_is_ok_and_missing_inputs_are_unknown_never_ok(self):
     healthy = context(healthy_steps(), ledger={"enqueued": 5, "popped": 5, "answered": 5})

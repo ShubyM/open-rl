@@ -63,6 +63,9 @@ def median_step(steps: list[dict]) -> float | None:
   return statistics.median(gaps) if gaps else None
 
 
+QUIET_SECONDS = 1200  # a live run completes a sample or a trainer op far more often; the longest sample seen took 568 s
+
+
 def progress(ctx: dict) -> dict:
   """Is the run completing optimizer steps at its normal pace?"""
   name, run_id, ops, steps = "progress", ctx["run"]["run_id"], trainer_ops(ctx), optim_steps(ctx)
@@ -96,6 +99,10 @@ def progress(ctx: dict) -> dict:
     return answer(name, verdict, f"no optimizer step {idle / 60:.0f} min after the first op", evidence, **numbers)
   if idle > limit:
     return answer(name, FAIL, f"no optimizer step for {idle / 60:.0f} min, over 3x the {median / 60:.0f} min median", evidence, **numbers)
+  quiet = ctx["now"] - max(s["at"] for s in ctx["samples"])
+  if quiet > QUIET_SECONDS:
+    reason = f"nothing completed for {quiet / 60:.0f} min, neither a trainer op nor a sample"
+    return answer(name, FAIL, reason, read(f"runs/{run_id}/commands", limit=5), **{**numbers, "quiet_s": round(quiet), "quiet_threshold_s": QUIET_SECONDS})
   if median and idle > max(600, 2 * median):
     return answer(name, WARN, f"no optimizer step for {idle / 60:.0f} min, over 2x the median", evidence, **numbers)
   return answer(name, OK, f"{len(steps)} steps; the last {idle / 60:.0f} min ago", **numbers)
@@ -135,7 +142,8 @@ def worker_health(ctx: dict) -> dict:
   run_id = run["run_id"]
   events = inspection.incidents(run, ctx["since"], ctx["now"])
   failed = [s for s in trainer_ops(ctx) if s.get("status") == "failed"]
-  restarts = sum(c.get("restart_count") or 0 for p in run.get("pods") or [] for c in p.get("containers") or [])
+  relaunched = relaunches(ctx)
+  restarts = max(len(relaunched), sum(c.get("restart_count") or 0 for p in run.get("pods") or [] for c in p.get("containers") or []))
   held = any(o.get("op") != "sample" for o in (run.get("progress") or {}).get("outstanding") or [])
   numbers = {"failed_ops": len(failed), "restarts": restarts, "incidents": len(events)}
   severe = [e for e in events if e.get("reason") in ("OOMKilled", "CrashLoopBackOff")]
@@ -145,6 +153,10 @@ def worker_health(ctx: dict) -> dict:
     evidence = read("logs", e.get("message"), run_id=run_id, pod=pod, severity="ERROR", **span(ctx))
     return answer(name, FAIL, f"{e['reason']} on {pod or 'a pod'}: {e.get('message', '')[:120]}", evidence, **numbers)
   if restarts and held:
+    if relaunched:
+      p = relaunched[0]
+      logs = read("logs", run_id=run_id, pod=p["pod"], since=iso(p["started_at"] - 120), until=iso(p["started_at"] + 60))
+      return answer(name, FAIL, f"the worker in {p['pod']} restarted at {iso(p['started_at'])} with a request in flight", logs, **numbers)
     errors = read("logs", run_id=run_id, severity="ERROR", **span(ctx))
     return answer(name, FAIL, f"{restarts} restarts while requests were in flight", errors, **numbers)
   if failed or restarts or events:
@@ -153,9 +165,18 @@ def worker_health(ctx: dict) -> dict:
     failures = read(f"runs/{run_id}/commands", role="trainer", **span(ctx))
     logs = failure_logs(run_id, failed[-1]) if failed else read("logs", run_id=run_id, severity="ERROR", **span(ctx))
     return answer(name, WARN, reason, failures, logs, **numbers)
-  if not run.get("pods") and not ctx["samples"]:
-    return answer(name, UNKNOWN, "no pods or ops recorded for this run", **numbers)
+  if not run.get("pods") and not ctx["samples"] and not ctx.get("placements"):
+    return answer(name, UNKNOWN, "no pods, placements or ops recorded for this run", **numbers)
   return answer(name, OK, "no failures, restarts or OOMs recorded", **numbers)
+
+
+def relaunches(ctx: dict) -> list[dict]:
+  """Worker processes that replaced an earlier one in the same pod during this run: a crash or a container restart."""
+  by_pod: dict[str, list[dict]] = {}
+  for p in ctx["workers"]:
+    if p.get("pod") and p.get("role") != "dispatcher" and p.get("started_at", 0) >= ctx["since"] - 60:
+      by_pod.setdefault(p["pod"], []).append(p)
+  return sorted((p for procs in by_pod.values() for p in sorted(procs, key=lambda p: p["started_at"])[1:]), key=lambda p: p["started_at"])
 
 
 def placement(ctx: dict) -> dict:
@@ -172,7 +193,9 @@ def placement(ctx: dict) -> dict:
     why = w.get("placed_message") or w.get("reason") or "waiting for a GPU"
     detail = f"{w['name']} ({w.get('role')}) unplaced for {age[w['name']] / 60:.0f} min: {why}"
     return answer(name, FAIL, detail, **numbers)
-  if ctx["finished"] or workloads:
+  if ctx["finished"]:
+    return answer(name, OK, f"the run ended; {len(ctx.get('placements') or [])} placements recorded", **numbers)
+  if workloads:
     return answer(name, OK, f"{len(workloads)} workloads, all placed", **numbers)
   return answer(name, UNKNOWN, "no workloads recorded for this run", **numbers)
 
