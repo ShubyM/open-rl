@@ -111,12 +111,12 @@ def lanes(fleet: dict, run_id: str | None = None, node_id: str | None = None) ->
     lane.update(role=record["role"], node=record["node"] or "", pod=record["pod"], devices=record["gpu_uuids"], device_count=len(record["gpu_uuids"]))
     lane.update(phase=max(procs, key=lambda p: p["started_at"])["phase"] if procs else None, turns=[t for p in procs for t in p.get("turns") or []])
     lane.update(start=start, end=end, ended=record["released_at"] is not None)
-    for member in members if lane["shared_runtime"] else [None]:
-      if member is None:
-        found.append(lane)
-      else:
-        label = f"{(member['model'] or lane['label']).split('/')[-1]} · {member['run_id'][:8]}"
-        found.append({**lane, "id": f"{lane['id']}:{member['run_id']}", "allocation_id": lane["id"], "run_ids": [member["run_id"]], "label": label})
+    if not lane["shared_runtime"]:
+      found.append(lane)
+      continue
+    for member in members:
+      label = f"{(member['model'] or lane['label']).split('/')[-1]} · {member['run_id'][:8]}"
+      found.append({**lane, "id": f"{lane['id']}:{member['run_id']}", "allocation_id": lane["id"], "run_ids": [member["run_id"]], "label": label})
   return [p for p in found if (not run_id or run_id in p["run_ids"]) and (not node_id or p["node"] == node_id)]
 
 

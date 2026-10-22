@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from server.dashboard import facts, fleet, sources
 from server.store import get_state_store
-from server.telemetry import key
+from server.telemetry import alive, key
 
 router = APIRouter(tags=["inspection"])
 BOUNDS = "ISO-8601, e.g. 2026-01-02T12:00:00Z; since also takes a span before until, e.g. 1h. Default: the 30 minutes ending now; at most 7 days."
@@ -45,6 +45,10 @@ async def inventory():
   problems, and an error per unavailable source. A run's facts are /runs/{id}/summary."""
   await sources.discover()
   state = await fleet.snapshot()
+  return inventory_data(state)
+
+
+def inventory_data(state: dict) -> dict:
   hidden = ("workloads", "runtime_id", "pods")
   runs = [
     {k: v for k, v in r.items() if k not in hidden} | {"pods": [{"name": p["name"], "problem": p["problem"]} for p in r["pods"]]}
@@ -68,7 +72,10 @@ async def activity(since: Bound = None, until: Bound = None, run_id: str | None 
 
 
 VLLM = "{pod=~$pods$scope}"
+CONTAINERS = 'monitored_resource="k8s_container",namespace_name=$namespace,pod_name=~$pods$container_scope'
 QUERIES = {
+  "worker_cpu_cores": f"sum by (pod_name) (rate(kubernetes_io:container_cpu_core_usage_time{{{CONTAINERS}}}[2m]))",
+  "worker_memory_bytes": f'sum by (pod_name) (kubernetes_io:container_memory_used_bytes{{{CONTAINERS},memory_type="non-evictable"}})',
   # By UUID and gpu: DCGM's slot index names a GPU after its node is gone.
   "gpu_util": "max by (UUID, gpu) (DCGM_FI_DEV_GPU_UTIL{UUID=~$gpus$scope})",
   "gpu_memory_mib": "max by (UUID, gpu) (DCGM_FI_DEV_FB_USED{UUID=~$gpus$scope})",
@@ -98,6 +105,27 @@ def subject(state: dict, run_id: str | None, node_id: str | None, low: float, hi
   return sorted({uuid for p in held for uuid in p["devices"]} | set(now)), sorted({p["pod"] for p in held if p["pod"]})
 
 
+def worker_windows(state: dict, run_id: str | None, node_id: str | None, low: float, high: float) -> dict[str, list]:
+  """Container metrics include placement and retained process lifetimes."""
+  if not (run_id or node_id):
+    return {}
+  held = fleet.lanes(state, run_id, node_id)
+  run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
+  for worker in state["workers"]:
+    if not worker.get("pod") or node_id and worker.get("node") != node_id:
+      continue
+    start = worker["started_at"]
+    end = state["observed_at"] if alive(worker, state["observed_at"]) else worker["heartbeat_at"]
+    if run_id and (run is None or run["runtime_id"] != worker.get("runtime_id") or run["created_at"] > end or (run["completed_at"] or end) < start):
+      continue
+    held.append({"pod": worker["pod"], "start": start, "end": end})
+  windows = {}
+  for record in held:
+    if record["pod"] and record["start"] <= high and record["end"] >= low:
+      windows.setdefault(record["pod"], []).append((max(low, record["start"]), min(high, record["end"])))
+  return windows
+
+
 @router.get("/api/v1/inspect/query", response_model=Doc)
 async def query(
   name: Annotated[str, Query(description="One of the named queries; an unknown name lists them")],
@@ -109,21 +137,33 @@ async def query(
 ):
   """A named PromQL query over a run's GPUs and pods, a node's, or (GPU queries only) the fleet's, at `points` resolution.
   points=1 evaluates once over the whole window, which is how a duty cycle is one number per GPU."""
+  return await read_query(name, run_id, node_id, since, until, points)
+
+
+async def read_query(name: str, run_id: str | None, node_id: str | None, since: str | None, until: str | None, points: int) -> dict:
   if name not in QUERIES:
     raise HTTPException(400, f"Unknown query; use one of {sorted(QUERIES)}")
   since, until, low, high = span(since, until)
   await sources.discover()
-  gpus, pods = subject(await fleet.snapshot(), run_id, node_id, low, high)
+  state = await fleet.snapshot()
+  windows = worker_windows(state, run_id, node_id, low, high) if name.startswith("worker_") else None
+  gpus, pods = (None, sorted(windows)) if windows is not None else subject(state, run_id, node_id, low, high)
   result = {"name": name, "since": since, "until": until, "series": [], "source": sources.prometheus_source()}
   if gpus == [] and "$gpus" in QUERIES[name] or not pods and "$pods" in QUERIES[name]:
     return {**result, "error": "No GPUs or pods recorded for this subject in this window"}
   values = {"gpus": '".+"' if gpus is None else sources.any_of(gpus), "pods": sources.any_of(pods), "window": max(1, int(high - low))}
+  cluster = sources.configuration()["cluster"]
+  values.update(namespace=json.dumps(sources.namespace()), container_scope=f",cluster_name={json.dumps(cluster)}" if cluster else "")
   result["query"] = text = Template(QUERIES[name]).substitute(values, scope=sources.scope())
   try:
     rows = await sources.prom(text, high if points == 1 else low, high, points)
   except Exception as exc:
     return {**result, "error": str(exc) if isinstance(exc, LookupError) else f"Query failed: {type(exc).__name__}"}
   series = [{"labels": r["metric"], "points": [[float(t), float(v)] for t, v in r["values"] if math.isfinite(float(v))]} for r in rows]
+  if windows is not None:
+    for row in series:
+      spans = windows.get(row["labels"].get("pod_name"), [])
+      row["points"] = [[at, value] for at, value in row["points"] if any(start <= at <= end for start, end in spans)]
   return result | {"series": series}
 
 
@@ -133,7 +173,7 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
   placement on it), util (mean of the last two minutes), busy (mean over the window), memory used and total in MiB."""
   since, until, low, high = span(since or ("1h" if until is None else None), until)
   names = {"util": "gpu_util_now", "busy": "gpu_busy", "memory_used_mib": "gpu_memory_mib", "memory_total_mib": "gpu_memory_total_mib"}
-  found = dict(zip(names, await asyncio.gather(*(query(name, run_id, node_id, since, until, 1) for name in names.values()))))
+  found = dict(zip(names, await asyncio.gather(*(read_query(name, run_id, node_id, since, until, 1) for name in names.values()))))
   result = {"since": since, "until": until, "gpus": [], "source": found["util"]["source"]}
   if error := next((r["error"] for r in found.values() if r.get("error")), None):
     return {**result, "error": error}
@@ -174,6 +214,10 @@ async def steps(
   fields: Annotated[str | None, Query(description="Comma-separated prefixes of client metrics to keep, e.g. env/all/reward")] = None,
 ):
   """The run's last steps, oldest first: window, completion, trainer ops (count, failures, seconds, metric spread), `client` metrics."""
+  return await read_steps(run_id, last, fields)
+
+
+async def read_steps(run_id: str, last: int, fields: str | None) -> dict:
   _, run = await run_of(run_id)
   every, keep, result = fleet.steps(await fleet.operations(run_id)), tuple(p for p in (fields or "").split(",") if p), {}
   try:
@@ -215,7 +259,7 @@ async def summary(run_id: str):
   if ops := ctx["ops"]:
     # Duty over the run's own span: averaging in the idle days after it ended would understate it.
     end = min(state["observed_at"], ops[-1]["at"] + 60)
-    duty = await query("gpu_busy", run_id, None, facts.iso(max(ops[0]["at"] - 60, end - 7 * 86400)), facts.iso(end), 1)
+    duty = await read_query("gpu_busy", run_id, None, facts.iso(max(ops[0]["at"] - 60, end - 7 * 86400)), facts.iso(end), 1)
     roles, busy = {uuid: lane["role"] for lane in ctx["lanes"] for uuid in lane["devices"]}, {}
     for series in (s for s in duty["series"] if s["points"]):
       busy.setdefault(roles.get(series["labels"].get("UUID"), "other"), []).append(series["points"][-1][1])
@@ -253,6 +297,12 @@ async def logs(
   cursor: Annotated[str | None, Query(max_length=16384, description="next_cursor of a page with the same filters and window")] = None,
 ):
   """Cloud Logging, newest first: the run's worker pods by owner label and its client."""
+  return await read_logs(run_id, pod, q, severity, since, until, limit, cursor)
+
+
+async def read_logs(
+  run_id: str, pod: str | None, q: str, severity: str | None, since: str | None, until: str | None, limit: int, cursor: str | None
+) -> dict:
   since, until, low, high = span(since, until)
   await sources.discover()
   state, run = await run_of(run_id)

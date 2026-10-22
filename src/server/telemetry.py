@@ -277,6 +277,7 @@ async def ingest_logs(store, run_id: str, body: LogRequest) -> dict:
     at = line.at if line.at is not None and abs(line.at - now) < 86400 else now  # a client clock is trusted within a day
     labels = {RUN_LABEL: run_id, SOURCE_LABEL: CLIENT}
     print(json.dumps({"severity": severity, "message": line.message, "time": iso(at), "logging.googleapis.com/labels": labels}), flush=True)
+    await store.append_sample(f"open_rl:run_logs:{run_id}", {"at": at, "severity": severity, "message": line.message}, 5000, TTL_SECONDS)
   return {"accepted": len(body.lines)}
 
 

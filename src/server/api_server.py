@@ -747,8 +747,10 @@ app.openapi = openapi_with_settings
 # Fleet inspection belongs on the operator dashboard, not the model-capability API.
 if os.getenv("OPEN_RL_INSPECTION_API", "").lower() == "true":
   from server.dashboard.router import router as dashboard_router
+  from server.dashboard.views import router as dashboard_views
 
   app.include_router(dashboard_router)
+  app.include_router(dashboard_views)
 FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
 
 

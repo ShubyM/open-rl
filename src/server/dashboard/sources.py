@@ -104,20 +104,25 @@ def incidents(pod: str, statuses: list[dict]) -> list[dict]:
   ]
 
 
+def k8s_clients():
+  from kubernetes import client, config  # the cluster extra installs it
+
+  try:
+    config.load_incluster_config()
+  except Exception:
+    config.load_kube_config()
+  return client.CoreV1Api(), client.CustomObjectsApi()
+
+
 async def kubernetes() -> dict:
   """Pods, nodes and scheduler Workloads; workloads is None when the scheduler cannot be read or is not installed."""
   try:
-    from kubernetes import client, config  # the cluster extra installs it
-
     from server.scheduler_worker_manager import workload_worker
 
-    try:
-      config.load_incluster_config()
-    except Exception:
-      config.load_kube_config()
+    core, custom = k8s_clients()
   except Exception as exc:
     return {"pods": [], "nodes": [], "workloads": None, "errors": [f"Kubernetes unavailable: {exc}"]}
-  core, custom, ns, errors = client.CoreV1Api(), client.CustomObjectsApi(), namespace(), []
+  ns, errors = namespace(), []
 
   async def items(name: str, call, *args) -> list[dict] | None:
     try:
@@ -128,16 +133,32 @@ async def kubernetes() -> dict:
         errors.append(f"{name} read failed: {exc}")
       return None
 
-  pods, nodes, workloads = await asyncio.gather(
+  pods, nodes, workloads, events = await asyncio.gather(
     items("pods", core.list_namespaced_pod, ns),
     items("nodes", core.list_node),
     items("workloads", custom.list_namespaced_custom_object, "openrl.io", "v1alpha1", ns, "workloads"),
+    items("events", core.list_namespaced_event, ns),
   )
+  by_pod = {}
+  for event in events or []:
+    by_pod.setdefault(event.get("involvedObject", {}).get("uid"), []).append(
+      {
+        "reason": event.get("reason"),
+        "message": event.get("message"),
+        "type": event.get("type"),
+        "first_seen_at": event.get("firstTimestamp") or event.get("metadata", {}).get("creationTimestamp"),
+        "last_seen_at": (event.get("series") or {}).get("lastObservedTime") or event.get("eventTime") or event.get("lastTimestamp"),
+        "count": event.get("count") or (event.get("series") or {}).get("count") or 1,
+      }
+    )
   result, now = {"pods": [], "nodes": [], "workloads": None if workloads is None else [], "errors": errors}, time.time()
   for pod in pods or []:
     name, labels, statuses = pod["metadata"]["name"], pod["metadata"].get("labels") or {}, pod["status"].get("containerStatuses") or []
     row = {"name": name, "node": pod["spec"].get("nodeName"), "owner": labels.get("timeslice.io/owner"), "problem": problem(pod["status"])}
-    result["pods"].append(row | {"incidents": incidents(name, statuses), "restarts": sum(cs.get("restartCount") or 0 for cs in statuses)})
+    row.update(worker=labels.get("openrl.io/worker"), incidents=incidents(name, statuses))
+    row.update(uid=pod["metadata"].get("uid"), phase=pod["status"].get("phase"), containers=[container_record(cs) for cs in statuses])
+    row["events"] = sorted(by_pod.get(row["uid"], []), key=lambda e: e["last_seen_at"] or "")[-10:]
+    result["pods"].append(row | {"restarts": sum(cs.get("restartCount") or 0 for cs in statuses)})
   for node in nodes or []:
     labels, status = node["metadata"].get("labels") or {}, node["status"]
     row = {"name": node["metadata"]["name"], "ready": any(c["type"] == "Ready" and c["status"] == "True" for c in status.get("conditions") or [])}
@@ -150,6 +171,36 @@ async def kubernetes() -> dict:
     worker.update(name=worker["workload"], training_kind=item["spec"].get("trainingKind"), message=placed.get("message") or status.get("reason"))
     result["workloads"].append(worker)
   return result
+
+
+def container_record(status: dict) -> dict:
+  kind, details = next(iter((status.get("state") or {}).items()), ("unknown", {}))
+  fields = {"exitCode": "exit_code", "startedAt": "started_at", "finishedAt": "finished_at"}
+  last = (status.get("lastState") or {}).get("terminated")
+  return {
+    "name": status["name"],
+    "image": status.get("image"),
+    "state": kind,
+    "restart_count": status.get("restartCount", 0),
+    **{fields.get(k, k): v for k, v in details.items()},
+    "last_termination": {fields.get(k, k): v for k, v in last.items()} if last else None,
+  }
+
+
+async def pod_logs(pod: str, container: str | None = None, tail: int = 200, previous: bool = False) -> dict:
+  core, _ = await asyncio.to_thread(k8s_clients)
+  text = await asyncio.to_thread(
+    core.read_namespaced_pod_log,
+    pod,
+    namespace(),
+    container=container,
+    previous=previous,
+    tail_lines=tail,
+    timestamps=True,
+    limit_bytes=128 * 1024,
+    _request_timeout=10,
+  )
+  return {"pod": pod, "container": container, "previous": previous, "text": text}
 
 
 def scope() -> str:

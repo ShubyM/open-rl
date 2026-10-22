@@ -5,6 +5,8 @@
 **Target branch**: `main`. The backend lands first; the Svelte UI (PR #23) follows separately
 **Instrumentation ledger**: [`docs/instrumentation-ledger.md`](../instrumentation-ledger.md)
 
+**Dashboard follow-up**: [Current routes and source requirements](../dashboard.md). The restored UI uses separate `/api/v1/dashboard` projections over the same cached facts and readers; agents retain the compact `/api/v1/inspect` contract. Implementation costs and validation are recorded in ledger row 12.
+
 ---
 
 ## 1. Summary

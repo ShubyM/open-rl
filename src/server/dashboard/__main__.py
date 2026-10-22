@@ -8,11 +8,13 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
 
 from server.dashboard.router import router
+from server.dashboard.views import router as dashboard_router
 
 app = FastAPI(title="Open-RL Inspection API")
 app.add_middleware(GZipMiddleware, minimum_size=4096, compresslevel=1)  # a port-forward carries large JSON slowly
 app.include_router(router)
-app.get("/", include_in_schema=False)(lambda: RedirectResponse("/docs"))
+app.include_router(dashboard_router)
+app.get("/", include_in_schema=False)(lambda: RedirectResponse("/dashboard"))
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(description=__doc__)

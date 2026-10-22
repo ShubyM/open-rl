@@ -94,8 +94,8 @@ def samplers(ctx: dict) -> dict | None:
     "sends": len(sends),
     "retried": sum(s.get("status") == "retried" for s in sends),
     "failed": sum(s.get("status") == "failed" for s in sends),
+    "median_s": round(statistics.median(s.get("elapsed_seconds", 0) for s in sends), 2),
   }
-  found["median_s"] = round(statistics.median(s.get("elapsed_seconds", 0) for s in sends), 2)
   # Answered sends only: a fast failure is not a replica's speed.
   by_pod: dict[str, list[float]] = {}
   for s in sends:
