@@ -1,19 +1,48 @@
 """Diagnostic checks: each answers one question about a run with a verdict, a reason, a few numbers and evidence.
 
 Thresholds come from past incidents (docs/designs/017-run-diagnostics.md, section 4.5). A check whose inputs are
-missing answers unknown, never ok, so absent data cannot read as healthy.
+missing answers unknown, never ok, so absent data cannot read as healthy. Symptoms set a run's verdict; causes
+name what may explain a failing symptom. Evidence is a list of reads an agent can run as given.
 """
 
 import statistics
+from datetime import UTC, datetime
 
 from server.dashboard import inspection
 
 OK, WARN, FAIL, UNKNOWN = "ok", "warn", "fail", "unknown"
 RANK = {OK: 0, UNKNOWN: 1, WARN: 2, FAIL: 3}
+# A failing symptom is what someone notices; causes are where to look first, in this order.
+SYMPTOMS = {"progress", "optimizer-health", "client-liveness"}
+EXPLAINS = {"sdk-errors": "client-liveness"}  # every other cause explains progress
 
 
-def answer(check: str, verdict: str, reason: str, evidence: str | None = None, **numbers) -> dict:
-  return {"check": check, "verdict": verdict, "reason": reason, "numbers": numbers, **({"evidence": evidence} if evidence else {})}
+def read(route: str, head: str | None = None, **args) -> dict:
+  """A call against /api/v1/inspect that shows the evidence; `head` is one line of what it returns."""
+  return {"read": route, "args": args, **({"head": head[:200]} if head else {})}
+
+
+def answer(check: str, verdict: str, reason: str, *evidence: dict, **numbers) -> dict:
+  kind = {"kind": "symptom"} if check in SYMPTOMS else {"kind": "cause", "explains": EXPLAINS.get(check, "progress")}
+  return {"check": check, "verdict": verdict, "reason": reason, **kind, "numbers": numbers, **({"evidence": list(evidence)} if evidence else {})}
+
+
+def span(ctx: dict) -> dict:
+  """since and until covering the run's records, so an evidence read finds them; reads allow at most seven days."""
+  times = [s["at"] for s in ctx["samples"]]
+  if not times:
+    return {}
+  until = max(times) + 60
+  return {"since": iso(max(min(times) - 60, until - 7 * 86400)), "until": iso(until)}
+
+
+def holder_logs(run_id: str, held: dict) -> dict:
+  """The holder pod's logs from just before it took the request: what it did instead of answering."""
+  return read("logs", run_id=run_id, pod=held["pod"], since=iso(held["since"] - 300), until=iso(held["since"] + 3600))
+
+
+def iso(at: float) -> str:
+  return datetime.fromtimestamp(at, UTC).isoformat(timespec="seconds")
 
 
 def trainer_ops(ctx: dict) -> list[dict]:
@@ -32,22 +61,32 @@ def median_step(steps: list[dict]) -> float | None:
 def progress(ctx: dict) -> dict:
   """Is the run completing optimizer steps at its normal pace?"""
   name, run_id, ops, steps = "progress", ctx["run"]["run_id"], trainer_ops(ctx), optim_steps(ctx)
+  waiting = [o for o in (ctx["run"].get("progress") or {}).get("outstanding") or [] if o.get("op") != "sample"]
+  oldest = max((o.get("age_seconds", 0) for o in waiting), default=0)
   if ctx["finished"]:
+    if not steps and waiting:
+      reason = f"the run ended without a step, with {waiting[0]['op']} never answered"
+      return answer(name, FAIL, reason, holder_logs(run_id, waiting[0]), steps=0, unanswered=len(waiting))
     return answer(name, OK, "the run finished", steps=len(steps))
   if not ops:
+    # Nothing ever completed, but the client is waiting: a run that never started is a failed run, not missing data.
+    if oldest > 1800:
+      reason = f"no op has completed and {waiting[0]['op']} has waited {oldest / 60:.0f} min"
+      return answer(name, FAIL, reason, holder_logs(run_id, waiting[0]), observed_s=round(oldest), threshold_s=1800)
     return answer(name, UNKNOWN, "no trainer ops recorded for this run")
   median = median_step(steps)
   idle = ctx["now"] - (steps[-1]["at"] if steps else ops[0]["started_at"])
-  numbers = {"steps": len(steps), "median_step_s": median, "since_last_step_s": round(idle)}
-  evidence = f"runs/{run_id}/steps?last=3"
+  limit = max(1800, 3 * median) if median else 1800
+  numbers = {"observed_s": round(idle), "expected_s": median, "threshold_s": limit, "steps": len(steps)}
+  evidence = read(f"runs/{run_id}/steps", last=3)
   if not steps:
     verdict = FAIL if idle > 1800 else OK
     return answer(name, verdict, f"no optimizer step {idle / 60:.0f} min after the first op", evidence, **numbers)
-  if median and idle > max(1800, 3 * median):
+  if idle > limit:
     return answer(name, FAIL, f"no optimizer step for {idle / 60:.0f} min, over 3x the {median / 60:.0f} min median", evidence, **numbers)
   if median and idle > max(600, 2 * median):
     return answer(name, WARN, f"no optimizer step for {idle / 60:.0f} min, over 2x the median", evidence, **numbers)
-  return answer(name, OK, f"{len(steps)} steps; the last {idle / 60:.0f} min ago", evidence, **numbers)
+  return answer(name, OK, f"{len(steps)} steps; the last {idle / 60:.0f} min ago", **numbers)
 
 
 def request_ledger(ctx: dict) -> dict:
@@ -58,18 +97,21 @@ def request_ledger(ctx: dict) -> dict:
   numbers = {"outstanding": sum(o.get("count", 0) for o in outstanding)}
   if dead:
     o = dead[0]
-    return answer(name, FAIL, f"{o['count']} {o['op']} held by {o['pod']}, which stopped reporting", f"pod {o['pod']}", **numbers)
+    reason = f"{o['count']} {o['op']} held by {o['pod']}, which stopped reporting"
+    return answer(name, FAIL, reason, holder_logs(run_id, o), **numbers)
   ledger = ctx["ledger"]
   if ledger.get("enqueued") is not None:
     lost = ledger["enqueued"] - (ledger.get("popped") or 0) - ((progress_.get("queued") or {}).get("trainer") or 0)
-    numbers["lost"] = lost
+    numbers.update(lost=lost, enqueued=ledger["enqueued"], popped=ledger.get("popped"))
     if lost > 0:
-      return answer(name, FAIL, f"{lost} requests were enqueued but never popped or queued", f"open_rl:ledger:{run_id}:*", **numbers)
+      evidence = read("logs", run_id=run_id, q="enqueued", **span(ctx))
+      return answer(name, FAIL, f"{lost} requests were enqueued but never popped or queued", evidence, **numbers)
   median = median_step(optim_steps(ctx))
   oldest = max((o.get("age_seconds", 0) for o in outstanding), default=0)
-  numbers["oldest_s"] = round(oldest)
+  numbers.update(observed_s=round(oldest), expected_s=median, threshold_s=3 * median if median else None)
   if median and oldest > 3 * median:
-    return answer(name, WARN, f"a request has waited {oldest / 60:.0f} min, over 3 median steps", f"runs/{run_id}/commands", **numbers)
+    reason = f"a request has waited {oldest / 60:.0f} min, over 3 median steps"
+    return answer(name, WARN, reason, read(f"runs/{run_id}/commands", **span(ctx)), **numbers)
   if ledger.get("enqueued") is None and not ctx["finished"]:
     return answer(name, UNKNOWN, "no ledger counters for this run; its workers predate them", **numbers)
   return answer(name, OK, "every request is queued, held by a live worker, or answered", **numbers)
@@ -78,6 +120,7 @@ def request_ledger(ctx: dict) -> dict:
 def worker_health(ctx: dict) -> dict:
   """Has any worker of this run crashed, restarted, OOMed or failed an op?"""
   name, run = "worker-health", ctx["run"]
+  run_id = run["run_id"]
   events = inspection.incidents(run, ctx["since"], ctx["now"])
   failed = [s for s in trainer_ops(ctx) if s.get("status") == "failed"]
   restarts = sum(c.get("restart_count") or 0 for p in run.get("pods") or [] for c in p.get("containers") or [])
@@ -86,14 +129,17 @@ def worker_health(ctx: dict) -> dict:
   severe = [e for e in events if e.get("reason") in ("OOMKilled", "CrashLoopBackOff")]
   if severe:
     e = severe[0]
-    return answer(name, FAIL, f"{e['reason']} on {e.get('pod', 'a pod')}: {e.get('message', '')[:120]}", f"pod {e.get('pod')}", **numbers)
+    pod = e.get("pod")
+    evidence = read("logs", e.get("message"), run_id=run_id, pod=pod, severity="ERROR", **span(ctx))
+    return answer(name, FAIL, f"{e['reason']} on {pod or 'a pod'}: {e.get('message', '')[:120]}", evidence, **numbers)
   if restarts and held:
-    return answer(name, FAIL, f"{restarts} restarts while requests were in flight", "pods", **numbers)
+    errors = read("logs", run_id=run_id, severity="ERROR", **span(ctx))
+    return answer(name, FAIL, f"{restarts} restarts while requests were in flight", errors, **numbers)
   if failed or restarts or events:
     kinds = sorted({s.get("error_type") or "failed" for s in failed})
-    return answer(
-      name, WARN, f"{len(failed)} failed ops ({', '.join(kinds) or 'none'}), {restarts} restarts", f"runs/{run['run_id']}/commands", **numbers
-    )
+    reason = f"{len(failed)} failed ops ({', '.join(kinds) or 'none'}), {restarts} restarts"
+    failures = read(f"runs/{run_id}/commands", role="trainer", **span(ctx))
+    return answer(name, WARN, reason, failures, read("logs", run_id=run_id, severity="ERROR", **span(ctx)), **numbers)
   if not run.get("pods") and not ctx["samples"]:
     return answer(name, UNKNOWN, "no pods or ops recorded for this run", **numbers)
   return answer(name, OK, "no failures, restarts or OOMs recorded", **numbers)
@@ -107,36 +153,40 @@ def placement(ctx: dict) -> dict:
   workloads = run.get("workloads") or []
   age = {w["name"]: (w.get("worker") or {}).get("age_seconds") or 0 for w in workloads}
   pending = [w for w in workloads if not w.get("node_name") and age[w["name"]] > 300]
-  numbers = {"workloads": len(workloads), "unplaced": len(pending)}
+  numbers = {"workloads": len(workloads), "unplaced": len(pending), "threshold_s": 300}
   if pending:
     w = pending[0]
-    reason = w.get("placed_message") or w.get("reason") or "waiting for a GPU"
-    return answer(
-      name, FAIL, f"{w['name']} ({w.get('role')}) unplaced for {age[w['name']] / 60:.0f} min: {reason}", f"workload {w['name']}", **numbers
-    )
+    why = w.get("placed_message") or w.get("reason") or "waiting for a GPU"
+    detail = f"{w['name']} ({w.get('role')}) unplaced for {age[w['name']] / 60:.0f} min: {why}"
+    return answer(name, FAIL, detail, read("inventory", why), **numbers)
   if ctx["finished"] or workloads:
     return answer(name, OK, f"{len(workloads)} workloads, all placed", **numbers)
   return answer(name, UNKNOWN, "no workloads recorded for this run", **numbers)
 
 
 def optimizer_health(ctx: dict) -> dict:
-  """Are gradients finite and inside their normal range?"""
+  """Are gradients finite, and is the grad norm steady rather than spiking or climbing?"""
   name, run_id = "optimizer-health", ctx["run"]["run_id"]
-  ops = trainer_ops(ctx)
-  poisoned = [s for s in ops if s.get("nonfinite")]
+  poisoned = [s for s in trainer_ops(ctx) if s.get("nonfinite")]
   numbers = {"nonfinite_ops": len(poisoned)}
+  evidence = read(f"runs/{run_id}/steps", last=10)
   if poisoned:
     s = poisoned[0]
-    return answer(name, FAIL, f"{s['operation']} returned non-finite {', '.join(s['nonfinite'])}", f"runs/{run_id}/steps", **numbers)
+    return answer(name, FAIL, f"{s['operation']} returned non-finite {', '.join(s['nonfinite'])}", evidence, **numbers)
   norms = [s["metrics"]["grad_norm:mean"] for s in optim_steps(ctx) if "grad_norm:mean" in s.get("metrics", {})]
   if not norms:
     return answer(name, UNKNOWN, "no grad norms recorded", **numbers)
-  numbers.update(last_grad_norm=norms[-1], median_grad_norm=statistics.median(norms))
+  median = statistics.median(norms)
+  numbers.update(observed=norms[-1], expected=median, threshold=10 * median)
   if len(norms) >= 2 and norms[-1] == norms[-2] == 0:
-    return answer(name, FAIL, "grad norm was exactly 0 for 2 steps", f"runs/{run_id}/steps", **numbers)
+    return answer(name, FAIL, "grad norm was exactly 0 for 2 steps", evidence, **numbers)
   if len(norms) >= 5 and norms[-1] > 10 * statistics.median(norms[:-1]):
-    return answer(name, WARN, f"grad norm {norms[-1]:.3g} is over 10x its median", f"runs/{run_id}/steps", **numbers)
-  return answer(name, OK, f"grad norms finite; last {norms[-1]:.3g}", **numbers)
+    return answer(name, WARN, f"grad norm {norms[-1]:.3g} is over 10x its median", evidence, **numbers)
+  # Growth often precedes instability (INTELLECT-2): five rising steps ending well above the run's median.
+  tail = norms[-5:]
+  if len(norms) >= 8 and all(a < b for a, b in zip(tail, tail[1:])) and tail[-1] > 3 * statistics.median(norms[:-5]):
+    return answer(name, WARN, f"grad norm rose for 5 steps to {tail[-1]:.3g}", evidence, **numbers)
+  return answer(name, OK, f"grad norms finite and steady; last {norms[-1]:.3g}", **numbers)
 
 
 def effective_config(ctx: dict) -> dict:
@@ -147,47 +197,63 @@ def effective_config(ctx: dict) -> dict:
     return answer(name, UNKNOWN, "no worker echoed its settings; they predate the echo")
   settings = run.get("settings") or {}
   for w in echoed:
-    env = w["config"].get("env", {})
-    asked = settings.get("openrl.fine_tuning_type")
-    got = env.get("OPEN_RL_FINE_TUNING_TYPE")
+    pod = w.get("pod")
+    asked, got = settings.get("openrl.fine_tuning_type"), w["config"].get("env", {}).get("OPEN_RL_FINE_TUNING_TYPE")
     if asked and got and asked != got:
-      return answer(name, FAIL, f"{w.get('pod')} runs {got}; the run asked for {asked}", f"pod {w.get('pod')}")
+      return answer(name, FAIL, f"{pod} runs {got}; the run asked for {asked}", read("logs", run_id=run["run_id"], pod=pod, q="openrl.config"))
     if w.get("role") == "trainer" and settings.get("openrl.trainer_gpus") and not w.get("gpus"):
-      return answer(name, FAIL, f"{w.get('pod')} sees no GPUs; the run asked for {settings['openrl.trainer_gpus']}", f"pod {w.get('pod')}")
+      reason = f"{pod} sees no GPUs; the run asked for {settings['openrl.trainer_gpus']}"
+      return answer(name, FAIL, reason, read("logs", run_id=run["run_id"], pod=pod, q="openrl.config"))
   return answer(name, OK, f"{len(echoed)} workers echo settings consistent with the run", workers=len(echoed))
 
 
 def sampler_flow(ctx: dict) -> dict:
-  """Are samplers answering, without many retries or failures?"""
+  """Are samplers answering without many retries or failures, and is no replica far slower than its peers?"""
   name, run_id = "sampler-flow", ctx["run"]["run_id"]
   sends = [s for s in ctx["samples"] if s.get("role") == "sampler"]
+  evidence = read(f"runs/{run_id}/commands", role="sampler", **span(ctx))
   if not sends:
     return answer(name, OK if ctx["finished"] else UNKNOWN, "no sample requests recorded")
   retried = sum(s.get("status") == "retried" for s in sends)
   failed = sum(s.get("status") == "failed" for s in sends)
   latency = statistics.median(s.get("elapsed_seconds", 0) for s in sends)
-  numbers = {"sends": len(sends), "retried": retried, "failed": failed, "median_s": round(latency, 2)}
-  evidence = f"runs/{run_id}/commands?role=sampler"
+  numbers = {"sends": len(sends), "retried": retried, "failed": failed, "median_s": round(latency, 2), "threshold_share": 0.05}
   if failed / len(sends) > 0.05:
     return answer(name, FAIL, f"{failed} of {len(sends)} sample requests failed", evidence, **numbers)
   if retried / len(sends) > 0.05:
     return answer(name, WARN, f"{retried} of {len(sends)} sends were retried", evidence, **numbers)
+  # Each replica against the fastest in the same run, so no stored baseline is needed (NVRx, Minder).
+  by_pod = {}
+  for s in sends:
+    # Answered sends to replica pods only: a fast failure, or a send recorded against the router URL, is not a replica's speed.
+    if s.get("status") == "succeeded" and s.get("pod") and "://" not in s["pod"]:
+      by_pod.setdefault(s["pod"], []).append(s.get("elapsed_seconds", 0))
+  medians = {pod: statistics.median(v) for pod, v in by_pod.items() if len(v) >= 20}
+  if len(medians) >= 2:
+    fastest, slowest = min(medians, key=medians.get), max(medians, key=medians.get)
+    numbers.update(slowest=slowest, slowest_s=round(medians[slowest], 2), fastest_s=round(medians[fastest], 2))
+    if medians[slowest] > 2 * medians[fastest]:
+      return answer(name, WARN, f"{slowest} answers in {medians[slowest]:.1f} s, over 2x the fastest replica", evidence, **numbers)
   return answer(name, OK, f"{len(sends)} sends, median {latency:.1f} s", **numbers)
 
 
 def storage(ctx: dict) -> dict:
-  """Do checkpoints save, so a crash loses little?"""
+  """Do checkpoints save, in reasonable time, so a crash loses little?"""
   name, run_id = "storage", ctx["run"]["run_id"]
   saves = [s for s in trainer_ops(ctx) if s["operation"] == "save_state"]
   failed = [s for s in saves if s.get("status") == "failed"]
+  slow = [s for s in saves if s.get("elapsed_seconds", 0) > 600]
   numbers = {"saves": len(saves), "failed": len(failed)}
+  evidence = read(f"runs/{run_id}/commands", role="trainer", **span(ctx))
   if failed:
-    return answer(name, FAIL, f"{len(failed)} of {len(saves)} save_state calls failed", f"runs/{run_id}/commands", **numbers)
+    return answer(name, FAIL, f"{len(failed)} of {len(saves)} save_state calls failed", evidence, **numbers)
   last_save = max((s["at"] for s in saves if s.get("status") == "succeeded"), default=0.0)
   since = sum(s["at"] > last_save for s in optim_steps(ctx))
-  numbers["steps_since_save"] = since
+  numbers.update(steps_since_save=since, threshold_steps=5)
   if since > 5:
-    return answer(name, WARN, f"{since} steps since the last successful save_state; a crash loses them", f"runs/{run_id}/commands", **numbers)
+    return answer(name, WARN, f"{since} steps since the last successful save_state; a crash loses them", evidence, **numbers)
+  if slow:
+    return answer(name, WARN, f"a save_state took {slow[-1]['elapsed_seconds'] / 60:.0f} min, over the 10 min deadline", evidence, **numbers)
   return answer(name, UNKNOWN, "saves succeed; volume usage is not recorded", **numbers)
 
 
@@ -207,6 +273,30 @@ def run_checks(ctx: dict, only: list[str] | None = None) -> list[dict]:
   return [CHECKS[name](ctx) for name in only or CHECKS]
 
 
+def verdict(results: list[dict]) -> str:
+  """A run's verdict is its worst symptom; causes only explain it."""
+  symptoms = [r["verdict"] for r in results if r["kind"] == "symptom"]
+  return max(symptoms, key=RANK.get, default=UNKNOWN)
+
+
+def goodput(ctx: dict) -> dict | None:
+  """Share of the run's span the trainer spent training, and where the rest went (Google ML goodput)."""
+  ops = trainer_ops(ctx)
+  if not ops:
+    return None
+  start = ops[0]["started_at"]
+  wall = max((ops[-1]["at"] if ctx["finished"] else ctx["now"]) - start, 1.0)
+  spent = {kind: sum(s.get("elapsed_seconds", 0) for s in ops if s["operation"] in names) for kind, names in BUCKETS.items()}
+  steps = optim_steps(ctx)
+  return {
+    "goodput": round(spent["train"] / wall, 3),
+    "seconds": {"wall": round(wall), **{k: round(v) for k, v in spent.items()}, "other": round(max(0.0, wall - sum(spent.values())))},
+    "first_step_after_s": round(steps[0]["at"] - start) if steps else None,
+  }
+
+
+# "other" is the trainer idle between ops: waiting for the client to sample, grade and send the next batch.
+BUCKETS = {"train": {"forward_backward", "optim_step"}, "checkpoint": {"save_state", "save_weights_for_sampler"}, "forward": {"forward"}}
 SESSION_LIVE_SECONDS = 120  # the live session key's expiry: a session silent this long is gone
 
 
@@ -219,8 +309,8 @@ def client_liveness(session: dict) -> dict:
   unfinished = [m for m, ctx in session["models"].items() if not ctx["finished"] and not session["resumed"].get(m)]
   if record.get("derived") and not session["live"] and unfinished:
     return answer(name, UNKNOWN, "no session record, and no live heartbeat key; its gateway predates session records")
-  numbers = {"since_heartbeat_s": round(heard), "since_request_s": round(quiet) if quiet is not None else None, "models": len(session["models"])}
-  evidence = f"sessions/{record['session_id']}/summary"
+  numbers = {"since_heartbeat_s": round(heard), "observed_s": round(quiet) if quiet is not None else None, "threshold_s": 600}
+  evidence = read(f"sessions/{record['session_id']}/summary")
   if session["live"] and unfinished and quiet is not None and quiet > 600:
     return answer(name, FAIL, f"the client heartbeats but sent nothing for {quiet / 60:.0f} min", evidence, **numbers)
   if not session["live"] and unfinished:
@@ -235,9 +325,8 @@ def sdk_errors(session: dict) -> dict:
     return answer(name, OK, "no SDK errors reported", errors=0)
   worst = FAIL if any(e.get("severity") == "CRITICAL" for e in errors) else WARN
   reasons = statistics.mode(e.get("reason") or "error" for e in errors)
-  return answer(
-    name, worst, f"{len(errors)} SDK errors, mostly {reasons}", f"open_rl:sdk_errors:{session['record']['session_id']}", errors=len(errors)
-  )
+  evidence = read(f"sessions/{session['record']['session_id']}/checks", errors[-1].get("message"))
+  return answer(name, worst, f"{len(errors)} SDK errors, mostly {reasons}", evidence, errors=len(errors))
 
 
 def session_checks(session: dict) -> list[dict]:

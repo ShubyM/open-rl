@@ -41,11 +41,13 @@ def verdict(name, ctx):
 
 class ChecksReplayTest(unittest.TestCase):
   def test_requests_held_by_a_trainer_that_stopped_reporting_fail_the_ledger(self):  # I1
-    held = {"op": "forward_backward", "count": 3, "age_seconds": 207360, "pod": "harvey-trainer-0", "process_alive": False}
+    held = {"op": "forward_backward", "count": 3, "since": NOW - 207360, "age_seconds": 207360, "pod": "harvey-trainer-0", "process_alive": False}
     ctx = context(healthy_steps(), outstanding=[held])
     result = checks.request_ledger(ctx)
     self.assertEqual(result["verdict"], checks.FAIL)
     self.assertIn("harvey-trainer-0", result["reason"])
+    (logs,) = result["evidence"]
+    self.assertEqual((logs["read"], logs["args"]["pod"]), ("logs", "harvey-trainer-0"))
 
   def test_a_request_lost_between_push_and_pop_fails_the_ledger_instead_of_reading_idle(self):  # I4
     ctx = context(healthy_steps(), ledger={"enqueued": 11, "popped": 10, "answered": 10}, queued=0)

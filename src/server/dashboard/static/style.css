@@ -51,6 +51,9 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .run-row > .run-session, #app .job-list-head.run-row > :nth-child(7) { text-align: right; overflow: hidden; text-overflow: ellipsis; }
 /* Sessions group the run rows; a session's runs are indented under its header. */
 #app .run-checks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+#app .check-verdict { margin: 0 0 12px; display: flex; gap: 8px; align-items: center; }
+#app .check-table td > .micro { display: block; }
+#app .check-evidence { display: block; color: var(--accent); }
 #app .check-badge { --check-tone: var(--dim); display: inline-block; padding: 1px 7px; border-radius: var(--radius); font-size: 11px; line-height: 18px; white-space: nowrap; color: var(--check-tone); background: color-mix(in srgb, var(--check-tone) 10%, var(--ground)); }
 #app .check-badge[data-verdict="ok"] { --check-tone: var(--status-success); }
 #app .check-badge[data-verdict="warn"] { --check-tone: var(--status-warning); }

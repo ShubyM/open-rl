@@ -20,6 +20,7 @@ from server import telemetry
 from server.dashboard import checks, inspection, metrics, queries, sources
 from server.dashboard.schema import (
   Activity,
+  Catalog,
   Checks,
   Commands,
   Inventory,
@@ -278,7 +279,7 @@ async def commands(
   matched = [s for s in records["samples"] if low <= s["at"] <= high and (role is None or (s.get("role") == "sampler") == (role == "sampler"))]
   matched.sort(key=lambda s: s["at"], reverse=True)
   extra = {k: records[k] for k in ("error", "partial") if records.get(k)}
-  return {"run_id": run_id, "commands": matched[:limit], "truncated": len(matched) > limit, **extra}
+  return {"run_id": run_id, "commands": matched[:limit], "total": len(matched), "truncated": len(matched) > limit, **extra}
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/steps", operation_id="steps", response_model=Steps, response_model_exclude_unset=True)
@@ -291,12 +292,13 @@ async def steps(
   state = await snapshot.current(get_state_store())
   run = next((r for r in state["runs"] if r["run_id"] == run_id), None)
   records = await read_operations(run_id, is_finished(run))
-  found = inspection.steps(records["samples"])[-last:]
+  every = inspection.steps(records["samples"])
+  found = every[-last:]
   client = {row["step"]: row["metrics"] for row in (await stored_history(run_id))["rows"]}
   keep = tuple(p for p in (fields or "").split(",") if p)
   for step in found:
     step["client"] = {k: v for k, v in client.get(step["step"], {}).items() if not keep or k.startswith(keep)}
-  return {"run_id": run_id, "steps": found, **({"error": records["error"]} if records.get("error") else {})}
+  return {"run_id": run_id, "total": len(every), "steps": found, **({"error": records["error"]} if records.get("error") else {})}
 
 
 async def check_context(run_id: str, window: tuple[float, float] | None = None) -> dict:
@@ -334,13 +336,26 @@ async def check_context(run_id: str, window: tuple[float, float] | None = None) 
   }
 
 
+@router.get("/api/v1/inspect/catalog", operation_id="catalog", response_model=Catalog, response_model_exclude_unset=True)
+async def catalog():
+  """What each check and named query means; read once, not in every answer."""
+  kinds = {name: "symptom" if name in checks.SYMPTOMS else "cause" for name in checks.CHECKS}
+  found = [{"name": name, "meaning": (fn.__doc__ or "").strip(), "kind": kinds[name]} for name, fn in checks.CHECKS.items()]
+  found += [
+    {"name": fn.__name__.replace("_", "-"), "meaning": (fn.__doc__ or "").strip(), "kind": "symptom" if fn is checks.client_liveness else "cause"}
+    for fn in (checks.client_liveness, checks.sdk_errors)
+  ]
+  return {"checks": found, "queries": [{"name": name, "meaning": query} for name, query in queries.QUERIES.items()]}
+
+
 @router.get("/api/v1/inspect/runs/{run_id}/checks", operation_id="checks", response_model=Checks, response_model_exclude_unset=True)
 async def run_checks(run_id: str, only: Annotated[str | None, Query(description="Comma-separated check names; all when omitted")] = None):
   """Diagnostic checks for the run: each a verdict (ok, warn, fail, unknown), a reason, a few numbers and evidence."""
   names = [n for n in (only or "").split(",") if n]
   if unknown := [n for n in names if n not in checks.CHECKS]:
     raise HTTPException(400, f"Unknown checks {unknown}; use {sorted(checks.CHECKS)}")
-  return {"run_id": run_id, "checks": checks.run_checks(await check_context(run_id), names or None)}
+  results = checks.run_checks(await check_context(run_id), names or None)
+  return {"run_id": run_id, "verdict": checks.verdict(results), "checks": results}
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/summary", operation_id="summary", response_model=Summary, response_model_exclude_unset=True)
@@ -366,6 +381,8 @@ async def run_summary(run_id: str):
       busy.setdefault(roles.get(series_["labels"].get("UUID")) or "other", []).append(series_["points"][-1][1])
   return {
     "run_id": run_id,
+    "verdict": checks.verdict(results),
+    "goodput": checks.goodput(ctx),
     "state": run.get("display_status") if ctx["finished"] else (run.get("progress") or {}).get("state") or run.get("display_status"),
     "steps": len(steps_),
     "step_seconds": {"median": statistics.median(gaps), "last": gaps[-1]} if gaps else None,
@@ -433,7 +450,7 @@ async def sessions(limit: int = Query(50, ge=1, le=500)):
         {**{k: record[k] for k in ("session_id", "created_at", "last_seen_at", "model_ids")}, "live": live, "recipe": metadata.get("recipe_name")}
       )
   found.sort(key=lambda r: r["created_at"], reverse=True)
-  return {"sessions": found[:limit]}
+  return {"total": len(found), "sessions": found[:limit]}
 
 
 @router.get(
@@ -443,7 +460,8 @@ async def session_checks(session_id: str):
   """The session's checks: client liveness, SDK errors, and each model check at its worst across the session's models."""
   session = await session_context(session_id)
   per_model = {model: checks.run_checks(ctx) for model, ctx in session["models"].items()}
-  return {"session_id": session_id, "live": session["live"], "checks": checks.session_checks(session), "models": per_model}
+  results = checks.session_checks(session)
+  return {"session_id": session_id, "live": session["live"], "verdict": checks.verdict(results), "checks": results, "models": per_model}
 
 
 @router.get(
@@ -467,6 +485,7 @@ async def session_summary(session_id: str):
   return {
     "session_id": session_id,
     "live": session["live"],
+    "verdict": checks.verdict(results),
     "created_at": record["created_at"],
     "last_seen_at": record["last_seen_at"],
     "models": models,

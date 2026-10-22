@@ -300,6 +300,7 @@ class Commands(Record):
 
   run_id: str
   commands: list[Operation]
+  total: int = Field(0, description="Records that matched before `limit`")
   truncated: bool = Field(False, description="More records matched than `limit`; narrow the window")
   error: str | None = None
   partial: str | None = None
@@ -325,20 +326,30 @@ class Steps(Record):
   """A run's steps from its trainer ops, oldest first, with the client's metrics where stored."""
 
   run_id: str
+  total: int = Field(0, description="Steps recorded; `last` keeps the newest")
   steps: list[Step]
   error: str | None = None
+
+
+class Evidence(Record):
+  read: str = Field(description="A route under /api/v1/inspect; run it with args as query parameters")
+  args: dict[str, JsonValue] = Field(default_factory=dict)
+  head: str | None = Field(None, description="One verbatim line of what the read returns")
 
 
 class CheckResult(Record):
   check: str
   verdict: Literal["ok", "warn", "fail", "unknown"] = Field(description="unknown: an input is missing; never read it as ok")
   reason: str
-  numbers: dict[str, JsonValue] = Field(default_factory=dict)
-  evidence: str | None = Field(None, description="Where to look next: a route, a pod, or a Redis key")
+  kind: Literal["symptom", "cause"] = Field(description="Symptoms set the run's verdict; a cause names where to look when its symptom fails")
+  explains: str | None = Field(None, description="For a cause, the symptom it explains")
+  numbers: dict[str, JsonValue] = Field(default_factory=dict, description="observed, expected and threshold where they apply")
+  evidence: list[Evidence] = Field(default_factory=list)
 
 
 class Checks(Record):
   run_id: str
+  verdict: Literal["ok", "warn", "fail", "unknown"] = Field(description="The worst symptom")
   checks: list[CheckResult]
 
 
@@ -346,9 +357,11 @@ class Summary(Record):
   """The run in one answer, for a status line or an agent's first call."""
 
   run_id: str
+  verdict: str = Field(description="The worst symptom check")
   state: str | None = None
   steps: int
   step_seconds: dict[str, float] | None = None
+  goodput: dict[str, JsonValue] | None = Field(None, description="Share of the run the trainer spent training, with where the rest went, in seconds")
   last_metrics: dict[str, float] = Field(default_factory=dict, description="Latest trainer metrics, from the newest ops")
   gpu_busy: dict[str, float] = Field(default_factory=dict, description="Mean GPU duty cycle by role over the run, percent")
   failing: list[str] = Field(default_factory=list)
@@ -368,12 +381,14 @@ class SessionRow(Record):
 class Sessions(Record):
   """Client sessions, newest first. A session is one client process; it owns the models it created or attached."""
 
+  total: int = Field(0, description="Sessions recorded; `limit` keeps the newest")
   sessions: list[SessionRow]
 
 
 class SessionChecks(Record):
   session_id: str
   live: bool
+  verdict: str = Field(description="The worst symptom across the session")
   checks: list[CheckResult] = Field(description="Session checks, then each model check at its worst across the session's models")
   models: dict[str, list[CheckResult]] = Field(default_factory=dict)
 
@@ -390,9 +405,23 @@ class SessionModel(Record):
 class SessionSummary(Record):
   session_id: str
   live: bool
+  verdict: str
   created_at: float
   last_seen_at: float
   models: list[SessionModel]
   failing: list[str] = Field(default_factory=list)
   warning: list[str] = Field(default_factory=list)
   unknown: list[str] = Field(default_factory=list)
+
+
+class CatalogEntry(Record):
+  name: str
+  meaning: str
+  kind: str | None = None
+
+
+class Catalog(Record):
+  """What each check and named query means, for reading answers without guessing."""
+
+  checks: list[CatalogEntry]
+  queries: list[CatalogEntry]
