@@ -67,10 +67,9 @@ class Dispatcher:
       while True:
         try:
           await self.store.wait_for_new(self.pool, await self.dispatch(), RETRY_MS)
-        except Exception as exc:
+        except Exception:
           # A Redis or Kubernetes hiccup must not end the pool's dispatching.
           logger.exception("Dispatching pool %s failed; retrying", self.pool)
-          telemetry.note(last_error=f"{type(exc).__name__} in dispatch")
           await asyncio.sleep(RETRY_MS / 1000)
     finally:
       for task in [*self.in_flight.values(), *self.loading.values()]:
@@ -90,8 +89,6 @@ class Dispatcher:
     target = self.revision or "default"
     urls = await self.list_replicas()
     versions = await asyncio.gather(*(self.weight_version(url) for url in urls), return_exceptions=True)
-    states = {self.pods.get(u, u): v if isinstance(v, str) else f"unreachable: {type(v).__name__}" for u, v in zip(urls, versions, strict=True)}
-    telemetry.note(revision=target, replicas=states, loading=[self.pods.get(u, u) for u in self.loading], in_flight=len(self.in_flight))
     for url, version in zip(urls, versions, strict=True):
       # A replica still starting does not answer yet, and a pool on base weights never loads any.
       if self.revision and isinstance(version, str) and version != target and url not in self.loading:
@@ -144,10 +141,8 @@ class Dispatcher:
     except httpx.HTTPError as exc:
       logger.info("Retrying %s after %r", r["request_id"], exc)
       retry = type(exc).__name__
-    if result and await self.commit(r, result):
-      telemetry.note(last_commit_at=time.time())
-    elif retry:
-      telemetry.note(last_error=f"{retry} from {self.pods.get(replica, replica)}")
+    if result:
+      await self.commit(r, result)
     status = "retried" if retry else "failed" if result.get("type") == "RequestFailedResponse" else "succeeded"
     # No runtime: the pool name is not the sampler Workload's runtime, and the replica pod is what joins the op to its lane.
     request = {"op": "sample", "logical_run_id": r.get("run_id"), "request_id": r["request_id"]}
@@ -175,7 +170,6 @@ class Dispatcher:
       await self.post(url, "/resume")
     except Exception as exc:
       logger.warning("Loading %r on %s failed: %r", revision, url, exc)  # the next dispatch tries again
-      telemetry.note(last_error=f"loading {revision} on {self.pods.get(url, url)}: {exc!r}"[:500])
     finally:
       self.loading.pop(url)
 

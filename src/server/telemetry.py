@@ -105,38 +105,17 @@ def worker_identity() -> dict:
   return {field: value for field, env in (("pod", "POD_NAME"), ("pod_uid", "POD_UID"), ("node", "NODE_NAME")) if (value := os.getenv(env))}
 
 
-def visible_gpus() -> list:
-  """NVML handles of the GPUs this process can see, in CUDA order."""
-  import pynvml
-
-  pynvml.nvmlInit()
-  handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]
-  visible = os.getenv("CUDA_VISIBLE_DEVICES")
-  return [h for i, h in enumerate(handles) if visible is None or str(i) in visible.split(",") or pynvml.nvmlDeviceGetUUID(h) in visible]
-
-
 def gpu_uuids() -> list[str]:
-  """The GPUs this process can see, as the UUIDs DCGM labels its series with."""
+  """The GPUs this process can see, in CUDA order, as the UUIDs DCGM labels its series with."""
   try:
     import pynvml
 
-    return [pynvml.nvmlDeviceGetUUID(h) for h in visible_gpus()]
+    pynvml.nvmlInit()
+    uuids = [pynvml.nvmlDeviceGetUUID(pynvml.nvmlDeviceGetHandleByIndex(i)) for i in range(pynvml.nvmlDeviceGetCount())]
   except Exception:
     return []
-
-
-def gpu_now() -> list[dict]:
-  """Utilization and memory of each visible GPU now, so GPU checks work without a metrics backend."""
-  try:
-    import pynvml
-
-    readings = []
-    for h in visible_gpus():
-      util, memory = pynvml.nvmlDeviceGetUtilizationRates(h).gpu, pynvml.nvmlDeviceGetMemoryInfo(h).used >> 20
-      readings.append({"uuid": pynvml.nvmlDeviceGetUUID(h), "util": util, "mem_mib": memory})
-    return readings
-  except Exception:
-    return []
+  visible = os.getenv("CUDA_VISIBLE_DEVICES")
+  return [gpu for i, gpu in enumerate(uuids) if visible is None or str(i) in visible.split(",") or gpu in visible]
 
 
 def effective_config() -> dict:
@@ -198,7 +177,6 @@ async def serving(role: str, runtime_id: str | None, **fields):
 
   async def heartbeat():
     while True:
-      worker.record["gpu_now"] = gpu_now()
       await save()
       await asyncio.sleep(HEARTBEAT_SECONDS)
 
@@ -210,11 +188,6 @@ async def serving(role: str, runtime_id: str | None, **fields):
     set_phase("exited")
     await save()
     current = None
-
-
-def note(**fields) -> None:
-  if current is not None:
-    current.record.update(fields)
 
 
 def set_phase(phase: str) -> None:
@@ -305,8 +278,6 @@ def record(
   error_type: str | None,
   result: dict,
   where: dict | None = None,
-  *,
-  run_scoped: bool = True,
 ) -> None:
   """`where` names the pod the op ran on, when not this process's. No payloads, outputs or error messages are kept."""
   if not (run_id := run_of(request)):
@@ -352,7 +323,7 @@ def record_op(name: str):
     if current is not None:
       runtime_id, role = current.record["runtime_id"], current.record["role"]
       with suppress(Exception):
-        record({"op": name, "model_id": runtime_id}, role, runtime_id, started_at, status, None, {}, run_scoped=False)
+        record({"op": name, "model_id": runtime_id}, role, runtime_id, started_at, status, None, {})
 
 
 @asynccontextmanager
