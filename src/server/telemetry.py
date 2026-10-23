@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from server.store import get_state_store
 
-SAMPLE_LIMIT = int(os.getenv("OPEN_RL_OPS_SAMPLE_LIMIT", "2000"))
+SAMPLE_LIMIT, STEP_TIMES = int(os.getenv("OPEN_RL_OPS_SAMPLE_LIMIT", "2000")), 64
 TTL_SECONDS = float(os.getenv("OPEN_RL_OPS_TTL_DAYS", "7")) * 86400 or None  # 0 keeps records
 HEARTBEAT_SECONDS, STALE_SECONDS, MAX_TURNS = 5, 30, 200  # a record not rewritten for STALE_SECONDS is a gone process
 CLIENT, RUN_LABEL, SOURCE_LABEL = "client", "openrl_run_id", "openrl_source"  # Cloud Logging labels on client lines
@@ -232,8 +232,12 @@ def record(request: dict, role: str, runtime_id: str | None, started_at: float, 
   # Samples keep their own list, so a run's sampling never evicts its training ops.
   list_key = key("operations", run_id, "samples") if operation == "sample" else key("operations", run_id)
   write(get_state_store().append_sample(list_key, sample, SAMPLE_LIMIT, TTL_SECONDS))
+  # A run's one-line form reads these few records instead of its command history.
+  if operation != "sample" and status == "failed":
+    count("failed", run_id)
   if operation == "optim_step" and status == "succeeded":
     write(get_state_store().increment(key("steps", run_id), TTL_SECONDS))
+    write(get_state_store().append_sample(key("step_times", run_id), at, STEP_TIMES, TTL_SECONDS))
     if run_id in steps_done:
       steps_done[run_id] += 1
 

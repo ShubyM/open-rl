@@ -243,7 +243,8 @@ async def runs(ended: bool = False):
   """Every live run in one line, longest since its last op first, so a stuck run is one read away. ended=true adds ended runs."""
   state = await fleet.snapshot()
   chosen = [r for r in state["runs"] if ended or r["lifecycle"] != "ended"]
-  lines = [{"run_id": r["run_id"], "name": r["name"], **facts.line(await facts.context(state, r))} for r in chosen]
+  found = await asyncio.gather(*(facts.fleet_line(state, r) for r in chosen))
+  lines = [{"run_id": r["run_id"], "name": r["name"], **line} for r, line in zip(chosen, found)]
   return {"runs": sorted(lines, key=lambda r: -(r["since_last_op_s"] if r["since_last_op_s"] is not None else math.inf))}
 
 

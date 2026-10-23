@@ -4,6 +4,7 @@ import asyncio
 import unittest
 from unittest import mock
 
+from server import telemetry
 from server.dashboard import facts, fleet
 from server.store import InMemoryStateStore, request_queue, sampler_queue
 from server.telemetry import key
@@ -159,6 +160,60 @@ class RunFactsTest(unittest.TestCase):
     _, healthy, _ = self.facts_of(healthy_steps(), ledger={"enqueued": 5, "popped": 5, "answered": 5})
     self.assertFalse({"failures", "relaunches", "incidents"} & set(healthy))
     self.assertLess(len(repr(healthy)), 3000)
+
+
+class FleetLineTest(unittest.TestCase):
+  """/runs gives every run's line without reading its command history, and agrees with the line built from that history."""
+
+  def setUp(self):
+    self.store = InMemoryStateStore()
+    for target in (facts, fleet, telemetry):
+      self.enterContext(mock.patch.object(target, "get_state_store", return_value=self.store))
+    self.enterContext(mock.patch.dict(telemetry.steps_done, clear=True))
+    fleet.cache.clear()
+
+  def record(self, operations) -> None:
+    async def write():
+      for at, operation, status in operations:
+        with mock.patch.object(telemetry.time, "time", return_value=at):
+          telemetry.record({"model_id": "r", "op": operation}, "trainer", "r", at - 10, status, None, {})
+        await asyncio.gather(*list(telemetry.writes))
+
+    asyncio.run(write())
+
+  def lines(self, lifecycle="placed") -> tuple[dict, dict]:
+    run = {"run_id": "r", "runtime_id": "r", "lifecycle": lifecycle, "created_at": 0.0, "completed_at": None, "workloads": [], "pods": []}
+    run["steps"] = int(asyncio.run(self.store.get_value(key("steps", "r"))) or 0)
+    state = {"observed_at": NOW, "workers": [], "placements": [], "runs": [run]}
+    self.store.list_length = mock.AsyncMock(return_value=0)
+    fleet.cache.clear()
+    return asyncio.run(facts.fleet_line(state, run)), facts.line(asyncio.run(facts.context(state, run)))
+
+  def test_the_fleet_line_matches_the_line_from_the_full_history(self):
+    self.record([(NOW - 900, "forward_backward", "failed"), *((NOW - 600 + 100 * i, "optim_step", "succeeded") for i in range(4))])
+    self.record([(NOW - 50, "forward_backward", "succeeded")])
+    brief, full = self.lines()
+    self.assertEqual(brief, full)
+    self.assertEqual((brief["steps"], brief["failures"], brief["median_step_s"], brief["since_last_op_s"]), (4, 1, 100, 50))
+
+  def test_runs_reads_a_few_records_per_run_whatever_its_history(self):
+    from fastapi.testclient import TestClient
+
+    from server.dashboard.__main__ import app
+
+    self.record([(NOW - 5000 + i, "forward_backward", "succeeded") for i in range(3000)] + [(NOW - 1, "optim_step", "succeeded")])
+    read, returned = self.store.read_samples, []
+
+    async def counted(list_key, last=None):
+      returned.extend(found := await read(list_key, last))
+      return found
+
+    run = {"run_id": "r", "name": "r", "runtime_id": "r", "lifecycle": "ended", "created_at": 0.0, "completed_at": None, "steps": 1}
+    snapshot = {"observed_at": NOW, "workers": [], "placements": [], "runs": [run], "nodes": [], "pods": [], "errors": []}
+    with mock.patch.object(self.store, "read_samples", counted), mock.patch.object(fleet, "snapshot", mock.AsyncMock(return_value=snapshot)):
+      (found,) = TestClient(app).get("/api/v1/inspect/runs", params={"ended": "true"}).json()["runs"]
+    self.assertEqual((found["steps"], found["since_last_op_s"]), (1, 1))
+    self.assertLess(len(returned), 100)
 
 
 if __name__ == "__main__":

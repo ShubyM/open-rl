@@ -1,6 +1,7 @@
 """Facts about a run, joined from its records, with no verdicts. A block appears only when it has content, so an absent
 block means nothing of its kind was recorded. A log pointer is a read against /api/v1/inspect to run as given."""
 
+import asyncio
 import statistics
 from datetime import UTC, datetime
 
@@ -13,8 +14,11 @@ BUCKETS = {"train": {"forward_backward", "optim_step"}, "checkpoint": {"save_sta
 
 async def context(state: dict, run: dict, low: float = 0, high: float = float("inf")) -> dict:
   """What the facts read about one run: its ops in [low, high], its workers, request counters and queue."""
-  store, run_id = get_state_store(), run["run_id"]
-  ops = [s for s in await fleet.operations(run_id) if low <= s["at"] <= high]
+  store, run_id, finished = get_state_store(), run["run_id"], run["lifecycle"] == "ended"
+  ops, counts, queued, samples_queued = await asyncio.gather(
+    fleet.operations(run_id), ledger(store, run_id), store.list_length(request_queue(run_id)), queued_samples(store, run, finished)
+  )
+  ops = [s for s in ops if low <= s["at"] <= high]
   trainer = [s for s in ops if s.get("role") != "sampler"]
   ctx = {
     "run": run,
@@ -22,12 +26,18 @@ async def context(state: dict, run: dict, low: float = 0, high: float = float("i
     "trainer": trainer,
     "steps": [s for s in trainer if s["operation"] == "optim_step" and s.get("status") == "succeeded"],
   }
-  ctx.update(ledger=await ledger(store, run_id), queued=await store.list_length(request_queue(run_id)))
-  ctx.update(now=state["observed_at"], finished=run["lifecycle"] == "ended", lanes=fleet.lanes(state, run_id))
-  # Samples wait in the runtime's queue, which co-tenant runs share; a finished run's share of it is gone.
-  ctx["samples_queued"] = None if ctx["finished"] else await store.list_length(sampler_queue(run["runtime_id"]))
-  ctx["workers"] = [w for w in state["workers"] if w.get("runtime_id") in (run["runtime_id"], run_id)]
+  ctx.update(ledger=counts, queued=queued, samples_queued=samples_queued, now=state["observed_at"], finished=finished)
+  ctx.update(lanes=fleet.lanes(state, run_id), workers=workers_of(state, run))
   return ctx
+
+
+def workers_of(state: dict, run: dict) -> list[dict]:
+  return [w for w in state["workers"] if w.get("runtime_id") in (run["runtime_id"], run["run_id"])]
+
+
+async def queued_samples(store, run: dict, finished: bool) -> int | None:
+  # Samples wait in the runtime's queue, which co-tenant runs share; a finished run's share of it is gone.
+  return None if finished else await store.list_length(sampler_queue(run["runtime_id"]))
 
 
 async def ledger(store, run_id: str) -> dict[str, int]:
@@ -212,17 +222,44 @@ def summary(ctx: dict) -> dict:
 
 
 def line(ctx: dict) -> dict:
-  """A run in one line, for a session or the fleet, enough to see which run to open."""
-  steps, held = ctx["steps"], unanswered(ctx)
+  """A run in one line from its full context, for a session over the session's span."""
+  last_op_at = ctx["ops"][-1]["at"] if ctx["ops"] else None
+  failures = sum(s.get("status") == "failed" for s in ctx["trainer"])
+  return one_line(ctx, len(ctx["steps"]), [s["at"] for s in ctx["steps"]], last_op_at, failures)
+
+
+async def fleet_line(state: dict, run: dict) -> dict:
+  """A run in one line for /runs, from a few small records instead of its command history: the step counter, the last
+  record of each command list, the newest step times and the failure count. A live run recorded before the step times
+  and failure count existed is read in full; an ended one leaves those fields null."""
+  store, run_id, finished = get_state_store(), run["run_id"], run["lifecycle"] == "ended"
+  counts, last_ops, last_samples, times, samples_queued = await asyncio.gather(
+    store.read_counts(key("ledger", run_id)),
+    store.read_samples(key("operations", run_id), last=1),
+    store.read_samples(key("operations", run_id, "samples"), last=1),
+    store.read_samples(key("step_times", run_id)),
+    queued_samples(store, run, finished),
+  )
+  if not counts and not finished:
+    return line(await context(state, run))
+  ctx = {"run": run, "workers": workers_of(state, run), "now": state["observed_at"], "samples_queued": samples_queued}
+  last_op_at = max((r["at"] for r in last_ops + last_samples), default=None)
+  return one_line(ctx, run["steps"], times, last_op_at, counts.get("failed", 0) if counts else None)
+
+
+def one_line(ctx: dict, steps: int, step_times: list[float], last_op_at: float | None, failures: int | None) -> dict:
+  """A run in one line, enough to see which run to open. ctx holds the run, its workers, now and its queued samples."""
+  held, now = unanswered(ctx), ctx["now"]
   return {
     "lifecycle": ctx["run"]["lifecycle"],
-    "steps": len(steps),
-    "since_last_op_s": since_last_op(ctx),
-    "since_last_step_s": round(ctx["now"] - steps[-1]["at"]) if steps else None,
-    "median_step_s": round(statistics.median(b["at"] - a["at"] for a, b in zip(steps, steps[1:]))) if len(steps) > 1 else None,
+    "steps": steps,
+    # The snapshot time lags records written after it, so a fresh op can look a few seconds in the future.
+    "since_last_op_s": max(0, round(now - last_op_at)) if last_op_at is not None else None,
+    "since_last_step_s": round(now - step_times[-1]) if step_times else None,
+    "median_step_s": round(statistics.median(b - a for a, b in zip(step_times, step_times[1:]))) if len(step_times) > 1 else None,
     "trainer_requests_unanswered": sum(o["count"] for o in held),
     "held_by_dead_worker": sum(o["count"] for o in held if not o["holder_alive"]),
     "samples_queued": ctx["samples_queued"],
-    "failures": sum(s.get("status") == "failed" for s in ctx["trainer"]),
+    "failures": failures,
     "relaunches": len(relaunches(ctx)),
   }
