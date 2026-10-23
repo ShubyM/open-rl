@@ -179,7 +179,7 @@ def logs_filter(run: dict, start: str, end: str, severity: str | None, q: str, p
   client = f"(labels.{RUN_LABEL}={json.dumps(run['run_id'])} AND labels.{SOURCE_LABEL}={json.dumps(CLIENT)})"
   owner = f"{OWNER}={json.dumps(owner_id(run['runtime_id']).rstrip('-'))}"  # the scheduler trims a truncated label value as well
   if pod and pod != CLIENT:
-    # One of the run's pods, never any pod in the namespace: a run id must not open another run's logs.
+    # One of the run's pods, never any pod in the namespace, so a run id cannot open another run's logs.
     clauses += [owner, f"resource.labels.pod_name={json.dumps(pod)}"]
   else:
     clauses.append(client if pod == CLIENT else f"({owner} OR {client})")

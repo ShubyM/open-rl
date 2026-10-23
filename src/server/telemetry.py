@@ -132,7 +132,7 @@ async def serving(role: str, runtime_id: str | None, **fields):
 
 
 async def finish() -> None:
-  """Before os._exit, which skips serving's cleanup: say this process exited and land the writes still in flight."""
+  """Say this process exited and land the writes still in flight, before an os._exit that skips serving's cleanup."""
   if current is not None:
     await current.close()
   await asyncio.gather(*list(writes), return_exceptions=True)

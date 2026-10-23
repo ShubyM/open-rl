@@ -166,7 +166,7 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
   for lane in held:
     for uuid in lane["devices"]:
       placed.setdefault(uuid, []).append(lane)
-  # A time-sliced GPU has several holders at once: every placement overlapping the newest one holds it.
+  # A time-sliced GPU has several holders at once, every placement that overlaps the newest one.
   holders = {uuid: [p for p in lanes if p["end"] >= lanes[-1]["start"]] for uuid, lanes in placed.items()}
   # A GPU whose node scaled down in the window has no utilization now, only its duty; util's labels name node and model.
   labels_of = {series["labels"]["UUID"]: series["labels"] for series in found["busy"]["series"] + found["util"]["series"]}
@@ -194,7 +194,7 @@ async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, 
     found[row["step"]] = finite(row["metrics"])
   for session in run["session_ids"]:
     for row in await store.read_samples(key("client_steps", session)):
-      # Training rows of this model only: a session may train several, and an eval may share a training step.
+      # Only this model's training rows, since a session may train several and an eval may share a training step.
       ours = row.get("model_id") in (None, run["run_id"]) and row.get("phase") in (None, "train")
       if ours and row.get("step") is not None and low <= row["at"] <= high:
         found.setdefault(int(row["step"]), {}).update(row["metrics"])
@@ -255,7 +255,7 @@ async def runs(ended: bool = False):
   """Every live run in one line, longest since its last op first, so a stuck run is one read away. ended=true adds ended runs."""
   state = await fleet.snapshot()
   chosen = [r for r in state["runs"] if ended or r["lifecycle"] != "ended"]
-  # A few runs at a time: each read in flight holds a store connection, and hundreds would each open one.
+  # A few runs at a time, since each read in flight holds a store connection.
   limit = asyncio.Semaphore(128)
 
   async def line(run):
