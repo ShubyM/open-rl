@@ -120,7 +120,7 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   }
   # MAX_JOBS caps FlashInfer's JIT build, which otherwise runs one ~3GB
   # compiler per core and blows through the pod's host memory limit.
-  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
+  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "VLLM_ENABLE_MULTIMODAL", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
     if os.getenv(name):
       values[name] = os.environ[name]
   # No other worker shares an exclusive worker's GPUs, so it never parks.

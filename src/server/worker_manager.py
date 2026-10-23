@@ -111,7 +111,12 @@ def worker_env(meta: TrainingModelMetadata, base_model: str, runtime: str, is_lo
     env["OPEN_RL_MODEL_ID"] = runtime
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-    if not is_lora and ("gemma-4" in base_model.lower() or "gemma4" in base_model.lower()):
+    # The text-only class skips the multimodal front end vLLM otherwise builds
+    # at start-up (about 45 s); OpenRL only sends token ids. LoRA adapters
+    # trained on the full model apply to it unchanged. VLLM_ENABLE_MULTIMODAL=1
+    # keeps the full model.
+    gemma_4 = "gemma-4" in base_model.lower() or "gemma4" in base_model.lower()
+    if gemma_4 and os.getenv("VLLM_ENABLE_MULTIMODAL", "0") != "1":
       env["VLLM_ARCHITECTURE_OVERRIDE"] = "Gemma4ForCausalLM"
   return env
 
