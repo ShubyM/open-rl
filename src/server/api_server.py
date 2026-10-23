@@ -882,7 +882,7 @@ async def create_session(req: CreateSessionRequest):
     raise HTTPException(status_code=400, detail=str(exc)) from exc
   session_id = f"sess-{uuid.uuid4().hex[:12]}"
   await session_registry.update_metadata(session_id, user_metadata)
-  note_session(state, session_id, created=True, metadata=user_metadata)
+  note_session(state, session_id, metadata=user_metadata)
   return {"session_id": session_id, "type": "create_session"}
 
 
