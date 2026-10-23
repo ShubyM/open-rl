@@ -100,3 +100,42 @@ On Kubernetes the release bundles set these variables. The API server runs with
 each trainer and sampler, and the OpenRL scheduler starts their pods. The API
 server writes each worker's environment into the `Workload`'s pod template, so
 there are no worker deployments to configure by hand.
+
+## Run telemetry
+
+Trainers, samplers and the API server record each run in Redis.
+`python -m server.dashboard` serves the records read only under
+`/api/v1/inspect`; `/docs` describes each route. Design Doc 018 explains them.
+
+| Env var | Default | What it does |
+| --- | --- | --- |
+| `OPEN_RL_OPS_SAMPLE_LIMIT` | `2000` | Newest command records kept per run, for trainer ops and samples separately. The scheduler passes it to worker pods. |
+| `OPEN_RL_OPS_TTL_DAYS` | `7` | Days a record lives after its last write. `0` keeps records. The scheduler passes it to worker pods. |
+| `OPEN_RL_INSPECTION_API` | unset | `true` mounts `/api/v1/inspect` on the API server too. It lists every run, so leave it off on a server clients reach. On GKE it reads nodes cluster-wide, which `k8s/deploy/base` does not grant. |
+| `OPEN_RL_PROMETHEUS_URL` | unset | Prometheus for GPU and vLLM metrics. Unset, the dashboard uses Managed Prometheus on GKE. |
+| `OPEN_RL_GKE_PROJECT` / `OPEN_RL_GKE_CLUSTER` / `OPEN_RL_GKE_LOCATION` | from the metadata server | The cluster whose metrics and logs the dashboard reads. `OPEN_RL_GKE_TELEMETRY=false` turns GKE reads off. |
+| `OPEN_RL_LOG_VIEWS` | the project | Comma-separated Cloud Logging views to read run logs from, such as a long-retention bucket's view. |
+
+### Client metrics by step
+
+`/runs/{id}/steps` shows the client's metrics for each step when the client
+logs through `OTelLogger` (see `examples/README.md`) and an OpenTelemetry
+Collector forwards its log events to the API server. The collector in
+`k8s/deploy/telemetry` does this. Another collector needs this exporter in its
+logs pipeline:
+
+```yaml
+exporters:
+  otlphttp/openrl:
+    logs_endpoint: http://open-rl-api-server-service:8000/api/v1/otlp/logs
+    encoding: json
+    compression: none
+service:
+  pipelines:
+    logs:
+      exporters: [otlphttp/openrl]
+```
+
+Without forwarded events, `/steps` falls back to the `openrl_client_metric`
+gauges in Prometheus, which can miss a step when two steps land within one
+export interval.

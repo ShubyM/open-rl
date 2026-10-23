@@ -1,0 +1,52 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 96
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    translation_strategy: UnderscoreEscapingWithSuffixes
+    resource_to_telemetry_conversion:
+      enabled: true
+    metric_expiration: 5m
+  # Keep per-call observations as OTLP JSON in container logs. This is not a
+  # durable archive; retain cookbook JSONL or configure a durable log exporter.
+  file/events:
+    path: /dev/stdout
+    format: json
+    append: true
+    flush_interval: 1s
+  # The API server keeps each step's event, which the run's Metrics tab reads.
+  # It accepts the exporter's default gzip; uncompressed spares it the work.
+  otlphttp/openrl:
+    logs_endpoint: http://open-rl-api-server-service:8000/api/v1/otlp/logs
+    encoding: json
+    compression: none
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [file/events, otlphttp/openrl]

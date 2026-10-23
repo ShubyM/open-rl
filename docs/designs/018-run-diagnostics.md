@@ -34,6 +34,7 @@ Every key is in the API server's Redis. Each record expires
 | SDK errors | `open_rl:sdk_errors:<session>` | API server, from the SDK's telemetry | The last 200 error events, without credentials |
 | Placement | `open_rl:placements:<runtime>`, one record per Workload placement | API server, which lists the scheduler's Workloads every 30 s and before each release | Workload, role, pod, node, GPU UUIDs, placed and released times |
 | Workload status | `status.gpuUUIDs`, `status.placedAt`, `status.releasedAt` | Scheduler, on bind and release | The source of placement records. The scheduler also exports `openrl_gpu_held{run_id, role, pod, node, UUID}` while a GPU is held and logs one `openrl.placement` line per change |
+| Client step event | `open_rl:client_steps:<session>` | API server, from the `openrl.training.metrics` log events an OpenTelemetry Collector forwards to `POST /api/v1/otlp/logs` | One row per `log_metrics` call: step, time, phase, model, and every finite metric the client logged |
 
 A run's display name comes from the `name`, `run_name`, `recipe_name` and
 `git_rev` keys of its `user_metadata`, kept in its model metadata.
@@ -55,7 +56,7 @@ too when `OPEN_RL_INSPECTION_API=true`. Every route is a `GET` under
 |---|---|
 | `/runs?ended=` | Which run to open: every live run in one line (lifecycle, steps, seconds since its last op and step, median step time, unanswered requests and how many a dead worker holds, samples queued, failures, relaunches), longest since its last op first. Built from the counters and the last record of each list, never the command history |
 | `/runs/{id}/summary` | What is wrong with this run: the run facts below, and GPU duty by role over the run's span |
-| `/runs/{id}/steps?last=` | What each step did: trainer ops grouped by step, with each op's count, failures, seconds and metric spread |
+| `/runs/{id}/steps?last=&fields=` | What each step did: trainer ops grouped by step, with each op's count, failures, seconds and metric spread, and the client's metrics for the step in `client`, kept by the `fields` prefixes. Client metrics come from the forwarded step events, else from the `openrl_client_metric` gauges aligned by `progress/batch` |
 | `/runs/{id}/commands?since=&until=&role=` | The raw command records, newest first |
 | `/sessions/{id}/summary` | What a client did: its session record, whether it is live, its SDK errors, and a line per model over the session's span |
 | `/inventory` | What exists now: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, pods with problems, and one error per source that could not be read |
@@ -100,8 +101,8 @@ so an agent follows a failure to its traceback in one call.
   Every store write runs in the background and is dropped after 5 s. An op
   returns or raises exactly as it would without telemetry, even when the store
   raises, hangs or is missing. `tests/test_telemetry_faults.py` checks this.
-- **Reads are bounded and shared.** The fleet snapshot is cached for 5 s and a
-  run's command records for 10 s. A stale entry is refreshed by the next
+- **Reads are bounded and shared.** The fleet snapshot is cached for 5 s, a
+  run's command records for 10 s and its client metrics for 30 s. A stale entry is refreshed by the next
   caller, and every caller gets the last good result until the refresh lands,
   unless that result is older than both 60 s and six windows. A failed read is
   retried by the next caller. The 32 most recently used entries are kept.
@@ -119,6 +120,13 @@ so an agent follows a failure to its traceback in one call.
   logs or placement blocks.
 - Runs recorded before step stamps, step times or the failure counter leave
   those fields null, and their steps are derived from the order of their ops.
+- Client metrics reach the server only from a client that logs through an
+  OpenTelemetry logger and a Collector with the exporter in
+  `docs/configuration.md`. Rows are kept per session, so a client that names no
+  model shares its metrics across the models its session trains.
+- External clients' logs reaching the collector are not scoped to their run
+  unless the collector's googlecloud exporter maps session and model
+  attributes to Cloud Logging labels.
 - Facts are computed on request. Alerts would need a timer and thresholds.
 - Not recorded yet: cgroup OOM kills and peak memory in the worker record, NVML
   utilization for GPU facts without Prometheus, and the request's holder
