@@ -202,6 +202,16 @@ func (r *WorkloadReconciler) repairPlacementAssignment(ctx context.Context, scop
 				return placementPhaseResult{}, err
 			}
 			scope.claimName = ""
+			// Record the loss now. A re-cut reuses the claim's name, and the
+			// later Pending or Failed patches touch neither claim nor node,
+			// so this is the only transition that releases the placement.
+			if err := r.patchStatus(ctx, worker, func(status *openrlv1alpha1.WorkloadStatus) {
+				status.Phase = openrlv1alpha1.PhasePending
+				status.ClaimName, status.AssignmentID, status.NodeName = "", "", ""
+				status.Reason = "ReplacingLostClaim: the assigned claim no longer exists"
+			}); err != nil {
+				return placementPhaseResult{}, err
+			}
 		}
 	}
 	// One seat per worker. Any other seat under this name is stale, left by

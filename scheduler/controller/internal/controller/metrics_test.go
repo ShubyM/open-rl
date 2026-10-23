@@ -1,12 +1,17 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	openrlv1alpha1 "github.com/gke-labs/open-rl/scheduler/controller/api/v1alpha1"
 )
@@ -72,10 +77,36 @@ func expectReleased(t *testing.T, r *WorkloadReconciler) {
 	}
 }
 
-// Abandoning a wedged claim releases the placement.
-func TestAbandonedClaimReleasesThePlacement(t *testing.T) {
-	r, _ := placedWorker(t)
-	markUnschedulable(t, r, "w-a", time.Now().Add(-2*wedgeGracePeriod))
-	runReconcile(t, r, "w-a")
-	expectReleased(t, r)
+// A placed worker stops holding its GPUs as soon as the controller sees its
+// claim abandoned or gone, whether re-placement waits on the old claim's
+// deletion or finds no capacity.
+func TestLostClaimReleasesBeforeRePlacement(t *testing.T) {
+	ctx := context.Background()
+	cases := map[string]func(t *testing.T, r *WorkloadReconciler, claimName string){
+		"wedged claim abandoned": func(t *testing.T, r *WorkloadReconciler, _ string) {
+			markUnschedulable(t, r, "w-a", time.Now().Add(-2*wedgeGracePeriod))
+		},
+		"old claim still terminating": func(t *testing.T, r *WorkloadReconciler, claimName string) {
+			var claim resourcev1.ResourceClaim
+			must(t, r.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: claimName}, &claim))
+			claim.Finalizers = append(claim.Finalizers, "test.openrl.io/hold")
+			must(t, r.Update(ctx, &claim))
+			must(t, r.Delete(ctx, &claim))
+		},
+		"no capacity left": func(t *testing.T, r *WorkloadReconciler, claimName string) {
+			must(t, r.Delete(ctx, &resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: claimName}}))
+			var node corev1.Node
+			must(t, r.Get(ctx, types.NamespacedName{Name: testNode}, &node))
+			node.Labels[NodeLabelEnabled] = "false"
+			must(t, r.Update(ctx, &node))
+		},
+	}
+	for name, loseClaim := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, claimName := placedWorker(t)
+			loseClaim(t, r, claimName)
+			runReconcile(t, r, "w-a")
+			expectReleased(t, r)
+		})
+	}
 }
