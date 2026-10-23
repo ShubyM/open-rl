@@ -45,10 +45,17 @@ def span(since: str | None, until: str | None) -> tuple[str, str, float, float]:
 
 
 async def run_of(run_id: str) -> tuple[dict, dict]:
+  """Find a run by its id, or by a session id that attached a single run (409 when a session attached several)."""
   state = await fleet.snapshot()
-  if (run := next((r for r in state["runs"] if r["run_id"] == run_id), None)) is None:
-    raise HTTPException(404, f"No run {run_id}")
-  return state, run
+  if (run := next((r for r in state["runs"] if r["run_id"] == run_id), None)) is not None:
+    return state, run
+  matches = [r for r in state["runs"] if run_id in r["session_ids"]]
+  if len(matches) == 1:
+    return state, matches[0]
+  if len(matches) > 1:
+    ids = ", ".join(r["run_id"] for r in matches)
+    raise HTTPException(409, f"Session {run_id} has multiple runs ({ids}); pass one run_id or read /api/v1/inspect/sessions/{run_id}/summary")
+  raise HTTPException(404, f"No run {run_id}")
 
 
 @router.get("/api/v1/inspect/inventory", response_model=Doc)
@@ -74,8 +81,8 @@ async def activity(since: Bound = None, until: Bound = None, run_id: str | None 
   """Each placement's GPU turns and recorded ops in the window (Unix seconds), fleet-wide, a node's or a run's.
   Gaps do not prove idleness."""
   since, until, low, high = span(since, until)
-  state = (await run_of(run_id))[0] if run_id else await fleet.snapshot()
-  placements = await fleet.activity(state, low, high, run_id, node_id)
+  state, run = await run_of(run_id) if run_id else (await fleet.snapshot(), None)
+  placements = await fleet.activity(state, low, high, run["run_id"] if run else None, node_id)
   return {"placements": placements, "since": since, "until": until, "observed_at": facts.iso(state["observed_at"])}
 
 
@@ -125,7 +132,8 @@ async def query(
     raise HTTPException(400, f"Unknown query; use one of {sorted(QUERIES)}")
   since, until, low, high = span(since, until)
   await sources.discover()
-  gpus, pods = subject(await fleet.snapshot(), run_id, node_id, low, high)
+  state, run = await run_of(run_id) if run_id else (await fleet.snapshot(), None)
+  gpus, pods = subject(state, run["run_id"] if run else None, node_id, low, high)
   result = {"name": name, "since": since, "until": until, "series": [], "source": sources.prometheus_source()}
   if gpus == [] and "$gpus" in QUERIES[name] or not pods and "$pods" in QUERIES[name]:
     return {**result, "error": "No GPUs or pods recorded for this subject in this window"}
@@ -145,13 +153,15 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
   newest placement on it and any time-sliced with it), util (mean of the last two minutes), busy (mean over the window), memory
   used and total in MiB."""
   since, until, low, high = span(since or ("1h" if until is None else None), until)
+  state, run = await run_of(run_id) if run_id else (await fleet.snapshot(), None)
+  resolved = run["run_id"] if run else None
   names = {"util": "gpu_util_now", "busy": "gpu_busy", "memory_used_mib": "gpu_memory_mib", "memory_total_mib": "gpu_memory_total_mib"}
-  found = dict(zip(names, await asyncio.gather(*(query(name, run_id, node_id, since, until, 1) for name in names.values()))))
+  found = dict(zip(names, await asyncio.gather(*(query(name, resolved, node_id, since, until, 1) for name in names.values()))))
   result = {"since": since, "until": until, "gpus": [], "source": found["util"]["source"]}
   if error := next((r["error"] for r in found.values() if r.get("error")), None):
     return {**result, "error": error}
   value = {k: {s["labels"]["UUID"]: round(s["points"][-1][1], 1) for s in r["series"] if s["points"]} for k, r in found.items()}
-  held = sorted((p for p in fleet.lanes(await fleet.snapshot(), run_id) if p["start"] <= high and p["end"] >= low), key=lambda p: p["start"])
+  held = sorted((p for p in fleet.lanes(state, resolved) if p["start"] <= high and p["end"] >= low), key=lambda p: p["start"])
   placed: dict[str, list[dict]] = {}
   for lane in held:
     for uuid in lane["devices"]:
@@ -218,6 +228,7 @@ async def steps(
 ):
   """The run's last steps, oldest first: window, completion, trainer ops (count, failures, seconds, metric spread), `client` metrics."""
   _, run = await run_of(run_id)
+  run_id = run["run_id"]
   every, keep, result = fleet.steps(await fleet.operations(run_id)), tuple(p for p in (fields or "").split(",") if p), {}
   try:
     read = lambda: client_steps(run, every[0]["started_at"] - 300, (run["completed_at"] or time.time()) + 300, keep)  # noqa: E731
@@ -232,7 +243,8 @@ async def steps(
 @router.get("/api/v1/inspect/runs/{run_id}/commands", response_model=Doc)
 async def commands(run_id: str, since: Bound = None, until: Bound = None, role: str | None = None, limit: int = Query(100, ge=1, le=5000)):
   """The run's raw command records (trainer ops and samples), newest first; without bounds, all of them."""
-  await run_of(run_id)
+  _, run = await run_of(run_id)
+  run_id = run["run_id"]
   low, high = span(since, until)[2:] if since or until else (0, math.inf)
   wanted = (lambda r: True) if role is None else (lambda r: (r.get("role") == "sampler") == (role == "sampler"))
   found = [r for r in reversed(await fleet.operations(run_id)) if low <= r["at"] <= high and wanted(r)]
@@ -262,6 +274,7 @@ async def summary(run_id: str):
   (lost = enqueued - popped - queued), failures and relaunches with log reads, saves, optimizer, samplers, config,
   placement, incidents, and GPU duty by role over the run's span (gpu_busy, percent). No verdict; reason from the facts."""
   state, run = await run_of(run_id)
+  run_id = run["run_id"]
   ctx = await facts.context(state, run)
   found = {"run_id": run_id, **facts.summary(ctx)}
   if ops := ctx["ops"]:
@@ -313,6 +326,7 @@ async def logs(
   since, until, low, high = span(since, until)
   await sources.discover()
   state, run = await run_of(run_id)
+  run_id = run["run_id"]
   pods = {lane["pod"]: {"pod": lane["pod"], "node": lane["node"], "role": lane["role"]} for lane in fleet.lanes(state, run_id) if lane["pod"]}
   result = {"run_id": run_id, "source": "gke", "since": since, "until": until, "sources": list(pods.values()), "records": [], "next_cursor": None}
   try:

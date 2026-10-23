@@ -364,31 +364,6 @@ def count_request(event: str, run_id: str | None) -> None:
     write(get_state_store().increment_field(key("ledger", run_id), event, TTL_SECONDS))
 
 
-# Session records
-
-session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # the API server runs as one replica
-
-
-@best_effort
-def note_session(store, session_id: str, *, model_id: str | None = None, metadata: dict | None = None) -> None:
-  """A session's creation, heartbeat or model attach. Its record outlives the session's two-minute live key."""
-  write(update_session(store, session_id, model_id, metadata))
-
-
-async def update_session(store, session_id: str, model_id: str | None, metadata: dict | None) -> None:
-  record_key, now = key("session_record", session_id), time.time()
-  # Heartbeats and attaches rewrite the same record. One at a time, or a heartbeat drops a model attached meanwhile.
-  async with session_locks[session_id]:
-    saved = await store.get_value(record_key)
-    record = json.loads(saved) if saved else {"session_id": session_id, "created_at": now, "model_ids": []}
-    record["last_seen_at"] = now
-    if metadata is not None:
-      record["metadata"] = redact(metadata)
-    if model_id and model_id not in record["model_ids"]:
-      record["model_ids"].append(model_id)
-    await store.set_value(record_key, json.dumps(record), ttl_seconds=TTL_SECONDS)
-
-
 # Placement records
 
 placements_lock = asyncio.Lock()  # sweeps run in the background and may overlap
@@ -461,7 +436,8 @@ def otlp_value(value: dict):
   return None
 
 
-async def ingest_client_steps(store, body: dict) -> None:
+@best_effort
+def ingest_client_steps(store, body: dict) -> None:
   """Keep the client's per-step metric events, which the collector forwards as OTLP JSON logs, one row per step per session.
   The step is in the event, so nothing has to be rebuilt from gauges later."""
   for resource in body.get("resourceLogs", []):
@@ -480,7 +456,7 @@ async def ingest_client_steps(store, body: dict) -> None:
           continue
         # A session may train several models, and log evals at a training step.
         row |= {field: attributes[name] for field, name in (("phase", "openrl.phase"), ("model_id", "openrl.model.id")) if attributes.get(name)}
-        await store.append_sample(key("client_steps", session), row, SAMPLE_LIMIT, TTL_SECONDS)
+        write(store.append_sample(key("client_steps", session), row, SAMPLE_LIMIT, TTL_SECONDS))
 
 
 # SDK events

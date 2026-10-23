@@ -95,16 +95,22 @@ class ClientStepsTest(unittest.TestCase):
     self.enterContext(mock.patch.object(sources, "configuration", return_value={**CONFIG, "cluster": ""}))
     return self.enterContext(mock.patch.object(sources, "prom", mock.AsyncMock(**answers)))
 
+  def ingest(self, *events):
+    async def run():
+      for event in events:
+        telemetry.ingest_client_steps(self.store, event)
+      await asyncio.gather(*list(telemetry.writes))
+
+    asyncio.run(run())
+
   def test_forwarded_step_events_keep_only_this_models_training_metrics_with_no_metrics_backend(self):
-    events = [
+    self.ingest(
       step_event(0, 0.2, 1000 * 10**9, **{"openrl.model.id": "m"}),
       step_event(0, 0.9, 1000 * 10**9, **{"openrl.model.id": "m", "openrl.phase": "eval"}),  # an eval at the same step
       step_event(0, 0.7, 1000 * 10**9, **{"openrl.model.id": "other"}),  # another model trained by the same session
       step_event(1, 0.5, 1001 * 10**9),  # a client that names no model
       {"resourceLogs": [{"scopeLogs": [{"logRecords": [{"eventName": "other"}]}]}]},
-    ]
-    for event in events:
-      asyncio.run(telemetry.ingest_client_steps(self.store, event))
+    )
     with mock.patch.object(sources, "prometheus_source", return_value=None):
       self.assertEqual({step: m["env/all/reward/total"] for step, m in self.steps().items()}, {0: 0.2, 1: 0.5})
 
@@ -114,7 +120,7 @@ class ClientStepsTest(unittest.TestCase):
     bad_step["body"]["kvlistValue"]["values"][1]["value"] = {"stringValue": "two"}
     bad_time["timeUnixNano"] = "soon"
     good["body"]["kvlistValue"]["values"][0]["value"]["kvlistValue"]["values"].append({"key": "done", "value": {"boolValue": True}})
-    asyncio.run(telemetry.ingest_client_steps(self.store, {"resourceLogs": [r for event in events for r in event["resourceLogs"]]}))
+    self.ingest({"resourceLogs": [r for event in events for r in event["resourceLogs"]]})
     [row] = asyncio.run(self.store.read_samples(telemetry.key("client_steps", "sess-1")))
     self.assertEqual((row["step"], sorted(row["metrics"])), (2, ["env/all/reward/total", "progress/batch"]))
 
@@ -299,8 +305,9 @@ class ApiTest(unittest.TestCase):
     asyncio.run(self.store.append_sample(key("operations", "r1"), {**op(100, 150), "operation": "optim_step", "status": "succeeded"}, 10, None))
     sampler = {**RECORD, "workload": "sampler", "role": "sampler", "pod": "sampler-0"}
     records = [RECORD, sampler, {**sampler, "workload": "sampler-1", "pod": "sampler-1", "gpu_uuids": ["GPU-2"]}]
-    run = {**RUN, "lifecycle": "placed", "status": "active", "workloads": [], "pods": [], "settings": {}, "session_ids": []}
-    snapshot = {**state(records=records, workers=[], runs=[run]), "nodes": [], "pods": [], "errors": []}
+    run = {**RUN, "lifecycle": "placed", "status": "active", "workloads": [], "pods": [], "settings": {}, "session_ids": ["s1", "shared-sess"]}
+    second = {**run, "run_id": "r2", "runtime_id": "r2", "session_ids": ["shared-sess"]}
+    snapshot = {**state(records=records, workers=[], runs=[run, second]), "nodes": [], "pods": [], "errors": []}
     fleet.cache.clear()
     self.enterContext(mock.patch.object(fleet, "snapshot", mock.AsyncMock(return_value=snapshot)))
     self.enterContext(mock.patch("server.dashboard.facts.get_state_store", return_value=self.store))
@@ -318,7 +325,13 @@ class ApiTest(unittest.TestCase):
   def test_routes_are_read_only_and_a_run_summary_reads_the_store(self):
     summary = self.client.get("/api/v1/inspect/runs/r1/summary").json()
     self.assertEqual((summary["steps"], summary["last_op"]["operation"]), (1, "optim_step"))
+    by_session = self.client.get("/api/v1/inspect/runs/s1/summary").json()
+    self.assertEqual((by_session["run_id"], by_session["steps"]), ("r1", 1))
+    conflict = self.client.get("/api/v1/inspect/runs/shared-sess/summary")
+    self.assertEqual(conflict.status_code, 409)
+    self.assertIn("r1, r2", conflict.json()["detail"])
     self.assertEqual(self.client.get("/api/v1/inspect/runs/missing/summary").status_code, 404)
+    self.assertEqual(self.client.get("/api/v1/inspect/accelerators", params={"run_id": "missing"}).status_code, 404)
     self.assertEqual(self.client.get("/api/v1/inspect/activity", params={"since": "not a time"}).status_code, 400)
     self.assertTrue(all(set(methods) == {"get"} for methods in self.client.get("/openapi.json").json()["paths"].values()))
 

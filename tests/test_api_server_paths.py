@@ -23,6 +23,7 @@ class ApiServerTest(unittest.TestCase):
   def setUp(self) -> None:
     self.enterContext(patch.object(api_server, "store", InMemoryStore()))
     self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
+    self.enterContext(patch.object(api_server.session_registry, "state", api_server.state))
     self.client = TestClient(api_server.app)
 
   def post(self, path: str, body: dict, **kwargs):
@@ -628,20 +629,40 @@ class TelemetryRecordsTest(ApiServerTest):
     [error] = asyncio.run(api_server.state.read_samples(telemetry.key("sdk_errors", session_id)))
     self.assertEqual((error["reason"], error["at"], error["message"]), ("SDK api_status_error", 1792411200.0, "HTTP 401: invalid key"))
 
-  def test_the_collector_s_default_gzip_body_is_accepted(self) -> None:
+  def test_the_collector_s_default_gzip_body_is_accepted_without_waiting_on_redis(self) -> None:
     from tests.test_dashboard import step_event
 
-    body = gzip.compress(json.dumps(step_event(3, 0.5, 10**18)).encode())
-    response = self.client.post("/api/v1/otlp/logs", content=body, headers={"Content-Type": "application/json", "Content-Encoding": "gzip"})
-    self.assertEqual(response.status_code, 200)
-    [row] = asyncio.run(api_server.state.read_samples(telemetry.key("client_steps", "sess-1")))
-    self.assertEqual((row["step"], row["metrics"]["env/all/reward/total"]), (3, 0.5))
-    plain = self.client.post("/api/v1/otlp/logs", json=step_event(4, 0.6, 10**18))
-    self.assertEqual(plain.status_code, 200)
-    self.assertEqual(self.client.post("/api/v1/otlp/logs", content=b"not json").status_code, 400)
+    async def export_and_drain() -> None:
+      body = gzip.compress(json.dumps(step_event(3, 0.5, 10**18)).encode())
+      async with asgi_client() as client:
+        response = await client.post("/api/v1/otlp/logs", content=body, headers={"Content-Type": "application/json", "Content-Encoding": "gzip"})
+        self.assertEqual(response.status_code, 200)
+        plain = await client.post("/api/v1/otlp/logs", json=step_event(4, 0.6, 10**18))
+        self.assertEqual(plain.status_code, 200)
+        self.assertEqual((await client.post("/api/v1/otlp/logs", content=b"not json")).status_code, 400)
+      await asyncio.gather(*list(telemetry.writes))
+
+    asyncio.run(export_and_drain())
+    rows = asyncio.run(api_server.state.read_samples(telemetry.key("client_steps", "sess-1")))
+    self.assertEqual([(r["step"], r["metrics"]["env/all/reward/total"]) for r in rows], [(3, 0.5), (4, 0.6)])
+
+    async def hang_export() -> int:
+      async def never(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+      with patch.object(api_server.state, "append_sample", never), patch.object(telemetry, "WRITE_SECONDS", 0.05):
+        async with asgi_client() as client:
+          response = await asyncio.wait_for(client.post("/api/v1/otlp/logs", json=step_event(5, 0.7, 10**18)), 0.2)
+        await asyncio.gather(*list(telemetry.writes), return_exceptions=True)
+      return response.status_code
+
+    self.assertEqual(asyncio.run(hang_export()), 200)
 
   def test_a_heartbeat_racing_a_model_attach_keeps_the_model(self) -> None:
+    from server.session_registry import SessionRegistry
+
     store = InMemoryStateStore()
+    registry = SessionRegistry(store)
     read = store.get_value
 
     async def slow_read(key):
@@ -650,9 +671,9 @@ class TelemetryRecordsTest(ApiServerTest):
       return value
 
     async def race():
-      await telemetry.update_session(store, "s1", None, None)
+      await registry.update_record("s1")
       with patch.object(store, "get_value", slow_read):
-        await asyncio.gather(telemetry.update_session(store, "s1", "m1", None), telemetry.update_session(store, "s1", None, None))
+        await asyncio.gather(registry.update_record("s1", "m1"), registry.update_record("s1"))
       return json.loads(await store.get_value(telemetry.key("session_record", "s1")))
 
     self.assertEqual(asyncio.run(race())["model_ids"], ["m1"])
