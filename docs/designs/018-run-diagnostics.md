@@ -54,7 +54,7 @@ Measured on 2026-10-21 against the Qwen3.8-27B LoRA run `43b3ebb3` (37 steps ove
 | Cloud Monitoring (Managed Prometheus) | DCGM per GPU UUID, vLLM per pod, `openrl_gpu_held` (4.3) | 24 months, full detail for a week |
 | Redis | Live state only: command records (trainer and sampler lists), worker records, ledger counters, client heartbeat | 7 days; a flush loses the live view, never the record |
 | Cloud Logging | Every pod's stdout, including the new JSON records | 365 days in `openrl-runs` |
-| Kubernetes | Pods, events, exit reasons, Workloads | While objects exist |
+| Kubernetes | Pods, exit reasons, nodes, Workloads, read from one watch per kind in each process | While objects exist |
 
 ### 4.2 The join key
 
@@ -81,7 +81,8 @@ With those known, Prometheus is queried by GPU UUID or pod, Cloud Logging by pod
 | Exit and OOM reasons | Kubernetes; workers add cgroup `oom_kill` and `memory.peak` | Pod status, worker record | Tens of bytes | `worker-health` |
 | GPU utilization and memory from NVML | Workers, in the 5 s worker record | Redis | About 20 B per GPU | GPU checks without Prometheus (local stacks) |
 | JSON worker log lines with `run_id`, `request_id`, `step`, `kind` | Trainer, sampler, API server | stdout → Cloud Logging | A few fields per line | Every check's evidence |
-| Client step row (reward, KL, eval, stop reasons, `time/*` phases) and heartbeat | Cookbook client: JSON on stdout in GKE; the OTel Collector from a laptop | Cloud Logging; latest heartbeat in Redis | About 5 KB per step | `reward-validity`, `episode-endings`, `policy-movement`, `client-liveness`, `dependencies` |
+| Client step event: the step and every finite metric the client logged for it | The client's OpenTelemetry logger, one `openrl.training.metrics` event per step; the OTel Collector forwards it to `POST /api/v1/otlp/logs` | `open_rl:client_steps:<session>`, one row per step | About 5 KB per step with every metric | `/runs/{id}/steps` |
+| Client heartbeat and the client-side facts (reward validity, stop reasons) | Cookbook client | Latest heartbeat in Redis | Tens of bytes | `client-liveness`, `episode-endings`, `policy-movement`, `dependencies` |
 
 NaN and infinity are written as `null` and named in `nonfinite`.
 
@@ -103,7 +104,7 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | `GET /activity?run_id=&node_id=&since=&until=` | One lane per placement with its GPU turns and recorded op intervals, for the Activity and Nodes pages | The window |
 | `GET /logs?run_id=&q=&severity=&pod=&since=&until=` | The existing log route already searches by text, severity and pod | `limit` |
 | `GET /runs/{id}/commands?since=&until=&role=` | Command records from Redis, raw | `limit` |
-| `GET /runs/{id}/steps?last=&fields=` | Trainer ops grouped by step, with the client's metrics from its `openrl_client_metric` OTel gauges, aligned by `progress/batch` (prefix filter) | 20 steps by default |
+| `GET /runs/{id}/steps?last=&fields=` | Trainer ops grouped by step, with the client's metrics (prefix filter): the forwarded step events, else its `openrl_client_metric` OTel gauges aligned by `progress/batch`, read incrementally and cached for 30 s | 20 steps by default |
 | `GET /runs/{id}/summary` | The run's facts (section 4.5) and GPU duty by role over its span | 0.6 to 1.5 KB on the 8 recorded runs |
 | `GET /runs?ended=` | Every live run in one line (lifecycle, steps, seconds since the last op and step, unanswered requests, how many a dead worker holds, failed ops, relaunches), longest since its last op first | About 240 B per run |
 | `GET /sessions/{id}/summary` | The session record, whether its registry key is live, its SDK errors, and each model in the one-line form of `/runs` | About 400 B for one model |
@@ -169,17 +170,22 @@ Facts and endpoints are written against four source functions: metrics (PromQL),
 
 In the cluster, credentials come from the metadata server and the mounted service account, so no credential code is needed beyond library defaults. Laptop access to the cluster is a small adapter.
 
+Every Kubernetes call goes through lightkube. `server/kube.py` keeps one watch per kind (pods, nodes, Workloads) for the life of the process: it lists, follows changes from the list's resourceVersion, and lists again on 410 Gone, on any failure, and every 5 minutes. The dashboard reads pods, nodes and Workloads from it, so a snapshot makes no Kubernetes call. The API server's scheduler worker manager watches only Workloads and reads its model view and the 30 s placement sweep from the same cache; it still creates, gets, lists and deletes Workloads with direct calls.
+
+Reads that every page repeats are shared. A snapshot is cached for 5 s, a run's command records for 10 s and its client metrics for 30 s. Once an entry is stale, the next caller starts a fresh read and every caller gets the last good result until it lands, so only the first read after start waits.
+
 ## 5. Size budget
 
-PR #23 had 2,770 backend lines (`src/server/telemetry.py` and `src/server/dashboard/*.py`). Trimming that structure bottomed out near 2,900 with this feature set, so it was rewritten from the requirements in two independent builds against one contract. The smaller one, about 1,300 lines, was kept. On `main`, without sampling pools or tracing setup, it is 1,255:
+PR #23 had 2,770 backend lines (`src/server/telemetry.py` and `src/server/dashboard/*.py`). Trimming that structure bottomed out near 2,900 with this feature set, so it was rewritten from the requirements in two independent builds against one contract. The smaller one, about 1,300 lines, was kept. On `main`, without sampling pools or tracing setup, it is 1,370, counting the Kubernetes watch cache that the dashboard shares with the worker manager:
 
 | Module | Lines | Job |
 |---|---|---|
-| `telemetry.py` | 307 | The writers: command, worker, placement and session records, request counters, settings echo |
-| `dashboard/sources.py` | 272 | Kubernetes, Managed Prometheus and Cloud Logging reads, GKE discovery |
-| `dashboard/router.py` | 268 | The routes in 4.4 and one response model |
+| `telemetry.py` | 336 | The writers: command, worker, placement and session records, request counters, settings echo, forwarded client step events |
+| `dashboard/router.py` | 293 | The routes in 4.4 and one response model |
+| `dashboard/sources.py` | 253 | Kubernetes from the watch cache, Managed Prometheus and Cloud Logging reads, GKE discovery |
 | `dashboard/facts.py` | 213 | The run facts in 4.5 and the one-line form |
-| `dashboard/fleet.py` | 172 | One snapshot shared for 5 s, lanes, steps |
+| `dashboard/fleet.py` | 178 | Shared reads that serve the last good result, the snapshot, lanes, steps |
+| `kube.py` | 74 | One watch per Kubernetes kind for the process |
 | `dashboard/__main__.py` | 23 | The standalone server |
 
 About 250 of those lines are the blank lines `ruff format` requires between definitions. `dev/diagnostics_budget.py` measures the total and the payload sizes.
@@ -203,7 +209,7 @@ Each PR is one row in the instrumentation ledger, with the signal it adds, the c
 - **Scheduler change.** GPU UUIDs in Workload status and the info metric are Go changes to `scheduler/controller` and a CRD update, deployed to a shared cluster.
 - **Historical runs.** Runs recorded before placement records exist keep today's reconstruction until they age out, or are backfilled once.
 - **Facts on request or on a timer.** On request is simpler; a timer enables alerts, which would bring back thresholds.
-- **Client contract.** The step row needs a small cookbook logger sink; the laptop path needs a Collector exporter that writes one log entry per event.
+- **Client contract.** Step events reach the server only from a client that logs through an OpenTelemetry logger and a Collector with the `otlphttp` exporter in `docs/configuration.md`. Rows are kept per session, so two models trained by one session in the same window share their client metrics.
 
 ## 8. Alternatives considered
 

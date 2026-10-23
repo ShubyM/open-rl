@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BACKEND = [ROOT / "src/server/telemetry.py", *sorted((ROOT / "src/server/dashboard").glob("*.py"))]
+BACKEND = [ROOT / "src/server/telemetry.py", ROOT / "src/server/kube.py", *sorted((ROOT / "src/server/dashboard").glob("*.py"))]
 
 
 def endpoints(run: str, since: str, until: str) -> dict[str, tuple[str, dict]]:
