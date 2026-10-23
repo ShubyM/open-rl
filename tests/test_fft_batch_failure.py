@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from server import telemetry
+from server.dashboard import facts
 from server.store import InMemoryStateStore, InMemoryStore
 from server.training_requests_processor import TrainingRequestsProcessor
 
@@ -119,7 +120,7 @@ class FailedAnswerRecordTest(unittest.TestCase):
     store = BatchStore([{"request_id": "s-1", "op": "shutdown_workers", "model_id": "run-a"}])
     proc = processor(store, SlicerStub())
 
-    increment = self.state.increment
+    increment = self.state.increment_field
 
     async def slow_increment(*args):
       await asyncio.sleep(0.05)
@@ -131,10 +132,10 @@ class FailedAnswerRecordTest(unittest.TestCase):
         with patch("os._exit", side_effect=SystemExit), self.assertRaises(SystemExit):
           await proc.run_once()
         record = json.loads(await self.state.get_value(telemetry.key("worker", worker.record["id"])) or "{}")
-        return record.get("phase"), await self.state.get_value(telemetry.key("ledger", "run-a", "popped"))
+        return record.get("phase"), (await facts.ledger(self.state, "run-a")).get("popped")
 
-    with patch.object(self.state, "increment", slow_increment):
-      self.assertEqual(asyncio.run(serve()), ("exited", "1"))
+    with patch.object(self.state, "increment_field", slow_increment):
+      self.assertEqual(asyncio.run(serve()), ("exited", 1))
 
 
 if __name__ == "__main__":
