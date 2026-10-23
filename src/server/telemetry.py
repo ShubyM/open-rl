@@ -1,5 +1,8 @@
-"""What OpenRL records about itself, where it happens, for the dashboard to read. Recording is best effort: no hook raises
-into the code it observes or waits on the store, and none changes what an op returns or raises."""
+"""The records OpenRL keeps about its own runs, written where things happen, for the inspection API to read.
+
+Telemetry never changes what it observes. Every hook swallows its own errors, every store write runs in the background
+and is dropped after WRITE_SECONDS, and no hook changes what an op returns or raises.
+"""
 
 import asyncio
 import functools
@@ -14,23 +17,34 @@ import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from numbers import Real
 
 from server.store import get_state_store
 
-SAMPLE_LIMIT, STEP_TIMES = int(os.getenv("OPEN_RL_OPS_SAMPLE_LIMIT", "2000")), 64
-TTL_SECONDS = float(os.getenv("OPEN_RL_OPS_TTL_DAYS", "7")) * 86400 or None  # 0 keeps records
-HEARTBEAT_SECONDS, STALE_SECONDS, MAX_TURNS = 5, 30, 200  # a record not rewritten for STALE_SECONDS is a gone process
-WRITE_SECONDS, FINISH_SECONDS = 5, 5  # how long one write, and everything at exit, may take before it is dropped
-CLIENT, RUN_LABEL, SOURCE_LABEL = "client", "openrl_run_id", "openrl_source"  # Cloud Logging labels on client lines
+TTL_SECONDS = float(os.getenv("OPEN_RL_OPS_TTL_DAYS", "7")) * 86400 or None  # 0 keeps records forever
+SAMPLE_LIMIT = int(os.getenv("OPEN_RL_OPS_SAMPLE_LIMIT", "2000"))  # command records kept per list
+STEP_TIMES = 64
+SDK_ERRORS = 200
+MAX_TURNS = 200
+HEARTBEAT_SECONDS = 5
+STALE_SECONDS = 30  # a worker record not rewritten for this long belongs to a gone process
+WRITE_SECONDS = 5
+FINISH_SECONDS = 5  # how long an exiting process waits for its last writes
+OPEN_PLACEMENTS = "open_rl:placements:open"  # models holding a placement not yet released
+FAILED = "RequestFailedResponse"
+
+# Cloud Logging labels on the lines logged for a run
+RUN_LABEL = "openrl_run_id"
+SOURCE_LABEL = "openrl_source"
+CLIENT = "client"
+
 SECRET = re.compile(r"authorization|cookie|api[-_]?key|access[-_]?token|secret|password", re.I)
 CONFIG_ENV = ("OPEN_RL_", "OPENRL_", "VLLM_", "NCCL_", "CUDA_", "PYTORCH_", "TORCH_")
-OPEN_PLACEMENTS = "open_rl:placements:open"  # models holding a placement not yet released
 
 
 def key(*parts: str) -> str:
-  """operations:<run>, operations:<run>:samples, worker:<id>, steps:<run>, ledger:<run> (a hash of counts), session_record:<id>, ..."""
   return ":".join(("open_rl", *parts))
 
 
@@ -38,17 +52,40 @@ def iso(at: float) -> str:
   return datetime.fromtimestamp(at, UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-current: "Worker | None" = None  # this process's record while it serves
-writes: set[asyncio.Task] = set()  # in-flight writes, held so they are not collected mid-write
-step_base: dict[str, asyncio.Future] = {}  # run id -> optim_steps the run had completed when this process first ran one of its ops
-steps_here: defaultdict[str, int] = defaultdict(int)  # run id -> optim_steps this process has completed for it since
-session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # the API server is one replica
-placements_lock = asyncio.Lock()
+def epoch(stamp: str | None) -> float | None:
+  return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() if stamp else None
+
+
+def rank_zero() -> bool:
+  # Every torchrun rank runs the same ops; rank 0 records them.
+  return os.getenv("RANK", "0") == "0"
+
+
+def identity() -> dict[str, str]:
+  """The pod this process runs in, as the scheduler passes it."""
+  return {field: value for field, env in (("pod", "POD_NAME"), ("pod_uid", "POD_UID"), ("node", "NODE_NAME")) if (value := os.getenv(env))}
+
+
+def run_of(request: dict) -> str | None:
+  return request.get("logical_run_id") or request.get("model_id")
+
+
+def operation_name(request: dict, role: str) -> str:
+  # A forward-only call travels as forward_backward, and its loss must not mix with training losses.
+  return "forward" if request.get("forward_only") else str(request.get("op") or ("sample" if role == "sampler" else "unknown"))
+
+
+def redact(value):
+  # The SDK attaches full request and response headers to fatal errors, and the request carries the API key.
+  if isinstance(value, dict):
+    return {k: "[redacted]" if SECRET.search(str(k)) else redact(v) for k, v in value.items() if k not in ("request_headers", "response_headers")}
+  return [redact(v) for v in value] if isinstance(value, list) else value
+
+
+writes: set[asyncio.Task] = set()  # held so a write in flight is not garbage collected
 
 
 def best_effort(hook):
-  """A hook that never raises into the code it observes."""
-
   @functools.wraps(hook)
   def quiet(*args, **kwargs):
     with suppress(Exception):
@@ -57,20 +94,23 @@ def best_effort(hook):
   return quiet
 
 
-@best_effort
 def write(coroutine: Coroutine, timeout: float | None = None) -> None:
-  """Run a store write in the background; one that fails or takes longer than timeout (WRITE_SECONDS) is dropped."""
+  """Run a store write in the background. One that fails or takes longer than timeout (WRITE_SECONDS) is dropped."""
+
+  async def bounded():
+    with suppress(Exception):
+      await asyncio.wait_for(coroutine, timeout or WRITE_SECONDS)
+
   try:
-    task = asyncio.get_running_loop().create_task(asyncio.wait_for(coroutine, timeout or WRITE_SECONDS))
-  except RuntimeError:
-    coroutine.close()  # no loop to run it on
-    raise
+    task = asyncio.get_running_loop().create_task(bounded())
+  except RuntimeError:  # no event loop to run it on
+    coroutine.close()
+    return
   writes.add(task)
-  task.add_done_callback(lambda t: (writes.discard(t), t.cancelled() or t.exception()))
+  task.add_done_callback(writes.discard)
 
 
-def identity() -> dict:
-  return {field: value for field, env in (("pod", "POD_NAME"), ("pod_uid", "POD_UID"), ("node", "NODE_NAME")) if (value := os.getenv(env))}
+# Worker records
 
 
 def gpu_uuids() -> list[str] | None:
@@ -91,36 +131,49 @@ def alive(record: dict, now: float) -> bool:
   return record.get("phase") != "exited" and now - record.get("heartbeat_at", 0) < STALE_SECONDS
 
 
-def operation_name(request: dict, role: str) -> str:
-  # A forward-only call travels as forward_backward; its loss must not mix with training losses.
-  return "forward" if request.get("forward_only") else str(request.get("op") or ("sample" if role == "sampler" else "unknown"))
+@dataclass
+class Outstanding:
+  """A request this worker popped and has not answered."""
 
-
-def run_of(request: dict) -> str | None:
-  return request.get("logical_run_id") or request.get("model_id")
+  op: str
+  run_id: str | None
+  since: float
+  observed: bool = False  # observe_operation records the op, so answered need not
 
 
 class Worker:
+  """This process's worker record. A thread rewrites it, so it stays fresh while loading a model holds the event loop."""
+
   def __init__(self, role: str, runtime_id: str | None) -> None:
     now = time.time()
-    # Per process, not per pod: a container restarted in place must not overwrite what its predecessor held.
-    self.record = {"id": uuid.uuid4().hex[:16], "node": socket.gethostname(), **identity(), "role": role, "runtime_id": runtime_id}
-    self.record.update(gpus=gpu_uuids(), started_at=now, phase="starting", phase_since=now, turns=[])
-    # The settings the scheduler passed as env: what this process actually runs with.
-    self.record["config"] = {"env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(CONFIG_ENV) and not SECRET.search(k)}}
-    self.outstanding: dict[str, dict] = {}  # request_id -> op, run_id and when it was popped
-    self.observed: set[str] = set()  # outstanding requests whose op ran under observe_operation, which records it
-    # A thread, so loading a model on the event loop does not make this worker look dead.
+    self.record = {
+      # One record per process, not per pod, so a container restarted in place does not overwrite its predecessor's.
+      "id": uuid.uuid4().hex[:16],
+      "node": socket.gethostname(),
+      **identity(),
+      "role": role,
+      "runtime_id": runtime_id,
+      "gpus": gpu_uuids(),
+      "started_at": now,
+      "phase": "starting",
+      "phase_since": now,
+      "turns": [],
+      # The settings the scheduler passed as env, which is what this process runs with.
+      "config": {"env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(CONFIG_ENV) and not SECRET.search(k)}},
+    }
+    self.outstanding: dict[str, Outstanding] = {}
     self.stopped = threading.Event()
     self.heartbeat = threading.Thread(target=self.beat, name="worker-heartbeat", daemon=True)
 
   def snapshot(self) -> str:
-    """The record as JSON. Copies first, because the heartbeat thread reads while the event loop writes."""
-    groups: dict[tuple, dict] = {}  # outstanding requests by op and run, the oldest of each first
-    for entry in list(self.outstanding.values()):
-      groups.setdefault((entry["op"], entry["run_id"]), {**entry, "count": 0})["count"] += 1
+    """The record as JSON, with outstanding requests counted by op and run, each group showing its oldest."""
+    groups: dict[tuple, dict] = {}
+    for entry in list(self.outstanding.values()):  # a copy, since the event loop changes it while the heartbeat reads
+      group = groups.setdefault((entry.op, entry.run_id), {"op": entry.op, "run_id": entry.run_id, "since": entry.since, "count": 0})
+      group["count"] += 1
     return json.dumps({**self.record, "heartbeat_at": time.time(), "outstanding": list(groups.values())})
 
+  @best_effort
   def save(self) -> None:
     write(get_state_store().set_value(key("worker", self.record["id"]), self.snapshot(), ttl_seconds=TTL_SECONDS))
 
@@ -130,19 +183,18 @@ class Worker:
         get_state_store().set_value_sync(key("worker", self.record["id"]), self.snapshot(), ttl_seconds=TTL_SECONDS)
 
 
-@best_effort
-def start(role: str, runtime_id: str | None) -> None:
-  global current
-  worker = Worker(role, runtime_id)
-  worker.save()
-  worker.heartbeat.start()
-  current = worker
+current: Worker | None = None  # this process's record while it serves
 
 
 @asynccontextmanager
 async def serving(role: str, runtime_id: str | None):
-  """Keep this process's record fresh while the body runs; a clean exit says so."""
-  start(role, runtime_id)
+  """Keep this process's worker record while the body runs, and mark it exited after."""
+  global current
+  if rank_zero():
+    with suppress(Exception):
+      current = Worker(role, runtime_id)
+      current.heartbeat.start()
+      current.save()
   try:
     yield current
   finally:
@@ -150,20 +202,17 @@ async def serving(role: str, runtime_id: str | None):
 
 
 async def finish() -> None:
-  """Say this process exited and land the writes in flight, within FINISH_SECONDS. Also called before an os._exit."""
+  """Mark this process exited and land the writes in flight, within FINISH_SECONDS. Also called before an os._exit."""
   global current
   worker, current = current, None
-
-  async def close() -> None:
-    if worker is not None:
-      worker.stopped.set()  # stop the heartbeat first, so no late beat overwrites the exit
-      await asyncio.to_thread(worker.heartbeat.join, WRITE_SECONDS)
-      worker.record.update(phase="exited", phase_since=time.time())
-      worker.save()
-    await asyncio.gather(*list(writes), return_exceptions=True)
-
   with suppress(Exception):
-    await asyncio.wait_for(close(), FINISH_SECONDS)
+    async with asyncio.timeout(FINISH_SECONDS):
+      if worker is not None:
+        worker.stopped.set()  # stop the heartbeat first, so no late beat overwrites the exit
+        await asyncio.to_thread(worker.heartbeat.join, WRITE_SECONDS)
+        worker.record.update(phase="exited", phase_since=time.time())
+        worker.save()
+      await asyncio.gather(*writes, return_exceptions=True)
 
 
 @best_effort
@@ -172,77 +221,87 @@ def set_phase(phase: str) -> None:
     current.record.update(phase=phase, phase_since=time.time())
 
 
-@best_effort
-def popped(requests: list[dict]) -> None:
-  """Requests this worker took from its queue; each stays outstanding until answered. A shared trainer's delete_model
-  is queued without being counted as enqueued, so it is not counted here either."""
-  if current is not None:
-    for r in requests:
-      if r.get("request_id") and r.get("op") != "delete_model":
-        current.outstanding[r["request_id"]] = {"op": operation_name(r, current.record["role"]), "run_id": run_of(r), "since": time.time()}
-        count("popped", run_of(r))
-
-
-@best_effort
-def answered(request_id: str, result: dict | None = None) -> None:
-  """The request's answer is written, so it is no longer outstanding. A failure answered without its op running, such as a
-  wake or parse failure, gets its record here, so every failed answer has one."""
-  if current is None or (entry := current.outstanding.pop(request_id, None)) is None:
-    return
-  count("answered", entry["run_id"])
-  if request_id not in current.observed and (result or {}).get("type") == "RequestFailedResponse":
-    request = {"op": entry["op"], "request_id": request_id, "logical_run_id": entry["run_id"]}
-    record(request, current.record["role"], current.record["runtime_id"], entry["since"], "RequestFailedResponse")
-  current.observed.discard(request_id)
-
-
 @asynccontextmanager
 async def gpu_turn():
-  """Show a GPU turn on this worker's record. Enter it right after time_slicer.acquire, so the turn is the hold."""
+  """Show a GPU turn on the worker record. Enter it right after time_slicer.acquire, so the turn is the hold."""
   started = time.time()
   set_phase("on_gpu")
   try:
     yield
   finally:
-    with suppress(Exception):  # no worker record outside a served process
+    if current is not None:
       current.record["turns"] = [*current.record["turns"][1 - MAX_TURNS :], [started, time.time()]]
     set_phase("ready")
 
 
 @best_effort
-def count(event: str, run_id: str | None) -> None:
-  """One more request of this run reached `event`; a request enqueued but never popped shows up as a gap."""
-  if run_id:
-    write(get_state_store().increment_field(key("ledger", run_id), event, TTL_SECONDS))
+def popped(requests: list[dict]) -> None:
+  """Requests this worker took from its queue, each outstanding until answered. A shared trainer's delete_model is queued
+  without being counted as enqueued, so it is not counted here either."""
+  if current is None:
+    return
+  for request in requests:
+    if request.get("request_id") and request.get("op") != "delete_model":
+      run_id = run_of(request)
+      current.outstanding[request["request_id"]] = Outstanding(operation_name(request, current.record["role"]), run_id, time.time())
+      count_request("popped", run_id)
 
 
 @best_effort
-def observing(request: dict, role: str) -> None:
-  """An op is about to run. Starts reading the run's step count, which its trainer records carry, without waiting on it."""
-  if current is not None and request.get("request_id") in current.outstanding:
-    current.observed.add(request["request_id"])
-  if (run_id := run_of(request)) and operation_name(request, role) != "sample" and run_id not in step_base:
-    step_base[run_id] = asyncio.ensure_future(asyncio.wait_for(get_state_store().get_value(key("steps", run_id)), WRITE_SECONDS))
-    step_base[run_id].add_done_callback(lambda f: f.cancelled() or f.exception())
+def answered(request_id: str, result: dict | None = None) -> None:
+  """The request's answer is written. A failure answered without its op running, such as a failed wake or parse, gets its
+  command record here, so every failed answer has one."""
+  if current is None or (entry := current.outstanding.pop(request_id, None)) is None:
+    return
+  count_request("answered", entry.run_id)
+  if not entry.observed and (result or {}).get("type") == FAILED:
+    request = {"op": entry.op, "request_id": request_id, "logical_run_id": entry.run_id}
+    record_command(request, current.record["role"], current.record["runtime_id"], entry.since, FAILED)
+
+
+# Command records
+
+
+@dataclass
+class RunSteps:
+  """A run's optimizer steps as this process counts them. start is the run's count when this process first ran one of
+  its ops, read in the background, and done_here the steps finished here since."""
+
+  start: asyncio.Task
+  done_here: int = 0
+
+
+run_steps: dict[str, RunSteps] = {}
+
+
+async def read_step_count(run_id: str) -> int | None:
+  with suppress(Exception):
+    return int(await asyncio.wait_for(get_state_store().get_value(key("steps", run_id)), WRITE_SECONDS) or 0)
+  return None
 
 
 async def observe_operation(request: dict, role: str, runtime_id: str | None, call: Callable[[], Awaitable[dict]]) -> dict:
-  """Run one API op and record how it went; returns or raises exactly as the op does."""
-  if os.getenv("RANK", "0") != "0":  # torchrun ranks run the same op; rank 0 records it
+  """Run one op and record how it went. Returns or raises exactly as the op does."""
+  if not rank_zero():
     return await call()
   started_at = time.time()
-  observing(request, role)
+  with suppress(Exception):
+    if current is not None and (entry := current.outstanding.get(request.get("request_id"))):
+      entry.observed = True
+    # Read the run's step count before this op can change it.
+    if (run_id := run_of(request)) and run_id not in run_steps and operation_name(request, role) != "sample":
+      run_steps[run_id] = RunSteps(asyncio.ensure_future(read_step_count(run_id)))
   try:
     result = await call()
   except Exception as error:
-    record(request, role, runtime_id, started_at, type(error).__name__)
+    record_command(request, role, runtime_id, started_at, type(error).__name__)
     raise
-  record(request, role, runtime_id, started_at, None, result)
+  record_command(request, role, runtime_id, started_at, result=result)
   return result
 
 
 def numbers(metrics: dict | None) -> dict[str, float]:
-  """The metric values that are numbers, as floats; a bool is not one."""
+  """The metric values that are numbers, as floats. A bool is not one."""
   return {k: float(v) for k, v in (metrics or {}).items() if isinstance(v, Real) and not isinstance(v, bool)}
 
 
@@ -250,131 +309,185 @@ def finite(metrics: dict | None) -> dict[str, float]:
   return {k: v for k, v in numbers(metrics).items() if math.isfinite(v)}
 
 
-async def append_trainer_op(run_id: str, sample: dict, done_here: int) -> None:
-  """Stamp the step the op belongs to, once the run's count is read, and keep the record. An unread count leaves it off."""
-  with suppress(Exception):
-    if run_id in step_base:
-      sample["step"] = int(await step_base[run_id] or 0) + done_here
-  await get_state_store().append_sample(key("operations", run_id), sample, SAMPLE_LIMIT, TTL_SECONDS)
+def command_record(request: dict, role: str, runtime_id: str | None, started_at: float, error_type: str | None, result: dict) -> dict:
+  """How one op went. It failed with error_type, or as its result says. No payload, output or error message is kept."""
+  if error_type is None and result.get("type") == FAILED:
+    error_type = FAILED
+  now, values = time.time(), numbers(result.get("metrics"))
+  record = {
+    "at": now,
+    "started_at": started_at,
+    "operation": operation_name(request, role),
+    "request_id": request.get("request_id"),
+    "run_id": run_of(request),
+    "runtime_id": runtime_id,
+    "role": role,
+    "status": "failed" if error_type else "succeeded",
+    "error_type": error_type,
+    "elapsed_seconds": now - started_at,
+    **identity(),
+    "metrics": finite(values),
+  }
+  # JSON has no NaN or infinity, so name the metrics that were, rather than leave them missing.
+  if nonfinite := sorted(k for k, v in values.items() if not math.isfinite(v)):
+    record["nonfinite"] = nonfinite
+  return record
 
 
 @best_effort
-def record(request: dict, role: str, runtime_id: str | None, started_at: float, error_type: str | None = None, result: dict | None = None):
-  """One command record: failed with error_type, or as the result says. No payloads, outputs or error messages are kept."""
+def record_command(request: dict, role: str, runtime_id: str | None, started_at: float, error_type: str | None = None, result=None) -> None:
+  """Keep one op's command record, and for a trainer op the run's failure and step counts."""
   if not (run_id := run_of(request)):
     return
-  result = result if isinstance(result, dict) else {}
-  if error_type is None and result.get("type") == "RequestFailedResponse":
-    error_type = "RequestFailedResponse"
-  operation, at, status = operation_name(request, role), time.time(), "failed" if error_type else "succeeded"
-  values = numbers(result.get("metrics"))
-  sample = {"at": at, "started_at": started_at, "operation": operation, "request_id": request.get("request_id"), "run_id": run_id}
-  sample.update(runtime_id=runtime_id, role=role, status=status, error_type=error_type, elapsed_seconds=at - started_at)
-  sample.update(identity(), metrics=finite(values))
-  # JSON has no NaN or infinity; name them so a NaN metric is not just missing.
-  if nonfinite := sorted(k for k, v in values.items() if not math.isfinite(v)):
-    sample["nonfinite"] = nonfinite
+  record = command_record(request, role, runtime_id, started_at, error_type, result if isinstance(result, dict) else {})
   store = get_state_store()
-  # Samples keep their own list, so a run's sampling never evicts its training ops.
-  if operation == "sample":
-    write(store.append_sample(key("operations", run_id, "samples"), sample, SAMPLE_LIMIT, TTL_SECONDS))
+  if record["operation"] == "sample":
+    # Samples keep their own list, so a run's sampling never evicts its training ops.
+    write(store.append_sample(key("operations", run_id, "samples"), record, SAMPLE_LIMIT, TTL_SECONDS))
     return
-  write(append_trainer_op(run_id, sample, steps_here[run_id]), 2 * WRITE_SECONDS)  # the step read may take one WRITE_SECONDS
-  # A run's one-line form reads these few records instead of its command history.
-  if status == "failed":
-    count("failed", run_id)
-  if operation == "optim_step" and status == "succeeded":
-    steps_here[run_id] += 1
+  steps = run_steps.get(run_id)
+  # done_here is taken before this op's own step is counted below. The write may wait WRITE_SECONDS on the step read.
+  write(append_trainer_op(record, steps, steps.done_here if steps else 0), 2 * WRITE_SECONDS)
+  # The few records a run's one-line summary reads instead of its command history.
+  if record["status"] == "failed":
+    count_request("failed", run_id)
+  elif record["operation"] == "optim_step":
+    if steps is not None:
+      steps.done_here += 1
     write(store.increment(key("steps", run_id), TTL_SECONDS))
-    write(store.append_sample(key("step_times", run_id), at, STEP_TIMES, TTL_SECONDS))
+    write(store.append_sample(key("step_times", run_id), record["at"], STEP_TIMES, TTL_SECONDS))
 
 
-async def update_session(store, session_id: str, created: bool, model_id: str | None, metadata: dict | None) -> None:
-  record_key, now = key("session_record", session_id), time.time()
-  # Heartbeats and attaches rewrite the same record; one at a time, or a heartbeat drops a model attached meanwhile.
-  async with session_locks[session_id]:
-    record = json.loads(await store.get_value(record_key) or "null") or {"session_id": session_id, "created_at": now, "model_ids": []}
-    record["last_seen_at"] = now
-    if metadata is not None:
-      record["metadata"] = redact(metadata)
-    event = "created" if created else None
-    if model_id and model_id not in record["model_ids"]:
-      record["model_ids"].append(model_id)
-      event = "attached"
-    await store.set_value(record_key, json.dumps(record), ttl_seconds=TTL_SECONDS)
-  if event:
-    labels = {SOURCE_LABEL: "openrl_event", **({RUN_LABEL: model_id} if model_id else {})}
-    line = {"kind": "openrl.session", "v": 1, "event": event, "session_id": session_id, "model_id": model_id, "time": iso(now)}
-    print(json.dumps({"severity": "INFO", "message": "openrl.session", "openrl": line, "logging.googleapis.com/labels": labels}), flush=True)
+async def append_trainer_op(record: dict, steps: RunSteps | None, done_here: int) -> None:
+  """Keep a trainer op, stamped with the step it belongs to once the run's count is read. An unread count leaves it off."""
+  if steps is not None and (start := await steps.start) is not None:
+    record["step"] = start + done_here
+  await get_state_store().append_sample(key("operations", record["run_id"]), record, SAMPLE_LIMIT, TTL_SECONDS)
+
+
+@best_effort
+def count_request(event: str, run_id: str | None) -> None:
+  """Count one more of the run's requests reaching event, which is enqueued, popped, answered or failed. A request
+  enqueued but never popped shows up as a gap between the counts."""
+  if run_id:
+    write(get_state_store().increment_field(key("ledger", run_id), event, TTL_SECONDS))
+
+
+# Session records
+
+session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # the API server runs as one replica
 
 
 @best_effort
 def note_session(store, session_id: str, *, created: bool = False, model_id: str | None = None, metadata: dict | None = None) -> None:
-  """When a session started and was last heard from, and its models; it outlives the live key's two-minute expiry."""
+  """A session's creation, heartbeat or model attach. Its record outlives the session's two-minute live key."""
   write(update_session(store, session_id, created, model_id, metadata))
 
 
-def epoch(stamp: str | None) -> float | None:
-  return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() if stamp else None
+async def update_session(store, session_id: str, created: bool, model_id: str | None, metadata: dict | None) -> None:
+  record_key, now = key("session_record", session_id), time.time()
+  # Heartbeats and attaches rewrite the same record. One at a time, or a heartbeat drops a model attached meanwhile.
+  async with session_locks[session_id]:
+    saved = await store.get_value(record_key)
+    record = json.loads(saved) if saved else {"session_id": session_id, "created_at": now, "model_ids": []}
+    record["last_seen_at"] = now
+    if metadata is not None:
+      record["metadata"] = redact(metadata)
+    attached = bool(model_id) and model_id not in record["model_ids"]
+    if attached:
+      record["model_ids"].append(model_id)
+    await store.set_value(record_key, json.dumps(record), ttl_seconds=TTL_SECONDS)
+  if created or attached:
+    labels = {SOURCE_LABEL: "openrl_event", **({RUN_LABEL: model_id} if model_id else {})}
+    event = "attached" if attached else "created"
+    line = {"kind": "openrl.session", "v": 1, "event": event, "session_id": session_id, "model_id": model_id, "time": iso(now)}
+    print(json.dumps({"severity": "INFO", "message": "openrl.session", "openrl": line, "logging.googleapis.com/labels": labels}), flush=True)
+
+
+# Placement records
+
+placements_lock = asyncio.Lock()  # sweeps run in the background and may overlap
+
+
+def placement(workload: dict) -> dict:
+  spec, status = workload["spec"], workload["status"]
+  return {
+    "workload": workload["metadata"]["name"],
+    "role": spec["role"],
+    "model_id": spec["modelID"],
+    "owner": spec.get("ownerID"),
+    "pod": status.get("podName"),
+    "node": status.get("nodeName"),
+    "gpu_uuids": status.get("gpuUUIDs") or [],
+    "placed_at": epoch(status["placedAt"]),
+    "released_at": epoch(status.get("releasedAt")),
+  }
+
+
+def merge_placements(records: list[dict], live: dict[str, dict], now: float) -> list[dict]:
+  """A model's placement records after a sweep. A record whose Workload still holds that placement takes its current
+  state, an open one whose Workload is gone or placed again is released now, and a new placement is added."""
+  fresh, merged = dict(live), []
+  for old in records:
+    if (new := fresh.get(old["workload"])) and new["placed_at"] == old["placed_at"]:
+      merged.append(fresh.pop(old["workload"]))
+    elif old["released_at"] is None:
+      merged.append({**old, "released_at": now})
+    else:
+      merged.append(old)
+  return merged + list(fresh.values())
 
 
 async def record_placements(store, workloads: list[dict]) -> None:
-  """One record per (Workload, placedAt), kept after the Workload; a gone or re-placed Workload's open record is released now."""
-  now, live = time.time(), {}
-  for item in workloads:
-    spec, status = item["spec"], item.get("status") or {}
-    if status.get("placedAt"):  # the scheduler stamps it on bind
-      name = item["metadata"]["name"]
-      live[name] = {"workload": name, "role": spec["role"], "model_id": spec["modelID"], "owner": spec.get("ownerID"), "pod": status.get("podName")}
-      live[name].update(node=status.get("nodeName"), gpu_uuids=status.get("gpuUUIDs") or [], placed_at=epoch(status["placedAt"]))
-      live[name]["released_at"] = epoch(status.get("releasedAt"))
-  async with placements_lock:  # sweeps run in the background and may overlap
+  """Keep one record per Workload placement, which outlives the Workload, and the set of models still holding one."""
+  now = time.time()
+  live: defaultdict[str, dict[str, dict]] = defaultdict(dict)  # model -> Workload name -> placement
+  for workload in workloads:
+    if (workload.get("status") or {}).get("placedAt"):  # the scheduler stamps it on bind
+      p = placement(workload)
+      live[p["model_id"]][p["workload"]] = p
+  async with placements_lock:
     opened = await store.set_members(OPEN_PLACEMENTS)
-    for model_id in opened | {p["model_id"] for p in live.values()}:
-      records = await store.read_samples(key("placements", model_id))
-      fresh = {name: p for name, p in live.items() if p["model_id"] == model_id}
-      updated = []
-      for old in records:
-        if (new := fresh.get(old["workload"])) and new["placed_at"] == old["placed_at"]:
-          old = fresh.pop(old["workload"])
-        elif old["released_at"] is None:
-          old = {**old, "released_at": now}
-        updated.append(old)
-      updated += fresh.values()
-      held = any(r["released_at"] is None for r in updated)
-      if updated != records:
-        await store.replace_samples(key("placements", model_id), updated, TTL_SECONDS)
+    for model_id in opened | live.keys():
+      records_key = key("placements", model_id)
+      records = await store.read_samples(records_key)
+      merged = merge_placements(records, live[model_id], now)
+      held = any(r["released_at"] is None for r in merged)
+      if merged != records:
+        await store.replace_samples(records_key, merged, TTL_SECONDS)
       elif held and TTL_SECONDS:  # a placement held longer than the TTL must outlive it
-        await store.expire(key("placements", model_id), TTL_SECONDS)
+        await store.expire(records_key, TTL_SECONDS)
       if held and model_id not in opened:
         await store.add_to_set(OPEN_PLACEMENTS, model_id)
       elif not held and model_id in opened:
         await store.remove_from_set(OPEN_PLACEMENTS, model_id)
 
 
-def redact(value):
-  # The SDK attaches full request and response headers to fatal errors, and the request carries the API key.
-  if isinstance(value, dict):
-    return {k: "[redacted]" if SECRET.search(str(k)) else redact(v) for k, v in value.items() if k not in ("request_headers", "response_headers")}
-  return [redact(v) for v in value] if isinstance(value, list) else value
+# SDK events
 
 
 @best_effort
 def ingest_sdk_events(store, body: dict) -> None:
-  """The tinker SDK's own telemetry: one redacted JSON line per event, and error events kept per session."""
+  """Log the tinker SDK's own telemetry, one redacted JSON line per event, and keep a session's error events."""
   context = {k: body.get(k) for k in ("session_id", "process_uuid", "sdk_version", "platform")}
   session_id, events = body.get("session_id"), body.get("events")
-  for event in [redact(e) for e in events if isinstance(e, dict)] if isinstance(events, list) else []:
+  if not isinstance(events, list):
+    return
+  for event in [redact(e) for e in events if isinstance(e, dict)]:
     severity = str(event.get("severity") or "INFO").upper()
     message = f"tinker {event.get('event_name') or event.get('event')}"
     print(json.dumps({"severity": severity, "message": message, **context, "event": event}, default=str), flush=True)
     if severity in ("ERROR", "CRITICAL") and isinstance(session_id, str) and session_id:
-      data = event.get("event_data") if isinstance(event.get("event_data"), dict) else {}
-      name = str(event.get("error_type") or event.get("event_name") or event.get("event") or "event").rsplit(".", 1)[-1]
-      status = f"HTTP {data['status_code']}: " if data.get("status_code") else ""
-      text = status + str(event.get("error_message") or data.get("detail") or data.get("exception") or data.get("message") or "")
-      at = time.time()
-      with suppress(ValueError):
-        at = datetime.fromisoformat(str(event.get("timestamp"))).timestamp()
-      sample = {"at": at, "severity": severity, "reason": f"SDK {name}", "message": text[:2000]}
-      write(store.append_sample(key("sdk_errors", session_id), sample, 200, TTL_SECONDS))
+      write(store.append_sample(key("sdk_errors", session_id), sdk_error(event, severity), SDK_ERRORS, TTL_SECONDS))
+
+
+def sdk_error(event: dict, severity: str) -> dict:
+  data = event.get("event_data") if isinstance(event.get("event_data"), dict) else {}
+  name = str(event.get("error_type") or event.get("event_name") or event.get("event") or "event").rsplit(".", 1)[-1]
+  status = f"HTTP {data['status_code']}: " if data.get("status_code") else ""
+  message = status + str(event.get("error_message") or data.get("detail") or data.get("exception") or data.get("message") or "")
+  try:
+    at = datetime.fromisoformat(str(event.get("timestamp"))).timestamp()
+  except ValueError:
+    at = time.time()
+  return {"at": at, "severity": severity, "reason": f"SDK {name}", "message": message[:2000]}

@@ -17,8 +17,7 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     self.store = InMemoryStateStore()
     self.enterContext(mock.patch.object(telemetry, "get_state_store", return_value=self.store))
     self.enterContext(mock.patch.dict("os.environ", {"POD_NAME": "pod", "POD_UID": "uid", "NODE_NAME": "node"}))
-    self.enterContext(mock.patch.dict(telemetry.step_base, clear=True))
-    self.enterContext(mock.patch.dict(telemetry.steps_here, clear=True))
+    self.enterContext(mock.patch.dict(telemetry.run_steps, clear=True))
 
   async def saved(self, worker_id: str) -> dict:
     await asyncio.gather(*list(telemetry.writes))
@@ -79,7 +78,7 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     await telemetry.observe_operation({"model_id": "r", "op": "forward_backward", "forward_only": True}, "trainer", "r", call())
     with mock.patch.object(telemetry, "SAMPLE_LIMIT", 3):
       for i in range(5):  # a shared sampler's requests name the base model's queue and the run they sample for
-        telemetry.record({"op": "sample", "model_id": "base", "logical_run_id": "r", "request_id": f"s{i}"}, "sampler", "base", 0.0)
+        telemetry.record_command({"op": "sample", "model_id": "base", "logical_run_id": "r", "request_id": f"s{i}"}, "sampler", "base", 0.0)
     trainer = await self.recorded("r")
     self.assertEqual(
       [(s["operation"], s["status"], s["step"]) for s in trainer],

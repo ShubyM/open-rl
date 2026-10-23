@@ -470,8 +470,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
 
 async def serve_trainer(args: argparse.Namespace) -> None:
-  if not is_primary():
-    return await main_async(args)
   async with serving("trainer", os.getenv("OPEN_RL_MODEL_ID") or args.model_id):
     await main_async(args)
 
