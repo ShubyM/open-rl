@@ -36,6 +36,16 @@ Every key is in the API server's Redis. Each record expires
 | Placement | `open_rl:placements:<runtime>`, one record per Workload placement | API server, which lists the scheduler's Workloads every 30 s and before each release | Workload, role, pod, node, GPU UUIDs, placed and released times |
 | Workload status | `status.gpuUUIDs`, `status.placedAt`, `status.releasedAt` | Scheduler, on bind and release | The source of placement records. The scheduler also exports `openrl_gpu_held{run_id, role, pod, node, UUID}` while a GPU is held and logs one `openrl.placement` line per change |
 
+Each event a writer records also prints one JSON line, so Cloud Logging keeps a
+history longer than the Redis TTL. The line carries the Cloud Logging labels
+`openrl_source=telemetry` and `openrl_run_id=<run>` or `openrl_session_id=<id>`,
+and its `message` is `telemetry <kind>`. A run's kinds are `enqueued`, `popped`,
+`answered` and `op` (a command record), all written through
+`telemetry.record(run_id, kind, **fields)`. Other kinds are `placement`,
+`session_created`, `model_attached` and `sdk_event`. An answered vLLM sample
+and a session heartbeat print no line. Fields are redacted before they print.
+No route reads these lines.
+
 A run's display name comes from the `name`, `run_name`, `recipe_name` and
 `git_rev` keys of its `user_metadata`, kept in its model metadata.
 
@@ -63,7 +73,7 @@ too when `OPEN_RL_INSPECTION_API=true`. Every route is a `GET` under
 | `/activity?run_id=&node_id=&since=&until=` | Who ran where and when: one lane per placement with its GPU turns and recorded op intervals. A sampler lane's samples are its vLLM pod's running requests from Prometheus |
 | `/accelerators?run_id=&node_id=&since=&until=` | What each GPU is doing: node, slot, model, every placement holding it, utilization now and over the window, memory used of total |
 | `/query?name=&run_id=&node_id=&since=&until=&points=` | A named PromQL query (`gpu_util`, `gpu_util_now`, `gpu_busy`, `gpu_memory_mib`, `gpu_memory_total_mib`, `vllm_*`) over a run's or node's GPUs and pods, or the fleet's GPUs |
-| `/logs?run_id=&pod=&q=&severity=&since=&until=&cursor=` | The run's lines from Cloud Logging, newest first: its worker pods by the scheduler's owner label, and the lines an in-cluster client labels `openrl_run_id=<run>` and `openrl_source=client`. A stderr line takes the level it prints |
+| `/logs?run_id=&pod=&q=&severity=&since=&until=&cursor=` | The run's lines from Cloud Logging, newest first: its worker pods by the scheduler's owner label, and the lines an in-cluster client labels `openrl_run_id=<run>` and `openrl_source=client`, without telemetry's own lines. A stderr line takes the level it prints |
 
 Bounds are ISO-8601 or a span such as `1h`, at most seven days, and default to
 the last 30 minutes.
