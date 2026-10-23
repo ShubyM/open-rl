@@ -208,6 +208,7 @@ OWNER = 'labels."k8s-pod/timeslice_io/owner"'
 RUN_LABEL = "openrl_run_id"
 SOURCE_LABEL = "openrl_source"
 CLIENT = "client"
+TELEMETRY = "telemetry"  # telemetry's own event lines, kept as history and never read here
 # GKE files every stderr line as ERROR, though most are progress bars, INFO logs and warnings; such a line takes the level it prints.
 RELABELED = ("DEBUG", "INFO", "WARNING")
 LEVEL, PROGRESS = re.compile(r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\b"), re.compile(r"\r|\d+%(\||\s+Completed)")
@@ -225,7 +226,7 @@ def logs_filter(run: dict, start: str, end: str, severity: str | None, q: str, p
     clauses += [owner, f"resource.labels.pod_name={json.dumps(pod)}"]
   else:
     clauses.append(client if pod == CLIENT else f"({owner} OR {client})")
-  clauses += [f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
+  clauses += [f"NOT labels.{SOURCE_LABEL}={json.dumps(TELEMETRY)}", f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
   if severity in RELABELED:
     stderr = json.dumps(f"projects/{config['project']}/logs/stderr")
     clauses.append(f'(severity={json.dumps(severity)} OR (severity="ERROR" AND logName={stderr}))')
