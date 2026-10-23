@@ -319,13 +319,25 @@ async def logs(
   limit: int = Query(200, ge=1, le=1000),
   cursor: Annotated[str | None, Query(max_length=16384, description="next_cursor of a page with the same filters and window")] = None,
 ):
-  """Cloud Logging, newest first: the run's worker pods by owner label and its client."""
+  """Newest first: the run's worker pods by owner label from Cloud Logging, and with pod=client its client's logs.log. That
+  file's lines carry no time, so since and until do not apply to it and its cursor is a byte offset."""
   since, until, low, high = span(since, until)
   await sources.discover()
   state, run = await run_of(run_id)
   run_id = run["run_id"]
   pods = {lane["pod"]: {"pod": lane["pod"], "node": lane["node"], "role": lane["role"]} for lane in fleet.lanes(state, run_id) if lane["pod"]}
   result = {"run_id": run_id, "source": "gke", "since": since, "until": until, "sources": list(pods.values()), "records": [], "next_cursor": None}
+  if directory := await client_directory(run):
+    result["sources"].append({"pod": sources.CLIENT, "node": None, "role": sources.CLIENT})
+  if directory and pod == sources.CLIENT:
+    if cursor and not cursor.isdigit():
+      raise HTTPException(400, "Invalid or expired log cursor; repeat the query without it")
+    result["source"] = path = f"{directory}/logs.log"
+    try:
+      page = await asyncio.to_thread(client_runs.log_page, directory, int(cursor) if cursor else None, limit, q, severity)
+      return {**result, **page, "available": True}
+    except OSError as exc:
+      return {**result, "available": False, "error": f"{path} unreadable: {type(exc).__name__}"}
   try:
     return {**result, **await sources.log_page(run, since, until, cursor=cursor, limit=limit, q=q, pod=pod, severity=severity), "available": True}
   except httpx.HTTPStatusError as exc:

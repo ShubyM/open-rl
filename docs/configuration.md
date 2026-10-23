@@ -117,14 +117,14 @@ Trainers, samplers and the API server record each run in Redis.
 | `OPEN_RL_LOG_VIEWS` | the project | Comma-separated Cloud Logging views to read run logs from, such as a long-retention bucket's view. |
 | `OPEN_RL_CLIENT_RUNS_ROOT` | `/mnt/shared` | Where the dashboard looks for each run's client directory, three levels deep. |
 
-### Client metrics
+### Client metrics and logs
 
-The dashboard reads a run's client metrics from the directory the
+The dashboard reads a run's client metrics and logs from the directory the
 tinker-cookbook client writes, its `log_path`. The client sends nothing extra.
 On GKE, set each run's `log_path` on the shared volume, such as
 `/mnt/shared/<project>/<run>`, which the API server also mounts at
 `/mnt/shared`. A run whose directory the server cannot read has no client
-metrics.
+metrics or logs.
 
 A directory is a run's when its `checkpoints.jsonl` names `tinker://<run>/`.
 Before the first checkpoint, it is a run's when its `config.json` was written
