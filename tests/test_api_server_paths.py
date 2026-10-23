@@ -21,6 +21,7 @@ class ApiServerTest(unittest.TestCase):
   def setUp(self) -> None:
     self.enterContext(patch.object(api_server, "store", InMemoryStore()))
     self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
+    self.enterContext(patch.object(api_server.session_registry, "state", api_server.state))
     self.client = TestClient(api_server.app)
 
   def post(self, path: str, body: dict, **kwargs):

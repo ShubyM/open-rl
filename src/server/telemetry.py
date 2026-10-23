@@ -364,31 +364,6 @@ def count_request(event: str, run_id: str | None) -> None:
     write(get_state_store().increment_field(key("ledger", run_id), event, TTL_SECONDS))
 
 
-# Session records
-
-session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # the API server runs as one replica
-
-
-@best_effort
-def note_session(store, session_id: str, *, model_id: str | None = None, metadata: dict | None = None) -> None:
-  """A session's creation, heartbeat or model attach. Its record outlives the session's two-minute live key."""
-  write(update_session(store, session_id, model_id, metadata))
-
-
-async def update_session(store, session_id: str, model_id: str | None, metadata: dict | None) -> None:
-  record_key, now = key("session_record", session_id), time.time()
-  # Heartbeats and attaches rewrite the same record. One at a time, or a heartbeat drops a model attached meanwhile.
-  async with session_locks[session_id]:
-    saved = await store.get_value(record_key)
-    record = json.loads(saved) if saved else {"session_id": session_id, "created_at": now, "model_ids": []}
-    record["last_seen_at"] = now
-    if metadata is not None:
-      record["metadata"] = redact(metadata)
-    if model_id and model_id not in record["model_ids"]:
-      record["model_ids"].append(model_id)
-    await store.set_value(record_key, json.dumps(record), ttl_seconds=TTL_SECONDS)
-
-
 # Placement records
 
 placements_lock = asyncio.Lock()  # sweeps run in the background and may overlap
