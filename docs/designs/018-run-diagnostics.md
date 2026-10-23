@@ -137,7 +137,7 @@ so an agent follows a failure to its traceback in one call.
 - vLLM's metrics are per pod, not per run. On a shared runtime, sampler
   latency, rollout time and activity cover every tenant. A median is
   interpolated within vLLM's histogram buckets, and running requests are
-  sampled every 15 s.
+  sampled every 15 s for activity and every 30 s for rollout.
 - Facts are computed on request. Alerts would need a timer and thresholds.
 - Not recorded yet: cgroup OOM kills and peak memory in the worker record, NVML
   utilization for GPU facts without Prometheus, and the request's holder
