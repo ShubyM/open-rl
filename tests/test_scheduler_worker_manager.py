@@ -142,6 +142,18 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
       env = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
       self.assertEqual({k: env.get(k) for k in settings}, settings)
 
+  def test_samplers_keep_the_vllm_compile_cache_on_the_shared_volume(self) -> None:
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/mnt/shared/open-rl"}), patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-lora-1", "sampler")
+      self.manager.ensure("job-lora-1", "trainer")
+
+    envs = {}
+    for pod in self.api.created:
+      envs[pod["spec"]["role"]] = {e["name"]: e.get("value") for e in pod["spec"]["template"]["spec"]["containers"][0]["env"]}
+    self.assertEqual(envs["sampler"]["VLLM_CACHE_ROOT"], "/mnt/shared/open-rl/vllm-cache")
+    self.assertNotIn("VLLM_CACHE_ROOT", envs["trainer"])
+
   def test_launch_is_idempotent(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
     with patch("server.worker_manager.get_state_store", return_value=s):
