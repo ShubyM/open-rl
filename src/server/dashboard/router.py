@@ -10,9 +10,9 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from server.dashboard import facts, fleet, sources
+from server.dashboard import client_runs, facts, fleet, sources
 from server.store import get_state_store
-from server.telemetry import key
+from server.telemetry import finite, key
 
 router = APIRouter(tags=["inspection"])
 BOUNDS = "ISO-8601, e.g. 2026-01-02T12:00:00Z; since also takes a span before until, e.g. 1h. Default: the 30 minutes ending now; at most 7 days."
@@ -177,12 +177,34 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
   return result
 
 
+async def client_directory(run: dict) -> str | None:
+  """The run's client directory under OPEN_RL_CLIENT_RUNS_ROOT, if exactly one matches it."""
+  candidates = await fleet.cached("client directories", 30, lambda: asyncio.to_thread(client_runs.directories))
+  return await asyncio.to_thread(client_runs.match, run, candidates)
+
+
 @router.get("/api/v1/inspect/runs/{run_id}/steps", response_model=Doc)
-async def steps(run_id: str, last: int = Query(20, ge=1, le=1000)):
-  """The run's last steps, oldest first: window, completion, trainer ops (count, failures, seconds, metric spread)."""
-  run_id = (await run_of(run_id))[1]["run_id"]
-  every = fleet.steps(await fleet.operations(run_id))
-  return {"run_id": run_id, "total": len(every), "steps": every[-last:]}
+async def steps(
+  run_id: str,
+  last: int = Query(20, ge=1, le=1000),
+  fields: Annotated[str | None, Query(description="Comma-separated prefixes of client metrics to keep, e.g. env/all/reward")] = None,
+):
+  """The run's last steps, oldest first: window, completion, trainer ops (count, failures, seconds, metric spread), and the
+  `client` metrics its client wrote to metrics.jsonl for the step."""
+  _, run = await run_of(run_id)
+  run_id = run["run_id"]
+  every, keep, result = fleet.steps(await fleet.operations(run_id)), tuple(p for p in (fields or "").split(",") if p), {}
+  # Some runs keep their client metrics in Redis; metrics.jsonl wins a step both have.
+  client = {row["step"]: finite(row["metrics"]) for row in await get_state_store().read_samples(f"open_rl:run_metrics:{run_id}")}
+  if directory := await client_directory(run):
+    try:
+      client |= await asyncio.to_thread(client_runs.metrics, directory)
+    except (OSError, ValueError) as exc:  # steps stand without the client's metrics
+      result["client_error"] = f"{directory}/metrics.jsonl unreadable: {type(exc).__name__}"
+  result["client_directory"] = directory
+  for step in every[-last:]:
+    step["client"] = {k: v for k, v in client.get(step["step"], {}).items() if not keep or k.startswith(keep)}
+  return result | {"run_id": run_id, "total": len(every), "steps": every[-last:]}
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/commands", response_model=Doc)
