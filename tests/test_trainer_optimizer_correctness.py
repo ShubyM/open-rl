@@ -722,8 +722,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
   def test_long_sequence_starts_a_new_pass_instead_of_padding_short_ones(self) -> None:
     worker = self._worker()
     data = [_datum(list(range(1, 11)), list(range(2, 12))) for _ in range(6)] + [_datum(list(range(1, 51)), list(range(2, 52)))]
-    with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "1000"}):
-      batches = worker.make_training_batches(data)
+    batches = worker.make_training_batches(data, 1000)
 
     self.assertEqual([sorted(idx for idx, _datum in batch) for batch in batches], [[0, 1, 2, 3, 4, 5], [6]])
 
