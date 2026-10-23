@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 GROUP = "openrl.io"
 VERSION = "v1alpha1"
 PLURAL = "workloads"
+OPS_SETTINGS = ("OPEN_RL_OPS_TTL_DAYS", "OPEN_RL_OPS_SAMPLE_LIMIT")
 
 
 def workload_name(role: str, owner: str, is_lora: bool, index: int = 0) -> str:
@@ -120,7 +121,7 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   }
   # MAX_JOBS caps FlashInfer's JIT build, which otherwise runs one ~3GB
   # compiler per core and blows through the pod's host memory limit.
-  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
+  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS", *OPS_SETTINGS):
     if os.getenv(name):
       values[name] = os.environ[name]
   # No other worker shares an exclusive worker's GPUs, so it never parks.
@@ -128,6 +129,9 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
     values["OPEN_RL_TIME_SLICING"] = "off"
   env: list[dict[str, Any]] = [{"name": name, "value": value} for name, value in values.items()]
   env.append({"name": "OPEN_RL_ACCEL_TIMESLICER_HOST", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}}})
+  # The pod identity a worker stamps on the ops it records, for the dashboard.
+  for name, field in (("POD_NAME", "metadata.name"), ("POD_UID", "metadata.uid"), ("NODE_NAME", "spec.nodeName")):
+    env.append({"name": name, "valueFrom": {"fieldRef": {"fieldPath": field}}})
   return env
 
 
@@ -324,6 +328,11 @@ class SchedulerWorkerManager:
         }
       )
     return workers
+
+  def workloads(self) -> list[dict[str, Any]]:
+    """Our Workload objects as the API returns them, read fresh, for the placement records."""
+    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
+    return self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)["items"]
 
 
 def worker_state(phase: str, reason: str, node: str | None, deleting: bool) -> tuple[str, str]:
