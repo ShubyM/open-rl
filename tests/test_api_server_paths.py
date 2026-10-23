@@ -35,6 +35,9 @@ class ApiServerTest(unittest.TestCase):
 
 
 class GetInfoTest(ApiServerTest):
+  def test_default_gateway_does_not_expose_fleet_inspection(self) -> None:
+    self.assertEqual(self.client.get("/api/v1/inspect/inventory").status_code, 404)
+
   def test_get_info_uses_base_model_env(self) -> None:
     with patch.dict(os.environ, {"BASE_MODEL": "env-model"}, clear=True):
       info = self.post("get_info", {"model_id": "model-a"}).json()

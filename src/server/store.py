@@ -362,6 +362,16 @@ class StateStore(ABC):
     """The counts increment_field keeps under key."""
     pass
 
+  @abstractmethod
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    """Every live value whose key starts with prefix."""
+    pass
+
+  @abstractmethod
+  async def list_length(self, key: str) -> int | None:
+    """Items in a list, such as a request queue; None where this store holds no queues."""
+    pass
+
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
@@ -434,6 +444,12 @@ class InMemoryStateStore(StateStore):
 
   async def read_counts(self, key: str) -> dict[str, int]:
     return dict(self.counts.get(key, {}))
+
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    return {key: value for key in list(self.kv_store) if key.startswith(prefix) and (value := self.get_value_sync(key)) is not None}
+
+  async def list_length(self, key: str) -> int | None:
+    return None  # the in-memory queues live in InMemoryStore
 
 
 class RedisStateStore(StateStore):
@@ -515,6 +531,13 @@ class RedisStateStore(StateStore):
 
   async def read_counts(self, key: str) -> dict[str, int]:
     return {field: int(value) for field, value in (await self.redis.hgetall(key)).items()}
+
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    keys = [key async for key in self.redis.scan_iter(match=prefix + "*", count=1000)]
+    return {key: value for key, value in zip(keys, await self.redis.mget(keys)) if value is not None} if keys else {}
+
+  async def list_length(self, key: str) -> int | None:
+    return await self.redis.llen(key)
 
 
 @cache
