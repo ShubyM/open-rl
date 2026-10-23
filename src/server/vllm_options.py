@@ -76,6 +76,16 @@ def sampler_batch_limits(device_memory_bytes: int | None = None) -> dict[str, in
   }
 
 
+def cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
+  """Batch sizes vLLM records a CUDA graph for: powers of two up to max_num_seqs.
+
+  vLLM's default list has dozens of sizes, and capturing them (once to profile
+  memory, once for real) is a large part of a sampler's start-up. A batch runs
+  on the next captured size up.
+  """
+  return [2**i for i in range(max_num_seqs.bit_length())]
+
+
 def detected_device_memory_bytes() -> int:
   try:
     import torch
