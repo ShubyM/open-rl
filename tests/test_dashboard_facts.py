@@ -117,6 +117,10 @@ class RunFactsTest(unittest.TestCase):
     self.setUp()
     _, _, line = self.facts_of(workers=[first, restarted])  # the container restarted in place
     self.assertEqual(line["relaunches"], 1)
+    self.setUp()
+    holding = {**first, "outstanding": [{"op": "create_model", "run_id": "r", "count": 1, "since": NOW - 950}]}
+    _, _, line = self.facts_of(workers=[holding, {**restarted, "pod_uid": "u2"}])  # a new pod after one died holding work
+    self.assertEqual(line["relaunches"], 1)
 
   def test_a_slow_sampler_replica_is_named_beside_the_fastest(self):
     sends = [op(NOW - i, "sample", role="sampler", pod=pod, elapsed_seconds=s) for i in range(20) for pod, s in (("fast", 10.0), ("slow", 40.0))]
