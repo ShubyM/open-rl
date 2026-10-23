@@ -46,6 +46,12 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     self.assertFalse(telemetry.alive(record, record["heartbeat_at"]))
     self.assertIsNone(telemetry.current)
 
+  async def test_a_process_that_cannot_read_nvml_records_its_gpus_as_unknown_not_as_zero(self) -> None:
+    with mock.patch.dict("sys.modules", {"pynvml": None}):
+      async with telemetry.serving("trainer", "run-a") as worker:
+        record = await self.saved(worker.record["id"])
+    self.assertIsNone(record["gpus"])
+
   async def test_each_process_records_its_settings_without_secrets(self) -> None:
     env = {"OPEN_RL_FINE_TUNING_TYPE": "lora", "VLLM_MAX_LORAS": "8", "OPEN_RL_API_KEY": "sk-private", "HOME": "/root"}
     with mock.patch.dict("os.environ", env), mock.patch("builtins.print") as printed:

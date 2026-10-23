@@ -136,6 +136,15 @@ class RunFactsTest(unittest.TestCase):
     _, summary, _ = self.facts_of(workers=[wrong])
     self.assertEqual(summary["config"], [{"pod": "t0", "setting": "openrl.fine_tuning_type", "asked": "lora", "running": "full"}])
 
+  def test_a_trainer_seeing_fewer_gpus_than_asked_is_listed_and_one_that_cannot_tell_is_not(self):
+    trainer = {"id": "w", "role": "trainer", "runtime_id": "r", "pod": "t0", "started_at": 0, "config": {"env": {}}}
+    for gpus, expected in ((None, None), (["GPU-1"], None), ([], 0)):
+      with self.subTest(gpus=gpus):
+        self.setUp()
+        _, summary, _ = self.facts_of(workers=[{**trainer, "gpus": gpus}])
+        drift = [d["running"] for d in summary.get("config") or [] if d["setting"] == "openrl.trainer_gpus"]
+        self.assertEqual(drift, [] if expected is None else [expected])
+
   def test_goodput_splits_trainer_idle_time_into_rollout_and_waiting_on_the_client(self):
     ctx, _, _ = self.facts_of([op(NOW - 100, "optim_step"), op(NOW - 50, "sample", role="sampler")])  # 10 s training, 10 s sampling
     seconds = facts.goodput(ctx)["seconds"]

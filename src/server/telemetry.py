@@ -48,15 +48,16 @@ def identity() -> dict:
   return {field: value for field, env in (("pod", "POD_NAME"), ("pod_uid", "POD_UID"), ("node", "NODE_NAME")) if (value := os.getenv(env))}
 
 
-def gpu_uuids() -> list[str]:
-  """The GPUs this process can see, in CUDA order, as the UUIDs DCGM labels its series with."""
+def gpu_uuids() -> list[str] | None:
+  """The GPUs this process can see, in CUDA order, as the UUIDs DCGM labels its series with. None when NVML cannot be
+  read. pynvml comes with vLLM, so a trainer may lack it, which says nothing about how many GPUs it has."""
   try:
     import pynvml
 
     pynvml.nvmlInit()
     uuids = [pynvml.nvmlDeviceGetUUID(pynvml.nvmlDeviceGetHandleByIndex(i)) for i in range(pynvml.nvmlDeviceGetCount())]
   except Exception:
-    return []
+    return None
   visible = os.getenv("CUDA_VISIBLE_DEVICES")
   return [gpu for i, gpu in enumerate(uuids) if visible is None or str(i) in visible.split(",") or gpu in visible]
 

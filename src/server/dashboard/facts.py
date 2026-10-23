@@ -122,8 +122,10 @@ def config(ctx: dict) -> list[dict] | str | None:
     asked, running = settings.get("openrl.fine_tuning_type"), w["config"].get("env", {}).get("OPEN_RL_FINE_TUNING_TYPE")
     if asked and running and asked != running:
       found.append({"pod": w.get("pod"), "setting": "openrl.fine_tuning_type", "asked": asked, "running": running})
-    if w.get("role") == "trainer" and settings.get("openrl.trainer_gpus") and not w.get("gpus"):
-      found.append({"pod": w.get("pod"), "setting": "openrl.trainer_gpus", "asked": settings["openrl.trainer_gpus"], "running": 0})
+    # gpus is None when the worker could not count them.
+    gpus, wanted = w.get("gpus"), settings.get("openrl.trainer_gpus")
+    if w.get("role") == "trainer" and wanted and gpus is not None and len(gpus) != int(wanted):
+      found.append({"pod": w.get("pod"), "setting": "openrl.trainer_gpus", "asked": wanted, "running": len(gpus)})
   return found or None
 
 
