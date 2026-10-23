@@ -64,7 +64,7 @@ The top-level unit is the **session**: one client process, with its lifetime, lo
 
 - *Place* is the pod (name and UID), node and GPU UUIDs, from the placement record.
 - *Window* is `[t0, t1]` of a command or a step, from command records.
-- *Step* is the run's `optim_step` ordinal, stamped on every command record.
+- *Step* is the run's `optim_step` ordinal, stamped on every trainer op's command record. Samples carry none; a sample belongs to the step its time falls in.
 
 With those known, Prometheus is queried by GPU UUID or pod, Cloud Logging by pod label and window, Redis by run and step, Kubernetes by run.
 
@@ -73,18 +73,18 @@ With those known, Prometheus is queried by GPU UUID or pod, Cloud Logging by pod
 | Record | Writer | Where | Size | Checks it feeds |
 |---|---|---|---|---|
 | Session record: started, last heard from, models used, client metadata (redacted) | API server on `create_session`, each heartbeat, and each model attach | `open_rl:session_record:<id>` (telemetry retention); one `openrl.session` JSON line per create and attach | About 300 B per session | `client-liveness`, `sdk-errors`, the session rollup |
-| Placement: run ids, role, runtime, pod and UID, node, GPU UUIDs, start, end | The scheduler, on bind and release; workers echo it at start | Workload status; `openrl_gpu_held{run_id, role, pod, UUID}` info metric; one JSON log line per change | About 300 B per process lifetime | `placement`, `worker-health`, every check's place |
-| Step ordinal on every command record | Trainer | Redis command records | About 8 B per record | `progress`, `optimizer-health`, per-step views |
+| Placement: run ids, role, runtime, pod and UID, node, GPU UUIDs, start, end | The scheduler, on bind and release; each worker's record carries its pod, pod UID, node and, where NVML is readable, GPU UUIDs | Workload status; `openrl_gpu_held{run_id, role, pod, UUID}` info metric; one JSON log line per change | About 300 B per process lifetime | `placement`, `worker-health`, every check's place |
+| Step ordinal on every trainer op record; samples carry none | Trainer | Redis command records | About 8 B per record | `progress`, `optimizer-health`, per-step views |
+| Step times: the last 64 successful `optim_step` times | Trainer | `open_rl:step_times:<run>` | About 1 KB per run | the `/runs` line |
 | Sampler command records in their own list | vLLM sampler worker | `open_rl:operations:<run>:samples` | Unchanged | `sampler-flow`; keeps trainer ops under the cap |
-| Ledger counters: enqueued, popped, answered, polled, with holder incarnation | API server, trainer | Redis | Tens of bytes per run | `request-ledger` |
-| Effective config echo | Every trainer and sampler at start | One JSON log line; latest in the worker record | About 1 KB per process | `effective-config` |
-| Exit and OOM reasons | Kubernetes; workers add cgroup `oom_kill` and `memory.peak` | Pod status, worker record | Tens of bytes | `worker-health` |
-| GPU utilization and memory from NVML | Workers, in the 5 s worker record | Redis | About 20 B per GPU | GPU checks without Prometheus (local stacks) |
-| JSON worker log lines with `run_id`, `request_id`, `step`, `kind` | Trainer, sampler, API server | stdout → Cloud Logging | A few fields per line | Every check's evidence |
+| Request counters: trainer requests enqueued, popped, answered and failed | API server, trainer | `open_rl:ledger:<run>`, one hash per run that expires as a whole | Tens of bytes per run | `request-ledger`, the `/runs` line |
+| Effective config echo: the settings env the process runs with, secrets left out | Every trainer and sampler at start | The worker record | About 1 KB per process | `effective-config` |
+| Exit and OOM reasons | Kubernetes | Pod status, the last termination of each container | Tens of bytes | `worker-health` |
 | Client step event: the step and every finite metric the client logged for it | The client's OpenTelemetry logger, one `openrl.training.metrics` event per step; the OTel Collector forwards it to `POST /api/v1/otlp/logs` | `open_rl:client_steps:<session>`, one row per step | About 5 KB per step with every metric | `/runs/{id}/steps` |
-| Client heartbeat and the client-side facts (reward validity, stop reasons) | Cookbook client | Latest heartbeat in Redis | Tens of bytes | `client-liveness`, `episode-endings`, `policy-movement`, `dependencies` |
 
 NaN and infinity are written as `null` and named in `nonfinite`.
+
+**Follow-ups.** These records are designed but not built: a JSON log line for the effective config; cgroup `oom_kill` and `memory.peak` in the worker record; NVML utilization and memory in the worker record, for GPU facts without Prometheus; JSON worker log lines carrying `run_id`, `request_id`, `step` and `kind`; a `polled` counter and the holder's incarnation in the request counters; and the client heartbeat with the client-side facts (reward validity, stop reasons).
 
 The placement info metric does the correlation in PromQL. For example, the utilization of the GPUs a run's trainer holds is
 
@@ -106,7 +106,7 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | `GET /runs/{id}/commands?since=&until=&role=` | Command records from Redis, raw | `limit` |
 | `GET /runs/{id}/steps?last=&fields=` | Trainer ops grouped by step, with the client's metrics (prefix filter): the forwarded step events, else its `openrl_client_metric` OTel gauges aligned by `progress/batch`, read incrementally and cached for 30 s | 20 steps by default |
 | `GET /runs/{id}/summary` | The run's facts (section 4.5) and GPU duty by role over its span | 0.6 to 1.5 KB on the 8 recorded runs |
-| `GET /runs?ended=` | Every live run in one line (lifecycle, steps, seconds since the last op and step, unanswered requests, how many a dead worker holds, samples queued, failed ops, relaunches), longest since its last op first | About 240 B per run |
+| `GET /runs?ended=` | Every live run in one line (lifecycle, steps, seconds since the last op and step, unanswered requests, how many a dead worker holds, samples queued, failed ops, relaunches), longest since its last op first. Built from the step counter, step times, request counters and the last command record, never the command history; a run recorded before step times and the failure count leaves those null | About 240 B per run |
 | `GET /sessions/{id}/summary` | The session record, whether its registry key is live, its SDK errors, and each model in the one-line form of `/runs` | About 400 B for one model |
 | `GET /accelerators?run_id=&node_id=&since=&until=` | One row per GPU: node, model, holders (every placement holding it at once with the newest), utilization now and over the window (last hour by default), memory used of total | About 9 KB for 30 GPUs |
 | `GET /inventory` | What the pages list: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, and pods with problems. No health judgment | About 17 KB on the demo store, against 112 KB |
@@ -139,7 +139,7 @@ A log pointer is a read under 4.4 with its arguments, so an agent follows a fail
 | `since_last_op_s`, `trainer_idle_s` | For a live run, seconds since any op finished and since the trainer's last op | What is a stuck run waiting on? |
 | `requests` | Unanswered trainer requests with the holding pod and whether its worker still reports; the ledger counters, with `lost = enqueued - popped - queued` when the queue length is known; for a live run, the samples waiting in its sampler queue (`samples_queued`) | Is a request held by a dead worker, or lost between push and pop? Is the run stuck behind a sampler that is not placed or not serving? |
 | `failures` | Failed trainer ops: count, the 5 newest, a log read around the newest naming its error type | Which op failed, and where is the traceback? |
-| `relaunches` | Workers that stopped reporting and restarted in the same pod, from worker records, with a log read around the first | Did a worker crash or restart mid-run? |
+| `relaunches` | Workers that stopped reporting and restarted in the same pod UID during the run, from worker records, with a log read around the first. A clean exit, or a pod deleted and created again under its name, is not one | Did a worker crash or restart mid-run? |
 | `saves` | `save_state` calls: count, failures, the last success, steps since, the slowest | How much would a crash lose? |
 | `optimizer` | Ops that returned non-finite metrics (count and the first), the last 5 grad norms | Are gradients finite? |
 | `samplers` | Sends, failures, sends a shutdown cut short (`cancelled`), median latency; the slowest and fastest replica with 20 or more answered sends | Is a sampler replica slow or failing? |
@@ -166,7 +166,7 @@ The Svelte dashboard is a client of 4.4. It shows no verdicts and no facts block
 
 ### 4.7 GKE and local
 
-Facts and endpoints are written against four source functions: metrics (PromQL), logs, placements and commands. GKE provides Managed Prometheus, Cloud Logging and Workload status. A local stack provides a plain Prometheus if present, JSON log files, and placement records written by the local launcher. A missing input leaves its block out of a run's facts.
+Facts and endpoints are written against four source functions: metrics (PromQL), logs, placements and commands. GKE provides Managed Prometheus, Cloud Logging and Workload status. A local stack provides a plain Prometheus if present. Local JSON log files and placement records from the local launcher are follow-ups, so a local run has no logs or placement blocks yet. A missing input leaves its block out of a run's facts.
 
 In the cluster, credentials come from the metadata server and the mounted service account, so no credential code is needed beyond library defaults. Laptop access to the cluster is a small adapter.
 

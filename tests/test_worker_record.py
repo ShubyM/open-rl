@@ -74,11 +74,11 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_each_process_records_its_settings_without_secrets(self) -> None:
     env = {"OPEN_RL_FINE_TUNING_TYPE": "lora", "VLLM_MAX_LORAS": "8", "OPEN_RL_API_KEY": "sk-private", "HOME": "/root"}
-    with mock.patch.dict("os.environ", env), mock.patch("builtins.print") as printed:
+    with mock.patch.dict("os.environ", env):
       async with telemetry.serving("trainer", "run-a") as worker:
         record = await self.saved(worker.record["id"])
     self.assertEqual(record["config"]["env"], {"OPEN_RL_FINE_TUNING_TYPE": "lora", "VLLM_MAX_LORAS": "8"})
-    self.assertNotIn("sk-private", repr(printed.call_args_list))
+    self.assertNotIn("sk-private", await self.store.get_value(telemetry.key("worker", worker.record["id"])))
 
   async def test_popped_requests_stay_outstanding_until_their_answer_is_written(self) -> None:
     async with telemetry.serving("trainer", "base") as worker:
