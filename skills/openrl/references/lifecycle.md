@@ -9,7 +9,7 @@ an image pull (the worker image is several GiB) and a model download.
 | Your call | What starts | Shared with |
 |---|---|---|
 | `create_lora_training_client` (LoRA, default) | one trainer for the base model, Workload `lora-<base>-0-trainer` | every other LoRA job on the same base model; each job is one adapter in it |
-| first `sample` or `save_weights_and_get_sampling_client` | one sampler, `lora-<base>-0-sampler` (plus `-1`, `-2`... with `openrl.sampler_replicas`) | same |
+| first `sample` or `save_weights_and_get_sampling_client`, or already at `create_lora_training_client` with `openrl.recipe=rl` | one sampler, `lora-<base>-0-sampler` (plus `-1`, `-2`... with `openrl.sampler_replicas`) | same |
 | `create_lora_training_client` with `openrl.fine_tuning_type=full`, or `openrl.exclusive=true`, or `openrl.trainer_gpus>1` | a trainer of its own, `fft-<model_id>-trainer`, and later `fft-<model_id>-sampler` | nothing; full fine-tuning workers take turns on a GPU with other jobs' workers unless exclusive |
 
 The workers that serve one job appear together in the job's model view,

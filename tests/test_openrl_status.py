@@ -104,6 +104,7 @@ class StatusViewsTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual((body["base_model"], body["fine_tuning_type"], body["status"]), ("test-base", "full", "active"))
     self.assertEqual(body["settings"]["openrl.fine_tuning_type"], "full")
     self.assertEqual(body["settings"]["openrl.weight_sync"], "delta")
+    self.assertIsNone(body["settings"]["openrl.recipe"])
     self.assertFalse(body["shares_workers"])
     self.assertTrue(body["session_live"])
     (worker,) = body["workers"]
