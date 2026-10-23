@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from collections import OrderedDict
 
 from server import openrl_status
 from server.dashboard import sources
@@ -11,20 +12,31 @@ from server.store import get_state_store
 from server.telemetry import key
 from server.worker_manager import STOPPED, WAITING_FOR_PLACEMENT, owner_id
 
-CACHE_SECONDS, OPS_SECONDS = 5, 10
-cache: dict[str, dict] = {}
+CACHE_SECONDS, OPS_SECONDS, CACHE_ENTRIES = 5, 10, 32
+cache: OrderedDict[str, dict] = OrderedDict()  # least recently used first
+
+
+def succeeded(task: asyncio.Future | None) -> bool:
+  return task is not None and task.done() and not task.cancelled() and task.exception() is None
 
 
 async def cached(name: str, seconds: float, read) -> object:
-  """One read serves every caller. Once it is older than `seconds` a fresh read starts, and callers keep getting the last
-  good result until it lands, so only the very first read waits. A client timeout cannot cancel a read for the others."""
+  """One read serves every caller. Once it is older than `seconds`, or failed, a fresh read starts, and callers keep getting
+  the last good result until it lands, so only the very first read waits. A client timeout cannot cancel a read for the
+  others. Only the CACHE_ENTRIES most recently used names are kept."""
   entry = cache.setdefault(name, {"at": 0.0, "task": None, "good": None})
+  cache.move_to_end(name)
+  while len(cache) > CACHE_ENTRIES:
+    cache.popitem(last=False)
   task = entry["task"]
-  if task is not None and task.done() and not task.cancelled() and task.exception() is None:
+  if succeeded(task):
     entry["good"] = task
-  if task is None or (task.done() and time.monotonic() - entry["at"] > seconds):
+  if task is None or (task.done() and (not succeeded(task) or time.monotonic() - entry["at"] > seconds)):
     entry["at"], entry["task"] = time.monotonic(), asyncio.ensure_future(read())
-  if not entry["task"].done() and entry["good"] is not None:
+    entry["task"].add_done_callback(lambda t: t.cancelled() or t.exception())  # retrieved, so asyncio does not log it
+  if succeeded(entry["task"]):
+    return entry["task"].result()
+  if entry["good"] is not None:
     return entry["good"].result()
   return await asyncio.shield(entry["task"])
 

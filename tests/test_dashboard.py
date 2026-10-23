@@ -168,6 +168,54 @@ class CachedTest(unittest.TestCase):
 
     self.assertEqual(asyncio.run(scenario()), ("first", "first", "second"))
 
+  def test_a_failed_refresh_serves_the_last_good_result_and_the_next_call_retries(self):
+    reads = iter(["first", ConnectionError("store offline"), "third"])
+
+    async def read():
+      if isinstance(value := next(reads), Exception):
+        raise value
+      return value
+
+    async def scenario():
+      fleet.cache.clear()
+      first = await fleet.cached("k", 0, read)
+      await asyncio.sleep(0.01)
+      during = await fleet.cached("k", 0, read)  # starts the refresh that fails
+      await asyncio.sleep(0.01)
+      after = await fleet.cached("k", 60, read)  # inside the window, after the failure
+      await asyncio.sleep(0.01)
+      return first, during, after, await fleet.cached("k", 60, read)
+
+    self.assertEqual(asyncio.run(scenario()), ("first", "first", "first", "third"))
+
+  def test_a_failed_first_read_is_not_kept_for_the_window(self):
+    reads = iter([ConnectionError("store offline"), "second"])
+
+    async def read():
+      if isinstance(value := next(reads), Exception):
+        raise value
+      return value
+
+    async def scenario():
+      fleet.cache.clear()
+      with self.assertRaises(ConnectionError):
+        await fleet.cached("k", 60, read)
+      return await fleet.cached("k", 60, read)
+
+    self.assertEqual(asyncio.run(scenario()), "second")
+
+  def test_the_cache_keeps_only_the_most_recently_used_entries(self):
+    async def scenario():
+      fleet.cache.clear()
+      for n in range(fleet.CACHE_ENTRIES + 8):
+        await fleet.cached(f"run-{n}", 60, mock.AsyncMock(return_value=n))
+        await fleet.cached("run-0", 60, mock.AsyncMock(return_value="never read"))  # used all along
+
+    asyncio.run(scenario())
+    self.assertEqual(len(fleet.cache), fleet.CACHE_ENTRIES)
+    self.assertIn("run-0", fleet.cache)
+    self.assertNotIn("run-1", fleet.cache)
+
 
 class RunJoinTest(unittest.TestCase):
   CLUSTER = {
