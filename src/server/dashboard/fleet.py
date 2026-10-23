@@ -14,6 +14,7 @@ from server.worker_manager import STOPPED, WAITING_FOR_PLACEMENT, owner_id
 
 CACHE_SECONDS, OPS_SECONDS, CACHE_ENTRIES = 5, 10, 32
 cache: OrderedDict[str, dict] = OrderedDict()  # least recently used first
+STALE_SECONDS = 60
 
 
 def succeeded(task: asyncio.Future | None) -> bool:
@@ -22,21 +23,22 @@ def succeeded(task: asyncio.Future | None) -> bool:
 
 async def cached(name: str, seconds: float, read) -> object:
   """One read serves every caller. Once it is older than `seconds`, or failed, a fresh read starts, and callers keep getting
-  the last good result until it lands, so only the very first read waits. A client timeout cannot cancel a read for the
+  the last good result until it lands, unless that result is far older than the window. A client timeout cannot cancel a read for the
   others. Only the CACHE_ENTRIES most recently used names are kept."""
-  entry = cache.setdefault(name, {"at": 0.0, "task": None, "good": None})
+  entry = cache.setdefault(name, {"at": 0.0, "task": None, "good": None, "good_at": 0.0})
   cache.move_to_end(name)
   while len(cache) > CACHE_ENTRIES:
     cache.popitem(last=False)
   task = entry["task"]
   if succeeded(task):
-    entry["good"] = task
+    entry["good"], entry["good_at"] = task, entry["at"]
   if task is None or (task.done() and (not succeeded(task) or time.monotonic() - entry["at"] > seconds)):
     entry["at"], entry["task"] = time.monotonic(), asyncio.ensure_future(read())
     entry["task"].add_done_callback(lambda t: t.cancelled() or t.exception())  # retrieved, so asyncio does not log it
   if succeeded(entry["task"]):
     return entry["task"].result()
-  if entry["good"] is not None:
+  # A result much older than its window is no answer: after an idle spell the caller waits for the fresh read.
+  if entry["good"] is not None and time.monotonic() - entry["good_at"] <= max(STALE_SECONDS, 6 * seconds):
     return entry["good"].result()
   return await asyncio.shield(entry["task"])
 

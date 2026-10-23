@@ -240,6 +240,21 @@ class CachedTest(unittest.TestCase):
 
     self.assertEqual(asyncio.run(scenario()), ("first", "first", "second"))
 
+  def test_a_result_far_older_than_its_window_is_not_served_after_an_idle_spell(self):
+    reads = iter(["first", "second"])
+
+    async def read():
+      return next(reads)
+
+    async def scenario():
+      fleet.cache.clear()
+      first = await fleet.cached("k", 0, read)
+      with mock.patch.object(fleet, "STALE_SECONDS", 0.005, create=True):
+        await asyncio.sleep(0.02)  # idle far past the stale bound
+        return first, await fleet.cached("k", 0, read)
+
+    self.assertEqual(asyncio.run(scenario()), ("first", "second"))
+
   def test_a_failed_refresh_serves_the_last_good_result_and_the_next_call_retries(self):
     reads = iter(["first", ConnectionError("store offline"), "third"])
 
