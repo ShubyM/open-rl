@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
 import json
+import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -51,6 +53,23 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
       async with telemetry.serving("trainer", "run-a") as worker:
         record = await self.saved(worker.record["id"])
     self.assertIsNone(record["gpus"])
+
+  async def test_the_record_stays_fresh_while_model_loading_blocks_the_event_loop(self) -> None:
+    seen, done = [], threading.Event()
+
+    def reader(record_key):  # a dashboard reading the record while the worker's loop is busy
+      while not done.wait(0.02):
+        seen.append(json.loads(self.store.get_value_sync(record_key) or "{}").get("heartbeat_at", 0))
+
+    with mock.patch.object(telemetry, "HEARTBEAT_SECONDS", 0.02):
+      async with telemetry.serving("trainer", "run-a") as worker:
+        watcher = threading.Thread(target=reader, args=(telemetry.key("worker", worker.record["id"]),))
+        blocked_at = time.time()
+        watcher.start()
+        time.sleep(0.3)  # loading weights holds the loop, and the heartbeat must not need it
+        done.set()
+        watcher.join()
+    self.assertGreater(max(seen) - blocked_at, 0.2)
 
   async def test_each_process_records_its_settings_without_secrets(self) -> None:
     env = {"OPEN_RL_FINE_TUNING_TYPE": "lora", "VLLM_MAX_LORAS": "8", "OPEN_RL_API_KEY": "sk-private", "HOME": "/root"}

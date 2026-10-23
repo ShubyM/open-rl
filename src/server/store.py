@@ -314,6 +314,11 @@ class StateStore(ABC):
     pass
 
   @abstractmethod
+  def set_value_sync(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
+    """set_value without the event loop, for a thread."""
+    pass
+
+  @abstractmethod
   async def delete_values(self, *keys: str) -> None:
     """Delete one or more keys."""
     pass
@@ -369,6 +374,9 @@ class InMemoryStateStore(StateStore):
     self.samples: dict[str, list[str]] = {}
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
+    self.set_value_sync(key, value, ttl_seconds)
+
+  def set_value_sync(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
     self.expiries.pop(key, None)
     if ttl_seconds is not None:
@@ -435,6 +443,9 @@ class RedisStateStore(StateStore):
 
   def get_value_sync(self, key: str) -> str | None:
     return self.sync_redis.get(key)
+
+  def set_value_sync(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
+    self.sync_redis.set(key, value, px=None if ttl_seconds is None else int(ttl_seconds * 1000))
 
   async def delete_values(self, *keys: str) -> None:
     if keys:

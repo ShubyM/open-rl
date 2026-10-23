@@ -7,6 +7,7 @@ import math
 import os
 import re
 import socket
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -85,14 +86,35 @@ class Worker:
     self.record["config"] = {"env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(CONFIG_ENV) and not SECRET.search(k)}}
     self.outstanding: dict[str, dict] = {}  # request_id -> op, run_id and when it was popped
     self.observed: set[str] = set()  # outstanding requests whose op ran under observe_operation, which records it
+    # A thread, so loading a model on the event loop does not make this worker look dead.
+    self.stopped = threading.Event()
+    self.heartbeat = threading.Thread(target=self.beat, name="worker-heartbeat", daemon=True)
+
+  def snapshot(self) -> str:
+    """The record as JSON. Copies first, because the heartbeat thread reads while the event loop writes."""
+    groups: dict[tuple, dict] = {}  # outstanding requests by op and run, the oldest of each first
+    for entry in list(self.outstanding.values()):
+      groups.setdefault((entry["op"], entry["run_id"]), {**entry, "count": 0})["count"] += 1
+    return json.dumps({**self.record, "heartbeat_at": time.time(), "outstanding": list(groups.values())})
 
   async def save(self) -> None:
-    groups: dict[tuple, dict] = {}  # outstanding requests by op and run, the oldest of each first
-    for entry in self.outstanding.values():
-      groups.setdefault((entry["op"], entry["run_id"]), {**entry, "count": 0})["count"] += 1
     with suppress(Exception):
-      value = json.dumps({**self.record, "heartbeat_at": time.time(), "outstanding": list(groups.values())})
-      await asyncio.wait_for(get_state_store().set_value(key("worker", self.record["id"]), value, ttl_seconds=TTL_SECONDS), timeout=5)
+      await asyncio.wait_for(get_state_store().set_value(key("worker", self.record["id"]), self.snapshot(), ttl_seconds=TTL_SECONDS), timeout=5)
+
+  def beat(self) -> None:
+    store = get_state_store()
+    while not self.stopped.wait(HEARTBEAT_SECONDS):
+      with suppress(Exception):
+        store.set_value_sync(key("worker", self.record["id"]), self.snapshot(), ttl_seconds=TTL_SECONDS)
+
+  async def close(self) -> None:
+    """Stop the heartbeat, then write the exited record, so no late beat overwrites it."""
+    self.stopped.set()
+    if self.heartbeat.is_alive():
+      await asyncio.to_thread(self.heartbeat.join, 5)
+    if self.record["phase"] != "exited":
+      self.record.update(phase="exited", phase_since=time.time())
+    await self.save()
 
 
 @asynccontextmanager
@@ -100,27 +122,19 @@ async def serving(role: str, runtime_id: str | None, **fields):
   """Keep this process's record fresh while the body runs; a clean exit says so."""
   global current
   current = worker = Worker(role, runtime_id, fields)
-
-  async def heartbeat():
-    while True:
-      await worker.save()
-      await asyncio.sleep(HEARTBEAT_SECONDS)
-
-  task = asyncio.create_task(heartbeat())
+  await worker.save()
+  worker.heartbeat.start()
   try:
     yield worker
   finally:
-    task.cancel()
-    set_phase("exited")
-    await worker.save()
+    await worker.close()
     current = None
 
 
 async def finish() -> None:
   """Before os._exit, which skips serving's cleanup: say this process exited and land the writes still in flight."""
-  set_phase("exited")
   if current is not None:
-    await current.save()
+    await current.close()
   await asyncio.gather(*list(writes), return_exceptions=True)
 
 
