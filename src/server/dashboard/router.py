@@ -151,8 +151,9 @@ async def query(
 
 @router.get("/api/v1/inspect/accelerators", response_model=Doc)
 async def accelerators(run_id: str | None = None, node_id: str | None = None, since: Bound = None, until: Bound = None):
-  """Every GPU in the fleet, a node's, or a run's in the window (default the last hour): node, slot, model, holder (the last
-  placement on it), util (mean of the last two minutes), busy (mean over the window), memory used and total in MiB."""
+  """Every GPU in the fleet, a node's, or a run's in the window (default the last hour): node, slot, model, holders (the
+  newest placement on it and any time-sliced with it), util (mean of the last two minutes), busy (mean over the window), memory
+  used and total in MiB."""
   since, until, low, high = span(since or ("1h" if until is None else None), until)
   names = {"util": "gpu_util_now", "busy": "gpu_busy", "memory_used_mib": "gpu_memory_mib", "memory_total_mib": "gpu_memory_total_mib"}
   found = dict(zip(names, await asyncio.gather(*(query(name, run_id, node_id, since, until, 1) for name in names.values()))))
@@ -161,12 +162,17 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
     return {**result, "error": error}
   value = {k: {s["labels"]["UUID"]: round(s["points"][-1][1], 1) for s in r["series"] if s["points"]} for k, r in found.items()}
   held = sorted((p for p in fleet.lanes(await fleet.snapshot(), run_id) if p["start"] <= high and p["end"] >= low), key=lambda p: p["start"])
-  holders = {uuid: lane for lane in held for uuid in lane["devices"]}  # the latest placement in the window wins
+  placed: dict[str, list[dict]] = {}
+  for lane in held:
+    for uuid in lane["devices"]:
+      placed.setdefault(uuid, []).append(lane)
+  # A time-sliced GPU has several holders at once: every placement overlapping the newest one holds it.
+  holders = {uuid: [p for p in lanes if p["end"] >= lanes[-1]["start"]] for uuid, lanes in placed.items()}
   for labels in (series["labels"] for series in found["util"]["series"]):
     gpu = {"uuid": (uuid := labels["UUID"]), "node": labels.get("Hostname"), "slot": labels.get("gpu"), "model": labels.get("modelName")}
     gpu |= {name: value[name][uuid] for name in names if uuid in value[name]}
-    if lane := holders.get(uuid):
-      gpu["holder"] = {k: lane[k] for k in ("run_ids", "role", "pod", "start", "end", "ended")}
+    if uuid in holders:
+      gpu["holders"] = [{k: lane[k] for k in ("run_ids", "role", "pod", "start", "end", "ended")} for lane in holders[uuid]]
     result["gpus"].append(gpu)
   result["gpus"].sort(key=lambda g: (g["node"] or "", int(g["slot"] or 0)))
   return result
@@ -253,9 +259,14 @@ async def summary(run_id: str):
     # Duty over the run's own span: averaging in the idle days after it ended would understate it.
     end = min(state["observed_at"], ops[-1]["at"] + 60)
     duty = await query("gpu_busy", run_id, None, facts.iso(max(ops[0]["at"] - 60, end - 7 * 86400)), facts.iso(end), 1)
-    roles, busy = {uuid: lane["role"] for lane in ctx["lanes"] for uuid in lane["devices"]}, {}
+    roles: dict[str, set[str]] = {}
+    for lane in ctx["lanes"]:
+      for uuid in lane["devices"]:
+        roles.setdefault(uuid, set()).add(lane["role"])
+    busy: dict[str, list[float]] = {}
     for series in (s for s in duty["series"] if s["points"]):
-      busy.setdefault(roles.get(series["labels"].get("UUID"), "other"), []).append(series["points"][-1][1])
+      # A GPU that time-sliced roles shared counts under the roles together, e.g. sampler+trainer.
+      busy.setdefault("+".join(sorted(roles.get(series["labels"].get("UUID")) or {"other"})), []).append(series["points"][-1][1])
     if busy:
       found["gpu_busy"] = {role: round(sum(v) / len(v), 1) for role, v in busy.items()}
       found["gpu_busy_window"] = {k: duty[k] for k in ("since", "until")}

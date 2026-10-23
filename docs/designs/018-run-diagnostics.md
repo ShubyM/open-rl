@@ -86,13 +86,13 @@ With those known, Prometheus is queried by GPU UUID or pod, Cloud Logging by pod
 
 NaN and infinity are written as `null` and named in `nonfinite`.
 
-The placement info metric does the correlation in PromQL. For example, a run's GPU utilization by role is
+The placement info metric does the correlation in PromQL. For example, the utilization of the GPUs a run's trainer holds is
 
 ```promql
-DCGM_FI_DEV_GPU_UTIL * on(UUID) group_left(run_id, role) openrl_gpu_held{run_id="$run"}
+DCGM_FI_DEV_GPU_UTIL * on(UUID) group_left() max by (UUID) (openrl_gpu_held{run_id="$run", role="trainer"})
 ```
 
-and the presence of `openrl_gpu_held` over time is the hold interval, which draws the Nodes timeline.
+A time-sliced GPU has one `openrl_gpu_held` series per holder, such as a trainer and a sampler, so the right side is reduced to one series per UUID before the join. Without the `max by (UUID)`, Prometheus rejects the join with a many-to-many matching error. The presence of `openrl_gpu_held` over time is the hold interval, which draws the Nodes timeline.
 
 ### 4.4 Read API
 
@@ -108,7 +108,7 @@ Generic endpoints under `/api/v1/inspect`, shared by the UI and agents:
 | `GET /runs/{id}/summary` | The run's facts (section 4.5) and GPU duty by role over its span | 0.6 to 1.5 KB on the 8 recorded runs |
 | `GET /runs?ended=` | Every live run in one line (lifecycle, steps, seconds since the last op and step, unanswered requests, how many a dead worker holds, failed ops, relaunches), longest since its last op first | About 240 B per run |
 | `GET /sessions/{id}/summary` | The session record, whether its registry key is live, its SDK errors, and each model in the one-line form of `/runs` | About 400 B for one model |
-| `GET /accelerators?run_id=&node_id=&since=&until=` | One row per GPU: node, model, holder, utilization now and over the window (last hour by default), memory used of total | About 9 KB for 30 GPUs |
+| `GET /accelerators?run_id=&node_id=&since=&until=` | One row per GPU: node, model, holders (every placement holding it at once with the newest), utilization now and over the window (last hour by default), memory used of total | About 9 KB for 30 GPUs |
 | `GET /inventory` | What the pages list: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, and pods with problems. No health judgment | About 17 KB on the demo store, against 112 KB |
 
 Named queries keep one copy of each PromQL expression for the UI and agents, and keep agent calls bounded.
@@ -146,7 +146,7 @@ A log pointer is a read under 4.4 with its arguments, so an agent follows a fail
 | `config` | Workers whose echoed settings differ from the run's, or `no echo` | Does each worker run what the run asked for? |
 | `placement` | Placements recorded, and workloads with no node yet | Does every worker exist and have a GPU? |
 | `incidents` | Kubernetes incidents on the run's pods (OOMKilled, CrashLoopBackOff, restarts, scheduling failures), newest 5 | Did Kubernetes kill or fail to place a pod? |
-| `gpu_busy` | Mean GPU duty by role over the run's span of recorded ops | Are the GPUs working? |
+| `gpu_busy` | Mean GPU duty by role over the run's span of recorded ops. A GPU that time-sliced roles shared counts under the roles joined, such as `sampler+trainer` | Are the GPUs working? |
 
 These cover the incident classes the checks covered: progress (23 incidents), worker health (12), sampler flow (11), effective config (10), the request ledger (9), placement (8), optimizer health (5) and storage (4). Questions that need client signals, such as reward validity, episode endings, policy movement and dependency health, wait for the client step row (rollout step 8) and become facts the same way.
 

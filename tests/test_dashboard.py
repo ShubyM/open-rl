@@ -277,5 +277,41 @@ class ApiTest(unittest.TestCase):
     self.assertTrue(all(set(methods) == {"get"} for methods in client.get("/openapi.json").json()["paths"].values()))
 
 
+class TimeSlicedGpuTest(unittest.TestCase):
+  """A time-sliced trainer and sampler hold the same GPU at once."""
+
+  def setUp(self):
+    from server.dashboard import router
+
+    self.store = InMemoryStateStore()
+    asyncio.run(self.store.append_sample(key("operations", "r1"), {**op(100, 150), "operation": "optim_step", "status": "succeeded"}, 10, None))
+    sampler = {**RECORD, "workload": "sampler", "role": "sampler", "pod": "sampler-0"}
+    records = [RECORD, sampler, {**sampler, "workload": "sampler-1", "pod": "sampler-1", "gpu_uuids": ["GPU-2"]}]
+    run = {**RUN, "lifecycle": "placed", "status": "active", "workloads": [], "pods": [], "settings": {}, "session_ids": []}
+    snapshot = {**state(records=records, workers=[], runs=[run]), "nodes": [], "pods": [], "errors": []}
+    busy = {"GPU-1": 40.0, "GPU-2": 80.0}
+
+    async def query(name, *args):
+      series = [{"labels": {"UUID": uuid, "Hostname": "n1", "gpu": uuid[-1]}, "points": [[200, value]]} for uuid, value in busy.items()]
+      return {"name": name, "since": "a", "until": "b", "source": "prom", "series": series}
+
+    fleet.cache.clear()
+    self.enterContext(mock.patch.object(fleet, "snapshot", mock.AsyncMock(return_value=snapshot)))
+    self.enterContext(mock.patch("server.dashboard.facts.get_state_store", return_value=self.store))
+    self.enterContext(mock.patch.object(fleet, "get_state_store", return_value=self.store))
+    self.enterContext(mock.patch.object(router, "query", query))
+    self.client = TestClient(app)
+
+  def test_duty_of_a_gpu_shared_by_two_roles_is_reported_under_both_together(self):
+    summary = self.client.get("/api/v1/inspect/runs/r1/summary").json()
+    self.assertEqual(summary["gpu_busy"], {"sampler+trainer": 40.0, "sampler": 80.0})
+
+  def test_a_gpu_lists_every_placement_holding_it_at_once(self):
+    window = {"since": "1970-01-01T00:00:00Z", "until": "1970-01-01T00:05:00Z"}
+    gpus = {g["uuid"]: g for g in self.client.get("/api/v1/inspect/accelerators", params=window).json()["gpus"]}
+    self.assertEqual(sorted(h["role"] for h in gpus["GPU-1"]["holders"]), ["sampler", "trainer"])
+    self.assertEqual([h["pod"] for h in gpus["GPU-2"]["holders"]], ["sampler-1"])
+
+
 if __name__ == "__main__":
   unittest.main()

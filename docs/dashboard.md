@@ -33,7 +33,7 @@ Pages show their last response while they refresh.
 | `GET /inventory` | What the pages list: runs with their lifecycle, nodes with their GPUs, the GPUs held now, pods with problems, and an error per unavailable source |
 | `GET /activity` | One lane per placement, fleet-wide, a node's or a run's, with its worker's GPU turns and completed ops in the window |
 | `GET /query` | A named PromQL query (`gpu_busy`, `gpu_util`, `gpu_memory_mib`, `vllm_*`, ...) over a run's or node's GPUs and pods, or the fleet's GPUs, at `points` resolution |
-| `GET /accelerators` | One row per GPU: node, slot, model, holder, utilization now and over the window, memory used of total |
+| `GET /accelerators` | One row per GPU: node, slot, model, holders (more than one on a time-sliced GPU), utilization now and over the window, memory used of total |
 | `GET /runs` | Every live run in one line, longest since its last op first; `ended=true` adds ended runs |
 | `GET /runs/{id}/summary` | The run's facts: pace, goodput, unanswered requests and their holders, the request ledger, failures and relaunches with log reads, saves, optimizer, samplers, config, placement, incidents and GPU duty by role |
 | `GET /runs/{id}/commands` | The run's raw command records, trainer ops and samples, newest first; `role` and the bounds filter them |
