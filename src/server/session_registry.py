@@ -1,4 +1,4 @@
-"""Which client sessions are using which owners.
+"""Which client sessions are using which owners, and each session's durable record.
 
 An owner is the scheduler's ownerID, the trainer and sampler pair that
 serves one FFT job or one LoRA base model. The tinker client heartbeats its
@@ -8,36 +8,67 @@ exits without calling delete_model still gives its GPUs back.
 
 Everything lives in the store, so an API server restart keeps it:
 
-  open_rl:session:<id>    present while the session is live. Each heartbeat
-                          resets its expiry, so a silent session vanishes
-                          on its own. Its value is the user_metadata the
-                          client opened the session with, plus its openrl.
-                          tags, the defaults for every model it creates.
-  open_rl:owner:<owner>   the sessions using this owner's workers.
-  open_rl:owners          every owner that has workers.
+  open_rl:session:<id>         present while the session is live. Each heartbeat
+                               resets its expiry, so a silent session vanishes
+                               on its own. Its value is the user_metadata the
+                               client opened the session with, plus its openrl.
+                               tags, the defaults for every model it creates.
+  open_rl:session_record:<id>  created and last-seen times, the models the
+                               session attached, and its redacted metadata,
+                               kept after the live key expires.
+  open_rl:owner:<owner>        the sessions using this owner's workers.
+  open_rl:owners               every owner that has workers.
 
 Nothing here is atomic. The API server holds a lock per owner around attach and
 around the in_use check and the teardown that follows it, so a session cannot
 attach to an owner between the check and the delete.
 """
 
+import asyncio
 import json
+import time
+from collections import defaultdict
 from typing import Any
 
 from server.store import StateStore
+from server.telemetry import TTL_SECONDS, best_effort, key, redact, write
 
 
 class SessionRegistry:
   def __init__(self, state: StateStore, ttl_seconds: float = 120.0):
     self.state = state
     self.ttl_seconds = ttl_seconds
+    self.locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # the API server runs as one replica
+
+  async def update_record(self, session_id: str, model_id: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+    record_key, now = key("session_record", session_id), time.time()
+    # Heartbeats and attaches rewrite the same record. One at a time, or a heartbeat drops a model attached meanwhile.
+    async with self.locks[session_id]:
+      saved = await self.state.get_value(record_key)
+      record = json.loads(saved) if saved else {"session_id": session_id, "created_at": now, "model_ids": []}
+      record["last_seen_at"] = now
+      if metadata is not None:
+        record["metadata"] = redact(metadata)
+      if model_id and model_id not in record["model_ids"]:
+        record["model_ids"].append(model_id)
+      await self.state.set_value(record_key, json.dumps(record), ttl_seconds=TTL_SECONDS)
+
+  @best_effort
+  def note(self, session_id: str, *, model_id: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+    """A session's creation, heartbeat or model attach. Its record outlives the session's two-minute live key."""
+    write(self.update_record(session_id, model_id, metadata))
+
+  async def refresh(self, session_id: str) -> None:
+    live_key = f"open_rl:session:{session_id}"
+    await self.state.set_value(live_key, await self.state.get_value(live_key) or "{}", ttl_seconds=self.ttl_seconds)
 
   async def heartbeat(self, session_id: str) -> None:
-    key = f"open_rl:session:{session_id}"
-    await self.state.set_value(key, await self.state.get_value(key) or "{}", ttl_seconds=self.ttl_seconds)
+    await self.refresh(session_id)
+    self.note(session_id)
 
   async def update_metadata(self, session_id: str, user_metadata: dict[str, Any]) -> None:
     await self.state.set_value(f"open_rl:session:{session_id}", json.dumps(user_metadata), ttl_seconds=self.ttl_seconds)
+    self.note(session_id, metadata=user_metadata)
 
   async def user_metadata(self, session_id: str | None) -> dict[str, Any]:
     raw = await self.state.get_value(f"open_rl:session:{session_id}") if session_id else None
@@ -48,11 +79,14 @@ class SessionRegistry:
   async def live(self, session_id: str) -> bool:
     return await self.state.get_value(f"open_rl:session:{session_id}") is not None
 
-  async def attach(self, session_id: str, owner: str) -> None:
-    """The session is using this owner's workers from now on."""
-    await self.heartbeat(session_id)
-    await self.state.add_to_set("open_rl:owners", owner)
-    await self.state.add_to_set(f"open_rl:owner:{owner}", session_id)
+  async def attach(self, session_id: str, owner: str | None = None, *, model_id: str | None = None) -> None:
+    """The session is using this owner's workers from now on, and records any model it attached."""
+    if owner is not None:
+      await self.refresh(session_id)
+      await self.state.add_to_set("open_rl:owners", owner)
+      await self.state.add_to_set(f"open_rl:owner:{owner}", session_id)
+    if owner is not None or model_id is not None:
+      self.note(session_id, model_id=model_id)
 
   async def owners(self) -> list[str]:
     return sorted(await self.state.set_members("open_rl:owners"))

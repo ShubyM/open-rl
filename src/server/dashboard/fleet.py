@@ -107,7 +107,7 @@ async def read() -> dict:
   placements = await asyncio.gather(*(store.read_samples(key("placements", runtime)) for runtime in {r["runtime_id"] for r in runs}))
 
   async def last_op(run):  # when a run that never said it finished last did anything
-    run["last_completed_at"] = max((s["at"] for s in await store.read_samples(key("operations", run["run_id"]), last=50)), default=None)
+    run["last_completed_at"] = max((s["at"] for s in await store.read_samples(key("operations", run["run_id"]), last=1)), default=None)
 
   await asyncio.gather(*(last_op(run) for run in runs if run["status"] == "active"))
   nodes = [{**n, "devices": gpus.get(n["name"], []), "gpu_capacity": max(n["gpu_capacity"], len(gpus.get(n["name"], [])))} for n in cluster["nodes"]]

@@ -38,7 +38,7 @@ from server.model_metadata import (
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import RedisStateStore, get_state_store, get_store
-from server.telemetry import count_request, ingest_client_steps, ingest_sdk_events, note_session, record_placements, write
+from server.telemetry import count_request, ingest_client_steps, ingest_sdk_events, record_placements, write
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
 from training import commands
@@ -67,12 +67,13 @@ async def bind_session(session_id: str | None, model_id: str) -> None:
     if meta is not None and session_id not in meta.session_ids:
       meta.session_ids.append(session_id)
       await persist_model_metadata(state, model_id, meta)
-    # A sampling session on a bare base model names no run.
-    if meta is not None:
-      note_session(state, session_id, model_id=model_id)
     # On the owner, for the reaper: workers stay while any attached session lives.
-    if worker_manager is not None:
-      await session_registry.attach(session_id, owner)
+    # A sampling session on a bare base model names no run.
+    await session_registry.attach(
+      session_id,
+      owner if worker_manager is not None else None,
+      model_id=model_id if meta is not None else None,
+    )
 
 
 async def sweep_placements() -> None:
@@ -888,7 +889,6 @@ async def create_session(req: CreateSessionRequest):
     raise HTTPException(status_code=400, detail=str(exc)) from exc
   session_id = f"sess-{uuid.uuid4().hex[:12]}"
   await session_registry.update_metadata(session_id, user_metadata)
-  note_session(state, session_id, metadata=user_metadata)
   return {"session_id": session_id, "type": "create_session"}
 
 
@@ -896,7 +896,6 @@ async def create_session(req: CreateSessionRequest):
 async def session_heartbeat(req: SessionHeartbeatRequest):
   if req.session_id:
     await session_registry.heartbeat(req.session_id)
-    note_session(state, req.session_id)
   return {"type": "session_heartbeat"}
 
 
@@ -1390,7 +1389,7 @@ async def otlp_logs(request: Request):
     body = json.loads(raw)
   except (zlib.error, ValueError) as exc:
     raise HTTPException(400, "Send OTLP logs as JSON (encoding: json), gzipped or not") from exc
-  await ingest_client_steps(state, body if isinstance(body, dict) else {})
+  ingest_client_steps(state, body if isinstance(body, dict) else {})
   return {}
 
 
