@@ -5,11 +5,18 @@
   import Views from "./Views.svelte";
 
   const inventory = createQuery(() => inspectUrl("inventory"), { poll: 10000 });
+  function withoutSelection(hash) {
+    const [path, query = ""] = hash.split("?");
+    const params = new URLSearchParams(query);
+    for (const name of ["node", "placement", "gpu"]) params.delete(name);
+    return params.size ? `${path}?${params}` : path;
+  }
   $effect(() => {
     const hash = currentView();
     if (location.hash !== hash) history.replaceState(history.state, "", hash);
-    if (view.page === "overview" || view.page === "nodes") saved[view.page] = hash;
-    if (view.page === "run" && view.back) saved.nodes = view.back;
+    if (view.page === "overview") saved.overview = hash;
+    // The Nodes tab keeps its time window but never reopens a node: a selection comes only from a link that names one.
+    if (view.page === "nodes" || (view.page === "run" && view.back)) saved.nodes = withoutSelection(view.page === "nodes" ? hash : view.back);
   });
   const section = $derived(view.page === "run" ? view.back ? "nodes" : "overview" : view.page);
   const connection = $derived(inventory.error ? inventory.data ? "Stale snapshot" : "Unavailable" : inventory.stale ? "Reconnecting…" : !inventory.data ? "Connecting…" : inventory.data.cluster.available ? "Connected" : "Cluster unavailable");
