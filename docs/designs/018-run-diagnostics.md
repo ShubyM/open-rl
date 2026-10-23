@@ -2,7 +2,7 @@
 
 **Status**: Proposed
 **Date**: 2026-10-21
-**Target branch**: `main`. The backend lands first; the Svelte UI (PR #23) follows separately
+**Target branch**: `main`, with the Svelte UI (PR #23) in the same change
 **Instrumentation ledger**: [`docs/instrumentation-ledger.md`](../instrumentation-ledger.md)
 
 ---
@@ -158,10 +158,10 @@ The Svelte dashboard is a client of 4.4. It shows no verdicts and no facts block
 |---|---|
 | Overview | `/inventory` for runs. The label is the gateway's status once it is final, else the lifecycle (`ended`, `queued`, `running`, `active`) |
 | Run · header | The same label, and pod problems from `/inventory` |
-| Run · Activity | `/runs/{id}/commands` for lanes; `/query?name=run_gpu_busy&points=1` for Duty |
+| Run · Activity | `/activity?run_id=` for lanes; `/query?name=gpu_busy&points=1` for Duty |
 | Run · Metrics | `/runs/{id}/steps` charted by step; `/query` for vLLM and GPU charts at chart width |
-| Run · Logs | `/logs/search` |
-| Nodes | `/query?name=node_gpu_holders`, `/query` per GPU |
+| Run · Logs | `/logs` |
+| Nodes | `/activity` for who held each GPU; `/query` for duty, utilization and memory per GPU |
 | Health | Pod problems, nodes not ready and source errors from `/inventory` |
 
 ### 4.7 GKE and local
