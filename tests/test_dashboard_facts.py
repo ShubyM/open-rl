@@ -109,6 +109,15 @@ class RunFactsTest(unittest.TestCase):
     _, summary, line = self.facts_of(workers=[first, later], completed_at=NOW - 500)
     self.assertEqual((line["relaunches"], "relaunches" in summary), (0, False))
 
+  def test_a_pod_replaced_under_the_same_name_is_not_a_relaunch(self):
+    first = {"id": "a", "pod": "t-0", "pod_uid": "u1", "role": "trainer", "runtime_id": "r", "started_at": NOW - 1000, "heartbeat_at": NOW - 905}
+    restarted = {**first, "id": "b", "started_at": NOW - 880, "heartbeat_at": NOW}
+    _, _, line = self.facts_of(workers=[first, {**restarted, "pod_uid": "u2"}])  # deleted and created again, as a teardown does
+    self.assertEqual(line["relaunches"], 0)
+    self.setUp()
+    _, _, line = self.facts_of(workers=[first, restarted])  # the container restarted in place
+    self.assertEqual(line["relaunches"], 1)
+
   def test_a_slow_sampler_replica_is_named_beside_the_fastest(self):
     sends = [op(NOW - i, "sample", role="sampler", pod=pod, elapsed_seconds=s) for i in range(20) for pod, s in (("fast", 10.0), ("slow", 40.0))]
     _, summary, _ = self.facts_of(sends)
