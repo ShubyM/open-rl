@@ -284,9 +284,11 @@ async def record_placements(store, workloads: list[dict]) -> None:
         old = {**old, "released_at": now}
       updated.append(old)
     updated += fresh.values()
+    held = any(r["released_at"] is None for r in updated)
     if updated != records:
       await store.replace_samples(key("placements", model_id), updated, TTL_SECONDS)
-    held = any(r["released_at"] is None for r in updated)
+    elif held and TTL_SECONDS:  # a placement held longer than the TTL must outlive it
+      await store.expire(key("placements", model_id), TTL_SECONDS)
     if held and model_id not in opened:
       await store.add_to_set(OPEN_PLACEMENTS, model_id)
     elif not held and model_id in opened:

@@ -147,6 +147,14 @@ class RedisFutureTest(SampleStoreContract, unittest.IsolatedAsyncioTestCase):
       ctx = await facts.context({"observed_at": time.time(), "workers": [], "placements": [], "runs": [run]}, run)
     self.assertEqual(ctx["ledger"], {"enqueued": 1, "popped": 1})
 
+  async def test_a_placement_still_held_does_not_expire_between_sweeps_that_change_nothing(self) -> None:
+    with mock.patch.object(telemetry, "TTL_SECONDS", 1):
+      await telemetry.record_placements(self.state, [workload("a")])
+      await asyncio.sleep(0.6)
+      await telemetry.record_placements(self.state, [workload("a")])
+    await asyncio.sleep(0.6)
+    self.assertEqual([p["workload"] for p in await self.state.read_samples(telemetry.key("placements", "m1"))], ["a"])
+
   async def test_counters_recorded_before_the_hash_still_read(self) -> None:
     for event, value in (("enqueued", "3"), ("popped", "2")):
       await self.state.set_value(telemetry.key("ledger", "old", event), value)

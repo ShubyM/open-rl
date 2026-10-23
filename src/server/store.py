@@ -356,6 +356,11 @@ class StateStore(ABC):
     pass
 
   @abstractmethod
+  async def expire(self, key: str, ttl_seconds: float) -> None:
+    """Expire a key ttl_seconds from now, whatever it holds."""
+    pass
+
+  @abstractmethod
   async def list_length(self, key: str) -> int | None:
     """Items in a list, such as a request queue; None where this store holds no queues."""
     pass
@@ -436,6 +441,10 @@ class InMemoryStateStore(StateStore):
   async def list_length(self, key: str) -> int | None:
     return None  # the in-memory queues live in InMemoryStore
 
+  async def expire(self, key: str, ttl_seconds: float) -> None:
+    if key in self.kv_store:
+      self.expiries[key] = time.monotonic() + ttl_seconds  # lists, sets and counts here never expire
+
   async def increment(self, key: str, ttl_seconds: float | None) -> int:
     value = int(self.get_value_sync(key) or 0) + 1
     await self.set_value(key, str(value), ttl_seconds)
@@ -510,6 +519,9 @@ class RedisStateStore(StateStore):
 
   async def list_length(self, key: str) -> int | None:
     return await self.redis.llen(key)
+
+  async def expire(self, key: str, ttl_seconds: float) -> None:
+    await self.redis.expire(key, int(ttl_seconds))
 
   async def increment(self, key: str, ttl_seconds: float | None) -> int:
     async with self.redis.pipeline(transaction=True) as pipeline:
