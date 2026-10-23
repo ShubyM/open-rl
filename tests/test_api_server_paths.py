@@ -633,13 +633,12 @@ class TelemetryRecordsTest(ApiServerTest):
       return value
 
     async def race():
-      await telemetry.update_session(store, "s1", True, None, None)
+      await telemetry.update_session(store, "s1", None, None)
       with patch.object(store, "get_value", slow_read):
-        await asyncio.gather(telemetry.update_session(store, "s1", False, "m1", None), telemetry.update_session(store, "s1", False, None, None))
+        await asyncio.gather(telemetry.update_session(store, "s1", "m1", None), telemetry.update_session(store, "s1", None, None))
       return json.loads(await store.get_value(telemetry.key("session_record", "s1")))
 
-    with patch("builtins.print"):
-      self.assertEqual(asyncio.run(race())["model_ids"], ["m1"])
+    self.assertEqual(asyncio.run(race())["model_ids"], ["m1"])
 
   def test_a_shared_trainers_delete_is_counted_neither_enqueued_nor_popped(self) -> None:
     [created] = self.call(("create_model", {"base_model": "m"}))

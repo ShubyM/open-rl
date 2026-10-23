@@ -18,7 +18,7 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from numbers import Real
 
 from server.store import get_state_store
@@ -35,21 +35,12 @@ FINISH_SECONDS = 5  # how long an exiting process waits for its last writes
 OPEN_PLACEMENTS = "open_rl:placements:open"  # models holding a placement not yet released
 FAILED = "RequestFailedResponse"
 
-# Cloud Logging labels on the lines logged for a run
-RUN_LABEL = "openrl_run_id"
-SOURCE_LABEL = "openrl_source"
-CLIENT = "client"
-
 SECRET = re.compile(r"authorization|cookie|api[-_]?key|access[-_]?token|secret|password", re.I)
 CONFIG_ENV = ("OPEN_RL_", "OPENRL_", "VLLM_", "NCCL_", "CUDA_", "PYTORCH_", "TORCH_")
 
 
 def key(*parts: str) -> str:
   return ":".join(("open_rl", *parts))
-
-
-def iso(at: float) -> str:
-  return datetime.fromtimestamp(at, UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def epoch(stamp: str | None) -> float | None:
@@ -379,12 +370,12 @@ session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # the
 
 
 @best_effort
-def note_session(store, session_id: str, *, created: bool = False, model_id: str | None = None, metadata: dict | None = None) -> None:
+def note_session(store, session_id: str, *, model_id: str | None = None, metadata: dict | None = None) -> None:
   """A session's creation, heartbeat or model attach. Its record outlives the session's two-minute live key."""
-  write(update_session(store, session_id, created, model_id, metadata))
+  write(update_session(store, session_id, model_id, metadata))
 
 
-async def update_session(store, session_id: str, created: bool, model_id: str | None, metadata: dict | None) -> None:
+async def update_session(store, session_id: str, model_id: str | None, metadata: dict | None) -> None:
   record_key, now = key("session_record", session_id), time.time()
   # Heartbeats and attaches rewrite the same record. One at a time, or a heartbeat drops a model attached meanwhile.
   async with session_locks[session_id]:
@@ -393,15 +384,9 @@ async def update_session(store, session_id: str, created: bool, model_id: str | 
     record["last_seen_at"] = now
     if metadata is not None:
       record["metadata"] = redact(metadata)
-    attached = bool(model_id) and model_id not in record["model_ids"]
-    if attached:
+    if model_id and model_id not in record["model_ids"]:
       record["model_ids"].append(model_id)
     await store.set_value(record_key, json.dumps(record), ttl_seconds=TTL_SECONDS)
-  if created or attached:
-    labels = {SOURCE_LABEL: "openrl_event", **({RUN_LABEL: model_id} if model_id else {})}
-    event = "attached" if attached else "created"
-    line = {"kind": "openrl.session", "v": 1, "event": event, "session_id": session_id, "model_id": model_id, "time": iso(now)}
-    print(json.dumps({"severity": "INFO", "message": "openrl.session", "openrl": line, "logging.googleapis.com/labels": labels}), flush=True)
 
 
 # Placement records
