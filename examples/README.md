@@ -36,6 +36,42 @@ It uses standard `unittest` in the examples environment.
 
 See [Harvey LAB RL](harvey_labs) for setup and recipe options.
 
+## Custom loop telemetry
+
+A custom loop that uses the cookbook logger can send its metrics to the
+server's `/runs/{id}/steps` by appending `OTelLogger`:
+
+```python
+from common.otel_logger import OTelLogger
+from tinker_cookbook.utils import ml_log
+
+session_id = service_client.holder.get_session_id()  # Tinker 0.29.0 has no public accessor yet
+logger = ml_log.setup_logging(log_dir=log_dir, config=config)
+logger.loggers.append(OTelLogger(session_id=session_id, model_id=model_id))
+try:
+  logger.log_metrics({"phase": "train", "loss": loss}, step=step)
+finally:
+  logger.close()
+```
+
+Point the standard OTLP HTTP exporters at a collector, such as the one in
+`k8s/deploy/telemetry` port-forwarded to 4318:
+
+```sh
+export OTEL_SERVICE_NAME=openrl-client
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_METRIC_EXPORT_INTERVAL=5000
+```
+
+Each `log_metrics` call emits one `openrl.training.metrics` log event with the
+step and every finite number, tagged with `session.id`, the optional
+`openrl.model.id` and the `phase` from the metrics. It also updates the
+`openrl.client.metric` and `openrl.client.step` gauges. A sink keeps at most 500
+gauge series (`max_series=`) and 500 values of up to 200-character names per
+event, reports what it dropped in the event, and warns once per limit. Delivery
+is best effort, so keep the cookbook's JSONL files. Run the logger's tests with
+`make test-client-telemetry` from the repository root.
+
 ---
 
 ## Examples Overview
