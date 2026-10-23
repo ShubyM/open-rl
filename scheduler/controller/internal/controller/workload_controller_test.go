@@ -268,6 +268,12 @@ func envOf(container corev1.Container, name string) string {
 // makes it joinable. Sharing decisions only ever run against allocated claims.
 func allocateClaim(t *testing.T, r *WorkloadReconciler, name string) {
 	t.Helper()
+	allocateClaimOn(t, r, name, "gpu-0")
+}
+
+// allocateClaimOn pins the claim to one named device of the test node.
+func allocateClaimOn(t *testing.T, r *WorkloadReconciler, name, device string) {
+	t.Helper()
 	var claim resourcev1.ResourceClaim
 	if err := r.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: name}, &claim); err != nil {
 		t.Fatalf("get claim %s: %v", name, err)
@@ -277,7 +283,7 @@ func allocateClaim(t *testing.T, r *WorkloadReconciler, name string) {
 		// only single-device claims are joinable.
 		Devices: resourcev1.DeviceAllocationResult{
 			Results: []resourcev1.DeviceRequestAllocationResult{{
-				Request: podClaimName, Driver: testDriver, Pool: testNode, Device: "gpu-0",
+				Request: podClaimName, Driver: testDriver, Pool: testNode, Device: device,
 			}},
 		},
 		NodeSelector: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
