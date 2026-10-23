@@ -448,6 +448,41 @@ async def record_placements(store, workloads: list[dict]) -> None:
         await store.remove_from_set(OPEN_PLACEMENTS, model_id)
 
 
+# Client step events
+
+
+def otlp_value(value: dict):
+  """An OTLP JSON AnyValue as a plain value; a kvlist becomes a dict."""
+  if "kvlistValue" in value:
+    return {kv["key"]: otlp_value(kv["value"]) for kv in value["kvlistValue"].get("values", [])}
+  for kind in ("doubleValue", "intValue", "stringValue", "boolValue"):
+    if kind in value:
+      return float(value[kind]) if kind == "intValue" else value[kind]
+  return None
+
+
+async def ingest_client_steps(store, body: dict) -> None:
+  """Keep the client's per-step metric events, which the collector forwards as OTLP JSON logs, one row per step per session.
+  The step is in the event, so nothing has to be rebuilt from gauges later."""
+  for resource in body.get("resourceLogs", []):
+    for scope in resource.get("scopeLogs", []):
+      for record in scope.get("logRecords", []):
+        if record.get("eventName") != "openrl.training.metrics":
+          continue
+        try:
+          attributes = {kv["key"]: otlp_value(kv["value"]) for kv in record.get("attributes", [])}
+          event = otlp_value(record.get("body", {}))
+          row = {"step": None if event.get("step") is None else int(event["step"]), "at": int(record.get("timeUnixNano", 0)) / 1e9}
+          row["metrics"] = finite(event.get("metrics"))
+        except (AttributeError, KeyError, TypeError, ValueError):
+          continue  # dropped, since failing the export would have the collector send it again forever
+        if not (session := attributes.get("session.id")):
+          continue
+        # A session may train several models, and log evals at a training step.
+        row |= {field: attributes[name] for field, name in (("phase", "openrl.phase"), ("model_id", "openrl.model.id")) if attributes.get(name)}
+        await store.append_sample(key("client_steps", session), row, SAMPLE_LIMIT, TTL_SECONDS)
+
+
 # SDK events
 
 

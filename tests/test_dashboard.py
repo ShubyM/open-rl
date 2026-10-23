@@ -7,6 +7,7 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
+from server import telemetry
 from server.dashboard import fleet, router, sources
 from server.dashboard.__main__ import app
 from server.store import InMemoryStateStore
@@ -67,6 +68,75 @@ class StepsTest(unittest.TestCase):
     self.assertEqual([(s["step"], s["complete"]) for s in found], [(0, True), (1, False), (7, True)])
     self.assertEqual(found[0]["ops"]["forward_backward"]["metrics"]["loss"], {"min": 2.0, "max": 2.0, "mean": 2.0})
     self.assertEqual((found[0]["started_at"], found[0]["ended_at"], found[2]["nonfinite"]), (9, 11, ["grad_norm"]))
+
+
+def step_event(step: int, reward: float, at_ns: int, **attributes) -> dict:
+  """An OTLP JSON log export as the collector forwards it, in the shape the cookbook logger emits."""
+  values = [{"key": "progress/batch", "value": {"doubleValue": step}}, {"key": "env/all/reward/total", "value": {"doubleValue": reward}}]
+  body = {
+    "kvlistValue": {"values": [{"key": "metrics", "value": {"kvlistValue": {"values": values}}}, {"key": "step", "value": {"intValue": str(step)}}]}
+  }
+  tags = [{"key": k, "value": {"stringValue": v}} for k, v in {"session.id": "sess-1", **attributes}.items()]
+  record = {"timeUnixNano": str(at_ns), "eventName": "openrl.training.metrics", "body": body, "attributes": tags}
+  return {"resourceLogs": [{"scopeLogs": [{"logRecords": [record]}]}]}
+
+
+class ClientStepsTest(unittest.TestCase):
+  def setUp(self):
+    self.store = InMemoryStateStore()
+    self.enterContext(mock.patch.object(router, "get_state_store", return_value=self.store))
+    router.history.clear()
+
+  def steps(self, high=2000, prefixes=()):
+    return asyncio.run(router.client_steps({"run_id": "m", "session_ids": ["sess-1"]}, 900, high, prefixes))
+
+  def prometheus(self, **answers):
+    self.enterContext(mock.patch.object(sources, "prometheus_source", return_value="prom"))
+    self.enterContext(mock.patch.object(sources, "configuration", return_value={**CONFIG, "cluster": ""}))
+    return self.enterContext(mock.patch.object(sources, "prom", mock.AsyncMock(**answers)))
+
+  def test_forwarded_step_events_keep_only_this_models_training_metrics_with_no_metrics_backend(self):
+    events = [
+      step_event(0, 0.2, 1000 * 10**9, **{"openrl.model.id": "m"}),
+      step_event(0, 0.9, 1000 * 10**9, **{"openrl.model.id": "m", "openrl.phase": "eval"}),  # an eval at the same step
+      step_event(0, 0.7, 1000 * 10**9, **{"openrl.model.id": "other"}),  # another model trained by the same session
+      step_event(1, 0.5, 1001 * 10**9),  # a client that names no model
+      {"resourceLogs": [{"scopeLogs": [{"logRecords": [{"eventName": "other"}]}]}]},
+    ]
+    for event in events:
+      asyncio.run(telemetry.ingest_client_steps(self.store, event))
+    with mock.patch.object(sources, "prometheus_source", return_value=None):
+      self.assertEqual({step: m["env/all/reward/total"] for step, m in self.steps().items()}, {0: 0.2, 1: 0.5})
+
+  def test_a_malformed_step_event_is_dropped_instead_of_failing_the_export(self):
+    events = [step_event(step, 0.1, 10**18) for step in range(3)]
+    bad_step, bad_time, good = (event["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0] for event in events)
+    bad_step["body"]["kvlistValue"]["values"][1]["value"] = {"stringValue": "two"}
+    bad_time["timeUnixNano"] = "soon"
+    good["body"]["kvlistValue"]["values"][0]["value"]["kvlistValue"]["values"].append({"key": "done", "value": {"boolValue": True}})
+    asyncio.run(telemetry.ingest_client_steps(self.store, {"resourceLogs": [r for event in events for r in event["resourceLogs"]]}))
+    [row] = asyncio.run(self.store.read_samples(telemetry.key("client_steps", "sess-1")))
+    self.assertEqual((row["step"], sorted(row["metrics"])), (2, ["env/all/reward/total", "progress/batch"]))
+
+  def test_gauges_align_by_batch_and_a_later_read_asks_only_for_new_time(self):
+    def gauges(*points):
+      return [{"metric": {"metric": name}, "values": [[at, value] for at, value in values]} for name, values in points]
+
+    prom = self.prometheus(
+      side_effect=[
+        gauges(("progress/batch", [(1950, 0)]), ("reward", [(1950, 0.2)])),  # kl had not been exported yet
+        gauges(("progress/batch", [(1950, 0), (2500, 1)]), ("reward", [(1950, 0.2), (2500, 0.5)]), ("kl", [(1950, 0.01)])),
+      ]
+    )
+    self.steps()
+    self.assertEqual(self.steps(high=3000), {0: {"reward": 0.2, "kl": 0.01}, 1: {"reward": 0.5}})
+    self.assertEqual([call.args[1:3] for call in prom.await_args_list], [(900, 2000), (1700, 3000)])
+
+  def test_gauge_reads_remembered_per_run_and_filter_are_capped(self):
+    self.prometheus(return_value=[])
+    for n in range(router.HISTORY_ENTRIES + 10):
+      self.steps(prefixes=(f"field-{n}",))
+    self.assertEqual(len(router.history), router.HISTORY_ENTRIES)
 
 
 class KubernetesReadTest(unittest.TestCase):

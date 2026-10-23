@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import io
 import json
 import os
@@ -626,6 +627,18 @@ class TelemetryRecordsTest(ApiServerTest):
     self.assertNotIn("tml-secret", stdout.getvalue())
     [error] = asyncio.run(api_server.state.read_samples(telemetry.key("sdk_errors", session_id)))
     self.assertEqual((error["reason"], error["at"], error["message"]), ("SDK api_status_error", 1792411200.0, "HTTP 401: invalid key"))
+
+  def test_the_collector_s_default_gzip_body_is_accepted(self) -> None:
+    from tests.test_dashboard import step_event
+
+    body = gzip.compress(json.dumps(step_event(3, 0.5, 10**18)).encode())
+    response = self.client.post("/api/v1/otlp/logs", content=body, headers={"Content-Type": "application/json", "Content-Encoding": "gzip"})
+    self.assertEqual(response.status_code, 200)
+    [row] = asyncio.run(api_server.state.read_samples(telemetry.key("client_steps", "sess-1")))
+    self.assertEqual((row["step"], row["metrics"]["env/all/reward/total"]), (3, 0.5))
+    plain = self.client.post("/api/v1/otlp/logs", json=step_event(4, 0.6, 10**18))
+    self.assertEqual(plain.status_code, 200)
+    self.assertEqual(self.client.post("/api/v1/otlp/logs", content=b"not json").status_code, 400)
 
   def test_a_heartbeat_racing_a_model_attach_keeps_the_model(self) -> None:
     store = InMemoryStateStore()

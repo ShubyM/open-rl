@@ -3,6 +3,8 @@
 import asyncio
 import json
 import math
+import re
+import time
 from string import Template
 from typing import Annotated
 
@@ -12,7 +14,7 @@ from pydantic import BaseModel
 
 from server.dashboard import facts, fleet, sources
 from server.store import get_state_store
-from server.telemetry import key
+from server.telemetry import finite, key
 
 router = APIRouter(tags=["inspection"])
 BOUNDS = "ISO-8601, e.g. 2026-01-02T12:00:00Z; since also takes a span before until, e.g. 1h. Default: the 30 minutes ending now; at most 7 days."
@@ -157,12 +159,62 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
   return result
 
 
+HISTORY_ENTRIES = 64
+history: dict[str, tuple[float, dict[int, dict[str, float]]]] = {}  # run and fields -> (read up to, client metrics by step)
+
+
+async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, ...]) -> dict[int, dict[str, float]]:
+  """The client's metrics by step: the older Redis history and the forwarded step events, else the OpenTelemetry gauges
+  aligned by progress/batch. A step's values never change, so each gauge read asks only for the time after the last."""
+  found, store = {}, get_state_store()
+  for row in await store.read_samples(f"open_rl:run_metrics:{run['run_id']}"):
+    found[row["step"]] = finite(row["metrics"])
+  for session in run["session_ids"]:
+    for row in await store.read_samples(key("client_steps", session)):
+      # Only this model's training rows, since a session may train several and an eval may share a training step.
+      ours = row.get("model_id") in (None, run["run_id"]) and row.get("phase") in (None, "train")
+      if ours and row.get("step") is not None and low <= row["at"] <= high:
+        found.setdefault(int(row["step"]), {}).update(row["metrics"])
+  if found or not run["session_ids"] or high <= low or not sources.prometheus_source():
+    return found
+  memo = f"{run['run_id']} {prefixes}"
+  seen, known = history.get(memo, (low, {}))
+  start = max(low, seen - 300)  # overlap, so a step that landed during the last read is not missed
+  wanted = "|".join(re.escape(p) + ".*" for p in ("progress/batch", *prefixes)) if prefixes else ".+"
+  where = f"session_id=~{sources.any_of(run['session_ids'])},metric=~{json.dumps(wanted)}{sources.scope()}"
+  where += f',openrl_phase=~"|train",openrl_model_id=~{json.dumps("|" + re.escape(run["run_id"]))}'  # an absent label matches ""
+  rows = await sources.prom(f"max by (metric) (openrl_client_metric{{{where}}})", start, high, points=max(2, min(1000, int((high - start) / 15))))
+  series = {r["metric"].get("metric"): {float(t): float(v) for t, v in r["values"] if math.isfinite(float(v))} for r in rows}
+  first: dict[int, float] = {}
+  for at, batch in sorted((series.pop("progress/batch", None) or {}).items()):
+    first.setdefault(int(batch), at)
+  known = dict(known)
+  for step, at in first.items():  # a step read while its gauges landed gets the rest now; the newer values win
+    known[step] = known.get(step, {}) | {name: points[at] for name, points in series.items() if at in points}
+  history.pop(memo, None)
+  history[memo] = (high, known)
+  while len(history) > HISTORY_ENTRIES:  # the least recently read first
+    history.pop(next(iter(history)))
+  return found | known
+
+
 @router.get("/api/v1/inspect/runs/{run_id}/steps", response_model=Doc)
-async def steps(run_id: str, last: int = Query(20, ge=1, le=1000)):
-  """The run's last steps, oldest first: window, completion, trainer ops (count, failures, seconds, metric spread)."""
-  await run_of(run_id)
-  every = fleet.steps(await fleet.operations(run_id))
-  return {"run_id": run_id, "total": len(every), "steps": every[-last:]}
+async def steps(
+  run_id: str,
+  last: int = Query(20, ge=1, le=1000),
+  fields: Annotated[str | None, Query(description="Comma-separated prefixes of client metrics to keep, e.g. env/all/reward")] = None,
+):
+  """The run's last steps, oldest first: window, completion, trainer ops (count, failures, seconds, metric spread), `client` metrics."""
+  _, run = await run_of(run_id)
+  every, keep, result = fleet.steps(await fleet.operations(run_id)), tuple(p for p in (fields or "").split(",") if p), {}
+  try:
+    read = lambda: client_steps(run, every[0]["started_at"] - 300, (run["completed_at"] or time.time()) + 300, keep)  # noqa: E731
+    client = await fleet.cached(f"client {run_id} {keep}", 30, read) if every else {}
+  except Exception as exc:  # steps stand without the client's metrics
+    client, result["error"] = {}, f"Client metrics unavailable: {type(exc).__name__}"
+  for step in every[-last:]:
+    step["client"] = {k: v for k, v in client.get(step["step"], {}).items() if not keep or k.startswith(keep)}
+  return result | {"run_id": run_id, "total": len(every), "steps": every[-last:]}
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/commands", response_model=Doc)

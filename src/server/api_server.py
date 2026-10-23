@@ -8,6 +8,7 @@ import re
 import time
 import traceback
 import uuid
+import zlib
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
@@ -37,7 +38,7 @@ from server.model_metadata import (
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import RedisStateStore, get_state_store, get_store
-from server.telemetry import count_request, ingest_sdk_events, note_session, record_placements, write
+from server.telemetry import count_request, ingest_client_steps, ingest_sdk_events, note_session, record_placements, write
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
 from training import commands
@@ -1370,6 +1371,27 @@ async def list_adapters():
 
 
 # *** Internal ***
+
+
+OTLP_BODY_LIMIT = 64 << 20  # bytes once decompressed; a small body can inflate without bound
+
+
+@app.post("/api/v1/otlp/logs")
+async def otlp_logs(request: Request):
+  """OTLP/HTTP JSON logs from the collector, gzipped as its exporter sends them by default or plain; the client's per-step
+  metric events are kept by session."""
+  raw = await request.body()
+  try:
+    if request.headers.get("content-encoding", "").lower() == "gzip":
+      inflate = zlib.decompressobj(16 + zlib.MAX_WBITS)
+      raw = inflate.decompress(raw, OTLP_BODY_LIMIT)
+      if inflate.unconsumed_tail:
+        raise HTTPException(413, f"OTLP body over {OTLP_BODY_LIMIT >> 20} MiB once decompressed")
+    body = json.loads(raw)
+  except (zlib.error, ValueError) as exc:
+    raise HTTPException(400, "Send OTLP logs as JSON (encoding: json), gzipped or not") from exc
+  await ingest_client_steps(state, body if isinstance(body, dict) else {})
+  return {}
 
 
 @app.post("/api/v1/telemetry")
