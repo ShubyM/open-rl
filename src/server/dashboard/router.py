@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from server import kube
 from server.dashboard import facts, fleet, sources
 from server.store import get_state_store
-from server.telemetry import key
+from server.telemetry import finite, key
 
 
 @contextlib.asynccontextmanager
@@ -191,7 +191,7 @@ async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, 
   Prometheus only for what came after the last one, at 15 s resolution."""
   found, store = {}, get_state_store()
   for row in await store.read_samples(f"open_rl:run_metrics:{run['run_id']}"):
-    found[row["step"]] = {k: float(v) for k, v in row["metrics"].items() if isinstance(v, int | float) and math.isfinite(v)}
+    found[row["step"]] = finite(row["metrics"])
   for session in run["session_ids"]:
     for row in await store.read_samples(key("client_steps", session)):
       # Training rows of this model only: a session may train several, and an eval may share a training step.

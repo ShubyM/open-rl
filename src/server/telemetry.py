@@ -215,15 +215,24 @@ async def observe_operation(request: dict, role: str, runtime_id: str | None, ca
       record(request, role, runtime_id, started_at, status, error_type, result)
 
 
+def numbers(metrics: dict | None) -> dict[str, float]:
+  """The metric values that are numbers, as floats; a bool is not one."""
+  return {k: float(v) for k, v in (metrics or {}).items() if isinstance(v, Real) and not isinstance(v, bool)}
+
+
+def finite(metrics: dict | None) -> dict[str, float]:
+  return {k: v for k, v in numbers(metrics).items() if math.isfinite(v)}
+
+
 def record(request: dict, role: str, runtime_id: str | None, started_at: float, status: str, error_type: str | None, result: dict, where=None):
   """`where` names the pod the op ran on, when not this process's. No payloads, outputs or error messages are kept."""
   if not (run_id := run_of(request)):
     return
   operation, at = operation_name(request, role), time.time()
-  values = {k: float(v) for k, v in (result.get("metrics") or {}).items() if isinstance(v, Real) and not isinstance(v, bool)}
+  values = numbers(result.get("metrics"))
   sample = {"at": at, "started_at": started_at, "operation": operation, "request_id": request.get("request_id"), "run_id": run_id}
   sample.update(runtime_id=runtime_id, role=role, status=status, error_type=error_type, elapsed_seconds=at - started_at)
-  sample.update(identity() if where is None else where, metrics={k: v for k, v in values.items() if math.isfinite(v)})
+  sample.update(identity() if where is None else where, metrics=finite(values))
   if operation != "sample" and run_id in steps_done:
     sample["step"] = steps_done[run_id]
   # JSON has no NaN or infinity; name them so a NaN grad norm is not just missing.
@@ -350,13 +359,12 @@ async def ingest_client_steps(store, body: dict) -> None:
         try:
           attributes = {kv["key"]: otlp_value(kv["value"]) for kv in record.get("attributes", [])}
           event = otlp_value(record.get("body", {}))
-          values = {k: float(v) for k, v in (event.get("metrics") or {}).items() if isinstance(v, int | float) and not isinstance(v, bool)}
           row = {"step": None if event.get("step") is None else int(event["step"]), "at": int(record.get("timeUnixNano", 0)) / 1e9}
+          row["metrics"] = finite(event.get("metrics"))
         except (AttributeError, KeyError, TypeError, ValueError):
           continue  # dropped, since failing the export would have the collector send it again forever
         if not (session := attributes.get("session.id")):
           continue
-        row["metrics"] = {k: v for k, v in values.items() if math.isfinite(v)}
         # A session may train several models, and log evals at a training step.
         row |= {field: attributes[name] for field, name in (("phase", "openrl.phase"), ("model_id", "openrl.model.id")) if attributes.get(name)}
         await store.append_sample(key("client_steps", session), row, SAMPLE_LIMIT, TTL_SECONDS)
