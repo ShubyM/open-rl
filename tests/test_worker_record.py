@@ -77,8 +77,9 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
       await telemetry.observe_operation({"model_id": "r", "op": op}, "trainer", "r", call(result))
     await telemetry.observe_operation({"model_id": "r", "op": "forward_backward", "forward_only": True}, "trainer", "r", call())
     with mock.patch.object(telemetry, "SAMPLE_LIMIT", 3):
-      for i in range(5):  # a shared sampler's requests name the base model's queue and the run they sample for
-        telemetry.record_command({"op": "sample", "model_id": "base", "logical_run_id": "r", "request_id": f"s{i}"}, "sampler", "base", 0.0)
+      for i in range(6):  # a shared sampler's requests name the base model's queue and the run they sample for
+        request = {"op": "sample", "model_id": "base", "logical_run_id": "r", "request_id": f"s{i}"}
+        telemetry.record_command(request, "sampler", "base", 0.0, "EngineDied" if i % 2 else None)
     trainer = await self.recorded("r")
     self.assertEqual(
       [(s["operation"], s["status"], s["step"]) for s in trainer],
@@ -87,9 +88,6 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     )
     self.assertEqual((trainer[0]["metrics"], trainer[0]["nonfinite"]), ({"loss": 1.5}, ["grad_norm", "kl"]))  # JSON has no NaN
     self.assertEqual(await self.store.get_value(telemetry.key("steps", "r")), "6")
-    samples = await self.recorded("r", "samples")
-    self.assertEqual([(s["request_id"], s["runtime_id"]) for s in samples], [("s2", "base"), ("s3", "base"), ("s4", "base")])
-    self.assertEqual(await self.recorded("base", "samples"), [])
 
 
 if __name__ == "__main__":

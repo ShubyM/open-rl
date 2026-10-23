@@ -327,14 +327,18 @@ def command_record(request: dict, role: str, runtime_id: str | None, started_at:
 
 @best_effort
 def record_command(request: dict, role: str, runtime_id: str | None, started_at: float, error_type: str | None = None, result=None) -> None:
-  """Keep one op's command record, and for a trainer op the run's failure and step counts."""
+  """Keep one op's command record, and for a trainer op the run's failure and step counts. Every sample is counted, with
+  the time of the last; one a vLLM sampler answered keeps no record."""
   if not (run_id := run_of(request)):
     return
   record = command_record(request, role, runtime_id, started_at, error_type, result if isinstance(result, dict) else {})
   store = get_state_store()
   if record["operation"] == "sample":
-    # Samples keep their own list, so a run's sampling never evicts its training ops.
-    write(store.append_sample(key("operations", run_id, "samples"), record, SAMPLE_LIMIT, TTL_SECONDS))
+    write(store.increment(key("sampled", run_id), TTL_SECONDS))
+    write(store.set_value(key("sampled_at", run_id), str(record["at"]), ttl_seconds=TTL_SECONDS))
+    # vLLM's own metrics time what it answers. A torch trainer's samples have nothing else. Samples keep their own list.
+    if record["status"] == "failed" or role != "sampler":
+      write(store.append_sample(key("operations", run_id, "samples"), record, SAMPLE_LIMIT, TTL_SECONDS))
     return
   steps = run_steps.get(run_id)
   # done_here is taken before this op's own step is counted below. The write may wait WRITE_SECONDS on the step read.

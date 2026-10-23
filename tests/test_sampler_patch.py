@@ -257,7 +257,7 @@ class SamplerLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.slicer.unregister.assert_awaited_once()
 
   async def recorded(self) -> list[tuple[str, str, str]]:
-    """Every answer a client gets, failed or not, has one sample record."""
+    """Every failed answer a client gets has one sample record."""
     await asyncio.gather(*list(telemetry.writes))
     return [(r["request_id"], r["status"], r["error_type"]) for r in await self.state.read_samples(telemetry.key("operations", "run", "samples"))]
 

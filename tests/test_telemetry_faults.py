@@ -61,7 +61,7 @@ class TelemetryFaultTest(unittest.TestCase):
     with patch.object(telemetry, "get_state_store", lambda: healthy):
       expected, _, _ = asyncio.run(serve())
     self.assertTrue(expected)
-    self.assertTrue(healthy.samples, "the healthy serve recorded its ops")
+    self.assertTrue(healthy.samples or healthy.get_value_sync(telemetry.key("sampled", "run-a")), "the healthy serve recorded its ops")
     for fault, store in FAULTS.items():
       with self.subTest(store=fault), patch.object(telemetry, "get_state_store", store):
         result, took, exiting = asyncio.run(serve())
