@@ -440,6 +440,19 @@ class ExclusiveMetadataTest(ApiServerTest):
     self.assertTrue(meta["exclusive"])
     self.assertFalse(meta["full_config"]["cpu_offload"])
 
+  def test_a_run_deleted_before_the_placement_sweep_keeps_its_placement(self) -> None:
+    class PlacingManager(RuntimeManager):
+      def workloads(self):
+        status = {"podName": "orw-trainer", "nodeName": "n1", "gpuUUIDs": ["GPU-1"], "placedAt": "2026-10-22T10:00:00Z"}
+        live = [m for m, _ in self.ensured if m not in self.released_models]
+        return [{"metadata": {"name": f"w-{m}"}, "spec": {"role": "trainer", "modelID": m, "ownerID": m}, "status": status} for m in live]
+
+    self.enterContext(patch.object(api_server, "worker_manager", PlacingManager()))
+    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}}).json()["request_id"]
+    self.post("delete_model", {"model_id": model_id})
+    placements = asyncio.run(api_server.state.read_samples(api_server.telemetry.key("placements", model_id)))
+    self.assertEqual([(p["pod"], p["gpu_uuids"]) for p in placements], [("orw-trainer", ["GPU-1"])])
+
   def test_a_json_boolean_is_accepted_too(self) -> None:
     model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": True}}).json()["request_id"]
     self.assertTrue(self.metadata(model_id)["exclusive"])

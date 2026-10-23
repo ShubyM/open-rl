@@ -75,11 +75,21 @@ async def bind_session(session_id: str | None, model_id: str) -> None:
       await session_registry.attach(session_id, owner)
 
 
+async def sweep_placements() -> None:
+  """Placement records from the scheduler's Workloads. Also run before a release, which deletes them, so a run shorter
+  than the reaper's interval keeps its placement. A failed sweep is retried by the next."""
+  try:
+    await telemetry.record_placements(state, await asyncio.to_thread(worker_manager.workloads))
+  except Exception:
+    traceback.print_exc()
+
+
 async def reap_owner(owner: str) -> None:
   async with owner_locks[owner]:
     if await session_registry.in_use(owner):
       return
     print(f"[API_SERVER] No live session uses {owner}; tearing its workers down")
+    await sweep_placements()
     for model in await asyncio.to_thread(worker_manager.release_owner, owner):
       await state.delete_values(f"open_rl:sampler_ready:{model}", f"open_rl:trainer_ready:{model}")
     await session_registry.forget(owner)
@@ -659,10 +669,7 @@ async def reap_dead_sessions():
   while True:
     await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
     # Nothing in a sweep may end the loop. A failed call is retried next sweep.
-    try:
-      await telemetry.record_placements(state, await asyncio.to_thread(worker_manager.workloads))
-    except Exception:
-      traceback.print_exc()
+    await sweep_placements()
     try:
       owners = await session_registry.owners()
     except Exception:
@@ -940,6 +947,7 @@ async def delete_model(req: ModelRequest):
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
     await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)), active_set_id=await _resolve_active_set_id(model_id))
     await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
+    await sweep_placements()
     await asyncio.to_thread(worker_manager.release, model_id)
   now = time.time()
   meta.status = "completed"
