@@ -115,7 +115,7 @@ class RedisFutureTest(SampleStoreContract, unittest.IsolatedAsyncioTestCase):
   async def test_a_runs_counters_and_a_held_placement_outlive_their_ttl_while_still_written(self) -> None:
     with mock.patch.object(telemetry, "TTL_SECONDS", 1), mock.patch.object(telemetry, "get_state_store", return_value=self.state):
       for event in ("enqueued", "popped"):  # the API server, then the trainer later; the counters must not lose the first
-        telemetry.count(event, "r")
+        telemetry.count_request(event, "r")
         await asyncio.gather(*list(telemetry.writes))
         await telemetry.record_placements(self.state, [workload("a")])  # a sweep that changes nothing
         await asyncio.sleep(0.6)

@@ -47,8 +47,7 @@ class TelemetryFaultTest(unittest.TestCase):
   def setUp(self) -> None:
     self.enterContext(patch.object(telemetry, "WRITE_SECONDS", 5 * BOUND))
     self.enterContext(patch.object(telemetry, "FINISH_SECONDS", BOUND))
-    self.enterContext(patch.dict(telemetry.step_base, clear=True))
-    self.enterContext(patch.dict(telemetry.steps_here, clear=True))
+    self.enterContext(patch.dict(telemetry.run_steps, clear=True))
 
   def assert_unchanged(self, work) -> None:
     async def serve():

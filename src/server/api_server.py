@@ -37,7 +37,7 @@ from server.model_metadata import (
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import RedisStateStore, get_state_store, get_store
-from server.telemetry import count, ingest_sdk_events, note_session, record_placements, write
+from server.telemetry import count_request, ingest_sdk_events, note_session, record_placements, write
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
 from training import commands
@@ -576,7 +576,7 @@ async def enqueue(command: Command) -> str:
   # One line per training request so a request that never reaches a worker can
   # be traced end to end (the workers log the same id when they pop it).
   print(f"[API_SERVER] enqueued op={command.op} request_id={command.request_id} model_id={command.model_id} active_set={active_set_id}")
-  count("enqueued", command.model_id)
+  count_request("enqueued", command.model_id)
   return command.request_id
 
 
