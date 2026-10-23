@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -7,9 +8,10 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from server import api_server
+from server import api_server, telemetry
 from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import LocalWorkerManager
+from tests.api_client import asgi_client
 from tests.test_session_lifecycle import RuntimeManager
 
 
@@ -569,6 +571,89 @@ class TrainerBackendTest(ApiServerTest):
       response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.sampler_replicas": "4"}})
     self.assertEqual(response.status_code, 400)
     self.assertIn("openrl.sampler_replicas above 1", response.json()["error"])
+
+
+class TelemetryRecordsTest(ApiServerTest):
+  """Records are written in the background, so each test runs its requests in one loop and lets the writes land."""
+
+  def setUp(self) -> None:
+    super().setUp()
+    self.enterContext(patch("server.worker_manager.get_state_store", return_value=api_server.state))
+    self.enterContext(patch.object(telemetry, "get_state_store", return_value=api_server.state))
+
+  def call(self, *requests: tuple[str, dict]) -> list[dict]:
+    async def run() -> list[dict]:
+      async with asgi_client() as client:
+        answers = [(await client.post(f"/api/v1/{path}", json=body)).json() for path, body in requests]
+      await asyncio.gather(*list(telemetry.writes))
+      return answers
+
+    return asyncio.run(run())
+
+  def test_a_run_deleted_before_the_placement_sweep_keeps_its_placement(self) -> None:
+    class PlacingManager(RuntimeManager):
+      def workloads(self):
+        status = {"podName": "orw-trainer", "nodeName": "n1", "gpuUUIDs": ["GPU-1"], "placedAt": "2026-10-22T10:00:00Z"}
+        live = [m for m, _ in self.ensured if m not in self.released_models]
+        return [{"metadata": {"name": f"w-{m}"}, "spec": {"role": "trainer", "modelID": m, "ownerID": m}, "status": status} for m in live]
+
+    self.enterContext(patch.object(api_server, "worker_manager", PlacingManager()))
+    [created] = self.call(("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}}))
+    self.call(("delete_model", {"model_id": created["request_id"]}))
+    placements = asyncio.run(api_server.state.read_samples(telemetry.key("placements", created["request_id"])))
+    self.assertEqual([(p["pod"], p["gpu_uuids"]) for p in placements], [("orw-trainer", ["GPU-1"])])
+
+  def test_a_session_keeps_its_lifetime_models_and_sdk_errors_without_credentials(self) -> None:
+    self.enterContext(patch.object(api_server, "worker_manager", RuntimeManager()))
+    [session] = self.call(("create_session", {"user_metadata": {"recipe_name": "harvey", "api_key": "sk-private"}}))
+    session_id = session["session_id"]
+    with patch.dict(os.environ, {"SAMPLING_BACKEND": "torch"}):  # a bare base model names no run
+      self.call(("create_sampling_session", {"base_model": "Qwen/Qwen3-8B", "session_id": session_id}))
+    [model] = self.call(("create_model", {"base_model": "m", "session_id": session_id}), ("session_heartbeat", {"session_id": session_id}))[:1]
+    record = json.loads(api_server.state.get_value_sync(telemetry.key("session_record", session_id)))
+    self.assertEqual((record["model_ids"], record["metadata"]["recipe_name"]), ([model["request_id"]], "harvey"))
+    self.assertGreaterEqual(record["last_seen_at"], record["created_at"])
+    self.assertNotIn("sk-private", json.dumps(record))
+    data = {"status_code": 401, "detail": "invalid key", "request_headers": {"authorization": "Bearer tml-secret"}}
+    event = {"event_name": "APIFuture.api_status_error", "severity": "ERROR", "event_data": data, "timestamp": "2026-10-19T12:00:00+00:00"}
+    with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+      self.call(("telemetry", {"session_id": session_id, "events": [event]}))
+    self.assertIn("invalid key", stdout.getvalue())
+    self.assertNotIn("tml-secret", stdout.getvalue())
+    [error] = asyncio.run(api_server.state.read_samples(telemetry.key("sdk_errors", session_id)))
+    self.assertEqual((error["reason"], error["at"], error["message"]), ("SDK api_status_error", 1792411200.0, "HTTP 401: invalid key"))
+
+  def test_a_heartbeat_racing_a_model_attach_keeps_the_model(self) -> None:
+    store = InMemoryStateStore()
+    read = store.get_value
+
+    async def slow_read(key):
+      value = await read(key)
+      await asyncio.sleep(0)  # a real store answers after a round trip
+      return value
+
+    async def race():
+      await telemetry.update_session(store, "s1", True, None, None)
+      with patch.object(store, "get_value", slow_read):
+        await asyncio.gather(telemetry.update_session(store, "s1", False, "m1", None), telemetry.update_session(store, "s1", False, None, None))
+      return json.loads(await store.get_value(telemetry.key("session_record", "s1")))
+
+    with patch("builtins.print"):
+      self.assertEqual(asyncio.run(race())["model_ids"], ["m1"])
+
+  def test_a_shared_trainers_delete_is_counted_neither_enqueued_nor_popped(self) -> None:
+    [created] = self.call(("create_model", {"base_model": "m"}))
+    self.assertEqual(self.post("delete_model", {"model_id": created["request_id"]}).status_code, 200)
+
+    async def trainer() -> None:
+      async with telemetry.serving("trainer", "m"):
+        requests = await api_server.store.get_requests(active_set_id="m-1")
+        self.assertEqual([r["op"] for r in requests], ["create_model", "delete_model"])
+        telemetry.popped(requests)
+
+    asyncio.run(trainer())
+    counts = asyncio.run(api_server.state.read_counts(telemetry.key("ledger", created["request_id"])))
+    self.assertEqual(counts, {"enqueued": 1, "popped": 1})
 
 
 if __name__ == "__main__":

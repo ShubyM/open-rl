@@ -10,10 +10,12 @@ import socket
 import subprocess
 import time
 import unittest
+from unittest import mock
 
 import redis as sync_redis
 import redis.asyncio as redis
 
+from server import telemetry
 from server.store import InMemoryStateStore, RedisStateStore, RedisStore
 
 TEST_REDIS_URL = os.getenv("OPEN_RL_TEST_REDIS_URL")
@@ -26,8 +28,42 @@ def free_port() -> int:
     return sock.getsockname()[1]
 
 
+def workload(name: str, placed_at: str | None = "1970-01-01T00:01:40Z", released_at: str | None = None) -> dict:
+  status = {"podName": f"orw-{name}", "nodeName": "n1", "gpuUUIDs": ["GPU-1"], "placedAt": placed_at, "releasedAt": released_at}
+  return {"metadata": {"name": name}, "spec": {"role": "trainer", "modelID": "m1", "ownerID": "m1"}, "status": status}
+
+
+class SampleStoreContract:
+  async def test_placements_are_upserted_and_released(self) -> None:
+    async def sweep(*workloads, now=1000.0):
+      with mock.patch.object(telemetry.time, "time", return_value=now):
+        await telemetry.record_placements(self.state, list(workloads))
+      return [(r["workload"], r["placed_at"], r["released_at"]) for r in await self.state.read_samples(telemetry.key("placements", "m1"))]
+
+    self.assertEqual(await sweep(workload("unplaced", placed_at=None)), [])
+    self.assertEqual(await sweep(workload("a")), [("a", 100, None)])
+    self.assertEqual(await sweep(workload("a")), [("a", 100, None)])
+    self.assertEqual(await self.state.set_members(telemetry.OPEN_PLACEMENTS), {"m1"})
+    released = await sweep(workload("a", released_at="1970-01-01T00:02:30Z"), workload("b"))
+    self.assertEqual(released, [("a", 100, 150), ("b", 100, None)])
+    # A Workload placed again starts a new record and releases the old one; one that is gone is released at the sweep.
+    self.assertEqual(await sweep(workload("b", placed_at="1970-01-01T00:03:00Z"), now=2000.0), [*released[:1], ("b", 100, 2000), ("b", 180, None)])
+    self.assertEqual([r[2] for r in await sweep(now=3000.0)], [150, 2000, 3000])
+    self.assertEqual([r[2] for r in await sweep(now=4000.0)], [150, 2000, 3000])
+    self.assertEqual(await self.state.set_members(telemetry.OPEN_PLACEMENTS), set())
+
+  async def test_sample_lists_keep_the_newest_and_counters_count_atomically(self) -> None:
+    for step in range(3):
+      await self.state.append_sample("samples", {"step": step}, limit=2, ttl_seconds=60)
+    self.assertEqual(await self.state.read_samples("samples"), [{"step": 1}, {"step": 2}])
+    counts = await asyncio.gather(*(self.state.increment("steps", ttl_seconds=60) for _ in range(40)))
+    self.assertEqual(sorted(counts), list(range(1, 41)))
+    await asyncio.gather(*(self.state.increment_field("ledger", event, ttl_seconds=60) for event in ("popped", "popped", "answered")))
+    self.assertEqual(await self.state.read_counts("ledger"), {"popped": 2, "answered": 1})
+
+
 @unittest.skipUnless(TEST_REDIS_URL or REDIS_SERVER, "needs OPEN_RL_TEST_REDIS_URL or redis-server on PATH")
-class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
+class RedisFutureTest(SampleStoreContract, unittest.IsolatedAsyncioTestCase):
   server: subprocess.Popen | None = None
   redis_url: str
 
@@ -69,6 +105,22 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
   async def asyncTearDown(self) -> None:
     await self.store.redis.aclose()
     self.state.sync_redis.close()
+
+  async def test_samples_with_no_ttl_stop_expiring(self) -> None:
+    await self.state.append_sample("ops", {"n": 1}, 10, 60)
+    self.assertGreater(await self.store.redis.ttl("ops"), 0)
+    await self.state.append_sample("ops", {"n": 2}, 10, None)
+    self.assertEqual(await self.store.redis.ttl("ops"), -1)
+
+  async def test_a_runs_counters_and_a_held_placement_outlive_their_ttl_while_still_written(self) -> None:
+    with mock.patch.object(telemetry, "TTL_SECONDS", 1), mock.patch.object(telemetry, "get_state_store", return_value=self.state):
+      for event in ("enqueued", "popped"):  # the API server, then the trainer later; the counters must not lose the first
+        telemetry.count(event, "r")
+        await asyncio.gather(*list(telemetry.writes))
+        await telemetry.record_placements(self.state, [workload("a")])  # a sweep that changes nothing
+        await asyncio.sleep(0.6)
+    self.assertEqual(await self.state.read_counts(telemetry.key("ledger", "r")), {"enqueued": 1, "popped": 1})
+    self.assertEqual([p["workload"] for p in await self.state.read_samples(telemetry.key("placements", "m1"))], ["a"])
 
   async def test_get_result_returns_already_resolved_result(self) -> None:
     await self.store.set_result("req-1", {"type": "sample", "ok": True})
@@ -152,7 +204,7 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(await self.state.set_members("missing"), set())
 
 
-class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
+class InMemoryStoreTest(SampleStoreContract, unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     from server.store import InMemoryStore
 
