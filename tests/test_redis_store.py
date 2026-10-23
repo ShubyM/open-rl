@@ -52,7 +52,7 @@ class SampleStoreContract:
     self.assertEqual([r[2] for r in await sweep(now=4000.0)], [150, 2000, 3000])
     self.assertEqual(await self.state.set_members(telemetry.OPEN_PLACEMENTS), set())
 
-  async def test_sample_lists_keep_the_newest_and_counters_count_atomically(self) -> None:
+  async def test_sample_lists_keep_the_newest_counters_count_atomically_and_scans_skip_expired_values(self) -> None:
     for step in range(3):
       await self.state.append_sample("samples", {"step": step}, limit=2, ttl_seconds=60)
     self.assertEqual(await self.state.read_samples("samples"), [{"step": 1}, {"step": 2}])
@@ -60,6 +60,10 @@ class SampleStoreContract:
     self.assertEqual(sorted(counts), list(range(1, 41)))
     await asyncio.gather(*(self.state.increment_field("ledger", event, ttl_seconds=60) for event in ("popped", "popped", "answered")))
     self.assertEqual(await self.state.read_counts("ledger"), {"popped": 2, "answered": 1})
+    await self.state.set_value("model:live", "metadata")
+    await self.state.set_value("model:expired", "old", ttl_seconds=0.01)
+    await asyncio.sleep(0.02)
+    self.assertEqual(await self.state.scan_values("model:"), {"model:live": "metadata"})
 
 
 @unittest.skipUnless(TEST_REDIS_URL or REDIS_SERVER, "needs OPEN_RL_TEST_REDIS_URL or redis-server on PATH")
