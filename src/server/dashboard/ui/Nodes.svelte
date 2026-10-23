@@ -68,9 +68,9 @@
     if (!view.node && !view.placement) scrollSelection = false;
     if (node && !loading && scrollSelection) { scrollSelection = false; tick().then(() => element?.querySelector("#placement-detail")?.scrollIntoView({ block: "start" })); }
   });
-  function keepViewport() { element.closest("#app").style.minHeight = `${window.scrollY + innerHeight}px`; }
+  function keepViewport() { element?.closest("#app")?.style.setProperty("min-height", `${window.scrollY + innerHeight}px`); }
   function select(p, reset = false) {
-    if (view.node !== p.node) element.closest("#app").style.removeProperty("min-height");
+    if (view.node !== p.node) element?.closest("#app")?.style.removeProperty("min-height");
     if (reset) view.gpu = "all";
     view.node = p.node;
     view.placement = p.id;
@@ -78,13 +78,13 @@
   async function close() {
     const previous = view.node;
     view.node = view.placement = null;
-    element.closest("#app").style.removeProperty("min-height");
+    element?.closest("#app")?.style.removeProperty("min-height");
     await tick();
     element.querySelector(`[data-node-details="${CSS.escape(previous || "")}"]`)?.focus({ preventScroll: true });
   }
   function openNode(name) {
     if (view.node === name) return close();
-    element.closest("#app").style.removeProperty("min-height");
+    element?.closest("#app")?.style.removeProperty("min-height");
     view.node = name; view.placement = null; view.gpu = "all";
   }
   function escapeKey(event) {
