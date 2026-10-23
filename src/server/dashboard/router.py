@@ -193,7 +193,9 @@ async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, 
     found[row["step"]] = {k: float(v) for k, v in row["metrics"].items() if isinstance(v, int | float) and math.isfinite(v)}
   for session in run["session_ids"]:
     for row in await store.read_samples(key("client_steps", session)):
-      if row.get("step") is not None and low <= row["at"] <= high:
+      # Training rows of this model only: a session may train several, and an eval may share a training step.
+      ours = row.get("model_id") in (None, run["run_id"]) and row.get("phase") in (None, "train")
+      if ours and row.get("step") is not None and low <= row["at"] <= high:
         found.setdefault(int(row["step"]), {}).update(row["metrics"])
   if found or not run["session_ids"] or high <= low or not sources.prometheus_source():
     return found
@@ -202,6 +204,7 @@ async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, 
   start = max(low, seen - 300)  # overlap, so a step that landed during the last read is not missed
   wanted = "|".join(re.escape(p) + ".*" for p in ("progress/batch", *prefixes)) if prefixes else ".+"
   where = f"session_id=~{sources.any_of(run['session_ids'])},metric=~{json.dumps(wanted)}{sources.scope()}"
+  where += f',openrl_phase=~"|train",openrl_model_id=~{json.dumps("|" + re.escape(run["run_id"]))}'  # an absent label matches ""
   rows = await sources.prom(f"max by (metric) (openrl_client_metric{{{where}}})", start, high, points=max(2, min(1000, int((high - start) / 15))))
   series = {r["metric"].get("metric"): {float(t): float(v) for t, v in r["values"] if math.isfinite(float(v))} for r in rows}
   first: dict[int, float] = {}

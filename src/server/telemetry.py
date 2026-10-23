@@ -345,16 +345,20 @@ async def ingest_client_steps(store, body: dict) -> None:
   for resource in body.get("resourceLogs", []):
     for scope in resource.get("scopeLogs", []):
       for record in scope.get("logRecords", []):
-        attributes = {kv["key"]: otlp_value(kv["value"]) for kv in record.get("attributes", [])}
-        event = otlp_value(record.get("body", {}))
-        session = attributes.get("session.id")
-        if record.get("eventName") != "openrl.training.metrics" or not session or not isinstance(event, dict):
+        if record.get("eventName") != "openrl.training.metrics":
           continue
-        values = {k: float(v) for k, v in (event.get("metrics") or {}).items() if isinstance(v, int | float) and math.isfinite(v)}
-        step = int(event["step"]) if event.get("step") is not None else None
-        row = {"step": step, "at": int(record.get("timeUnixNano", 0)) / 1e9, "metrics": values}
-        if attributes.get("openrl.phase"):
-          row["phase"] = attributes["openrl.phase"]
+        try:
+          attributes = {kv["key"]: otlp_value(kv["value"]) for kv in record.get("attributes", [])}
+          event = otlp_value(record.get("body", {}))
+          values = {k: float(v) for k, v in (event.get("metrics") or {}).items() if isinstance(v, int | float) and not isinstance(v, bool)}
+          row = {"step": None if event.get("step") is None else int(event["step"]), "at": int(record.get("timeUnixNano", 0)) / 1e9}
+        except (AttributeError, KeyError, TypeError, ValueError):
+          continue  # dropped, since failing the export would have the collector send it again forever
+        if not (session := attributes.get("session.id")):
+          continue
+        row["metrics"] = {k: v for k, v in values.items() if math.isfinite(v)}
+        # A session may train several models, and log evals at a training step.
+        row |= {field: attributes[name] for field, name in (("phase", "openrl.phase"), ("model_id", "openrl.model.id")) if attributes.get(name)}
         await store.append_sample(key("client_steps", session), row, SAMPLE_LIMIT, TTL_SECONDS)
 
 

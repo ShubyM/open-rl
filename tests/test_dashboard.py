@@ -124,6 +124,43 @@ class ClientStepsTest(unittest.TestCase):
       found = asyncio.run(router.client_steps(run, 900, 2000, ()))
     self.assertEqual({step: m["env/all/reward/total"] for step, m in found.items()}, {0: 0.2, 1: 0.5})
 
+  def test_a_step_keeps_only_this_models_training_metrics(self):
+    from server import telemetry
+    from server.dashboard import router
+
+    def tagged(step, reward, **attributes):
+      event = step_event(step, reward, (1000 + step) * 10**9)
+      record = event["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]
+      record["attributes"] += [{"key": k, "value": {"stringValue": v}} for k, v in attributes.items()]
+      return event
+
+    store = InMemoryStateStore()
+    for event in (
+      tagged(0, 0.2, **{"openrl.model.id": "m"}),
+      tagged(0, 0.9, **{"openrl.model.id": "m", "openrl.phase": "eval"}),  # an eval at the same step
+      tagged(0, 0.7, **{"openrl.model.id": "other"}),  # another model trained by the same session
+      tagged(1, 0.5),  # a client that names no model
+    ):
+      asyncio.run(telemetry.ingest_client_steps(store, event))
+    run = {"run_id": "m", "session_ids": ["sess-1"]}
+    with mock.patch.object(router, "get_state_store", return_value=store), mock.patch.object(sources, "prometheus_source", return_value=None):
+      found = asyncio.run(router.client_steps(run, 900, 2000, ()))
+    self.assertEqual({step: m["env/all/reward/total"] for step, m in found.items()}, {0: 0.2, 1: 0.5})
+
+  def test_a_malformed_step_event_is_dropped_instead_of_failing_the_export(self):
+    from server import telemetry
+
+    bad_step, bad_time, good = step_event(0, 0.1, 10**18), step_event(1, 0.2, 10**18), step_event(2, 0.3, 10**18)
+    bad_step["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["body"]["kvlistValue"]["values"][1]["value"] = {"stringValue": "two"}
+    bad_time["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["timeUnixNano"] = "soon"
+    flag = {"key": "done", "value": {"boolValue": True}}
+    good["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["body"]["kvlistValue"]["values"][0]["value"]["kvlistValue"]["values"].append(flag)
+    store = InMemoryStateStore()
+    body = {"resourceLogs": [*bad_step["resourceLogs"], *bad_time["resourceLogs"], *good["resourceLogs"]]}
+    asyncio.run(telemetry.ingest_client_steps(store, body))
+    [row] = asyncio.run(store.read_samples(telemetry.key("client_steps", "sess-1")))
+    self.assertEqual((row["step"], sorted(row["metrics"])), (2, ["env/all/reward/total", "progress/batch"]))
+
   def test_a_later_read_asks_prometheus_only_for_new_time_and_keeps_the_earlier_steps(self):
     from server.dashboard import router
 
