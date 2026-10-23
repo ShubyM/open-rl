@@ -66,8 +66,10 @@ async def bind_session(session_id: str | None, model_id: str) -> None:
     if meta is not None and session_id not in meta.session_ids:
       meta.session_ids.append(session_id)
       await persist_model_metadata(state, model_id, meta)
-    with suppress(Exception):
-      await telemetry.note_session(state, session_id, model_id=model_id)
+    # A sampling session on a bare base model names no run.
+    if meta is not None:
+      with suppress(Exception):
+        await telemetry.note_session(state, session_id, model_id=model_id)
     # On the owner, for the reaper: workers stay while any attached session lives.
     if worker_manager is not None:
       await session_registry.attach(session_id, owner)

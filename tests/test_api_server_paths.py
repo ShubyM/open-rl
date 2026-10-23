@@ -630,6 +630,31 @@ class TelemetryTest(ApiServerTest):
     self.assertIn("invalid key", error["message"])
     self.assertNotIn("tml-secret", repr(error))
 
+  def test_a_sampling_session_on_a_bare_base_model_attaches_no_model(self) -> None:
+    session_id = self.post("create_session", {}).json()["session_id"]
+    with patch.dict(os.environ, {"SAMPLING_BACKEND": "torch"}):
+      self.post("create_sampling_session", {"base_model": "Qwen/Qwen3-8B", "session_id": session_id})
+    record = json.loads(asyncio.run(api_server.state.get_value(api_server.telemetry.key("session_record", session_id))))
+    self.assertEqual(record["model_ids"], [])
+
+  def test_a_heartbeat_racing_a_model_attach_keeps_the_model(self) -> None:
+    store = InMemoryStateStore()
+    read = store.get_value
+
+    async def slow_read(key):
+      value = await read(key)
+      await asyncio.sleep(0)  # a real store answers after a round trip
+      return value
+
+    async def race():
+      await api_server.telemetry.note_session(store, "s1", created=True)
+      with patch.object(store, "get_value", slow_read):
+        await asyncio.gather(api_server.telemetry.note_session(store, "s1", model_id="m1"), api_server.telemetry.note_session(store, "s1"))
+      return json.loads(await store.get_value(api_server.telemetry.key("session_record", "s1")))
+
+    with patch("builtins.print"):
+      self.assertEqual(asyncio.run(race())["model_ids"], ["m1"])
+
   def test_every_request_a_shared_trainer_pops_was_counted_when_it_was_enqueued(self) -> None:
     self.enterContext(patch.object(api_server.telemetry, "get_state_store", return_value=api_server.state))
     model_id = self.post("create_model", {"base_model": "m"}).json()["request_id"]

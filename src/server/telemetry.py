@@ -9,6 +9,7 @@ import re
 import socket
 import time
 import uuid
+from collections import defaultdict
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
@@ -40,6 +41,7 @@ def iso(at: float) -> str:
 current: "Worker | None" = None  # this process's record while it serves
 writes: set[asyncio.Task] = set()  # in-flight writes, held so they are not collected mid-write
 steps_done: dict[str, int] = {}  # run id -> optim_steps it had completed, stamped on each of its trainer ops
+session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # the API server is one replica
 
 
 def identity() -> dict:
@@ -224,15 +226,17 @@ def record(request: dict, role: str, runtime_id: str | None, started_at: float, 
 async def note_session(store, session_id: str, *, created: bool = False, model_id: str | None = None, metadata: dict | None = None) -> None:
   """When a session started and was last heard from, and its models; it outlives the live key's two-minute expiry."""
   record_key, now = key("session_record", session_id), time.time()
-  record = json.loads(await store.get_value(record_key) or "null") or {"session_id": session_id, "created_at": now, "model_ids": []}
-  record["last_seen_at"] = now
-  if metadata is not None:
-    record["metadata"] = redact(metadata)
-  event = "created" if created else None
-  if model_id and model_id not in record["model_ids"]:
-    record["model_ids"].append(model_id)
-    event = "attached"
-  await store.set_value(record_key, json.dumps(record), ttl_seconds=TTL_SECONDS)
+  # Heartbeats and attaches rewrite the same record; one at a time, or a heartbeat drops a model attached meanwhile.
+  async with session_locks[session_id]:
+    record = json.loads(await store.get_value(record_key) or "null") or {"session_id": session_id, "created_at": now, "model_ids": []}
+    record["last_seen_at"] = now
+    if metadata is not None:
+      record["metadata"] = redact(metadata)
+    event = "created" if created else None
+    if model_id and model_id not in record["model_ids"]:
+      record["model_ids"].append(model_id)
+      event = "attached"
+    await store.set_value(record_key, json.dumps(record), ttl_seconds=TTL_SECONDS)
   if event:
     labels = {SOURCE_LABEL: "openrl_event", **({RUN_LABEL: model_id} if model_id else {})}
     line = {"kind": "openrl.session", "v": 1, "event": event, "session_id": session_id, "model_id": model_id, "time": iso(now)}
