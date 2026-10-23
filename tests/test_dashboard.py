@@ -354,6 +354,27 @@ class TimeSlicedGpuTest(unittest.TestCase):
     summary = self.client.get("/api/v1/inspect/runs/r1/summary").json()
     self.assertEqual(summary["gpu_busy"], {"sampler+trainer": 40.0, "sampler": 80.0})
 
+  def test_a_gpu_whose_node_scaled_down_in_the_window_is_still_listed(self):
+    from server.dashboard import router
+
+    async def query(name, *args):
+      # GPU-2's node is gone, so it has no utilization now, only its duty over the window.
+      kept = {"GPU-1", "GPU-2"} if name in ("gpu_busy", "gpu_memory_mib") else {"GPU-1"}
+      labels = {"gpu_util_now": lambda u: {"UUID": u, "Hostname": "n1", "gpu": "0", "modelName": "L4"}}.get(name, lambda u: {"UUID": u, "gpu": "0"})
+      return {
+        "name": name,
+        "since": "a",
+        "until": "b",
+        "source": "prom",
+        "series": [{"labels": labels(u), "points": [[200, 50.0]]} for u in sorted(kept)],
+      }
+
+    window = {"since": "1970-01-01T00:00:00Z", "until": "1970-01-01T00:05:00Z"}
+    with mock.patch.object(router, "query", query):
+      gpus = {g["uuid"]: g for g in self.client.get("/api/v1/inspect/accelerators", params=window).json()["gpus"]}
+    self.assertEqual(sorted(gpus), ["GPU-1", "GPU-2"])
+    self.assertEqual((gpus["GPU-2"]["busy"], gpus["GPU-2"]["node"], "util" in gpus["GPU-2"]), (50.0, "n1", False))
+
   def test_a_gpu_lists_every_placement_holding_it_at_once(self):
     window = {"since": "1970-01-01T00:00:00Z", "until": "1970-01-01T00:05:00Z"}
     gpus = {g["uuid"]: g for g in self.client.get("/api/v1/inspect/accelerators", params=window).json()["gpus"]}

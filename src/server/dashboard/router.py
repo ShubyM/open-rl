@@ -168,8 +168,11 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
       placed.setdefault(uuid, []).append(lane)
   # A time-sliced GPU has several holders at once: every placement overlapping the newest one holds it.
   holders = {uuid: [p for p in lanes if p["end"] >= lanes[-1]["start"]] for uuid, lanes in placed.items()}
-  for labels in (series["labels"] for series in found["util"]["series"]):
-    gpu = {"uuid": (uuid := labels["UUID"]), "node": labels.get("Hostname"), "slot": labels.get("gpu"), "model": labels.get("modelName")}
+  # A GPU whose node scaled down in the window has no utilization now, only its duty; util's labels name node and model.
+  labels_of = {series["labels"]["UUID"]: series["labels"] for series in found["busy"]["series"] + found["util"]["series"]}
+  for uuid, labels in labels_of.items():
+    node = labels.get("Hostname") or next((lane["node"] for lane in reversed(holders.get(uuid, []))), None)
+    gpu = {"uuid": uuid, "node": node, "slot": labels.get("gpu"), "model": labels.get("modelName")}
     gpu |= {name: value[name][uuid] for name in names if uuid in value[name]}
     if uuid in holders:
       gpu["holders"] = [{k: lane[k] for k in ("run_ids", "role", "pod", "start", "end", "ended")} for lane in holders[uuid]]
