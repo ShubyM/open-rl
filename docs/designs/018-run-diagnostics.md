@@ -172,20 +172,20 @@ In the cluster, credentials come from the metadata server and the mounted servic
 
 Every Kubernetes call goes through lightkube. `server/kube.py` keeps one watch per kind (pods, nodes, Workloads) for the life of the process: it lists, follows changes from the list's resourceVersion, and lists again on 410 Gone, on any failure, and every 5 minutes. The dashboard reads pods, nodes and Workloads from it, so a snapshot makes no Kubernetes call. The API server's scheduler worker manager watches only Workloads and reads its model view and the 30 s placement sweep from the same cache; it still creates, gets, lists and deletes Workloads with direct calls.
 
-Reads that every page repeats are shared. A snapshot is cached for 5 s, a run's command records for 10 s and its client metrics for 30 s. Once an entry is stale, the next caller starts a fresh read and every caller gets the last good result until it lands, so only the first read after start waits.
+Reads that every page repeats are shared. A snapshot is cached for 5 s, a run's command records for 10 s and its client metrics for 30 s. Once an entry is stale, the next caller starts a fresh read and every caller gets the last good result until it lands, so only the first read after start waits. A failed read is retried by the next caller, and only the 32 most recently used entries are kept.
 
 ## 5. Size budget
 
-PR #23 had 2,770 backend lines (`src/server/telemetry.py` and `src/server/dashboard/*.py`). Trimming that structure bottomed out near 2,900 with this feature set, so it was rewritten from the requirements in two independent builds against one contract. The smaller one, about 1,300 lines, was kept. On `main`, without sampling pools or tracing setup, it is 1,370, counting the Kubernetes watch cache that the dashboard shares with the worker manager:
+PR #23 had 2,770 backend lines (`src/server/telemetry.py` and `src/server/dashboard/*.py`). Trimming that structure bottomed out near 2,900 with this feature set, so it was rewritten from the requirements in two independent builds against one contract. The smaller one, about 1,300 lines, was kept. On `main`, without sampling pools or tracing setup, it was 1,370, counting the Kubernetes watch cache that the dashboard shares with the worker manager. The review fixes on top (the heartbeat thread, the cheap fleet line, failure records, cache bounds, gzip and log scoping) bring it to 1,534:
 
 | Module | Lines | Job |
 |---|---|---|
-| `telemetry.py` | 336 | The writers: command, worker, placement and session records, request counters, settings echo, forwarded client step events |
-| `dashboard/router.py` | 293 | The routes in 4.4 and one response model |
-| `dashboard/sources.py` | 253 | Kubernetes from the watch cache, Managed Prometheus and Cloud Logging reads, GKE discovery |
-| `dashboard/facts.py` | 213 | The run facts in 4.5 and the one-line form |
-| `dashboard/fleet.py` | 178 | Shared reads that serve the last good result, the snapshot, lanes, steps |
-| `kube.py` | 74 | One watch per Kubernetes kind for the process |
+| `telemetry.py` | 390 | The writers: command, worker, placement and session records, request counters, settings echo, forwarded client step events |
+| `dashboard/router.py` | 336 | The routes in 4.4 and one response model |
+| `dashboard/sources.py` | 254 | Kubernetes from the watch cache, Managed Prometheus and Cloud Logging reads, GKE discovery |
+| `dashboard/facts.py` | 264 | The run facts in 4.5 and the one-line form |
+| `dashboard/fleet.py` | 190 | Shared reads that serve the last good result, the snapshot, lanes, steps |
+| `kube.py` | 77 | One watch per Kubernetes kind for the process |
 | `dashboard/__main__.py` | 23 | The standalone server |
 
 About 250 of those lines are the blank lines `ruff format` requires between definitions. `dev/diagnostics_budget.py` measures the total and the payload sizes.
