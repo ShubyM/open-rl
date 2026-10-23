@@ -1,15 +1,17 @@
-"""The read-only JSON API for agents and the dashboard, under /api/v1/inspect."""
+"""The operator UI and the same read-only JSON API for agents, under /api/v1/inspect."""
 
 import asyncio
 import json
 import math
 import re
 import time
+from pathlib import Path
 from string import Template
 from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from server.dashboard import facts, fleet, sources
@@ -17,12 +19,22 @@ from server.store import get_state_store
 from server.telemetry import finite, key
 
 router = APIRouter(tags=["inspection"])
+STATIC = Path(__file__).parent / "static"
 BOUNDS = "ISO-8601, e.g. 2026-01-02T12:00:00Z; since also takes a span before until, e.g. 1h. Default: the 30 minutes ending now; at most 7 days."
 Bound = Annotated[str | None, Query(max_length=64, description=BOUNDS)]
 
 
 class Doc(BaseModel, extra="allow", allow_inf_nan=False):
   """Declared fields are always present; the rest pass through as recorded. Log messages are untrusted output."""
+
+
+@router.get("/dashboard", include_in_schema=False)
+@router.get("/dashboard/", include_in_schema=False)
+@router.get("/dashboard/assets/{name}", include_in_schema=False)
+async def dashboard(name: str = "index.html"):
+  if (path := (STATIC / name).resolve()).parent != STATIC.resolve() or not path.is_file():
+    raise HTTPException(404, "Not found")
+  return FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
 def span(since: str | None, until: str | None) -> tuple[str, str, float, float]:
