@@ -179,6 +179,11 @@ def prometheus_source() -> str | None:
   return "prometheus" if os.getenv("OPEN_RL_PROMETHEUS_URL") else "gke" if configuration()["configured"] else None
 
 
+def step_seconds(start: float, end: float, points: int) -> int:
+  """The seconds between the points prom returns for [start, end]."""
+  return max(15, int((end - start) / points))
+
+
 async def prom(query: str, start: float, end: float, points: int = 1) -> list[dict]:
   """Prometheus matrix rows; start == end evaluates once, at end."""
   url, headers = os.getenv("OPEN_RL_PROMETHEUS_URL", "").rstrip("/"), {}
@@ -186,7 +191,7 @@ async def prom(query: str, start: float, end: float, points: int = 1) -> list[di
     if not configuration()["configured"]:
       raise LookupError("No GPU metrics source: not on GKE and OPEN_RL_PROMETHEUS_URL is unset")
     url, headers = f"https://monitoring.googleapis.com/v1/projects/{configuration()['project']}/location/global/prometheus", await gcp_headers()
-  step = max(15, int((end - start) / points))
+  step = step_seconds(start, end, points)
   # Samples land on multiples of step, so queries made at different moments share timestamps.
   start -= start % step if start < end else 0
   payload = (
