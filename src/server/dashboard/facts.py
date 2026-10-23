@@ -19,7 +19,7 @@ async def context(state: dict, run: dict, low: float = 0, high: float = float("i
     fleet.operations(run_id), ledger(store, run_id), store.list_length(request_queue(run_id)), queued_samples(store, run, finished)
   )
   ops = [s for s in ops if low <= s["at"] <= high]
-  trainer = [s for s in ops if s.get("role") != "sampler"]
+  trainer = [s for s in ops if s["operation"] != "sample"]  # a single-process trainer answers samples too
   ctx = {
     "run": run,
     "ops": ops,
@@ -111,7 +111,7 @@ def saves(ctx: dict) -> dict | None:
 
 
 def samplers(ctx: dict) -> dict | None:
-  if not (sends := [s for s in ctx["ops"] if s.get("role") == "sampler"]):
+  if not (sends := [s for s in ctx["ops"] if s["operation"] == "sample"]):
     return None
   found = {
     "sends": len(sends),

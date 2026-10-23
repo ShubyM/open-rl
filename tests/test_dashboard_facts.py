@@ -33,7 +33,7 @@ class RunFactsTest(unittest.TestCase):
     async def read():
       for record in ops:
         await self.store.append_sample(
-          key("operations", "r", "samples") if record["role"] == "sampler" else key("operations", "r"), record, 10_000, None
+          key("operations", "r", "samples") if record["operation"] == "sample" else key("operations", "r"), record, 10_000, None
         )
       for event, value in (ledger or {}).items():
         for _ in range(value):
@@ -133,6 +133,13 @@ class RunFactsTest(unittest.TestCase):
     ]
     _, summary, _ = self.facts_of(sends)
     self.assertEqual({k: summary["samplers"][k] for k in ("sends", "failed", "cancelled")}, {"sends": 3, "failed": 1, "cancelled": 1})
+
+  def test_samples_a_single_process_trainer_answers_count_as_samples_not_trainer_ops(self):
+    sends = [op(NOW - 50 + i, "sample", role="trainer") for i in range(3)]  # SAMPLING_BACKEND=torch samples in the trainer
+    ctx, summary, line = self.facts_of([op(NOW - 100, "optim_step"), *sends])
+    self.assertEqual((summary["samplers"]["sends"], summary["last_op"]["operation"], line["steps"]), (3, "optim_step", 1))
+    self.assertEqual(facts.goodput(ctx)["seconds"]["rollout"], 12)  # three 10 s samples a second apart, while the trainer idled
+    self.assertEqual([list(step["ops"]) for step in fleet.steps(ctx["ops"])], [["optim_step"]])
 
   def test_a_worker_running_other_settings_than_asked_is_listed_with_both(self):
     wrong = {

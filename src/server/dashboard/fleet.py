@@ -170,7 +170,7 @@ def steps(ops: list[dict]) -> list[dict]:
   """Trainer ops grouped by the step they belong to: the step's window, and per op its count, time and metric spread."""
   found: dict[int, dict] = {}
   completed = 0  # records from before ops carried their step count optim_steps instead
-  for s in (s for s in ops if s.get("role") != "sampler"):
+  for s in (s for s in ops if s["operation"] != "sample"):
     number = s["step"] if isinstance(s.get("step"), int) else completed
     completed += s["operation"] == "optim_step" and s.get("status") == "succeeded"
     step = found.setdefault(number, {"step": number, "started_at": s["started_at"], "ended_at": s["at"], "ops": {}, "nonfinite": set()})
