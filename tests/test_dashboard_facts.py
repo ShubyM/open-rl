@@ -28,7 +28,7 @@ class RunFactsTest(unittest.TestCase):
       self.enterContext(mock.patch.object(target, "get_state_store", return_value=self.store))
     fleet.cache.clear()
 
-  def facts_of(self, ops=(), workers=(), ledger=None, queued=0, lifecycle="placed", workloads=(), pods=(), samples_queued=0):
+  def facts_of(self, ops=(), workers=(), ledger=None, queued=0, lifecycle="placed", workloads=(), pods=(), samples_queued=0, completed_at=None):
     async def read():
       for record in ops:
         await self.store.append_sample(
@@ -38,7 +38,7 @@ class RunFactsTest(unittest.TestCase):
         await self.store.set_value(key("ledger", "r", event), str(value))
       queues = {request_queue("r"): queued, sampler_queue("r"): samples_queued}  # the in-memory store keeps no queues
       self.store.list_length = mock.AsyncMock(side_effect=queues.get)
-      run = {"run_id": "r", "runtime_id": "r", "lifecycle": lifecycle, "created_at": 0.0, "workloads": list(workloads)}
+      run = {"run_id": "r", "runtime_id": "r", "lifecycle": lifecycle, "created_at": 0.0, "completed_at": completed_at, "workloads": list(workloads)}
       run.update(pods=list(pods), settings={"openrl.fine_tuning_type": "lora", "openrl.trainer_gpus": 1})
       ctx = await facts.context({"observed_at": NOW, "workers": list(workers), "placements": [], "runs": [run]}, run)
       return ctx, facts.summary(ctx), facts.line(ctx)
@@ -97,6 +97,15 @@ class RunFactsTest(unittest.TestCase):
     _, summary, line = self.facts_of(workers=[first, {**first, "id": "b", "started_at": NOW - 880, "heartbeat_at": NOW}])
     restarted = {"pod": "t-0", "stopped_reporting_at": facts.iso(NOW - 905), "restarted_at": facts.iso(NOW - 880)}
     self.assertEqual((summary["relaunches"]["workers"], summary["relaunches"]["logs"]["args"]["pod"], line["relaunches"]), ([restarted], "t-0", 1))
+
+  def test_a_clean_exit_or_a_process_after_the_run_ended_is_not_a_relaunch(self):
+    first = {"id": "a", "pod": "t-0", "role": "trainer", "runtime_id": "r", "started_at": NOW - 1000, "heartbeat_at": NOW - 905}
+    _, summary, line = self.facts_of(workers=[{**first, "phase": "exited"}, {**first, "id": "b", "started_at": NOW - 880, "heartbeat_at": NOW}])
+    self.assertEqual((line["relaunches"], "relaunches" in summary), (0, False))
+    self.setUp()
+    later = {**first, "id": "b", "started_at": NOW - 300, "heartbeat_at": NOW}  # the next run on the shared runtime, same pod name
+    _, summary, line = self.facts_of(workers=[first, later], completed_at=NOW - 500)
+    self.assertEqual((line["relaunches"], "relaunches" in summary), (0, False))
 
   def test_a_slow_sampler_replica_is_named_beside_the_fastest(self):
     sends = [op(NOW - i, "sample", role="sampler", pod=pod, elapsed_seconds=s) for i in range(20) for pod, s in (("fast", 10.0), ("slow", 40.0))]

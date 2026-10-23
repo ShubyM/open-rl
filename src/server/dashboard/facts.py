@@ -63,15 +63,18 @@ def failures(ctx: dict) -> dict | None:
 
 
 def relaunches(ctx: dict) -> list[dict]:
-  """Worker processes that replaced an earlier one in the same pod during this run: a crash or a container restart."""
+  """Worker processes that replaced an earlier one in the same pod during this run: a crash or a container restart. A
+  predecessor that exited cleanly was stopped, and a shared runtime's pod names come back for the runs after this one."""
   by_pod: dict[str, list[dict]] = {}
+  low, high = (ctx["run"]["created_at"] or 0) - 60, ctx["run"].get("completed_at") or float("inf")
   for w in sorted(ctx["workers"], key=lambda w: w["started_at"]):
-    if w.get("pod") and w["started_at"] >= (ctx["run"]["created_at"] or 0) - 60:
+    if w.get("pod") and low <= w["started_at"] <= high:
       by_pod.setdefault(w["pod"], []).append(w)
   found = [
     {"pod": b["pod"], "stopped_at": a.get("heartbeat_at", b["started_at"]), "started_at": b["started_at"]}
     for p in by_pod.values()
     for a, b in zip(p, p[1:])
+    if a.get("phase") != "exited"
   ]
   return sorted(found, key=lambda p: p["started_at"])
 
