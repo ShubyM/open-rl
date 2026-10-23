@@ -215,6 +215,11 @@ class Settings(BaseModel):
     default=None,
     description="lora unless set. A model restored from a checkpoint takes the checkpoint's type.",
   )
+  recipe: Literal["rl", "sft"] | None = Field(
+    default=None,
+    description="What the job runs. rl starts the sampler together with the trainer, so its start-up overlaps the trainer's. "
+    "sft or unset starts it at the first sample or save for sampling.",
+  )
   # The rest apply to full fine-tuning only.
   weight_sync: Literal["delta", "full"] | None = Field(
     default=None,
@@ -523,6 +528,7 @@ async def _extract_and_persist_model_metadata(
     trainer_backend=settings.trainer_backend,
     trainer_gpus=settings.trainer_gpus,
     trainer_cp=settings.trainer_cp,
+    recipe=settings.recipe,
   )
   await persist_model_metadata(state, model_id, meta_obj)
 
@@ -561,13 +567,18 @@ async def enqueue(command: Command) -> str:
   return command.request_id
 
 
-async def launch_worker_and_enqueue(command: Command) -> str:
-  """Ensure the model's dedicated trainer worker exists, then enqueue onto its queue.
+async def launch_worker_and_enqueue(command: Command, start_sampler: bool = False) -> str:
+  """Ensure the model's trainer worker exists, then enqueue onto its queue.
 
   The launcher is idempotent per model_id, and Kubernetes (or the local process
   table) owns the worker's lifecycle from here; there is no separate launch
   queue. Launch failures resolve the future immediately so clients don't long-poll
   a request that can never be served.
+
+  With start_sampler (an RL job), the sampler starts here too rather than at
+  the client's first save or sampling call, so its engine build overlaps the
+  trainer's start-up and the client's dataset loading. An SFT job may never
+  sample, so by default it gets no sampler until it asks for one.
   """
   assert worker_manager is not None, "Worker manager is initialized by the app lifespan"
   request_id = command.request_id
@@ -577,6 +588,8 @@ async def launch_worker_and_enqueue(command: Command) -> str:
     traceback.print_exc()
     await store.set_result(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
     return request_id
+  if start_sampler:
+    await ensure_sampler_launched(command.model_id)
   return await enqueue(command)
 
 
@@ -889,7 +902,7 @@ async def create_model(req: CreateModelRequest, request: Request) -> dict[str, A
     lora_config=meta.lora_config or {},
     full_config=meta.full_config or {},
   )
-  req_id = await launch_worker_and_enqueue(command) if worker_manager is not None else await enqueue(command)
+  req_id = await launch_worker_and_enqueue(command, start_sampler=meta.recipe == "rl") if worker_manager is not None else await enqueue(command)
   return {"request_id": req_id}
 
 
@@ -945,7 +958,7 @@ async def create_model_from_state(req: CreateModelFromStateRequest, request: Req
     restore_optimizer=req.restore_optimizer,
     fine_tuning_type="full" if meta.fine_tuning_type == "full" else "lora",
   )
-  req_id = await launch_worker_and_enqueue(command) if worker_manager is not None else await enqueue(command)
+  req_id = await launch_worker_and_enqueue(command, start_sampler=meta.recipe == "rl") if worker_manager is not None else await enqueue(command)
   return {"request_id": req_id}
 
 

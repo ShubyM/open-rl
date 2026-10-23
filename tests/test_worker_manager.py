@@ -90,7 +90,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
       result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
-    self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
+    self.assertEqual(self.worker_manager.launched_trainer_model_ids, [model_id])
     self.assertEqual(len(self.store.forwarded_requests), 1)
     request = self.store.forwarded_requests[0]
     self.assertEqual(request["op"], "create_model")
@@ -106,7 +106,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
       result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
-    self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
+    self.assertEqual(self.worker_manager.launched_trainer_model_ids, [model_id])
     self.assertEqual(self.store.forwarded_requests, [])
     self.assertEqual(self.store.futures[model_id], {"type": "RequestFailedResponse", "error_message": "boom"})
 
@@ -126,7 +126,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
       )
 
     model_id = result["request_id"]
-    self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
+    self.assertEqual(self.worker_manager.launched_trainer_model_ids, [model_id])
     self.assertEqual(len(self.store.forwarded_requests), 1)
     req_forwarded = self.store.forwarded_requests[0]
     self.assertEqual(req_forwarded["op"], "create_model_from_state")
@@ -158,12 +158,37 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual(self.worker_manager.launched_sampler_model_ids, ["model-x"])
 
+  async def test_an_rl_job_starts_the_sampler_with_the_trainer(self) -> None:
+    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}):
+      result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id, "user_metadata": {"openrl.recipe": "rl"}})
+
+    model_id = result["request_id"]
+    self.assertEqual(self.worker_manager.launched_trainer_model_ids, [model_id])
+    self.assertEqual(self.worker_manager.launched_sampler_model_ids, [model_id])
+    self.assertEqual(len(self.store.forwarded_requests), 1)
+
+  async def test_without_the_rl_recipe_the_sampler_waits_for_its_first_use(self) -> None:
+    for user_metadata in ({}, {"openrl.recipe": "sft"}):
+      with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}):
+        await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id, "user_metadata": user_metadata})
+
+    self.assertEqual(len(self.worker_manager.launched_trainer_model_ids), 2)
+    self.assertEqual(self.worker_manager.launched_sampler_model_ids, [])
+
+  async def test_a_failed_trainer_launch_starts_no_sampler(self) -> None:
+    self.worker_manager.error = RuntimeError("boom")
+
+    with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true", "SAMPLING_BACKEND": "vllm"}), patch("server.api_server.traceback.print_exc"):
+      await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id, "user_metadata": {"openrl.recipe": "rl"}})
+
+    self.assertEqual(self.worker_manager.launched_sampler_model_ids, [])
+
   async def test_create_model_launches_trainer_when_worker_manager_present(self) -> None:
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "false"}):
       result = await self.post("create_model", {"base_model": "base-model", "session_id": self.session_id})
 
     model_id = result["request_id"]
-    self.assertEqual(self.worker_manager.launched_model_ids, [model_id])
+    self.assertEqual(self.worker_manager.launched_trainer_model_ids, [model_id])
     self.assertEqual(len(self.store.forwarded_requests), 1)
 
 
