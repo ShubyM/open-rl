@@ -2,6 +2,7 @@
 Results land in the `open_rl:future:<id>` list that `retrieve_future` already reads."""
 
 import json
+from array import array
 from typing import Any
 
 import redis.asyncio as redis
@@ -13,6 +14,17 @@ PENDING_TTL_SECONDS = 3 * 24 * 3600
 
 def stream_key(pool: str) -> str:
   return f"open_rl:sampling:{pool}"
+
+
+def compact_prompt(record: dict[str, Any]) -> dict[str, Any]:
+  """A json.loads object_hook that holds a prompt as array('I'), four bytes a token against about 36 as a list of ints,
+  and drops each list as soon as its record is read. A prompt array('I') cannot hold stays the list, for vLLM to refuse."""
+  if isinstance(tokens := record.get("prompt_token_ids"), list):
+    try:
+      record["prompt_token_ids"] = array("I", tokens)
+    except (OverflowError, TypeError):
+      pass
+  return record
 
 
 def idempotency_key(pool: str, key: str) -> str:
@@ -45,9 +57,13 @@ class SamplingStore:
 
     return await self.redis.transaction(add, key, value_from_callable=True)
 
-  async def pending(self, pool: str, limit: int | None = 1000) -> list[dict[str, Any]]:
-    entries = await self.redis.xrange(stream_key(pool), count=limit)
-    return [{**json.loads(fields["record"]), "entry_id": entry_id} for entry_id, fields in entries]
+  async def pending(self, pool: str, limit: int | None = 1000, after: str = "0-0") -> list[dict[str, Any]]:
+    """Pending records in accept order. The dispatcher holds every one until its result is set, so prompts come back compact."""
+    entries = await self.redis.xrange(stream_key(pool), min=f"({after}", count=limit)
+    return [{**json.loads(fields["record"], object_hook=compact_prompt), "entry_id": entry_id} for entry_id, fields in entries]
+
+  async def wait_for_new(self, pool: str, after: str, timeout_ms: int) -> None:
+    await self.redis.xread({stream_key(pool): after}, count=1, block=timeout_ms)
 
   async def set_result(self, record: dict[str, Any], result: dict[str, Any]) -> bool:
     """Save the first final result and drop the pending entry. False if it already has one."""
