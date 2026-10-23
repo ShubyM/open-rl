@@ -126,14 +126,16 @@ finite metric and a `session.id` attribute. An OpenTelemetry Collector can
 forward those events to the API server's `POST /api/v1/otlp/logs`, which keeps
 one row per step per session in `open_rl:client_steps:<session>`.
 `/runs/{id}/steps` reads these rows first, so it needs no metrics backend and
-does not rebuild steps from gauges. Add an exporter to the collector's logs
-pipeline:
+does not rebuild steps from gauges. The collector in `k8s/deploy/telemetry`
+does this; another collector needs an exporter in its logs pipeline. The route
+does not decompress request bodies, so turn off the exporter's default gzip:
 
 ```yaml
 exporters:
   otlphttp/openrl:
     logs_endpoint: http://open-rl-api-server-service:8000/api/v1/otlp/logs
     encoding: json
+    compression: none
 service:
   pipelines:
     logs:

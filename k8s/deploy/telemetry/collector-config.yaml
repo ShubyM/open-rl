@@ -28,6 +28,12 @@ exporters:
     format: json
     append: true
     flush_interval: 1s
+  # The API server keeps each step's event, which the run's Metrics tab reads.
+  # It does not decompress request bodies, and the exporter gzips by default.
+  otlphttp/openrl:
+    logs_endpoint: http://open-rl-api-server-service:8000/api/v1/otlp/logs
+    encoding: json
+    compression: none
 
 extensions:
   health_check:
@@ -43,4 +49,4 @@ service:
     logs:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [file/events]
+      exporters: [file/events, otlphttp/openrl]
