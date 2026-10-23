@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-rl-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: open-rl-collector
+  template:
+    metadata:
+      labels:
+        app: open-rl-collector
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - name: collector
+        image: otel/opentelemetry-collector-contrib:0.147.0
+        args: ["--config=/etc/otelcol-contrib/collector-config.yaml"]
+        ports:
+        - name: otlp-http
+          containerPort: 4318
+        - name: metrics
+          containerPort: 8889
+        - name: health
+          containerPort: 13133
+        readinessProbe:
+          httpGet:
+            path: /
+            port: health
+        livenessProbe:
+          httpGet:
+            path: /
+            port: health
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: [ALL]
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otelcol-contrib
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: open-rl-telemetry-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-rl-collector
+spec:
+  type: ClusterIP
+  selector:
+    app: open-rl-collector
+  ports:
+  - name: otlp-http
+    port: 4318
+    targetPort: otlp-http
+  - name: metrics
+    port: 8889
+    targetPort: metrics
