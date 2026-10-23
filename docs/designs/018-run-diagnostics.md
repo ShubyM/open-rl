@@ -67,6 +67,10 @@ too when `OPEN_RL_INSPECTION_API=true`. Every route is a `GET` under
 Bounds are ISO-8601 or a span such as `1h`, at most seven days, and default to
 the last 30 minutes.
 
+The `/runs/{id}` routes, `/activity` and `/logs` also take a session id in place
+of a run id. A session with one run answers for that run. A session with several
+runs answers 409 and names them.
+
 ### Run facts
 
 `/runs/{id}/summary` returns each block only when it has content. An absent

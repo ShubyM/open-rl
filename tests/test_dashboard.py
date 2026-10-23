@@ -34,6 +34,15 @@ class ApiTest(unittest.TestCase):
     self.assertEqual(self.client.get("/api/v1/inspect/runs/missing/summary").status_code, 404)
     self.assertTrue(all(set(methods) == {"get"} for methods in self.client.get("/openapi.json").json()["paths"].values()))
 
+  def test_a_session_id_names_its_one_run_and_a_session_with_several_runs_is_refused(self):
+    self.snapshot["runs"] = [{**RUN, "session_ids": ["s1", "s2"]}, {**RUN, "run_id": "r2", "runtime_id": "r2", "session_ids": ["s2"]}]
+    by_session = self.client.get("/api/v1/inspect/runs/s1/summary").json()
+    self.assertEqual((by_session["run_id"], by_session["steps"]), ("r1", 1))
+    refused = self.client.get("/api/v1/inspect/runs/s2/summary")
+    self.assertEqual(refused.status_code, 409)
+    self.assertIn("r1, r2", refused.text)
+    self.assertEqual(self.client.get("/api/v1/inspect/runs/s3/summary").status_code, 404)
+
 
 if __name__ == "__main__":
   unittest.main()
