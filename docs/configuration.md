@@ -128,7 +128,8 @@ one row per step per session in `open_rl:client_steps:<session>`.
 `/runs/{id}/steps` reads these rows first, so it needs no metrics backend and
 does not rebuild steps from gauges. The collector in `k8s/deploy/telemetry`
 does this; another collector needs an exporter in its logs pipeline. The route
-does not decompress request bodies, so turn off the exporter's default gzip:
+accepts the exporter's default gzip; `compression: none` spares the API server
+the decompression:
 
 ```yaml
 exporters:

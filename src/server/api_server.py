@@ -9,6 +9,7 @@ import re
 import time
 import traceback
 import uuid
+import zlib
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any, Literal
@@ -1392,10 +1393,24 @@ async def run_logs(run_id: str, body: telemetry.LogRequest):
   return await telemetry.ingest_logs(state, run_id, body)
 
 
+OTLP_BODY_LIMIT = 64 << 20  # bytes once decompressed; a small body can inflate without bound
+
+
 @app.post("/api/v1/otlp/logs")
-async def otlp_logs(body: dict):
-  """OTLP/HTTP JSON logs from the collector; the client's per-step metric events are kept by session."""
-  await telemetry.ingest_client_steps(state, body)
+async def otlp_logs(request: Request):
+  """OTLP/HTTP JSON logs from the collector, gzipped as its exporter sends them by default or plain; the client's per-step
+  metric events are kept by session."""
+  raw = await request.body()
+  try:
+    if request.headers.get("content-encoding", "").lower() == "gzip":
+      inflate = zlib.decompressobj(16 + zlib.MAX_WBITS)
+      raw = inflate.decompress(raw, OTLP_BODY_LIMIT)
+      if inflate.unconsumed_tail:
+        raise HTTPException(413, f"OTLP body over {OTLP_BODY_LIMIT >> 20} MiB once decompressed")
+    body = json.loads(raw)
+  except (zlib.error, ValueError) as exc:
+    raise HTTPException(400, "Send OTLP logs as JSON (encoding: json), gzipped or not") from exc
+  await telemetry.ingest_client_steps(state, body if isinstance(body, dict) else {})
   return {}
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import io
 import json
 import os
@@ -643,6 +644,17 @@ class TelemetryTest(ApiServerTest):
     self.assertEqual((error["reason"], error["at"]), ("SDK api_status_error", 1792411200.0))
     self.assertIn("invalid key", error["message"])
     self.assertNotIn("tml-secret", repr(error))
+
+  def test_the_collector_s_default_gzip_body_is_accepted(self) -> None:
+    from tests.test_dashboard import step_event
+
+    body = gzip.compress(json.dumps(step_event(3, 0.5, 10**18)).encode())
+    response = self.client.post("/api/v1/otlp/logs", content=body, headers={"Content-Type": "application/json", "Content-Encoding": "gzip"})
+    self.assertEqual(response.status_code, 200)
+    [row] = asyncio.run(api_server.state.read_samples(api_server.telemetry.key("client_steps", "sess-1")))
+    self.assertEqual((row["step"], row["metrics"]["env/all/reward/total"]), (3, 0.5))
+    plain = self.client.post("/api/v1/otlp/logs", json=step_event(4, 0.6, 10**18))
+    self.assertEqual(plain.status_code, 200)
 
   def test_a_sampling_session_on_a_bare_base_model_attaches_no_model(self) -> None:
     session_id = self.post("create_session", {}).json()["session_id"]

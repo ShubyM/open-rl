@@ -47,7 +47,7 @@ Pages show their last response while they refresh.
 
 A training loop that uses the cookbook logger sends its metrics by appending `OTelLogger` (`examples/common/otel_logger.py`); see [custom loop telemetry](../examples/README.md#custom-loop-telemetry). Each `log_metrics` call emits one `openrl.training.metrics` log event carrying the step and every finite metric, and updates the `openrl_client_metric` gauges. The client sends both to an OpenTelemetry Collector named by `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
-On GKE, `kubectl apply -k k8s/deploy/telemetry` deploys the Collector as `open-rl-collector` on port 4318 in `openrl-system`, with no public endpoint; port-forward it for a client outside the cluster. It forwards the log events to the API server's `POST /api/v1/otlp/logs`, which keeps one row per step per session (`open_rl:client_steps:<session>`), so `/steps` reads them with no metrics backend and no step reconstruction. It also exports the gauges to Managed Prometheus. Another collector needs this exporter in its logs pipeline, with gzip off because the route does not decompress request bodies:
+On GKE, `kubectl apply -k k8s/deploy/telemetry` deploys the Collector as `open-rl-collector` on port 4318 in `openrl-system`, with no public endpoint; port-forward it for a client outside the cluster. It forwards the log events to the API server's `POST /api/v1/otlp/logs`, which keeps one row per step per session (`open_rl:client_steps:<session>`), so `/steps` reads them with no metrics backend and no step reconstruction. It also exports the gauges to Managed Prometheus. Another collector needs this exporter in its logs pipeline. The route accepts the exporter's default gzip; `compression: none` spares the API server the decompression:
 
 ```yaml
 exporters:
