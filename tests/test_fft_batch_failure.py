@@ -118,7 +118,7 @@ class FailedAnswerRecordTest(unittest.TestCase):
 
     async def serve():
       async with telemetry.serving("trainer", "run-a") as worker:
-        telemetry.count_request("popped", "run-a")  # still in flight when the process exits
+        telemetry.record("run-a", "popped")  # still in flight when the process exits
         with patch("os._exit", side_effect=SystemExit), self.assertRaises(SystemExit):
           await proc.run_once()
         record = json.loads(await self.state.get_value(telemetry.key("worker", worker.record["id"])) or "{}")

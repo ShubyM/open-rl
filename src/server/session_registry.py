@@ -34,7 +34,7 @@ from collections import defaultdict
 from typing import Any
 
 from server.store import StateStore
-from server.telemetry import TTL_SECONDS, best_effort, key, redact, write
+from server.telemetry import TTL_SECONDS, best_effort, key, log_event, redact, write
 
 
 class SessionRegistry:
@@ -57,8 +57,13 @@ class SessionRegistry:
 
   @best_effort
   def note(self, session_id: str, *, model_id: str | None = None, metadata: dict | None = None) -> None:
-    """A session's creation, heartbeat or model attach, kept on its record."""
+    """A session's creation, heartbeat or model attach, kept on its record. Creation and attach also log a line; a
+    heartbeat, every ten seconds, only moves last_seen_at."""
     write(self.update_record(session_id, model_id, metadata))
+    if metadata is not None:
+      log_event("session_created", {"session_id": session_id, "metadata": metadata}, session_id=session_id)
+    if model_id:
+      log_event("model_attached", {"session_id": session_id, "model_id": model_id}, run_id=model_id, session_id=session_id)
 
   async def update_record(self, session_id: str, model_id: str | None, metadata: dict | None) -> None:
     record_key, now = key("session_record", session_id), time.time()

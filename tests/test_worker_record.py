@@ -79,7 +79,7 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
     with mock.patch.object(telemetry, "SAMPLE_LIMIT", 3):
       for i in range(6):  # a shared sampler's requests name the base model's queue and the run they sample for
         request = {"op": "sample", "model_id": "base", "logical_run_id": "r", "request_id": f"s{i}"}
-        telemetry.record_command(request, "sampler", "base", 0.0, "EngineDied" if i % 2 else None)
+        telemetry.op_finished(request, "sampler", "base", 0.0, "EngineDied" if i % 2 else None)
     trainer = await self.recorded("r")
     self.assertEqual(
       [(s["operation"], s["status"], s["step"]) for s in trainer],

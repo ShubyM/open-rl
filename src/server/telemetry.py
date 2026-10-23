@@ -1,5 +1,8 @@
 """The records OpenRL keeps about its own runs, written where things happen, for the inspection API to read.
 
+A run's events go through record(), which keeps them in the store and also prints each as one JSON line labelled with
+the run, for history. Sessions, placements and SDK events print the same lines through log_event().
+
 Telemetry never changes what it observes. Every hook swallows its own errors, every store write runs in the background
 and is dropped after WRITE_SECONDS, and no hook changes what an op returns or raises.
 """
@@ -233,9 +236,9 @@ def popped(requests: list[dict]) -> None:
     return
   for request in requests:
     if request.get("request_id") and request.get("op") != "delete_model":
-      run_id = run_of(request)
-      current.outstanding[request["request_id"]] = Outstanding(operation_name(request, current.record["role"]), run_id, time.time())
-      count_request("popped", run_id)
+      run_id, op = run_of(request), operation_name(request, current.record["role"])
+      current.outstanding[request["request_id"]] = Outstanding(op, run_id, time.time())
+      record(run_id, "popped", request_id=request["request_id"], op=op)
 
 
 @best_effort
@@ -244,10 +247,10 @@ def answered(request_id: str, result: dict | None = None) -> None:
   command record here, so every failed answer has one."""
   if current is None or (entry := current.outstanding.pop(request_id, None)) is None:
     return
-  count_request("answered", entry.run_id)
+  record(entry.run_id, "answered", request_id=request_id, op=entry.op)
   if not entry.observed and (result or {}).get("type") == FAILED:
     request = {"op": entry.op, "request_id": request_id, "logical_run_id": entry.run_id}
-    record_command(request, current.record["role"], current.record["runtime_id"], entry.since, FAILED)
+    op_finished(request, current.record["role"], current.record["runtime_id"], entry.since, FAILED)
 
 
 # Command records
@@ -285,9 +288,9 @@ async def observe_operation(request: dict, role: str, runtime_id: str | None, ca
   try:
     result = await call()
   except Exception as error:
-    record_command(request, role, runtime_id, started_at, type(error).__name__)
+    op_finished(request, role, runtime_id, started_at, type(error).__name__)
     raise
-  record_command(request, role, runtime_id, started_at, result=result)
+  op_finished(request, role, runtime_id, started_at, result=result)
   return result
 
 
@@ -300,8 +303,9 @@ def finite(metrics: dict | None) -> dict[str, float]:
   return {k: v for k, v in numbers(metrics).items() if math.isfinite(v)}
 
 
-def command_record(request: dict, role: str, runtime_id: str | None, started_at: float, error_type: str | None, result: dict) -> dict:
+def command_record(request: dict, role: str, runtime_id: str | None, started_at: float, error_type: str | None, result) -> dict:
   """How one op went. It failed with error_type, or as its result says. No payload, output or error message is kept."""
+  result = result if isinstance(result, dict) else {}
   if error_type is None and result.get("type") == FAILED:
     error_type = FAILED
   now, values = time.time(), numbers(result.get("metrics"))
@@ -326,31 +330,42 @@ def command_record(request: dict, role: str, runtime_id: str | None, started_at:
 
 
 @best_effort
-def record_command(request: dict, role: str, runtime_id: str | None, started_at: float, error_type: str | None = None, result=None) -> None:
-  """Keep one op's command record, and for a trainer op the run's failure and step counts. Every sample is counted, with
-  the time of the last; one a vLLM sampler answered keeps no record."""
-  if not (run_id := run_of(request)):
-    return
-  record = command_record(request, role, runtime_id, started_at, error_type, result if isinstance(result, dict) else {})
-  store = get_state_store()
-  if record["operation"] == "sample":
+def op_finished(request: dict, role: str, runtime_id: str | None, started_at: float, error_type: str | None = None, result=None) -> None:
+  """Record how one op went. A sample a vLLM sampler answered is only counted, with the time of the last, since vLLM's own
+  metrics time what it answers."""
+  op = command_record(request, role, runtime_id, started_at, error_type, result)
+  if op["operation"] == "sample" and role == "sampler" and op["status"] == "succeeded":
+    count_sample(op["run_id"], op["at"])
+  else:
+    record(op["run_id"], "op", **op)
+
+
+def count_sample(run_id: str | None, at: float) -> None:
+  if run_id:
+    store = get_state_store()
     write(store.increment(key("sampled", run_id), TTL_SECONDS))
-    write(store.set_value(key("sampled_at", run_id), str(record["at"]), ttl_seconds=TTL_SECONDS))
-    # vLLM's own metrics time what it answers. A torch trainer's samples have nothing else. Samples keep their own list.
-    if record["status"] == "failed" or role != "sampler":
-      write(store.append_sample(key("operations", run_id, "samples"), record, SAMPLE_LIMIT, TTL_SECONDS))
+    write(store.set_value(key("sampled_at", run_id), str(at), ttl_seconds=TTL_SECONDS))
+
+
+def keep_op(run_id: str, op: dict) -> None:
+  """Keep one op's command record, and for a trainer op the run's failure and step counts."""
+  store = get_state_store()
+  if op["operation"] == "sample":
+    count_sample(run_id, op["at"])
+    # Samples keep their own list, so a run's sampling never evicts its training ops.
+    write(store.append_sample(key("operations", run_id, "samples"), op, SAMPLE_LIMIT, TTL_SECONDS))
     return
   steps = run_steps.get(run_id)
   # done_here is taken before this op's own step is counted below. The write may wait WRITE_SECONDS on the step read.
-  write(append_trainer_op(record, steps, steps.done_here if steps else 0), 2 * WRITE_SECONDS)
+  write(append_trainer_op(op, steps, steps.done_here if steps else 0), 2 * WRITE_SECONDS)
   # The few records a run's one-line summary reads instead of its command history.
-  if record["status"] == "failed":
-    count_request("failed", run_id)
-  elif record["operation"] == "optim_step":
+  if op["status"] == "failed":
+    count_request(run_id, "failed")
+  elif op["operation"] == "optim_step":
     if steps is not None:
       steps.done_here += 1
     write(store.increment(key("steps", run_id), TTL_SECONDS))
-    write(store.append_sample(key("step_times", run_id), record["at"], STEP_TIMES, TTL_SECONDS))
+    write(store.append_sample(key("step_times", run_id), op["at"], STEP_TIMES, TTL_SECONDS))
 
 
 async def append_trainer_op(record: dict, steps: RunSteps | None, done_here: int) -> None:
@@ -360,12 +375,36 @@ async def append_trainer_op(record: dict, steps: RunSteps | None, done_here: int
   await get_state_store().append_sample(key("operations", record["run_id"]), record, SAMPLE_LIMIT, TTL_SECONDS)
 
 
-@best_effort
-def count_request(event: str, run_id: str | None) -> None:
+def count_request(run_id: str, event: str) -> None:
   """Count one more of the run's requests reaching event, which is enqueued, popped, answered or failed. A request
   enqueued but never popped shows up as a gap between the counts."""
-  if run_id:
-    write(get_state_store().increment_field(key("ledger", run_id), event, TTL_SECONDS))
+  write(get_state_store().increment_field(key("ledger", run_id), event, TTL_SECONDS))
+
+
+# Run events
+
+
+@best_effort
+def record(run_id: str | None, kind: str, /, **fields) -> None:
+  """Keep one event about a run and log it. kind is enqueued, popped or answered, which count the run's requests, or op,
+  whose fields are a command record from command_record. The store write runs in the background."""
+  if not run_id:
+    return
+  with suppress(Exception):
+    if kind == "op":
+      keep_op(run_id, fields)
+    else:
+      count_request(run_id, kind)
+  log_event(kind, fields, run_id=run_id)
+
+
+@best_effort
+def log_event(kind: str, fields: dict, *, run_id: str | None = None, session_id: str | None = None, severity: str | None = None) -> None:
+  """Print one event as a JSON line, labelled with its run or session, for the year of history Cloud Logging keeps. The
+  inspection API never reads these lines. A failed op logs as an error."""
+  labels = {"openrl_source": "telemetry"} | ({"openrl_run_id": run_id} if run_id else {}) | ({"openrl_session_id": session_id} if session_id else {})
+  line = {"severity": severity or ("ERROR" if fields.get("status") == "failed" else "INFO"), "message": f"telemetry {kind}"}
+  print(json.dumps(line | redact(fields) | {"logging.googleapis.com/labels": labels}, default=str), flush=True)
 
 
 # Placement records
@@ -419,6 +458,8 @@ async def record_placements(store, workloads: list[dict]) -> None:
       held = any(r["released_at"] is None for r in merged)
       if merged != records:
         await store.replace_samples(records_key, merged, TTL_SECONDS)
+        for changed in (p for p in merged if p not in records):  # placed, moved or released
+          log_event("placement", changed, run_id=model_id)
       elif held and TTL_SECONDS:  # a placement held longer than the TTL must outlive it
         await store.expire(records_key, TTL_SECONDS)
       if held and model_id not in opened:
@@ -437,11 +478,11 @@ def ingest_sdk_events(store, body: dict) -> None:
   session_id, events = body.get("session_id"), body.get("events")
   if not isinstance(events, list):
     return
+  session_id = session_id if isinstance(session_id, str) and session_id else None
   for event in [redact(e) for e in events if isinstance(e, dict)]:
     severity = str(event.get("severity") or "INFO").upper()
-    message = f"tinker {event.get('event_name') or event.get('event')}"
-    print(json.dumps({"severity": severity, "message": message, **context, "event": event}, default=str), flush=True)
-    if severity in ("ERROR", "CRITICAL") and isinstance(session_id, str) and session_id:
+    log_event("sdk_event", {**context, "event": event}, session_id=session_id, severity=severity)
+    if severity in ("ERROR", "CRITICAL") and session_id:
       write(store.append_sample(key("sdk_errors", session_id), sdk_error(event, severity), SDK_ERRORS, TTL_SECONDS))
 
 
