@@ -176,12 +176,13 @@ def logs_filter(run: dict, start: str, end: str, severity: str | None, q: str, p
   config = configuration()
   labels = {"project_id": config["project"], "location": config["location"], "cluster_name": config["cluster"], "namespace_name": kube.namespace()}
   clauses = ['resource.type="k8s_container"', *(f"resource.labels.{label}={json.dumps(value)}" for label, value in labels.items())]
+  client = f"(labels.{RUN_LABEL}={json.dumps(run['run_id'])} AND labels.{SOURCE_LABEL}={json.dumps(CLIENT)})"
+  owner = f"{OWNER}={json.dumps(owner_id(run['runtime_id']).rstrip('-'))}"  # the scheduler trims a truncated label value as well
   if pod and pod != CLIENT:
-    clauses.append(f"resource.labels.pod_name={json.dumps(pod)}")
+    # One of the run's pods, never any pod in the namespace: a run id must not open another run's logs.
+    clauses += [owner, f"resource.labels.pod_name={json.dumps(pod)}"]
   else:
-    client = f"(labels.{RUN_LABEL}={json.dumps(run['run_id'])} AND labels.{SOURCE_LABEL}={json.dumps(CLIENT)})"
-    owner = owner_id(run["runtime_id"]).rstrip("-")  # the scheduler trims a truncated label value as well
-    clauses.append(client if pod == CLIENT else f"({OWNER}={json.dumps(owner)} OR {client})")
+    clauses.append(client if pod == CLIENT else f"({owner} OR {client})")
   clauses += [f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
   if severity in RELABELED:
     stderr = json.dumps(f"projects/{config['project']}/logs/stderr")

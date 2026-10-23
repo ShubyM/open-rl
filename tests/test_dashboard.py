@@ -276,7 +276,9 @@ class LogsTest(unittest.TestCase):
     self.assertIn('(labels.openrl_run_id="r1" AND labels.openrl_source="client")', text)
     self.assertIn('severity="DEFAULT"', text)
     self.assertIn('textPayload:"oom" OR jsonPayload.message:"oom"', text)
-    self.assertNotIn("timeslice_io/owner", sources.logs_filter(LOG_RUN, *BOUNDS, None, "", pod="orw-a"))
+    one_pod = sources.logs_filter(LOG_RUN, *BOUNDS, None, "", pod="orw-other-run")  # any pod name in the namespace
+    self.assertIn('resource.labels.pod_name="orw-other-run"', one_pod)
+    self.assertIn('labels."k8s-pod/timeslice_io/owner"="qwen-qwen3-8b"', one_pod)  # still only the run's own pods
 
   def test_stderr_lines_take_the_level_they_print(self):
     for text, severity in (
