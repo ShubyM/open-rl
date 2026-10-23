@@ -43,10 +43,12 @@ async def follow(api, kind: str, resource, namespace: str | None) -> None:
       code = exc.status.code if exc.response is None else exc.response.status_code
       if code == 410:
         continue
-      if code == 404:  # no scheduler CRD on a local stack
+      if code == 404:  # no scheduler CRD on a local stack; it is not about to appear
         watched[kind], watch_errors[kind] = None, None
-      else:
-        watch_errors[kind] = f"{kind} read failed: {exc}"
+        attempted[kind].set()
+        await asyncio.sleep(RESYNC_SECONDS)
+        continue
+      watch_errors[kind] = f"{kind} read failed: {exc}"
     except Exception as exc:
       watch_errors[kind] = f"{kind} read failed: {exc}"
     attempted[kind].set()
@@ -54,7 +56,8 @@ async def follow(api, kind: str, resource, namespace: str | None) -> None:
 
 
 def watch(kinds=tuple(watch_errors)) -> None:
-  """Start each kind's watch once, on the running loop, from the in-cluster service account or else the kubeconfig."""
+  """Start each kind's watch on the running loop, unless it is running, from the in-cluster service account or else the
+  kubeconfig. A watch that ended, with a lifespan or a loop that closed, starts again."""
   from lightkube import AsyncClient
   from lightkube.resources.core_v1 import Node, Pod
 
@@ -63,7 +66,7 @@ def watch(kinds=tuple(watch_errors)) -> None:
   global client
   client = client or AsyncClient()
   scopes = {"pods": (Pod, namespace()), "nodes": (Node, None), "workloads": (Workload, namespace())}
-  for kind in set(kinds) - set(watchers):
+  for kind in (k for k in set(kinds) if k not in watchers or watchers[k].done()):
     watchers[kind] = asyncio.create_task(follow(client, kind, *scopes[kind]))
 
 
