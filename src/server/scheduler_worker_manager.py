@@ -222,6 +222,7 @@ class SchedulerWorkerManager:
     if not os.getenv("REDIS_URL"):
       raise RuntimeError("OPEN_RL_ENABLE_FFT=true requires REDIS_URL so launched workers can share queues and futures")
     self.namespace = kube.namespace()
+    self.watching = api is None  # an injected client, as in tests, is read directly
     if api is None:
       api = Client()
       kube.watch(["workloads"])
@@ -298,7 +299,11 @@ class SchedulerWorkerManager:
     return [worker for item in self.workloads() if (worker := workload_worker(item, now))["owner"] == owner]
 
   def workloads(self) -> list[dict[str, Any]]:
-    """Our Workload objects, from the process's watch."""
+    """Our Workload objects, from the process's watch or the injected client."""
+    if not self.watching:
+      return [
+        item.to_dict() for item in self.api.list(Workload, namespace=self.namespace, labels={"app.kubernetes.io/managed-by": "open-rl-api-server"})
+      ]
     kube.wait(["workloads"])
     if error := kube.watch_errors["workloads"]:
       raise RuntimeError(error)

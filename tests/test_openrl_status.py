@@ -6,12 +6,11 @@ port-forward would see, without a cluster."""
 
 import asyncio
 import os
-import threading
 import unittest
 from collections import defaultdict
 from unittest.mock import patch
 
-from server import api_server, kube
+from server import api_server
 from server.scheduler_worker_manager import SchedulerWorkerManager, worker_state
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStateStore, InMemoryStore
@@ -251,12 +250,9 @@ class SchedulerViewTest(unittest.TestCase):
       ),
       "fft-job-trainer": workload("fft-job-trainer", "trainer", "job", "job", {"phase": "Pending", "reason": "NoCapacity: needs 40Gi"}),
     }
-    # The watch has answered with these Workloads.
-    self.enterContext(patch.dict(kube.watched, {"workloads": watched}))
-    self.enterContext(patch.dict(kube.watch_errors, {"workloads": None}))
-    self.enterContext(patch.dict(kube.attempted, {"workloads": threading.Event()}))
-    kube.attempted["workloads"].set()
-    self.manager = SchedulerWorkerManager(FakeClient())
+    api = FakeClient()
+    api.existing.update(watched)
+    self.manager = SchedulerWorkerManager(api)
 
   def test_workers_come_from_workload_status_alone(self):
     by_name = {w["workload"]: w for w in self.manager.inspect_owner("base")}

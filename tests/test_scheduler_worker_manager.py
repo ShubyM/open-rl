@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import unittest
 from typing import Any
 from unittest.mock import patch
@@ -60,6 +61,15 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     s = InMemoryStateStore()
     s.kv_store[f"open_rl:model_meta:{model_id}"] = json.dumps(meta)
     return s
+
+  def test_an_injected_clients_workloads_are_read_from_it_without_waiting_on_a_watch(self) -> None:
+    s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("job-lora-1", "trainer")
+    started = time.monotonic()
+    found = self.manager.workloads()
+    self.assertLess(time.monotonic() - started, 1)
+    self.assertEqual([w["metadata"]["name"] for w in found], ["lora-qwen-qwen2-5-0-5b-0-trainer"])
 
   def test_lora_trainer_and_sampler_share_an_owner(self) -> None:
     s = self.store_with("job-lora-1", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
