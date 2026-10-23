@@ -8,6 +8,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	openrlv1alpha1 "github.com/gke-labs/open-rl/scheduler/controller/api/v1alpha1"
 )
@@ -102,10 +106,61 @@ func TestPlacementRecordsGPUsUntilTeardown(t *testing.T) {
 	}
 }
 
-// Abandoning a wedged claim releases the placement.
-func TestAbandonedClaimReleasesThePlacement(t *testing.T) {
-	r, _ := placedWorker(t)
-	markUnschedulable(t, r, "w-a", time.Now().Add(-2*wedgeGracePeriod))
+// A placed worker stops holding its GPUs as soon as the controller sees its
+// claim abandoned or gone, whether re-placement waits on the old claim's
+// deletion or finds no capacity.
+func TestLostClaimReleasesBeforeRePlacement(t *testing.T) {
+	ctx := context.Background()
+	cases := map[string]func(t *testing.T, r *WorkloadReconciler, claimName string){
+		"wedged claim abandoned": func(t *testing.T, r *WorkloadReconciler, _ string) {
+			markUnschedulable(t, r, "w-a", time.Now().Add(-2*wedgeGracePeriod))
+		},
+		"old claim still terminating": func(t *testing.T, r *WorkloadReconciler, claimName string) {
+			var claim resourcev1.ResourceClaim
+			must(t, r.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: claimName}, &claim))
+			claim.Finalizers = append(claim.Finalizers, "test.openrl.io/hold")
+			must(t, r.Update(ctx, &claim))
+			must(t, r.Delete(ctx, &claim))
+		},
+		"no capacity left": func(t *testing.T, r *WorkloadReconciler, claimName string) {
+			must(t, r.Delete(ctx, &resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: claimName}}))
+			var node corev1.Node
+			must(t, r.Get(ctx, types.NamespacedName{Name: testNode}, &node))
+			node.Labels[NodeLabelEnabled] = "false"
+			must(t, r.Update(ctx, &node))
+		},
+	}
+	for name, loseClaim := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, claimName := placedWorker(t)
+			loseClaim(t, r, claimName)
+			runReconcile(t, r, "w-a")
+			expectReleased(t, r)
+		})
+	}
+}
+
+// A lost dedicated claim is re-cut under the same name. The GPUs reported for
+// the worker are the new allocation's, even though its pod kept its node.
+func TestRecutClaimReportsItsOwnGPUs(t *testing.T) {
+	ctx := context.Background()
+	r, claimName := placedWorker(t)
+	pod := getPod(t, r, "orw-w-a")
+	pod.Spec.NodeName = testNode
+	must(t, r.Update(ctx, pod))
+	must(t, r.Delete(ctx, &resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: claimName}}))
 	runReconcile(t, r, "w-a")
-	expectReleased(t, r)
+	if again := claimOf(t, r, "w-a"); again != claimName {
+		t.Fatalf("re-cut claim = %q, want the same name %q", again, claimName)
+	}
+	allocateClaimOn(t, r, claimName, "gpu-1")
+	runReconcile(t, r, "w-a")
+
+	want := []string{"model-a trainer orw-w-a node-a GPU-gpu-1=1"}
+	if status := getWorker(t, r, "w-a").Status; !slices.Equal(status.GPUUUIDs, []string{"GPU-gpu-1"}) || status.ReleasedAt != nil {
+		t.Fatalf("status = uuids %v releasedAt %v, want GPU-gpu-1 and not released", status.GPUUUIDs, status.ReleasedAt)
+	}
+	if got := heldGPUs(t, r); !slices.Equal(got, want) {
+		t.Fatalf("series = %v, want %v", got, want)
+	}
 }
