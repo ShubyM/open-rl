@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from server import telemetry
+from server.dashboard import facts
 from server.store import InMemoryStateStore
 
 
@@ -146,8 +147,8 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
       telemetry.popped([{"request_id": "a", "model_id": "r", "op": "optim_step"}, {"request_id": "b", "model_id": "r", "op": "optim_step"}])
       telemetry.answered("a")
       await asyncio.gather(*list(telemetry.writes))
-    counts = [await self.store.get_value(telemetry.key("ledger", "r", event)) for event in ("popped", "answered")]
-    self.assertEqual(counts, ["2", "1"])
+    counts = await facts.ledger(self.store, "r")
+    self.assertEqual(counts, {"popped": 2, "answered": 1})
 
   async def test_store_failures_do_not_change_the_operation_result(self) -> None:
     result = {"type": "ok", "output": "private tokens"}

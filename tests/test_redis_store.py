@@ -16,6 +16,7 @@ import redis as sync_redis
 import redis.asyncio as redis
 
 from server import telemetry
+from server.dashboard import facts, fleet
 from server.store import InMemoryStateStore, RedisStateStore, RedisStore
 
 TEST_REDIS_URL = os.getenv("OPEN_RL_TEST_REDIS_URL")
@@ -129,6 +130,31 @@ class RedisFutureTest(SampleStoreContract, unittest.IsolatedAsyncioTestCase):
   async def asyncTearDown(self) -> None:
     await self.store.redis.aclose()
     self.state.sync_redis.close()
+
+  async def test_a_runs_request_counters_expire_together(self) -> None:
+    async def count(event: str) -> None:
+      telemetry.count(event, "r")
+      await asyncio.gather(*list(telemetry.writes))
+
+    run = {"run_id": "r", "runtime_id": "r", "lifecycle": "ended", "created_at": 0}
+    with mock.patch.object(telemetry, "TTL_SECONDS", 1), mock.patch.object(telemetry, "get_state_store", return_value=self.state):
+      await count("enqueued")  # the API server
+      await asyncio.sleep(0.6)
+      await count("popped")  # the trainer, later; the run's counters must not lose the API server's
+    await asyncio.sleep(0.6)
+    fleet.cache.clear()
+    with mock.patch.object(facts, "get_state_store", return_value=self.state), mock.patch.object(fleet, "get_state_store", return_value=self.state):
+      ctx = await facts.context({"observed_at": time.time(), "workers": [], "placements": [], "runs": [run]}, run)
+    self.assertEqual(ctx["ledger"], {"enqueued": 1, "popped": 1})
+
+  async def test_counters_recorded_before_the_hash_still_read(self) -> None:
+    for event, value in (("enqueued", "3"), ("popped", "2")):
+      await self.state.set_value(telemetry.key("ledger", "old", event), value)
+    run = {"run_id": "old", "runtime_id": "old", "lifecycle": "ended", "created_at": 0}
+    fleet.cache.clear()
+    with mock.patch.object(facts, "get_state_store", return_value=self.state), mock.patch.object(fleet, "get_state_store", return_value=self.state):
+      ctx = await facts.context({"observed_at": time.time(), "workers": [], "placements": [], "runs": [run]}, run)
+    self.assertEqual(ctx["ledger"], {"enqueued": 3, "popped": 2})
 
   async def test_get_result_returns_already_resolved_result(self) -> None:
     await self.store.set_result("req-1", {"type": "sample", "ok": True})

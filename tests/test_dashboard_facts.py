@@ -35,7 +35,8 @@ class RunFactsTest(unittest.TestCase):
           key("operations", "r", "samples") if record["role"] == "sampler" else key("operations", "r"), record, 10_000, None
         )
       for event, value in (ledger or {}).items():
-        await self.store.set_value(key("ledger", "r", event), str(value))
+        for _ in range(value):
+          await self.store.increment_field(key("ledger", "r"), event, None)
       queues = {request_queue("r"): queued, sampler_queue("r"): samples_queued}  # the in-memory store keeps no queues
       self.store.list_length = mock.AsyncMock(side_effect=queues.get)
       run = {"run_id": "r", "runtime_id": "r", "lifecycle": lifecycle, "created_at": 0.0, "completed_at": completed_at, "workloads": list(workloads)}

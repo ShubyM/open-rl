@@ -9,6 +9,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from server import api_server
+from server.dashboard import facts
 from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import LocalWorkerManager
 from tests.test_session_lifecycle import RuntimeManager
@@ -668,8 +669,8 @@ class TelemetryTest(ApiServerTest):
         await asyncio.gather(*list(api_server.telemetry.writes))
 
     asyncio.run(trainer())
-    counts = {event: asyncio.run(api_server.state.get_value(api_server.telemetry.key("ledger", model_id, event))) for event in ("enqueued", "popped")}
-    self.assertEqual(counts, {"enqueued": "2", "popped": "2"})
+    counts = asyncio.run(facts.ledger(api_server.state, model_id))
+    self.assertEqual(counts, {"enqueued": 2, "popped": 2})
 
 
 if __name__ == "__main__":

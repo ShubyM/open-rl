@@ -31,7 +31,7 @@ OPEN_PLACEMENTS = "open_rl:placements:open"  # models holding a placement not ye
 
 
 def key(*parts: str) -> str:
-  """operations:<run>, operations:<run>:samples, worker:<id>, steps:<run>, ledger:<run>:<event>, session_record:<id>, ..."""
+  """operations:<run>, operations:<run>:samples, worker:<id>, steps:<run>, ledger:<run> (a hash of counts), session_record:<id>, ..."""
   return ":".join(("open_rl", *parts))
 
 
@@ -191,7 +191,7 @@ def write(coroutine: Coroutine) -> None:
 def count(event: str, run_id: str | None) -> None:
   """One more request of this run reached `event`; a request enqueued but never popped shows up as a gap."""
   if run_id:
-    write(get_state_store().increment(key("ledger", run_id, event), TTL_SECONDS))
+    write(get_state_store().increment_field(key("ledger", run_id), event, TTL_SECONDS))
 
 
 async def observe_operation(request: dict, role: str, runtime_id: str | None, call: Callable[[], Awaitable[dict]]) -> dict:

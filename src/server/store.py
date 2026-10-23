@@ -365,6 +365,16 @@ class StateStore(ABC):
     """Atomically count up from zero; the counter expires ttl_seconds after the last increment, or never."""
     pass
 
+  @abstractmethod
+  async def increment_field(self, key: str, field: str, ttl_seconds: float | None) -> int:
+    """increment for one of several counts kept under one key, which all expire together."""
+    pass
+
+  @abstractmethod
+  async def read_counts(self, key: str) -> dict[str, int]:
+    """The counts increment_field keeps under key."""
+    pass
+
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
@@ -372,6 +382,7 @@ class InMemoryStateStore(StateStore):
     self.expiries: dict[str, float] = {}
     self.sets: dict[str, set[str]] = {}
     self.samples: dict[str, list[str]] = {}
+    self.counts: dict[str, dict[str, int]] = {}
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.set_value_sync(key, value, ttl_seconds)
@@ -397,6 +408,7 @@ class InMemoryStateStore(StateStore):
       self.expiries.pop(k, None)
       self.sets.pop(k, None)
       self.samples.pop(k, None)
+      self.counts.pop(k, None)
 
   async def add_to_set(self, key: str, member: str) -> None:
     self.sets.setdefault(key, set()).add(member)
@@ -428,6 +440,14 @@ class InMemoryStateStore(StateStore):
     value = int(self.get_value_sync(key) or 0) + 1
     await self.set_value(key, str(value), ttl_seconds)
     return value
+
+  async def increment_field(self, key: str, field: str, ttl_seconds: float | None) -> int:
+    counts = self.counts.setdefault(key, {})
+    counts[field] = counts.get(field, 0) + 1
+    return counts[field]
+
+  async def read_counts(self, key: str) -> dict[str, int]:
+    return dict(self.counts.get(key, {}))
 
 
 class RedisStateStore(StateStore):
@@ -500,6 +520,19 @@ class RedisStateStore(StateStore):
         pipeline.persist(key)
       value, _ = await pipeline.execute()
     return value
+
+  async def increment_field(self, key: str, field: str, ttl_seconds: float | None) -> int:
+    async with self.redis.pipeline(transaction=True) as pipeline:
+      pipeline.hincrby(key, field, 1)
+      if ttl_seconds:
+        pipeline.expire(key, int(ttl_seconds))
+      else:
+        pipeline.persist(key)
+      value, _ = await pipeline.execute()
+    return value
+
+  async def read_counts(self, key: str) -> dict[str, int]:
+    return {field: int(value) for field, value in (await self.redis.hgetall(key)).items()}
 
 
 @cache

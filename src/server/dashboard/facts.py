@@ -15,7 +15,6 @@ async def context(state: dict, run: dict, low: float = 0, high: float = float("i
   """What the facts read about one run: its ops in [low, high], its workers, request counters and queue."""
   store, run_id = get_state_store(), run["run_id"]
   ops = [s for s in await fleet.operations(run_id) if low <= s["at"] <= high]
-  ledger = {event: await store.get_value(key("ledger", run_id, event)) for event in ("enqueued", "popped", "answered")}
   trainer = [s for s in ops if s.get("role") != "sampler"]
   ctx = {
     "run": run,
@@ -23,12 +22,20 @@ async def context(state: dict, run: dict, low: float = 0, high: float = float("i
     "trainer": trainer,
     "steps": [s for s in trainer if s["operation"] == "optim_step" and s.get("status") == "succeeded"],
   }
-  ctx.update(ledger={e: int(v) for e, v in ledger.items() if v is not None}, queued=await store.list_length(request_queue(run_id)))
+  ctx.update(ledger=await ledger(store, run_id), queued=await store.list_length(request_queue(run_id)))
   ctx.update(now=state["observed_at"], finished=run["lifecycle"] == "ended", lanes=fleet.lanes(state, run_id))
   # Samples wait in the runtime's queue, which co-tenant runs share; a finished run's share of it is gone.
   ctx["samples_queued"] = None if ctx["finished"] else await store.list_length(sampler_queue(run["runtime_id"]))
   ctx["workers"] = [w for w in state["workers"] if w.get("runtime_id") in (run["runtime_id"], run_id)]
   return ctx
+
+
+async def ledger(store, run_id: str) -> dict[str, int]:
+  """The run's request counters, kept in one hash; runs recorded before it kept a key per counter."""
+  if counts := await store.read_counts(key("ledger", run_id)):
+    return counts
+  old = {event: await store.get_value(key("ledger", run_id, event)) for event in ("enqueued", "popped", "answered")}
+  return {event: int(value) for event, value in old.items() if value is not None}
 
 
 def read(route: str, **args) -> dict:
