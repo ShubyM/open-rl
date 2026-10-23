@@ -231,8 +231,8 @@ def line(ctx: dict) -> dict:
 
 async def fleet_line(state: dict, run: dict) -> dict:
   """A run in one line for /runs, from a few small records instead of its command history: the step counter, the last
-  record of each command list, the newest step times and the failure count. A live run recorded before the step times
-  and failure count existed is read in full; an ended one leaves those fields null."""
+  record of each command list, the newest step times and the failure count. A run recorded before the step times and
+  failure count existed leaves those fields null."""
   store, run_id, finished = get_state_store(), run["run_id"], run["lifecycle"] == "ended"
   counts, last_ops, last_samples, times, samples_queued = await asyncio.gather(
     store.read_counts(key("ledger", run_id)),
@@ -241,8 +241,6 @@ async def fleet_line(state: dict, run: dict) -> dict:
     store.read_samples(key("step_times", run_id)),
     queued_samples(store, run, finished),
   )
-  if not counts and not finished:
-    return line(await context(state, run))
   ctx = {"run": run, "workers": workers_of(state, run), "now": state["observed_at"], "samples_queued": samples_queued}
   last_op_at = max((r["at"] for r in last_ops + last_samples), default=None)
   return one_line(ctx, run["steps"], times, last_op_at, counts.get("failed", 0) if counts else None)
