@@ -11,8 +11,9 @@
   const loading = $derived(!steps.data && !steps.error);
   const stepRange = $derived(rows.length ? { start: rows[0].step, end: rows.at(-1).step } : null);
   const byStep = (value) => rows.map((row) => [row.step, value(row)]).filter(([, v]) => Number.isFinite(v));
-  // Each op's metrics arrive as min, max and mean over the step's calls; the means of the per-call means are charted.
-  const trainerCharts = $derived([...new Map(rows.flatMap((row) => Object.entries(row.ops).flatMap(([op, entry]) => Object.keys(entry.metrics).filter((name) => name.endsWith(":mean")).map((name) => [`${op} ${name}`, [op, name]])))).values()]
+  // Each op's metrics arrive as min, max and mean over the step's calls; the means are charted, of per-call means such as
+  // loss:mean and of plain values such as time/optimizer_step.
+  const trainerCharts = $derived([...new Map(rows.flatMap((row) => Object.entries(row.ops).flatMap(([op, entry]) => Object.keys(entry.metrics).filter((name) => !name.includes(":") || name.endsWith(":mean")).map((name) => [`${op} ${name}`, [op, name]])))).values()]
     .sort(([a, x], [b, y]) => opRank(a) - opRank(b) || x.localeCompare(y)));
   const FIRST = [["env/all/reward/total", "Reward"], ["test/env/all/reward/total", "Held-out reward"], ["env/all/lab/criteria_pass_fraction", "Criteria pass rate"],
     ["test/env/all/lab/criteria_pass_fraction", "Held-out criteria pass rate"], ["optim/kl_sample_train_v2", "Sampler-trainer KL"], ["optim/entropy", "Entropy"], ["time/total", "Step time", "s"]];
