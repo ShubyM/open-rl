@@ -183,6 +183,41 @@ class ClientStepsTest(unittest.TestCase):
     self.assertEqual([call.args[1:3] for call in prom.await_args_list], [(900, 2000), (1700, 3000)])
     self.assertEqual({step: m["reward"] for step, m in found.items()}, {0: 0.2, 1: 0.5})
 
+  def test_a_step_read_while_its_gauges_landed_gets_the_rest_from_the_next_read(self):
+    from server.dashboard import router
+
+    def gauges(*points):
+      return [{"metric": {"metric": name}, "values": [[at, value] for at, value in values]} for name, values in points]
+
+    answers = [
+      gauges(("progress/batch", [(1950, 0)]), ("reward", [(1950, 0.2)])),  # kl had not been exported yet
+      gauges(("progress/batch", [(1950, 0)]), ("reward", [(1950, 0.2)]), ("kl", [(1950, 0.01)])),
+    ]
+    run = {"run_id": "m-overlap", "session_ids": ["s1"]}
+    with (
+      mock.patch.object(router, "get_state_store", return_value=InMemoryStateStore()),
+      mock.patch.object(sources, "prometheus_source", return_value="prom"),
+      mock.patch.object(sources, "configuration", return_value={**CONFIG, "cluster": ""}),
+      mock.patch.object(sources, "prom", mock.AsyncMock(side_effect=answers)),
+    ):
+      asyncio.run(router.client_steps(run, 900, 2000, ()))
+      found = asyncio.run(router.client_steps(run, 900, 3000, ()))
+    self.assertEqual(found[0], {"reward": 0.2, "kl": 0.01})
+
+  def test_gauge_reads_remembered_per_run_and_filter_are_capped(self):
+    from server.dashboard import router
+
+    router.history.clear()
+    with (
+      mock.patch.object(router, "get_state_store", return_value=InMemoryStateStore()),
+      mock.patch.object(sources, "prometheus_source", return_value="prom"),
+      mock.patch.object(sources, "configuration", return_value={**CONFIG, "cluster": ""}),
+      mock.patch.object(sources, "prom", mock.AsyncMock(return_value=[])),
+    ):
+      for n in range(router.HISTORY_ENTRIES + 10):
+        asyncio.run(router.client_steps({"run_id": "m", "session_ids": ["s1"]}, 900, 2000, (f"field-{n}",)))
+    self.assertEqual(len(router.history), router.HISTORY_ENTRIES)
+
 
 class CachedTest(unittest.TestCase):
   def test_a_stale_read_is_served_while_its_refresh_runs_and_the_refresh_replaces_it(self):

@@ -181,7 +181,8 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
   return result
 
 
-history: dict[str, tuple[float, dict[int, dict[str, float]]]] = {}  # run -> (read up to, client metrics by step)
+HISTORY_ENTRIES = 64
+history: dict[str, tuple[float, dict[int, dict[str, float]]]] = {}  # run and fields -> (read up to, client metrics by step)
 
 
 async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, ...]) -> dict[int, dict[str, float]]:
@@ -210,8 +211,13 @@ async def client_steps(run: dict, low: float, high: float, prefixes: tuple[str, 
   first: dict[int, float] = {}
   for at, batch in sorted((series.pop("progress/batch", None) or {}).items()):
     first.setdefault(int(batch), at)
-  known = {step: {name: points[at] for name, points in series.items() if at in points} for step, at in first.items()} | known
+  known = dict(known)
+  for step, at in first.items():  # a step read while its gauges landed gets the rest now; the newer values win
+    known[step] = known.get(step, {}) | {name: points[at] for name, points in series.items() if at in points}
+  history.pop(memo, None)
   history[memo] = (high, known)
+  while len(history) > HISTORY_ENTRIES:  # the least recently read first
+    history.pop(next(iter(history)))
   return found | known
 
 
