@@ -21,7 +21,7 @@ from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_fr
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.model_metadata import get_model_metadata
 from server.store import RequestStore, StateStore, get_state_store, get_store
-from server.telemetry import answered, gpu_turn, observe_operation, popped, serving, set_phase
+from server.telemetry import answered, finish, gpu_turn, observe_operation, popped, serving, set_phase
 from training import commands
 from training.commands import parse_command
 from training.distributed import broadcast_object, is_distributed, is_primary, local_rank
@@ -182,6 +182,7 @@ class TrainingRequestsProcessor:
       await self.time_slicer.close()
     except Exception:
       pass
+    await finish()
     os._exit(0)
 
   async def next_batch(self) -> list[dict[str, Any]]:
@@ -204,7 +205,7 @@ class TrainingRequestsProcessor:
     # Only rank 0 writes to the store; the other ranks computed the same result.
     if request_id is not None and is_primary():
       await self.store.set_result(request_id, result)
-      answered(request_id)
+      answered(request_id, result)
 
   async def run_once(self) -> None:
     batch = await self.next_batch()

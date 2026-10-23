@@ -92,7 +92,7 @@ def samplers(ctx: dict) -> dict | None:
     return None
   found = {
     "sends": len(sends),
-    "retried": sum(s.get("status") == "retried" for s in sends),
+    "cancelled": sum(s.get("status") == "cancelled" for s in sends),
     "failed": sum(s.get("status") == "failed" for s in sends),
   }
   found["median_s"] = round(statistics.median(s.get("elapsed_seconds", 0) for s in sends), 2)

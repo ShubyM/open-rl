@@ -8,7 +8,7 @@ import os
 import signal
 import time
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from itertools import groupby
 from typing import Any
 
@@ -26,7 +26,7 @@ from vllm.sampling_params import RequestOutputKind
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, time_slicing_enabled, workload_from_env
 from accel_timeslicer.workload import SAMPLER_CLAIM, WorkloadRef, local_workload_name
 from server.store import RequestStore, StateStore, get_state_store, get_store
-from server.telemetry import gpu_turn, observe_operation, serving, set_phase
+from server.telemetry import gpu_turn, observe_operation, record, serving, set_phase
 from server.vllm_options import gpu_memory_utilization, sampler_batch_limits, split_stop, text_only_engine_kwargs
 
 tracer = trace.get_tracer("vllm.inference.worker")
@@ -233,42 +233,48 @@ async def process_batch(sampler: Sampler, store: RequestStore, requests: list[di
     try:
       await sampler.ensure_weights(weights_path)
     except Exception as exc:
-      for request in batch:
-        await store.set_result(request["request_id"], failed_response(f"vLLM weight update failed: {exc}"))
+      await fail_requests(store, batch, exc, "vLLM weight update failed")
       continue
     await serve_group(sampler, store, batch)
 
 
 async def serve_group(sampler: Sampler, store: RequestStore, batch: list[dict[str, Any]]) -> None:
-  """A dead EngineCore leaves generate() hanging, so the wait polls for it and fails what is left."""
-  tasks = {asyncio.create_task(process_request(sampler, store, req)): req for req in batch}
-  pending = set(tasks)
-  while pending:
-    _, pending = await asyncio.wait(pending, timeout=ENGINE_POLL_SECONDS)
-    if pending and sampler.engine.errored:
-      for task in pending:
-        task.cancel()
-      await fail_requests(store, [tasks[task] for task in pending], "vLLM engine died during the batch")
-      break
+  await asyncio.gather(*(process_request(sampler, store, req) for req in batch))
   if sampler.engine.errored:
     raise RuntimeError("vLLM engine is dead")
-  for task in tasks:
-    task.result()
 
 
-async def fail_requests(store: RequestStore, requests: list[dict[str, Any]], error: Any) -> None:
-  """Best effort, so clients see the failure instead of waiting forever."""
+async def fail_requests(store: RequestStore, requests: list[dict[str, Any]], error: Exception, prefix: str = "vLLM Worker Error") -> None:
+  """Best effort, so clients see the failure instead of waiting forever. Each one is recorded as a failed sample."""
   for request in requests:
+    with suppress(Exception):
+      record(request, "sampler", request.get("model_id"), time.time(), "failed", type(error).__name__, {})
     try:
-      await store.set_result(request["request_id"], failed_response(f"vLLM Worker Error: {error}"))
+      await store.set_result(request["request_id"], failed_response(f"{prefix}: {error}"))
     except Exception as exc:
       print(f"[vLLM Worker] Could not fail request {request['request_id']}: {exc}")
+
+
+class EngineDied(RuntimeError):
+  pass
+
+
+async def generate_until_engine_dies(sampler: Sampler, request: dict[str, Any]) -> dict[str, Any]:
+  """A dead EngineCore leaves generate() hanging, so the wait polls for it and fails the request."""
+  task = asyncio.ensure_future(sampler.generate(request))
+  try:
+    while not (await asyncio.wait({task}, timeout=ENGINE_POLL_SECONDS))[0]:
+      if sampler.engine.errored:
+        raise EngineDied("vLLM engine died during the batch")
+    return task.result()
+  finally:
+    task.cancel()
 
 
 async def process_request(sampler: Sampler, store: RequestStore, request: dict[str, Any]) -> None:
   with tracer.start_as_current_span("process_sampling_request", context=propagate.extract(request.get("trace_context", {}))):
     try:
-      result = await observe_operation(request, "sampler", request.get("model_id"), lambda: sampler.generate(request))
+      result = await observe_operation(request, "sampler", request.get("model_id"), lambda: generate_until_engine_dies(sampler, request))
       result["type"] = "sample"
     except Exception as exc:
       result = failed_response(f"vLLM Worker Error: {exc}")

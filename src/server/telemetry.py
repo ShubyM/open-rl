@@ -81,6 +81,15 @@ class Worker:
     # The settings the scheduler passed as env: what this process actually runs with.
     self.record["config"] = {"env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(CONFIG_ENV) and not SECRET.search(k)}}
     self.outstanding: dict[str, dict] = {}  # request_id -> op, run_id and when it was popped
+    self.observed: set[str] = set()  # outstanding requests whose op ran under observe_operation, which records it
+
+  async def save(self) -> None:
+    groups: dict[tuple, dict] = {}  # outstanding requests by op and run, the oldest of each first
+    for entry in self.outstanding.values():
+      groups.setdefault((entry["op"], entry["run_id"]), {**entry, "count": 0})["count"] += 1
+    with suppress(Exception):
+      value = json.dumps({**self.record, "heartbeat_at": time.time(), "outstanding": list(groups.values())})
+      await asyncio.wait_for(get_state_store().set_value(key("worker", self.record["id"]), value, ttl_seconds=TTL_SECONDS), timeout=5)
 
 
 @asynccontextmanager
@@ -89,17 +98,9 @@ async def serving(role: str, runtime_id: str | None, **fields):
   global current
   current = worker = Worker(role, runtime_id, fields)
 
-  async def save():
-    groups: dict[tuple, dict] = {}  # outstanding requests by op and run, the oldest of each first
-    for entry in worker.outstanding.values():
-      groups.setdefault((entry["op"], entry["run_id"]), {**entry, "count": 0})["count"] += 1
-    with suppress(Exception):
-      value = json.dumps({**worker.record, "heartbeat_at": time.time(), "outstanding": list(groups.values())})
-      await asyncio.wait_for(get_state_store().set_value(key("worker", worker.record["id"]), value, ttl_seconds=TTL_SECONDS), timeout=5)
-
   async def heartbeat():
     while True:
-      await save()
+      await worker.save()
       await asyncio.sleep(HEARTBEAT_SECONDS)
 
   task = asyncio.create_task(heartbeat())
@@ -108,8 +109,16 @@ async def serving(role: str, runtime_id: str | None, **fields):
   finally:
     task.cancel()
     set_phase("exited")
-    await save()
+    await worker.save()
     current = None
+
+
+async def finish() -> None:
+  """Before os._exit, which skips serving's cleanup: say this process exited and land the writes still in flight."""
+  set_phase("exited")
+  if current is not None:
+    await current.save()
+  await asyncio.gather(*list(writes), return_exceptions=True)
 
 
 def set_phase(phase: str) -> None:
@@ -126,10 +135,16 @@ def popped(requests: list[dict]) -> None:
         count("popped", run_of(r))
 
 
-def answered(request_id: str) -> None:
-  """The request's answer is written, so it is no longer outstanding."""
-  if current is not None and (entry := current.outstanding.pop(request_id, None)):
-    count("answered", entry["run_id"])
+def answered(request_id: str, result: dict | None = None) -> None:
+  """The request's answer is written, so it is no longer outstanding. A failure answered without its op running, such as a
+  wake or parse failure, gets its record here, so every failed answer has one."""
+  if current is None or (entry := current.outstanding.pop(request_id, None)) is None:
+    return
+  count("answered", entry["run_id"])
+  if request_id not in current.observed and (result or {}).get("type") == "RequestFailedResponse":
+    request = {"op": entry["op"], "request_id": request_id, "logical_run_id": entry["run_id"]}
+    record(request, current.record["role"], current.record["runtime_id"], entry["since"], "failed", "RequestFailedResponse", {})
+  current.observed.discard(request_id)
 
 
 @asynccontextmanager
@@ -164,6 +179,8 @@ def count(event: str, run_id: str | None) -> None:
 
 async def observe_operation(request: dict, role: str, runtime_id: str | None, call: Callable[[], Awaitable[dict]]) -> dict:
   """Run one API op and record how it went; returns or raises exactly as the op does."""
+  if current is not None and request.get("request_id") in current.outstanding:
+    current.observed.add(request["request_id"])
   if (run_id := run_of(request)) and run_id not in steps_done:
     with suppress(Exception):
       steps_done[run_id] = int(await get_state_store().get_value(key("steps", run_id)) or 0)

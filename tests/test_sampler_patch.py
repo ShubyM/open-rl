@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from accel_timeslicer.workload import WorkloadRef
+from server import telemetry
+from server.store import InMemoryStateStore
 from server.vllm_sampler import SHUTDOWN_SENTINEL, Sampler, process_batch, serve, serve_time_sliced
 
 
@@ -135,7 +137,9 @@ class SamplerLifecycleTest(unittest.IsolatedAsyncioTestCase):
       patch("server.vllm_sampler.workload_from_env", return_value=self.workload),
       patch("server.vllm_sampler.get_state_store", return_value=self.store),
       patch("server.vllm_sampler.ENGINE_POLL_SECONDS", 0.01),
+      patch.object(telemetry, "get_state_store", return_value=(state := InMemoryStateStore())),
     ]
+    self.state = state
     for p in self.patches:
       p.start()
       self.addCleanup(p.stop)
@@ -250,6 +254,36 @@ class SamplerLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.assertIn("wake failed", self.results()["1"]["error_message"])
     self.assertEqual(self.results()["2"]["type"], "sample")
     self.slicer.unregister.assert_awaited_once()
+
+  async def recorded(self) -> list[tuple[str, str, str]]:
+    """Every failed answer a client gets has one failed sample record, whatever failed."""
+    await asyncio.gather(*list(telemetry.writes))
+    return [(r["request_id"], r["status"], r["error_type"]) for r in await self.state.read_samples(telemetry.key("operations", "run", "samples"))]
+
+  async def test_a_failed_weight_update_records_each_request_it_failed(self):
+    self.engine.update_weights.side_effect = RuntimeError("invalid patch")
+    await process_batch(Sampler(self.engine), self.store, [{"request_id": "1", "model_id": "run", "weights_path": "a"}])
+    self.assertIn("invalid patch", self.results()["1"]["error_message"])
+    self.assertEqual(await self.recorded(), [("1", "failed", "RuntimeError")])
+
+  async def test_a_failed_wake_records_the_requests_it_failed(self):
+    self.store.get_sampling_requests_for_model.side_effect = [[{"request_id": "1", "model_id": "run"}], [{"request_id": SHUTDOWN_SENTINEL}]]
+    self.engine.wake_up.side_effect = [RuntimeError("wake failed")]
+    await serve_time_sliced("test", self.store, self.factory)
+    self.assertIn("wake failed", self.results()["1"]["error_message"])
+    self.assertEqual(await self.recorded(), [("1", "failed", "RuntimeError")])
+
+  async def test_an_engine_death_records_each_hanging_request_once_as_failed(self):
+    async def hang(request_id):
+      self.engine.errored = True
+      await asyncio.Event().wait()
+
+    self.engine.generate.side_effect = make_engine(hang).generate
+    self.store.get_sampling_requests_for_model.return_value = [{"request_id": "1", "model_id": "run"}]
+    with self.assertRaisesRegex(RuntimeError, "engine is dead"):
+      await serve_time_sliced("test", self.store, self.factory)
+    self.assertIn("engine died", self.results()["1"]["error_message"])
+    self.assertEqual(await self.recorded(), [("1", "failed", "EngineDied")])
 
 
 if __name__ == "__main__":

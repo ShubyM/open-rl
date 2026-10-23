@@ -142,7 +142,7 @@ A log pointer is a read under 4.4 with its arguments, so an agent follows a fail
 | `relaunches` | Workers that stopped reporting and restarted in the same pod, from worker records, with a log read around the first | Did a worker crash or restart mid-run? |
 | `saves` | `save_state` calls: count, failures, the last success, steps since, the slowest | How much would a crash lose? |
 | `optimizer` | Ops that returned non-finite metrics (count and the first), the last 5 grad norms | Are gradients finite? |
-| `samplers` | Sends, retries, failures, median latency; the slowest and fastest replica with 20 or more answered sends | Is a sampler replica slow or failing? |
+| `samplers` | Sends, failures, sends a shutdown cut short (`cancelled`), median latency; the slowest and fastest replica with 20 or more answered sends | Is a sampler replica slow or failing? |
 | `config` | Workers whose echoed settings differ from the run's, or `no echo` | Does each worker run what the run asked for? |
 | `placement` | Placements recorded, and workloads with no node yet | Does every worker exist and have a GPU? |
 | `incidents` | Kubernetes incidents on the run's pods (OOMKilled, CrashLoopBackOff, restarts, scheduling failures), newest 5 | Did Kubernetes kill or fail to place a pod? |

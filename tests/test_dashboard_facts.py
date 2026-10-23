@@ -96,6 +96,15 @@ class RunFactsTest(unittest.TestCase):
       (summary["samplers"]["slowest"], summary["samplers"]["fastest"]), ({"pod": "slow", "median_s": 40.0}, {"pod": "fast", "median_s": 10.0})
     )
 
+  def test_sends_a_shutdown_cut_short_count_beside_the_failed_ones(self):
+    sends = [
+      op(NOW - 3, "sample", role="sampler"),
+      op(NOW - 2, "sample", "failed", role="sampler"),
+      op(NOW - 1, "sample", "cancelled", role="sampler"),
+    ]
+    _, summary, _ = self.facts_of(sends)
+    self.assertEqual({k: summary["samplers"][k] for k in ("sends", "failed", "cancelled")}, {"sends": 3, "failed": 1, "cancelled": 1})
+
   def test_a_worker_running_other_settings_than_asked_is_listed_with_both(self):
     wrong = {
       "id": "w",
