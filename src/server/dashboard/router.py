@@ -62,7 +62,8 @@ async def inventory():
 @router.get("/api/v1/inspect/activity", response_model=Doc)
 async def activity(since: Bound = None, until: Bound = None, run_id: str | None = None, node_id: str | None = None):
   """Each placement's GPU turns and recorded ops in the window (Unix seconds), fleet-wide, a node's or a run's.
-  Gaps do not prove idleness."""
+  A sampler's `sample` spans are its vLLM pod's running requests from Prometheus, at its 15 s resolution or coarser, and
+  on a shared runtime every tenant's; `error` says when those were unreadable. Gaps do not prove idleness."""
   since, until, low, high = span(since, until)
   if run_id:
     state, run = await run_of(run_id)
@@ -92,6 +93,15 @@ QUERIES = {
   "vllm_preemptions_per_second": f"sum(rate(vllm:num_preemptions_total{VLLM}[2m]))",
   "vllm_time_to_first_token_p99_seconds": f"histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{VLLM}[2m])))",
   "vllm_request_latency_p99_seconds": f"histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{VLLM}[2m])))",
+  "vllm_requests_running_by_pod": fleet.RUNNING_BY_POD,
+  # Over the whole window, one number per pod with points=1. max by pod, since a pod two jobs scrape reports twice.
+  "vllm_requests_finished_by_pod": f"max by (pod) (increase(vllm:e2e_request_latency_seconds_count{VLLM}[${{window}}s]))",
+  "vllm_request_latency_median_by_pod_seconds": (
+    f"histogram_quantile(0.5, max by (pod, le) (increase(vllm:e2e_request_latency_seconds_bucket{VLLM}[${{window}}s])))"
+  ),
+  "vllm_request_latency_median_seconds": (
+    f"histogram_quantile(0.5, sum by (le) (max by (pod, le) (increase(vllm:e2e_request_latency_seconds_bucket{VLLM}[${{window}}s]))))"
+  ),
 }
 
 
@@ -113,14 +123,15 @@ async def query(
   until: Bound = None,
   points: int = Query(300, ge=1, le=1000),
 ):
-  """A named PromQL query over a run's GPUs and pods, a node's, or (GPU queries only) the fleet's, at `points` resolution.
-  points=1 evaluates once over the whole window, which is how a duty cycle is one number per GPU."""
+  """A named PromQL query over a run's GPUs and pods, a node's, or (GPU queries only) the fleet's, at `points` resolution,
+  `step` seconds apart. points=1 evaluates once over the whole window, which is how a duty cycle is one number per GPU."""
   if name not in QUERIES:
     raise HTTPException(400, f"Unknown query; use one of {sorted(QUERIES)}")
   since, until, low, high = span(since, until)
   await sources.discover()
   gpus, pods = subject(await fleet.snapshot(), run_id, node_id, low, high)
-  result = {"name": name, "since": since, "until": until, "series": [], "source": sources.prometheus_source()}
+  step = sources.step_seconds(low, high, points)
+  result = {"name": name, "since": since, "until": until, "step": step, "series": [], "source": sources.prometheus_source()}
   if gpus == [] and "$gpus" in QUERIES[name] or not pods and "$pods" in QUERIES[name]:
     return {**result, "error": "No GPUs or pods recorded for this subject in this window"}
   values = {"gpus": '".+"' if gpus is None else sources.any_of(gpus), "pods": sources.any_of(pods), "window": max(1, int(high - low))}
@@ -175,7 +186,8 @@ async def steps(run_id: str, last: int = Query(20, ge=1, le=1000)):
 
 @router.get("/api/v1/inspect/runs/{run_id}/commands", response_model=Doc)
 async def commands(run_id: str, since: Bound = None, until: Bound = None, role: str | None = None, limit: int = Query(100, ge=1, le=5000)):
-  """The run's raw command records (trainer ops and samples), newest first; without bounds, all of them."""
+  """The run's raw command records (trainer ops and failed samples), newest first; without bounds, all of them. An answered
+  sample keeps no record; vLLM's metrics time it (/query, vllm_*)."""
   run_id = (await run_of(run_id))[1]["run_id"]
   low, high = span(since, until)[2:] if since or until else (0, math.inf)
   wanted = (lambda r: True) if role is None else (lambda r: (r.get("role") == "sampler") == (role == "sampler"))
@@ -185,7 +197,8 @@ async def commands(run_id: str, since: Bound = None, until: Bound = None, role: 
 
 @router.get("/api/v1/inspect/runs", response_model=Doc)
 async def runs(ended: bool = False):
-  """Every live run in one line, longest since its last op first, so a stuck run is one read away. ended=true adds ended runs."""
+  """Every live run in one line, longest since its last op first, so a stuck run is one read away. An op includes a sample.
+  ended=true adds ended runs."""
   state = await fleet.snapshot()
   chosen = [r for r in state["runs"] if ended or r["lifecycle"] != "ended"]
   # A few runs at a time, since each read in flight holds a store connection.
@@ -200,18 +213,51 @@ async def runs(ended: bool = False):
   return {"runs": sorted(lines, key=lambda r: -(r["since_last_op_s"] if r["since_last_op_s"] is not None else math.inf))}
 
 
+async def sampler_facts(run_id: str, ctx: dict) -> dict:
+  """What vLLM's metrics say about the run's sampler pods: median latency overall and per replica, with the requests each
+  answered, over the run's sampling span, and the spans with a request running over its trainer span."""
+  week = 7 * 86400
+  low, high = facts.sampling_span(ctx)
+  since, until = facts.iso(max(low, high - week)), facts.iso(high)
+  names = ("vllm_request_latency_median_seconds", "vllm_request_latency_median_by_pod_seconds", "vllm_requests_finished_by_pod")
+  reads = [query(name, run_id, None, since, until, 1) for name in names]
+  if trainer := facts.trainer_span(ctx):
+    reads.append(query("vllm_requests_running", run_id, None, facts.iso(max(trainer[0], trainer[1] - week)), facts.iso(trainer[1]), 10000))
+  overall, by_pod, finished, *running = await asyncio.gather(*reads)
+  last = lambda r: {s["labels"].get("pod"): s["points"][-1][1] for s in r["series"] if s["points"]}  # noqa: E731
+  answered = last(finished)
+  latency = {"median_s": next(iter(last(overall).values()), None), "replicas": {pod: (answered.get(pod, 0), m) for pod, m in last(by_pod).items()}}
+  if error := next((r["error"] for r in (overall, by_pod, finished) if r.get("error")), None):
+    latency["error"] = error
+  found = {"latency": latency}
+  # No series means vLLM reported nothing for the run's pods, which says nothing about whether it sampled.
+  if running and running[0]["series"]:
+    found["running"] = [span for s in running[0]["series"] for span in fleet.running_spans(s["points"], running[0]["step"])]
+  return found
+
+
 @router.get("/api/v1/inspect/runs/{run_id}/summary", response_model=Doc)
 async def summary(run_id: str):
   """The run's facts, each block only when it has content: pace, goodput, unanswered requests and their holders, the ledger
   (lost = enqueued - popped - queued), failures and relaunches with log reads, saves, optimizer, samplers, config,
-  placement, incidents, and GPU duty by role over the run's span (gpu_busy, percent). No verdict; reason from the facts."""
+  placement, incidents, and GPU duty by role over the run's span (gpu_busy, percent). No verdict; reason from the facts.
+
+  A vLLM sampler's samples keep no record unless they fail, so vLLM's Prometheus metrics on the run's sampler pods stand
+  in for the rest, and on a shared runtime they cover every tenant. In samplers, sends is the run's sample count, and
+  failed and cancelled count its records. Its median_s, and the slowest and fastest of the replicas that answered 20 or
+  more requests, are vLLM's end-to-end latency over the run's span. They count only answered requests and are
+  interpolated within vLLM's histogram buckets, and latency_error says why they are missing. In goodput, rollout is
+  trainer idle time while a vLLM pod of the run had a request running, at Prometheus' 15 s resolution or coarser. When
+  vLLM reported nothing for the run's pods, that idle time is all "other"."""
   state, run = await run_of(run_id)
   run_id = run["run_id"]
   ctx = await facts.context(state, run)
-  found = {"run_id": run_id, **facts.summary(ctx)}
+  # Read beside the GPU duty, since a long run's running requests are thousands of points.
+  vllm = asyncio.ensure_future(sampler_facts(run_id, ctx)) if facts.sends(ctx) else None
+  found = {}
   if ops := ctx["ops"]:
     # Duty over the run's own span: averaging in the idle days after it ended would understate it.
-    end = min(state["observed_at"], ops[-1]["at"] + 60)
+    end = min(state["observed_at"], facts.last_op_at(ctx) + 60)
     duty = await query("gpu_busy", run_id, None, facts.iso(max(ops[0]["at"] - 60, end - 7 * 86400)), facts.iso(end), 1)
     roles: dict[str, set[str]] = {}
     for lane in ctx["lanes"]:
@@ -224,7 +270,9 @@ async def summary(run_id: str):
     if busy:
       found["gpu_busy"] = {role: round(sum(v) / len(v), 1) for role, v in busy.items()}
       found["gpu_busy_window"] = {k: duty[k] for k in ("since", "until")}
-  return found
+  if vllm is not None:
+    ctx.update(await vllm)
+  return {"run_id": run_id, **facts.summary(ctx), **found}
 
 
 @router.get("/api/v1/inspect/sessions/{session_id}/summary", response_model=Doc)

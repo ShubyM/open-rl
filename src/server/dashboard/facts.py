@@ -13,10 +13,15 @@ BUCKETS = {"train": {"forward_backward", "optim_step"}, "checkpoint": {"save_sta
 
 
 async def context(state: dict, run: dict, low: float = 0, high: float = float("inf")) -> dict:
-  """What the facts read about one run: its ops in [low, high], its workers, request counters and queue."""
+  """What the facts read about one run: its ops in [low, high], its workers, request and sample counters and queue."""
   store, run_id, finished = get_state_store(), run["run_id"], run["lifecycle"] == "ended"
-  ops, counts, queued, samples_queued = await asyncio.gather(
-    fleet.operations(run_id), store.read_counts(key("ledger", run_id)), store.list_length(request_queue(run_id)), queued_samples(store, run, finished)
+  ops, counts, queued, samples_queued, sampled, sampled_at = await asyncio.gather(
+    fleet.operations(run_id),
+    store.read_counts(key("ledger", run_id)),
+    store.list_length(request_queue(run_id)),
+    queued_samples(store, run, finished),
+    store.get_value(key("sampled", run_id)),
+    store.get_value(key("sampled_at", run_id)),
   )
   ops = [s for s in ops if low <= s["at"] <= high]
   trainer = [s for s in ops if s["operation"] != "sample"]  # a single-process trainer answers samples too
@@ -26,7 +31,8 @@ async def context(state: dict, run: dict, low: float = 0, high: float = float("i
     "trainer": trainer,
     "steps": [s for s in trainer if s["operation"] == "optim_step" and s.get("status") == "succeeded"],
   }
-  ctx.update(ledger=counts, queued=queued, samples_queued=samples_queued, now=state["observed_at"], finished=finished)
+  ctx.update(ledger=counts, queued=queued, samples_queued=samples_queued, now=state["observed_at"], finished=finished, window=(low, high))
+  ctx.update(sampled=int(sampled) if sampled else None, sampled_at=float(sampled_at) if sampled_at else None)
   ctx.update(lanes=fleet.lanes(state, run_id), workers=workers_of(state, run))
   return ctx
 
@@ -109,24 +115,38 @@ def saves(ctx: dict) -> dict | None:
   )
 
 
+def sends(ctx: dict) -> int:
+  """The samples the run sent. A run recorded before the sample count kept a record per send."""
+  return ctx["sampled"] if ctx["sampled"] is not None else sum(s["operation"] == "sample" for s in ctx["ops"])
+
+
+def answered(ctx: dict) -> list[dict]:
+  """The answered samples that kept a record: a torch trainer's, or any from a run recorded before vLLM's metrics replaced them."""
+  return [s for s in ctx["ops"] if s["operation"] == "sample" and s.get("status") == "succeeded"]
+
+
 def samplers(ctx: dict) -> dict | None:
-  if not (sends := [s for s in ctx["ops"] if s["operation"] == "sample"]):
+  """Sends and failures from the run's own count and records. Latency and the replica comparison come from vLLM's
+  histograms on the run's sampler pods (ctx["latency"]), which time only the requests vLLM answered."""
+  if not (sent := sends(ctx)):
     return None
+  records = [s for s in ctx["ops"] if s["operation"] == "sample"]
   found = {
-    "sends": len(sends),
-    "cancelled": sum(s.get("status") == "cancelled" for s in sends),
-    "failed": sum(s.get("status") == "failed" for s in sends),
+    "sends": sent,
+    "cancelled": sum(s.get("status") == "cancelled" for s in records),
+    "failed": sum(s.get("status") == "failed" for s in records),
   }
-  found["median_s"] = round(statistics.median(s.get("elapsed_seconds", 0) for s in sends), 2)
-  # Answered sends only: a fast failure is not a replica's speed.
-  by_pod: dict[str, list[float]] = {}
-  for s in sends:
-    if s.get("status") == "succeeded" and s.get("pod"):
-      by_pod.setdefault(s["pod"], []).append(s.get("elapsed_seconds", 0))
-  medians = {pod: statistics.median(v) for pod, v in by_pod.items() if len(v) >= 20}
+  latency = ctx.get("latency") or {}
+  if (median := latency.get("median_s")) is None and (recorded := answered(ctx)):
+    median = statistics.median(s.get("elapsed_seconds", 0) for s in recorded)
+  if median is not None:
+    found["median_s"] = round(median, 2)
+  medians = {pod: value for pod, (count, value) in latency.get("replicas", {}).items() if count >= 20}
   if len(medians) >= 2:
     for end, pick in (("slowest", max), ("fastest", min)):
       found[end] = {"pod": (pod := pick(medians, key=medians.get)), "median_s": round(medians[pod], 2)}
+  if latency.get("error"):
+    found["latency_error"] = latency["error"]
   return found
 
 
@@ -146,18 +166,35 @@ def config(ctx: dict) -> list[dict] | str | None:
   return found or None
 
 
-def goodput(ctx: dict) -> dict | None:
-  """Share of the run's span the trainer spent training, and where the rest went (Google ML goodput)."""
+def trainer_span(ctx: dict) -> tuple[float, float] | None:
+  """From the run's first trainer op to its last once the run has ended, else to now."""
   if not (ops := ctx["trainer"]):
     return None
   start = ops[0]["started_at"]
-  wall = max((ops[-1]["at"] if ctx["finished"] else ctx["now"]) - start, 1.0)
+  return start, start + max((ops[-1]["at"] if ctx["finished"] else ctx["now"]) - start, 1.0)
+
+
+def sampling_span(ctx: dict) -> tuple[float, float]:
+  """From the run's creation to its last op or sample once the run has ended, else to now."""
+  start, last = ctx["run"]["created_at"], last_op_at(ctx)
+  return start, max(last if ctx["finished"] and last else ctx["now"], start + 1.0)
+
+
+def goodput(ctx: dict) -> dict | None:
+  """Share of the run's span the trainer spent training, and where the rest went (Google ML goodput)."""
+  if not (span := trainer_span(ctx)):
+    return None
+  ops, (start, end) = ctx["trainer"], span
+  wall = end - start
   spent = {kind: sum(s.get("elapsed_seconds", 0) for s in ops if s["operation"] in names) for kind, names in BUCKETS.items()}
   idle = max(0.0, wall - sum(spent.values()))
   split = {"other": round(idle)}
-  # Trainer idle time with a sample in flight is rollout; with nothing in flight the server waits on the client.
-  if sends := [s for s in ctx["ops"] if s["operation"] == "sample"]:
-    rollout = min(idle, max(0.0, covered(ops + sends, start, start + wall) - covered(ops, start, start + wall)))
+  # Trainer idle time with a sample in flight is rollout; with none the server waits on the client. vLLM's running requests
+  # say when one was in flight, else the answered samples' records do.
+  running = ctx.get("running")
+  if running is not None or (running := [(s["started_at"], s["at"]) for s in answered(ctx)]):
+    busy = [(s["started_at"], s["at"]) for s in ops]
+    rollout = min(idle, max(0.0, covered(busy + running, start, end) - covered(busy, start, end)))
     split = {"rollout": round(rollout), "client": round(idle - rollout)}
   first = round(ctx["steps"][0]["at"] - start) if ctx["steps"] else None
   return {
@@ -167,11 +204,16 @@ def goodput(ctx: dict) -> dict | None:
   }
 
 
-def covered(records: list[dict], low: float, high: float) -> float:
-  """Seconds of [low, high] during which at least one of the records was in flight."""
-  return sum(
-    b - a for a, b in fleet.merge([(max(r["started_at"], low), min(r["at"], high)) for r in records if r["at"] > low and r["started_at"] < high])
-  )
+def covered(spans: list, low: float, high: float) -> float:
+  """Seconds of [low, high] inside at least one of the spans."""
+  return sum(b - a for a, b in fleet.merge([(max(a, low), min(b, high)) for a, b in spans if b > low and a < high]))
+
+
+def last_op_at(ctx: dict) -> float | None:
+  """When the run last did anything in the context's window: its last recorded op, or its last sample."""
+  low, high = ctx["window"]
+  sampled = [at for at in [ctx["sampled_at"]] if at is not None and low <= at <= high]
+  return max([s["at"] for s in ctx["ops"][-1:]] + sampled, default=None)
 
 
 def summary(ctx: dict) -> dict:
@@ -199,7 +241,7 @@ def summary(ctx: dict) -> dict:
     steps=len(steps),
     step_seconds={"median": round(statistics.median(gaps), 1), "last": round(gaps[-1], 1)} if gaps else None,
     since_last_step_s=round(ctx["now"] - steps[-1]["at"]) if steps and not ctx["finished"] else None,
-    since_last_op_s=max(0, round(ctx["now"] - ctx["ops"][-1]["at"])) if ctx["ops"] and not ctx["finished"] else None,
+    since_last_op_s=max(0, round(ctx["now"] - last)) if (last := last_op_at(ctx)) is not None and not ctx["finished"] else None,
     trainer_idle_s=max(0, round(ctx["now"] - ops[-1]["at"])) if ops and not ctx["finished"] else None,
     last_op={"operation": ops[-1]["operation"], "status": ops[-1].get("status"), "at": iso(ops[-1]["at"])} if ops else None,
     last_metrics={k: float(f"{v:.6g}") for s in ops[-50:] for k, v in s.get("metrics", {}).items()},
@@ -218,25 +260,25 @@ def summary(ctx: dict) -> dict:
 
 def line(ctx: dict) -> dict:
   """A run in one line from its full context, for a session over the session's span."""
-  last_op_at = ctx["ops"][-1]["at"] if ctx["ops"] else None
   failures = sum(s.get("status") == "failed" for s in ctx["trainer"])
-  return one_line(ctx, len(ctx["steps"]), [s["at"] for s in ctx["steps"]], last_op_at, failures)
+  return one_line(ctx, len(ctx["steps"]), [s["at"] for s in ctx["steps"]], last_op_at(ctx), failures)
 
 
 async def fleet_line(state: dict, run: dict) -> dict:
   """A run in one line for /runs from a few small records, never its command history. A run recorded before step times
   and the failure count existed leaves those null."""
   store, run_id, finished = get_state_store(), run["run_id"], run["lifecycle"] == "ended"
-  counts, last_ops, last_samples, times, samples_queued = await asyncio.gather(
+  counts, last_ops, last_samples, times, samples_queued, sampled_at = await asyncio.gather(
     store.read_counts(key("ledger", run_id)),
     store.read_samples(key("operations", run_id), last=1),
     store.read_samples(key("operations", run_id, "samples"), last=1),
     store.read_samples(key("step_times", run_id)),
     queued_samples(store, run, finished),
+    store.get_value(key("sampled_at", run_id)),
   )
   ctx = {"run": run, "workers": workers_of(state, run), "now": state["observed_at"], "samples_queued": samples_queued}
-  last_op_at = max((r["at"] for r in last_ops + last_samples), default=None)
-  return one_line(ctx, run["steps"], times, last_op_at, counts.get("failed", 0) if counts else None)
+  last = max([r["at"] for r in last_ops + last_samples] + ([float(sampled_at)] if sampled_at else []), default=None)
+  return one_line(ctx, run["steps"], times, last, counts.get("failed", 0) if counts else None)
 
 
 def one_line(ctx: dict, steps: int, step_times: list[float], last_op_at: float | None, failures: int | None) -> dict:
