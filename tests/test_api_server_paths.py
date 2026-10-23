@@ -630,6 +630,22 @@ class TelemetryTest(ApiServerTest):
     self.assertIn("invalid key", error["message"])
     self.assertNotIn("tml-secret", repr(error))
 
+  def test_every_request_a_shared_trainer_pops_was_counted_when_it_was_enqueued(self) -> None:
+    self.enterContext(patch.object(api_server.telemetry, "get_state_store", return_value=api_server.state))
+    model_id = self.post("create_model", {"base_model": "m"}).json()["request_id"]
+    self.assertEqual(self.post("delete_model", {"model_id": model_id}).status_code, 200)
+
+    async def trainer() -> None:
+      async with api_server.telemetry.serving("trainer", "m"):
+        requests = await api_server.store.get_requests(active_set_id="m-1")
+        self.assertEqual([r["op"] for r in requests], ["create_model", "delete_model"])
+        api_server.telemetry.popped(requests)
+        await asyncio.gather(*list(api_server.telemetry.writes))
+
+    asyncio.run(trainer())
+    counts = {event: asyncio.run(api_server.state.get_value(api_server.telemetry.key("ledger", model_id, event))) for event in ("enqueued", "popped")}
+    self.assertEqual(counts, {"enqueued": "2", "popped": "2"})
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -933,8 +933,7 @@ async def delete_model(req: ModelRequest):
   if meta.shares_runtime():
     # Other jobs keep the trainer, so it only frees this job's adapter, after
     # the job's queued work.
-    delete = commands.DeleteModel(request_id=str(uuid.uuid4()), model_id=model_id)
-    await store.put_request(commands.wire(delete), active_set_id=await _resolve_active_set_id(model_id))
+    await enqueue(commands.DeleteModel(request_id=str(uuid.uuid4()), model_id=model_id))
   elif worker_manager is not None:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
     await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)), active_set_id=await _resolve_active_set_id(model_id))
