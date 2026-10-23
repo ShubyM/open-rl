@@ -1,4 +1,5 @@
-# The dashboard keeps one watch per kind: pods and Workloads in the namespace, nodes cluster-wide.
+# The dashboard keeps one watch per kind: pods and Workloads in the namespace, nodes cluster-wide. It runs as the API
+# server's account, so an API server with OPEN_RL_INSPECTION_API=true needs this applied too; base grants no node reads.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -39,6 +40,8 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: open-rl-sa
+  # A cluster binding's subject needs its namespace; kustomize does not fill it in.
+  namespace: openrl-system
 roleRef:
   kind: ClusterRole
   name: open-rl-dashboard
