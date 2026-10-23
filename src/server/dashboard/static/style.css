@@ -189,7 +189,8 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .activity-status.unavailable { color: var(--status-warning); }
 /* Chart layout stays separate from the SVG gridlines. */
 #app div.chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 24px 20px; margin-top: 16px; }
-#app .chart { --metric-stroke: var(--dim); --plot-height: 160px; min-width: 0; }
+#app .chart { --metric-stroke: var(--dim); --plot-height: 160px; min-width: 0; min-height: calc(var(--plot-height) + 82px); }
+#app .chart > .chart-empty { display: grid; place-items: center; height: var(--plot-height); margin: 0; }
 #app .chart[data-tone="accent"] { --metric-stroke: color-mix(in srgb, var(--accent) 75%, var(--dim)); }
 #app .allocation-expansion .chart { --plot-height: 100px; min-height: calc(var(--plot-height) + 82px); }
 #app .allocation-expansion .chart-plot { grid-template-columns: var(--activity-label-width) minmax(0, 1fr); column-gap: 12px; }

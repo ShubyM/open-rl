@@ -7,6 +7,8 @@
   // Every recorded step of the run, charted by step rather than by the time window.
   const steps = createQuery(() => inspectUrl(`runs/${encodeURIComponent(view.id)}/steps`, { last: 1000 }), { poll: 30000, pollWhen: () => !finished });
   const rows = $derived(steps.data?.steps || []);
+  // Until the first steps arrive, hold each section's space with empty charts so nothing below jumps when they land.
+  const loading = $derived(!steps.data && !steps.error);
   const stepRange = $derived(rows.length ? { start: rows[0].step, end: rows.at(-1).step } : null);
   const byStep = (value) => rows.map((row) => [row.step, value(row)]).filter(([, v]) => Number.isFinite(v));
   // Each op's metrics arrive as min, max and mean over the step's calls; the means of the per-call means are charted.
@@ -36,6 +38,8 @@
     ["kv_cache_usage", "KV cache use", "%", 100], ["preemptions_per_second", "Preemptions", "/s"], ["time_to_first_token_p99_seconds", "Time to first token p99", "s"], ["request_latency_p99_seconds", "Request latency p99", "s"]];
 </script>
 
+{#snippet placeholders(count)}<div class="chart-grid">{#each Array.from({ length: count }) as _, i (i)}<Chart title="" points={[]} empty="Loading…" />{/each}</div>{/snippet}
+
 <div class="run-metrics" data-run-metrics={view.id}>
   {#if steps.error}<p class="source-error" role="status">{steps.error}{rows.length ? " · Showing previously fetched steps" : ""}</p>{/if}
   <h2 class="scheduler-title">Client metrics</h2>
@@ -47,13 +51,14 @@
   </div>{/if}
   {#if clientCharts.length}<div class="chart-grid">
     {#each clientCharts as [key, title, unit = ""] (key)}<Chart {title} {unit} steps points={byStep((row) => row.client?.[key])} start={stepRange.start} end={stepRange.end} empty="No values" />{/each}
-  </div>{:else if allClient.length}<p class="muted">No client metric matches</p>{:else if steps.data}<p class="muted">0 metrics</p>{:else if !steps.error}<p class="muted">Loading…</p>{/if}
+  </div>{:else if allClient.length}<p class="muted">No client metric matches</p>{:else if loading}{@render placeholders(FIRST.length)}{:else if steps.data}<p class="muted">0 metrics</p>{/if}
   <h2 class="scheduler-title">Trainer metrics</h2>
   {#if trainerCharts.length}<div class="chart-grid">
     {#each trainerCharts as [op, name] (`${op} ${name}`)}<Chart title={`${name} · ${opLabel(op)}`} steps points={byStep((row) => row.ops[op]?.metrics[name]?.mean)} start={stepRange.start} end={stepRange.end} tone="accent" empty="No values" />{/each}
-  </div>{:else if steps.data}<p class="muted">0 metrics</p>{/if}
+  </div>{:else if loading}{@render placeholders(3)}{:else if steps.data}<p class="muted">0 metrics</p>{/if}
   <h2 class="scheduler-title">Operations</h2>
   <div class="run-metric-summary"><span>Completed steps <strong>{run.steps ?? "—"}</strong></span></div>
+  {#if loading}{@render placeholders(3)}{/if}
   <div class="chart-grid">
     {#each opNames as op (op)}<Chart title={`${opLabel(op)} duration`} unit="s" steps points={byStep((row) => row.ops[op] && row.ops[op].seconds / row.ops[op].count)} start={stepRange.start} end={stepRange.end} min={0} tone="accent" empty="No values" />{/each}
     {#if steps.data && !rows.length}<p class="empty-state">No operations recorded</p>{/if}
