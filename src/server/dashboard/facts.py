@@ -5,7 +5,7 @@ import statistics
 from datetime import UTC, datetime
 
 from server.dashboard import fleet
-from server.store import get_state_store, request_queue
+from server.store import get_state_store, request_queue, sampler_queue
 from server.telemetry import alive, key
 
 BUCKETS = {"train": {"forward_backward", "optim_step"}, "checkpoint": {"save_state", "save_weights_for_sampler"}, "forward": {"forward"}}
@@ -25,6 +25,8 @@ async def context(state: dict, run: dict, low: float = 0, high: float = float("i
   }
   ctx.update(ledger={e: int(v) for e, v in ledger.items() if v is not None}, queued=await store.list_length(request_queue(run_id)))
   ctx.update(now=state["observed_at"], finished=run["lifecycle"] == "ended", lanes=fleet.lanes(state, run_id))
+  # Samples wait in the runtime's queue, which co-tenant runs share; a finished run's share of it is gone.
+  ctx["samples_queued"] = None if ctx["finished"] else await store.list_length(sampler_queue(run["runtime_id"]))
   ctx["workers"] = [w for w in state["workers"] if w.get("runtime_id") in (run["runtime_id"], run_id)]
   return ctx
 
@@ -185,7 +187,7 @@ def summary(ctx: dict) -> dict:
     last_op={"operation": ops[-1]["operation"], "status": ops[-1].get("status"), "at": iso(ops[-1]["at"])} if ops else None,
     last_metrics={k: float(f"{v:.6g}") for s in ops[-50:] for k, v in s.get("metrics", {}).items()},
     goodput=goodput(ctx),
-    requests=present(unanswered=unanswered(ctx), ledger=ledger),
+    requests=present(unanswered=unanswered(ctx), ledger=ledger, samples_queued=ctx["samples_queued"] or None),
     failures=failures(ctx),
     relaunches=restarts,
     saves=saves(ctx),
@@ -208,6 +210,7 @@ def line(ctx: dict) -> dict:
     "median_step_s": round(statistics.median(b["at"] - a["at"] for a, b in zip(steps, steps[1:]))) if len(steps) > 1 else None,
     "trainer_requests_unanswered": sum(o["count"] for o in held),
     "held_by_dead_worker": sum(o["count"] for o in held if not o["holder_alive"]),
+    "samples_queued": ctx["samples_queued"],
     "failures": sum(s.get("status") == "failed" for s in ctx["trainer"]),
     "relaunches": len(relaunches(ctx)),
   }

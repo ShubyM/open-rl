@@ -149,6 +149,10 @@ def request_queue(model_id: str) -> str:
   return f"open_rl:queue:{model_id}"
 
 
+def sampler_queue(model_id: str) -> str:
+  return f"open_rl:sampler_queue:{model_id}"
+
+
 class RedisStore(RequestStore):
   def __init__(self, client: redis.Redis):
     self.redis = client
@@ -240,11 +244,11 @@ class RedisStore(RequestStore):
 
   async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
     model_id = req_data.get("model_id", "default")
-    queue_key = f"open_rl:sampler_queue:{model_id}"
+    queue_key = sampler_queue(model_id)
     await self.redis.rpush(queue_key, json.dumps(req_data))
 
   async def get_sampling_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    queue_key = f"open_rl:sampler_queue:{model_id}"
+    queue_key = sampler_queue(model_id)
     try:
       result = await self.redis.blpop(queue_key, timeout=5)
     except RedisTimeoutError:

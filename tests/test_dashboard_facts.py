@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 from server.dashboard import facts, fleet
-from server.store import InMemoryStateStore
+from server.store import InMemoryStateStore, request_queue, sampler_queue
 from server.telemetry import key
 
 NOW = 100_000.0
@@ -28,7 +28,7 @@ class RunFactsTest(unittest.TestCase):
       self.enterContext(mock.patch.object(target, "get_state_store", return_value=self.store))
     fleet.cache.clear()
 
-  def facts_of(self, ops=(), workers=(), ledger=None, queued=0, lifecycle="placed", workloads=(), pods=()):
+  def facts_of(self, ops=(), workers=(), ledger=None, queued=0, lifecycle="placed", workloads=(), pods=(), samples_queued=0):
     async def read():
       for record in ops:
         await self.store.append_sample(
@@ -36,7 +36,8 @@ class RunFactsTest(unittest.TestCase):
         )
       for event, value in (ledger or {}).items():
         await self.store.set_value(key("ledger", "r", event), str(value))
-      self.store.list_length = mock.AsyncMock(return_value=queued)  # the in-memory store keeps no request queues
+      queues = {request_queue("r"): queued, sampler_queue("r"): samples_queued}  # the in-memory store keeps no queues
+      self.store.list_length = mock.AsyncMock(side_effect=queues.get)
       run = {"run_id": "r", "runtime_id": "r", "lifecycle": lifecycle, "created_at": 0.0, "workloads": list(workloads)}
       run.update(pods=list(pods), settings={"openrl.fine_tuning_type": "lora", "openrl.trainer_gpus": 1})
       ctx = await facts.context({"observed_at": NOW, "workers": list(workers), "placements": [], "runs": [run]}, run)
@@ -66,6 +67,14 @@ class RunFactsTest(unittest.TestCase):
     self.setUp()
     _, queued, _ = self.facts_of(healthy_steps(), ledger={"enqueued": 11, "popped": 10, "answered": 10}, queued=1)
     self.assertEqual(queued["requests"]["ledger"]["lost"], 0)
+
+  def test_samples_waiting_on_a_sampler_show_so_a_stuck_run_does_not_look_idle(self):
+    _, summary, line = self.facts_of(healthy_steps(), samples_queued=64)
+    self.assertEqual((summary["requests"]["samples_queued"], line["samples_queued"]), (64, 64))
+    self.setUp()
+    _, summary, line = self.facts_of(healthy_steps())
+    self.assertNotIn("samples_queued", summary.get("requests", {}))
+    self.assertEqual(line["samples_queued"], 0)
 
   def test_a_nan_gradient_names_the_op_step_and_metric(self):  # I30
     _, summary, _ = self.facts_of([*healthy_steps(), op(NOW - 5, "optim_step", nonfinite=["grad_norm:mean"], step=5)])
