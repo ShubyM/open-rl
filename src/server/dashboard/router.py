@@ -222,7 +222,9 @@ async def sampler_facts(run_id: str, ctx: dict) -> dict:
   names = ("vllm_request_latency_median_seconds", "vllm_request_latency_median_by_pod_seconds", "vllm_requests_finished_by_pod")
   reads = [query(name, run_id, None, since, until, 1) for name in names]
   if trainer := facts.trainer_span(ctx):
-    reads.append(query("vllm_requests_running", run_id, None, facts.iso(max(trainer[0], trainer[1] - week)), facts.iso(trainer[1]), 10000))
+    start, end = max(trainer[0], trainer[1] - week), trainer[1]
+    # 30 s apart, twice the scrape interval, which halves a long run's read and moved rollout under 0.3% on the demo runs.
+    reads.append(query("vllm_requests_running", run_id, None, facts.iso(start), facts.iso(end), max(2, int((end - start) / 30))))
   overall, by_pod, finished, *running = await asyncio.gather(*reads)
   last = lambda r: {s["labels"].get("pod"): s["points"][-1][1] for s in r["series"] if s["points"]}  # noqa: E731
   answered = last(finished)
@@ -247,7 +249,7 @@ async def summary(run_id: str):
   failed and cancelled count its records. Its median_s, and the slowest and fastest of the replicas that answered 20 or
   more requests, are vLLM's end-to-end latency over the run's span. They count only answered requests and are
   interpolated within vLLM's histogram buckets, and latency_error says why they are missing. In goodput, rollout is
-  trainer idle time while a vLLM pod of the run had a request running, at Prometheus' 15 s resolution or coarser. When
+  trainer idle time while a vLLM pod of the run had a request running, read every 30 s. When
   vLLM reported nothing for the run's pods, that idle time is all "other"."""
   state, run = await run_of(run_id)
   run_id = run["run_id"]
