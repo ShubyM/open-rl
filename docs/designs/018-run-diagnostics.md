@@ -66,17 +66,30 @@ too when `OPEN_RL_INSPECTION_API=true`. Every route is a `GET` under
 |---|---|
 | `/runs?ended=` | Which run to open: every live run in one line (lifecycle, steps, seconds since its last op and step, median step time, unanswered requests and how many a dead worker holds, samples queued, failures, relaunches), longest since its last op first. Built from the counters, the last sample time and the last record of each list, never the command history |
 | `/runs/{id}/summary` | What is wrong with this run: the run facts below, and GPU duty by role over the run's span |
-| `/runs/{id}/steps?last=` | What each step did: trainer ops grouped by step, with each op's count, failures, seconds and metric spread |
+| `/runs/{id}/steps?last=&fields=` | What each step did: trainer ops grouped by step, with each op's count, failures, seconds and metric spread, and in `client` the metrics the client wrote for the step, kept by the `fields` prefixes. `client_directory` names the client directory, or is null when none matched |
 | `/runs/{id}/commands?since=&until=&role=` | The raw command records, newest first. A vLLM sampler's samples appear only when they failed |
 | `/sessions/{id}/summary` | What a client did: its session record, whether it is live, its SDK errors, and a line per model over the session's span |
 | `/inventory` | What exists now: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, pods with problems, and one error per source that could not be read |
 | `/activity?run_id=&node_id=&since=&until=` | Who ran where and when: one lane per placement with its GPU turns and recorded op intervals. A sampler lane's samples are the groups it served, plus its vLLM pod's running requests from Prometheus where scraped |
 | `/accelerators?run_id=&node_id=&since=&until=` | What each GPU is doing: node, slot, model, every placement holding it, utilization now and over the window, memory used of total |
 | `/query?name=&run_id=&node_id=&since=&until=&points=` | A named PromQL query (`gpu_util`, `gpu_util_now`, `gpu_busy`, `gpu_memory_mib`, `gpu_memory_total_mib`, `vllm_*`) over a run's or node's GPUs and pods, or the fleet's GPUs |
-| `/logs?run_id=&pod=&q=&severity=&since=&until=&cursor=` | The run's lines from Cloud Logging, newest first: its worker pods by the scheduler's owner label, and the lines an in-cluster client labels `openrl_run_id=<run>` and `openrl_source=client`, without telemetry's own lines. A stderr line takes the level it prints |
+| `/logs?run_id=&pod=&q=&severity=&since=&until=&cursor=` | The run's lines, newest first. From Cloud Logging, its worker pods by the scheduler's owner label and the lines an in-cluster client labels `openrl_run_id=<run>` and `openrl_source=client`, without telemetry's own lines; a stderr line takes the level it prints. With `pod=client` and a client directory, its `logs.log`, whose lines carry no time, so the window does not apply and the cursor is a byte offset |
 
 Bounds are ISO-8601 or a span such as `1h`, at most seven days, and default to
 the last 30 minutes.
+
+A run's client metrics and logs come from its client directory, the
+tinker-cookbook's `log_path`, read where the server mounts it
+(`OPEN_RL_CLIENT_RUNS_ROOT`, `/mnt/shared` by default). The client sends
+nothing. `metrics.jsonl` holds one line per step with its `step`, read from the
+offset the last read stopped at. `logs.log` is paged back from its end. A
+directory is a run's when its `checkpoints.jsonl` names `tinker://<run>/`, or
+before the first save when its `config.json` was written within 60 s of the
+run's creation for the run's base model. When the match is ambiguous, the run
+has no client directory. `docs/configuration.md` gives the rules.
+`timing_spans.jsonl` in the same directory is a later source for trace export.
+Some runs keep client metrics in Redis under `open_rl:run_metrics:<run>`;
+`metrics.jsonl` wins a step both have.
 
 The `/runs/{id}` routes, `/activity` and `/logs` also take a session id in place
 of a run id. A session with one run answers for that run. A session with several
@@ -138,6 +151,10 @@ so an agent follows a failure to its traceback in one call.
   latency, rollout time and activity cover every tenant. A median is
   interpolated within vLLM's histogram buckets, and running requests are
   sampled every 15 s for activity and every 30 s for rollout.
+- Client metrics and logs need the client's directory on a volume the server
+  reads. A run whose `log_path` is not on the shared volume, and a client on a
+  laptop, have none. Runs started together on one base model match no directory
+  by time, so each has none until its first checkpoint.
 - Facts are computed on request. Alerts would need a timer and thresholds.
 - Not recorded yet: cgroup OOM kills and peak memory in the worker record, NVML
   utilization for GPU facts without Prometheus, and the request's holder
