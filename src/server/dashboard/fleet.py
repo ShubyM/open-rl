@@ -167,7 +167,8 @@ async def running(pods: list[str], low: float, high: float) -> dict[str, list]:
 
 async def activity(fleet: dict, low: float, high: float, run_id: str | None = None, node_id: str | None = None) -> list[dict]:
   """Each lane in the window with its GPU turns (none on a shared lane) and the ops it ran, clipped to it. A sampler lane's
-  samples are its vLLM pod's running requests, every tenant's on a shared runtime, plus its failed sends. Never utilization."""
+  samples are the groups it served and its failed sends, plus its vLLM pod's running requests where Prometheus has them,
+  every tenant's on a shared runtime. Never utilization."""
   shown = [p for p in lanes(fleet, run_id, node_id) if p["start"] <= high and p["end"] >= low]
   wanted = sorted({n for lane in shown for n in lane["run_ids"]})
   records = dict(zip(wanted, await asyncio.gather(*(operations(n) for n in wanted))))

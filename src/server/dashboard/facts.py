@@ -121,7 +121,7 @@ def sends(ctx: dict) -> int:
 
 
 def answered(ctx: dict) -> list[dict]:
-  """The answered samples that kept a record: a torch trainer's, or any from a run recorded before vLLM's metrics replaced them."""
+  """The answered samples that kept a record: a torch trainer's, or a group a vLLM sampler served, timed as a whole."""
   return [s for s in ctx["ops"] if s["operation"] == "sample" and s.get("status") == "succeeded"]
 
 

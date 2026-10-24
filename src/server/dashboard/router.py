@@ -62,8 +62,9 @@ async def inventory():
 @router.get("/api/v1/inspect/activity", response_model=Doc)
 async def activity(since: Bound = None, until: Bound = None, run_id: str | None = None, node_id: str | None = None):
   """Each placement's GPU turns and recorded ops in the window (Unix seconds), fleet-wide, a node's or a run's.
-  A sampler's `sample` spans are its vLLM pod's running requests from Prometheus, at its 15 s resolution or coarser, and
-  on a shared runtime every tenant's; `error` says when those were unreadable. Gaps do not prove idleness."""
+  A sampler's `sample` spans are the groups of samples it served, one record per run each, plus its vLLM pod's running
+  requests from Prometheus where they are scraped, at 15 s or coarser and on a shared runtime every tenant's; `error` says
+  when those were unreadable. Gaps do not prove idleness."""
   since, until, low, high = span(since, until)
   if run_id:
     state, run = await run_of(run_id)
@@ -186,8 +187,8 @@ async def steps(run_id: str, last: int = Query(20, ge=1, le=1000)):
 
 @router.get("/api/v1/inspect/runs/{run_id}/commands", response_model=Doc)
 async def commands(run_id: str, since: Bound = None, until: Bound = None, role: str | None = None, limit: int = Query(100, ge=1, le=5000)):
-  """The run's raw command records (trainer ops and failed samples), newest first; without bounds, all of them. An answered
-  sample keeps no record; vLLM's metrics time it (/query, vllm_*)."""
+  """The run's raw command records (trainer ops, the groups of samples a sampler served, and failed samples),
+  newest first; without bounds, all of them. A group's record has its count of samples."""
   run_id = (await run_of(run_id))[1]["run_id"]
   low, high = span(since, until)[2:] if since or until else (0, math.inf)
   wanted = (lambda r: True) if role is None else (lambda r: (r.get("role") == "sampler") == (role == "sampler"))
@@ -244,13 +245,14 @@ async def summary(run_id: str):
   (lost = enqueued - popped - queued), failures and relaunches with log reads, saves, optimizer, samplers, config,
   placement, incidents, and GPU duty by role over the run's span (gpu_busy, percent). No verdict; reason from the facts.
 
-  A vLLM sampler's samples keep no record unless they fail, so vLLM's Prometheus metrics on the run's sampler pods stand
-  in for the rest, and on a shared runtime they cover every tenant. In samplers, sends is the run's sample count, and
-  failed and cancelled count its records. Its median_s, and the slowest and fastest of the replicas that answered 20 or
-  more requests, are vLLM's end-to-end latency over the run's span. They count only answered requests and are
-  interpolated within vLLM's histogram buckets, and latency_error says why they are missing. In goodput, rollout is
-  trainer idle time while a vLLM pod of the run had a request running, read every 30 s. When
-  vLLM reported nothing for the run's pods, that idle time is all "other"."""
+  A vLLM sampler keeps one record per group of samples it served and one per failed sample. Where vLLM's Prometheus
+  metrics on the run's sampler pods are scraped they time each answered request, and on a shared runtime they cover
+  every tenant. In samplers, sends is the run's sample count, and failed and cancelled count its records. Its median_s,
+  and the slowest and fastest of the replicas that answered 20 or more requests, are vLLM's end-to-end latency over the
+  run's span. They count only answered requests and are interpolated within vLLM's histogram buckets, and latency_error
+  says why they are missing. Without those metrics median_s is the median time of the groups it served. In goodput,
+  rollout is trainer idle time while a vLLM pod of the run had a request running, read every 30 s. When vLLM reported
+  nothing for the run's pods, the groups its samplers served say when a sample was in flight."""
   state, run = await run_of(run_id)
   run_id = run["run_id"]
   ctx = await facts.context(state, run)
