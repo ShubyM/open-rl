@@ -180,8 +180,9 @@ def prometheus_source() -> str | None:
 
 
 def step_seconds(start: float, end: float, points: int) -> int:
-  """The seconds between the points prom returns for [start, end]."""
-  return max(15, int((end - start) / points))
+  """The seconds between the points prom returns for [start, end]. DCGM is read and scraped every 10 s; a finer step only
+  repeats samples."""
+  return max(10, int((end - start) / points))
 
 
 async def prom(query: str, start: float, end: float, points: int = 1) -> list[dict]:
