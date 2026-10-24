@@ -340,6 +340,20 @@ def op_finished(request: dict, role: str, runtime_id: str | None, started_at: fl
     record(op["run_id"], "op", **op)
 
 
+@best_effort
+def sampled_group(requests: list[dict], started_at: float) -> None:
+  """One record per run for the samples a vLLM sampler served together, so its lane shows when it sampled without a
+  record per sample. op_finished counted each sample, and a failed one keeps its own record too."""
+  store, groups = get_state_store(), defaultdict(list)
+  for request in requests:
+    groups[run_of(request)].append(request)
+  for run_id, group in groups.items():
+    if run_id:
+      op = command_record(group[0], "sampler", group[0].get("model_id"), started_at, None, None) | {"request_id": None, "count": len(group)}
+      write(store.append_sample(key("operations", run_id, "samples"), op, SAMPLE_LIMIT, TTL_SECONDS))
+      log_event("op", op, run_id=run_id)
+
+
 def count_sample(run_id: str | None, at: float) -> None:
   if run_id:
     store = get_state_store()
