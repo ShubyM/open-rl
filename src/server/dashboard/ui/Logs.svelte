@@ -24,14 +24,16 @@
     return [...pods.values()].sort((a, b) => a.name.localeCompare(b.name));
   });
   // Dozzle-style line tags: the part of the pod name that differs between the run's pods, e.g. "0-trainer".
+  // The client is not a pod, so its name takes no part in the prefix and is never cut.
   const cut = $derived.by(() => {
-    const [first = "", ...rest] = sources.map((p) => p.name);
+    const [first = "", ...rest] = sources.map((p) => p.name).filter((name) => name !== "client");
     let n = 0;
     while (rest.length && n < first.length && rest.every((name) => name[n] === first[n])) n++;
     return rest.length ? first.lastIndexOf("-", n - 1) + 1 : first.length;
   });
   const hues = $derived(new Map(sources.map((p, i) => [p.name, `hue-${i % 8}`])));
-  const tagWidth = $derived(Math.min(20, Math.max(0, ...sources.map((p) => p.name.length - cut))));
+  const tag = (name) => (name === "client" ? name : name?.slice(cut));
+  const tagWidth = $derived(Math.min(20, Math.max(0, ...sources.map((p) => tag(p.name).length))));
   const match = $derived(view.q ? new RegExp(`(${escapeRegExp(view.q)})`, "i") : null);
   // The API pages newest first; a tail reads down to the newest line.
   const shown = $derived(records.toReversed());
@@ -104,7 +106,7 @@
 <div class="log-toolbar">
   <input id="log-search" type="search" bind:value={view.q} placeholder="Search logs" aria-label="Search logs" />
   <select id="log-source" aria-label="Pod" bind:value={view.pod}><option value="">All pods</option>
-    {#each sources as pod (pod.name)}<option value={pod.name}>{pod.name.slice(cut) || pod.name}</option>{/each}
+    {#each sources as pod (pod.name)}<option value={pod.name}>{tag(pod.name) || pod.name}</option>{/each}
   </select>
   {#if run.shared_runtime}<label class="log-scope" title="These pods also serve other runs on this base model. Lines that do not name this run are hidden unless this is on."><input type="checkbox" bind:checked={everything} />Include other runs' lines</label>{/if}
   <button type="button" class="chip" onclick={() => view.end === null ? pause() : follow()}>{view.end === null ? "Pause" : "Jump to latest"}</button>
@@ -119,7 +121,7 @@
   {#each shown as record (record.id)}
     {@const at = timestamp(record.timestamp)}
     <div class="workspace-logrow" data-key={record.id} data-severity={severity(record)}>
-      <time class="log-time" datetime={at} title={at || "No timestamp"}>{at ? at.slice(11, 23) : "—"}</time><span class={`log-pod ${hues.get(record.pod) || ""}`} title={record.pod}>{record.pod?.slice(cut)}</span><pre class="log-message">{#each match ? record.message.split(match) : [record.message] as part, i}{#if i % 2}<mark>{part}</mark>{:else}{part}{/if}{/each}{#if record.message_truncated}<span class="muted">{"\n[Message truncated by source]"}</span>{/if}</pre>
+      <time class="log-time" datetime={at} title={at || "No timestamp"}>{at ? at.slice(11, 23) : "—"}</time><span class={`log-pod ${hues.get(record.pod) || ""}`} title={record.pod}>{tag(record.pod)}</span><pre class="log-message">{#each match ? record.message.split(match) : [record.message] as part, i}{#if i % 2}<mark>{part}</mark>{:else}{part}{/if}{/each}{#if record.message_truncated}<span class="muted">{"\n[Message truncated by source]"}</span>{/if}</pre>
     </div>
   {:else}{#if !pending && !error}<p class="empty-state">{data?.note || "No logs match this time range and filter"}</p>{/if}{/each}
 </div>
