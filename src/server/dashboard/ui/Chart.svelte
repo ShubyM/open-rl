@@ -1,7 +1,8 @@
 <script>
   import { axisTime, chartNumber, chartTime, valueText } from "./visualization.js";
   import { crosshair, crosshairOffset } from "./state.svelte.js";
-  let { title, unit = "", points = [], start, end, min, max, tone = "neutral", gapSeconds = Infinity, empty = "No samples in this time range", note = "", navigating = false, steps = false } = $props();
+  let { title, unit = "", points = [], start, end, min, max, tone = "neutral", gapSeconds = Infinity, empty = "No samples in this time range", note = "", navigating = false, steps = false, readingSeconds = 0 } = $props();
+  // With readingSeconds, each point is a reading the source took that often, so it holds until the next one.
   // With steps, x is a training step rather than a time, so the chart stays out of the shared time crosshair.
   let plot = $state(null), svg = $state(null), tip = $state(null);
   let selectedAt = $state(null);
@@ -36,7 +37,7 @@
   const x = (at) => ((at - start) / (end - start || 1) * 1000).toFixed(1);
   const y = (value) => (1000 - (Math.max(scale.low, Math.min(scale.high, value)) - scale.low) / (scale.high - scale.low) * 1000).toFixed(1);
   const paths = $derived(segments.map((segment) => {
-    const line = segment.map(([at, value], i) => `${i ? "L" : "M"}${x(at)},${y(value)}`).join(" ");
+    const line = segment.map(([at, value], i) => !i ? `M${x(at)},${y(value)}` : readingSeconds ? `H${x(at)} V${y(value)}` : `L${x(at)},${y(value)}`).join(" ");
     return { line: segment.length === 1 ? `${line} h0.01` : line, area: segment.length > 1 ? `${line} L${x(segment.at(-1)[0])},1000 L${x(segment[0][0])},1000 Z` : null };
   }));
   const label = (at) => steps ? chartNumber(Math.round(at)) : axisTime(at, { start, now: end });
@@ -89,6 +90,6 @@
       <div class="chart-x">{#each Array.from({ length: tickCount + 1 }, (_, i) => start + (end - start) * i / (tickCount || 1)) as at}<span>{label(at)}</span>{/each}</div>
       <div class="chart-hover" hidden={!hover} style:left={`${hover?.left || 0}px`}><div class="chart-cursor"></div><div class="chart-point" style:top={`${hover?.top || 0}%`}></div><div class="chart-tip" bind:this={tip} style:left={`${hover?.tipLeft || 0}px`}>{hover?.text || ""}</div></div>
     </div>
-    <div class="chart-summary"><span title="Arithmetic mean of the reported samples">Average <strong>{valueText(values.reduce((sum, value) => sum + value, 0) / values.length, unit)}</strong></span><span>Peak <strong>{valueText(Math.max(...values), unit)}</strong></span>{#if note}<span class="chart-note" role="status">{note}</span>{/if}</div>
+    <div class="chart-summary"><span title="Arithmetic mean of the reported samples">Average <strong>{valueText(values.reduce((sum, value) => sum + value, 0) / values.length, unit)}</strong></span><span>Peak <strong>{valueText(Math.max(...values), unit)}</strong></span>{#if readingSeconds}<span>One reading per {readingSeconds} s</span>{/if}{#if note}<span class="chart-note" role="status">{note}</span>{/if}</div>
   {/if}
 </figure>

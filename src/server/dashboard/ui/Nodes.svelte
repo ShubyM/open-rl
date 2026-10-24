@@ -37,6 +37,8 @@
   const loaded = $derived(Object.values(queries).some((q) => q.data || q.error));
   const metrics = $derived({ devices: rows(["utilization", "memory_mib"], "UUID") });
   const selectedDevices = $derived(metrics.devices.filter((d) => view.gpu === "all" || view.gpu === d.id));
+  // The exporter's collection interval in k8s/deploy; each engine-activity reading averages it.
+  const DCGM_READING_SECONDS = 10;
   const gpuPoints = $derived(deviceSeries(selectedDevices, "utilization"));
   const gpuMemory = $derived(lastValue(deviceSeries(selectedDevices, "memory_mib"), range));
   const failure = (q) => q.error || q.data?.error || "";
@@ -134,7 +136,7 @@
             {#each devices as device (device.id)}{@const value = lastValue(deviceSeries(metrics.devices.filter((d) => d.id === device.id), "utilization"), range)}<button type="button" class="chip" data-device={device.id} title={`GPU ${deviceLabel(device.name)}`} aria-pressed={view.gpu === device.id} onclick={() => { keepViewport(); view.gpu = device.id; }}>{#if loaded}{deviceLabel(device.name)}{Number.isFinite(value) ? ` · ${Math.round(value)}%` : ""}{/if}</button>{/each}
           </div>{/if}
           <div class="node-activity" data-key="node-timeline"><Activity placements={visible} {range} {inventory} selected={view.placement} onselect={select} {back} activeOnly showSource={false} {navigating} /></div>
-          {#if item.gpu_capacity}<div class="node-gpu-detail" data-key="node-gpu-detail"><div><Chart title={`GPU utilization · ${label}`} unit="%" points={gpuPoints} start={range.start} end={range.now} min={0} max={100} gapSeconds={gapFor(gpuPoints, 60)} empty={gpuError || (!loaded && "Loading…") || "No samples for this GPU"} note={gpuError ? `${gpuError} · Showing previously fetched samples` : ""} {navigating} />
+          {#if item.gpu_capacity}<div class="node-gpu-detail" data-key="node-gpu-detail"><div><Chart title={`GPU utilization · ${label}`} unit="%" points={gpuPoints} start={range.start} end={range.now} min={0} max={100} readingSeconds={DCGM_READING_SECONDS} gapSeconds={gapFor(gpuPoints, 60)} empty={gpuError || (!loaded && "Loading…") || "No samples for this GPU"} note={gpuError ? `${gpuError} · Showing previously fetched samples` : ""} {navigating} />
             {#if queries.utilization.error}<button type="button" class="chip" onclick={queries.utilization.retry}>Retry GPU metrics</button>{/if}
           </div><div class="allocation-detail-footer"><span>{activitySource(visible)}</span><span class="allocation-memory">GPU memory <strong>{Number.isFinite(gpuMemory) ? `${(gpuMemory / 1024).toFixed(1)} GiB` : "—"}</strong>{#if gpuMemoryError}<span class="source-error" role="status"> · {Number.isFinite(gpuMemory) ? "Stale" : "Unavailable"}: {gpuMemoryError}</span>{/if}</span></div></div>{/if}
         </section>
