@@ -76,15 +76,24 @@ async def activity(since: Bound = None, until: Bound = None, run_id: str | None 
 
 
 VLLM = "{pod=~$pods$scope}"
+
+
+def utilization(form: str, by: str = "UUID, gpu") -> str:
+  """A GPU's busy percent. GR_ENGINE_ACTIVE averages DCGM's whole collection interval. GPU_UTIL, the fallback where it is
+  missing, covers about the last second of each interval, so a load with that period aliases."""
+  active, util = "DCGM_FI_PROF_GR_ENGINE_ACTIVE{UUID=~$gpus$scope}", "DCGM_FI_DEV_GPU_UTIL{UUID=~$gpus$scope}"
+  return f"max by ({by}) (100 * {form.format(active)}) or max by ({by}) ({form.format(util)})"
+
+
 QUERIES = {
   # By UUID and gpu: DCGM's slot index names a GPU after its node is gone.
-  "gpu_util": "max by (UUID, gpu) (DCGM_FI_DEV_GPU_UTIL{UUID=~$gpus$scope})",
+  "gpu_util": utilization("{}"),
   "gpu_memory_mib": "max by (UUID, gpu) (DCGM_FI_DEV_FB_USED{UUID=~$gpus$scope})",
   "gpu_memory_total_mib": "max by (UUID) (DCGM_FI_DEV_FB_TOTAL{UUID=~$gpus$scope})",
   # Utilization comes in bursts; the last two minutes say whether a GPU is working now better than one sample.
-  "gpu_util_now": "max by (Hostname, UUID, gpu, modelName) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{UUID=~$gpus$scope}[2m]))",
+  "gpu_util_now": utilization("avg_over_time({}[2m])", "Hostname, UUID, gpu, modelName"),
   # Duty cycle over the window: the share of time a kernel ran, one number per GPU with points=1.
-  "gpu_busy": "max by (UUID, gpu) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{UUID=~$gpus$scope}[${window}s]))",
+  "gpu_busy": utilization("avg_over_time({}[${{window}}s])"),
   # From vLLM's and llm-d's published Grafana dashboards.
   "vllm_generation_tokens_per_second": f"sum(rate(vllm:generation_tokens_total{VLLM}[2m]))",
   "vllm_prompt_tokens_per_second": f"sum(rate(vllm:prompt_tokens_total{VLLM}[2m]))",

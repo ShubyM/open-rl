@@ -53,8 +53,13 @@ A run's display name comes from the `name`, `run_name`, `recipe_name` and
 per holder, so reduce it per UUID before the join:
 
 ```promql
-DCGM_FI_DEV_GPU_UTIL * on(UUID) group_left() max by (UUID) (openrl_gpu_held{run_id="$run", role="trainer"})
+100 * DCGM_FI_PROF_GR_ENGINE_ACTIVE * on(UUID) group_left() max by (UUID) (openrl_gpu_held{run_id="$run", role="trainer"})
 ```
+
+Utilization comes from `DCGM_FI_PROF_GR_ENGINE_ACTIVE`, which averages the exporter's whole 10 s collection interval.
+`DCGM_FI_DEV_GPU_UTIL` covers only about the last second of each interval, so a load with the same period aliases. On an
+A100 running 5 s on and 5 s off, it read 88% while engine activity read 51%. The read API falls back to it where engine
+activity is missing.
 
 ## Routes
 
