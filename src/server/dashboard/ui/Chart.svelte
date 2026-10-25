@@ -1,11 +1,16 @@
+<script module>
+  let charts = 0;
+</script>
 <script>
   import { axisTime, chartNumber, chartTime, valueText } from "./visualization.js";
   import { crosshair, crosshairOffset } from "./state.svelte.js";
-  let { title, unit = "", points = [], start, end, min, max, tone = "neutral", gapSeconds = Infinity, empty = "No samples in this time range", note = "", navigating = false, steps = false, readingSeconds = 0 } = $props();
+  let { title, unit = "", points = [], start, end, min, max, tone = "neutral", gapSeconds = Infinity, empty = "No samples in this time range", note = "", navigating = false, steps = false, readingSeconds = 0, bands = [] } = $props();
+  // Each band is a process and the spans it held the GPU; the area under the line takes its color there.
   // With readingSeconds, each point is a reading the source took that often, so it holds until the next one.
   // With steps, x is a training step rather than a time, so the chart stays out of the shared time crosshair.
   let plot = $state(null), svg = $state(null), tip = $state(null);
   let selectedAt = $state(null);
+  const uid = `chart-${charts++}`;
   const samples = $derived(points.filter(([at]) => Number.isFinite(at) && at >= start && at <= end).sort((a, b) => a[0] - b[0]));
   const data = $derived(samples.filter(([, value]) => Number.isFinite(value)));
   const values = $derived(data.map(([, value]) => value));
@@ -34,6 +39,7 @@
   });
   const spans = $derived(segments.map((segment) => [segment[0][0], segment.at(-1)[0]]));
   const tickCount = $derived(end === start ? 0 : 4);
+  const xAt = (at) => (Math.max(start, Math.min(end, at)) - start) / (end - start || 1) * 1000;
   const x = (at) => ((at - start) / (end - start || 1) * 1000).toFixed(1);
   const y = (value) => (1000 - (Math.max(scale.low, Math.min(scale.high, value)) - scale.low) / (scale.high - scale.low) * 1000).toFixed(1);
   const paths = $derived(segments.map((segment) => {
@@ -84,12 +90,15 @@
       <div class="chart-y">{#each scale.ticks as tick}<span>{chartNumber(tick)}</span>{/each}</div>
       <svg bind:this={svg} viewBox="0 0 1000 1000" preserveAspectRatio="none" role="img" aria-label={`${title}. Latest ${valueText(data.at(-1)[1], unit)}.`}>
         {#each scale.ticks as tick}<line class="chart-grid" x1="0" x2="1000" y1={y(tick)} y2={y(tick)} vector-effect="non-scaling-stroke" />{/each}
-        {#each paths as path}{#if path.area}<path class="chart-area" d={path.area} />{/if}<path class={path.area ? "chart-line" : "chart-dot"} d={path.line} vector-effect="non-scaling-stroke" />{/each}
+        {#each paths as path}{#if path.area}<path class="chart-area" d={path.area} />{/if}{/each}
+        {#each bands as band, i (band.key)}<clipPath id={`${uid}-${i}`}>{#each band.spans as [a, b]}<rect x={xAt(a)} width={Math.max(0, xAt(b) - xAt(a))} y="0" height="1000" />{/each}</clipPath>
+          {#each paths as path}{#if path.area}<path class={`chart-band ${band.hue}`} class:sampler={band.role === "sampler"} d={path.area} clip-path={`url(#${uid}-${i})`} />{/if}{/each}{/each}
+        {#each paths as path}<path class={path.area ? "chart-line" : "chart-dot"} d={path.line} vector-effect="non-scaling-stroke" />{/each}
         {#if !hover && crosshairX !== null}<line class="chart-crosshair" x1={crosshairX * 10} x2={crosshairX * 10} y1="0" y2="1000" vector-effect="non-scaling-stroke" />{/if}
       </svg>
       <div class="chart-x">{#each Array.from({ length: tickCount + 1 }, (_, i) => start + (end - start) * i / (tickCount || 1)) as at}<span>{label(at)}</span>{/each}</div>
       <div class="chart-hover" hidden={!hover} style:left={`${hover?.left || 0}px`}><div class="chart-cursor"></div><div class="chart-point" style:top={`${hover?.top || 0}%`}></div><div class="chart-tip" bind:this={tip} style:left={`${hover?.tipLeft || 0}px`}>{hover?.text || ""}</div></div>
     </div>
-    <div class="chart-summary"><span title="Arithmetic mean of the reported samples">Average <strong>{valueText(values.reduce((sum, value) => sum + value, 0) / values.length, unit)}</strong></span><span>Peak <strong>{valueText(Math.max(...values), unit)}</strong></span>{#if readingSeconds}<span>One reading per {readingSeconds} s</span>{/if}{#if note}<span class="chart-note" role="status">{note}</span>{/if}</div>
+    <div class="chart-summary"><span title="Arithmetic mean of the reported samples">Average <strong>{valueText(values.reduce((sum, value) => sum + value, 0) / values.length, unit)}</strong></span><span>Peak <strong>{valueText(Math.max(...values), unit)}</strong></span>{#if readingSeconds}<span>One reading per {readingSeconds} s</span>{/if}{#each bands as band (band.key)}<span class={`chart-band-key ${band.hue}`} class:sampler={band.role === "sampler"}><span class="chart-band-swatch"></span>{band.label}</span>{/each}{#if note}<span class="chart-note" role="status">{note}</span>{/if}</div>
   {/if}
 </figure>

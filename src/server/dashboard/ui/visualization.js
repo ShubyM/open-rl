@@ -8,6 +8,9 @@ export const chartTime = (at, seconds = false) => new Date(at * 1000).toISOStrin
 export const valueText = (value, unit) => unit === "%" ? `${percent.format(value)}%` : `${chartNumber(value)}${unit ? ` ${unit}` : ""}`;
 export const axisTime = (at, range) => `${range.now - range.start >= 86400 ? `${new Date(at * 1000).toISOString().slice(5, 10)} ` : ""}${chartTime(at, range.now - range.start <= 120)}`;
 export const placementColor = (p) => family(p.run_ids?.[0] || p.runtime_id);
+// The exporter's collection interval in k8s/deploy; each engine-activity reading averages it.
+export const DCGM_READING_SECONDS = 10;
+export const dutyBands = (lanes, device = null) => lanes.filter((p) => p.intervals.length && (!device || p.devices.includes(device))).map((p) => ({ key: p.id, label: `${p.label} · ${p.role || "process"}`, hue: placementColor(p), role: p.role, spans: p.intervals }));
 export const deviceLabel = (name) => /(\d+)$/.exec(String(name ?? ""))?.[1] ?? String(name ?? "");
 export const acceleratorLabel = (node) => node.accelerator ? node.accelerator.replace(/^nvidia[- ]/i, "").replace(/-\d+gb$/i, "").replace(/-/g, " ").toUpperCase() : node.gpu_capacity ? "GPU" : "CPU";
 export function clipPlacements(placements = [], range, error = null, status = null) {

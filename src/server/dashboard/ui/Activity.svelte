@@ -1,8 +1,9 @@
 <script>
   import { nodeLink, viewLink, crosshair, crosshairOffset, timeAt } from "./state.svelte.js";
+  import GpuDuty from "./GpuDuty.svelte";
   import { axisTime, chartTime, valueText, placementColor, processLabel, shortNodeName, opRank, opLabel, activitySource, deviceLabel } from "./visualization.js";
   let { placements = [], range, inventory, acrossNodes = false, activeOnly = false, selected = null, onselect, error = null, pending = false, showSource = true, back = null, navigating = false, onpick = null, duty = null, slots = null } = $props();
-  let tooltip = $state(null), tip;
+  let tooltip = $state(null), tip, open = $state({});
   const cursor = $derived(crosshairOffset(range));
   const activities = $derived(placements.toSorted((a, b) => (acrossNodes ? (({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""))) : 0) || a.start - b.start || a.id.localeCompare(b.id)));
   const shown = $derived(activeOnly ? activities.filter((p) => p.intervals.length || p.error) : activities);
@@ -56,7 +57,7 @@
           {#if first}<svelte:element this={link ? "a" : "span"} class={`activity-label ${placementColor(p)}`} data-key={`label:${p.id}`} href={link || undefined} aria-disabled={!link ? "true" : undefined} title={acrossNodes ? `${name} · ${p.node || "Node unassigned"}${p.node && !link ? " · Node no longer reported" : ""}` : p.label}>
             <span class="activity-swatch"></span><span class="activity-label-text"><span class="activity-name">{name}</span><span class="activity-meta">{meta}{p.ended ? " · Process ended" : p.phase && p.phase !== "ready" ? ` · ${p.phase.replace("_", " ")}` : ""}{!link ? acrossNodes ? p.node ? " · Node no longer reported" : "" : p.run_ids?.length ? " · Run record unavailable" : " · No linked run" : ""}</span></span>
           </svelte:element>{:else}<span></span>{/if}
-          {#if acrossNodes}<span class="activity-gpu" title={device ? device.id : "This process recorded no GPUs"}>{device?.label ?? "GPUs not recorded"}</span>{/if}
+          {#if acrossNodes}{#if device && p.node}<button type="button" class="activity-gpu activity-gpu-toggle" aria-expanded={!!open[key]} title={`${device.id} · ${open[key] ? "Hide" : "Plot"} this GPU's duty cycle`} onclick={() => open[key] = !open[key]}><span class="activity-chevron" aria-hidden="true">{open[key] ? "▾" : "▸"}</span>{device.label}</button>{:else}<span class="activity-gpu" title={device ? device.id : "This process recorded no GPUs"}>{device?.label ?? "GPUs not recorded"}</span>{/if}{/if}
           <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events (Pointer location follows the shared time axis. Incident links and the Logs tab reach the same logs by keyboard.) -->
           <div class="activity-track" onpointermove={trackMove} onclick={onpick && ((event) => onpick(Math.round(timeAt(event, range))))}>
             <svg viewBox="0 0 1000 24" preserveAspectRatio="none" role="img" aria-label="Recorded activity">
@@ -71,6 +72,7 @@
           </div>
           {#if acrossNodes}<span class="node-duty">{dutyText(device)}</span>{/if}
         </div>
+        {#if open[key] && device && p.node}<div class="activity-duty"><GpuDuty node={p.node} {device} {range} /></div>{/if}
       {/each}
       {#if ops.length}<div class="op-legend" aria-label="GPU ops">{#each ops as op}<span data-op={op}><span class="op-swatch"></span>{opLabel(op)}</span>{/each}<span><span class="op-swatch turn"></span>held, unlabelled</span></div>{/if}
     </div>

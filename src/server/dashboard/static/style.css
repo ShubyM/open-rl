@@ -208,6 +208,10 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app svg .chart-grid { stroke: var(--line); stroke-width: 1; }
 #app .chart-line { fill: none; stroke: var(--metric-stroke); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
 #app .chart-area { fill: var(--metric-stroke); fill-opacity: 0.07; }
+#app .chart-band { fill: var(--allocation-color); fill-opacity: 0.55; }
+#app .chart-band.sampler { fill-opacity: 0.28; }
+#app .chart-band-swatch { display: inline-block; width: 9px; height: 9px; margin-right: 5px; border-radius: 2px; background: var(--allocation-color); opacity: 0.55; vertical-align: -1px; }
+#app .chart-band-key.sampler .chart-band-swatch { opacity: 0.28; }
 #app .chart-dot { stroke: var(--metric-stroke); stroke-width: 5; stroke-linecap: round; }
 #app .chart-hover { width: 0; position: absolute; top: 0; height: var(--plot-height); pointer-events: none; z-index: 2; }
 #app .chart-hover[hidden] { display: none; }
@@ -240,6 +244,13 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .run-activity .activity-intro { margin: 0 0 12px; font-size: 12px; }
 #app .run-activity :is(.activity-header, .activity-row) { grid-template-columns: var(--activity-label-width) 88px minmax(0, 1fr) 48px; }
 #app .run-activity .activity-gpu { color: var(--dim); font: 11px var(--mono); overflow-wrap: anywhere; }
+#app .activity-gpu-toggle { padding: 0; border: 0; background: none; text-align: left; cursor: pointer; }
+#app .activity-gpu-toggle:hover { color: var(--ink); }
+#app .activity-chevron { display: inline-block; width: 12px; }
+#app .activity-duty { padding: 10px 0 14px; border-top: 1px solid var(--line); }
+#app .activity-duty .chart { --plot-height: 100px; min-height: calc(var(--plot-height) + 82px); }
+/* The plot lines up with the lane tracks: past the label and GPU columns, short of the duty column. */
+#app .activity-duty .chart-plot { grid-template-columns: calc(var(--activity-label-width) + 100px) minmax(0, 1fr); column-gap: 12px; margin-right: 60px; }
 #app .run-activity .activity-row[data-continued] { min-height: 30px; border-top-color: transparent; }
 #app .run-activity .activity-row[data-continued] .activity-track { height: 30px; }
 #app .run-activity .activity-row[data-lead] { min-height: 30px; }
