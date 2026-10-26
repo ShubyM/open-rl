@@ -231,11 +231,20 @@ def summary(ctx: dict) -> dict:
     restarts = {
       "workers": [{"pod": p["pod"], "stopped_reporting_at": iso(p["stopped_at"]), "restarted_at": iso(p["started_at"])} for p in relaunched],
       "logs": logs,
+      # Who created or deleted the run's Workloads and pods around the relaunches, from the cluster's audit log.
+      "cluster_changes": ctx.get("changes"),
     }
   unplaced = [
     {"name": w["name"], "role": w["role"], "age_s": round(w["age_seconds"] or 0), "message": w["message"]} for w in run["workloads"] if not w["node"]
   ]
-  incidents = sorted((i for pod in run["pods"] for i in pod["incidents"]), key=lambda i: -i["at"])[:5]
+  # A live pod's restarts, and the terminations placement records kept after their pods were gone.
+  kept = [
+    {"at": t["at"], "pod": lane["pod"], "reason": t.get("reason") or "Terminated", "message": exit_text(t)}
+    for lane in ctx["lanes"]
+    for t in lane.get("terminations") or []
+  ]
+  found = {(i["pod"], round(i["at"])): i for i in [*kept, *(i for pod in run["pods"] for i in pod["incidents"])]}
+  incidents = sorted(found.values(), key=lambda i: -i["at"])[:5]
   return present(
     lifecycle=run["lifecycle"],
     steps=len(steps),
@@ -256,6 +265,11 @@ def summary(ctx: dict) -> dict:
     placement=present(recorded=len(ctx["lanes"]), unplaced=unplaced) or None,
     incidents=[present(at=iso(i["at"]), pod=i["pod"], reason=i["reason"], message=(i.get("message") or "")[:200]) for i in incidents],
   )
+
+
+def exit_text(termination: dict) -> str:
+  signal = f", signal {termination['signal']}" if termination.get("signal") else ""
+  return f"{termination.get('container') or 'container'} exited with code {termination.get('exit_code')}{signal}"
 
 
 def line(ctx: dict) -> dict:

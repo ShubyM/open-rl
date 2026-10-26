@@ -281,11 +281,40 @@ async def log_page(run: dict, since: str, until: str, *, cursor=None, limit=200,
   return {"records": records, "next_cursor": payload.get("nextPageToken")}
 
 
+async def audit_events(names: list[str], start: float, end: float) -> list[dict]:
+  """Who created or deleted these Workloads and their pods, from the cluster's audit log, oldest first."""
+  if not (config := configuration())["configured"]:
+    raise LookupError("GKE telemetry is not configured")
+  audit_log = f"projects/{config['project']}/logs/cloudaudit.googleapis.com%2Factivity"
+  methods = ("io.openrl.v1alpha1.workloads.create", "io.openrl.v1alpha1.workloads.delete", "io.k8s.core.v1.pods.delete")
+  clauses = [
+    f"logName={json.dumps(audit_log)}",
+    f"resource.labels.cluster_name={json.dumps(config['cluster'])}",
+    "(" + " OR ".join(f"protoPayload.resourceName:{json.dumps(name)}" for name in names) + ")",
+    "(" + " OR ".join(f"protoPayload.methodName={json.dumps(m)}" for m in methods) + ")",
+    f"timestamp>={json.dumps(datetime.fromtimestamp(start, UTC).isoformat())}",
+    f"timestamp<={json.dumps(datetime.fromtimestamp(end, UTC).isoformat())}",
+  ]
+  query = {"resourceNames": [f"projects/{config['project']}"], "filter": " AND ".join(clauses), "orderBy": "timestamp asc", "pageSize": 50}
+  payload = (await send("POST", "https://logging.googleapis.com/v2/entries:list", json=query, headers=await gcp_headers())).json()
+  return [
+    {
+      "at": e.get("timestamp"),
+      "action": e["protoPayload"]["methodName"].rsplit(".", 2)[-2] + " " + e["protoPayload"]["methodName"].rsplit(".", 1)[-1],
+      "resource": e["protoPayload"].get("resourceName", "").rsplit("/", 1)[-1],
+      "by": e["protoPayload"].get("authenticationInfo", {}).get("principalEmail"),
+    }
+    for e in payload.get("entries", [])
+  ]
+
+
 def window(since: str | None = None, until: str | None = None) -> tuple[str, str, float, float]:
-  """(since, until) in ISO-8601 UTC, then in Unix seconds. until defaults to now, since to 30 minutes before it or a
+  """(since, until) in ISO-8601 UTC, then in Unix seconds; either form is accepted. until defaults to now, since to 30 minutes before it or a
   span before it such as 1h; at most seven days."""
 
   def parse(value: str) -> datetime:
+    if re.fullmatch(r"\d+(\.\d+)?", value):
+      return datetime.fromtimestamp(float(value), UTC)
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
 

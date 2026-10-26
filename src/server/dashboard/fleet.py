@@ -130,6 +130,7 @@ def lanes(fleet: dict, run_id: str | None = None, node_id: str | None = None) ->
     lane.update(label=members[0]["name"] if len(members) == 1 else record["model_id"], shared_runtime=record["model_id"] not in ids if ids else None)
     lane.update(role=record["role"], node=record["node"] or "", pod=record["pod"], devices=record["gpu_uuids"], device_count=len(record["gpu_uuids"]))
     lane.update(phase=max(procs, key=lambda p: p["started_at"])["phase"] if procs else None, turns=[t for p in procs for t in p.get("turns") or []])
+    lane.update(waits=[w for p in procs for w in p.get("waits") or []], terminations=record.get("terminations") or [])
     lane.update(start=start, end=end, ended=record["released_at"] is not None)
     for member in members if lane["shared_runtime"] else [None]:
       if member is None:
@@ -166,7 +167,7 @@ async def running(pods: list[str], low: float, high: float) -> dict[str, list]:
 
 
 async def activity(fleet: dict, low: float, high: float, run_id: str | None = None, node_id: str | None = None) -> list[dict]:
-  """Each lane in the window with its GPU turns (none on a shared lane) and the ops it ran, clipped to it. A sampler lane's
+  """Each lane in the window with its GPU turns and waits for them (none on a shared lane) and the ops it ran, clipped to it. A sampler lane's
   samples are the groups it served and its failed sends, plus its vLLM pod's running requests where Prometheus has them,
   every tenant's on a shared runtime. Never utilization."""
   shown = [p for p in lanes(fleet, run_id, node_id) if p["start"] <= high and p["end"] >= low]
@@ -178,8 +179,10 @@ async def activity(fleet: dict, low: float, high: float, run_id: str | None = No
   except Exception as exc:
     serving, error = {}, f"vLLM metrics unavailable: {exc if isinstance(exc, LookupError) else type(exc).__name__}"
   for lane in shown:
-    lo, hi, turns = max(low, lane["start"]), min(high, lane["end"]), lane.pop("turns")
+    lo, hi, turns, waits = max(low, lane["start"]), min(high, lane["end"]), lane.pop("turns"), lane.pop("waits")
     turns = [] if lane["shared_runtime"] else [[max(lo, a), min(hi, b)] for a, b in turns if a < hi and b > lo]
+    # A grant inside half a second is the slicer's own round trip, not a wait for another holder.
+    waits = [] if lane["shared_runtime"] else [[max(lo, a), min(hi, b)] for a, b in waits if a < hi and b > lo and b - a >= 0.5]
     ops: dict[str, list] = {}
     for r in (r for n in lane["run_ids"] for r in records[n]):
       start = max(lo, r.get("started_at") or r["at"] - r.get("elapsed_seconds", 0))
@@ -191,6 +194,7 @@ async def activity(fleet: dict, low: float, high: float, run_id: str | None = No
     if error and lane["role"] == "sampler":
       lane["error"] = error
     lane.update(ops={n: merge(s) for n, s in ops.items()}, exact=bool(turns), intervals=merge(turns + [s for group in ops.values() for s in group]))
+    lane["waits"] = merge(waits)
   return shown
 
 

@@ -15,7 +15,10 @@ from server.store import get_state_store
 from server.telemetry import key
 
 router = APIRouter(tags=["inspection"])
-BOUNDS = "ISO-8601, e.g. 2026-01-02T12:00:00Z; since also takes a span before until, e.g. 1h. Default: the 30 minutes ending now; at most 7 days."
+BOUNDS = (
+  "ISO-8601, e.g. 2026-01-02T12:00:00Z, or Unix seconds; since also takes a span before until, e.g. 1h. "
+  "Default: the 30 minutes ending now; at most 7 days."
+)
 Bound = Annotated[str | None, Query(max_length=64, description=BOUNDS)]
 
 
@@ -27,7 +30,7 @@ def span(since: str | None, until: str | None) -> tuple[str, str, float, float]:
   try:
     return sources.window(since, until)
   except (ValueError, OverflowError, OSError) as exc:
-    raise HTTPException(400, "Use ISO-8601 since/until timestamps and a positive window of at most seven days") from exc
+    raise HTTPException(400, "Use ISO-8601 or Unix-second since/until and a positive window of at most seven days") from exc
 
 
 async def run_of(run_id: str) -> tuple[dict, dict]:
@@ -48,8 +51,11 @@ async def inventory():
   await sources.discover()
   state = await fleet.snapshot()
   hidden = ("workloads", "runtime_id", "pods")
+  # status is what the client last reported (active until it deletes the model), so a crashed run stays active there;
+  # lifecycle is what the cluster shows.
   runs = [
-    {k: v for k, v in r.items() if k not in hidden} | {"pods": [{"name": p["name"], "problem": p["problem"]} for p in r["pods"]]}
+    {("client_status" if k == "status" else k): v for k, v in r.items() if k not in hidden}
+    | {"pods": [{"name": p["name"], "problem": p["problem"]} for p in r["pods"]]}
     for r in state["runs"]
   ]
   fields = ("id", "label", "run_ids", "role", "node", "pod", "devices", "device_count")
@@ -61,7 +67,8 @@ async def inventory():
 
 @router.get("/api/v1/inspect/activity", response_model=Doc)
 async def activity(since: Bound = None, until: Bound = None, run_id: str | None = None, node_id: str | None = None):
-  """Each placement's GPU turns and recorded ops in the window (Unix seconds), fleet-wide, a node's or a run's.
+  """Each placement's GPU turns, waits (from asking the time slicer for the GPU to the grant, half a second or more), recorded
+  ops and its pod's container terminations in the window (Unix seconds), fleet-wide, a node's or a run's.
   A sampler's `sample` spans are the groups of samples it served, one record per run each, plus its vLLM pod's running
   requests from Prometheus where they are scraped, at 15 s or coarser and on a shared runtime every tenant's; `error` says
   when those were unreadable. Gaps do not prove idleness."""
@@ -78,6 +85,10 @@ async def activity(since: Bound = None, until: Bound = None, run_id: str | None 
 VLLM = "{pod=~$pods$scope}"
 
 
+# The DCGM exporter's collection interval in k8s/deploy.
+DCGM_SECONDS = 10
+
+
 def utilization(form: str, by: str = "UUID, gpu") -> str:
   """A GPU's busy percent. GR_ENGINE_ACTIVE averages DCGM's whole collection interval. GPU_UTIL, the fallback where it is
   missing, covers about the last second of each interval, so a load with that period aliases."""
@@ -89,11 +100,12 @@ QUERIES = {
   # By UUID and gpu: DCGM's slot index names a GPU after its node is gone.
   "gpu_util": utilization("{}"),
   "gpu_memory_mib": "max by (UUID, gpu) (DCGM_FI_DEV_FB_USED{UUID=~$gpus$scope})",
+  "gpu_memory_peak_mib": "max by (UUID, gpu) (max_over_time(DCGM_FI_DEV_FB_USED{UUID=~$gpus$scope}[${window}s]))",
   "gpu_memory_total_mib": "max by (UUID) (DCGM_FI_DEV_FB_TOTAL{UUID=~$gpus$scope})",
   # Utilization comes in bursts; the last two minutes say whether a GPU is working now better than one sample.
   "gpu_util_now": utilization("avg_over_time({}[2m])", "Hostname, UUID, gpu, modelName"),
   # Duty cycle over the window: the share of time a kernel ran, one number per GPU with points=1.
-  "gpu_busy": utilization("avg_over_time({}[${{window}}s])"),
+  "gpu_busy": utilization("avg_over_time({}[${{window}}s])", "Hostname, UUID, gpu, modelName"),
   # From vLLM's and llm-d's published Grafana dashboards.
   "vllm_generation_tokens_per_second": f"sum(rate(vllm:generation_tokens_total{VLLM}[2m]))",
   "vllm_prompt_tokens_per_second": f"sum(rate(vllm:prompt_tokens_total{VLLM}[2m]))",
@@ -126,7 +138,7 @@ def subject(state: dict, run_id: str | None, node_id: str | None, low: float, hi
 
 @router.get("/api/v1/inspect/query", response_model=Doc)
 async def query(
-  name: Annotated[str, Query(description="One of the named queries; an unknown name lists them")],
+  name: Annotated[str | None, Query(description="One of the named queries; leave it out to list them")] = None,
   run_id: str | None = None,
   node_id: str | None = None,
   since: Bound = None,
@@ -134,9 +146,10 @@ async def query(
   points: int = Query(300, ge=1, le=1000),
 ):
   """A named PromQL query over a run's GPUs and pods, a node's, or (GPU queries only) the fleet's, at `points` resolution,
-  `step` seconds apart. points=1 evaluates once over the whole window, which is how a duty cycle is one number per GPU."""
+  `step` seconds apart. points=1 evaluates once over the whole window, which is how a duty cycle is one number per GPU.
+  A gpu_util point is a DCGM reading placed at the start of the reading_seconds it averaged, so it lines up with turns."""
   if name not in QUERIES:
-    raise HTTPException(400, f"Unknown query; use one of {sorted(QUERIES)}")
+    raise HTTPException(400, f"{'Unknown query' if name else 'Name a query'}; use one of {sorted(QUERIES)}")
   since, until, low, high = span(since, until)
   await sources.discover()
   gpus, pods = subject(await fleet.snapshot(), run_id, node_id, low, high)
@@ -150,19 +163,26 @@ async def query(
     rows = await sources.prom(text, high if points == 1 else low, high, points)
   except Exception as exc:
     return {**result, "error": str(exc) if isinstance(exc, LookupError) else f"Query failed: {type(exc).__name__}"}
-  series = [{"labels": r["metric"], "points": [[float(t), float(v)] for t, v in r["values"] if math.isfinite(float(v))]} for r in rows]
-  return result | {"series": series}
+  # A reading averages the interval before it was collected, and a range query returns it up to one reading later.
+  shift = 2 * DCGM_SECONDS if name == "gpu_util" else 0
+  series = [{"labels": r["metric"], "points": [[float(t) - shift, float(v)] for t, v in r["values"] if math.isfinite(float(v))]} for r in rows]
+  return result | {"series": series} | ({"reading_seconds": DCGM_SECONDS} if shift else {})
 
 
 @router.get("/api/v1/inspect/accelerators", response_model=Doc)
 async def accelerators(run_id: str | None = None, node_id: str | None = None, since: Bound = None, until: Bound = None):
-  """Every GPU in the fleet, a node's, or a run's in the window (default the last hour): node, slot, model, holders (the
-  newest placement on it and any time-sliced with it), util (mean of the last two minutes), busy (mean over the window), memory
-  used and total in MiB."""
+  """Every GPU in the fleet, a node's, or a run's in the window: node, slot, model, holders (the newest placement on it
+  and any time-sliced with it, with their pods' container terminations), busy (percent of the window DCGM saw the GPU
+  engine active), and peak and total memory in MiB. The window defaults to the last hour, or an ended run's last hour."""
+  if run_id and since is None and until is None:
+    state, run = await run_of(run_id)
+    run_id, ends = run["run_id"], [p["end"] for p in fleet.lanes(state, run["run_id"])]
+    if run["lifecycle"] == "ended" and ends:
+      since, until = "1h", facts.iso(max(ends))
   since, until, low, high = span(since or ("1h" if until is None else None), until)
-  names = {"util": "gpu_util_now", "busy": "gpu_busy", "memory_used_mib": "gpu_memory_mib", "memory_total_mib": "gpu_memory_total_mib"}
+  names = {"busy": "gpu_busy", "memory_peak_mib": "gpu_memory_peak_mib", "memory_total_mib": "gpu_memory_total_mib"}
   found = dict(zip(names, await asyncio.gather(*(query(name, run_id, node_id, since, until, 1) for name in names.values()))))
-  result = {"since": since, "until": until, "gpus": [], "source": found["util"]["source"]}
+  result = {"since": since, "until": until, "gpus": [], "source": found["busy"]["source"]}
   if error := next((r["error"] for r in found.values() if r.get("error")), None):
     return {**result, "error": error}
   value = {k: {s["labels"]["UUID"]: round(s["points"][-1][1], 1) for s in r["series"] if s["points"]} for k, r in found.items()}
@@ -173,14 +193,13 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
       placed.setdefault(uuid, []).append(lane)
   # A time-sliced GPU has several holders at once, every placement that overlaps the newest one.
   holders = {uuid: [p for p in lanes if p["end"] >= lanes[-1]["start"]] for uuid, lanes in placed.items()}
-  # A GPU whose node scaled down in the window has no utilization now, only its duty; util's labels name node and model.
-  labels_of = {series["labels"]["UUID"]: series["labels"] for series in found["busy"]["series"] + found["util"]["series"]}
+  labels_of = {series["labels"]["UUID"]: series["labels"] for series in found["busy"]["series"]}
   for uuid, labels in labels_of.items():
     node = labels.get("Hostname") or next((lane["node"] for lane in reversed(holders.get(uuid, []))), None)
     gpu = {"uuid": uuid, "node": node, "slot": labels.get("gpu"), "model": labels.get("modelName")}
     gpu |= {name: value[name][uuid] for name in names if uuid in value[name]}
     if uuid in holders:
-      gpu["holders"] = [{k: lane[k] for k in ("run_ids", "role", "pod", "start", "end", "ended")} for lane in holders[uuid]]
+      gpu["holders"] = [{k: lane[k] for k in ("run_ids", "role", "pod", "start", "end", "ended", "terminations")} for lane in holders[uuid]]
     result["gpus"].append(gpu)
   result["gpus"].sort(key=lambda g: (g["node"] or "", int(g["slot"] or 0)))
   return result
@@ -265,6 +284,13 @@ async def summary(run_id: str):
   state, run = await run_of(run_id)
   run_id = run["run_id"]
   ctx = await facts.context(state, run)
+  if relaunched := facts.relaunches(ctx):
+    # The scheduler names a Workload's pod orw-<workload>, so the Workload's name matches both; older records hold the pod's.
+    names = sorted({lane["name"].removeprefix("orw-") for lane in ctx["lanes"]})
+    try:
+      ctx["changes"] = await sources.audit_events(names, relaunched[0]["stopped_at"] - 300, relaunched[-1]["started_at"] + 60)
+    except Exception as exc:
+      ctx["changes"] = {"error": f"Audit log unavailable: {exc if isinstance(exc, LookupError) else type(exc).__name__}"}
   # Read beside the GPU duty, since a long run's running requests are thousands of points.
   vllm = asyncio.ensure_future(sampler_facts(run_id, ctx)) if facts.sends(ctx) else None
   found = {}
@@ -282,7 +308,8 @@ async def summary(run_id: str):
       busy.setdefault("+".join(sorted(roles.get(series["labels"].get("UUID")) or {"other"})), []).append(series["points"][-1][1])
     if busy:
       found["gpu_busy"] = {role: round(sum(v) / len(v), 1) for role, v in busy.items()}
-      found["gpu_busy_window"] = {k: duty[k] for k in ("since", "until")}
+      # On a shared runtime these are the runtime's GPUs, busy with every run it serves.
+      found["gpu_busy_window"] = {k: duty[k] for k in ("since", "until")} | {"scope": "runtime" if run["shared_runtime"] else "run"}
   if vllm is not None:
     ctx.update(await vllm)
   return {"run_id": run_id, **facts.summary(ctx), **found}
