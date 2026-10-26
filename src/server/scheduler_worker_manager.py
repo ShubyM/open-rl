@@ -334,6 +334,17 @@ class SchedulerWorkerManager:
     selector = "app.kubernetes.io/managed-by=open-rl-api-server"
     return self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)["items"]
 
+  def pod_terminations(self) -> dict[str, list[dict[str, Any]]]:
+    """Each worker pod's container terminations, the current one and the one before a restart, for the placement records."""
+    found: dict[str, list[dict[str, Any]]] = {}
+    for pod in client.CoreV1Api().list_namespaced_pod(self.namespace, label_selector="openrl.io/worker").items:
+      for cs in pod.status.container_statuses or []:
+        for ended in (cs.state and cs.state.terminated, cs.last_state and cs.last_state.terminated):
+          if ended and ended.finished_at:
+            entry = {"at": ended.finished_at.timestamp(), "container": cs.name, "reason": ended.reason, "exit_code": ended.exit_code}
+            found.setdefault(pod.metadata.name, []).append(entry | {"signal": ended.signal})
+    return found
+
 
 def worker_state(phase: str, reason: str, node: str | None, deleting: bool) -> tuple[str, str]:
   """Map a Workload's status onto the client vocabulary. The raw facts go

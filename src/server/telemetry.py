@@ -152,6 +152,7 @@ class Worker:
       "phase": "starting",
       "phase_since": now,
       "turns": [],
+      "waits": [],
       # The settings the scheduler passed as env, which is what this process runs with.
       "config": {"env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(CONFIG_ENV) and not SECRET.search(k)}},
     }
@@ -216,16 +217,21 @@ def set_phase(phase: str) -> None:
 
 
 @asynccontextmanager
-async def gpu_turn():
-  """Show a GPU turn on the worker record. Enter it right after time_slicer.acquire, so the turn is the hold."""
-  started = time.time()
-  set_phase("on_gpu")
-  try:
-    yield
-  finally:
+async def gpu_turn(slot):
+  """Take the time slicer's slot for the body and show it on the worker record: the wait from asking to the grant, then
+  the turn, which is the hold."""
+  asked = time.time()
+  async with slot:
+    started = time.time()
     if current is not None:
-      current.record["turns"] = [*current.record["turns"][1 - MAX_TURNS :], [started, time.time()]]
-    set_phase("ready")
+      current.record["waits"] = [*current.record["waits"][1 - MAX_TURNS :], [asked, started]]
+    set_phase("on_gpu")
+    try:
+      yield
+    finally:
+      if current is not None:
+        current.record["turns"] = [*current.record["turns"][1 - MAX_TURNS :], [started, time.time()]]
+      set_phase("ready")
 
 
 @best_effort
@@ -426,8 +432,10 @@ def log_event(kind: str, fields: dict, *, run_id: str | None = None, session_id:
 placements_lock = asyncio.Lock()  # sweeps run in the background and may overlap
 
 
-def placement(workload: dict) -> dict:
+def placement(workload: dict, terminations: dict[str, list[dict]]) -> dict:
+  """A Workload's placement, with the container terminations its pod has shown since, so they outlive the pod."""
   spec, status = workload["spec"], workload["status"]
+  placed_at = epoch(status["placedAt"])
   return {
     "workload": workload["metadata"]["name"],
     "role": spec["role"],
@@ -436,8 +444,9 @@ def placement(workload: dict) -> dict:
     "pod": status.get("podName"),
     "node": status.get("nodeName"),
     "gpu_uuids": status.get("gpuUUIDs") or [],
-    "placed_at": epoch(status["placedAt"]),
+    "placed_at": placed_at,
     "released_at": epoch(status.get("releasedAt")),
+    "terminations": [t for t in terminations.get(status.get("podName"), []) if t["at"] >= placed_at],
   }
 
 
@@ -447,7 +456,9 @@ def merge_placements(records: list[dict], live: dict[str, dict], now: float) -> 
   fresh, merged = dict(live), []
   for old in records:
     if (new := fresh.get(old["workload"])) and new["placed_at"] == old["placed_at"]:
-      merged.append(fresh.pop(old["workload"]))
+      # A restarted container's earlier termination drops out of its pod status; the record keeps it.
+      kept = old.get("terminations", [])
+      merged.append(fresh.pop(old["workload"]) | {"terminations": kept + [t for t in new["terminations"] if t not in kept]})
     elif old["released_at"] is None:
       merged.append({**old, "released_at": now})
     else:
@@ -455,13 +466,13 @@ def merge_placements(records: list[dict], live: dict[str, dict], now: float) -> 
   return merged + list(fresh.values())
 
 
-async def record_placements(store, workloads: list[dict]) -> None:
+async def record_placements(store, workloads: list[dict], terminations: dict[str, list[dict]]) -> None:
   """Keep one record per Workload placement, which outlives the Workload, and the set of models still holding one."""
   now = time.time()
   live: defaultdict[str, dict[str, dict]] = defaultdict(dict)  # model -> Workload name -> placement
   for workload in workloads:
     if (workload.get("status") or {}).get("placedAt"):  # the scheduler stamps it on bind
-      p = placement(workload)
+      p = placement(workload, terminations)
       live[p["model_id"]][p["workload"]] = p
   async with placements_lock:
     opened = await store.set_members(OPEN_PLACEMENTS)

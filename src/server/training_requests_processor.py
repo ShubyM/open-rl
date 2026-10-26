@@ -270,7 +270,7 @@ class TrainingRequestsProcessor:
     save_reqs = [r for r in requests if r.get("op") in save_ops]
 
     if gpu_reqs:
-      async with self.time_slicer.acquire(self.workload), gpu_turn():
+      async with gpu_turn(self.time_slicer.acquire(self.workload)):
         await asyncio.to_thread(self.worker.wake_up)
         try:
           for request in gpu_reqs:
@@ -284,7 +284,7 @@ class TrainingRequestsProcessor:
       for request in save_reqs:
         results.append(await self.handle_request(request))
     else:
-      async with self.time_slicer.acquire(self.workload), gpu_turn():
+      async with gpu_turn(self.time_slicer.acquire(self.workload)):
         for request in save_reqs:
           results.append(await self.handle_request(request))
 

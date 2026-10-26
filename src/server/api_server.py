@@ -81,7 +81,11 @@ async def sweep_placements() -> None:
   except Exception as exc:
     print(f"[API_SERVER] Placement sweep skipped: {exc!r}")
     return
-  write(record_placements(state, workloads), timeout=SESSION_REAP_INTERVAL_SEC)
+  try:
+    terminations = await asyncio.wait_for(asyncio.to_thread(worker_manager.pod_terminations), timeout=5)
+  except Exception:  # placements stand without their pods' exit reasons
+    terminations = {}
+  write(record_placements(state, workloads, terminations), timeout=SESSION_REAP_INTERVAL_SEC)
 
 
 async def reap_owner(owner: str) -> None:

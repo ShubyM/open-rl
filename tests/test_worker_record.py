@@ -92,3 +92,17 @@ class WorkerRecordTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class PlacementRecordTest(unittest.TestCase):
+  def test_a_placement_keeps_its_pods_termination_after_the_pod_status_drops_it(self) -> None:
+    workload = {
+      "metadata": {"name": "w"},
+      "spec": {"role": "trainer", "modelID": "m"},
+      "status": {"placedAt": "2026-10-21T06:00:00Z", "podName": "p"},
+    }
+    oom = {"at": telemetry.epoch("2026-10-21T06:30:00Z"), "container": "worker", "reason": "OOMKilled", "exit_code": 137, "signal": None}
+    first = telemetry.merge_placements([], {"w": telemetry.placement(workload, {"p": [oom]})}, time.time())
+    later = telemetry.merge_placements(first, {"w": telemetry.placement(workload, {})}, time.time())
+    self.assertEqual(later[0]["terminations"], [oom])
+    self.assertIsNone(later[0]["released_at"])

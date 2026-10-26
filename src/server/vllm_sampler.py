@@ -216,7 +216,7 @@ async def holding_gpu(time_slicer: TimeSlicerClient | None, workload: WorkloadRe
   if time_slicer is None:
     yield
     return
-  async with time_slicer.acquire(workload), gpu_turn():
+  async with gpu_turn(time_slicer.acquire(workload)):
     if sampler is not None:
       await sampler.wake()
     try:
