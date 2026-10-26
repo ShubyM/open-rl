@@ -57,6 +57,7 @@ help:
 	@echo "make cluster-eval EVAL_MODEL_PATH=/mnt/shared/open-rl/checkpoints/...  # one-off vLLM eval job on the cluster"
 	@echo "make lint | fmt"
 	@echo "make render OVERLAY=k8s/deploy/lora VERSION=v0.0.1  # pinned manifests to stdout"
+	@echo "make render OVERLAY=k8s/deploy/lora VERSION=v0.0.1 STORAGE_CLASS=zonal-rwx STORAGE_SIZE=10Ti  # shared volume class/size"
 	@echo "make release-bundle VERSION=v0.0.1     # release assets into $(DIST_DIR)/"
 
 # ---------------------------------------------------------------------------
@@ -315,6 +316,10 @@ IMAGE_REPO     ?= ghcr.io/gke-labs/open-rl
 RELEASE_IMAGES ?= server api-server client scheduler
 # Gitignored; the release job uploads everything in here.
 DIST_DIR       ?= dist
+# Optional storage class and size for the shared volume (open-rl-shared-pvc);
+# unset keeps the overlay's own, e.g. STORAGE_CLASS=zonal-rwx STORAGE_SIZE=10Ti.
+STORAGE_CLASS  ?=
+STORAGE_SIZE   ?=
 
 # Print any overlay with the open-rl images pinned to VERSION:
 #   make render OVERLAY=examples/text-to-sql VERSION=v0.0.1 | kubectl apply --server-side -f -
@@ -331,6 +336,10 @@ render:
 	for image in $(RELEASE_IMAGES); do \
 	  kustomize edit set image "$(IMAGE_REPO)/$$image:$(VERSION)"; \
 	done; \
+	ops=""; \
+	if [ -n "$(STORAGE_CLASS)" ]; then ops="{\"op\":\"replace\",\"path\":\"/spec/storageClassName\",\"value\":\"$(STORAGE_CLASS)\"}"; fi; \
+	if [ -n "$(STORAGE_SIZE)" ]; then ops="$${ops:+$$ops,}{\"op\":\"replace\",\"path\":\"/spec/resources/requests/storage\",\"value\":\"$(STORAGE_SIZE)\"}"; fi; \
+	if [ -n "$$ops" ]; then kustomize edit add patch --kind PersistentVolumeClaim --name open-rl-shared-pvc --patch "[$$ops]"; fi; \
 	kustomize build .
 
 # Build the assets attached to a GitHub Release. Asset names carry no version so
