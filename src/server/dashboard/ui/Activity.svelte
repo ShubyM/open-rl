@@ -3,7 +3,7 @@
   import GpuDuty from "./GpuDuty.svelte";
   import { axisTime, chartTime, valueText, placementColor, processLabel, shortNodeName, opRank, opLabel, activitySource, deviceLabel } from "./visualization.js";
   let { placements = [], range, inventory, acrossNodes = false, activeOnly = false, selected = null, onselect, error = null, pending = false, showSource = true, back = null, navigating = false, onpick = null, duty = null, slots = null } = $props();
-  let tooltip = $state(null), tip, open = $state({});
+  let tooltip = $state(null), tip, open = $state({}), mode = $state("lanes");
   const cursor = $derived(crosshairOffset(range));
   const activities = $derived(placements.toSorted((a, b) => (acrossNodes ? (({ trainer: 0, sampler: 1 }[a.role] ?? 2) - ({ trainer: 0, sampler: 1 }[b.role] ?? 2) || String(a.node || "").localeCompare(String(b.node || ""))) : 0) || a.start - b.start || a.id.localeCompare(b.id)));
   const shown = $derived(activeOnly ? activities.filter((p) => p.intervals.length || p.error) : activities);
@@ -43,7 +43,8 @@
 <svelte:window onscroll={() => tooltip = crosshair.at = null} onresize={() => tooltip = crosshair.at = null} />
 <!-- svelte-ignore a11y_no_static_element_interactions (The timeline delegates pointer inspection to its tracks.) -->
 <section class:cross-node-activity={acrossNodes} class:run-activity={acrossNodes} aria-label={acrossNodes ? "Run process activity" : "Node process activity"} data-crosshair={cursor !== null ? "" : undefined} style:--crosshair={`${cursor ?? 0}%`} onpointerleave={() => tooltip = crosshair.at = null} onpointerdown={() => tooltip = crosshair.at = null}>
-  {#if acrossNodes}<h2 class="scheduler-title activity-title">GPU activity</h2><p class="muted activity-intro">One row per accelerator. Colored bars are ops the process on that GPU ran; grey is GPU time held between ops. Duty is the share of time a kernel ran on the GPU, measured by DCGM.</p>{/if}
+  {#if acrossNodes}<h2 class="scheduler-title activity-title">GPU activity</h2><p class="muted activity-intro">One row per accelerator. Colored bars are ops the process on that GPU ran; grey is GPU time held between ops. Duty is the share of time a kernel ran on the GPU, measured by DCGM.</p>
+    <div class="activity-mode" role="group" aria-label="Lanes or duty cycle"><button type="button" class="chip" aria-pressed={mode === "lanes"} onclick={() => mode = "lanes"}>Lanes</button><button type="button" class="chip" aria-pressed={mode === "duty"} onclick={() => mode = "duty"}>Duty cycle</button></div>{/if}
   {#if !shown.length}<p class="empty-state">{empty}</p>
   {:else}
     <div class="activity-timeline" aria-label="Recorded run activity">
@@ -60,7 +61,7 @@
           {#if acrossNodes}{#if device && p.node}<button type="button" class="activity-gpu activity-gpu-toggle" aria-expanded={!!open[key]} title={`${device.id} · ${open[key] ? "Hide" : "Plot"} this GPU's duty cycle`} onclick={() => open[key] = !open[key]}><span class="activity-chevron" aria-hidden="true">{open[key] ? "▾" : "▸"}</span>{device.label}</button>{:else}<span class="activity-gpu" title={device ? device.id : "This process recorded no GPUs"}>{device?.label ?? "GPUs not recorded"}</span>{/if}{/if}
           <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events (Pointer location follows the shared time axis. Incident links and the Logs tab reach the same logs by keyboard.) -->
           <div class="activity-track" onpointermove={trackMove} onclick={onpick && ((event) => onpick(Math.round(timeAt(event, range))))}>
-            <svg viewBox="0 0 1000 24" preserveAspectRatio="none" role="img" aria-label="Recorded activity">
+            {#if mode === "lanes"}<svg viewBox="0 0 1000 24" preserveAspectRatio="none" role="img" aria-label="Recorded activity">
               {#if p.waits?.length}<path class="activity-block wait" d={blocks(p.waits)} vector-effect="non-scaling-stroke" onpointermove={(event) => inspect(event, p.waits, `Waiting for the GPU · ${rowLabel(p)}`, "From asking the time slicer to the grant")} />{/if}
               <!-- svelte-ignore a11y_no_static_element_interactions, a11y_no_noninteractive_tabindex (Keyboard activation selects this placement.) -->
               <path class={`activity-block ${placementColor(p)}`} role={onselect ? "button" : undefined} tabindex={onselect ? 0 : undefined} aria-label={rowLabel(p)} data-placement={!acrossNodes ? p.id : undefined} data-selected={!acrossNodes && p.id === selected} d={blocks(p.intervals)} vector-effect="non-scaling-stroke" onclick={(event) => select(event, p)} onkeydown={(event) => select(event, p)} onpointermove={(event) => inspect(event, p.intervals, rowLabel(p), p.exact ? "GPU turns" : "Recorded operations")} />
@@ -68,14 +69,14 @@
                 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_no_noninteractive_tabindex (Keyboard activation selects this placement.) -->
                 <path class="activity-block op" role={onselect ? "button" : undefined} tabindex={onselect ? 0 : undefined} aria-label={`${opLabel(op)} · ${rowLabel(p)}`} data-placement={!acrossNodes ? p.id : undefined} data-op={op} d={blocks(spans)} vector-effect="non-scaling-stroke" onclick={(event) => select(event, p)} onkeydown={(event) => select(event, p)} onpointermove={(event) => inspect(event, spans, `${opLabel(op)} · ${rowLabel(p)}`, "Worker-recorded op")} />
               {/each}
-            </svg>
+            </svg>{/if}
             {#if status && first}<span class="activity-status" class:unavailable={!!p.error} title={p.error || status}>{status}</span>{/if}
           </div>
           {#if acrossNodes}<span class="node-duty">{dutyText(device)}</span>{/if}
         </div>
-        {#if open[key] && device && p.node}<div class="activity-duty"><GpuDuty node={p.node} {device} {range} /></div>{/if}
+        {#if (open[key] || mode === "duty") && device && p.node}<div class="activity-duty"><GpuDuty node={p.node} {device} {range} /></div>{/if}
       {/each}
-      {#if ops.length}<div class="op-legend" aria-label="GPU ops">{#each ops as op}<span data-op={op}><span class="op-swatch"></span>{opLabel(op)}</span>{/each}<span><span class="op-swatch turn"></span>held, unlabelled</span>{#if shown.some((p) => p.waits?.length)}<span><span class="op-swatch wait"></span>waiting for the GPU</span>{/if}</div>{/if}
+      {#if ops.length && mode === "lanes"}<div class="op-legend" aria-label="GPU ops">{#each ops as op}<span data-op={op}><span class="op-swatch"></span>{opLabel(op)}</span>{/each}<span><span class="op-swatch turn"></span>held, unlabelled</span>{#if shown.some((p) => p.waits?.length)}<span><span class="op-swatch wait"></span>waiting for the GPU</span>{/if}</div>{/if}
     </div>
   {/if}
   {#if error && shown.length}<p class="source-error" role="status">Activity unavailable: {error}</p>{/if}

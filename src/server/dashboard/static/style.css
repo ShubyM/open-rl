@@ -117,9 +117,9 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .hue-7 { --allocation-color: var(--hue-7); }
 #app .capacity-allocation { container: allocation / inline-size; position: absolute; overflow: hidden; display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 0; border: 0; border-radius: 2px; background: color-mix( in srgb, var(--allocation-color, var(--accent)) 19%, var(--ground) ); text-align: left; }
 #app .capacity-allocation:hover { background: color-mix( in srgb, var(--allocation-color, var(--accent)) 27%, var(--ground) ); }
-#app .capacity-allocation.selected:not(.shared) { z-index: 1; background: color-mix( in srgb, var(--allocation-color, var(--accent)) 27%, var(--ground) ); outline: 1px solid color-mix(in srgb, var(--allocation-color, var(--accent)) 70%, var(--line)); }
+#app .capacity-allocation.selected:not(.held) { z-index: 1; background: color-mix( in srgb, var(--allocation-color, var(--accent)) 27%, var(--ground) ); outline: 1px solid color-mix(in srgb, var(--allocation-color, var(--accent)) 70%, var(--line)); }
 #app .capacity-allocation.ended { --allocation-color: var(--dim); color: var(--dim); }
-#app .capacity-allocation.shared { overflow: hidden; background: color-mix(in srgb, var(--line) 45%, var(--ground)); }
+#app .capacity-allocation.held { overflow: hidden; background: color-mix(in srgb, var(--line) 45%, var(--ground)); }
 #app :is(.allocation-name, .allocation-count) { position: relative; z-index: 1; }
 #app .capacity-allocation.unknown-mapping { position: relative; width: 100%; height: 26px; margin-block: 3px; }
 #app .allocation-name { margin-left: 7px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -250,6 +250,9 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .activity-gpu-toggle:hover { color: var(--ink); }
 #app .activity-chevron { display: inline-block; width: 12px; }
 #app .activity-duty { padding: 10px 0 14px; border-top: 1px solid var(--line); }
+#app :is(.activity-mode, .chart-mode) { display: inline-flex; gap: 4px; }
+#app .activity-mode { margin: 0 0 12px; }
+#app .chart-mode { margin-left: 12px; margin-right: auto; }
 #app .activity-duty .chart { --plot-height: 100px; min-height: calc(var(--plot-height) + 82px); }
 /* The plot lines up with the lane tracks: past the label and GPU columns, short of the duty column. */
 #app .activity-duty .chart-plot { grid-template-columns: calc(var(--activity-label-width) + 100px) minmax(0, 1fr); column-gap: 12px; margin-right: 60px; }

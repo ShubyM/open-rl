@@ -41,25 +41,17 @@ export function claimLabel(node, placements, live) {
   return `${new Set(placements.flatMap((p) => p.devices)).size}/${node.gpu_capacity} claimed`;
 }
 export function capacityBars(devices, placements, range, selected) {
+  // Every held GPU draws the turns and ops its holders ran, never one block naming the run; the name is a click away.
   const height = devices.length === 1 ? 30 : 22;
   const span = (from, to) => `left:${100 * Math.max(0, Math.max(range.start, from) - range.start) / (range.now - range.start)}%;width:${100 * Math.max(0, Math.min(range.now, to) - Math.max(range.start, from)) / (range.now - range.start)}%`;
-  const sharers = devices.map((device) => placements.filter((p) => p.devices.includes(device.id)).sort((a, b) => a.start - b.start || a.id.localeCompare(b.id)));
-  const shared = new Set(sharers.flatMap((rows, i) => rows.some((a, n) => rows.slice(n + 1).some((b) => Math.min(a.end, b.end) > Math.max(a.start, b.start))) ? [i] : []));
-  const bars = [...shared].map((i) => {
-    const rows = sharers[i], from = Math.max(range.start, Math.min(...rows.map((p) => p.start))), to = Math.min(range.now, Math.max(...rows.map((p) => p.end)));
-    return { key: `shared:${devices[i].id}`, shared: true, placement: rows.find((p) => p.id === selected) || rows[0], selected: rows.some((p) => p.id === selected), title: `Shared GPU operation activity: ${rows.map((p) => `${p.label} ${p.role || ""}`.trim()).join(", ")}`,
+  return devices.flatMap((device, i) => {
+    const rows = placements.filter((p) => p.devices.includes(device.id)).sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
+    if (!rows.length) return [];
+    const from = Math.max(range.start, Math.min(...rows.map((p) => p.start))), to = Math.min(range.now, Math.max(...rows.map((p) => p.end)));
+    return [{ key: `gpu:${device.id}`, placement: rows.find((p) => p.id === selected) || rows.at(-1), selected: rows.some((p) => p.id === selected), title: `GPU activity: ${rows.map((p) => `${p.label} ${p.role || ""}`.trim()).join(", ")}`,
       style: `${span(from, to)};top:${i * height + 2}px;height:${height - 4}px`,
-      holds: rows.flatMap((p) => p.intervals.map(([a, b]) => ({ placement: p, style: `left:${100 * (Math.max(a, from) - from) / (to - from || 1)}%;width:${100 * (Math.min(b, to) - Math.max(a, from)) / (to - from || 1)}%` }))) };
+      holds: rows.flatMap((p) => p.intervals.map(([a, b]) => ({ placement: p, style: `left:${100 * (Math.max(a, from) - from) / (to - from || 1)}%;width:${100 * (Math.min(b, to) - Math.max(a, from)) / (to - from || 1)}%` }))) }];
   });
-  for (const p of placements) {
-    const groups = [];
-    for (const i of p.devices.map((id) => devices.findIndex((d) => d.id === id)).filter((i) => i >= 0 && !shared.has(i)).sort((a, b) => a - b)) {
-      const last = groups.at(-1);
-      if (last && last.at(-1) === i - 1) last.push(i); else groups.push([i]);
-    }
-    for (const group of groups) bars.push({ key: `${p.id}:${group[0]}`, placement: p, selected: p.id === selected, count: group.length, title: `${p.label}${p.role ? ` · ${p.role}` : ""} · ${group.length} GPU${group.length === 1 ? "" : "s"}`, style: `${span(p.start, p.end)};top:${group[0] * height + 2}px;height:${group.length * height - 4}px` });
-  }
-  return bars;
 }
 // sortedPoints must be in time order; unsorted input gives wrong gaps without an error.
 export function gapFor(sortedPoints, floor) {
