@@ -11,11 +11,22 @@
   let plot = $state(null), svg = $state(null), tip = $state(null);
   let selectedAt = $state(null);
   const uid = `chart-${charts++}`;
-  // A reading chart can show the rolling mean of the last minute instead, which reads as sustained use rather than bursts.
+  // A chart with bands opens on whether anything ran on the GPU: 100 while a process held it or ran an op, else 0, from the
+  // records rather than DCGM's 10 s averages. Readings shows DCGM's own, and Duty (1 min) their rolling mean.
   const ROLLING_SECONDS = 60;
-  let rolling = $state(false);
+  let chosen = $state(null);
+  const mode = $derived(chosen ?? (bands.length ? "running" : "readings"));
+  const running = $derived.by(() => {
+    const merged = [];
+    for (const [a, b] of bands.flatMap((band) => band.spans).map(([a, b]) => [Math.max(start, a), Math.min(end, b)]).filter(([a, b]) => b > a).toSorted((p, q) => p[0] - q[0])) {
+      if (merged.length && a <= merged.at(-1)[1]) merged.at(-1)[1] = Math.max(merged.at(-1)[1], b);
+      else merged.push([a, b]);
+    }
+    return merged;
+  });
   const shown = $derived.by(() => {
-    if (!rolling) return points;
+    if (mode === "running") return [[start, 0], ...running.flatMap(([a, b]) => [[a, 0], [a, 100], [b, 100], [b, 0]]), [end, 0]];
+    if (mode !== "rolling") return points;
     const sorted = points.filter(([at, value]) => Number.isFinite(at) && Number.isFinite(value)).toSorted((a, b) => a[0] - b[0]);
     let first = 0, sum = 0;
     return sorted.map(([at, value], i) => {
@@ -45,7 +56,7 @@
     let current;
     for (const sample of samples) {
       if (!Number.isFinite(sample[1])) { current = null; continue; }
-      if (!current || sample[0] - current.at(-1)[0] > gapSeconds) result.push(current = []);
+      if (!current || (mode !== "running" && sample[0] - current.at(-1)[0] > gapSeconds)) result.push(current = []);
       current.push(sample);
     }
     return result;
@@ -56,7 +67,7 @@
   const x = (at) => ((at - start) / (end - start || 1) * 1000).toFixed(1);
   const y = (value) => (1000 - (Math.max(scale.low, Math.min(scale.high, value)) - scale.low) / (scale.high - scale.low) * 1000).toFixed(1);
   const paths = $derived(segments.map((segment) => {
-    const line = segment.map(([at, value], i) => !i ? `M${x(at)},${y(value)}` : readingSeconds && !rolling ? `H${x(at)} V${y(value)}` : `L${x(at)},${y(value)}`).join(" ");
+    const line = segment.map(([at, value], i) => !i ? `M${x(at)},${y(value)}` : readingSeconds && mode === "readings" ? `H${x(at)} V${y(value)}` : `L${x(at)},${y(value)}`).join(" ");
     return { line: segment.length === 1 ? `${line} h0.01` : line, area: segment.length > 1 ? `${line} L${x(segment.at(-1)[0])},1000 L${x(segment[0][0])},1000 Z` : null };
   }));
   const label = (at) => steps ? chartNumber(Math.round(at)) : axisTime(at, { start, now: end });
@@ -95,7 +106,7 @@
 </script>
 <svelte:window onresize={() => selectedAt = null} />
 <figure class="chart" data-key={title} data-tone={tone}>
-  <figcaption class="chart-head"><h2>{title}</h2>{#if readingSeconds}<span class="chart-mode" role="group" aria-label="Readings or rolling duty"><button type="button" class="chip" aria-pressed={!rolling} onclick={() => rolling = false}>Readings</button><button type="button" class="chip" aria-pressed={rolling} onclick={() => rolling = true}>Duty (1 min)</button></span>{/if}{#if data.length}<span class="chart-latest" title={steps ? `Step ${data.at(-1)[0]}` : new Date(data.at(-1)[0] * 1000).toISOString()}><span>Latest</span> <strong>{valueText(data.at(-1)[1], unit)}</strong></span>{/if}</figcaption>
+  <figcaption class="chart-head"><h2>{title}</h2>{#if readingSeconds}<span class="chart-mode" role="group" aria-label="What to plot">{#if bands.length}<button type="button" class="chip" aria-pressed={mode === "running"} onclick={() => chosen = "running"}>Running</button>{/if}<button type="button" class="chip" aria-pressed={mode === "readings"} onclick={() => chosen = "readings"}>Readings</button><button type="button" class="chip" aria-pressed={mode === "rolling"} onclick={() => chosen = "rolling"}>Duty (1 min)</button></span>{/if}{#if data.length && mode !== "running"}<span class="chart-latest" title={steps ? `Step ${data.at(-1)[0]}` : new Date(data.at(-1)[0] * 1000).toISOString()}><span>Latest</span> <strong>{valueText(data.at(-1)[1], unit)}</strong></span>{/if}</figcaption>
   {#if !data.length}<p class="chart-empty">{empty}</p>
   {:else}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions (Arrow keys inspect the chart samples.) -->
@@ -112,6 +123,6 @@
       <div class="chart-x">{#each Array.from({ length: tickCount + 1 }, (_, i) => start + (end - start) * i / (tickCount || 1)) as at}<span>{label(at)}</span>{/each}</div>
       <div class="chart-hover" hidden={!hover} style:left={`${hover?.left || 0}px`}><div class="chart-cursor"></div><div class="chart-point" style:top={`${hover?.top || 0}%`}></div><div class="chart-tip" bind:this={tip} style:left={`${hover?.tipLeft || 0}px`}>{hover?.text || ""}</div></div>
     </div>
-    <div class="chart-summary"><span title="Arithmetic mean of the reported samples">Average <strong>{valueText(values.reduce((sum, value) => sum + value, 0) / values.length, unit)}</strong></span><span>Peak <strong>{valueText(Math.max(...values), unit)}</strong></span>{#if readingSeconds}<span>{rolling ? `Mean of the last minute's ${readingSeconds} s readings` : `One reading per ${readingSeconds} s`}</span>{/if}{#each bands as band (band.key)}<span class={`chart-band-key ${band.hue}`} class:sampler={band.role === "sampler"}><span class="chart-band-swatch"></span>{band.label}</span>{/each}{#if note}<span class="chart-note" role="status">{note}</span>{/if}</div>
+    <div class="chart-summary">{#if mode === "running"}<span>Something ran <strong>{valueText(100 * running.reduce((sum, [a, b]) => sum + b - a, 0) / (end - start || 1), "%")}</strong> of the range</span>{:else}<span title="Arithmetic mean of the reported samples">Average <strong>{valueText(values.reduce((sum, value) => sum + value, 0) / values.length, unit)}</strong></span><span>Peak <strong>{valueText(Math.max(...values), unit)}</strong></span>{#if readingSeconds}<span>{mode === "rolling" ? `Mean of the last minute's ${readingSeconds} s readings` : `One reading per ${readingSeconds} s`}</span>{/if}{/if}{#each bands as band (band.key)}<span class={`chart-band-key ${band.hue}`} class:sampler={band.role === "sampler"}><span class="chart-band-swatch"></span>{band.label}</span>{/each}{#if note}<span class="chart-note" role="status">{note}</span>{/if}</div>
   {/if}
 </figure>
