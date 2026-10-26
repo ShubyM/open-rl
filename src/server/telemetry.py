@@ -180,6 +180,17 @@ class Worker:
 
 current: Worker | None = None  # this process's record while it serves
 
+# The sampler pod's port named http, which the sampler PodMonitoring scrapes.
+SAMPLER_METRICS_PORT = 9095
+
+
+@best_effort
+def serve_metrics() -> None:
+  """Serve this process's Prometheus registry, where an in-process vLLM engine records its own metrics."""
+  from prometheus_client import start_http_server  # the sampler image has it through vLLM; the API server never calls this
+
+  start_http_server(SAMPLER_METRICS_PORT)
+
 
 @asynccontextmanager
 async def serving(role: str, runtime_id: str | None):

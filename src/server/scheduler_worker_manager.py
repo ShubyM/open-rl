@@ -28,6 +28,7 @@ from typing import Any
 from kubernetes import client, config
 
 from server.estimator import Footprint, footprint
+from server.telemetry import SAMPLER_METRICS_PORT
 from server.worker_manager import (
   FAILED,
   READY,
@@ -183,6 +184,8 @@ def pod_template(worker: Worker) -> dict[str, Any]:
 
   if pull_policy := os.getenv("OPEN_RL_WORKER_IMAGE_PULL_POLICY"):
     template["spec"]["containers"][0]["imagePullPolicy"] = pull_policy
+  if worker.role == "sampler":
+    template["spec"]["containers"][0]["ports"] = [{"name": "http", "containerPort": SAMPLER_METRICS_PORT}]
   return template
 
 
