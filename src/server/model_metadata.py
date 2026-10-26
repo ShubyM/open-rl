@@ -87,13 +87,17 @@ class TrainingModelMetadata(BaseModel):
     return f"{self.trainer_backend}-{self.base_model}"
 
   def pool(self, model_id: str) -> str:
-    """The sampling pool that serves this job's runtime. Base model names are not
-    valid Kubernetes names, so those runtimes get a slug and a hash."""
-    runtime = self.runtime(model_id)
-    if POOL_NAME.fullmatch(name := f"sampler-{runtime}"):
-      return name
-    slug = re.sub(r"[^a-z0-9]+", "-", runtime.lower()).strip("-")[:40]
-    return f"sampler-{slug}-{hashlib.sha256(runtime.encode()).hexdigest()[:8]}"
+    """The sampling pool that serves this job's runtime."""
+    return pool_name(self.runtime(model_id))
+
+
+def pool_name(runtime: str) -> str:
+  """The sampling pool that serves a runtime. Base model names are not valid
+  Kubernetes names, so those runtimes get a slug and a hash."""
+  if POOL_NAME.fullmatch(name := f"sampler-{runtime}"):
+    return name
+  slug = re.sub(r"[^a-z0-9]+", "-", runtime.lower()).strip("-")[:40]
+  return f"sampler-{slug}-{hashlib.sha256(runtime.encode()).hexdigest()[:8]}"
 
 
 def decode_model_metadata(raw: str | None) -> TrainingModelMetadata | None:

@@ -146,7 +146,8 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   }
   # MAX_JOBS caps FlashInfer's JIT build, which otherwise runs one ~3GB
   # compiler per core and blows through the pod's host memory limit.
-  for name in ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "VLLM_ENABLE_MULTIMODAL", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS"):
+  passed = ("VLLM_GPU_MEMORY_UTILIZATION", "VLLM_MAX_MODEL_LEN", "VLLM_ENABLE_MULTIMODAL", "OPEN_RL_TRAIN_TOKEN_BUDGET", "MAX_JOBS")
+  for name in (*passed, "OPEN_RL_SAMPLE_DEADLINE_SECONDS"):
     if os.getenv(name):
       values[name] = os.environ[name]
   # vLLM keys its torch.compile artifacts by model, GPU type and engine config.
@@ -247,8 +248,9 @@ def pod_template(worker: Worker) -> dict[str, Any]:
 
 def dispatcher_body(pool: str, owner: str) -> dict[str, Any]:
   """The pool's CPU pod, named after the pool: the dispatcher, Envoy and the llm-d
-  EPP. Recreate stops the old pod before the new one starts, so two dispatchers
-  never send for one pool."""
+  EPP. Recreate stops the old pod before the new one starts. An eviction or a
+  partition can still overlap two dispatchers, and set_result's transaction keeps
+  each request to one result."""
   labels = pool_labels("dispatcher", pool)
   env = [
     {"name": "REDIS_URL", "value": os.environ["REDIS_URL"]},
@@ -256,8 +258,9 @@ def dispatcher_body(pool: str, owner: str) -> dict[str, Any]:
     {"name": "OPEN_RL_SAMPLER_POOL", "value": pool},
     downward("OPEN_RL_WORKER_NAMESPACE", "metadata.namespace"),
   ]
-  if concurrency := os.getenv("OPEN_RL_DISPATCH_CONCURRENCY"):
-    env.append({"name": "OPEN_RL_DISPATCH_CONCURRENCY", "value": concurrency})
+  for name in ("OPEN_RL_DISPATCH_CONCURRENCY", "OPEN_RL_SAMPLE_DEADLINE_SECONDS"):
+    if value := os.getenv(name):
+      env.append({"name": name, "value": value})
   dispatcher = {
     "name": "dispatcher",
     # The dispatcher is a small CPU process; the API-server image carries it without the GPU stack.
@@ -384,8 +387,8 @@ class SchedulerWorkerManager:
 
   def ensure_dispatcher(self, pool: str, owner: str) -> None:
     # A released pool's Deployment stays until its pod is gone, so waiting
-    # here keeps an old and a new dispatcher from overlapping. The
-    # NetworkPolicy of a released pool is gone long before that.
+    # here keeps an old and a new dispatcher from overlapping in the usual case.
+    # The NetworkPolicy of a released pool is gone long before that.
     started, waited = time.monotonic(), False
     while not self.create_once(self.apps_api.create_namespaced_deployment, dispatcher_body(pool, owner)):
       try:
@@ -471,6 +474,29 @@ class SchedulerWorkerManager:
     for item in ours:
       self.delete_workload(item["metadata"]["name"])
     return {item["spec"]["modelID"] for item in ours}
+
+  def sampler_exists(self, model_id: str) -> bool:
+    """Whether the model's pool is up: a sampler Workload of its runtime not being deleted and, when the pool is routed,
+    its dispatcher Deployment."""
+    _, runtime, _ = runtime_of(model_id)
+    selector = "app.kubernetes.io/managed-by=open-rl-api-server"
+    found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
+    samplers = [
+      item
+      for item in found["items"]
+      if item["spec"].get("role") == "sampler" and item["spec"]["modelID"] == runtime and not item["metadata"].get("deletionTimestamp")
+    ]
+    if not samplers:
+      return False
+    pool = samplers[0]["metadata"].get("labels", {}).get("app.kubernetes.io/instance")
+    if pool is None:
+      return True
+    try:
+      return not self.apps_api.read_namespaced_deployment(pool, self.namespace).metadata.deletion_timestamp
+    except Exception as exc:
+      if getattr(exc, "status", None) != 404:
+        raise
+      return False
 
   def close(self) -> None:
     pass  # Workloads outlive the API server; the scheduler owns them from here

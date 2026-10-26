@@ -53,7 +53,8 @@ class PinnedVersionTest(RedisTestCase):
     await persist_model_metadata(state, "run-a", meta)
     self.enterContext(patch.object(trp, "get_state_store", return_value=state))
     versions = os.path.join(tmp, "sampler_full", "run-a", "sampler_weights")
-    pinned = {"request_id": "waiting", "pool": meta.pool("run-a"), "revision": os.path.join(versions, "sampler-1"), "idempotency_key": None}
+    pinned = {"request_id": "waiting", "pool": meta.pool("run-a"), "job": "run-a", "model": "base", "idempotency_key": None}
+    pinned["revision"] = os.path.join(versions, "sampler-1")
     await SamplingStore(self.redis).accept(pinned)
     proc = trp.TrainingRequestsProcessor(RedisStore(self.redis), RecordingWorker(), "run-a", time_slicer=SlicerStub())
     for step in range(1, 6):

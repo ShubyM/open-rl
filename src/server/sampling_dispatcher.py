@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # The dispatcher wakes for each new request, or after this long to retry a failed send and look at its replicas.
 RETRY_MS = 1000
 # A request no replica has answered for this long fails, so its client stops waiting.
-SAMPLE_DEADLINE_SECONDS = 3600
+SAMPLE_DEADLINE_SECONDS = int(os.getenv("OPEN_RL_SAMPLE_DEADLINE_SECONDS", "3600"))
 # The version a replica reports once its weights may not match any revision. Never a path, so no pool revision equals it.
 UNKNOWN_WEIGHTS = "unknown"
 # How long one /weight_info call may take.
@@ -85,7 +85,7 @@ class Dispatcher:
   def __init__(self, store: SamplingStore, pool: str, sampler: Any, concurrency: int) -> None:
     self.store, self.pool, self.sampler, self.concurrency = store, pool, sampler, concurrency
     self.revision = ""
-    # This dispatcher is the pool's only reader, so it reads each record once and drops it when its result is saved.
+    # Each record is read once and dropped when its result is saved.
     self.records: dict[str, dict[str, Any]] = {}
     self.newest = "0-0"
     self.in_flight: dict[str, asyncio.Task] = {}
@@ -140,6 +140,12 @@ class Dispatcher:
     for r in await self.store.pending(self.pool, after=self.newest):
       self.records[r["entry_id"]] = r
       self.newest = r["entry_id"]
+    # The API server's deadline sweep and reconcile save results too, so a record they answered is dropped.
+    held = list(self.records.values())
+    answered = await self.store.answered([r["request_id"] for r in held])
+    for r in held:
+      if r["request_id"] in answered:
+        self.records.pop(r["entry_id"])
     for r in list(self.records.values()):
       if (waited := time.time() - accepted_at(r)) > SAMPLE_DEADLINE_SECONDS:
         logger.warning("Failing %s after %.0fs without a result", r["request_id"], waited)
