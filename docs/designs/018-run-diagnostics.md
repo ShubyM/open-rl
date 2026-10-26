@@ -27,7 +27,7 @@ Every key is in the API server's Redis. Each record expires
 | Record | Key | Writer | Holds |
 |---|---|---|---|
 | Command record | `open_rl:operations:<run>` for trainer ops, `open_rl:operations:<run>:samples` for samples | Trainer, one per op. Sampler, one per failed sample only | `operation`, `status`, `error_type`, `started_at`, `at`, `elapsed_seconds`, `request_id`, `role`, `runtime_id`, `pod`, `pod_uid`, `node`, finite `metrics`, the names of non-finite ones in `nonfinite`, and `step` on trainer ops. The newest `OPEN_RL_OPS_SAMPLE_LIMIT` (2,000) of each list |
-| Sample count and time | `open_rl:sampled:<run>`, `open_rl:sampled_at:<run>` | Sampler and torch trainer, on every sample | The run's samples sent, and when the last one finished. vLLM's own Prometheus metrics time the samples it answers, so an answered vLLM sample keeps no command record. A torch trainer's samples keep theirs |
+| Sample count and time | `open_rl:sampled:<run>`, `open_rl:sampled_at:<run>` | Sampler and torch trainer, on every sample | The run's samples sent, and when the last one finished. A vLLM sampler keeps one command record per group of samples it served, not one per sample. A torch trainer's samples keep theirs |
 | Step counter and step times | `open_rl:steps:<run>`, `open_rl:step_times:<run>` | Trainer, on each successful `optim_step` | The run's step count, and the times of its last 64 steps |
 | Request counters | `open_rl:ledger:<run>`, one hash | API server (`enqueued`), trainer (`popped`, `answered`, `failed`) | Trainer requests that reached each point |
 | Worker record | `open_rl:worker:<id>`, one per process | Every trainer and sampler, rewritten every 5 s by a thread | Pod, pod UID, node, role, runtime, GPU UUIDs (`null` when NVML is unreadable), phase, recent GPU turns, outstanding requests by op and run with the oldest's age, and the settings env with secrets left out. A record not rewritten for 30 s belongs to a gone process |
@@ -72,10 +72,10 @@ too when `OPEN_RL_INSPECTION_API=true`. Every route is a `GET` under
 | `/runs?ended=` | Which run to open: every live run in one line (lifecycle, steps, seconds since its last op and step, median step time, unanswered requests and how many a dead worker holds, samples queued, failures, relaunches), longest since its last op first. Built from the counters, the last sample time and the last record of each list, never the command history |
 | `/runs/{id}/summary` | What is wrong with this run: the run facts below, and GPU duty by role over the run's span |
 | `/runs/{id}/steps?last=` | What each step did: trainer ops grouped by step, with each op's count, failures, seconds and metric spread |
-| `/runs/{id}/commands?since=&until=&role=` | The raw command records, newest first. A vLLM sampler's samples appear only when they failed |
+| `/runs/{id}/commands?since=&until=&role=` | The raw command records, newest first. A vLLM sampler's samples appear as the groups it served, with a count, and one record per failed sample |
 | `/sessions/{id}/summary` | What a client did: its session record, whether it is live, its SDK errors, and a line per model over the session's span |
 | `/inventory` | What exists now: runs with their lifecycle (`ended`, `waiting`, `placed`, `active`), nodes with their GPUs, the GPUs held now, pods with problems, and one error per source that could not be read |
-| `/activity?run_id=&node_id=&since=&until=` | Who ran where and when: one lane per placement with its GPU turns and recorded op intervals. A sampler lane's samples are the groups it served, plus its vLLM pod's running requests from Prometheus where scraped |
+| `/activity?run_id=&node_id=&since=&until=` | Who ran where and when: one lane per placement with its GPU turns and recorded op intervals. A sampler lane's samples are the groups it served |
 | `/accelerators?run_id=&node_id=&since=&until=` | What each GPU is doing: node, slot, model, every placement holding it, utilization now and over the window, memory used of total |
 | `/query?name=&run_id=&node_id=&since=&until=&points=` | A named PromQL query (`gpu_util`, `gpu_util_now`, `gpu_busy`, `gpu_memory_mib`, `gpu_memory_total_mib`, `vllm_*`) over a run's or node's GPUs and pods, or the fleet's GPUs |
 | `/logs?run_id=&pod=&q=&severity=&since=&until=&cursor=` | The run's lines from Cloud Logging, newest first: its worker pods by the scheduler's owner label, and the lines an in-cluster client labels `openrl_run_id=<run>` and `openrl_source=client`, without telemetry's own lines. A stderr line takes the level it prints |
@@ -96,13 +96,13 @@ block means nothing of its kind was recorded.
 |---|---|
 | `steps`, `step_seconds`, `since_last_step_s`, `last_op`, `last_metrics` | Optimizer steps, the median and last gap between them, and the newest trainer op |
 | `since_last_op_s`, `trainer_idle_s` | For a live run, seconds since any op and since the trainer's last op |
-| `goodput` | The share of the run's span spent training, the rest split into checkpoint, forward-only, rollout (a vLLM request running on one of the run's sampler pods, or a recorded torch sample in flight) and client (nothing in flight) seconds |
+| `goodput` | The share of the run's span spent training, the rest split into checkpoint, forward-only, rollout (a group of samples being served, or a recorded torch sample in flight) and client (nothing in flight) seconds |
 | `requests` | Unanswered trainer requests with the holding pod and whether its worker still reports; the counters, with `lost = enqueued - popped - queued`; samples waiting in the sampler queue |
 | `failures` | Failed trainer ops: the count, the 5 newest, and a log read around the newest |
 | `relaunches` | Workers replaced in the same pod during the run, with a log read around the first. A clean exit, or a shared runtime's idle pod recreated under its name, is not one |
 | `saves` | `save_state` calls, failures, the last success and the steps since |
 | `optimizer` | Ops with non-finite metrics and the first of them, and the last 5 grad norms |
-| `samplers` | Sends (the sample count) and failures (the failed records). Median latency, and the slowest and fastest replica with 20 or more answered requests, from vLLM's `e2e_request_latency_seconds` histograms on the run's sampler pods |
+| `samplers` | Sends (the sample count), failures (the failed records), and the median time of the groups its samplers served |
 | `config` | Workers whose echoed settings differ from what the run asked for, or `no echo` |
 | `placement` | Placements recorded, and Workloads with no node yet |
 | `incidents` | The 5 newest Kubernetes terminations and scheduling failures on the run's pods |
@@ -139,10 +139,9 @@ so an agent follows a failure to its traceback in one call.
   logs or placement blocks.
 - Runs recorded before step stamps, step times or the failure counter leave
   those fields null, and their steps are derived from the order of their ops.
-- vLLM's metrics are per pod, not per run. On a shared runtime, sampler
-  latency, rollout time and activity cover every tenant. A median is
-  interpolated within vLLM's histogram buckets, and running requests are
-  sampled every 15 s for activity and every 30 s for rollout.
+- Sampler latency is the time a group of samples took, not each request's. Runs
+  recorded before group records, which kept neither, have no sampler latency,
+  rollout split or sample bars. vLLM's per-pod charts stay on `/query`.
 - Facts are computed on request. Alerts would need a timer and thresholds.
 - Not recorded yet: cgroup OOM kills and peak memory in the worker record, NVML
   utilization for GPU facts without Prometheus, and the request's holder

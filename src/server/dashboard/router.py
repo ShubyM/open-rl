@@ -69,9 +69,7 @@ async def inventory():
 async def activity(since: Bound = None, until: Bound = None, run_id: str | None = None, node_id: str | None = None):
   """Each placement's GPU turns, waits (from asking the time slicer for the GPU to the grant, half a second or more), recorded
   ops and its pod's container terminations in the window (Unix seconds), fleet-wide, a node's or a run's.
-  A sampler's `sample` spans are the groups of samples it served, one record per run each, plus its vLLM pod's running
-  requests from Prometheus where they are scraped, at 15 s or coarser and on a shared runtime every tenant's; `error` says
-  when those were unreadable. Gaps do not prove idleness."""
+  A sampler's `sample` spans are the groups of samples it served, one record per run each. Gaps do not prove idleness."""
   since, until, low, high = span(since, until)
   if run_id:
     state, run = await run_of(run_id)
@@ -115,15 +113,6 @@ QUERIES = {
   "vllm_preemptions_per_second": f"sum(rate(vllm:num_preemptions_total{VLLM}[2m]))",
   "vllm_time_to_first_token_p99_seconds": f"histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{VLLM}[2m])))",
   "vllm_request_latency_p99_seconds": f"histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{VLLM}[2m])))",
-  "vllm_requests_running_by_pod": fleet.RUNNING_BY_POD,
-  # Over the whole window, one number per pod with points=1. max by pod, since a pod two jobs scrape reports twice.
-  "vllm_requests_finished_by_pod": f"max by (pod) (increase(vllm:e2e_request_latency_seconds_count{VLLM}[${{window}}s]))",
-  "vllm_request_latency_median_by_pod_seconds": (
-    f"histogram_quantile(0.5, max by (pod, le) (increase(vllm:e2e_request_latency_seconds_bucket{VLLM}[${{window}}s])))"
-  ),
-  "vllm_request_latency_median_seconds": (
-    f"histogram_quantile(0.5, sum by (le) (max by (pod, le) (increase(vllm:e2e_request_latency_seconds_bucket{VLLM}[${{window}}s]))))"
-  ),
 }
 
 
@@ -242,45 +231,15 @@ async def runs(ended: bool = False):
   return {"runs": sorted(lines, key=lambda r: -(r["since_last_op_s"] if r["since_last_op_s"] is not None else math.inf))}
 
 
-async def sampler_facts(run_id: str, ctx: dict) -> dict:
-  """What vLLM's metrics say about the run's sampler pods: median latency overall and per replica, with the requests each
-  answered, over the run's sampling span, and the spans with a request running over its trainer span."""
-  week = 7 * 86400
-  low, high = facts.sampling_span(ctx)
-  since, until = facts.iso(max(low, high - week)), facts.iso(high)
-  names = ("vllm_request_latency_median_seconds", "vllm_request_latency_median_by_pod_seconds", "vllm_requests_finished_by_pod")
-  reads = [query(name, run_id, None, since, until, 1) for name in names]
-  if trainer := facts.trainer_span(ctx):
-    start, end = max(trainer[0], trainer[1] - week), trainer[1]
-    # 30 s apart, twice the scrape interval, which halves a long run's read and moved rollout under 0.3% on the demo runs.
-    reads.append(query("vllm_requests_running", run_id, None, facts.iso(start), facts.iso(end), max(2, int((end - start) / 30))))
-  overall, by_pod, finished, *running = await asyncio.gather(*reads)
-  last = lambda r: {s["labels"].get("pod"): s["points"][-1][1] for s in r["series"] if s["points"]}  # noqa: E731
-  answered = last(finished)
-  latency = {"median_s": next(iter(last(overall).values()), None), "replicas": {pod: (answered.get(pod, 0), m) for pod, m in last(by_pod).items()}}
-  if error := next((r["error"] for r in (overall, by_pod, finished) if r.get("error")), None):
-    latency["error"] = error
-  found = {"latency": latency}
-  # No series means vLLM reported nothing for the run's pods, which says nothing about whether it sampled.
-  if running and running[0]["series"]:
-    found["running"] = [span for s in running[0]["series"] for span in fleet.running_spans(s["points"], running[0]["step"])]
-  return found
-
-
 @router.get("/api/v1/inspect/runs/{run_id}/summary", response_model=Doc)
 async def summary(run_id: str):
   """The run's facts, each block only when it has content: pace, goodput, unanswered requests and their holders, the ledger
   (lost = enqueued - popped - queued), failures and relaunches with log reads, saves, optimizer, samplers, config,
   placement, incidents, and GPU duty by role over the run's span (gpu_busy, percent). No verdict; reason from the facts.
 
-  A vLLM sampler keeps one record per group of samples it served and one per failed sample. Where vLLM's Prometheus
-  metrics on the run's sampler pods are scraped they time each answered request, and on a shared runtime they cover
-  every tenant. In samplers, sends is the run's sample count, and failed and cancelled count its records. Its median_s,
-  and the slowest and fastest of the replicas that answered 20 or more requests, are vLLM's end-to-end latency over the
-  run's span. They count only answered requests and are interpolated within vLLM's histogram buckets, and latency_error
-  says why they are missing. Without those metrics median_s is the median time of the groups it served. In goodput,
-  rollout is trainer idle time while a vLLM pod of the run had a request running, read every 30 s. When vLLM reported
-  nothing for the run's pods, the groups its samplers served say when a sample was in flight."""
+  A vLLM sampler keeps one record per group of samples it served and one per failed sample. In samplers, sends is the
+  run's sample count, failed and cancelled count its records, and median_s is the median time of the groups it served.
+  In goodput, rollout is trainer idle time while one of those groups was being served."""
   state, run = await run_of(run_id)
   run_id = run["run_id"]
   ctx = await facts.context(state, run)
@@ -291,8 +250,6 @@ async def summary(run_id: str):
       ctx["changes"] = await sources.audit_events(names, relaunched[0]["stopped_at"] - 300, relaunched[-1]["started_at"] + 60)
     except Exception as exc:
       ctx["changes"] = {"error": f"Audit log unavailable: {exc if isinstance(exc, LookupError) else type(exc).__name__}"}
-  # Read beside the GPU duty, since a long run's running requests are thousands of points.
-  vllm = asyncio.ensure_future(sampler_facts(run_id, ctx)) if facts.sends(ctx) else None
   found = {}
   if ops := ctx["ops"]:
     # Duty over the run's own span: averaging in the idle days after it ended would understate it.
@@ -310,8 +267,6 @@ async def summary(run_id: str):
       found["gpu_busy"] = {role: round(sum(v) / len(v), 1) for role, v in busy.items()}
       # On a shared runtime these are the runtime's GPUs, busy with every run it serves.
       found["gpu_busy_window"] = {k: duty[k] for k in ("since", "until")} | {"scope": "runtime" if run["shared_runtime"] else "run"}
-  if vllm is not None:
-    ctx.update(await vllm)
   return {"run_id": run_id, **facts.summary(ctx), **found}
 
 

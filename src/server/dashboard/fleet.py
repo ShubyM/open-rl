@@ -4,7 +4,6 @@ import asyncio
 import json
 import time
 from collections import OrderedDict
-from string import Template
 
 from server import openrl_status
 from server.dashboard import sources
@@ -151,33 +150,12 @@ def merge(spans: list) -> list:
   return result
 
 
-RUNNING_BY_POD = "max by (pod) (vllm:num_requests_running{pod=~$pods$scope})"  # max, since a pod two jobs scrape reports twice
-
-
-def running_spans(points: list, step: float) -> list:
-  """The spans in which a gauge read above zero, each reading standing for the step before it."""
-  return merge([[float(t) - step, float(t)] for t, v in points if float(v) > 0])
-
-
-async def running(pods: list[str], low: float, high: float) -> dict[str, list]:
-  """Each vLLM pod's spans in [low, high] with a request running, at Prometheus resolution."""
-  points = min(1000, max(2, int((high - low) / 15)))
-  rows = await sources.prom(Template(RUNNING_BY_POD).substitute(pods=sources.any_of(pods), scope=sources.scope()), low, high, points)
-  return {r["metric"].get("pod"): running_spans(r["values"], sources.step_seconds(low, high, points)) for r in rows}
-
-
 async def activity(fleet: dict, low: float, high: float, run_id: str | None = None, node_id: str | None = None) -> list[dict]:
   """Each lane in the window with its GPU turns and waits for them (none on a shared lane) and the ops it ran, clipped to it. A sampler lane's
-  samples are the groups it served and its failed sends, plus its vLLM pod's running requests where Prometheus has them,
-  every tenant's on a shared runtime. Never utilization."""
+  samples are the groups it served and its failed sends. Never utilization."""
   shown = [p for p in lanes(fleet, run_id, node_id) if p["start"] <= high and p["end"] >= low]
   wanted = sorted({n for lane in shown for n in lane["run_ids"]})
   records = dict(zip(wanted, await asyncio.gather(*(operations(n) for n in wanted))))
-  pods, error = sorted({lane["pod"] for lane in shown if lane["role"] == "sampler" and lane["pod"]}), None
-  try:
-    serving = await running(pods, low, high) if pods else {}
-  except Exception as exc:
-    serving, error = {}, f"vLLM metrics unavailable: {exc if isinstance(exc, LookupError) else type(exc).__name__}"
   for lane in shown:
     lo, hi, turns, waits = max(low, lane["start"]), min(high, lane["end"]), lane.pop("turns"), lane.pop("waits")
     turns = [] if lane["shared_runtime"] else [[max(lo, a), min(hi, b)] for a, b in turns if a < hi and b > lo]
@@ -189,10 +167,6 @@ async def activity(fleet: dict, low: float, high: float, run_id: str | None = No
       # A sample lands on the replica pod that answered it.
       if r.get("role") == lane["role"] and r.get("pod") in (None, lane["pod"]) and start < min(hi, r["at"]):
         ops.setdefault(r["operation"], []).append([start, min(hi, r["at"])])
-    if spans := [[max(lo, a), min(hi, b)] for a, b in serving.get(lane["pod"], []) if a < hi and b > lo]:
-      ops.setdefault("sample", []).extend(spans)
-    if error and lane["role"] == "sampler":
-      lane["error"] = error
     lane.update(ops={n: merge(s) for n, s in ops.items()}, exact=bool(turns), intervals=merge(turns + [s for group in ops.values() for s in group]))
     lane["waits"] = merge(waits)
   return shown

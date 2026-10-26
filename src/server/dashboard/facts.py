@@ -126,8 +126,7 @@ def answered(ctx: dict) -> list[dict]:
 
 
 def samplers(ctx: dict) -> dict | None:
-  """Sends and failures from the run's own count and records. Latency and the replica comparison come from vLLM's
-  histograms on the run's sampler pods (ctx["latency"]), which time only the requests vLLM answered."""
+  """Sends and failures from the run's own count and records, and the median time of the groups its samplers served."""
   if not (sent := sends(ctx)):
     return None
   records = [s for s in ctx["ops"] if s["operation"] == "sample"]
@@ -136,17 +135,8 @@ def samplers(ctx: dict) -> dict | None:
     "cancelled": sum(s.get("status") == "cancelled" for s in records),
     "failed": sum(s.get("status") == "failed" for s in records),
   }
-  latency = ctx.get("latency") or {}
-  if (median := latency.get("median_s")) is None and (recorded := answered(ctx)):
-    median = statistics.median(s.get("elapsed_seconds", 0) for s in recorded)
-  if median is not None:
-    found["median_s"] = round(median, 2)
-  medians = {pod: value for pod, (count, value) in latency.get("replicas", {}).items() if count >= 20}
-  if len(medians) >= 2:
-    for end, pick in (("slowest", max), ("fastest", min)):
-      found[end] = {"pod": (pod := pick(medians, key=medians.get)), "median_s": round(medians[pod], 2)}
-  if latency.get("error"):
-    found["latency_error"] = latency["error"]
+  if recorded := answered(ctx):
+    found["median_s"] = round(statistics.median(s.get("elapsed_seconds", 0) for s in recorded), 2)
   return found
 
 
@@ -174,12 +164,6 @@ def trainer_span(ctx: dict) -> tuple[float, float] | None:
   return start, start + max((ops[-1]["at"] if ctx["finished"] else ctx["now"]) - start, 1.0)
 
 
-def sampling_span(ctx: dict) -> tuple[float, float]:
-  """From the run's creation to its last op or sample once the run has ended, else to now."""
-  start, last = ctx["run"]["created_at"], last_op_at(ctx)
-  return start, max(last if ctx["finished"] and last else ctx["now"], start + 1.0)
-
-
 def goodput(ctx: dict) -> dict | None:
   """Share of the run's span the trainer spent training, and where the rest went (Google ML goodput)."""
   if not (span := trainer_span(ctx)):
@@ -189,10 +173,8 @@ def goodput(ctx: dict) -> dict | None:
   spent = {kind: sum(s.get("elapsed_seconds", 0) for s in ops if s["operation"] in names) for kind, names in BUCKETS.items()}
   idle = max(0.0, wall - sum(spent.values()))
   split = {"other": round(idle)}
-  # Trainer idle time with a sample in flight is rollout; with none the server waits on the client. vLLM's running requests
-  # say when one was in flight, else the answered samples' records do.
-  running = ctx.get("running")
-  if running is not None or (running := [(s["started_at"], s["at"]) for s in answered(ctx)]):
+  # Trainer idle time with a sample in flight is rollout; with none the server waits on the client.
+  if running := [(s["started_at"], s["at"]) for s in answered(ctx)]:
     busy = [(s["started_at"], s["at"]) for s in ops]
     rollout = min(idle, max(0.0, covered(busy + running, start, end) - covered(busy, start, end)))
     split = {"rollout": round(rollout), "client": round(idle - rollout)}
