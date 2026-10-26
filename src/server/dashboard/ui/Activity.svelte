@@ -61,6 +61,7 @@
           <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events (Pointer location follows the shared time axis. Incident links and the Logs tab reach the same logs by keyboard.) -->
           <div class="activity-track" onpointermove={trackMove} onclick={onpick && ((event) => onpick(Math.round(timeAt(event, range))))}>
             <svg viewBox="0 0 1000 24" preserveAspectRatio="none" role="img" aria-label="Recorded activity">
+              {#if p.waits?.length}<path class="activity-block wait" d={blocks(p.waits)} vector-effect="non-scaling-stroke" onpointermove={(event) => inspect(event, p.waits, `Waiting for the GPU · ${rowLabel(p)}`, "From asking the time slicer to the grant")} />{/if}
               <!-- svelte-ignore a11y_no_static_element_interactions, a11y_no_noninteractive_tabindex (Keyboard activation selects this placement.) -->
               <path class={`activity-block ${placementColor(p)}`} role={onselect ? "button" : undefined} tabindex={onselect ? 0 : undefined} aria-label={rowLabel(p)} data-placement={!acrossNodes ? p.id : undefined} data-selected={!acrossNodes && p.id === selected} d={blocks(p.intervals)} vector-effect="non-scaling-stroke" onclick={(event) => select(event, p)} onkeydown={(event) => select(event, p)} onpointermove={(event) => inspect(event, p.intervals, rowLabel(p), p.exact ? "GPU turns" : "Recorded operations")} />
               {#each Object.entries(p.ops).sort(([a], [b]) => opRank(a) - opRank(b)) as [op, spans] (op)}
@@ -74,7 +75,7 @@
         </div>
         {#if open[key] && device && p.node}<div class="activity-duty"><GpuDuty node={p.node} {device} {range} /></div>{/if}
       {/each}
-      {#if ops.length}<div class="op-legend" aria-label="GPU ops">{#each ops as op}<span data-op={op}><span class="op-swatch"></span>{opLabel(op)}</span>{/each}<span><span class="op-swatch turn"></span>held, unlabelled</span></div>{/if}
+      {#if ops.length}<div class="op-legend" aria-label="GPU ops">{#each ops as op}<span data-op={op}><span class="op-swatch"></span>{opLabel(op)}</span>{/each}<span><span class="op-swatch turn"></span>held, unlabelled</span>{#if shown.some((p) => p.waits?.length)}<span><span class="op-swatch wait"></span>waiting for the GPU</span>{/if}</div>{/if}
     </div>
   {/if}
   {#if error && shown.length}<p class="source-error" role="status">Activity unavailable: {error}</p>{/if}

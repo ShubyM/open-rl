@@ -5,7 +5,7 @@
   import { opLabel, opRank } from "./visualization.js";
   let { run, view, range, bounds, selection, finished, navigating = false } = $props();
   // Every recorded step of the run, charted by step rather than by the time window.
-  const steps = createQuery(() => inspectUrl(`runs/${encodeURIComponent(view.id)}/steps`, { last: 1000 }), { poll: 30000, pollWhen: () => !finished });
+  const steps = createQuery(() => inspectUrl(`runs/${encodeURIComponent(view.id)}/steps`, { last: 1000, fields: "*" }), { poll: 30000, pollWhen: () => !finished });
   const rows = $derived(steps.data?.steps || []);
   // Until the first steps arrive, hold each section's space with empty charts so nothing below jumps when they land.
   const loading = $derived(!steps.data && !steps.error);

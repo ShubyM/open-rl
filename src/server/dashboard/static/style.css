@@ -209,6 +209,8 @@ body { margin: 0; background: light-dark(#ffffff, #131519); }
 #app .chart-line { fill: none; stroke: var(--metric-stroke); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
 #app .chart-area { fill: var(--metric-stroke); fill-opacity: 0.07; }
 #app .chart-band { fill: var(--allocation-color); fill-opacity: 0.55; }
+#app .activity-block.wait { fill: var(--dim); fill-opacity: 0.16; }
+#app .op-swatch.wait { background: var(--dim); opacity: 0.3; }
 #app .chart-band.sampler { fill-opacity: 0.28; }
 #app .chart-band-swatch { display: inline-block; width: 9px; height: 9px; margin-right: 5px; border-radius: 2px; background: var(--allocation-color); opacity: 0.55; vertical-align: -1px; }
 #app .chart-band-key.sampler .chart-band-swatch { opacity: 0.28; }

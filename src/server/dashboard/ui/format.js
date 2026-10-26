@@ -6,7 +6,7 @@ export const isFinished = (run) => run?.lifecycle === "ended";
 // When a finished run stopped: when it was marked complete, else its last completed work.
 export const finishedAt = (run) => [seconds(run.completed_at), run.last_completed_at].find(Number.isFinite) ?? NaN;
 // One label: the gateway's status once it is final, else the lifecycle.
-export const runLabel = (run) => run.status !== "active" ? run.status : { ended: "ended", waiting: "queued", placed: "running" }[run.lifecycle] || "active";
+export const runLabel = (run) => run.client_status !== "active" ? run.client_status : { ended: "ended", waiting: "queued", placed: "running" }[run.lifecycle] || "active";
 export function elapsedTime(run, observedAt) {
   const stop = isFinished(run) ? finishedAt(run) : NaN;
   const start = seconds(run.created_at), end = Number.isFinite(stop) ? stop : seconds(observedAt);
