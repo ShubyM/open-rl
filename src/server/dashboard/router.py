@@ -194,6 +194,13 @@ async def accelerators(run_id: str | None = None, node_id: str | None = None, si
   return result
 
 
+# Prefixes of the cookbook's metrics an agent reads first; the rest is a fields= away.
+KEY_METRICS = (
+  *("env/all/reward", "test/env/all/reward", "env/all/lab/criteria_pass_fraction", "test/env/all/lab/criteria_pass_fraction"),
+  *("optim/kl", "optim/entropy", "time/total", "progress/"),
+)
+
+
 async def client_directory(run: dict) -> str | None:
   """The run's client directory under OPEN_RL_CLIENT_RUNS_ROOT, if exactly one matches it."""
   candidates = await fleet.cached("client directories", 30, lambda: asyncio.to_thread(client_runs.directories))
@@ -204,13 +211,15 @@ async def client_directory(run: dict) -> str | None:
 async def steps(
   run_id: str,
   last: int = Query(20, ge=1, le=1000),
-  fields: Annotated[str | None, Query(description="Comma-separated prefixes of client metrics to keep, e.g. env/all/reward")] = None,
+  fields: Annotated[str | None, Query(description="Comma-separated prefixes of client metrics to keep, e.g. env/all/reward; * keeps all")] = None,
 ):
   """The run's last steps, oldest first: window, completion, trainer ops (count, failures, seconds, metric spread), and the
-  `client` metrics its client wrote to metrics.jsonl for the step."""
+  `client` metrics its client wrote to metrics.jsonl for the step: by default the key ones (rewards, KL, entropy, step time,
+  progress), with every name the client logged in client_metric_names."""
   _, run = await run_of(run_id)
   run_id = run["run_id"]
-  every, keep, result = fleet.steps(await fleet.operations(run_id)), tuple(p for p in (fields or "").split(",") if p), {}
+  keep = () if fields == "*" else tuple(p for p in fields.split(",") if p) if fields else KEY_METRICS
+  every, result = fleet.steps(await fleet.operations(run_id)), {}
   # Some runs keep their client metrics in Redis; metrics.jsonl wins a step both have.
   client = {row["step"]: finite(row["metrics"]) for row in await get_state_store().read_samples(f"open_rl:run_metrics:{run_id}")}
   if directory := await client_directory(run):
@@ -221,6 +230,7 @@ async def steps(
   result["client_directory"] = directory
   for step in every[-last:]:
     step["client"] = {k: v for k, v in client.get(step["step"], {}).items() if not keep or k.startswith(keep)}
+  result["client_metric_names"] = sorted({name for metrics in client.values() for name in metrics})
   return result | {"run_id": run_id, "total": len(every), "steps": every[-last:]}
 
 
