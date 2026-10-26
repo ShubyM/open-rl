@@ -35,6 +35,11 @@ def future_key(request_id: str) -> str:
   return f"open_rl:future:{request_id}"
 
 
+def job_of(r: dict[str, Any]) -> str:
+  """The job that asked for the record. Records accepted before the API server named the job group under their model."""
+  return r.get("job") or r["model"]
+
+
 class SamplingStore:
   def __init__(self, client: redis.Redis):
     self.redis = client

@@ -128,7 +128,7 @@ API Server Data Queues (queue:<model_id>, sampler_queue:<model_id>) ---> Workers
 
 ### Provisioning & Activation Mechanics
 * **Trainer Provisioning:** When `/api/v1/create_model` is invoked, the API Server enqueues a launch command. `WorkerLaunchProcessor` pops the request and invokes `FFTWorkerManager.launch_trainer(model_id)` to provision the pod or subprocess.
-* **Sampler Provisioning:** When `/api/v1/create_sampling_session` is invoked, `WorkerLaunchProcessor` invokes `FFTWorkerManager.launch_sampler(model_id)`. The sampler compiles CUDA graphs and posts `open_rl:sampler_ready:<model_id> = "1"` to Redis. The API Server polls this key, blocking session return until physical readiness is verified.
+* **Sampler Provisioning:** When `/api/v1/create_sampling_session` is invoked, the API Server makes sure the model's sampling pool exists and returns at once. Samples wait in the pool's Redis stream until a sampler is up to serve them.
 
 ### Graceful Queue-Based Teardown (Sentinel Pattern)
 To prevent dropping in-flight rollouts during de-provisioning, teardown uses the **Sentinel Pattern**:

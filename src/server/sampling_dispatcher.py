@@ -1,7 +1,7 @@
 """Serves one sampling pool's pending records with a sampler and saves the first result for each.
 
-The sampler is HttpSampler, which sends through the pool's router, Envoy in front of the llm-d EPP, to its vllm serve
-replicas."""
+The sampler is either vLLM in this process (vllm_sampler.Sampler), for a pool of one replica that one job owns, or
+HttpSampler, which sends through the pool's router, Envoy in front of the llm-d EPP, to its vllm serve replicas."""
 
 import asyncio
 import contextlib
@@ -18,6 +18,7 @@ import httpx
 import redis.asyncio as redis
 
 from server.sampling_store import SamplingStore
+from server.vllm_options import sample_params, sample_result
 
 logger = logging.getLogger(__name__)
 
@@ -68,14 +69,13 @@ class RevisionUnloadable(Exception):
 
 
 def to_result(body: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
-  """The old sampler's result shape, from a vLLM /inference/v1/generate response."""
-  logprobs = [[e["logprob"] for e in c["logprobs"]["content"]] for c in body["choices"]]
-  sequences = [{"tokens": c["token_ids"], "logprobs": lp, "stop_reason": c["finish_reason"]} for c, lp in zip(body["choices"], logprobs)]
-  result: dict[str, Any] = {"type": "sample", "sequences": sequences}
+  """The result for a vLLM /inference/v1/generate response."""
+  sequences = [(c["token_ids"], [e["logprob"] for e in c["logprobs"]["content"]], c["finish_reason"]) for c in body["choices"]]
+  prompt_logprobs = None
   if record["include_prompt_logprobs"]:
     pairs = zip(record["prompt_token_ids"], body["prompt_logprobs"], strict=True)
-    result["prompt_logprobs"] = [None if e is None else e[str(token)]["logprob"] for token, e in pairs]
-  return result
+    prompt_logprobs = [None if e is None else e[str(token)]["logprob"] for token, e in pairs]
+  return sample_result(sequences, prompt_logprobs)
 
 
 class Dispatcher:
@@ -212,7 +212,7 @@ class HttpSampler:
   async def generate(self, r: dict[str, Any]) -> dict[str, Any] | None:
     """The result, or None when the answer did not come from the record's revision."""
     target, sent = r["revision"] or "default", time.monotonic()
-    params = {**r["sampling_params"], "logprobs": 0, "prompt_logprobs": 0 if r["include_prompt_logprobs"] else None}
+    params = sample_params(r)
     attempt_id = f"{r['request_id']}-{uuid.uuid4().hex[:8]}"
     # The store hands prompts back as array('I'), which JSON cannot encode.
     body = {"request_id": attempt_id, "token_ids": list(r["prompt_token_ids"]), "model": r["model"], "sampling_params": params}
