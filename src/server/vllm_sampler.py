@@ -230,10 +230,12 @@ async def process_batch(sampler: Sampler, store: RequestStore, requests: list[di
   """Serve consecutive requests that share a weights_path together, updating weights between groups."""
   for weights_path, group in groupby(requests, key=lambda req: req.get("weights_path")):
     batch = list(group)
+    updating = time.time()
     try:
       await sampler.ensure_weights(weights_path)
     except Exception as exc:
       for request in batch:
+        op_finished(request, "sampler", request.get("model_id"), updating, type(exc).__name__)
         await store.set_result(request["request_id"], failed_response(f"vLLM weight update failed: {exc}"))
       continue
     started = time.time()

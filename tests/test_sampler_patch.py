@@ -244,6 +244,14 @@ class SamplerLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.slicer.unregister.assert_not_called()
     self.slicer.close.assert_awaited_once()
 
+  async def test_failed_weight_update_keeps_a_failed_record(self):
+    self.engine.update_weights.side_effect = RuntimeError("CUDA out of memory")
+    request = {"request_id": "1", "model_id": "run", "weights_path": "a"}
+    self.store.get_sampling_requests_for_model.side_effect = [[request, {"request_id": SHUTDOWN_SENTINEL}]]
+    await serve_time_sliced("test", self.store, self.factory)
+    self.assertIn("out of memory", self.results()["1"]["error_message"])
+    self.assertEqual(await self.recorded(), [("1", "failed", "RuntimeError")])
+
   async def test_loop_errors_fail_unserved_requests_and_retry(self):
     self.store.get_sampling_requests_for_model.side_effect = [
       RuntimeError("redis down"),
