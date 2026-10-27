@@ -48,7 +48,7 @@ UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 # A row of the per-step metrics table the client prints: "│ time/total │ 117.589038 │".
 METRIC_ROW = re.compile(r"│\s*(\S+)\s*│\s*(\S+)\s*│")
 # Step time columns: report label and the client metric behind it.
-STEP_PARTS = (("Step time", "time/total"), ("Sampling", "time/sampling"), ("Training", "time/train_step"), ("Weight sync", "time/save_checkpoint"))
+STEP_PARTS = (("Whole step", "time/total"), ("Sampling", "time/sampling"), ("Training", "time/train_step"), ("Weight sync", "time/save_checkpoint"))
 
 
 @dataclass(frozen=True)
@@ -347,38 +347,43 @@ def mean(xs: list[float]) -> float | None:
 
 
 def fmt(x: float | None) -> str:
-  return "-" if x is None else f"{x:.0f}" if abs(x) >= 100 else f"{x:.1f}"
+  return "-" if x is None else f"{x:.0f}" if abs(x) >= 10 else f"{x:.1f}"
 
 
 def change(before: float | None, after: float | None) -> str:
   return "-" if not before or after is None else f"{(after - before) / before * 100:+.0f}%"
 
 
-def build_report(records: list[dict]) -> str:
+def compare(before: float | None, after: float | None, pct: bool = True) -> str:
+  """One report cell: before → after, and the change unless pct is False."""
+  if before is None and after is None:
+    return "-"
+  return f"{fmt(before)} → {fmt(after)}" + (f" ({change(before, after)})" if pct else "")
+
+
+def build_report(records: list[dict], labels: dict[str, str]) -> str:
+  """labels: plain-word description per job group, from describe_groups."""
   steps = records[0]["steps"]
   runs = {v: [r for r in records if r["version"] == v and r["valid"]] for v in ("before", "after")}
   out = ["# OpenRL performance: before vs after", ""]
   for v in ("before", "after"):
     images = next((r["images"] for r in records if r["version"] == v), {})
     out.append(f"- **{v}**: " + ", ".join(f"{k} `{img}`" for k, img in images.items()))
+  totals = {v: mean([t for r in rs if (t := total_time(r)) is not None]) for v, rs in runs.items()}
   out += [
     "",
-    "Values are means over each version's valid runs. Times are seconds from launch. On a shared runtime they include",
-    "waiting for other jobs' turns.",
+    "Values are means over each version's valid runs. On a shared runtime, times include waiting for other jobs' turns.",
     "",
-    "## Runs",
+    "## Total time",
+    "",
+    f"Launch until the last job finishes step {steps}: **{compare(totals['before'], totals['after'])}** seconds.",
     "",
     "| Run | Version | Total time (s) | Failed or unfinished jobs |",
     "|---|---|---|---|",
   ]
   for r in records:
     bad = [name for name, j in r["jobs"].items() if not j["ok"] or len(j["steps"]) < steps]
-    total = total_time(r)
-    out.append(f"| {r['run']} | {r['version']}{'' if r['valid'] else ' (timed out)'} | {fmt(total)} | {', '.join(bad) or '-'} |")
-
-  totals = {v: mean([t for r in rs if (t := total_time(r)) is not None]) for v, rs in runs.items()}
-  out += ["", "## Total time", "", "| | Before | After | Change |", "|---|---|---|---|"]
-  out += [f"| Launch until the last job finishes step {steps} (s) | {fmt(totals['before'])} | {fmt(totals['after'])} | {change(*totals.values())} |"]
+    out.append(f"| {r['run']} | {r['version']}{'' if r['valid'] else ' (timed out)'} | {fmt(total_time(r))} | {', '.join(bad) or '-'} |")
 
   def group_values(version: str, group: str) -> dict[str, float | None]:
     """Per metric: mean over the group's jobs in every run of the version."""
@@ -386,9 +391,9 @@ def build_report(records: list[dict]) -> str:
     for r in runs[version]:
       for job in (j for j in r["jobs"].values() if j["group"] == group and j["steps"]):
         s = job["steps"]
-        vals.setdefault("Step 1", []).append(s[0]["t"])
+        vals.setdefault("first", []).append(s[0]["t"])
         if len(s) >= steps:
-          vals.setdefault(f"Step {steps}", []).append(s[steps - 1]["t"])
+          vals.setdefault("last", []).append(s[steps - 1]["t"])
         # Steady state: step 1 includes start-up, so use the later steps when there are any.
         later = s[1:steps] or s[:1]
         for label, key in STEP_PARTS:
@@ -398,43 +403,74 @@ def build_report(records: list[dict]) -> str:
     return {k: mean(v) for k, v in vals.items()}
 
   groups = list(dict.fromkeys(j["group"] for r in records for j in r["jobs"].values()))
-  metrics = ["Step 1", f"Step {steps}", *(label for label, _ in STEP_PARTS)]
+  values = {g: (group_values("before", g), group_values("after", g)) for g in groups}
   out += [
     "",
-    "## Per job group",
+    "## When jobs finish",
     "",
-    f"Step 1 and Step {steps}: launch until the job finishes that step. Step time: median of steps 2-{steps} from the client's",
-    "metrics, split into sampling, training and weight sync (`time/save_checkpoint`).",
+    "Seconds from launch until the job finishes that step, before → after.",
     "",
-    "| Group | Metric | Before | After | Change |",
-    "|---|---|---|---|---|",
+    f"| Jobs | First step done | All {steps} steps done |",
+    "|---|---|---|",
   ]
-  for group in groups:
-    b, a = group_values("before", group), group_values("after", group)
-    for metric in metrics:
-      out.append(f"| {group} | {metric} (s) | {fmt(b.get(metric))} | {fmt(a.get(metric))} | {change(b.get(metric), a.get(metric))} |")
+  for g in groups:
+    b, a = values[g]
+    out.append(f"| {labels.get(g, g)} | {compare(b.get('first'), a.get('first'))} | {compare(b.get('last'), a.get('last'))} |")
+
+  parts = [label for label, _ in STEP_PARTS]
+  out += [
+    "",
+    "## How long a step takes",
+    "",
+    f"Seconds, median of steps 2-{steps} (step 1 includes start-up), before → after. Weight sync is `time/save_checkpoint`.",
+    "",
+    "| Jobs | " + " | ".join(parts) + " |",
+    "|---|" + "---|" * len(parts),
+  ]
+  for g in groups:
+    b, a = values[g]
+    cells = [compare(b.get(parts[0]), a.get(parts[0]))] + [compare(b.get(p), a.get(p), pct=False) for p in parts[1:]]
+    out.append(f"| {labels.get(g, g)} | " + " | ".join(cells) + " |")
 
   out += [
     "",
     "## Peak GPU memory",
     "",
-    "nvidia-smi `memory.used` in each worker pod, MiB, max over the group's workers, mean over runs. Time-sliced workers",
+    "nvidia-smi `memory.used` in each worker pod, GiB, max over the group's workers, before → after. Time-sliced workers",
     "share a GPU, so theirs is the memory of everything on that GPU.",
     "",
-    "| Group | Role | GPU | Before | After | Change |",
-    "|---|---|---|---|---|---|",
+    "| Jobs | GPU | Trainer | Sampler |",
+    "|---|---|---|---|",
   ]
   peaks: dict[tuple[str, str], dict[str, list[float]]] = {}
-  gpus: dict[tuple[str, str], set[str]] = {}
+  gpus: dict[str, set[str]] = {}
   for v, rs in runs.items():
     for r in rs:
-      for key, ws in worker_groups(r).items():
-        peaks.setdefault(key, {}).setdefault(v, []).append(max(w["peak_mib"] for w in ws))
-        gpus.setdefault(key, set()).update(w["gpu"].replace("NVIDIA ", "") for w in ws if w.get("gpu"))
-  for key in sorted(peaks):
-    b, a = mean(peaks[key].get("before", [])), mean(peaks[key].get("after", []))
-    out.append(f"| {key[0]} | {key[1]} | {', '.join(sorted(gpus[key])) or '-'} | {fmt(b)} | {fmt(a)} | {change(b, a)} |")
+      for (group, role), ws in worker_groups(r).items():
+        peaks.setdefault((group, role), {}).setdefault(v, []).append(max(w["peak_mib"] for w in ws) / 1024)
+        gpus.setdefault(group, set()).update(w["gpu"].replace("NVIDIA ", "") for w in ws if w.get("gpu"))
+  for g in [*groups, *sorted(set(gpus) - set(groups))]:
+    if g not in gpus:
+      continue
+    cells = [compare(*(mean(peaks.get((g, role), {}).get(v, [])) for v in ("before", "after"))) for role in ("trainer", "sampler")]
+    out.append(f"| {labels.get(g, g)} | {', '.join(sorted(gpus[g])) or '-'} | {cells[0]} | {cells[1]} |")
   return "\n".join(out) + "\n"
+
+
+def describe_groups(jobs: list[Job]) -> dict[str, str]:
+  """Each job group in plain words, e.g. "gemma-4-E2B LoRA, shared runtime (6 jobs)"."""
+  out = {}
+  for group in dict.fromkeys(j.group for j in jobs):
+    members = [j for j in jobs if j.group == group]
+    job = members[0]
+    lora = job.scenario.startswith("lora")
+    if "openrl.exclusive=true" in job.tags.split(","):
+      sharing = "exclusive"
+    else:
+      sharing = "shared runtime" if lora else "time-sliced"
+    count = f"{len(members)} job{'s' if len(members) > 1 else ''}"
+    out[group] = f"{job.model.split('/')[-1]} {'LoRA' if lora else 'FFT'}, {sharing} ({count})"
+  return out
 
 
 def run_order(repeats: int) -> list[tuple[str, str]]:
@@ -449,8 +485,8 @@ def run_order(repeats: int) -> list[tuple[str, str]]:
 
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("--before", type=parse_version, help="Images of the version to compare against.")
-  parser.add_argument("--after", type=parse_version, help="Images of the changed version.")
+  parser.add_argument("--before", type=parse_version, required=True, help="Images of the version to compare against.")
+  parser.add_argument("--after", type=parse_version, required=True, help="Images of the changed version.")
   parser.add_argument("--repeats", type=int, default=2, help="Scored runs per version.")
   parser.add_argument("--steps", type=int, default=3, help="Training steps per job.")
   parser.add_argument("--no-warmup", action="store_true", help="Skip the unscored 1-step warm-up run per version.")
@@ -458,23 +494,12 @@ def main() -> None:
   parser.add_argument("--namespace", default="openrl-system")
   parser.add_argument("--run-timeout", type=float, default=3600, help="Seconds before a run is stopped and marked timed out.")
   parser.add_argument("--out", type=Path, default=None, help="Results directory (default runs/perf-compare-<UTC time>).")
-  parser.add_argument("--report-only", type=Path, default=None, help="Rebuild report.md from the timeline.json files in this directory.")
   args = parser.parse_args()
-
-  if args.report_only:
-    records = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(args.report_only.glob("*/timeline.json"))]
-    records = sorted((r for r in records if not r["run"].startswith("warmup-")), key=lambda r: r["t0"])
-    if not records:
-      parser.error(f"no scored runs in {args.report_only}")
-    (args.report_only / "report.md").write_text(build_report(records), encoding="utf-8")
-    print(build_report(records))
-    return
-  if not args.before or not args.after:
-    parser.error("--before and --after are required")
 
   out = args.out or REPO_ROOT / "runs" / f"perf-compare-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
   out.mkdir(parents=True, exist_ok=True)
   jobs = load_workload(args.workload)
+  labels = describe_groups(jobs)
   cluster = Cluster(args.namespace)
   context = subprocess.run(["kubectl", "config", "current-context"], capture_output=True, text=True).stdout.strip()
   log(f"context {context}, namespace {args.namespace}, {len(jobs)} jobs, results in {out}")
@@ -486,8 +511,8 @@ def main() -> None:
   records = []
   for run, version in run_order(args.repeats):
     records.append(run_once(cluster, run, version, images[version], jobs, args.steps, out, args.run_timeout))
-    (out / "report.md").write_text(build_report(records), encoding="utf-8")
-  print(build_report(records))
+    (out / "report.md").write_text(build_report(records, labels), encoding="utf-8")
+  print(build_report(records, labels))
   log(f"report: {out / 'report.md'}")
   if not all(r["valid"] for r in records):
     sys.exit(1)

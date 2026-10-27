@@ -75,10 +75,17 @@ class PerfCompareScriptTest(unittest.TestCase):
 
   def test_report_compares_totals_steps_and_memory(self) -> None:
     records = [record("before", "b1", [300, 400], 20000), record("after", "a1", [200, 250], 30000)]
-    report = perf_compare.build_report(records)
-    self.assertIn("| Launch until the last job finishes step 2 (s) | 400 | 250 | -38% |", report)
-    self.assertIn("| qwen-lora | Step 2 (s) | 350 | 225 | -36% |", report)
-    self.assertIn("| qwen-lora | trainer | H100 | 20000 | 30000 | +50% |", report)
+    report = perf_compare.build_report(records, {"qwen-lora": "Qwen LoRA (2 jobs)"})
+    self.assertIn("Launch until the last job finishes step 2: **400 → 250 (-38%)** seconds.", report)
+    self.assertIn("| Qwen LoRA (2 jobs) | 100 → 100 (+0%) | 350 → 225 (-36%) |", report)
+    self.assertIn("| Qwen LoRA (2 jobs) | 250 → 125 (-50%) | 5.0 → 5.0 | - | - |", report)
+    self.assertIn("| Qwen LoRA (2 jobs) | H100 | 20 → 29 (+50%) | - |", report)
+
+  def test_describe_groups_names_model_training_and_sharing(self) -> None:
+    labels = perf_compare.describe_groups(perf_compare.load_workload(perf_compare.WORKLOAD))
+    self.assertEqual(labels["gemma-fft-x"], "gemma-4-E2B FFT, exclusive (1 job)")
+    self.assertEqual(labels["qwen-fft-ts"], "Qwen3-0.6B-Base FFT, time-sliced (2 jobs)")
+    self.assertEqual(labels["gemma-lora"], "gemma-4-E2B LoRA, shared runtime (6 jobs)")
 
   def test_job_manifest_names_run_and_volume(self) -> None:
     job = perf_compare.Job("qwen-lora-1", "qwen-lora", "lora-gsm8k-rl", "Qwen/Qwen3-0.6B-Base", "openrl.recipe=rl")
