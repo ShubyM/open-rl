@@ -1,4 +1,4 @@
-.PHONY: server test lint fmt help render release-bundle push-vm pull-vm cluster-eval \
+.PHONY: server test lint fmt help render release-bundle push-vm pull-vm cluster-eval perf-compare \
 	cloud-build-api-server cloud-build-server cloud-build-client \
 	cloud-deploy-api-server cloud-deploy-server \
 	cloud-rollout-api-server cloud-rollout-server cloud-rollout \
@@ -19,7 +19,7 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_api_server_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_trainer_logprob_chunks tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_diffing_backends tests.test_sampler_weight_rotation tests.test_commands tests.test_weight_sync_config tests.test_exclusive_trainer tests.test_delete_model tests.test_automodel_worker tests.test_worker_thread_device tests.test_trainer_data_parallel tests.test_sampler_batch_limits tests.test_openrl_status tests.test_skill_docs tests.test_trainer_ready tests.test_sampling_store tests.test_lora_snapshots tests.test_pool_accept tests.test_sampling_dispatcher
+UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_api_server_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_trainer_logprob_chunks tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_perf_compare_script tests.test_delta_weight_sync tests.test_diffing_backends tests.test_sampler_weight_rotation tests.test_commands tests.test_weight_sync_config tests.test_exclusive_trainer tests.test_delete_model tests.test_automodel_worker tests.test_worker_thread_device tests.test_trainer_data_parallel tests.test_sampler_batch_limits tests.test_openrl_status tests.test_skill_docs tests.test_trainer_ready tests.test_sampling_store tests.test_lora_snapshots tests.test_pool_accept tests.test_sampling_dispatcher
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -291,6 +291,16 @@ cluster-e2e:
 	if [ -n "$(E2E_NAMESPACE)" ]; then set -- "$$@" --namespace "$(E2E_NAMESPACE)"; fi; \
 	if [ -n "$(WEIGHT_SYNC_STRATEGY)" ]; then set -- "$$@" --weight-sync-strategy "$(WEIGHT_SYNC_STRATEGY)"; fi; \
 	python3 scripts/run_cluster_e2e.py "$$@"
+
+# Before/after performance comparison on the cluster (see scripts/perf_compare.py):
+#   make perf-compare PERF_BEFORE=api-server=<img>,worker=<img> PERF_AFTER=api-server=<img>,worker=<img>
+perf-compare:
+	@if [ -z "$(PERF_BEFORE)" ] || [ -z "$(PERF_AFTER)" ]; then \
+	  echo "Missing PERF_BEFORE or PERF_AFTER. Example:"; \
+	  echo "  make perf-compare PERF_BEFORE=api-server=<img>,worker=<img> PERF_AFTER=api-server=<img>,worker=<img>"; \
+	  exit 2; \
+	fi; \
+	python3 scripts/perf_compare.py --before "$(PERF_BEFORE)" --after "$(PERF_AFTER)" $(PERF_ARGS)
 
 # Local Redis (for testing distributed mode):
 #   sudo apt install redis-server && sudo service redis-server start
