@@ -11,11 +11,14 @@ import redis
 from server import api_server
 from server.lora_snapshots import freeze_adapter, snapshot_name
 from server.model_metadata import TrainingModelMetadata, persist_model_metadata
-from server.sampling_store import SamplingStore
+from server.sampling_store import SamplingStore, stream_key
+from server.scheduler_worker_manager import SchedulerWorkerManager
+from server.session_registry import SessionRegistry
 from server.store import RedisStateStore, RedisStore
-from server.worker_manager import default_metadata
+from server.worker_manager import default_metadata, owner_of
 from tests.api_client import asgi_client
 from tests.redis_server import RedisTestCase
+from tests.test_scheduler_worker_manager import FakeApi, FakeCustomObjectsApi
 
 
 class PoolAcceptTest(RedisTestCase):
@@ -87,6 +90,87 @@ class PoolAcceptTest(RedisTestCase):
   async def test_pool_names_are_valid_kubernetes_names(self) -> None:
     pools = {default_metadata("Qwen/Qwen3.5-9B").pool("Qwen/Qwen3.5-9B"), TrainingModelMetadata(base_model="Qwen/Qwen3-8B").pool("job")}
     self.assertTrue(all(len(p) <= 63 and p == p.lower() and "/" not in p and "." not in p for p in pools), pools)
+
+  def on_kubernetes(self, workloads: FakeCustomObjectsApi | None = None) -> None:
+    """The API server with the scheduler's worker manager over fake Kubernetes APIs."""
+    self.workloads, self.apps = workloads or FakeCustomObjectsApi(), FakeApi()
+    self.enterContext(patch.dict(os.environ, {"REDIS_URL": self.url}))
+    self.manager = SchedulerWorkerManager(custom_api=self.workloads, apps_api=self.apps, networking_api=FakeApi())
+    self.enterContext(patch.object(api_server, "worker_manager", self.manager))
+    self.enterContext(patch.object(api_server, "session_registry", SessionRegistry(self.state)))
+    self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.state))
+
+  async def sampling_session(self, live: bool, **create) -> str:
+    """A sampling session on a pool the scheduler launched, opened by a client session that is still live or has ended."""
+    client_session = (await self.client.post("/api/v1/create_session", json={})).json()["session_id"]
+    body = {"session_id": client_session, **create}
+    sampling = (await self.client.post("/api/v1/create_sampling_session", json=body)).json()["sampling_session_id"]
+    self.assertTrue(self.launched())
+    if not live:
+      await self.state.delete_values(f"open_rl:session:{client_session}")
+    return sampling
+
+  async def sampling_on_kubernetes(self, live: bool) -> str:
+    self.on_kubernetes()
+    return await self.sampling_session(live, base_model=self.base)
+
+  def launched(self) -> set:
+    return set(self.workloads.existing) | set(self.apps.objects)
+
+  def delete_pool(self) -> None:
+    # By hand, by a node pool going away, or by the reaper. A pass also serves other tests' leftover requests in the
+    # shared Redis, so checks look only at this test's pool.
+    self.workloads.existing.clear()
+    self.apps.objects.clear()
+
+  async def answer(self, pool: str, count: int = 1) -> None:
+    sampling = SamplingStore(self.redis)
+    for r in (await sampling.pending(pool))[:count]:
+      await sampling.set_result(r, {"type": "sample", "sequences": []})
+
+  async def test_the_reaper_deletes_a_released_pools_stream_once_nothing_is_pending_in_it(self) -> None:
+    pool = default_metadata(self.base).pool(self.base)
+    session = await self.sampling_on_kubernetes(live=False)
+    await self.sample(0, session)
+    await self.sample(1, session)
+    await self.answer(pool)
+    await api_server.reap_owner(owner_of(self.base))
+    self.assertEqual(len(await self.pending(pool, "request_id")), 1)
+    # The pool comes back for the next session, and once its last request is answered the reaper deletes the stream.
+    session = await self.sampling_session(live=False, base_model=self.base)
+    await self.answer(pool)
+    await api_server.reap_owner(owner_of(self.base))
+    self.assertFalse(await self.redis.exists(stream_key(pool)))
+
+  async def test_deleting_an_fft_job_deletes_its_pools_empty_stream(self) -> None:
+    self.on_kubernetes()
+    model_id = uuid.uuid4().hex
+    meta = TrainingModelMetadata(base_model=self.base, fine_tuning_type="full")
+    await persist_model_metadata(self.state, model_id, meta)
+    record = {"request_id": str(uuid.uuid4()), "pool": meta.pool(model_id), "job": model_id, "revision": "", "model": self.base}
+    await SamplingStore(self.redis).accept({**record, "idempotency_key": None, "prompt_token_ids": [1]})
+    await self.answer(meta.pool(model_id))
+    self.assertTrue(await self.redis.exists(stream_key(meta.pool(model_id))))
+    self.assertEqual((await self.client.post("/api/v1/delete_model", json={"model_id": model_id})).status_code, 200)
+    self.assertFalse(await self.redis.exists(stream_key(meta.pool(model_id))))
+
+  async def test_the_reconcile_deletes_a_stream_whose_last_request_was_answered_after_its_pool_went_away(self) -> None:
+    # As the deadline sweep, or a sampler's late result, does once the reaper has already released the pool.
+    model_id = uuid.uuid4().hex
+    meta = TrainingModelMetadata(base_model=self.base, fine_tuning_type="full")
+    record = {"request_id": str(uuid.uuid4()), "pool": meta.pool(model_id), "job": model_id, "revision": "", "model": self.base}
+    await SamplingStore(self.redis).accept({**record, "idempotency_key": None, "prompt_token_ids": [1]})
+    await self.answer(meta.pool(model_id))
+    await api_server.reconcile_pools()
+    self.assertFalse(await self.redis.exists(stream_key(meta.pool(model_id))))
+
+  async def test_a_pool_deleted_under_a_live_jobs_pending_requests_comes_back_without_another_sample(self) -> None:
+    session = await self.sampling_on_kubernetes(live=True)
+    launched = self.launched()
+    await self.sample(0, session)
+    self.delete_pool()
+    await api_server.reconcile_pools()
+    self.assertLessEqual(launched, self.launched())
 
 
 class PoolsNeedRedisTest(unittest.IsolatedAsyncioTestCase):

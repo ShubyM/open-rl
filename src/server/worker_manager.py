@@ -142,6 +142,10 @@ class WorkerManager(Protocol):
     model ids they served, so the caller can clear their state."""
     ...
 
+  def sampler_exists(self, model_id: str) -> bool:
+    """Whether any sampler of this model's pool exists, ready or not."""
+    ...
+
   def close(self) -> None:
     """The API server is exiting."""
     ...
@@ -209,6 +213,12 @@ class LocalWorkerManager:
     with self.lock:
       for key in [key for key in self.processes if key[1] in {runtime, model_id}]:
         self.terminate(key)
+
+  def sampler_exists(self, model_id: str) -> bool:
+    _, runtime, _ = runtime_of(model_id)
+    with self.lock:
+      proc = self.processes.get(("sampler", runtime))
+      return proc is not None and proc.poll() is None
 
   def release_owner(self, owner: str) -> set[str]:
     with self.lock:

@@ -33,12 +33,14 @@ from server.model_metadata import (
   WeightSyncConfig,
   get_model_metadata,
   persist_model_metadata,
+  pool_name,
 )
+from server.sampling_dispatcher import SAMPLE_DEADLINE_SECONDS
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
 from server.store import get_state_store, get_store
 from server.vllm_options import split_stop
-from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
+from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_id, owner_of, runtime_of
 from training import commands
 from training.commands import Command
 from training.types import TRAINER_BACKENDS, Datum, FFTConfig, FineTuningType, LoraConfig
@@ -49,6 +51,8 @@ worker_manager: WorkerManager | None = None
 
 session_registry = SessionRegistry(state)
 SESSION_REAP_INTERVAL_SEC = 30
+# Jobs whose pools the reconcile may ensure at once.
+RECONCILE_CONCURRENCY = 4
 # Attaching a session to an owner and reaping that owner take turns, so a
 # session cannot attach between the reaper deciding an owner is unused and
 # deleting its workers. In-process, which is why there is one API server replica.
@@ -77,6 +81,8 @@ async def reap_owner(owner: str) -> None:
     print(f"[API_SERVER] No live session uses {owner}; tearing its workers down")
     for model in await asyncio.to_thread(worker_manager.release_owner, owner):
       await state.delete_values(f"open_rl:trainer_ready:{model}")
+      if get_sampler_backend() == "vllm":
+        await SamplingStore(store.redis).delete_if_empty(pool_name(model))
     await session_registry.forget(owner)
 
 
@@ -640,6 +646,16 @@ def translate_future_result(result: dict) -> dict:
   return result
 
 
+async def every_interval(step) -> None:
+  """Runs `step` every SESSION_REAP_INTERVAL_SEC. A failed step is retried next time."""
+  while True:
+    await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
+    try:
+      await step()
+    except Exception:
+      traceback.print_exc()
+
+
 async def reap_dead_sessions():
   while True:
     await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
@@ -654,6 +670,66 @@ async def reap_dead_sessions():
         await reap_owner(owner)
       except Exception:
         traceback.print_exc()
+
+
+async def reconcile_pools() -> None:
+  """For each job with pending requests whose pool is gone, recreates the pool when the job has a live session and fails
+  the requests when it has none, so no request waits on a pool nothing will bring back. Standing worker deployments
+  run without a worker manager and own their pools."""
+  if worker_manager is None:
+    return
+  sampling = SamplingStore(store.redis)
+  pairs = []
+  for pool in await sampling.pools():
+    try:
+      jobs = await sampling.pending_jobs(pool)
+      # Whichever path answered a pool's last request, its empty stream stays until something deletes it.
+      if not jobs:
+        await sampling.delete_if_empty(pool)
+      pairs += [(pool, job) for job in jobs]
+    except Exception:
+      traceback.print_exc()
+  # Concurrently, since an ensure can wait minutes for an old pool to terminate, but a few at a time so stuck ensures
+  # cannot take every thread the API server runs blocking calls on.
+  slots = asyncio.Semaphore(RECONCILE_CONCURRENCY)
+
+  async def reconcile(pool: str, job: str) -> None:
+    async with slots:
+      await reconcile_job(sampling, pool, job)
+
+  for outcome in await asyncio.gather(*(reconcile(pool, job) for pool, job in pairs), return_exceptions=True):
+    if isinstance(outcome, Exception):
+      traceback.print_exception(outcome)
+
+
+async def reconcile_job(sampling: SamplingStore, pool: str, job: str) -> None:
+  meta, runtime, _ = await asyncio.to_thread(runtime_of, job)
+  if meta.pool(job) != pool:
+    return  # a record from before records named their job, whose model is no job on this pool
+  owner = owner_id(runtime)
+  # Under the owner lock, so a reaper release cannot land between the checks and the ensure and leave a pool no one removes.
+  async with owner_locks[owner]:
+    # Read again under the lock, since delete_model may have completed the job meanwhile.
+    if (current := await get_model_metadata(state, job)) is not None and current.status == "completed":
+      if failed := await sampling.fail_job(pool, job, {"type": "RequestFailedResponse", "error_message": f"{job} was deleted"}):
+        print(f"[API_SERVER] Failed {failed} sampling requests of {job}, which was deleted")
+      return
+    # A pool that is up serves its requests, since a client may sample without a session.
+    if await asyncio.to_thread(worker_manager.sampler_exists, job):
+      return
+    if await session_registry.in_use(owner):
+      await asyncio.to_thread(worker_manager.ensure, job, "sampler")
+      return
+    message = f"The pool of {job} is gone and its session ended before a sampler read the request"
+    if failed := await sampling.fail_job(pool, job, {"type": "RequestFailedResponse", "error_message": message}):
+      print(f"[API_SERVER] Failed {failed} sampling requests of {job}, whose pool is gone and whose session ended")
+
+
+async def sweep_sample_deadlines() -> None:
+  """Fails pool requests past the deadline, which no dispatcher does while the pool is gone."""
+  result = {"type": "RequestFailedResponse", "error_message": f"No sampler read the request within {SAMPLE_DEADLINE_SECONDS}s"}
+  if failed := await SamplingStore(store.redis).fail_older_than(SAMPLE_DEADLINE_SECONDS, result):
+    print(f"[API_SERVER] Failed {failed} sampling requests no sampler read in time")
 
 
 @asynccontextmanager
@@ -680,11 +756,16 @@ async def lifespan(_: FastAPI):
         await asyncio.to_thread(worker.load_base_model, base_model)
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
   reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
+  pool_tasks = []
+  if get_sampler_backend() == "vllm":
+    # Separate tasks, so a reconcile stuck in an ensure never holds up the deadline sweep.
+    pool_tasks = [asyncio.create_task(every_interval(sweep_sample_deadlines)), asyncio.create_task(every_interval(reconcile_pools))]
   try:
     yield
   finally:
-    if reap_task is not None:
-      reap_task.cancel()
+    for background in (reap_task, *pool_tasks):
+      if background is not None:
+        background.cancel()
     if task is not None:
       task.cancel()
     if worker_manager is not None:
@@ -912,12 +993,20 @@ async def delete_model(req: ModelRequest):
   elif worker_manager is not None:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
     await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)), active_set_id=await _resolve_active_set_id(model_id))
-    await asyncio.to_thread(worker_manager.release, model_id)
-  now = time.time()
-  meta.status = "completed"
-  meta.completed_at = now
-  meta.updated_at = now
-  await persist_model_metadata(state, model_id, meta)
+  # Under the owner lock the reconcile takes, so it cannot bring back a pool for the job between these steps.
+  async with owner_locks[await asyncio.to_thread(owner_of, model_id)]:
+    now = time.time()
+    meta.status = "completed"
+    meta.completed_at = now
+    meta.updated_at = now
+    await persist_model_metadata(state, model_id, meta)
+    if get_sampler_backend() == "vllm":
+      result = {"type": "RequestFailedResponse", "error_message": f"{model_id} was deleted"}
+      await SamplingStore(store.redis).fail_job(meta.pool(model_id), model_id, result)
+    if worker_manager is not None and not meta.shares_runtime():
+      await asyncio.to_thread(worker_manager.release, model_id)
+      if get_sampler_backend() == "vllm":
+        await SamplingStore(store.redis).delete_if_empty(meta.pool(model_id))
   return {"status": "ok"}
 
 

@@ -89,7 +89,12 @@ class TrainingModelMetadata(BaseModel):
   def pool(self, model_id: str) -> str:
     """The sampling pool that serves this job's runtime. Base model names are not
     valid Kubernetes names, so those runtimes get a slug and a hash."""
-    return runtime_name(self.runtime(model_id), "sampler-")
+    return pool_name(self.runtime(model_id))
+
+
+def pool_name(runtime: str) -> str:
+  """The sampling pool that serves a runtime."""
+  return runtime_name(runtime, "sampler-")
 
 
 def runtime_name(runtime: str, prefix: str = "") -> str:
