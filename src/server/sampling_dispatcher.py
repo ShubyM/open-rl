@@ -5,6 +5,7 @@ HttpSampler, which sends through the pool's router, Envoy in front of the llm-d 
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ from typing import Any
 import httpx
 import redis.asyncio as redis
 
-from server.sampling_store import SamplingStore
+from server.sampling_store import SamplingStore, job_of
 from server.vllm_options import sample_params, sample_result
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,8 @@ class Dispatcher:
     self.records: dict[str, dict[str, Any]] = {}
     self.newest = "0-0"
     self.in_flight: dict[str, asyncio.Task] = {}
+    self.sends = itertools.count()
+    self.served: dict[str, int] = {}  # the number of each job's latest send
 
   async def run(self) -> None:
     try:
@@ -152,7 +155,14 @@ class Dispatcher:
       self.revision = revision
 
   def to_send(self) -> list[dict[str, Any]]:
-    return [r for r in self.records.values() if r["revision"] == self.revision and r["request_id"] not in self.in_flight]
+    """The current revision's records not in flight, one from each job in turn and oldest first within a job. The job
+    served longest ago goes first, so one job's big batch does not hold up the others."""
+    jobs: dict[str, list[dict[str, Any]]] = {}
+    for r in self.records.values():
+      if r["revision"] == self.revision and r["request_id"] not in self.in_flight:
+        jobs.setdefault(job_of(r), []).append(r)
+    turns = sorted(jobs.items(), key=lambda job: self.served.get(job[0], -1))
+    return [r for turn in itertools.zip_longest(*(records for _, records in turns)) for r in turn if r is not None]
 
   async def set_result(self, r: dict[str, Any], result: dict[str, Any]) -> None:
     await self.store.set_result(r, result)
@@ -160,6 +170,7 @@ class Dispatcher:
 
   async def send(self, r: dict[str, Any]) -> None:
     """Saves the sampler's answer. None, or an error, leaves the record pending to be sent again."""
+    self.served[job_of(r)] = next(self.sends)
     try:
       # A sampler that never answers must not hold the send past its record's deadline.
       timeout = max(0.0, accepted_at(r) + SAMPLE_DEADLINE_SECONDS - time.time())

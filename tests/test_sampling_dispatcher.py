@@ -184,9 +184,10 @@ class SamplingDispatcherTest(RedisTestCase):
   def loads(self, *names: str) -> dict[str, list[str]]:
     return {name: [entry[2] for entry in self.log if entry[:2] == ("update", name)] for name in names}
 
-  async def accepted(self, revision: str = "", prompt: list | None = None) -> dict:
+  async def accepted(self, revision: str = "", prompt: list | None = None, **fields) -> dict:
     identity = {"request_id": str(uuid.uuid4()), "pool": self.pool, "revision": revision, "model": "base", "idempotency_key": None}
     r = {**identity, "prompt_token_ids": prompt or [1, 2, 3], "sampling_params": {"n": 1, "max_tokens": 2}, "include_prompt_logprobs": False}
+    r |= fields
     await self.store.accept(r)
     return r
 
@@ -255,3 +256,23 @@ class SamplingDispatcherTest(RedisTestCase):
     self.assertEqual(self.loads(early.name), {early.name: [second, third]})
     self.assertTrue(same(replayed(at_first, [second, third]), weights(worker)))
     self.assertTrue(same(replayed(at_first, [third]), weights(worker)))
+
+  async def test_one_jobs_big_batch_does_not_hold_up_another_jobs_request(self):
+    (replica,) = await self.replicas("default")
+    sent = []
+
+    # Records which job's request each send carries. Each job samples its own adapter, so the model names the job.
+    async def route(request) -> Response:
+      body = await request.body()
+      sent.append(json.loads(body)["model"])
+      upstream = await self.http.post(f"{replica.url}/inference/v1/generate", content=body, timeout=None)
+      return Response(upstream.content, upstream.status_code, headers={"x-openrl-upstream": replica.url.removeprefix("http://")})
+
+    router_url = await self.serve(Starlette(routes=[Route("/inference/v1/generate", route, methods=["POST"])]))
+    big = [await self.accepted(job="job-a", model="adapter-a") for _ in range(6)]
+    small = await self.accepted(job="job-b", model="adapter-b")
+    run = asyncio.create_task(run_routed(routed_dispatcher(self.store, self.pool, self.http, router_url, [replica.url], concurrency=1)))
+    self.addAsyncCleanup(lambda: (run.cancel(), asyncio.gather(run, return_exceptions=True))[1])
+    for r in [*big, small]:
+      await until(lambda r=r: self.redis.llen(future_key(r["request_id"])))
+    self.assertEqual(sent[:2], ["adapter-a", "adapter-b"])
