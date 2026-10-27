@@ -269,6 +269,11 @@ class StateStore(ABC):
   async def set_members(self, key: str) -> set[str]:
     pass
 
+  @abstractmethod
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    """Every live value whose key starts with prefix."""
+    pass
+
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
@@ -306,6 +311,9 @@ class InMemoryStateStore(StateStore):
   async def set_members(self, key: str) -> set[str]:
     return set(self.sets.get(key, set()))
 
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    return {key: value for key in list(self.kv_store) if key.startswith(prefix) and (value := self.get_value_sync(key)) is not None}
+
 
 class RedisStateStore(StateStore):
   def __init__(self, client: redis.Redis, sync_client: sync_redis.Redis):
@@ -333,6 +341,10 @@ class RedisStateStore(StateStore):
 
   async def set_members(self, key: str) -> set[str]:
     return set(await self.redis.smembers(key))
+
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    keys = [key async for key in self.redis.scan_iter(match=prefix + "*", count=1000)]
+    return {key: value for key, value in zip(keys, await self.redis.mget(keys)) if value is not None} if keys else {}
 
 
 @cache

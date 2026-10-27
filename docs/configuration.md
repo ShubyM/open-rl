@@ -122,3 +122,13 @@ for. On one machine every pool has one replica, in process. See
 | `OPEN_RL_DISPATCH_CONCURRENCY` | `256` | Requests one pool keeps in flight. |
 | `OPEN_RL_SAMPLE_DEADLINE_SECONDS` | `3600` | How long a sampling request waits for a result before it fails. Set it on the API server. Worker pods and pool dispatchers get the same value. |
 | `OPEN_RL_DISPATCHER_IMAGE` | the worker image | Image for each pool's dispatcher container. The release sets it to the API-server image, which carries the dispatcher without the GPU stack and pulls in seconds. |
+
+## Inspection API
+
+The API server serves a read-only inventory of runs at
+`/api/v1/inspect/inventory`. It reads runs and their live sessions from the
+same Redis as the rest of the server.
+
+| Env var | Default | What it does |
+| --- | --- | --- |
+| `REDIS_URL` | unset | The Redis that holds model records and live sessions. Unset, the inventory has no runs. |

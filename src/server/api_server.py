@@ -27,6 +27,7 @@ from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, C
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import openrl_status, proto_codec
+from server.dashboard.router import router
 from server.lora_snapshots import snapshot_name, snapshot_root
 from server.model_metadata import (
   TrainingModelMetadata,
@@ -809,6 +810,7 @@ def openapi_with_settings() -> dict[str, Any]:
 
 app.openapi = openapi_with_settings
 FastAPIInstrumentor.instrument_app(app, excluded_urls="/api/v1/retrieve_future,/api/v1/session_heartbeat")
+app.include_router(router)
 
 
 @app.exception_handler(RequestValidationError)
