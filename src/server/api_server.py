@@ -10,6 +10,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -32,12 +33,14 @@ from server.model_metadata import (
   WeightSyncConfig,
   get_model_metadata,
   persist_model_metadata,
+  pool_name,
 )
+from server.sampling_dispatcher import SAMPLE_DEADLINE_SECONDS
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
-from server.store import RedisStateStore, get_state_store, get_store
+from server.store import get_state_store, get_store
 from server.vllm_options import split_stop
-from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
+from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_id, owner_of, runtime_of
 from training import commands
 from training.commands import Command
 from training.types import TRAINER_BACKENDS, Datum, FFTConfig, FineTuningType, LoraConfig
@@ -48,6 +51,8 @@ worker_manager: WorkerManager | None = None
 
 session_registry = SessionRegistry(state)
 SESSION_REAP_INTERVAL_SEC = 30
+# Jobs whose pools the reconcile may ensure at once.
+RECONCILE_CONCURRENCY = 4
 # Attaching a session to an owner and reaping that owner take turns, so a
 # session cannot attach between the reaper deciding an owner is unused and
 # deleting its workers. In-process, which is why there is one API server replica.
@@ -75,7 +80,9 @@ async def reap_owner(owner: str) -> None:
       return
     print(f"[API_SERVER] No live session uses {owner}; tearing its workers down")
     for model in await asyncio.to_thread(worker_manager.release_owner, owner):
-      await state.delete_values(f"open_rl:sampler_ready:{model}", f"open_rl:trainer_ready:{model}")
+      await state.delete_values(f"open_rl:trainer_ready:{model}")
+      if get_sampler_backend() == "vllm":
+        await SamplingStore(store.redis).delete_if_empty(pool_name(model))
     await session_registry.forget(owner)
 
 
@@ -457,15 +464,6 @@ def base_model_id_from_sampling_ref(model_id: str | None) -> str | None:
   return model_id.split("-samp-")[0]
 
 
-def is_sampler_weights_ref(model_id: str | None) -> bool:
-  if not model_id or not model_id.startswith("tinker://"):
-    return False
-
-  path = model_id[len("tinker://") :]
-  parts = path.split("/")
-  return len(parts) >= 3 and parts[1] == "sampler_weights"
-
-
 async def _extract_and_persist_model_metadata(
   req: CreateModelRequest | CreateModelFromStateRequest,
   request: Request | None = None,
@@ -530,6 +528,8 @@ async def _extract_and_persist_model_metadata(
     trainer_cp=settings.trainer_cp,
     recipe=settings.recipe,
   )
+  if meta_obj.sampler_replicas > 1 and meta_obj.shares_gpu():
+    raise ValueError("openrl.sampler_replicas above 1 needs samplers on GPUs of their own; set openrl.exclusive=true")
   await persist_model_metadata(state, model_id, meta_obj)
 
   return model_id, meta_obj
@@ -601,13 +601,11 @@ async def ensure_sampler_launched(model_id: str) -> None:
       traceback.print_exc()
 
 
-def check_single_process_backend() -> None:
-  """vLLM sampling runs in a worker the API server launches, and they share queues
-  through Redis, so one process can only sample with torch."""
-  if get_sampler_backend() == "vllm":
+def check_sampler_backend() -> None:
+  if get_sampler_backend() == "vllm" and not os.getenv("REDIS_URL"):
     raise RuntimeError(
-      "SAMPLING_BACKEND=vllm needs REDIS_URL: the API server launches the vLLM sampler as a separate worker. "
-      "Set REDIS_URL (for example redis://127.0.0.1:6379/0), or unset SAMPLING_BACKEND to sample with torch in one process."
+      "Sampling pools need REDIS_URL, because vLLM sampling requests wait in a Redis stream for each pool's dispatcher. "
+      "Set REDIS_URL (for example redis://127.0.0.1:6379/0), or set BASE_MODEL and unset SAMPLING_BACKEND to sample with torch in one process."
     )
 
 
@@ -648,6 +646,16 @@ def translate_future_result(result: dict) -> dict:
   return result
 
 
+async def every_interval(step) -> None:
+  """Runs `step` every SESSION_REAP_INTERVAL_SEC. A failed step is retried next time."""
+  while True:
+    await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
+    try:
+      await step()
+    except Exception:
+      traceback.print_exc()
+
+
 async def reap_dead_sessions():
   while True:
     await asyncio.sleep(SESSION_REAP_INTERVAL_SEC)
@@ -664,10 +672,71 @@ async def reap_dead_sessions():
         traceback.print_exc()
 
 
+async def reconcile_pools() -> None:
+  """For each job with pending requests whose pool is gone, recreates the pool when the job has a live session and fails
+  the requests when it has none, so no request waits on a pool nothing will bring back. Standing worker deployments
+  run without a worker manager and own their pools."""
+  if worker_manager is None:
+    return
+  sampling = SamplingStore(store.redis)
+  pairs = []
+  for pool in await sampling.pools():
+    try:
+      jobs = await sampling.pending_jobs(pool)
+      # Whichever path answered a pool's last request, its empty stream stays until something deletes it.
+      if not jobs:
+        await sampling.delete_if_empty(pool)
+      pairs += [(pool, job) for job in jobs]
+    except Exception:
+      traceback.print_exc()
+  # Concurrently, since an ensure can wait minutes for an old pool to terminate, but a few at a time so stuck ensures
+  # cannot take every thread the API server runs blocking calls on.
+  slots = asyncio.Semaphore(RECONCILE_CONCURRENCY)
+
+  async def reconcile(pool: str, job: str) -> None:
+    async with slots:
+      await reconcile_job(sampling, pool, job)
+
+  for outcome in await asyncio.gather(*(reconcile(pool, job) for pool, job in pairs), return_exceptions=True):
+    if isinstance(outcome, Exception):
+      traceback.print_exception(outcome)
+
+
+async def reconcile_job(sampling: SamplingStore, pool: str, job: str) -> None:
+  meta, runtime, _ = await asyncio.to_thread(runtime_of, job)
+  if meta.pool(job) != pool:
+    return  # a record from before records named their job, whose model is no job on this pool
+  owner = owner_id(runtime)
+  # Under the owner lock, so a reaper release cannot land between the checks and the ensure and leave a pool no one removes.
+  async with owner_locks[owner]:
+    # Read again under the lock, since delete_model may have completed the job meanwhile.
+    if (current := await get_model_metadata(state, job)) is not None and current.status == "completed":
+      if failed := await sampling.fail_job(pool, job, {"type": "RequestFailedResponse", "error_message": f"{job} was deleted"}):
+        print(f"[API_SERVER] Failed {failed} sampling requests of {job}, which was deleted")
+      return
+    # A pool that is up serves its requests, since a client may sample without a session.
+    if await asyncio.to_thread(worker_manager.sampler_exists, job):
+      return
+    if await session_registry.in_use(owner):
+      await asyncio.to_thread(worker_manager.ensure, job, "sampler")
+      return
+    message = f"The pool of {job} is gone and its session ended before a sampler read the request"
+    if failed := await sampling.fail_job(pool, job, {"type": "RequestFailedResponse", "error_message": message}):
+      print(f"[API_SERVER] Failed {failed} sampling requests of {job}, whose pool is gone and whose session ended")
+
+
+async def sweep_sample_deadlines() -> None:
+  """Fails pool requests past the deadline, which no dispatcher does while the pool is gone."""
+  result = {"type": "RequestFailedResponse", "error_message": f"No sampler read the request within {SAMPLE_DEADLINE_SECONDS}s"}
+  if failed := await SamplingStore(store.redis).fail_older_than(SAMPLE_DEADLINE_SECONDS, result):
+    print(f"[API_SERVER] Failed {failed} sampling requests no sampler read in time")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
   global worker_manager
   task = None
+  check_sampler_backend()
   if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER"):
     worker_manager = create_worker_manager()
   if is_single_process_mode():
@@ -679,7 +748,6 @@ async def lifespan(_: FastAPI):
     print(f"-> Sampling backend: {get_sampler_backend()}")
     print(f"-> FFT enabled     : {is_fft_enabled()}")
     print("-> Server mode     : API server + worker loop in one process\n")
-    check_single_process_backend()
     if not is_fft_enabled():
       from server import training_requests_processor
 
@@ -688,11 +756,16 @@ async def lifespan(_: FastAPI):
         await asyncio.to_thread(worker.load_base_model, base_model)
       task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
   reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
+  pool_tasks = []
+  if get_sampler_backend() == "vllm":
+    # Separate tasks, so a reconcile stuck in an ensure never holds up the deadline sweep.
+    pool_tasks = [asyncio.create_task(every_interval(sweep_sample_deadlines)), asyncio.create_task(every_interval(reconcile_pools))]
   try:
     yield
   finally:
-    if reap_task is not None:
-      reap_task.cancel()
+    for background in (reap_task, *pool_tasks):
+      if background is not None:
+        background.cancel()
     if task is not None:
       task.cancel()
     if worker_manager is not None:
@@ -920,13 +993,20 @@ async def delete_model(req: ModelRequest):
   elif worker_manager is not None:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
     await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)), active_set_id=await _resolve_active_set_id(model_id))
-    await store.put_sampling_request({"request_id": "SHUTDOWN_SENTINEL", "model_id": model_id})
-    await asyncio.to_thread(worker_manager.release, model_id)
-  now = time.time()
-  meta.status = "completed"
-  meta.completed_at = now
-  meta.updated_at = now
-  await persist_model_metadata(state, model_id, meta)
+  # Under the owner lock the reconcile takes, so it cannot bring back a pool for the job between these steps.
+  async with owner_locks[await asyncio.to_thread(owner_of, model_id)]:
+    now = time.time()
+    meta.status = "completed"
+    meta.completed_at = now
+    meta.updated_at = now
+    await persist_model_metadata(state, model_id, meta)
+    if get_sampler_backend() == "vllm":
+      result = {"type": "RequestFailedResponse", "error_message": f"{model_id} was deleted"}
+      await SamplingStore(store.redis).fail_job(meta.pool(model_id), model_id, result)
+    if worker_manager is not None and not meta.shares_runtime():
+      await asyncio.to_thread(worker_manager.release, model_id)
+      if get_sampler_backend() == "vllm":
+        await SamplingStore(store.redis).delete_if_empty(meta.pool(model_id))
   return {"status": "ok"}
 
 
@@ -1168,26 +1248,13 @@ async def create_sampling_session(req: CreateSamplingSessionRequest):
     sess_id = req.model_id or "samp-session-live-123"
     target_model_id = sess_id
 
-  model_meta = await get_model_metadata(state, target_model_id) if target_model_id else None
-  ready_check_id = (model_meta.runtime(target_model_id) or target_model_id) if model_meta else target_model_id
-
   await bind_session(req.session_id, target_model_id)
 
-  if get_sampler_backend() == "vllm" and ready_check_id:
-    # Launch by model ID so the worker manager retains the training kind.
-    # LoRA readiness is still reported under the shared base-model runtime.
+  if get_sampler_backend() == "vllm":
+    # Requests wait in the pool's stream, so there is no sampler to wait for. The SDK
+    # numbers seq_id from 0 in every sampling client, so each session needs its own id.
     await ensure_sampler_launched(target_model_id)
-    if isinstance(state, RedisStateStore):
-      print(f"[API_SERVER] Waiting for dynamic vLLM sampler worker to be ready for model {ready_check_id}...")
-      start_time = time.monotonic()
-      while True:
-        is_ready = await state.get_value(f"open_rl:sampler_ready:{ready_check_id}")
-        if is_ready == "1" or is_ready == b"1":
-          print(f"[API_SERVER] Dynamic vLLM sampler worker is ready! (took {time.monotonic() - start_time:.2f}s)")
-          break
-        if time.monotonic() - start_time > 300:
-          raise TimeoutError("Timed out waiting for dynamic vLLM sampler worker to be ready")
-        await asyncio.sleep(1)
+    return {"sampling_session_id": f"{sess_id}@{uuid.uuid4().hex}", "type": "create_sampling_session"}
 
   return {"sampling_session_id": sess_id, "type": "create_sampling_session"}
 
@@ -1202,7 +1269,8 @@ async def get_sampler(sampler_id: str):
   resolve to the base model, which is all the client wants -- it loads the
   tokenizer from the Hub itself.
   """
-  base_model_id = base_model_id_from_sampling_ref(sampler_id)
+  ref = sampling_ref(sampler_id)
+  base_model_id = base_model_id_from_sampling_ref(ref)
   model_meta = await get_model_metadata(state, base_model_id) if base_model_id else None
   base_model = (model_meta.base_model if model_meta is not None else None) or base_model_id or get_default_model_name()
   if not base_model:
@@ -1210,7 +1278,7 @@ async def get_sampler(sampler_id: str):
   return {
     "sampler_id": sampler_id,
     "base_model": base_model,
-    "model_path": sampler_id if sampler_id.startswith("tinker://") else None,
+    "model_path": ref if ref.startswith("tinker://") else None,
   }
 
 
@@ -1223,6 +1291,35 @@ def sample_sequence_ids(request_id: str, num_samples: int) -> list[str]:
   return [f"{request_id}:{index}" for index in range(max(1, int(num_samples)))]
 
 
+# How long a sample waits for weights another node just saved to show up here.
+SAVED_WEIGHTS_WAIT_SECONDS = 2.0
+
+
+def visible(path: Path) -> bool:
+  """Whether a file another node saved shows here. An NFS client keeps a failed
+  lookup until it revalidates the directory, and listing a directory makes it
+  revalidate, so on a miss this lists the nearest directory above the file that
+  exists and looks again."""
+  if path.is_file():
+    return True
+  for directory in path.parents:
+    try:
+      os.listdir(directory)
+      break
+    except OSError:
+      continue
+  return path.is_file()
+
+
+async def wait_until_visible(path: Path) -> bool:
+  deadline = time.monotonic() + SAVED_WEIGHTS_WAIT_SECONDS
+  while not await asyncio.to_thread(visible, path):
+    if time.monotonic() >= deadline:
+      return False
+    await asyncio.sleep(0.2)
+  return True
+
+
 async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
   """Missing weights are a 400, never a fallback to other weights."""
   ref = sampling_ref(req.model_id or req.sampling_session_id or "")
@@ -1233,16 +1330,13 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
   elif meta.fine_tuning_type == "full":
     revision, model = resolve_sampler_weights_path(ref), meta.base_model
     # The trainer writes metadata.json last, so a save in progress is missing too.
-    if not os.path.isfile(os.path.join(revision, "metadata.json")):
+    if not await wait_until_visible(Path(revision, "metadata.json")):
       raise HTTPException(status_code=400, detail=f"No saved sampler weights for {ref}")
   else:
     revision, model = "", snapshot_name(ref)
-    if not (snapshot_root() / model / "adapter_config.json").is_file():
+    if not await wait_until_visible(snapshot_root() / model / "adapter_config.json"):
       raise HTTPException(status_code=400, detail=f"No saved LoRA sampler weights for {ref}")
-  try:
-    pool = meta.pool(lookup_id)
-  except ValueError as exc:
-    raise HTTPException(status_code=400, detail=str(exc)) from exc
+  pool = meta.pool(lookup_id)
 
   params = req.sampling_params
   stop, stop_token_ids = split_stop(params.stop)
@@ -1250,6 +1344,7 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
     {
       "request_id": new_request_id(),
       "pool": pool,
+      "job": lookup_id,
       "revision": revision,
       "model": model,
       "idempotency_key": f"{req.sampling_session_id}:{req.seq_id}" if req.sampling_session_id and req.seq_id is not None else None,
@@ -1285,44 +1380,7 @@ async def asample(req: AsampleRequest):
     )
     return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
-  # vLLM backend
-  req_id = str(uuid.uuid4())
-  carrier = await open_future(req_id)
-
-  model_meta = await get_model_metadata(state, lookup_id)
-  fine_tuning_type = model_meta.fine_tuning_type if model_meta else "lora"
-
-  if fine_tuning_type == "lora":
-    weights_path = None
-    lora_id = model_id
-    peft_dir = os.path.join(TMP_DIR, "peft", lookup_id, lookup_id)
-    lora_path = peft_dir if os.path.exists(peft_dir) else None
-    queue_id = (model_meta.runtime(lookup_id) if model_meta else None) or lookup_id
-  else:
-    resolved_path = resolve_sampler_weights_path(model_id) if is_sampler_weights_ref(model_id) or is_fft_enabled() else None
-    weights_path = resolved_path
-    lora_id = None
-    lora_path = None
-    queue_id = lookup_id
-
-  sampling_req = {
-    "request_id": req_id,
-    "prompt_token_ids": prompt,
-    "max_tokens": params.max_tokens,
-    "temperature": params.temperature,
-    "stop": params.stop,
-    "top_p": params.top_p,
-    "top_k": params.top_k,
-    "num_samples": num_samples,
-    "lora_id": lora_id,
-    "lora_path": lora_path,
-    "weights_path": weights_path,
-    "include_prompt_logprobs": req.prompt_logprobs,
-    "model_id": queue_id,
-    "trace_context": carrier,
-  }
-
-  await store.put_sampling_request(sampling_req)
+  req_id = await accept_pool_sample(req, prompt)
   return {"request_id": req_id, "sample_sequence_ids": sample_sequence_ids(req_id, num_samples)}
 
 

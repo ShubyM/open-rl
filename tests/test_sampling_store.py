@@ -12,7 +12,8 @@ class SamplingStoreTest(RedisTestCase):
     self.store, self.pool = SamplingStore(self.redis), f"sampler-{uuid.uuid4()}"
 
   def record(self, revision: str = "", key: str | None = None) -> dict:
-    return {"request_id": str(uuid.uuid4()), "pool": self.pool, "revision": revision, "idempotency_key": key, "prompt_token_ids": [1]}
+    r = {"request_id": str(uuid.uuid4()), "pool": self.pool, "revision": revision, "model": "base", "idempotency_key": key}
+    return {**r, "prompt_token_ids": [1]}
 
   async def pending(self) -> dict[str, dict]:
     return {r["request_id"]: r for r in await self.store.pending(self.pool)}

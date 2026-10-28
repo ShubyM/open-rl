@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from server.store import StateStore
 from training.types import TRAINER_BACKENDS, FFTConfig, FineTuningType, LoraConfig
 
-POOL_NAME = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
+K8S_NAME = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
 
 SPARSE_DELTA_VERSION = 2
 
@@ -75,9 +75,10 @@ class TrainingModelMetadata(BaseModel):
 
   def runtime(self, model_id: str) -> str:
     """The id of the workers that serve this job. LoRA jobs share workers only
-    with jobs on the same trainer backend."""
+    with jobs on the same trainer backend. A sampling session on a bare base-model
+    name that does not share is kept apart from the base model's shared runtime."""
     if not self.shares_runtime():
-      return model_id
+      return f"base-{model_id}" if model_id == self.base_model else model_id
     if self.trainer_backend == "pytorch":
       return self.base_model
     if image := self.trainer_image():
@@ -86,18 +87,24 @@ class TrainingModelMetadata(BaseModel):
     return f"{self.trainer_backend}-{self.base_model}"
 
   def pool(self, model_id: str) -> str:
-    """The sampling pool that serves this job. A runtime named after a base model
-    (shared LoRA, or a bare base-model session) needs a name from
-    OPEN_RL_SAMPLER_POOLS, because base model names are not valid Kubernetes names."""
-    runtime = self.runtime(model_id)
-    name = json.loads(os.getenv("OPEN_RL_SAMPLER_POOLS", "{}")).get(runtime)
-    if name is None and not self.shares_runtime():
-      name = f"sampler-{model_id}"
-    if name is None:
-      raise ValueError(f"OPEN_RL_SAMPLER_POOLS has no pool for {runtime}")
-    if not POOL_NAME.fullmatch(name):
-      raise ValueError(f"Pool name {name!r} is not a DNS-1123 label of at most 63 characters")
+    """The sampling pool that serves this job's runtime. Base model names are not
+    valid Kubernetes names, so those runtimes get a slug and a hash."""
+    return pool_name(self.runtime(model_id))
+
+
+def pool_name(runtime: str) -> str:
+  """The sampling pool that serves a runtime."""
+  return runtime_name(runtime, "sampler-")
+
+
+def runtime_name(runtime: str, prefix: str = "") -> str:
+  """A Kubernetes name for a runtime. A runtime that is not already a valid name
+  keeps a hash of itself, so two runtimes never share workers or a pool."""
+  if K8S_NAME.fullmatch(name := f"{prefix}{runtime}"):
     return name
+  digest = hashlib.sha256(runtime.encode()).hexdigest()[:8]
+  slug = re.sub(r"[^a-z0-9]+", "-", runtime.lower()).strip("-")[: 62 - len(prefix) - len(digest)].rstrip("-")
+  return f"{prefix}{slug}-{digest}" if slug else f"{prefix}{digest}"
 
 
 def decode_model_metadata(raw: str | None) -> TrainingModelMetadata | None:

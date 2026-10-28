@@ -75,14 +75,16 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
       await api_server.reap_owner(owner)
 
   async def test_shared_lora_owner_outlives_the_session_that_created_it(self):
+    # Pools keep requests in Redis, which this test has none of, and reaping an owner deletes its pools' empty streams.
+    self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "torch"}))
     training = (await self.post("create_session", {}))["session_id"]
     adapter = (await self.post("create_model", {"base_model": "test-base", "session_id": training}))["request_id"]
     fft_body = {"base_model": "fft-base", "session_id": training, "user_metadata": {"openrl.fine_tuning_type": "full"}}
     fft_model = (await self.post("create_model", fft_body))["request_id"]
-    await self.state.set_value("open_rl:sampler_ready:test-base", "1")
+    await self.state.set_value("open_rl:trainer_ready:test-base", "1")
     sampling = (await self.post("create_session", {}))["session_id"]
     await self.post("create_sampling_session", {"model_path": f"tinker://{adapter}/sampler_weights/test", "session_id": sampling})
-    self.assertEqual(self.manager.ensured, [(adapter, "trainer"), (fft_model, "trainer"), (adapter, "sampler")])
+    self.assertEqual(self.manager.ensured, [(adapter, "trainer"), (fft_model, "trainer")])
 
     await self.expire(training)
     await self.reap()
@@ -91,10 +93,12 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
     await self.expire(sampling)
     await self.reap()
     self.assertEqual(self.manager.released, [fft_model.lower(), "test-base"])
-    self.assertIsNone(await self.state.get_value("open_rl:sampler_ready:test-base"))
+    self.assertIsNone(await self.state.get_value("open_rl:trainer_ready:test-base"))
     self.assertEqual(await self.registry.owners(), [])
 
   async def test_an_exclusive_lora_model_has_its_own_runtime(self):
+    # Pools keep requests in Redis, which this test has none of, and deleting a job fails its pool requests.
+    self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "torch"}))
     session = (await self.post("create_session", {}))["session_id"]
     shared = (await self.post("create_model", {"base_model": "test-base", "session_id": session}))["request_id"]
     exclusive_metadata = {"openrl.exclusive": "true"}
@@ -111,6 +115,8 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self.manager.released_models, [exclusive])
 
   async def test_deleting_a_job_frees_its_adapter_or_its_workers(self):
+    # Pools keep requests in Redis, which this test has none of, and deleting a job fails its pool requests.
+    self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "torch"}))
     session = (await self.post("create_session", {}))["session_id"]
     shared = (await self.post("create_model", {"base_model": "test-base", "session_id": session}))["request_id"]
     body = {"base_model": "test-base", "session_id": session, "user_metadata": {"openrl.exclusive": "true"}}
@@ -136,6 +142,9 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(await self.registry.owners(), [])
 
   async def test_a_session_attaching_during_teardown_waits_for_it(self):
+    # Without FFT, a session on the bare base model shares the base model's LoRA owner. Pools keep requests in Redis,
+    # which this test has none of, and reaping an owner deletes its pools' empty streams.
+    self.enterContext(patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "false", "SAMPLING_BACKEND": "torch"}))
     await self.registry.attach("a", "test-base")
     await self.expire("a")
     loop = asyncio.get_running_loop()
