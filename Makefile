@@ -1,4 +1,4 @@
-.PHONY: server test lint fmt help render release-bundle push-vm pull-vm cluster-eval \
+.PHONY: server test lint fmt help render release-bundle push-vm pull-vm cluster-eval perf-compare \
 	cloud-build-api-server cloud-build-server cloud-build-client \
 	cloud-deploy-api-server cloud-deploy-server \
 	cloud-rollout-api-server cloud-rollout-server cloud-rollout \
@@ -19,7 +19,7 @@ HOST           ?= 127.0.0.1
 PORT           ?= 9003
 # The fully qualified base URL used by local CLI tools and clients
 BASE_URL       ?= http://$(HOST):$(PORT)
-UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_api_server_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_trainer_logprob_chunks tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_delta_weight_sync tests.test_diffing_backends tests.test_sampler_weight_rotation tests.test_commands tests.test_weight_sync_config tests.test_exclusive_trainer tests.test_delete_model tests.test_automodel_worker tests.test_worker_thread_device tests.test_trainer_data_parallel tests.test_sampler_batch_limits tests.test_openrl_status tests.test_skill_docs tests.test_trainer_ready tests.test_sampling_store tests.test_lora_snapshots tests.test_pool_accept tests.test_sampling_dispatcher
+UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_forward_only tests.test_fft_batch_failure tests.test_api_server_paths tests.test_accel_timeslicer tests.test_trainer_optimizer_correctness tests.test_trainer_logprob_chunks tests.test_worker_manager tests.test_scheduler_worker_manager tests.test_estimator tests.test_redis_store tests.test_cluster_eval_script tests.test_perf_compare_script tests.test_delta_weight_sync tests.test_diffing_backends tests.test_sampler_weight_rotation tests.test_sampler_batch_limits tests.test_commands tests.test_weight_sync_config tests.test_exclusive_trainer tests.test_delete_model tests.test_automodel_worker tests.test_worker_thread_device tests.test_trainer_data_parallel tests.test_openrl_status tests.test_skill_docs tests.test_trainer_ready tests.test_sampling_store tests.test_lora_snapshots tests.test_pool_accept tests.test_sampling_dispatcher tests.test_vllm_sampler tests.test_vllm_options tests.test_dashboard
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
@@ -57,6 +57,7 @@ help:
 	@echo "make cluster-eval EVAL_MODEL_PATH=/mnt/shared/open-rl/checkpoints/...  # one-off vLLM eval job on the cluster"
 	@echo "make lint | fmt"
 	@echo "make render OVERLAY=k8s/deploy/lora VERSION=v0.0.1  # pinned manifests to stdout"
+	@echo "make render OVERLAY=k8s/deploy/lora VERSION=v0.0.1 STORAGE_CLASS=zonal-rwx STORAGE_SIZE=10Ti  # shared volume class/size"
 	@echo "make release-bundle VERSION=v0.0.1     # release assets into $(DIST_DIR)/"
 
 # ---------------------------------------------------------------------------
@@ -114,7 +115,7 @@ test:
 
 .PHONY: test-weight-transfer
 test-weight-transfer:
-	uv run --frozen --extra vllm --extra gpu --extra cluster python -m unittest tests.test_delta_weight_transfer_engine tests.test_delta_weight_sync tests.test_weight_sync_config tests.test_sampler_patch tests.test_weight_transfer_gpu
+	uv run --frozen --extra vllm --extra gpu --extra cluster python -m unittest tests.test_delta_weight_transfer_engine tests.test_delta_weight_sync tests.test_weight_sync_config tests.test_weight_transfer_gpu
 
 lint:
 	uv run --extra dev ruff check .
@@ -292,6 +293,16 @@ cluster-e2e:
 	if [ -n "$(WEIGHT_SYNC_STRATEGY)" ]; then set -- "$$@" --weight-sync-strategy "$(WEIGHT_SYNC_STRATEGY)"; fi; \
 	python3 scripts/run_cluster_e2e.py "$$@"
 
+# Before/after performance comparison on the cluster (see scripts/perf_compare.py):
+#   make perf-compare PERF_BEFORE=api-server=<img>,worker=<img> PERF_AFTER=api-server=<img>,worker=<img>
+perf-compare:
+	@if [ -z "$(PERF_BEFORE)" ] || [ -z "$(PERF_AFTER)" ]; then \
+	  echo "Missing PERF_BEFORE or PERF_AFTER. Example:"; \
+	  echo "  make perf-compare PERF_BEFORE=api-server=<img>,worker=<img> PERF_AFTER=api-server=<img>,worker=<img>"; \
+	  exit 2; \
+	fi; \
+	python3 scripts/perf_compare.py --before "$(PERF_BEFORE)" --after "$(PERF_AFTER)" $(PERF_ARGS)
+
 # Local Redis (for testing distributed mode):
 #   sudo apt install redis-server && sudo service redis-server start
 #   redis-cli ping   # should print PONG
@@ -315,6 +326,10 @@ IMAGE_REPO     ?= ghcr.io/gke-labs/open-rl
 RELEASE_IMAGES ?= server api-server client scheduler
 # Gitignored; the release job uploads everything in here.
 DIST_DIR       ?= dist
+# Optional storage class and size for the shared volume (open-rl-shared-pvc);
+# unset keeps the overlay's own, e.g. STORAGE_CLASS=zonal-rwx STORAGE_SIZE=10Ti.
+STORAGE_CLASS  ?=
+STORAGE_SIZE   ?=
 
 # Print any overlay with the open-rl images pinned to VERSION:
 #   make render OVERLAY=examples/text-to-sql VERSION=v0.0.1 | kubectl apply --server-side -f -
@@ -331,6 +346,10 @@ render:
 	for image in $(RELEASE_IMAGES); do \
 	  kustomize edit set image "$(IMAGE_REPO)/$$image:$(VERSION)"; \
 	done; \
+	ops=""; \
+	if [ -n "$(STORAGE_CLASS)" ]; then ops="{\"op\":\"replace\",\"path\":\"/spec/storageClassName\",\"value\":\"$(STORAGE_CLASS)\"}"; fi; \
+	if [ -n "$(STORAGE_SIZE)" ]; then ops="$${ops:+$$ops,}{\"op\":\"replace\",\"path\":\"/spec/resources/requests/storage\",\"value\":\"$(STORAGE_SIZE)\"}"; fi; \
+	if [ -n "$$ops" ]; then kustomize edit add patch --kind PersistentVolumeClaim --name open-rl-shared-pvc --patch "[$$ops]"; fi; \
 	kustomize build .
 
 # Build the assets attached to a GitHub Release. Asset names carry no version so

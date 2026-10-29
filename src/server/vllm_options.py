@@ -1,9 +1,23 @@
-"""Engine and sampling options shared by the two vLLM sampler workers."""
+"""Engine and sampling options for the vLLM samplers."""
 
 import json
 import os
 from collections.abc import Mapping, Sequence
 from typing import Any
+
+# Every setting the sampler engine reads from the environment. The API server passes each one to sampler pods, so an
+# engine in the sampler's process and a vllm serve replica see the same values. VLLM_ARCHITECTURE_OVERRIDE depends on
+# the model, so worker_env sets it for each pod instead.
+ENGINE_ENV = (
+  "VLLM_GPU_MEMORY_UTILIZATION",
+  "VLLM_MAX_MODEL_LEN",
+  "VLLM_MAX_NUM_SEQS",
+  "VLLM_MAX_NUM_BATCHED_TOKENS",
+  "VLLM_ENFORCE_EAGER",
+  "VLLM_ENABLE_MULTIMODAL",
+  "VLLM_MAX_LORAS",
+  "VLLM_MAX_LORA_RANK",
+)
 
 
 def text_only_engine_kwargs() -> dict:
@@ -97,22 +111,37 @@ def detected_device_memory_bytes() -> int:
   return 0
 
 
-def engine_args(base_model: str, is_lora: bool, env: Mapping[str, str | None], sleep_mode: bool = False) -> dict[str, Any]:
-  """vLLM engine settings for a sampler, the same for a `vllm serve` replica and an engine in the sampler's process."""
-  args: dict[str, Any] = {"enable_prefix_caching": True}
+def sample_params(r: Mapping[str, Any]) -> dict[str, Any]:
+  """vLLM sampling params for a pool record, asking for the logprobs every result carries."""
+  return {**r["sampling_params"], "logprobs": 0, "prompt_logprobs": 0 if r["include_prompt_logprobs"] else None}
+
+
+def sample_result(sequences: list[tuple[list[int], list[float], str]], prompt_logprobs: list[float | None] | None) -> dict[str, Any]:
+  """The result a pool saves for a record, from each sequence's tokens, logprobs and stop reason."""
+  result: dict[str, Any] = {"type": "sample", "sequences": [{"tokens": t, "logprobs": lp, "stop_reason": s} for t, lp, s in sequences]}
+  if prompt_logprobs is not None:
+    result["prompt_logprobs"] = prompt_logprobs
+  return result
+
+
+def engine_args(is_lora: bool, sleep_mode: bool = False) -> dict[str, Any]:
+  """vLLM engine settings for a sampler, the same for a `vllm serve` replica and an engine in the sampler's process.
+  Both compute them on the sampler's own pod, so the batch is sized for the GPU it runs on."""
+  # Not for LoRA, where every save is a new adapter and no cached block outlives a step. With prefix caching on, a
+  # 13-job shared pool took twice as long as main to answer its first batch.
+  args: dict[str, Any] = {"enable_prefix_caching": not is_lora}
   # A checkpoint's generation_config.json could add sampling params the client never asked for, such as a repetition penalty.
   args["generation_config"] = "vllm"
   args["max_model_len"] = int(os.getenv("VLLM_MAX_MODEL_LEN", "8192"))
   # vLLM's own default of 0.92 has run FFT delta applies out of memory on an L4.
   args["gpu_memory_utilization"] = gpu_memory_utilization()
-  # These are set where the replica's device is unknown, so vLLM sizes the batch for the device it runs on unless told.
-  for name in ("VLLM_MAX_NUM_SEQS", "VLLM_MAX_NUM_BATCHED_TOKENS"):
-    if os.getenv(name):
-      args[name.removeprefix("VLLM_").lower()] = int(os.environ[name])
+  args.update(sampler_batch_limits())
   if os.getenv("VLLM_ENFORCE_EAGER", "0") == "1":
     args["enforce_eager"] = True
+  else:
+    args["compilation_config"] = {"cudagraph_capture_sizes": cudagraph_capture_sizes(args["max_num_seqs"])}
   args.update(text_only_engine_kwargs())
-  if architecture := env.get("VLLM_ARCHITECTURE_OVERRIDE"):
+  if architecture := os.getenv("VLLM_ARCHITECTURE_OVERRIDE"):
     args["hf_overrides"] = {"architectures": [architecture]}
   if is_lora:
     args.update(enable_lora=True, max_loras=int(os.getenv("VLLM_MAX_LORAS", "8")), max_lora_rank=int(os.getenv("VLLM_MAX_LORA_RANK", "64")))
@@ -123,10 +152,14 @@ def engine_args(base_model: str, is_lora: bool, env: Mapping[str, str | None], s
   return args
 
 
-def serve_args(base_model: str, is_lora: bool, env: Mapping[str, str | None], port: int = 8000) -> list[str]:
-  """`vllm serve` flags for a sampling pool replica."""
+def serve_args(base_model: str, is_lora: bool, port: int = 8000) -> list[str]:
+  """`vllm serve` flags for a sampling pool replica, computed on the replica's pod."""
   args = [base_model, "--port", str(port), "--api-server-count", "1", "--enable-scale-out"]
-  for name, value in engine_args(base_model, is_lora, env).items():
-    flag = "--" + name.replace("_", "-")
-    args += [flag] if value is True else [flag, json.dumps(value) if isinstance(value, dict) else str(value)]
+  for name, value in engine_args(is_lora).items():
+    flag = name.replace("_", "-")
+    if isinstance(value, bool):
+      # vllm serve takes booleans as --flag and --no-flag; a value after the flag is an error.
+      args.append(f"--{flag}" if value else f"--no-{flag}")
+    else:
+      args += [f"--{flag}", json.dumps(value) if isinstance(value, dict) else str(value)]
   return args

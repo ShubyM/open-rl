@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from server.vllm_options import cudagraph_capture_sizes, gpu_memory_utilization, split_stop
+from server.vllm_options import cudagraph_capture_sizes, gpu_memory_utilization, serve_args, split_stop
 
 
 class SplitStopTest(unittest.TestCase):
@@ -52,3 +52,11 @@ class CudagraphCaptureSizesTest(unittest.TestCase):
   def test_powers_of_two_up_to_max_num_seqs(self) -> None:
     self.assertEqual(cudagraph_capture_sizes(256), [1, 2, 4, 8, 16, 32, 64, 128, 256])
     self.assertEqual(cudagraph_capture_sizes(96), [1, 2, 4, 8, 16, 32, 64])
+
+
+class ServeArgsTest(unittest.TestCase):
+  def test_a_lora_replica_turns_prefix_caching_off_the_way_vllm_serve_accepts(self) -> None:
+    # A bare False after the flag made vllm serve exit, so every routed LoRA replica crash-looped.
+    args = serve_args("org/m", is_lora=True)
+    self.assertIn("--no-enable-prefix-caching", args)
+    self.assertFalse({"True", "False"} & set(args))

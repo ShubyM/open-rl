@@ -570,6 +570,13 @@ class TrainerBackendTest(ApiServerTest):
     self.assertEqual(response.status_code, 400)
     self.assertIn("openrl.sampler_replicas above 1", response.json()["error"])
 
+  def test_an_fft_job_sharing_its_trainers_gpu_cannot_ask_for_more_samplers(self) -> None:
+    fft = {"openrl.fine_tuning_type": "full", "openrl.sampler_replicas": "4"}
+    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
+      self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": fft}).status_code, 400)
+      exclusive = self.post("create_model", {"base_model": "m", "user_metadata": {**fft, "openrl.exclusive": "true"}})
+    self.assertEqual(self.metadata(exclusive.json()["request_id"])["sampler_replicas"], 4)
+
 
 if __name__ == "__main__":
   unittest.main()

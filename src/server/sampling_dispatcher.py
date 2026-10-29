@@ -1,10 +1,11 @@
 """Serves one sampling pool's pending records with a sampler and saves the first result for each.
 
-The sampler is HttpSampler, which sends through the pool's router, Envoy in front of the llm-d EPP, to its vllm serve
-replicas."""
+The sampler is either vLLM in this process (vllm_sampler.Sampler), for a pool of one replica that one job owns, or
+HttpSampler, which sends through the pool's router, Envoy in front of the llm-d EPP, to its vllm serve replicas."""
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import os
@@ -17,14 +18,15 @@ from typing import Any
 import httpx
 import redis.asyncio as redis
 
-from server.sampling_store import SamplingStore
+from server.sampling_store import SamplingStore, job_of
+from server.vllm_options import sample_params, sample_result
 
 logger = logging.getLogger(__name__)
 
 # The dispatcher wakes for each new request, or after this long to retry a failed send and look at its replicas.
 RETRY_MS = 1000
 # A request no replica has answered for this long fails, so its client stops waiting.
-SAMPLE_DEADLINE_SECONDS = 3600
+SAMPLE_DEADLINE_SECONDS = int(os.getenv("OPEN_RL_SAMPLE_DEADLINE_SECONDS", "3600"))
 # The version a replica reports once its weights may not match any revision. Never a path, so no pool revision equals it.
 UNKNOWN_WEIGHTS = "unknown"
 # How long one /weight_info call may take.
@@ -68,14 +70,13 @@ class RevisionUnloadable(Exception):
 
 
 def to_result(body: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
-  """The old sampler's result shape, from a vLLM /inference/v1/generate response."""
-  logprobs = [[e["logprob"] for e in c["logprobs"]["content"]] for c in body["choices"]]
-  sequences = [{"tokens": c["token_ids"], "logprobs": lp, "stop_reason": c["finish_reason"]} for c, lp in zip(body["choices"], logprobs)]
-  result: dict[str, Any] = {"type": "sample", "sequences": sequences}
+  """The result for a vLLM /inference/v1/generate response."""
+  sequences = [(c["token_ids"], [e["logprob"] for e in c["logprobs"]["content"]], c["finish_reason"]) for c in body["choices"]]
+  prompt_logprobs = None
   if record["include_prompt_logprobs"]:
     pairs = zip(record["prompt_token_ids"], body["prompt_logprobs"], strict=True)
-    result["prompt_logprobs"] = [None if e is None else e[str(token)]["logprob"] for token, e in pairs]
-  return result
+    prompt_logprobs = [None if e is None else e[str(token)]["logprob"] for token, e in pairs]
+  return sample_result(sequences, prompt_logprobs)
 
 
 class Dispatcher:
@@ -84,10 +85,12 @@ class Dispatcher:
   def __init__(self, store: SamplingStore, pool: str, sampler: Any, concurrency: int) -> None:
     self.store, self.pool, self.sampler, self.concurrency = store, pool, sampler, concurrency
     self.revision = ""
-    # This dispatcher is the pool's only reader, so it reads each record once and drops it when its result is saved.
+    # Each record is read once and dropped when its result is saved.
     self.records: dict[str, dict[str, Any]] = {}
     self.newest = "0-0"
     self.in_flight: dict[str, asyncio.Task] = {}
+    self.sends = itertools.count()
+    self.served: dict[str, int] = {}  # the number of each job's latest send
 
   async def run(self) -> None:
     try:
@@ -137,6 +140,12 @@ class Dispatcher:
     for r in await self.store.pending(self.pool, after=self.newest):
       self.records[r["entry_id"]] = r
       self.newest = r["entry_id"]
+    # The API server's deadline sweep and reconcile save results too, so a record they answered is dropped.
+    held = list(self.records.values())
+    answered = await self.store.answered([r["request_id"] for r in held])
+    for r in held:
+      if r["request_id"] in answered:
+        self.records.pop(r["entry_id"], None)  # a send may have saved it during the await above
     for r in list(self.records.values()):
       if (waited := time.time() - accepted_at(r)) > SAMPLE_DEADLINE_SECONDS:
         logger.warning("Failing %s after %.0fs without a result", r["request_id"], waited)
@@ -152,7 +161,14 @@ class Dispatcher:
       self.revision = revision
 
   def to_send(self) -> list[dict[str, Any]]:
-    return [r for r in self.records.values() if r["revision"] == self.revision and r["request_id"] not in self.in_flight]
+    """The current revision's records not in flight, one from each job in turn and oldest first within a job. The job
+    served longest ago goes first, so one job's big batch does not hold up the others."""
+    jobs: dict[str, list[dict[str, Any]]] = {}
+    for r in self.records.values():
+      if r["revision"] == self.revision and r["request_id"] not in self.in_flight:
+        jobs.setdefault(job_of(r), []).append(r)
+    turns = sorted(jobs.items(), key=lambda job: self.served.get(job[0], -1))
+    return [r for turn in itertools.zip_longest(*(records for _, records in turns)) for r in turn if r is not None]
 
   async def set_result(self, r: dict[str, Any], result: dict[str, Any]) -> None:
     await self.store.set_result(r, result)
@@ -160,6 +176,7 @@ class Dispatcher:
 
   async def send(self, r: dict[str, Any]) -> None:
     """Saves the sampler's answer. None, or an error, leaves the record pending to be sent again."""
+    self.served[job_of(r)] = next(self.sends)
     try:
       # A sampler that never answers must not hold the send past its record's deadline.
       timeout = max(0.0, accepted_at(r) + SAMPLE_DEADLINE_SECONDS - time.time())
@@ -212,7 +229,7 @@ class HttpSampler:
   async def generate(self, r: dict[str, Any]) -> dict[str, Any] | None:
     """The result, or None when the answer did not come from the record's revision."""
     target, sent = r["revision"] or "default", time.monotonic()
-    params = {**r["sampling_params"], "logprobs": 0, "prompt_logprobs": 0 if r["include_prompt_logprobs"] else None}
+    params = sample_params(r)
     attempt_id = f"{r['request_id']}-{uuid.uuid4().hex[:8]}"
     # The store hands prompts back as array('I'), which JSON cannot encode.
     body = {"request_id": attempt_id, "token_ids": list(r["prompt_token_ids"]), "model": r["model"], "sampling_params": params}

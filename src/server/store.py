@@ -32,16 +32,6 @@ class RequestStore(ABC):
     pass
 
   @abstractmethod
-  async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
-    """Push a sampling request into the queue for its model."""
-    pass
-
-  @abstractmethod
-  async def get_sampling_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    """Block until this model has at least 1 sampling request, then return all queued requests for it."""
-    pass
-
-  @abstractmethod
   async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     """Resolve a future by its request ID."""
     pass
@@ -61,7 +51,6 @@ class InMemoryStore(RequestStore):
     self.active_tenants_cv = asyncio.Condition()
     self.futures_store: dict[str, dict[str, Any]] = {}
     self.futures_cv = asyncio.Condition()
-    self.sampling_queues: dict[str, asyncio.Queue] = {}
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
@@ -111,23 +100,6 @@ class InMemoryStore(RequestStore):
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     raise RuntimeError("Per-model full fine-tuning workers require REDIS_URL; in-memory queues cannot be shared across processes")
-
-  async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
-    model_id = req_data.get("model_id", "default")
-    if model_id not in self.sampling_queues:
-      self.sampling_queues[model_id] = asyncio.Queue()
-    await self.sampling_queues[model_id].put(req_data)
-
-  async def get_sampling_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    if model_id not in self.sampling_queues:
-      return []
-    queue = self.sampling_queues[model_id]
-    if queue.empty():
-      return []
-    batch = [queue.get_nowait()]
-    while not queue.empty():
-      batch.append(queue.get_nowait())
-    return batch
 
   async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
@@ -234,31 +206,6 @@ class RedisStore(RequestStore):
 
     return batch
 
-  async def put_sampling_request(self, req_data: dict[str, Any]) -> None:
-    model_id = req_data.get("model_id", "default")
-    queue_key = f"open_rl:sampler_queue:{model_id}"
-    await self.redis.rpush(queue_key, json.dumps(req_data))
-
-  async def get_sampling_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    queue_key = f"open_rl:sampler_queue:{model_id}"
-    try:
-      result = await self.redis.blpop(queue_key, timeout=5)
-    except RedisTimeoutError:
-      return []
-
-    if not result:
-      return []
-
-    batch = [json.loads(result[1])]
-
-    while True:
-      item = await self.redis.lpop(queue_key)
-      if not item:
-        break
-      batch.append(json.loads(item))
-
-    return batch
-
   async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
       return
@@ -322,6 +269,11 @@ class StateStore(ABC):
   async def set_members(self, key: str) -> set[str]:
     pass
 
+  @abstractmethod
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    """Every live value whose key starts with prefix."""
+    pass
+
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
@@ -359,6 +311,9 @@ class InMemoryStateStore(StateStore):
   async def set_members(self, key: str) -> set[str]:
     return set(self.sets.get(key, set()))
 
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    return {key: value for key in list(self.kv_store) if key.startswith(prefix) and (value := self.get_value_sync(key)) is not None}
+
 
 class RedisStateStore(StateStore):
   def __init__(self, client: redis.Redis, sync_client: sync_redis.Redis):
@@ -386,6 +341,10 @@ class RedisStateStore(StateStore):
 
   async def set_members(self, key: str) -> set[str]:
     return set(await self.redis.smembers(key))
+
+  async def scan_values(self, prefix: str) -> dict[str, str]:
+    keys = [key async for key in self.redis.scan_iter(match=prefix + "*", count=1000)]
+    return {key: value for key, value in zip(keys, await self.redis.mget(keys)) if value is not None} if keys else {}
 
 
 @cache
