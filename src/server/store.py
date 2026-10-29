@@ -280,6 +280,11 @@ class StateStore(ABC):
     ttl_seconds after the last push."""
     pass
 
+  @abstractmethod
+  async def recent(self, key: str) -> list[str]:
+    """The list push_recent_sync keeps at key, newest first."""
+    pass
+
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
@@ -324,6 +329,9 @@ class InMemoryStateStore(StateStore):
   def push_recent_sync(self, key: str, values: list[str], keep: int, ttl_seconds: float) -> None:
     self.lists[key] = (values[::-1] + self.lists.get(key, []))[:keep]
 
+  async def recent(self, key: str) -> list[str]:
+    return list(self.lists.get(key, []))
+
 
 class RedisStateStore(StateStore):
   def __init__(self, client: redis.Redis, sync_client: sync_redis.Redis):
@@ -358,6 +366,9 @@ class RedisStateStore(StateStore):
 
   def push_recent_sync(self, key: str, values: list[str], keep: int, ttl_seconds: float) -> None:
     self.sync_redis.pipeline().lpush(key, *values).ltrim(key, 0, keep - 1).expire(key, int(ttl_seconds)).execute()
+
+  async def recent(self, key: str) -> list[str]:
+    return await self.redis.lrange(key, 0, -1)
 
 
 @cache
