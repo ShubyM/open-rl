@@ -132,3 +132,24 @@ same Redis as the rest of the server.
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `REDIS_URL` | unset | The Redis that holds model records and live sessions. Unset, the inventory has no runs. |
+
+### Metrics and logs on GKE
+
+The `lora`, `fft` and `distributed-fft-timeslice` bundles ship an NVIDIA DCGM
+exporter (`k8s/deploy/dcgm`). GKE's managed DCGM exporter skips DRA node pools,
+so without it those nodes report no GPU metrics.
+
+The steps below are for the inspection API's metrics and logs reads. It reads
+Cloud Monitoring and Cloud Logging as the API server's Kubernetes
+ServiceAccount, `open-rl-sa`, through Workload Identity. Enable Workload
+Identity when you create the cluster (`--workload-pool=<project>.svc.id.goog`).
+Enabling it on an existing cluster replaces its nodes.
+
+```bash
+PRINCIPAL=principal://iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<project>.svc.id.goog/subject/ns/openrl-system/sa/open-rl-sa
+gcloud projects add-iam-policy-binding <project> --role=roles/monitoring.viewer --member="$PRINCIPAL"
+gcloud projects add-iam-policy-binding <project> --role=roles/logging.viewer --member="$PRINCIPAL"
+```
+
+`<number>` is the project number. If you read logs through a log bucket view,
+also grant `roles/logging.viewAccessor` on that view.
