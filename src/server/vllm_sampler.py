@@ -19,6 +19,7 @@ from accel_timeslicer.workload import SAMPLER_CLAIM, WorkloadRef, local_workload
 from server.lora_snapshots import snapshot_root
 from server.sampling_dispatcher import Dispatcher, RevisionUnloadable, delta_applies, failed, redis_client
 from server.sampling_store import SamplingStore
+from server.telemetry import gpu_turn, serving, set_phase
 from server.vllm_options import engine_args, sample_params, sample_result
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,7 @@ async def holding_gpu(time_slicer: TimeSlicerClient | None, workload: WorkloadRe
   if time_slicer is None:
     yield
     return
-  async with time_slicer.acquire(workload):
+  async with gpu_turn(time_slicer.acquire(workload)):
     if sampler is not None:
       await sampler.wake()
     try:
@@ -189,6 +190,7 @@ async def run_sampling_worker(pool: str) -> None:
       if time_slicer is not None:
         await sampler.sleep()  # give the memory back before releasing the turn
     Path(READY_FILE).touch()
+    set_phase("ready")
     concurrency = int(os.getenv("OPEN_RL_DISPATCH_CONCURRENCY", "256"))
     if time_slicer is not None:
       dispatcher = TimeSlicedDispatcher(store, pool, sampler, concurrency, time_slicer, workload)
@@ -216,12 +218,17 @@ async def run_sampling_worker(pool: str) -> None:
     await store.redis.aclose()
 
 
+async def serve_pool(pool: str) -> None:
+  async with serving("sampler", pool):
+    await run_sampling_worker(pool)
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description="Open-RL sampling pool replica with vLLM in this process")
   parser.add_argument("--pool", required=True, help="The sampling pool whose stream this replica serves")
   args = parser.parse_args()
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-  asyncio.run(run_sampling_worker(args.pool))
+  asyncio.run(serve_pool(args.pool))
 
 
 if __name__ == "__main__":

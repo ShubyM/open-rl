@@ -27,6 +27,7 @@ from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, C
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import openrl_status, proto_codec
+from server import telemetry as run_records
 from server.lora_snapshots import snapshot_name, snapshot_root
 from server.model_metadata import (
   TrainingModelMetadata,
@@ -568,6 +569,7 @@ async def enqueue(command: Command) -> str:
 
   active_set_id = await _resolve_active_set_id(command.model_id)
   await store.put_request(commands.wire(command.model_copy(update={"trace_context": carrier})), active_set_id=active_set_id)
+  run_records.enqueued(command.model_id)
   # One line per training request so a request that never reaches a worker can
   # be traced end to end (the workers log the same id when they pop it).
   print(f"[API_SERVER] enqueued op={command.op} request_id={command.request_id} model_id={command.model_id} active_set={active_set_id}")
@@ -744,6 +746,8 @@ async def lifespan(_: FastAPI):
   global worker_manager
   task = None
   check_sampler_backend()
+  # The in-process trainer's records, and the requests this server enqueues, are written from here.
+  run_records.start("api_server", worker_record=False)
   if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER"):
     worker_manager = create_worker_manager()
   if is_single_process_mode():
@@ -778,6 +782,7 @@ async def lifespan(_: FastAPI):
     if worker_manager is not None:
       worker_manager.close()
       worker_manager = None
+    await run_records.finish()
 
 
 # The release tag, baked in at image build (OPEN_RL_VERSION build arg); the

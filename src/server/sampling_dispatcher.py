@@ -19,6 +19,7 @@ import httpx
 import redis.asyncio as redis
 
 from server.sampling_store import SamplingStore, job_of
+from server.telemetry import serving, set_phase
 from server.vllm_options import sample_params, sample_result
 
 logger = logging.getLogger(__name__)
@@ -368,7 +369,8 @@ async def main() -> None:
   logging.getLogger("httpx").setLevel(logging.WARNING)
   router = os.getenv("OPEN_RL_SAMPLER_ROUTER", "http://127.0.0.1:8081")
   store, pool = SamplingStore(redis_client(os.environ["REDIS_URL"])), os.environ["OPEN_RL_SAMPLER_POOL"]
-  async with http_client() as http:
+  async with serving("dispatcher", pool), http_client() as http:
+    set_phase("ready")
     sampler = HttpSampler(http, pool, router, [])
     task = asyncio.create_task(Dispatcher(store, pool, sampler, int(os.getenv("OPEN_RL_DISPATCH_CONCURRENCY", "256"))).run())
     for sig in (signal.SIGTERM, signal.SIGINT):

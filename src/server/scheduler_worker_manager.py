@@ -170,6 +170,8 @@ def pod_env(worker: Worker) -> list[dict[str, Any]]:
   env.append(downward("OPEN_RL_ACCEL_TIMESLICER_HOST", "status.hostIP"))
   if worker.pool:
     env.append(downward("POD_IP", "status.podIP"))
+  # The pod a worker names on the records it keeps.
+  env += [downward("POD_NAME", "metadata.name"), downward("POD_UID", "metadata.uid"), downward("NODE_NAME", "spec.nodeName")]
   return env
 
 
