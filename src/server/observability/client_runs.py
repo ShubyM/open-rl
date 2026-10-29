@@ -1,84 +1,32 @@
-"""A run's client directory: the tinker-cookbook's log_path on a volume the server also mounts, where the client writes
-config.json, checkpoints.jsonl and logs.log. Every read is blocking, so callers run it in a thread."""
+"""A run's client log: logs.log under the openrl.log_path the client declared, such as the tinker-cookbook's log_path on a
+volume the server also mounts. Every read is blocking, so callers run it in a thread."""
 
-import json
 import os
 import re
 
-# Run directories as deep as the e2e client's /mnt/shared/open-rl/runs/<scenario>/open-rl-tmp/<run>.
-DEPTH = 5
-MATCH_SECONDS = 60  # config.json is written just before the client creates its model
 SCAN_BYTES = 4 << 20  # of logs.log per page
 MESSAGE_CHARS = 16384
-TINKER_PATH = re.compile(r'tinker://([^/"]+)/')
 # The cookbook's file format, "%(name)s:%(lineno)d [%(levelname)s] %(message)s"; other lines continue the record above.
 HEADER = re.compile(r"\S+:\d+ \[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\] ")
-listings: dict[str, tuple[int, list[str], bool]] = {}  # directory -> (mtime, subdirectories, is a run directory)
-parsed: dict[str, tuple[tuple[int, int], object]] = {}  # file -> ((mtime, size), parsed contents)
 
 
-def root() -> str:
-  return os.getenv("OPEN_RL_CLIENT_RUNS_ROOT", "/mnt/shared")
+def log_file(log_path: str | None) -> str:
+  """<log_path>/logs.log, resolved, when it lies under one of OPEN_RL_CLIENT_LOG_ROOTS. The path is the client's word, so
+  one that leads elsewhere, by .. or a symlink, is refused rather than read."""
+  roots = [os.path.realpath(root.strip()) for root in os.getenv("OPEN_RL_CLIENT_LOG_ROOTS", "").split(",") if root.strip()]
+  if not log_path:
+    raise LookupError("This run declared no openrl.log_path")
+  if not roots:
+    raise LookupError("No client log roots configured. Set OPEN_RL_CLIENT_LOG_ROOTS; see docs/configuration.md.")
+  path = os.path.realpath(os.path.join(log_path, "logs.log"))
+  if not any(os.path.commonpath([path, root]) == root for root in roots):
+    raise LookupError(f"{log_path} is not under OPEN_RL_CLIENT_LOG_ROOTS")
+  return path
 
 
-def directories(path: str | None = None, depth: int = DEPTH) -> list[str]:
-  """Every directory under the root, to DEPTH, that holds config.json or checkpoints.jsonl. A run directory is not
-  descended into, and a directory is listed again only when its mtime changes."""
-  path = path or root()
-  try:
-    mtime = os.stat(path).st_mtime_ns
-    if (listing := listings.get(path)) is None or listing[0] != mtime:
-      with os.scandir(path) as scan:
-        entries = list(scan)
-      run = any(e.name in ("config.json", "checkpoints.jsonl") for e in entries)
-      below = [] if run else [e.path for e in entries if not e.name.startswith(".") and e.name != "lost+found" and e.is_dir(follow_symlinks=False)]
-      listing = listings[path] = (mtime, below, run)
-  except OSError:  # no root here, or a directory removed while it was scanned
-    return []
-  if listing[2]:
-    return [path]
-  return [found for below in listing[1] for found in directories(below, depth - 1)] if depth > 0 else []
-
-
-def read(path: str, parse) -> tuple[float, object] | None:
-  """The file's mtime and parsed contents, read again only when its mtime or size changes. None when it is absent, as
-  checkpoints.jsonl is until the first save, or is not what the cookbook writes."""
-  try:
-    stat = os.stat(path)
-    if (entry := parsed.get(path)) is None or entry[0] != (stat.st_mtime_ns, stat.st_size):
-      with open(path, encoding="utf-8", errors="replace") as f:
-        entry = parsed[path] = ((stat.st_mtime_ns, stat.st_size), parse(f.read()))
-  except (OSError, ValueError):
-    return None
-  return entry[0][0] / 1e9, entry[1]
-
-
-def started(directory: str, run: dict) -> bool:
-  """Whether config.json was written within MATCH_SECONDS of the run's creation, for its base model."""
-  if not (found := read(os.path.join(directory, "config.json"), json.loads)) or not isinstance(config := found[1], dict):
-    return False
-  return abs(found[0] - run["created_at"]) <= MATCH_SECONDS and config.get("model_name") == run["model"]
-
-
-def checkpoint_runs(directory: str) -> set[str]:
-  found = read(os.path.join(directory, "checkpoints.jsonl"), lambda text: set(TINKER_PATH.findall(text)))
-  return found[1] if found else set()
-
-
-def match(run: dict, candidates: list[str]) -> str | None:
-  """The run's directory: the one whose checkpoints.jsonl names tinker://<run_id>/, else the one started() for it. Of
-  several, only one that was also started() for it is taken; otherwise none, never a guess."""
-  exact = [d for d in candidates if run["run_id"] in checkpoint_runs(d)]
-  if len(exact) == 1:
-    return exact[0]
-  timed = [d for d in exact or candidates if started(d, run)]
-  return timed[0] if len(timed) == 1 else None
-
-
-def log_page(directory: str, before: int | None, limit: int, q: str = "", severity: str | None = None) -> dict:
+def log_page(path: str, before: int | None, limit: int, q: str = "", severity: str | None = None) -> dict:
   """logs.log, newest first, in the shape of a Cloud Logging page. Its lines carry no time, so a record is a header line
   and the lines under it, such as a traceback, and next_cursor is the byte offset the next older page ends at."""
-  path = os.path.join(directory, "logs.log")
   with open(path, "rb") as f:
     size = f.seek(0, os.SEEK_END)
     end = size if before is None else min(before, size)

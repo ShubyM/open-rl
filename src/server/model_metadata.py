@@ -49,6 +49,7 @@ class TrainingModelMetadata(BaseModel):
   trainer_gpus: int = 1
   trainer_cp: int = 1
   recipe: Literal["rl", "sft"] | None = None
+  log_path: str | None = None
   status: str = "active"
   updated_at: float = 0.0
   completed_at: float | None = None

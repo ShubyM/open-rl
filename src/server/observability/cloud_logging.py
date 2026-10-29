@@ -10,11 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 
-from server.observability.kubernetes import namespace
-
 METADATA = {"project": "project/project-id", "cluster": "instance/attributes/cluster-name", "location": "instance/attributes/cluster-location"}
-# GKE copies each pod label onto its log entries as k8s-pod/<key>, with the dots in the key as underscores.
-OWNER = 'labels."k8s-pod/timeslice_io/owner"'
 # GKE files every stderr line as ERROR, though most are progress bars, INFO logs and warnings; such a line takes the level it prints.
 RELABELED = ("DEBUG", "INFO", "WARNING")
 LEVEL, PROGRESS = re.compile(r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\b"), re.compile(r"\r|\d+%(\||\s+Completed)")
@@ -33,10 +29,9 @@ async def send(method: str, url: str, **kwargs) -> httpx.Response:
 
 
 def configuration() -> dict:
-  """OPEN_RL_GKE_PROJECT, _CLUSTER and _LOCATION, else what the metadata server said; OPEN_RL_GKE_TELEMETRY=0 turns GKE off."""
+  """OPEN_RL_GKE_PROJECT, _CLUSTER and _LOCATION, else what the metadata server said."""
   fields = {key: os.getenv(f"OPEN_RL_GKE_{key.upper()}") or detected.get(key, "") for key in METADATA}
-  off = os.getenv("OPEN_RL_GKE_TELEMETRY", "auto").strip().lower() not in ("auto", "1", "true")
-  return {**fields, "configured": not off and all(fields.values())}
+  return {**fields, "configured": all(fields.values())}
 
 
 async def discover() -> None:
@@ -99,13 +94,13 @@ def window(since: str | None, until: str | None) -> tuple[str, str]:
   return start.isoformat(timespec="microseconds"), end.isoformat(timespec="microseconds")
 
 
-def logs_filter(owner: str, start: str, end: str, severity: str | None, q: str, pod: str | None = None) -> str:
-  """The pods with the run's owner label in the window, or one of them. Never any other pod in the namespace, so a run id
-  cannot open another run's logs."""
+def logs_filter(namespace: str, pod_prefix: str, start: str, end: str, severity: str | None, q: str, pod: str | None = None) -> str:
+  """The namespace's pods whose names start with pod_prefix, in the window, or one of them. Never any other pod, so a run
+  id cannot open another run's logs."""
   config = configuration()
-  labels = {"project_id": config["project"], "location": config["location"], "cluster_name": config["cluster"], "namespace_name": namespace()}
+  labels = {"project_id": config["project"], "location": config["location"], "cluster_name": config["cluster"], "namespace_name": namespace}
   clauses = ['resource.type="k8s_container"', *(f"resource.labels.{label}={json.dumps(value)}" for label, value in labels.items())]
-  clauses.append(f"{OWNER}={json.dumps(owner)}")
+  clauses.append(f"resource.labels.pod_name=~{json.dumps('^' + pod_prefix)}")
   if pod:
     clauses.append(f"resource.labels.pod_name={json.dumps(pod)}")
   clauses += [f"timestamp>={json.dumps(start)}", f"timestamp<={json.dumps(end)}"]
@@ -142,12 +137,14 @@ def entry_record(entry: dict) -> dict:
   return record | {"severity": severity, "message": text[:MESSAGE_CHARS], "message_truncated": len(text) > MESSAGE_CHARS}
 
 
-async def log_page(owner: str, since: str, until: str, *, cursor=None, limit=200, q="", pod=None, severity=None) -> dict:
+async def log_page(namespace: str, pod_prefix: str, since: str, until: str, *, cursor=None, limit=200, q="", pod=None, severity=None) -> dict:
   """A page of logs, newest first. The cursor is Cloud Logging's own page token, valid for the same filters."""
+  await discover()
   if not (config := configuration())["configured"]:
-    raise LookupError("GKE telemetry is not configured")
+    raise LookupError("Cloud Logging needs the GKE metadata server or OPEN_RL_GKE_PROJECT, _CLUSTER and _LOCATION")
   views = [v.strip() for v in os.getenv("OPEN_RL_LOG_VIEWS", "").split(",") if v.strip()] or [f"projects/{config['project']}"]
-  query = {"resourceNames": views, "filter": logs_filter(owner, since, until, severity, q, pod), "orderBy": "timestamp desc", "pageSize": limit}
+  filters = logs_filter(namespace, pod_prefix, since, until, severity, q, pod)
+  query = {"resourceNames": views, "filter": filters, "orderBy": "timestamp desc", "pageSize": limit}
   query |= {"pageToken": cursor} if cursor else {}
   payload = (await send("POST", "https://logging.googleapis.com/v2/entries:list", json=query, headers=await gcp_headers())).json()
   records = [entry_record(entry) for entry in payload.get("entries", [])]
