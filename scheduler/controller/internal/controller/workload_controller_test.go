@@ -79,10 +79,12 @@ func enabledNode() []client.Object {
 	nodeName := testNode
 	product := "NVIDIA RTX PRO 6000 Blackwell"
 	device := func(name string) resourcev1.Device {
+		uuid := "GPU-" + name
 		return resourcev1.Device{
 			Name: name,
 			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
 				"productName": {StringValue: &product},
+				"uuid":        {StringValue: &uuid},
 			},
 			Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 				"memory": {Value: resource.MustParse("96Gi")},
@@ -1246,5 +1248,37 @@ func TestMultiGPUWorkloadCutsAnExactCountExclusiveClaim(t *testing.T) {
 	waiting := getWorker(t, r, "tp4")
 	if waiting.Status.ClaimName != "" || !strings.Contains(waiting.Status.Reason, "4 device(s)") {
 		t.Fatalf("status = %+v, want no claim and a reason naming four devices", waiting.Status)
+	}
+}
+
+func TestWorkerStatusRecordsItsPlacementInterval(t *testing.T) {
+	r := newReconciler(t, append(enabledNode(), trainerWorker("w-a", "model-a"))...)
+	settle(t, r, "w-a")
+	allocateClaim(t, r, claimOf(t, r, "w-a"))
+	runReconcile(t, r, "w-a")
+
+	placed := getWorker(t, r, "w-a").Status
+	if placed.NodeName != testNode || placed.PlacedAt == nil || placed.ReleasedAt != nil {
+		t.Fatalf("status = %+v, want placed on %s and not released", placed, testNode)
+	}
+	if got := placed.GPUUUIDs; len(got) != 1 || got[0] != "GPU-gpu-0" {
+		t.Fatalf("gpuUUIDs = %v, want the allocated device's UUID", got)
+	}
+
+	// A second finalizer keeps the worker readable after teardown lets go.
+	held := getWorker(t, r, "w-a")
+	held.Finalizers = append(held.Finalizers, "test.openrl.io/hold")
+	if err := r.Update(context.Background(), held); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), held); err != nil {
+		t.Fatal(err)
+	}
+	runReconcile(t, r, "w-a")
+	runReconcile(t, r, "w-a")
+
+	released := getWorker(t, r, "w-a").Status
+	if released.ReleasedAt == nil || !released.PlacedAt.Equal(placed.PlacedAt) {
+		t.Fatalf("status = %+v, want releasedAt stamped and placedAt kept", released)
 	}
 }
