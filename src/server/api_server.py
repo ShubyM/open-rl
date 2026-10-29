@@ -27,7 +27,6 @@ from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, C
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import openrl_status, proto_codec
-from server.dashboard.router import router
 from server.lora_snapshots import snapshot_name, snapshot_root
 from server.model_metadata import (
   TrainingModelMetadata,
@@ -36,6 +35,7 @@ from server.model_metadata import (
   persist_model_metadata,
   pool_name,
 )
+from server.observability.router import router
 from server.sampling_dispatcher import SAMPLE_DEADLINE_SECONDS
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry

@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from server.dashboard import fleet
+from server.observability import fleet
 
 router = APIRouter(tags=["inspection"])
 

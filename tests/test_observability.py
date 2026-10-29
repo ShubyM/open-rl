@@ -5,8 +5,8 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from server import api_server
-from server.dashboard import fleet
 from server.model_metadata import TrainingModelMetadata
+from server.observability import fleet
 from server.store import InMemoryStateStore
 
 
