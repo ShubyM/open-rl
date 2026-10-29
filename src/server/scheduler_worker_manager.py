@@ -21,8 +21,10 @@ label and the time-slicer call job_id.
 
 import dataclasses
 import datetime
+import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Any
@@ -32,6 +34,7 @@ from kubernetes import client, config
 from server.estimator import Footprint, footprint
 from server.lora_snapshots import snapshot_root
 from server.sampling_dispatcher import revision_file, tmp_root
+from server.store import get_state_store
 from server.vllm_options import ENGINE_ENV
 from server.worker_manager import (
   FAILED,
@@ -58,6 +61,7 @@ ENVOY_IMAGE = "docker.io/envoyproxy/envoy:distroless-v1.33.2"
 ROUTER_CONFIG = "/etc/sampler-router"
 # On a pool's Deployment and NetworkPolicy, so release_owner finds them after the pool's Workloads are gone.
 OWNER_LABEL = "openrl.io/owner"
+PLACEMENT_HISTORY, PLACEMENT_HISTORY_SECONDS = 200, 7 * 24 * 3600
 
 
 def workload_name(role: str, owner: str, is_lora: bool, index: int = 0) -> str:
@@ -460,6 +464,7 @@ class SchedulerWorkerManager:
     selector = "app.kubernetes.io/managed-by=open-rl-api-server"
     found = self.custom_api.list_namespaced_custom_object(GROUP, VERSION, self.namespace, PLURAL, label_selector=selector)
     ours = [item for item in found["items"] if item["spec"]["ownerID"] == owner]
+    record_placements(ours)
     pools = {item["metadata"]["labels"].get("app.kubernetes.io/instance") for item in ours} - {None}
     owned = f"{OWNER_LABEL}={owner}"
     pools |= {d.metadata.name for d in self.apps_api.list_namespaced_deployment(self.namespace, label_selector=owned).items}
@@ -611,8 +616,50 @@ def worker_state(phase: str, reason: str, node: str | None, deleting: bool) -> t
   return STARTING, facts
 
 
+def epoch_seconds(timestamp: str | None) -> float | None:
+  return datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp() if timestamp else None
+
+
 def age_seconds(timestamp: str | None, now: float) -> float | None:
-  if not timestamp:
-    return None
-  created = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
-  return max(0.0, now - created)
+  created = epoch_seconds(timestamp)
+  return None if created is None else max(0.0, now - created)
+
+
+def placement_of(workload: dict[str, Any]) -> dict[str, Any]:
+  """Where a Workload runs and the GPUs it holds, as the scheduler stamps them on its status."""
+  meta, spec, status = workload["metadata"], workload["spec"], workload.get("status") or {}
+  return {
+    "name": meta["name"],
+    "role": spec.get("role"),
+    "node": status.get("nodeName"),
+    "pod": status.get("podName"),
+    "gpu_uuids": status.get("gpuUUIDs") or [],
+    "placed_at": epoch_seconds(status.get("placedAt")),
+    "released_at": epoch_seconds(status.get("releasedAt")),
+    "deleting": bool(meta.get("deletionTimestamp")),
+  }
+
+
+def holds_gpus(placement: dict[str, Any]) -> bool:
+  return placement["placed_at"] is not None and placement["released_at"] is None and not placement["deleting"]
+
+
+def record_placements(workloads: list[dict[str, Any]]) -> None:
+  """Keep the final placement of each Workload still holding GPUs in open_rl:placements:<runtime>, newest first, so it
+  outlives the Workload. A daemon thread writes it, so a slow or failing Redis neither delays nor fails the release."""
+  records: dict[str, list[str]] = {}
+  for item in workloads:
+    if holds_gpus(placement := placement_of(item)):
+      del placement["deleting"]
+      placement.update(training_kind=item["spec"].get("trainingKind"), released_at=time.time())
+      records.setdefault(f"open_rl:placements:{item['spec']['modelID']}", []).append(json.dumps(placement))
+  if records:
+    threading.Thread(target=push_placements, args=(records,), daemon=True).start()
+
+
+def push_placements(records: dict[str, list[str]]) -> None:
+  try:
+    for key, values in records.items():
+      get_state_store().push_recent_sync(key, values, PLACEMENT_HISTORY, PLACEMENT_HISTORY_SECONDS)
+  except Exception as exc:
+    logger.warning("Could not record the placements of released workloads: %s", exc)

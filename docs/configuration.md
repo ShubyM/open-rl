@@ -129,6 +129,13 @@ The API server serves a read-only inventory of runs at
 `/api/v1/inspect/inventory` and a run's logs at
 `/api/v1/inspect/logs?run_id=<id>`. See `/docs` for their fields.
 
+`placements` lists the `Workload`s that hold GPUs now, from their status in
+Kubernetes. Each entry has the node, pod, GPU UUIDs, `placed_at` in Unix
+seconds, and the `run_ids` the `Workload` serves. When the server releases a
+run's workers, it also saves each `Workload`'s last placement to the Redis list
+`open_rl:placements:<runtime>`. The list keeps the newest 200 records for seven
+days.
+
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `OPEN_RL_LOG_STORE` | unset | Where it reads logs. Unset turns log reads off. `cloud-logging` reads Cloud Logging in the project of the server's Google credentials. `cloud-logging:<resource>` reads that Cloud Logging resource instead, such as `projects/<project>/locations/global/buckets/<bucket>/views/<view>`. |

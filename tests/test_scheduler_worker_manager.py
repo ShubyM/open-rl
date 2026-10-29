@@ -1,10 +1,12 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from server import api_server
 from server.estimator import footprint
@@ -81,6 +83,16 @@ class FakeApi:
       self.objects[(kind, args[1]["metadata"]["name"])] = args[1]
 
     return call
+
+
+class HistoryStore(InMemoryStateStore):
+  def __init__(self):
+    super().__init__()
+    self.pushed = threading.Event()
+
+  def push_recent_sync(self, *args) -> None:
+    super().push_recent_sync(*args)
+    self.pushed.set()
 
 
 class SchedulerWorkerManagerTest(unittest.TestCase):
@@ -403,6 +415,47 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     }
     self.assertEqual(self.manager.release_owner("old"), {"old"})
     self.assertEqual(self.api.deleted, ["fft-old-trainer"])
+
+  def place_lora_pair_and_other(self) -> str:
+    s = self.store_with("adapter", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
+    s.kv_store["open_rl:model_meta:other"] = json.dumps({"base_model": "Qwen/Qwen3-0.6B", "fine_tuning_type": "lora"})
+    with patch("server.worker_manager.get_state_store", return_value=s):
+      self.manager.ensure("adapter", "trainer")
+      self.manager.ensure("adapter", "sampler")
+      self.manager.ensure("other", "trainer")
+    for name, body in self.api.existing.items():
+      body["status"] = {"nodeName": "n1", "podName": f"orw-{name}", "gpuUUIDs": [f"GPU-{name}"], "placedAt": "2026-10-29T12:00:00Z"}
+    return owner_id("Qwen/Qwen2.5-0.5B")
+
+  def test_release_records_the_final_placement_of_each_released_workload(self) -> None:
+    owner, store = self.place_lora_pair_and_other(), HistoryStore()
+    with patch("server.scheduler_worker_manager.get_state_store", return_value=store):
+      self.manager.release_owner(owner)
+    self.assertTrue(store.pushed.wait(5))
+
+    self.assertEqual(list(store.lists), ["open_rl:placements:Qwen/Qwen2.5-0.5B"])
+    records = [json.loads(r) for r in store.lists["open_rl:placements:Qwen/Qwen2.5-0.5B"]]
+    self.assertEqual(
+      sorted((r["name"], r["role"], r["node"], r["gpu_uuids"][0]) for r in records),
+      [
+        (f"lora-{owner}-0-sampler", "sampler", "n1", f"GPU-lora-{owner}-0-sampler"),
+        (f"lora-{owner}-0-trainer", "trainer", "n1", f"GPU-lora-{owner}-0-trainer"),
+      ],
+    )
+    self.assertTrue(all(r["training_kind"] == "lora" and r["released_at"] > r["placed_at"] for r in records), records)
+
+  def test_a_failing_or_hanging_history_store_does_not_hold_up_the_release(self) -> None:
+    unblock = threading.Event()
+    self.addCleanup(unblock.set)
+    for push in (RuntimeError("redis down"), lambda *args: unblock.wait(5)):
+      self.api.deleted.clear()
+      owner = self.place_lora_pair_and_other()
+      store = SimpleNamespace(push_recent_sync=Mock(side_effect=push))
+      with patch("server.scheduler_worker_manager.get_state_store", return_value=store):
+        started = time.monotonic()
+        self.assertEqual(self.manager.release_owner(owner), {"Qwen/Qwen2.5-0.5B"})
+      self.assertLess(time.monotonic() - started, 1)
+      self.assertEqual(len(self.api.deleted), 2)
 
   def test_ensure_waits_for_a_terminating_workload_before_recreating_it(self) -> None:
     s = self.store_with("adapter", {"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": "lora"})
