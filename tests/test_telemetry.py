@@ -3,18 +3,29 @@
 import asyncio
 import json
 import os
+import sys
+import tempfile
 import threading
 import time
+import types
 import unittest
+import uuid
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
 from server import api_server, telemetry
+from server.sampling_dispatcher import Dispatcher, RevisionUnloadable, failed
+from server.sampling_store import SamplingStore, future_key
 from server.store import InMemoryStateStore, InMemoryStore, StateStore
 from server.training_requests_processor import TrainingRequestsProcessor
+from server.vllm_sampler import Sampler
 from tests.api_client import asgi_client
+from tests.redis_server import RedisTestCase
 from tests.test_fft_batch_failure import BatchStore, BrokenWorker, SlicerStub
+from tests.test_sampling_dispatcher import SAMPLE, until
+from tests.test_vllm_sampler import FakeEngine, fake_vllm
 from training.trainer_worker import BaseTrainerWorker
 
 BOUND = 1.0  # an exiting process waits this long for its last flush; a serve must finish well inside it
@@ -276,6 +287,125 @@ class StepsRouteTest(TelemetryTest):
     (step,) = self.get([*fb, self.op(0, "optim_step")], "?fields=loss,kl")["steps"]
     spread = {"loss": {"min": 1.0, "max": 2.0, "mean": 1.5}, "kl": {"min": 0.1, "max": 0.1, "mean": 0.1}}
     self.assertEqual(step["ops"]["forward_backward"], {"count": 2, "failed": 0, "seconds": 1.0, "metrics": spread})
+
+
+class ScriptedSampler:
+  """Answers prompt [1], fails the first send of [2] so the dispatcher sends it again, refuses [3], and can find no
+  weights a revision applies on."""
+
+  def __init__(self, unloadable: bool = False) -> None:
+    self.unloadable, self.raised = unloadable, False
+
+  async def ensure_weights(self, revision: str) -> bool:
+    if revision and self.unloadable:
+      raise RevisionUnloadable(revision, ["default"])
+    return True
+
+  async def generate(self, r: dict) -> dict:
+    prompt = list(r["prompt_token_ids"])
+    if prompt == [2] and not self.raised:
+      self.raised = True
+      raise ConnectionError("the replica went away")
+    return failed("Sampler rejected the request") if prompt == [3] else SAMPLE
+
+
+class BrokenUpdateEngine(FakeEngine):
+  async def pause_generation(self, **kwargs) -> None:
+    raise RuntimeError("CUDA out of memory")
+
+
+class SampleRecordTest(RedisTestCase):
+  """A run's sends are read back from its sample records: each group record's count, plus one per failed record."""
+
+  async def asyncSetUp(self) -> None:
+    await super().asyncSetUp()
+    self.store, self.pool, self.telemetry = SamplingStore(self.redis), f"sampler-{uuid.uuid4()}", InMemoryStateStore()
+    self.enterContext(patch.object(telemetry, "get_state_store", lambda: self.telemetry))
+    vllm = fake_vllm() | {name: types.ModuleType(name) for name in ("vllm.distributed", "vllm.distributed.weight_transfer.base")}
+    vllm["vllm.distributed.weight_transfer.base"].WeightTransferUpdateRequest = dict
+    self.enterContext(patch.dict(sys.modules, vllm))
+    self.tmp = self.enterContext(tempfile.TemporaryDirectory())
+    self.enterContext(patch.dict(os.environ, {"OPEN_RL_TMP_DIR": self.tmp}))
+
+  async def accepted(self, prompt: list[int], revision: str = "") -> dict:
+    r = {"request_id": str(uuid.uuid4()), "pool": self.pool, "job": "run", "revision": revision, "model": "base", "idempotency_key": None}
+    r |= {"prompt_token_ids": prompt, "sampling_params": {"n": 1, "max_tokens": 1}, "include_prompt_logprobs": False}
+    await self.store.accept(r)
+    return r
+
+  async def answer(self, r: dict) -> str | None:
+    raw = await self.redis.lindex(future_key(r["request_id"]), 0)
+    return json.loads(raw)["type"] if raw else None
+
+  def serve(self, sampler) -> None:
+    """Serve the pool as a sampler process does, until it exits."""
+    telemetry.start("sampler", self.pool)
+    self.running = asyncio.create_task(Dispatcher(self.store, self.pool, sampler, 4).run())
+    self.addAsyncCleanup(self.exit)
+
+  async def exit(self) -> None:
+    self.running.cancel()
+    await asyncio.gather(self.running, return_exceptions=True)
+    await telemetry.finish()
+
+  async def sent(self) -> dict:
+    """The run's sends and failures, read back from what the sampler process recorded by the time it exited."""
+    await self.exit()
+    records = await self.telemetry.read_samples(telemetry.key("operations", "run", "samples"))
+    return {"sends": sum(r.get("count", 1) for r in records), "failed": sum(r["status"] == "failed" for r in records)}
+
+  async def test_a_request_sent_again_after_an_error_and_one_refused_are_each_sent_once(self) -> None:
+    records = [await self.accepted([prompt]) for prompt in (1, 2, 3)]
+    self.serve(ScriptedSampler())
+    await until(lambda: all_answered(self, records))
+    self.assertEqual([await self.answer(r) for r in records], ["sample", "sample", "RequestFailedResponse"])
+    self.assertEqual(await self.sent(), {"sends": 3, "failed": 1})
+
+  async def test_an_answer_saved_after_another_one_is_not_counted(self) -> None:
+    r = await self.accepted([1])
+    release = asyncio.Event()
+
+    class SlowSampler(ScriptedSampler):
+      async def generate(self, r: dict) -> dict:
+        await release.wait()
+        return SAMPLE
+
+    self.serve(SlowSampler())
+    await asyncio.sleep(0.2)
+    # The API server's deadline sweep fails the request while its send is in flight.
+    await self.store.fail_older_than(0, failed("No sampler answered"))
+    release.set()
+    await asyncio.sleep(0.2)
+    self.assertEqual(await self.answer(r), "RequestFailedResponse")
+    self.assertEqual(await self.sent(), {"sends": 1, "failed": 1})
+
+  async def test_a_failed_weight_update_answers_nothing_and_unloadable_weights_fail_each_request_once(self) -> None:
+    revision = Path(self.tmp, "w1")
+    revision.mkdir()
+    (revision / "metadata.json").write_text("{}")
+    records = [await self.accepted([1], str(revision)) for _ in range(2)]
+    self.serve(Sampler(BrokenUpdateEngine(), "base"))
+    await asyncio.sleep(0.5)  # the worker exits now, and the records wait for the restarted one
+    self.assertEqual([await self.answer(r) for r in records], [None, None])
+    self.assertEqual(await self.sent(), {"sends": 0, "failed": 0})
+    self.serve(ScriptedSampler(unloadable=True))
+    await until(lambda: all_answered(self, records))
+    self.assertEqual(await self.sent(), {"sends": 2, "failed": 2})
+
+  async def test_samples_answered_before_the_engine_died_are_sent_once_as_is_the_one_it_failed(self) -> None:
+    engine = FakeEngine(poison=[6, 6, 6])
+    self.serve(Sampler(engine, "base"))
+    answered = [await self.accepted([1]), await self.accepted([2])]
+    await until(lambda: all_answered(self, answered))
+    poison = await self.accepted([6, 6, 6])
+    await until(lambda: self.answer(poison))
+    self.assertEqual([await self.answer(r) for r in [*answered, poison]], ["sample", "sample", "RequestFailedResponse"])
+    self.assertTrue(engine.errored)
+    self.assertEqual(await self.sent(), {"sends": 3, "failed": 1})
+
+
+async def all_answered(test: SampleRecordTest, records: list[dict]) -> bool:
+  return all([await test.answer(r) for r in records])
 
 
 if __name__ == "__main__":

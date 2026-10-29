@@ -5,7 +5,8 @@ nothing, so telemetry never blocks or changes what it observes. One thread write
 every FLUSH_SECONDS, with a worker's record of itself, so a failing or hanging Redis costs a flush and nothing more.
 
   open_rl:operations:<run>          trainer op records, each stamped with the run's step, the newest SAMPLE_LIMIT
-  open_rl:operations:<run>:samples  the trainer's sample op records, kept apart so sampling never evicts training ops
+  open_rl:operations:<run>:samples  sample records, kept apart so sampling never evicts training ops: per flush, one for
+                                    the samples of the run its clients got, with their count, and one per failed sample
   open_rl:steps:<run>               the run's optimizer steps, and open_rl:step_times:<run> when its last STEP_TIMES ended
   open_rl:ledger:<run>              a hash counting the run's trainer requests enqueued, popped, answered and failed
   open_rl:worker:<id>               a worker process's phase, GPU turns and the waits for them, outstanding requests and
@@ -46,6 +47,7 @@ CONFIG_ENV = ("OPEN_RL_", "OPENRL_", "VLLM_", "NCCL_", "CUDA_", "PYTORCH_", "TOR
 #   ("op", run, record)      a trainer op record, whose step counts this process's steps until a flush adds the run's
 #                            count before them
 #   ("sample", run, record)  a sample record
+#   ("sampled", run, runtime, started_at, at)  one sample a client got
 #   ("step", run, at)        an optimizer step that ended at `at`
 #   ("count", run, event)    one more of the run's trainer requests reached event
 # While flushes fail the oldest go.
@@ -115,10 +117,11 @@ def append(writes: Writes, list_key: str, item, limit: int) -> None:
   writes.appends.setdefault(list_key, ([], limit))[0].append(json.dumps(item))
 
 
-def plan(entries: Iterable[tuple], step_starts: dict[str, int], pod: dict[str, str]) -> Writes:
+def plan(entries: Iterable[tuple], step_starts: dict[str, int], pod: dict[str, str], role: str) -> Writes:
   """The writes for buffered entries. step_starts holds each trainer op's run's step count before this process's
-  first step, and pod is this process's pod, which every record names."""
-  writes = Writes()
+  first step, and pod and role are this process's, which every record names. The samples a run's clients got make
+  one record, so its sampling is visible without a record per sample."""
+  writes, groups = Writes(), {}
   for kind, run, *rest in entries:
     if kind == "op":
       record = rest[0] | pod
@@ -126,11 +129,18 @@ def plan(entries: Iterable[tuple], step_starts: dict[str, int], pod: dict[str, s
       append(writes, key("operations", run), record, SAMPLE_LIMIT)
     elif kind == "sample":
       append(writes, key("operations", run, "samples"), rest[0] | pod, SAMPLE_LIMIT)
+    elif kind == "sampled":
+      runtime, started_at, at = rest
+      if (group := groups.get(run)) is None:
+        group = groups[run] = op_record("sample", run, None, runtime, role, started_at, None) | {"at": at, "count": 0}
+      group.update(started_at=min(group["started_at"], started_at), at=max(group["at"], at), count=group["count"] + 1)
     elif kind == "step":
       writes.counts[key("steps", run)] += 1
       append(writes, key("step_times", run), rest[0], STEP_TIMES)
     elif kind == "count":
       writes.fields.setdefault(key("ledger", run), Counter())[rest[0]] += 1
+  for run, group in groups.items():
+    append(writes, key("operations", run, "samples"), group | {"elapsed_seconds": group["at"] - group["started_at"]} | pod, SAMPLE_LIMIT)
   return writes
 
 
@@ -138,8 +148,8 @@ class Recorder:
   """This process's writer: a thread that drains the buffer into one pipeline every FLUSH_SECONDS, with the worker's
   record, and once more when stopped. It is the only thread that writes, so a flush never overlaps another."""
 
-  def __init__(self, worker: Worker | None) -> None:
-    self.worker, self.pod = worker, identity()
+  def __init__(self, role: str, worker: Worker | None) -> None:
+    self.role, self.worker, self.pod = role, worker, identity()
     # Each run's steps done in this process, counted on the event loop as its ops finish.
     self.steps_done: Counter[str] = Counter()
     # Each run's step count before this process's first step, read on this thread before its first op is written.
@@ -164,7 +174,7 @@ class Recorder:
       # This process's steps for a run land with or after its first op, so the count read here precedes them.
       for run in {entry[1] for entry in entries if entry[0] == "op"} - self.step_starts.keys():
         self.step_starts[run] = int(store.get_value_sync(key("steps", run)) or 0)
-      writes = plan(entries, self.step_starts, self.pod)
+      writes = plan(entries, self.step_starts, self.pod, self.role)
       if self.worker is not None:
         writes.values[key("worker", self.worker.record["id"])] = self.worker.snapshot()
       store.write_sync(writes, TTL_SECONDS)
@@ -189,7 +199,7 @@ def start(role: str, runtime_id: str | None = None, *, worker_record: bool = Tru
   if recorder is not None or os.getenv("RANK", "0") != "0":
     return
   with suppress(Exception):
-    started = Recorder(Worker(role, runtime_id) if worker_record else None)
+    started = Recorder(role, Worker(role, runtime_id) if worker_record else None)
     started.thread.start()
     recorder = started
 
@@ -270,7 +280,7 @@ def answered(request_id: str, result: dict) -> None:
     return
   add("count", entry.run_id, "answered")
   if not entry.observed and result.get("type") == FAILED:
-    keep_op(op_record(entry.op, entry.run_id, request_id, w.record["runtime_id"], entry.since, FAILED))
+    keep_op(op_record(entry.op, entry.run_id, request_id, w.record["runtime_id"], "trainer", entry.since, FAILED))
 
 
 # Trainer op records
@@ -285,7 +295,7 @@ def nonfinite(names: Iterable[str]) -> None:
     found.update(names)
 
 
-def op_record(op: str, run_id: str, request_id: str | None, runtime_id: str | None, started_at: float, error_type: str | None) -> dict:
+def op_record(op: str, run_id: str, request_id: str | None, runtime_id: str | None, role: str, started_at: float, error_type: str | None) -> dict:
   now = time.time()
   return {
     "at": now,
@@ -294,7 +304,7 @@ def op_record(op: str, run_id: str, request_id: str | None, runtime_id: str | No
     "request_id": request_id,
     "run_id": run_id,
     "runtime_id": runtime_id,
-    "role": "trainer",
+    "role": role,
     "status": "failed" if error_type else "succeeded",
     "error_type": error_type,
     "elapsed_seconds": now - started_at,
@@ -326,7 +336,7 @@ def op_finished(command: Command, runtime_id: str | None, started_at: float, fou
   if error_type is None and result.get("type") == FAILED:
     error_type = FAILED
   op = "forward" if getattr(command, "forward_only", False) else command.op  # an eval loss must not mix with training losses
-  record = op_record(op, command.model_id, command.request_id, runtime_id, started_at, error_type)
+  record = op_record(op, command.model_id, command.request_id, runtime_id, "trainer", started_at, error_type)
   numbers = {k: float(v) for k, v in (result.get("metrics") or {}).items() if isinstance(v, Real) and not isinstance(v, bool)}
   found = found | {k for k, v in numbers.items() if not math.isfinite(v)}
   record["metrics"] = {k: v for k, v in numbers.items() if k not in found}
@@ -357,3 +367,18 @@ async def observe_operation(command: Command, runtime_id: str | None, call: Call
 def mark_observed(request_id: str) -> None:
   if (w := worker()) is not None and (entry := w.outstanding.get(request_id)) is not None:
     entry.observed = True
+
+
+# Sample records
+
+
+@best_effort
+def sample_answered(run_id: str, pool: str, request_id: str, result: dict, started_at: float) -> None:
+  """A client got its sampling request's result. A failure keeps its own record; a success counts toward the run's next
+  group record."""
+  if recorder is None:
+    return
+  if result.get("type") == FAILED:
+    add("sample", run_id, op_record("sample", run_id, request_id, pool, recorder.role, started_at, FAILED))
+  else:
+    add("sampled", run_id, pool, started_at, time.time())
