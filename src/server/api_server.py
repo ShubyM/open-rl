@@ -228,10 +228,10 @@ class Settings(BaseModel):
     description="What the job runs. rl starts the sampler together with the trainer, so its start-up overlaps the trainer's. "
     "sft or unset starts it at the first sample or save for sampling.",
   )
-  log_path: str | None = Field(
+  client_log_id: str | None = Field(
     default=None,
-    description="Where the client writes its files, such as the tinker-cookbook log_path, on a volume the server also mounts. "
-    "The inspection API serves <log_path>/logs.log when the server allows that path.",
+    description="The id on the client's log lines, as the label openrl_client=<id> in the server's log store. "
+    "The inspection API reads the run's client logs by it.",
   )
   # The rest apply to full fine-tuning only.
   weight_sync: Literal["delta", "full"] | None = Field(
@@ -533,7 +533,7 @@ async def _extract_and_persist_model_metadata(
     trainer_gpus=settings.trainer_gpus,
     trainer_cp=settings.trainer_cp,
     recipe=settings.recipe,
-    log_path=settings.log_path,
+    client_log_id=settings.client_log_id,
   )
   if meta_obj.sampler_replicas > 1 and meta_obj.shares_gpu():
     raise ValueError("openrl.sampler_replicas above 1 needs samplers on GPUs of their own; set openrl.exclusive=true")

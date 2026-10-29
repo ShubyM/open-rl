@@ -370,10 +370,10 @@ class FineTuningSettingsTest(ApiServerTest):
     self.assertEqual(meta["weight_sync_config"]["strategy"], "full")
     self.assertEqual(meta["full_config"], {"seed": None, "cpu_offload": False, "weight_sync_strategy": "full"})
 
-  def test_the_log_path_tag_lands_on_the_model(self) -> None:
-    session_id = self.post("create_session", {"tags": ["openrl.log_path=/mnt/runs/gsm8k"]}).json()["session_id"]
+  def test_the_client_log_id_tag_lands_on_the_model(self) -> None:
+    session_id = self.post("create_session", {"tags": ["openrl.client_log_id=gsm8k-7"]}).json()["session_id"]
     meta = self.metadata(self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"])
-    self.assertEqual(meta["log_path"], "/mnt/runs/gsm8k")
+    self.assertEqual(meta["client_log_id"], "gsm8k-7")
 
   def test_lora_is_the_default(self) -> None:
     meta = self.metadata(self.post("create_model", {"base_model": "m"}).json()["request_id"])

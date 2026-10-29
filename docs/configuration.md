@@ -126,44 +126,19 @@ for. On one machine every pool has one replica, in process. See
 ## Inspection API
 
 The API server serves a read-only inventory of runs at
-`/api/v1/inspect/inventory`. It reads runs and their live sessions from the
-same Redis as the rest of the server. It reads pods, nodes and `Workload`s from
-Kubernetes.
-
-Each run has a `lifecycle`. It is `ended`, `failed`, `waiting`, `placed` or
-`active`, from the run's `Workload`s. Without `Workload`s it is `active` while a
-client session is live. Each run also lists its `pods`, by name with a
-`problem` when one is not simply running, and the `nodes` they are on. Runs
-that share a runtime show its pods only while they are active. `cluster` lists
-the nodes with their GPUs and the pods with problems. A source that cannot be
-read adds a line to `errors`.
-
-`/api/v1/inspect/logs?run_id=<id>` returns a page of the run's worker logs,
-newest first, from the log store that `OPEN_RL_LOG_STORE` names. Without it,
-log reads are off. It reads only the pods in the worker namespace whose names
-start with the run's prefix, `orw-<kind>-<owner>-`. `pod` narrows it to one of
-them. `since` and `until` take ISO-8601 or Unix seconds, and `since` also takes
-a span such as `1h`. The window defaults to the last 30 minutes and is at most
-seven days. Pass `next_cursor` back as `cursor` for the next older page.
-Cloud Logging is the only store today. Other stores, such as Loki, plug in
-later as adapters. On a cluster outside GKE, logs need a shipper into a
-supported store.
-
-With `pod=client`, it reads `logs.log` from the directory that the run's
-`openrl.log_path` setting names. Whatever launches the client sets it, as a
-`TINKER_TAGS` entry or in `user_metadata`, to where the client writes its
-files, such as the `tinker-cookbook` `log_path` on a volume the server also
-mounts. The server reads the file only when its resolved path is under one of
-`OPEN_RL_CLIENT_LOG_ROOTS`.
+`/api/v1/inspect/inventory` and a run's logs at
+`/api/v1/inspect/logs?run_id=<id>`. See `/docs` for their fields.
 
 | Env var | Default | What it does |
 | --- | --- | --- |
-| `REDIS_URL` | unset | The Redis that holds model records and live sessions. Unset, the inventory has no runs. |
-| `OPEN_RL_WORKER_NAMESPACE` | `POD_NAMESPACE`, else `openrl-system` | The namespace whose pods, `Workload`s and logs it reads. |
-| `OPEN_RL_LOG_STORE` | unset | Where it reads worker logs. Unset turns log reads off. `cloud-logging` reads Cloud Logging with the server's Google application default credentials. |
-| `OPEN_RL_GKE_PROJECT`, `OPEN_RL_GKE_CLUSTER`, `OPEN_RL_GKE_LOCATION` | the GKE metadata server | With `cloud-logging`, the cluster whose logs it reads. Outside GKE, set all three. |
-| `OPEN_RL_LOG_VIEWS` | `projects/<project>` | With `cloud-logging`, comma-separated Cloud Logging resources to read, such as a log bucket view. |
-| `OPEN_RL_CLIENT_LOG_ROOTS` | unset | Comma-separated directories that a run's `openrl.log_path` must be under. Unset, it reads no client logs. |
+| `OPEN_RL_LOG_STORE` | unset | Where it reads logs. Unset turns log reads off. `cloud-logging` reads Cloud Logging in the project of the server's Google credentials. `cloud-logging:<resource>` reads that Cloud Logging resource instead, such as `projects/<project>/locations/global/buckets/<bucket>/views/<view>`. |
+
+To read a run's client logs with `pod=client`, set the session tag
+`openrl.client_log_id=<id>`. Ship the client's logs to the same store with the
+label `openrl_client=<id>`. For a client pod, that is a pod label.
+
+A bucket view only shows client logs when that bucket's sink routes them in, so
+plain `cloud-logging` is the simplest choice when clients run outside the cluster.
 
 ### Metrics and logs on GKE
 

@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import os
-import tempfile
 import unittest
 from unittest import mock
 
@@ -91,83 +90,80 @@ class JoinTest(unittest.TestCase):
     self.assertTrue(finished["shared_runtime"] and active["shared_runtime"])
 
 
-GKE = {"OPEN_RL_GKE_PROJECT": "p", "OPEN_RL_GKE_CLUSTER": "c", "OPEN_RL_GKE_LOCATION": "l", "OPEN_RL_WORKER_NAMESPACE": "ns"}
-
-
 class LogsTest(ApiTest):
-  def test_logs_read_only_the_runs_pods_and_page_with_the_stores_cursor(self):
-    sent = []
+  def setUp(self):
+    super().setUp()
+    self.sent = []
 
     async def send(method: str, url: str, json: dict, headers: dict) -> httpx.Response:
-      sent.append(json)
+      self.sent.append(json)
       entry = {"textPayload": "INFO loading", "resource": {"labels": {"pod_name": "orw-fft-r1-trainer"}}}
       page = {"entries": [entry], "nextPageToken": "t2"} if "pageToken" not in json else {"entries": []}
       return httpx.Response(200, json=page, request=httpx.Request(method, url))
 
-    self.enterContext(mock.patch.dict(os.environ, GKE | {"OPEN_RL_LOG_STORE": "cloud-logging"}))
+    self.enterContext(mock.patch.dict(os.environ, {"OPEN_RL_WORKER_NAMESPACE": "ns", "OPEN_RL_LOG_STORE": "cloud-logging"}))
     self.enterContext(mock.patch.object(cloud_logging, "send", send))
-    self.enterContext(mock.patch.object(cloud_logging, "gcp_headers", mock.AsyncMock(return_value={})))
+    self.enterContext(mock.patch.object(cloud_logging, "credentials", None))
+    self.enterContext(mock.patch.object(cloud_logging, "project", None))
+    self.google_auth = self.enterContext(mock.patch("google.auth.default", return_value=(mock.Mock(valid=True, token="t"), "p")))
+
+  def test_logs_read_only_the_runs_pods_and_page_with_the_stores_cursor(self):
     window = "since=2026-10-01T00:00:00Z&until=2026-10-01T01:00:00Z"
     first = self.get(f"/api/v1/inspect/logs?run_id=r1&pod=orw-fft-r1-trainer&{window}", **{"model_meta:r1": meta(fine_tuning_type="full")})
     second = self.get(f"/api/v1/inspect/logs?run_id=r1&pod=orw-fft-r1-trainer&{window}&cursor=t2")
 
     self.assertEqual([(r["pod"], r["message"]) for r in first["records"]], [("orw-fft-r1-trainer", "INFO loading")])
     self.assertEqual((first["next_cursor"], second["records"], second["next_cursor"]), ("t2", [], None))
-    self.assertEqual([s.get("pageToken") for s in sent], [None, "t2"])
-    clauses = sent[0]["filter"].split(" AND ")
+    self.assertEqual([s.get("pageToken") for s in self.sent], [None, "t2"])
+    self.assertEqual(self.sent[0]["resourceNames"], ["projects/p"])
+    clauses = self.sent[0]["filter"].split(" AND ")
     self.assertIn('resource.labels.namespace_name="ns"', clauses)
     self.assertIn('resource.labels.pod_name=~"^orw-fft-r1-"', clauses)
     self.assertIn('resource.labels.pod_name="orw-fft-r1-trainer"', clauses)
-    self.assertNotIn("owner", sent[0]["filter"])
+    self.assertNotIn("owner", self.sent[0]["filter"])
+
+  def test_a_named_resource_is_read_instead_of_the_credentials_project(self):
+    self.google_auth.return_value = (mock.Mock(valid=True, token="t"), None)
+    meta_r1 = {"model_meta:r1": meta()}
+    default = self.get("/api/v1/inspect/logs?run_id=r1", **meta_r1)
+    view = "projects/q/locations/global/buckets/b/views/v"
+    os.environ["OPEN_RL_LOG_STORE"] = f"cloud-logging:{view}"
+    named = self.get("/api/v1/inspect/logs?run_id=r1")
+
+    self.assertFalse(default["available"])
+    self.assertIn("The Google credentials name no project", default["error"])
+    self.assertTrue(named["available"])
+    self.assertEqual([s["resourceNames"] for s in self.sent], [[view]])
 
   def test_logs_stay_off_without_a_known_log_store(self):
-    self.enterContext(mock.patch.dict(os.environ, GKE | {"KUBERNETES_SERVICE_HOST": "10.0.0.1"}))
-    os.environ.pop("OPEN_RL_LOG_STORE", None)
-    network = self.enterContext(mock.patch.object(httpx.AsyncClient, "send", side_effect=AssertionError("no log read")))
-
+    os.environ.pop("OPEN_RL_LOG_STORE")
     unset = self.get("/api/v1/inspect/logs?run_id=r1", **{"model_meta:r1": meta()})
     os.environ["OPEN_RL_LOG_STORE"] = "splunk"
     unknown = self.get("/api/v1/inspect/logs?run_id=r1")
 
     self.assertEqual((unset["available"], unset["error"]), (False, "No log store configured. Set OPEN_RL_LOG_STORE; see docs/configuration.md."))
     self.assertEqual((unknown["available"], unknown["error"]), (False, "Unknown OPEN_RL_LOG_STORE 'splunk'; supported: cloud-logging"))
-    network.assert_not_called()
+    self.assertEqual(self.sent, [])
 
-  def test_the_client_log_is_read_from_its_declared_path_and_paged_newest_first(self):
-    root = os.path.realpath(self.enterContext(tempfile.TemporaryDirectory()))
-    run_dir = os.path.join(root, "runs", "fft_gsm8k_rl")
-    os.makedirs(run_dir)
-    with open(os.path.join(run_dir, "logs.log"), "w") as f:
-      f.write("train:10 [INFO] step 1\ntrain:20 [ERROR] step 2 failed\nTraceback (most recent call last)\n")
-    self.enterContext(mock.patch.dict(os.environ, {"OPEN_RL_CLIENT_LOG_ROOTS": f"/nonexistent, {root}"}))
+  def test_client_logs_are_the_lines_labelled_with_its_id(self):
+    window = "since=2026-10-01T00:00:00Z&until=2026-10-01T01:00:00Z"
+    body = self.get(f"/api/v1/inspect/logs?run_id=r1&pod=client&{window}", **{"model_meta:r1": meta(client_log_id="c1")})
 
-    newest = self.get("/api/v1/inspect/logs?run_id=r1&pod=client&limit=1", **{"model_meta:r1": meta(log_path=run_dir)})
-    older = self.get(f"/api/v1/inspect/logs?run_id=r1&pod=client&limit=1&cursor={newest['next_cursor']}")
+    self.assertTrue(body["available"])
+    self.assertEqual(
+      self.sent[0]["filter"].split(" AND "),
+      [
+        '(labels."k8s-pod/openrl_client"="c1" OR labels."openrl_client"="c1")',
+        'timestamp>="2026-10-01T00:00:00.000000+00:00"',
+        'timestamp<="2026-10-01T01:00:00.000000+00:00"',
+      ],
+    )
 
-    self.assertEqual(newest["source"], os.path.join(run_dir, "logs.log"))
-    self.assertEqual([r["message"] for r in newest["records"]], ["train:20 [ERROR] step 2 failed\nTraceback (most recent call last)"])
-    self.assertEqual(([r["message"] for r in older["records"]], older["next_cursor"]), (["train:10 [INFO] step 1"], None))
+  def test_a_run_without_a_client_log_id_has_no_client_logs(self):
+    body = self.get("/api/v1/inspect/logs?run_id=r1&pod=client", **{"model_meta:r1": meta()})
 
-  def test_a_client_log_outside_the_roots_is_refused(self):
-    base = os.path.realpath(self.enterContext(tempfile.TemporaryDirectory()))
-    root, outside = os.path.join(base, "root"), os.path.join(base, "outside")
-    os.makedirs(root), os.makedirs(outside)
-    with open(os.path.join(outside, "logs.log"), "w") as f:
-      f.write("train:10 [INFO] secret\n")
-    os.symlink(outside, os.path.join(root, "link"))
-    self.enterContext(mock.patch.dict(os.environ, {"OPEN_RL_CLIENT_LOG_ROOTS": root}))
-    cases = {
-      "undeclared": (None, "This run declared no openrl.log_path"),
-      "dotdot": (os.path.join(root, "..", "outside"), "is not under OPEN_RL_CLIENT_LOG_ROOTS"),
-      "symlink": (os.path.join(root, "link"), "is not under OPEN_RL_CLIENT_LOG_ROOTS"),
-    }
-    for run_id, (log_path, error) in cases.items():
-      body = self.get(f"/api/v1/inspect/logs?run_id={run_id}&pod=client", **{f"model_meta:{run_id}": meta(log_path=log_path)})
-      self.assertEqual((body["available"], body["records"]), (False, []), run_id)
-      self.assertIn(error, body["error"], run_id)
-    os.environ["OPEN_RL_CLIENT_LOG_ROOTS"] = ""
-    body = self.get("/api/v1/inspect/logs?run_id=r1&pod=client", **{"model_meta:r1": meta(log_path=os.path.join(root, "run"))})
-    self.assertIn("Set OPEN_RL_CLIENT_LOG_ROOTS", body["error"])
+    self.assertEqual((body["available"], body["error"]), (False, "This run set no openrl.client_log_id; see docs/configuration.md."))
+    self.assertEqual(self.sent, [])
 
 
 if __name__ == "__main__":
