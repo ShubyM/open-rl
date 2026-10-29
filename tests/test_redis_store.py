@@ -151,6 +151,15 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(await self.state.set_members("s"), {"b"})
     self.assertEqual(await self.state.set_members("missing"), set())
 
+  async def test_scan_values_returns_live_values_under_a_prefix(self) -> None:
+    await self.state.set_value("open_rl:model_meta:a", "1")
+    await self.state.set_value("open_rl:model_meta:b", "2")
+    await self.state.set_value("open_rl:model_meta:gone", "3", ttl_seconds=0.2)
+    await self.state.set_value("open_rl:session:a", "4")
+    await asyncio.sleep(0.5)
+    self.assertEqual(await self.state.scan_values("open_rl:model_meta:"), {"open_rl:model_meta:a": "1", "open_rl:model_meta:b": "2"})
+    self.assertEqual(await self.state.scan_values("open_rl:missing:"), {})
+
 
 class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
@@ -202,6 +211,15 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
     await self.state.remove_from_set("s", "a")
     self.assertEqual(await self.state.set_members("s"), {"b"})
     self.assertEqual(await self.state.set_members("missing"), set())
+
+  async def test_scan_values_returns_live_values_under_a_prefix(self) -> None:
+    await self.state.set_value("open_rl:model_meta:a", "1")
+    await self.state.set_value("open_rl:model_meta:b", "2")
+    await self.state.set_value("open_rl:model_meta:gone", "3", ttl_seconds=0.2)
+    await self.state.set_value("open_rl:session:a", "4")
+    await asyncio.sleep(0.5)
+    self.assertEqual(await self.state.scan_values("open_rl:model_meta:"), {"open_rl:model_meta:a": "1", "open_rl:model_meta:b": "2"})
+    self.assertEqual(await self.state.scan_values("open_rl:missing:"), {})
 
 
 if __name__ == "__main__":
