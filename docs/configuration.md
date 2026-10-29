@@ -127,11 +127,36 @@ for. On one machine every pool has one replica, in process. See
 
 The API server serves a read-only inventory of runs at
 `/api/v1/inspect/inventory`. It reads runs and their live sessions from the
-same Redis as the rest of the server.
+same Redis as the rest of the server. It reads pods, nodes and `Workload`s from
+Kubernetes.
+
+Each run has a `lifecycle`. It is `ended`, `failed`, `waiting`, `placed` or
+`active`, from the run's `Workload`s. Without `Workload`s it is `active` while a
+client session is live. Each run also lists its `pods`, by name with a
+`problem` when one is not simply running, and the `nodes` they are on. Runs
+that share a runtime show its pods only while they are active. `cluster` lists
+the nodes with their GPUs and the pods with problems. A source that cannot be
+read adds a line to `errors`.
+
+`/api/v1/inspect/logs?run_id=<id>` returns a page of the run's worker logs from
+Cloud Logging, newest first, with the server's Google application default
+credentials. It reads only pods with the run's owner label.
+`pod` narrows it to one of them. `since` and `until` take ISO-8601 or Unix
+seconds, and `since` also takes a span such as `1h`. The window defaults to the
+last 30 minutes and is at most seven days. Pass `next_cursor` back as `cursor`
+for the next older page. With `pod=client`, it reads the client's `logs.log`
+from the run's client directory instead. That directory is the
+`tinker-cookbook` `log_path` on a volume the server mounts, up to five levels
+under `OPEN_RL_CLIENT_RUNS_ROOT`.
 
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `REDIS_URL` | unset | The Redis that holds model records and live sessions. Unset, the inventory has no runs. |
+| `OPEN_RL_WORKER_NAMESPACE` | `POD_NAMESPACE`, else `openrl-system` | The namespace whose pods, `Workload`s and logs it reads. |
+| `OPEN_RL_GKE_PROJECT`, `OPEN_RL_GKE_CLUSTER`, `OPEN_RL_GKE_LOCATION` | the GKE metadata server | The cluster whose logs it reads. Outside GKE, set all three to read logs. |
+| `OPEN_RL_GKE_TELEMETRY` | `auto` | `0` turns off log reads. |
+| `OPEN_RL_LOG_VIEWS` | `projects/<project>` | Comma-separated Cloud Logging resources to read, such as a log bucket view. |
+| `OPEN_RL_CLIENT_RUNS_ROOT` | `/mnt/shared` | Where it looks for client directories. |
 
 ### Metrics and logs on GKE
 
