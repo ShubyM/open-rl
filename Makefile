@@ -23,6 +23,7 @@ UNIT_TESTS ?= tests.test_session_lifecycle tests.test_proto_codec tests.test_for
 # Only forward BASE_URL to e2e when the user supplied it. The Makefile default
 # is for local CLI usage; e2e should start its own backend by default.
 TRAINING_TEST_BASE_URL ?= $(if $(filter environment command line,$(origin BASE_URL)),$(BASE_URL),)
+UNIT_TESTS += tests.test_dashboard_kubernetes
 TRAINING_TEST_EXTRA ?= gpu
 TRAINING_TEST_ARGS ?=
 PIGLATIN_TEST_PYTHONPATH ?= examples/sft/pig-latin
