@@ -568,6 +568,7 @@ async def enqueue(command: Command) -> str:
   carrier = await open_future(command.request_id)
 
   active_set_id = await _resolve_active_set_id(command.model_id)
+  carrier[commands.ENQUEUED_AT_KEY] = str(time.time())
   await store.put_request(commands.wire(command.model_copy(update={"trace_context": carrier})), active_set_id=active_set_id)
   run_records.enqueued(command.model_id)
   # One line per training request so a request that never reaches a worker can

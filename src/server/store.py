@@ -303,6 +303,11 @@ class StateStore(ABC):
     """Apply writes in one round trip, without the event loop, for a thread."""
     pass
 
+  @abstractmethod
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    """The JSON items of a list write_sync appends to, oldest first."""
+    pass
+
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
@@ -364,6 +369,9 @@ class InMemoryStateStore(StateStore):
       self.kv_store[key] = value
       self.expiries[key] = time.monotonic() + ttl_seconds
 
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    return [json.loads(item) for item in self.lists.get(key, [])]
+
 
 class RedisStateStore(StateStore):
   def __init__(self, client: redis.Redis, sync_client: sync_redis.Redis):
@@ -416,6 +424,11 @@ class RedisStateStore(StateStore):
     for key, value in writes.values.items():
       pipe.set(key, value, ex=ttl)
     pipe.execute()
+
+  async def read_samples(self, key: str) -> list[dict[str, Any]]:
+    raw = await self.redis.lrange(key, 0, -1)
+    # Decoded off the event loop, since a list holds up to thousands of records.
+    return await asyncio.to_thread(lambda: [json.loads(item) for item in raw])
 
 
 @cache

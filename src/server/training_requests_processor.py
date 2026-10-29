@@ -22,7 +22,7 @@ from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
 from server.sampling_store import SamplingStore
 from server.store import RedisStore, RequestStore, StateStore, get_state_store, get_store
-from server.telemetry import answered, finish, gpu_turn, popped, serving, set_phase
+from server.telemetry import answered, finish, gpu_turn, observe_operation, popped, serving, set_phase
 from training import commands
 from training.commands import parse_command
 from training.distributed import broadcast_object, is_distributed, is_primary, local_rank
@@ -208,7 +208,7 @@ class TrainingRequestsProcessor:
     # Only rank 0 writes to the store; the other ranks computed the same result.
     if request_id is not None and is_primary():
       await self.store.set_result(request_id, result)
-      answered(request_id)
+      answered(request_id, result)
 
   async def run_once(self) -> None:
     batch = await self.next_batch()
@@ -306,7 +306,7 @@ class TrainingRequestsProcessor:
       ctx = propagate.extract(command.trace_context) if command.trace_context else None
       token = otel_context.attach(ctx) if ctx else None
 
-      result = await self.dispatch_operation(command)
+      result = await observe_operation(command, self.model_id, lambda: self.dispatch_operation(command))
       return request_id, result
     except Exception as exc:
       traceback.print_exc()

@@ -138,6 +138,12 @@ run's workers, it also saves each `Workload`'s last placement to the Redis list
 `open_rl:placements:<runtime>`. The list keeps the newest 200 records for seven
 days.
 
+Trainers record each op, the run's step count and its request counts in the
+API server's Redis, and each worker records its phase, GPU turns and settings.
+Records expire after 7 days. `/api/v1/inspect/runs/<id>/steps?last=&fields=`
+returns the run's ops grouped by step, with their counts, failures, time and
+metrics.
+
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `OPEN_RL_LOG_STORE` | unset | Where it reads logs. Unset turns log reads off. `cloud-logging` reads Cloud Logging in the project of the server's Google credentials. `cloud-logging:<resource>` reads that Cloud Logging resource instead, such as `projects/<project>/locations/global/buckets/<bucket>/views/<view>`. |
