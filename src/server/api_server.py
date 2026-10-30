@@ -27,7 +27,6 @@ from pydantic import AfterValidator, AliasChoices, BaseModel, BeforeValidator, C
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server import openrl_status, proto_codec
-from server.dashboard.router import router
 from server.lora_snapshots import snapshot_name, snapshot_root
 from server.model_metadata import (
   TrainingModelMetadata,
@@ -36,6 +35,7 @@ from server.model_metadata import (
   persist_model_metadata,
   pool_name,
 )
+from server.observability.router import router
 from server.sampling_dispatcher import SAMPLE_DEADLINE_SECONDS
 from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
@@ -227,6 +227,11 @@ class Settings(BaseModel):
     default=None,
     description="What the job runs. rl starts the sampler together with the trainer, so its start-up overlaps the trainer's. "
     "sft or unset starts it at the first sample or save for sampling.",
+  )
+  client_log_id: str | None = Field(
+    default=None,
+    description="The id on the client's log lines, as the label openrl_client=<id> in the server's log store. "
+    "The inspection API reads the run's client logs by it.",
   )
   # The rest apply to full fine-tuning only.
   weight_sync: Literal["delta", "full"] | None = Field(
@@ -528,6 +533,7 @@ async def _extract_and_persist_model_metadata(
     trainer_gpus=settings.trainer_gpus,
     trainer_cp=settings.trainer_cp,
     recipe=settings.recipe,
+    client_log_id=settings.client_log_id,
   )
   if meta_obj.sampler_replicas > 1 and meta_obj.shares_gpu():
     raise ValueError("openrl.sampler_replicas above 1 needs samplers on GPUs of their own; set openrl.exclusive=true")

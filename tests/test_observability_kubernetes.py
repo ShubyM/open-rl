@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest import mock
 
-from server.dashboard.kubernetes import gpu_capacity, kubernetes, problem
+from server.observability.kubernetes import gpu_capacity, kubernetes, problem
 
 
 class NodeTest(unittest.TestCase):
@@ -29,7 +29,7 @@ class ProblemTest(unittest.TestCase):
 
 class KubernetesTest(unittest.TestCase):
   def test_a_cluster_without_a_client_is_reported_as_unavailable(self):
-    with mock.patch("server.dashboard.kubernetes.kubernetes_api", side_effect=RuntimeError("no kubeconfig")):
+    with mock.patch("server.observability.kubernetes.kubernetes_api", side_effect=RuntimeError("no kubeconfig")):
       cluster = asyncio.run(kubernetes())
 
     self.assertFalse(cluster["available"])

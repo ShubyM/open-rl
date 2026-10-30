@@ -126,12 +126,19 @@ for. On one machine every pool has one replica, in process. See
 ## Inspection API
 
 The API server serves a read-only inventory of runs at
-`/api/v1/inspect/inventory`. It reads runs and their live sessions from the
-same Redis as the rest of the server.
+`/api/v1/inspect/inventory` and a run's logs at
+`/api/v1/inspect/logs?run_id=<id>`. See `/docs` for their fields.
 
 | Env var | Default | What it does |
 | --- | --- | --- |
-| `REDIS_URL` | unset | The Redis that holds model records and live sessions. Unset, the inventory has no runs. |
+| `OPEN_RL_LOG_STORE` | unset | Where it reads logs. Unset turns log reads off. `cloud-logging` reads Cloud Logging in the project of the server's Google credentials. `cloud-logging:<resource>` reads that Cloud Logging resource instead, such as `projects/<project>/locations/global/buckets/<bucket>/views/<view>`. |
+
+To read a run's client logs with `pod=client`, set the session tag
+`openrl.client_log_id=<id>`. Ship the client's logs to the same store with the
+label `openrl_client=<id>`. For a client pod, that is a pod label.
+
+A bucket view only shows client logs when that bucket's sink routes them in, so
+plain `cloud-logging` is the simplest choice when clients run outside the cluster.
 
 ### Metrics and logs on GKE
 
