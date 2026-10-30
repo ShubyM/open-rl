@@ -12,6 +12,7 @@ from server.store import get_state_store
 from server.worker_manager import FAILED, STOPPED, WAITING_FOR_PLACEMENT, owner_id
 
 CACHE_SECONDS, STALE_SECONDS = 5, 60
+PLACEMENT_FIELDS = ("name", "role", "node", "pod", "gpu_uuids", "placed_at", "released_at", "training_kind")
 Lifecycle = Literal["ended", "failed", "waiting", "placed", "active"]
 
 
@@ -80,13 +81,17 @@ def join(run_id: str, raw: str, live: set[str], cluster: Cluster) -> dict:
   return run | {"pods": [{"name": p["name"], "problem": p["problem"]} for p in pods]}
 
 
+def redis_failed(exc: Exception) -> str:
+  return f"Redis read failed: {f'no reply in {READ_TIMEOUT_SECONDS} s' if isinstance(exc, TimeoutError) else exc}"
+
+
 async def read() -> dict:
   store, observed_at = get_state_store(), datetime.now(UTC).isoformat(timespec="seconds")
   scans = [asyncio.wait_for(store.scan_values(prefix), READ_TIMEOUT_SECONDS) for prefix in ("open_rl:model_meta:", "open_rl:session:")]
   cluster, (metas, sessions) = await asyncio.gather(kubernetes(), asyncio.gather(*scans, return_exceptions=True))
   errors, runs = cluster["errors"], []
   if failed := next((r for r in (metas, sessions) if isinstance(r, Exception)), None):
-    errors.append(f"Redis read failed: {f'no reply in {READ_TIMEOUT_SECONDS} s' if isinstance(failed, TimeoutError) else failed}")
+    errors.append(redis_failed(failed))
     metas, sessions = {}, {}
   live = {name.removeprefix("open_rl:session:") for name in sessions}
   for name, raw in metas.items():
@@ -120,3 +125,79 @@ def placements(workloads: list[dict] | None, metas: dict[str, str]) -> list[dict
     for w in workloads or []
     if w["holds_gpus"]
   ]
+
+
+async def holdings() -> dict:
+  return await cached("holdings", CACHE_SECONDS, read_holdings)
+
+
+async def read_holdings() -> dict:
+  """Every placement known: live ones from Workload status, released ones from open_rl:placements:<runtime>; and the runs
+  that could have used them."""
+  now = time.time()
+  history = asyncio.ensure_future(asyncio.wait_for(read_history(), READ_TIMEOUT_SECONDS))
+  cluster = await kubernetes()
+  live = [{f: w[f] for f in PLACEMENT_FIELDS} | {"runtime": w["model_id"]} for w in cluster["workloads"] or [] if w["holds_gpus"]]
+  try:
+    runs, released, errors = await history
+  except Exception as exc:
+    runs, released, errors = [], [], [redis_failed(exc)]
+  return {"observed_at": now, "runs": runs, "placements": live + released, "errors": cluster["errors"] + errors}
+
+
+async def read_history() -> tuple[list[dict], list[dict], list[str]]:
+  """From Redis: the runs, the placements their runtimes released, and an error per unreadable history."""
+  store, runs, released, errors = get_state_store(), [], [], []
+  for name, raw in (await store.scan_values("open_rl:model_meta:")).items():
+    try:
+      meta, run_id = decode_model_metadata(raw), name.removeprefix("open_rl:model_meta:")
+    except Exception:
+      continue  # the inventory reports it
+    kind = "lora" if meta.fine_tuning_type == "lora" else "fft"
+    runs.append({"run_id": run_id, "runtime": meta.runtime(run_id), "kind": kind, "created_at": meta.created_at, "completed_at": meta.completed_at})
+  runtimes = sorted({r["runtime"] for r in runs})
+  for runtime, records in zip(runtimes, await asyncio.gather(*(store.recent(f"open_rl:placements:{r}") for r in runtimes))):
+    try:
+      released += [{f: record[f] for f in PLACEMENT_FIELDS} | {"runtime": runtime} for record in map(json.loads, records)]
+    except (ValueError, KeyError) as exc:
+      errors.append(f"placement history of {runtime} unreadable: {exc!r}")
+  return runs, released, errors
+
+
+def lanes(held: dict, low: float, high: float, run_id: str | None = None, node_id: str | None = None) -> list[dict]:
+  """One lane per Workload and the GPUs it held in [low, high]: the intervals it held them, clipped to the window, and the
+  runs on its runtime that lived then. Lanes that held one GPU at overlapping times are shared_gpu."""
+  now, found = held["observed_at"], {}
+  for p in held["placements"]:
+    start, end = p["placed_at"], p["released_at"] or now
+    if start >= high or end <= low:
+      continue
+    fresh = {k: p[k] for k in ("name", "role", "node", "pod", "gpu_uuids")} | {"run_ids": set(), "intervals": [], "ended": True}
+    lane = found.setdefault((p["name"], p["node"], tuple(p["gpu_uuids"])), fresh)
+    lane["run_ids"].update(
+      r["run_id"]
+      for r in held["runs"]
+      if (r["runtime"], r["kind"]) == (p["runtime"], p["training_kind"]) and r["created_at"] <= end and (r["completed_at"] or now) >= start
+    )
+    lane["intervals"].append([max(low, start), min(high, end)])
+    lane["ended"] &= p["released_at"] is not None
+  result = [lane | {"run_ids": sorted(lane["run_ids"]), "intervals": merge(lane["intervals"])} for lane in found.values()]
+  for lane in result:
+    lane["shared_gpu"] = any(
+      other is not lane and set(lane["gpu_uuids"]) & set(other["gpu_uuids"]) and overlap(lane["intervals"], other["intervals"]) for other in result
+    )
+  return [lane for lane in result if (not run_id or run_id in lane["run_ids"]) and (not node_id or lane["node"] == node_id)]
+
+
+def merge(spans: list[list[float]]) -> list[list[float]]:
+  merged: list[list[float]] = []
+  for start, end in sorted(spans):
+    if merged and start <= merged[-1][1]:
+      merged[-1][1] = max(end, merged[-1][1])
+    else:
+      merged.append([start, end])
+  return merged
+
+
+def overlap(a: list[list[float]], b: list[list[float]]) -> bool:
+  return any(a0 < b1 and b0 < a1 for a0, a1 in a for b0, b1 in b)

@@ -1,11 +1,12 @@
 import os
-from typing import Annotated
+from datetime import datetime
+from typing import Annotated, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 
 from server.model_metadata import decode_model_metadata
-from server.observability import cloud_logging, fleet
+from server.observability import cloud_logging, fleet, metrics
 from server.observability.kubernetes import namespace
 from server.observability.log_selector import ClientLines, WorkerPods
 from server.store import get_state_store
@@ -28,6 +29,55 @@ async def inventory():
   return await fleet.snapshot()
 
 
+def bounds(since: str | None, until: str | None) -> tuple[str, str]:
+  try:
+    return cloud_logging.window(since, until)
+  except (ValueError, OverflowError, OSError) as exc:
+    raise HTTPException(400, "Use ISO-8601 or Unix-second since/until and a positive window of at most seven days") from exc
+
+
+def epoch(bound: str) -> float:
+  return datetime.fromisoformat(bound).timestamp()
+
+
+@router.get("/api/v1/inspect/activity")
+async def activity(since: Bound = None, until: Bound = None, run_id: str | None = None, node_id: str | None = None):
+  """One lane per Workload that held GPUs in the window, a run's or a node's: its role, node, pod, GPU UUIDs, the runs on
+  its runtime that lived then, the intervals it held them in Unix seconds clipped to the window, and whether it let go.
+  shared_gpu means another lane held one of its GPUs at an overlapping time, so its GPUs' metrics are not its own."""
+  since, until = bounds(since, until)
+  held = await fleet.holdings()
+  return {"since": since, "until": until, "errors": held["errors"], "lanes": fleet.lanes(held, epoch(since), epoch(until), run_id, node_id)}
+
+
+@router.get("/api/v1/inspect/query")
+async def query(
+  name: Literal[tuple(metrics.QUERIES)],
+  run_id: str | None = None,
+  node_id: str | None = None,
+  since: Bound = None,
+  until: Bound = None,
+  points: int = Query(300, ge=1, le=1000),
+):
+  """A named DCGM query over the GPUs a run's or a node's placements held in the window, from OPEN_RL_PROMETHEUS_URL:
+  series of [Unix seconds, value] `step` seconds apart. points=1 evaluates once over the whole window. metric is the DCGM
+  metric that answered; gpu_busy falls back to DCGM_FI_DEV_GPU_UTIL where DCGM_FI_PROF_GR_ENGINE_ACTIVE has no data."""
+  since, until = bounds(since, until)
+  result = {"name": name, "since": since, "until": until, "series": []}
+  if not os.getenv("OPEN_RL_PROMETHEUS_URL"):
+    return {**result, "available": False, "error": "No metrics source configured. Set OPEN_RL_PROMETHEUS_URL."}
+  low, high = epoch(since), epoch(until)
+  gpus = sorted({uuid for lane in fleet.lanes(await fleet.holdings(), low, high, run_id, node_id) for uuid in lane["gpu_uuids"]})
+  if not gpus:
+    return {**result, "available": True, "error": "No GPUs held by this run or node in this window"}
+  try:
+    return {**result, **await metrics.query(name, gpus, low, high, points), "available": True}
+  except httpx.HTTPStatusError as exc:
+    return {**result, "available": False, "error": f"The metrics source refused the query (HTTP {exc.response.status_code})"}
+  except Exception as exc:
+    return {**result, "available": False, "error": f"The metrics source is unavailable: {type(exc).__name__}"}
+
+
 @router.get("/api/v1/inspect/logs")
 async def logs(
   run_id: str,
@@ -40,10 +90,7 @@ async def logs(
   cursor: Annotated[str | None, Query(max_length=16384, description="next_cursor of a page with the same filters and window")] = None,
 ):
   """Newest first, from the OPEN_RL_LOG_STORE log store: the run's worker pods, or with pod=client its client's lines."""
-  try:
-    since, until = cloud_logging.window(since, until)
-  except (ValueError, OverflowError, OSError) as exc:
-    raise HTTPException(400, "Use ISO-8601 or Unix-second since/until and a positive window of at most seven days") from exc
+  since, until = bounds(since, until)
   if (raw := await get_state_store().get_value(f"open_rl:model_meta:{run_id}")) is None:
     raise HTTPException(404, f"No run {run_id}")
   meta = decode_model_metadata(raw)

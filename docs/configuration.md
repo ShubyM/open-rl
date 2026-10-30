@@ -127,7 +127,9 @@ for. On one machine every pool has one replica, in process. See
 
 The API server serves a read-only inventory of runs at
 `/api/v1/inspect/inventory` and a run's logs at
-`/api/v1/inspect/logs?run_id=<id>`. See `/docs` for their fields.
+`/api/v1/inspect/logs?run_id=<id>`. `/api/v1/inspect/activity` shows which
+`Workload`s held which GPUs in a time window, and `/api/v1/inspect/query` reads
+those GPUs' DCGM metrics. See `/docs` for their fields.
 
 `placements` lists the `Workload`s that hold GPUs now, from their status in
 Kubernetes. Each entry has the node, pod, GPU UUIDs, `placed_at` in Unix
@@ -139,6 +141,7 @@ days.
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `OPEN_RL_LOG_STORE` | unset | Where it reads logs. Unset turns log reads off. `cloud-logging` reads Cloud Logging in the project of the server's Google credentials. `cloud-logging:<resource>` reads that Cloud Logging resource instead, such as `projects/<project>/locations/global/buckets/<bucket>/views/<view>`. |
+| `OPEN_RL_PROMETHEUS_URL` | unset | A Prometheus-compatible query endpoint with the DCGM exporter's metrics, such as an in-cluster Managed Service for Prometheus frontend at `http://gmp-frontend:9090`. Unset turns metric reads off. |
 
 To read a run's client logs with `pod=client`, set the session tag
 `openrl.client_log_id=<id>`. Ship the client's logs to the same store with the
@@ -153,17 +156,20 @@ The `lora`, `fft` and `distributed-fft-timeslice` bundles ship an NVIDIA DCGM
 exporter (`k8s/deploy/dcgm`). GKE's managed DCGM exporter skips DRA node pools,
 so without it those nodes report no GPU metrics.
 
-The steps below are for the inspection API's metrics and logs reads. It reads
-Cloud Monitoring and Cloud Logging as the API server's Kubernetes
-ServiceAccount, `open-rl-sa`, through Workload Identity. Enable Workload
-Identity when you create the cluster (`--workload-pool=<project>.svc.id.goog`).
-Enabling it on an existing cluster replaces its nodes.
+The inspection API reads GPU metrics from the Prometheus-compatible endpoint in
+`OPEN_RL_PROMETHEUS_URL`, such as the in-cluster Managed Service for Prometheus
+frontend. It reads Cloud Logging as the API server's Kubernetes ServiceAccount,
+`open-rl-sa`, through Workload Identity. Enable Workload Identity when you
+create the cluster (`--workload-pool=<project>.svc.id.goog`). Enabling it on an
+existing cluster replaces its nodes.
 
 ```bash
 PRINCIPAL=principal://iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<project>.svc.id.goog/subject/ns/openrl-system/sa/open-rl-sa
-gcloud projects add-iam-policy-binding <project> --role=roles/monitoring.viewer --member="$PRINCIPAL"
 gcloud projects add-iam-policy-binding <project> --role=roles/logging.viewer --member="$PRINCIPAL"
 ```
+
+Grant `roles/monitoring.viewer` the same way only if `OPEN_RL_PROMETHEUS_URL`
+is Cloud Monitoring's own Prometheus API.
 
 `<number>` is the project number. If you read logs through a log bucket view,
 also grant `roles/logging.viewAccessor` on that view.
