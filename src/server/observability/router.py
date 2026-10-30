@@ -1,4 +1,6 @@
+import asyncio
 import os
+import time
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -6,7 +8,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 
 from server.model_metadata import decode_model_metadata
-from server.observability import cloud_logging, fleet, metrics
+from server.observability import cloud_logging, facts, fleet, metrics
 from server.observability.kubernetes import namespace
 from server.observability.log_selector import ClientLines, WorkerPods
 from server.observability.steps import steps
@@ -78,6 +80,48 @@ async def query(
     return {**result, "available": False, "error": f"The metrics source refused the query (HTTP {exc.response.status_code})"}
   except Exception as exc:
     return {**result, "available": False, "error": f"The metrics source is unavailable: {type(exc).__name__}"}
+
+
+@router.get("/api/v1/inspect/runs")
+async def runs(ended: bool = False):
+  """Every live run in one line, longest since its last op (a trainer op or a sample) first, so a stuck run is one read
+  away. ended=true adds ended runs, which show no since_last_op_s or since_last_step_s. failures counts failed trainer
+  requests, sample_failures failed samples, and sdk_errors the SDK's error events across the run's sessions."""
+  state, found, now = await fleet.snapshot(), await facts.workers(), time.time()
+  chosen = [r for r in state["runs"] if ended or r["lifecycle"] != "ended"]
+  limit = asyncio.Semaphore(64)  # each read in flight holds a store connection
+
+  async def line(run: dict) -> dict:
+    async with limit:
+      return {"run_id": run["run_id"], "name": run["name"], **await facts.line(run, facts.workers_of(found, run), now)}
+
+  lines = await asyncio.gather(*(line(r) for r in chosen))
+  return {"runs": sorted(lines, key=lambda r: -r.get("since_last_op_s", -1))}
+
+
+@router.get("/api/v1/inspect/runs/{run_id}/summary")
+async def run_summary(run_id: str):
+  """The run's facts, each block only when it has content: steps and pace; goodput, the share of the trainer's span spent
+  training, its idle seconds split into gpu_wait, queued, rollout (a sample group in flight) and client (the rest);
+  requests, with the ledger and unanswered requests with their holder; failures and relaunches with a logs read;
+  saves; optimizer; samplers; config mismatches; placement; incidents; sdk_errors. A run_id may name a session with one
+  run. In the ledger, lost = enqueued - popped - queued, shown once the gap has lasted over a flush across reads."""
+  state, found, now = await fleet.snapshot(), await facts.workers(), time.time()
+  chosen = [r for r in state["runs"] if r["run_id"] == run_id] or [r for r in state["runs"] if run_id in r["session_ids"]]
+  if len(chosen) != 1:
+    raise HTTPException(404 if not chosen else 409, f"No run {run_id}" if not chosen else f"Session {run_id} has {len(chosen)} runs")
+  run = chosen[0]
+  return {"run_id": run["run_id"], **await facts.summary(run, facts.workers_of(found, run), now)}
+
+
+@router.get("/api/v1/inspect/sessions/{session_id}/summary")
+async def session_summary(session_id: str):
+  """The session's record (created_at and redacted metadata, or recorded false when it has none), when the API server
+  last heard from it, whether its live key is present, its SDK errors, and a /runs line per model."""
+  state, found, now = await fleet.snapshot(), await facts.workers(), time.time()
+  if (body := await facts.session(session_id, state["runs"], found, now)) is None:
+    raise HTTPException(404, f"No session {session_id}")
+  return body
 
 
 @router.get("/api/v1/inspect/runs/{run_id}/steps")

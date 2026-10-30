@@ -77,7 +77,7 @@ def join(run_id: str, raw: str, live: set[str], cluster: Cluster) -> dict:
   run.update(model=meta.base_model, recipe_name=row.get("recipe_name"), fine_tuning_type=meta.fine_tuning_type, client_status=meta.status)
   run["lifecycle"] = lifecycle(meta.status, any(s in live for s in meta.session_ids), states)
   run.update(created_at=meta.created_at, completed_at=meta.completed_at, session_ids=meta.session_ids, settings=openrl_status.settings_of(meta))
-  run.update(shared_runtime=shared, nodes=sorted({p["node"] for p in pods if p["node"]}))
+  run.update(runtime=runtime, shared_runtime=shared, nodes=sorted({p["node"] for p in pods if p["node"]}))
   return run | {"pods": [{"name": p["name"], "problem": p["problem"]} for p in pods]}
 
 

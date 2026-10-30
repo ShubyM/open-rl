@@ -64,6 +64,7 @@ owner_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 async def bind_session(session_id: str | None, model_id: str) -> None:
   if not session_id:
     return
+  run_records.session_seen(session_id)
   owner = await asyncio.to_thread(owner_of, model_id)
   async with owner_locks[owner]:
     # On the model, for the model view: which sessions are this model's own.
@@ -962,6 +963,7 @@ async def create_session(req: CreateSessionRequest):
     raise HTTPException(status_code=400, detail=str(exc)) from exc
   session_id = f"sess-{uuid.uuid4().hex[:12]}"
   await session_registry.update_metadata(session_id, user_metadata)
+  run_records.session_seen(session_id, user_metadata)
   return {"session_id": session_id, "type": "create_session"}
 
 
@@ -969,6 +971,7 @@ async def create_session(req: CreateSessionRequest):
 async def session_heartbeat(req: SessionHeartbeatRequest):
   if req.session_id:
     await session_registry.heartbeat(req.session_id)
+    run_records.session_seen(req.session_id)
   return {"type": "session_heartbeat"}
 
 
@@ -1428,5 +1431,6 @@ async def list_adapters():
 
 
 @app.post("/api/v1/telemetry")
-async def telemetry(_: dict):
+async def telemetry(body: dict):
+  run_records.sdk_events(body)
   return {"status": "accepted"}

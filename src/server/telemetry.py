@@ -11,6 +11,12 @@ every FLUSH_SECONDS, with a worker's record of itself, so a failing or hanging R
   open_rl:ledger:<run>              a hash counting the run's trainer requests enqueued, popped, answered and failed
   open_rl:worker:<id>               a worker process's phase, GPU turns and the waits for them, outstanding requests and
                                     settings env
+
+The API server also keeps each client session's record, its last heartbeat and the SDK's error events for it:
+
+  open_rl:session_record:<session>  when the session was created, with its metadata, secrets redacted
+  open_rl:session_seen:<session>    when the API server last heard from it
+  open_rl:sdk_errors:<session>      the SDK's ERROR and CRITICAL events, the newest SDK_ERRORS
 """
 
 import asyncio
@@ -27,6 +33,7 @@ from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime
 from functools import wraps
 from numbers import Real
 
@@ -37,6 +44,8 @@ TTL_SECONDS = 7 * 86400
 SAMPLE_LIMIT = 2000  # records kept per list
 STEP_TIMES = 64
 MAX_TURNS = 200
+SDK_ERRORS = 200
+MESSAGE_CHARS = 500
 FLUSH_SECONDS = 5
 FINISH_SECONDS = 5  # how long an exiting process waits for its last flush
 FAILED = "RequestFailedResponse"
@@ -50,6 +59,8 @@ CONFIG_ENV = ("OPEN_RL_", "OPENRL_", "VLLM_", "NCCL_", "CUDA_", "PYTORCH_", "TOR
 #   ("sampled", run, runtime, started_at, at)  one sample a client got
 #   ("step", run, at)        an optimizer step that ended at `at`
 #   ("count", run, event)    one more of the run's trainer requests reached event
+#   ("session", session, at, metadata)  the API server heard from a session; metadata only when it was created
+#   ("sdk_error", session, record)      an SDK error event
 # While flushes fail the oldest go.
 buffer: deque[tuple] = deque(maxlen=100_000)
 
@@ -139,6 +150,13 @@ def plan(entries: Iterable[tuple], step_starts: dict[str, int], pod: dict[str, s
       append(writes, key("step_times", run), rest[0], STEP_TIMES)
     elif kind == "count":
       writes.fields.setdefault(key("ledger", run), Counter())[rest[0]] += 1
+    elif kind == "session":
+      at, metadata = rest
+      writes.values[key("session_seen", run)] = str(at)
+      if metadata is not None:
+        writes.values[key("session_record", run)] = json.dumps({"session_id": run, "created_at": at, "metadata": metadata})
+    elif kind == "sdk_error":
+      append(writes, key("sdk_errors", run), rest[0], SDK_ERRORS)
   for run, group in groups.items():
     append(writes, key("operations", run, "samples"), group | {"elapsed_seconds": group["at"] - group["started_at"]} | pod, SAMPLE_LIMIT)
   return writes
@@ -382,3 +400,41 @@ def sample_answered(run_id: str, pool: str, request_id: str, result: dict, start
     add("sample", run_id, op_record("sample", run_id, request_id, pool, recorder.role, started_at, FAILED))
   else:
     add("sampled", run_id, pool, started_at, time.time())
+
+
+# Session records, kept by the API server
+
+
+def redact(value):
+  if isinstance(value, dict):
+    return {k: "[redacted]" if SECRET.search(str(k)) else redact(v) for k, v in value.items()}
+  return [redact(v) for v in value] if isinstance(value, list) else value
+
+
+@best_effort
+def session_seen(session_id: str, metadata: dict | None = None) -> None:
+  """The API server heard from a session: its creation with metadata, a heartbeat, or a model attached."""
+  add("session", session_id, time.time(), None if metadata is None else redact(metadata))
+
+
+@best_effort
+def sdk_events(body: dict) -> None:
+  """Keep the ERROR and CRITICAL events of a batch the tinker SDK posts about its session. Other events are dropped."""
+  session_id, events = body.get("session_id"), body.get("events")
+  if not isinstance(session_id, str) or not session_id or not isinstance(events, list):
+    return
+  for event in (e for e in events if isinstance(e, dict)):
+    if (severity := str(event.get("severity") or "").upper()) in ("ERROR", "CRITICAL"):
+      add("sdk_error", session_id, sdk_error(event, severity))
+
+
+def sdk_error(event: dict, severity: str) -> dict:
+  data = event.get("event_data") if isinstance(event.get("event_data"), dict) else {}
+  name = str(event.get("error_type") or event.get("event_name") or event.get("event") or "event").rsplit(".", 1)[-1]
+  status = f"HTTP {data['status_code']}: " if data.get("status_code") else ""
+  message = status + str(event.get("error_message") or data.get("detail") or data.get("exception") or data.get("message") or "")
+  try:
+    at = datetime.fromisoformat(str(event.get("timestamp"))).timestamp()
+  except ValueError:
+    at = time.time()
+  return {"at": at, "severity": severity, "reason": f"SDK {name}", "message": message[:MESSAGE_CHARS]}

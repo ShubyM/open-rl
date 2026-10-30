@@ -144,6 +144,12 @@ its own phase, GPU turns and settings.
 `/api/v1/inspect/runs/<id>/steps?last=&fields=` returns the run's trainer ops
 grouped by step, with their counts, failures, time and metrics.
 
+`/api/v1/inspect/runs` returns each live run in one line, and `?ended=true`
+adds ended runs. `/api/v1/inspect/runs/<id>/summary` and
+`/api/v1/inspect/sessions/<id>/summary` return the facts recorded about one run
+or one client session, such as its pace, goodput, unanswered requests, failures
+and SDK errors. See `/docs` for their fields.
+
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `OPEN_RL_LOG_STORE` | unset | Where it reads logs. Unset turns log reads off. `cloud-logging` reads Cloud Logging in the project of the server's Google credentials. `cloud-logging:<resource>` reads that Cloud Logging resource instead, such as `projects/<project>/locations/global/buckets/<bucket>/views/<view>`. |

@@ -43,6 +43,11 @@ class RequestStore(ABC):
     """Block until the future resolves or the timeout is reached."""
     pass
 
+  @abstractmethod
+  async def queued(self, model_id: str) -> int:
+    """How many of the model's requests wait in its queue."""
+    pass
+
 
 class InMemoryStore(RequestStore):
   def __init__(self):
@@ -99,6 +104,9 @@ class InMemoryStore(RequestStore):
             continue
 
         await self.active_tenants_cv.wait()
+
+  async def queued(self, model_id: str) -> int:
+    return queue.qsize() if (queue := self.queues.get(model_id)) else 0
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     raise RuntimeError("Per-model full fine-tuning workers require REDIS_URL; in-memory queues cannot be shared across processes")
@@ -182,6 +190,9 @@ class RedisStore(RequestStore):
         # afterwards keeps a continuously-enqueueing tenant from starving peers.
         await self.redis.lmove(active_list, active_list, "LEFT", "RIGHT")
         return batch
+
+  async def queued(self, model_id: str) -> int:
+    return await self.redis.llen(f"open_rl:queue:{model_id}")
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     queue_key = f"open_rl:queue:{model_id}"
@@ -304,8 +315,13 @@ class StateStore(ABC):
     pass
 
   @abstractmethod
-  async def read_samples(self, key: str) -> list[dict[str, Any]]:
-    """The JSON items of a list write_sync appends to, oldest first."""
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
+    """The JSON items of a list write_sync appends to, oldest first, or only its last ones."""
+    pass
+
+  @abstractmethod
+  async def read_counts(self, key: str) -> dict[str, int]:
+    """The counts in a hash write_sync adds to."""
     pass
 
 
@@ -369,8 +385,11 @@ class InMemoryStateStore(StateStore):
       self.kv_store[key] = value
       self.expiries[key] = time.monotonic() + ttl_seconds
 
-  async def read_samples(self, key: str) -> list[dict[str, Any]]:
-    return [json.loads(item) for item in self.lists.get(key, [])]
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
+    return [json.loads(item) for item in self.lists.get(key, [])[-(last or 0) :]]
+
+  async def read_counts(self, key: str) -> dict[str, int]:
+    return dict(self.hashes.get(key, {}))
 
 
 class RedisStateStore(StateStore):
@@ -425,10 +444,13 @@ class RedisStateStore(StateStore):
       pipe.set(key, value, ex=ttl)
     pipe.execute()
 
-  async def read_samples(self, key: str) -> list[dict[str, Any]]:
-    raw = await self.redis.lrange(key, 0, -1)
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
+    raw = await self.redis.lrange(key, -(last or 0), -1)
     # Decoded off the event loop, since a list holds up to thousands of records.
     return await asyncio.to_thread(lambda: [json.loads(item) for item in raw])
+
+  async def read_counts(self, key: str) -> dict[str, int]:
+    return {name: int(count) for name, count in (await self.redis.hgetall(key)).items()}
 
 
 @cache
