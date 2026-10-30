@@ -1,7 +1,10 @@
 import asyncio
 import copy
+import json
 import os
 import unittest
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest import mock
 
 import httpx
@@ -18,6 +21,12 @@ NO_CLUSTER = {"available": True, "pods": [], "nodes": [], "workloads": None, "er
 
 def meta(**fields) -> str:
   return TrainingModelMetadata(base_model="Qwen/Qwen3-8B", **fields).model_dump_json()
+
+
+def workload(name: str, model_id: str, kind: str, deleting: bool = False, **status: str) -> dict:
+  metadata = {"name": name} | ({"deletionTimestamp": "2026-10-29T12:05:00Z"} if deleting else {})
+  status = {"phase": "Running", "nodeName": "n1", "podName": f"orw-{name}", "gpuUUIDs": [f"GPU-{name}"]} | status
+  return {"metadata": metadata, "spec": {"role": "trainer", "modelID": model_id, "trainingKind": kind}, "status": status}
 
 
 def cluster(*states: str) -> dict:
@@ -70,6 +79,47 @@ class InventoryTest(ApiTest):
 
     self.assertEqual([r["run_id"] for r in body["runs"]], ["good"])
     self.assertTrue(any("bad" in error for error in body["errors"]), body["errors"])
+
+  def test_placements_list_the_workloads_holding_gpus_with_the_runs_they_serve(self):
+    def listing(items) -> object:
+      return lambda *args, **kwargs: SimpleNamespace(data=json.dumps({"items": list(items)}))
+
+    placed, released = "2026-10-29T12:00:00Z", "2026-10-29T12:10:00Z"
+    workloads = (
+      workload("fft-a", "fft-1", "fft", placedAt=placed),
+      workload("lora-a", "Qwen/Qwen3-8B", "lora", placedAt=placed),
+      workload("fft-gone", "fft-2", "fft", placedAt=placed, releasedAt=released, nodeName=""),
+      workload("fft-deleting", "fft-3", "fft", deleting=True, placedAt=placed),
+      workload("fft-waiting", "fft-4", "fft", nodeName=""),
+    )
+    api = SimpleNamespace(list_namespaced_pod=listing([]), list_node=listing([]), list_cluster_custom_object=listing([]))
+    api.list_namespaced_custom_object = listing(workloads)
+    self.enterContext(mock.patch("server.observability.kubernetes.kubernetes_api", return_value=(api, api)))
+    records = {
+      "model_meta:fft-1": meta(fine_tuning_type="full", status="completed"),
+      "model_meta:lora-live": meta(),
+      "model_meta:lora-done": meta(status="completed"),
+    }
+    for key, value in records.items():
+      asyncio.run(self.store.set_value(f"open_rl:{key}", value))
+    body = TestClient(api_server.app).get("/api/v1/inspect/inventory").json()
+
+    at = datetime(2026, 10, 29, 12, tzinfo=UTC).timestamp()
+    self.assertEqual(
+      body["placements"],
+      [
+        {"name": "fft-a", "role": "trainer", "node": "n1", "pod": "orw-fft-a", "gpu_uuids": ["GPU-fft-a"], "placed_at": at, "run_ids": ["fft-1"]},
+        {
+          "name": "lora-a",
+          "role": "trainer",
+          "node": "n1",
+          "pod": "orw-lora-a",
+          "gpu_uuids": ["GPU-lora-a"],
+          "placed_at": at,
+          "run_ids": ["lora-live"],
+        },
+      ],
+    )
 
 
 class JoinTest(unittest.TestCase):

@@ -98,4 +98,25 @@ async def read() -> dict:
   runs.sort(key=lambda r: -r["created_at"])
   pods = [{"name": p["name"], "problem": p["problem"], "restarts": p["restarts"]} for p in cluster["pods"] if p["problem"]]
   view = {"available": cluster["available"], "nodes": cluster["nodes"], "pods": pods}
-  return {"observed_at": observed_at, "errors": errors, "runs": runs, "cluster": view}
+  return {"observed_at": observed_at, "errors": errors, "runs": runs, "cluster": view, "placements": placements(cluster["workloads"], metas)}
+
+
+def placements(workloads: list[dict] | None, metas: dict[str, str]) -> list[dict]:
+  """The Workloads holding GPUs now, each with the runs it serves: those whose runtime is its model ID and whose kind
+  matches. A shared runtime serves only its active runs."""
+  served = []
+  for name, raw in metas.items():
+    run_id = name.removeprefix("open_rl:model_meta:")
+    try:
+      meta = decode_model_metadata(raw)
+    except Exception:
+      continue  # read reports the unreadable record
+    if meta.status == "active" or not meta.shares_runtime():
+      served.append((meta.runtime(run_id), "lora" if meta.fine_tuning_type == "lora" else "fft", run_id))
+  fields = ("name", "role", "node", "pod", "gpu_uuids", "placed_at")
+  return [
+    {field: w[field] for field in fields}
+    | {"run_ids": sorted(r for runtime, kind, r in served if (runtime, kind) == (w["model_id"], w["training_kind"]))}
+    for w in workloads or []
+    if w["holds_gpus"]
+  ]

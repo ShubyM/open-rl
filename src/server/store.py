@@ -274,12 +274,19 @@ class StateStore(ABC):
     """Every live value whose key starts with prefix."""
     pass
 
+  @abstractmethod
+  def push_recent_sync(self, key: str, values: list[str], keep: int, ttl_seconds: float) -> None:
+    """Synchronously put values at the head of the list at key and keep its newest `keep`. Redis drops the list
+    ttl_seconds after the last push."""
+    pass
+
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
     self.kv_store: dict[str, str] = {}
     self.expiries: dict[str, float] = {}
     self.sets: dict[str, set[str]] = {}
+    self.lists: dict[str, list[str]] = {}
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
@@ -314,6 +321,9 @@ class InMemoryStateStore(StateStore):
   async def scan_values(self, prefix: str) -> dict[str, str]:
     return {key: value for key in list(self.kv_store) if key.startswith(prefix) and (value := self.get_value_sync(key)) is not None}
 
+  def push_recent_sync(self, key: str, values: list[str], keep: int, ttl_seconds: float) -> None:
+    self.lists[key] = (values[::-1] + self.lists.get(key, []))[:keep]
+
 
 class RedisStateStore(StateStore):
   def __init__(self, client: redis.Redis, sync_client: sync_redis.Redis):
@@ -346,6 +356,9 @@ class RedisStateStore(StateStore):
     keys = [key async for key in self.redis.scan_iter(match=prefix + "*", count=1000)]
     return {key: value for key, value in zip(keys, await self.redis.mget(keys)) if value is not None} if keys else {}
 
+  def push_recent_sync(self, key: str, values: list[str], keep: int, ttl_seconds: float) -> None:
+    self.sync_redis.pipeline().lpush(key, *values).ltrim(key, 0, keep - 1).expire(key, int(ttl_seconds)).execute()
+
 
 @cache
 def redis_client(redis_url: str) -> redis.Redis:
@@ -364,5 +377,5 @@ def get_store() -> RequestStore:
 def get_state_store() -> StateStore:
   redis_url = os.environ.get("REDIS_URL")
   if redis_url:
-    return RedisStateStore(redis_client(redis_url), sync_redis.Redis.from_url(redis_url, decode_responses=True))
+    return RedisStateStore(redis_client(redis_url), sync_redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=5))
   return InMemoryStateStore()

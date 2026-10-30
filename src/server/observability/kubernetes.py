@@ -59,7 +59,7 @@ def kubernetes_api() -> tuple:
 
 async def kubernetes() -> Cluster:
   try:
-    from server.scheduler_worker_manager import worker_state
+    from server.scheduler_worker_manager import holds_gpus, placement_of, worker_state
 
     core, custom = kubernetes_api()
   except Exception as exc:
@@ -97,5 +97,7 @@ async def kubernetes() -> Cluster:
     spec, status = item["spec"], item.get("status") or {}
     deleting = bool(item["metadata"].get("deletionTimestamp"))
     state, _ = worker_state(phase=status.get("phase") or "Pending", reason=status.get("reason") or "", node=status.get("nodeName"), deleting=deleting)
-    result["workloads"].append({"model_id": spec["modelID"], "training_kind": spec.get("trainingKind"), "state": state})
+    placement = placement_of(item)
+    row = {"model_id": spec["modelID"], "training_kind": spec.get("trainingKind"), "state": state, "holds_gpus": holds_gpus(placement)}
+    result["workloads"].append(row | placement)
   return result
