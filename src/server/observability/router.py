@@ -9,7 +9,9 @@ from server.model_metadata import decode_model_metadata
 from server.observability import cloud_logging, fleet, metrics
 from server.observability.kubernetes import namespace
 from server.observability.log_selector import ClientLines, WorkerPods
+from server.observability.steps import steps
 from server.store import get_state_store
+from server.telemetry import key
 from server.worker_manager import owner_id
 
 router = APIRouter(tags=["inspection"])
@@ -76,6 +78,25 @@ async def query(
     return {**result, "available": False, "error": f"The metrics source refused the query (HTTP {exc.response.status_code})"}
   except Exception as exc:
     return {**result, "available": False, "error": f"The metrics source is unavailable: {type(exc).__name__}"}
+
+
+@router.get("/api/v1/inspect/runs/{run_id}/steps")
+async def run_steps(
+  run_id: str,
+  last: int = Query(20, ge=1, le=1000),
+  fields: Annotated[str | None, Query(description="Comma-separated prefixes of the op metrics to keep, e.g. loss,grad_norm. Default: all")] = None,
+):
+  """The run's last steps, oldest first, from the trainer's op records: each step's window, whether its optim_step
+  succeeded, the metrics that were NaN or infinite, and per op its count, failures, seconds and metric spread."""
+  store = get_state_store()
+  if await store.get_value(key("model_meta", run_id)) is None:
+    raise HTTPException(404, f"No run {run_id}")
+  every = steps(await store.read_samples(key("operations", run_id)))
+  if keep := tuple(p for p in (fields or "").split(",") if p):
+    for step in every[-last:]:
+      for op in step["ops"].values():
+        op["metrics"] = {name: spread for name, spread in op["metrics"].items() if name.startswith(keep)}
+  return {"run_id": run_id, "total": len(every), "steps": every[-last:]}
 
 
 @router.get("/api/v1/inspect/logs")
