@@ -46,6 +46,9 @@ class GpuSampler:
     self.gpu.add("sampler")
     self.log.append(("wake", "sampler"))
 
+  async def wake_kv_cache(self) -> None:
+    assert self.gpu == {"sampler"}, self.gpu
+
   async def sleep(self) -> None:
     self.gpu.discard("sampler")
     self.log.append(("sleep", "sampler"))
@@ -71,8 +74,10 @@ class EngineDeadError(Exception):
 def fake_vllm() -> dict[str, types.ModuleType]:
   """The vLLM names Sampler imports. vLLM needs a GPU, and the unit tests run without one."""
   names = ["exceptions", "sampling_params", "lora", "lora.request", "v1", "v1.engine", "v1.engine.exceptions"]
+  names += ["distributed", "distributed.weight_transfer", "distributed.weight_transfer.base"]
   modules = {name: types.ModuleType(name) for name in ["vllm", *(f"vllm.{name}" for name in names)]}
   modules["vllm"].SamplingParams = dict
+  modules["vllm.distributed.weight_transfer.base"].WeightTransferUpdateRequest = lambda update_info: update_info
   modules["vllm.exceptions"].VLLMClientError = type("VLLMClientError", (Exception,), {})
   modules["vllm.sampling_params"].RequestOutputKind = SimpleNamespace(FINAL_ONLY="final_only")
   modules["vllm.lora.request"].LoRARequest = lambda name, lora_id, path: path
@@ -97,6 +102,45 @@ class FakeEngine:
       raise EngineDeadError()
     choice = SimpleNamespace(token_ids=[100], logprobs=[{100: SimpleNamespace(logprob=-0.5)}], finish_reason="length")
     yield SimpleNamespace(outputs=[choice], prompt_logprobs=None)
+
+
+class SleepingEngine(FakeEngine):
+  """A fake engine in sleep mode. It tracks which of its memory tags are awake, records the awake set at each weight
+  update, and refuses a request that reaches it before everything is awake."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.awake: set[str] = set()
+    self.updates: list[frozenset[str]] = []
+
+  async def wake_up(self, tags: list[str]) -> None:
+    self.awake |= set(tags)
+
+  async def sleep(self, level: int) -> None:
+    self.awake.clear()
+
+  async def pause_generation(self, mode: str, clear_cache: bool) -> None:
+    pass
+
+  async def start_weight_update(self) -> None:
+    pass
+
+  async def update_weights(self, request: dict) -> None:
+    self.updates.append(frozenset(self.awake))
+
+  async def finish_weight_update(self, weight_version: str) -> None:
+    pass
+
+  async def reset_encoder_cache(self) -> None:
+    pass
+
+  async def resume_generation(self) -> None:
+    pass
+
+  async def generate(self, prompt: dict, sampling_params: dict, request_id: str, lora_request: str | None):
+    assert self.awake == {"weights", "kv_cache"}, self.awake
+    async for output in super().generate(prompt, sampling_params, request_id, lora_request):
+      yield output
 
 
 class InProcessSamplerTest(RedisTestCase):
@@ -205,3 +249,23 @@ class TimeSlicedPoolTest(RedisTestCase):
     expected = [("wake", "sampler"), *batch, ("sleep", "sampler"), ("park", "sampler"), ("step", "trainer"), ("park", "trainer"), *turn]
     self.assertEqual(self.log, expected)
     self.assertEqual([json.loads(raw) for r in first + second for raw in await self.redis.lrange(future_key(r["request_id"]), 0, -1)], [SAMPLE] * 5)
+
+  async def test_a_delta_is_applied_before_the_kv_cache_wakes(self):
+    """A sparse delta needs a temporary buffer that the awake KV cache leaves no room for, so a turn that starts with a
+    weight update wakes the weights alone, applies it, and wakes the cache for the batch."""
+    self.enterContext(patch.dict(sys.modules, fake_vllm()))
+    delta = str(self.tmp / "step-1")
+    Path(delta).mkdir()
+    Path(delta, "metadata.json").write_text(json.dumps({"format": "sparse_delta", "parent": ""}))
+    records = [await self.accepted(delta) for _ in range(2)]
+    engine = SleepingEngine()
+    dispatcher = TimeSlicedDispatcher(self.store, self.pool, Sampler(engine, "base"), 4, self.sampler_slicer, self.sampler)
+    run = asyncio.create_task(dispatcher.run())
+    self.addAsyncCleanup(lambda: (run.cancel(), asyncio.gather(run, return_exceptions=True))[1])
+    await self.saved(*records)
+    self.assertEqual(engine.updates, [frozenset({"weights"})])
+    self.assertEqual([prompt for prompt, _ in engine.seen], [[1, 2, 3], [1, 2, 3]])
+    self.assertEqual([(await self.results(r))[0]["type"] for r in records], ["sample", "sample"])
+
+  async def results(self, r: dict) -> list[dict]:
+    return [json.loads(raw) for raw in await self.redis.lrange(future_key(r["request_id"]), 0, -1)]
