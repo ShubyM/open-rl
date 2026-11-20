@@ -347,5 +347,23 @@ class LogsTest(ApiTest):
     self.assertEqual(self.sent, [])
 
 
+class DashboardStaticTest(unittest.TestCase):
+  def test_dashboard_serves_index_and_static_assets_and_rejects_traversal(self):
+    client = TestClient(api_server.app)
+    for path in ("/dashboard", "/dashboard/"):
+      response = client.get(path)
+      self.assertEqual(response.status_code, 200)
+      self.assertIn("/dashboard/assets/app.js", response.text)
+      self.assertEqual(response.headers.get("cache-control"), "no-store")
+    css = client.get("/dashboard/assets/style.css")
+    self.assertEqual(css.status_code, 200)
+    self.assertIn("text/css", css.headers.get("content-type", ""))
+    js = client.get("/dashboard/assets/app.js")
+    self.assertEqual(js.status_code, 200)
+    self.assertIn("javascript", js.headers.get("content-type", ""))
+    self.assertEqual(client.get("/dashboard/assets/missing.js").status_code, 404)
+    self.assertEqual(client.get("/dashboard/assets/..%2Frouter.py").status_code, 404)
+
+
 if __name__ == "__main__":
   unittest.main()

@@ -2,10 +2,12 @@ import asyncio
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
 
 from server.model_metadata import decode_model_metadata
 from server.observability import cloud_logging, facts, fleet, metrics
@@ -17,11 +19,21 @@ from server.telemetry import key
 from server.worker_manager import owner_id
 
 router = APIRouter(tags=["inspection"])
+STATIC = Path(__file__).parent / "static"
 BOUNDS = "ISO-8601 or Unix seconds; since also takes a span before until, e.g. 1h. Default: the 30 minutes ending now; at most 7 days."
 Bound = Annotated[str | None, Query(max_length=64, description=BOUNDS)]
 CURSOR_EXPIRED = "Invalid or expired log cursor; repeat the query without it"
 # OPEN_RL_LOG_STORE is <store> or <store>:<resource>, the resource in the store's own terms. A store reads what a selector names.
 LOG_STORES = {"cloud-logging": cloud_logging.log_page}
+
+
+@router.get("/dashboard", include_in_schema=False)
+@router.get("/dashboard/", include_in_schema=False)
+@router.get("/dashboard/assets/{name}", include_in_schema=False)
+async def dashboard(name: str = "index.html"):
+  if (path := (STATIC / name).resolve()).parent != STATIC.resolve() or not path.is_file():
+    raise HTTPException(404, "Not found")
+  return FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/api/v1/inspect/inventory")

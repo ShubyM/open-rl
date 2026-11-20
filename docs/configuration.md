@@ -127,8 +127,9 @@ for. On one machine every pool has one replica, in process. See
 ## Inspection API
 
 The API server serves a read-only inventory of runs at
-`/api/v1/inspect/inventory` and a run's logs at
-`/api/v1/inspect/logs?run_id=<id>`. `/api/v1/inspect/activity` shows which
+`/api/v1/inspect/inventory`, a run's logs at
+`/api/v1/inspect/logs?run_id=<id>`, and the [cluster dashboard](dashboard.md) at
+`/dashboard`. `/api/v1/inspect/activity` shows which
 `Workload`s held which GPUs in a time window, and `/api/v1/inspect/query` reads
 those GPUs' DCGM metrics. See `/docs` for their fields.
 
