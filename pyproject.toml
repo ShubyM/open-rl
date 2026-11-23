@@ -11,6 +11,7 @@ requires-python = ">=3.12, <3.13"
 dependencies = [
     "chz>=0.4.0",
     "fastapi",
+    "numpy",
     "opentelemetry-api",
     "opentelemetry-sdk",
     "opentelemetry-instrumentation-fastapi",
@@ -32,7 +33,6 @@ cpu = [
     "cbor2",
     "datasets",
     "einops",
-    "numpy",
     "openai",
     "openai_harmony",
     "peft",
@@ -45,7 +45,6 @@ cpu = [
 gpu = [
     "datasets",
     "flash-linear-attention==0.5.1",
-    "numpy",
     "peft",
     "tilelang>=0.1.9; sys_platform == 'linux'",
     "torch; sys_platform == 'linux'",

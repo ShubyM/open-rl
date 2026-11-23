@@ -8,7 +8,8 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from server import api_server, telemetry
+from server import telemetry
+from server.api_server import create_app
 from server.observability import facts, fleet, router
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStateStore, InMemoryStore, Writes
@@ -29,6 +30,7 @@ class SummaryTest(unittest.TestCase):
     self.enterContext(mock.patch.object(fleet, "kubernetes", mock.AsyncMock(side_effect=lambda: json.loads(json.dumps(NO_CLUSTER)))))
     self.enterContext(mock.patch.object(router, "time", mock.Mock(time=lambda: self.now)))
     self.recorder = self.enterContext(mock.patch.object(telemetry, "recorder", telemetry.Recorder("api_server", None)))
+    self.app = create_app(state=self.store, session_registry=SessionRegistry(self.store))
 
   def run_a(self, live: bool = True, sessions: tuple[str, ...] = ("sess-a",), **fields) -> None:
     asyncio.run(self.store.set_value("open_rl:model_meta:run-a", meta(session_ids=list(sessions), created_at=self.now - 3600, **fields)))
@@ -48,7 +50,7 @@ class SummaryTest(unittest.TestCase):
     self.store.write_sync(Writes(values={telemetry.key("worker", w["id"]): json.dumps(w)}), telemetry.TTL_SECONDS)
 
   def get(self, path: str, status: int = 200, **params) -> dict:
-    response = TestClient(api_server.app).get(f"/api/v1/inspect/{path}", params=params)
+    response = TestClient(self.app).get(f"/api/v1/inspect/{path}", params=params)
     self.assertEqual(response.status_code, status, response.text)
     return response.json()
 
@@ -125,8 +127,7 @@ class SummaryTest(unittest.TestCase):
     self.assertEqual(self.line()["sample_failures"], 1)
 
   def test_a_session_keeps_its_record_sdk_errors_and_models(self) -> None:
-    self.enterContext(mock.patch.object(api_server, "session_registry", SessionRegistry(self.store)))
-    client = TestClient(api_server.app)
+    client = TestClient(self.app)
     session = client.post("/api/v1/create_session", json={"user_metadata": {"recipe_name": "s8", "api_key": "k"}}).json()["session_id"]
     self.run_a(live=False, sessions=(session,))
     client.post("/api/v1/session_heartbeat", json={"session_id": session})

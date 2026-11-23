@@ -7,14 +7,16 @@ import unittest
 from dataclasses import dataclass
 from unittest.mock import patch
 
+import numpy as np
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
+from server.api import wire
 from server.training_requests_processor import build_worker
 from training import automodel_worker
 from training.automodel_worker import AutomodelTrainingWorker, lora_target_patterns
 from training.trainer_worker import BaseTrainerWorker
-from training.types import Datum, FFTConfig, LoraConfig, TensorData
+from training.types import FFTConfig, LoraConfig
 
 
 class ClipGradientsTest(unittest.TestCase):
@@ -138,9 +140,12 @@ def tiny_lora_model(rank: int) -> LlamaForCausalLM:
   return model
 
 
-def datums(rows: list[list[int]]) -> list[Datum]:
+def datums(rows: list[list[int]]) -> list[wire.Datum]:
   return [
-    Datum(model_input=row[:-1], loss_fn_inputs={"target_tokens": TensorData(data=row[1:]), "weights": TensorData(data=[1.0] * (len(row) - 1))})
+    wire.Datum(
+      np.asarray(row[:-1], dtype=np.int32),
+      {"target_tokens": np.asarray(row[1:], dtype=np.int64), "weights": np.ones(len(row) - 1, dtype=np.float32)},
+    )
     for row in rows
   ]
 

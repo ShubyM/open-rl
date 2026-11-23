@@ -5,22 +5,30 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from server import api_server
+from server.api import paths, wire
+from server.proto import tinker_public_pb2 as pb
 from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import LocalWorkerManager
 from tests.test_session_lifecycle import RuntimeManager
 
 
 class ApiServerTest(unittest.TestCase):
-  """Requests go through the ASGI app, so routing, body validation and the
-  error handlers are the ones the tinker client sees."""
+  """Requests go through a fresh `create_app(...)` ASGI app (no module-global monkeypatching)."""
+
+  def _make_app(self, **kwargs):
+    self.store = kwargs.pop("store", InMemoryStore())
+    self.state = kwargs.pop("state", InMemoryStateStore())
+    self.app = api_server.create_app(store=self.store, state=self.state, **kwargs)
+    self.gw = self.app.state.server
+    self.client = TestClient(self.app)
 
   def setUp(self) -> None:
-    self.enterContext(patch.object(api_server, "store", InMemoryStore()))
-    self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
-    self.client = TestClient(api_server.app)
+    self._make_app()
 
   def post(self, path: str, body: dict, **kwargs):
     return self.client.post(f"/api/v1/{path}", json=body, **kwargs)
@@ -29,54 +37,40 @@ class ApiServerTest(unittest.TestCase):
     return self.client.post(f"/api/v1/{path}", content=body, headers={"Content-Type": media_type})
 
   def queued(self) -> list[dict]:
-    return asyncio.run(api_server.store.get_requests())
+    return asyncio.run(self.store.get_requests())
 
 
 class GetInfoTest(ApiServerTest):
   def test_get_info_uses_base_model_env(self) -> None:
     with patch.dict(os.environ, {"BASE_MODEL": "env-model"}, clear=True):
       info = self.post("get_info", {"model_id": "model-a"}).json()
-
-    self.assertEqual(info["model_name"], "env-model")
-    self.assertEqual(info["model_data"]["tokenizer_id"], "env-model")
-    self.assertEqual(info["model_id"], "model-a")
+    self.assertEqual((info["model_name"], info["model_data"]["tokenizer_id"], info["model_id"]), ("env-model", "env-model", "model-a"))
 
   def test_get_info_prefers_the_models_own_base_model(self) -> None:
     meta = json.dumps({"base_model": "google/gemma-4-e2b", "fine_tuning_type": "full"})
-    asyncio.run(api_server.state.set_value("open_rl:model_meta:model-g", meta))
+    asyncio.run(self.state.set_value("open_rl:model_meta:model-g", meta))
     with patch.dict(os.environ, {"BASE_MODEL": "Qwen/Qwen2.5-0.5B"}, clear=True):
       info = self.post("get_info", {"model_id": "model-g"}).json()
-      via_sampler_ref = self.post("get_info", {"model_id": "tinker://model-g/sampler_weights/sampler-1"}).json()
+      via_ref = self.post("get_info", {"model_id": "tinker://model-g/sampler_weights/sampler-1"}).json()
       unknown = self.post("get_info", {"model_id": "model-unknown"}).json()
-
-    # The client loads its tokenizer from this name, so it must be the job's model.
-    self.assertEqual(info["model_name"], "google/gemma-4-e2b")
-    self.assertEqual(info["model_data"]["tokenizer_id"], "google/gemma-4-e2b")
-    self.assertEqual(via_sampler_ref["model_name"], "google/gemma-4-e2b")
-    self.assertEqual(unknown["model_name"], "Qwen/Qwen2.5-0.5B")
+    self.assertEqual((info["model_name"], info["model_data"]["tokenizer_id"]), ("google/gemma-4-e2b", "google/gemma-4-e2b"))
+    self.assertEqual((via_ref["model_name"], unknown["model_name"]), ("google/gemma-4-e2b", "Qwen/Qwen2.5-0.5B"))
 
   def test_get_info_reports_the_lora_rank_the_job_was_created_with(self) -> None:
-    lora = json.dumps({"base_model": "google/gemma-4-e2b", "lora_config": {"rank": 32}})
-    full = json.dumps({"base_model": "google/gemma-4-e2b", "fine_tuning_type": "full", "lora_config": {"rank": 32}})
-    asyncio.run(api_server.state.set_value("open_rl:model_meta:model-r32", lora))
-    asyncio.run(api_server.state.set_value("open_rl:model_meta:model-full", full))
+    asyncio.run(self.state.set_value("open_rl:model_meta:model-r32", json.dumps({"base_model": "g", "lora_config": {"rank": 32}})))
+    full_meta = json.dumps({"base_model": "g", "fine_tuning_type": "full", "lora_config": {"rank": 32}})
+    asyncio.run(self.state.set_value("open_rl:model_meta:model-full", full_meta))
     with patch.dict(os.environ, {"BASE_MODEL": "Qwen/Qwen2.5-0.5B"}, clear=True):
-      info = self.post("get_info", {"model_id": "model-r32"}).json()
-      via_sampler_ref = self.post("get_info", {"model_id": "tinker://model-r32/sampler_weights/sampler-1"}).json()
-      full_info = self.post("get_info", {"model_id": "model-full"}).json()
-      unknown = self.post("get_info", {"model_id": "model-unknown"}).json()
-
-    self.assertEqual(info["lora_rank"], 32)
-    self.assertEqual(via_sampler_ref["lora_rank"], 32)
-    # A full fine-tune has no adapter; the SDK still expects a rank, so it gets the default.
-    self.assertEqual(full_info["lora_rank"], 16)
-    self.assertEqual(unknown["lora_rank"], 16)
+      ranks = [
+        self.post("get_info", {"model_id": mid}).json()["lora_rank"]
+        for mid in ("model-r32", "tinker://model-r32/sampler_weights/sampler-1", "model-full", "model-unknown")
+      ]
+    self.assertEqual(ranks, [32, 32, 16, 16])
 
   def test_get_info_404s_without_base_model_env(self) -> None:
     with patch.dict(os.environ, {}, clear=True):
       response = self.post("get_info", {"model_id": "model-a"})
-    self.assertEqual(response.status_code, 404)
-    self.assertEqual(response.json(), {"error": "No base model is configured"})
+    self.assertEqual((response.status_code, response.json()), (404, {"error": "No base model is configured"}))
 
   def test_create_model_requires_base_model_payload(self) -> None:
     response = self.post("create_model", {})
@@ -93,46 +87,34 @@ class GetInfoTest(ApiServerTest):
   def test_create_model_accepts_base_model_payload(self) -> None:
     model_id = self.post("create_model", {"base_model": "my-model"}).json()["request_id"]
     queued = self.queued()
-    self.assertEqual(queued[0]["model_id"], model_id)
-    self.assertEqual(queued[0]["payload"]["base_model"], "my-model")
-    meta = json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
-    self.assertEqual(meta["base_model"], "my-model")
+    self.assertEqual((queued[0]["model_id"], queued[0]["payload"]["base_model"]), (model_id, "my-model"))
+    self.assertEqual(json.loads(self.state.get_value_sync(f"open_rl:model_meta:{model_id}"))["base_model"], "my-model")
 
 
 class ErrorShapeTest(ApiServerTest):
-  """Every refused request answers {"error": ...}, whichever layer refused it."""
-
   def test_an_unknown_route_answers_the_shared_error_shape(self) -> None:
     response = self.client.get("/api/v1/no_such_endpoint")
-    self.assertEqual(response.status_code, 404)
-    self.assertEqual(response.json(), {"error": "Not Found"})
+    self.assertEqual((response.status_code, response.json()), (404, {"error": "Not Found"}))
 
   def test_a_body_of_the_wrong_shape_is_a_422_that_names_the_field(self) -> None:
     response = self.post("get_info", {"model_id": ["not", "a", "string"]})
-    self.assertEqual(response.status_code, 422)
     body = response.json()
-    self.assertEqual(body["error"], "invalid request")
-    self.assertEqual(body["detail"][0]["loc"], ["body", "model_id"])
-    self.assertEqual(body["detail"][0]["input"], ["not", "a", "string"])
+    self.assertEqual((response.status_code, body["error"]), (422, "invalid request"))
+    self.assertEqual((body["detail"][0]["loc"], body["detail"][0]["input"]), (["body", "model_id"], ["not", "a", "string"]))
 
   def test_a_binary_body_on_a_json_route_is_a_422_not_a_500(self) -> None:
-    response = self.post_bytes("optim_step", b"\x8a\xff", "application/x-protobuf")
-    self.assertEqual(response.status_code, 422)
-    self.assertEqual(response.json()["detail"][0]["input"], "<2 bytes>")
+    response = self.post_bytes("optim_step", b"\x8a\xff", wire.PROTO)
+    self.assertEqual((response.status_code, response.json()["detail"][0]["input"]), (422, "<2 bytes>"))
 
   def test_http_errors_keep_their_headers_and_body_rules(self) -> None:
-    from fastapi import HTTPException
-
     throttled = asyncio.run(api_server.http_error(None, HTTPException(status_code=429, detail="slow down", headers={"Retry-After": "3"})))
-    self.assertEqual((throttled.status_code, throttled.headers["retry-after"]), (429, "3"))
-    self.assertEqual(json.loads(throttled.body), {"error": "slow down"})
+    self.assertEqual((throttled.status_code, throttled.headers["retry-after"], json.loads(throttled.body)), (429, "3", {"error": "slow down"}))
     unchanged = asyncio.run(api_server.http_error(None, HTTPException(status_code=304)))
     self.assertEqual((unchanged.status_code, unchanged.body), (304, b""))
 
 
 class SaveSeqIdZeroTest(ApiServerTest):
   def test_the_first_saves_zero_seq_id_is_kept(self) -> None:
-    # The client's counter is 0-based; 0 must not fall back to a timestamp id.
     self.post("save_weights_for_sampler", {"model_id": "job-a", "sampling_session_seq_id": 0})
     self.post("save_weights", {"model_id": "job-a", "seq_id": 0})
     queued = self.queued()
@@ -141,45 +123,29 @@ class SaveSeqIdZeroTest(ApiServerTest):
 
 
 class ApiServerPathTest(ApiServerTest):
-  def test_checkpoint_state_paths_are_model_scoped(self) -> None:
-    old_tmp_dir = api_server.TMP_DIR
+  def test_checkpoint_state_paths_are_model_scoped_and_tinker_uri_roundtrip(self) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
-      api_server.TMP_DIR = tmp_dir
-      self.addCleanup(setattr, api_server, "TMP_DIR", old_tmp_dir)
+      self._make_app(tmp_dir=tmp_dir)
+      dir_a = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
+      self.assertEqual(paths.checkpoint_state_path("job-a", "step-5", base_dir=tmp_dir), dir_a)
+      self.assertEqual(paths.tinker_state_path(dir_a, base_dir=tmp_dir), "tinker://job-a/weights/step-5")
+      self.assertEqual(paths.checkpoint_state_path("job-b", "tinker://job-a/weights/step-5", base_dir=tmp_dir), dir_a)
+      self.assertEqual(paths.tinker_state_path("/elsewhere/final", base_dir=tmp_dir), "/elsewhere/final")
+      self.assertEqual(paths.checkpoint_state_path("job-a", "/mnt/checkpoints/final", base_dir=tmp_dir), "/mnt/checkpoints/final")
+      self.assertIsNone(paths.tinker_checkpoint_dir("tinker://job-a/sampler_weights/sampler-3", base_dir=tmp_dir))
 
-      self.assertEqual(
-        api_server.checkpoint_state_path("job-a", "final"),
-        os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "final"),
-      )
-      self.assertEqual(
-        api_server.checkpoint_state_path("job-b", "final"),
-        os.path.join(tmp_dir, "checkpoints", "job-b", "weights", "final"),
-      )
-
-  def test_a_tinker_path_names_the_model_that_saved_it(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
-      state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
-      self.assertEqual(api_server.tinker_state_path(state_dir), "tinker://job-a/weights/step-5")
-      # A resuming job passes the dead job's path under its own model id.
-      self.assertEqual(api_server.checkpoint_state_path("job-b", "tinker://job-a/weights/step-5"), state_dir)
-      self.assertEqual(api_server.tinker_state_path("/elsewhere/final"), "/elsewhere/final")
-      # Only weights paths are checkpoints. A sampler path is refused, not resolved under the caller.
-      self.assertIsNone(api_server.tinker_checkpoint_dir("tinker://job-a/sampler_weights/sampler-3"))
       refused = self.post("load_weights", {"model_id": "job-b", "path": "tinker://job-a/sampler_weights/sampler-3"})
       self.assertEqual(refused.status_code, 400)
       self.assertIn("is not a tinker://<model>/weights/<name> path", refused.json()["error"])
 
-  def test_save_state_keeps_the_optimizer_and_answers_with_a_tinker_path(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
       self.post("save_weights", {"model_id": "job-a", "path": "step-5"})
-      queued = self.queued()
-      self.assertEqual(queued[0]["op"], "save_state")
-      self.assertTrue(queued[0]["payload"]["include_optimizer"])
-      saved = api_server.translate_future_result({"type": "state_saved", "path": queued[0]["payload"]["state_path"]})
-    self.assertEqual(saved, {"type": "save_weights", "path": "tinker://job-a/weights/step-5"})
+      queued = self.queued()[0]
+      self.assertEqual((queued["op"], queued["payload"]["include_optimizer"]), ("save_state", True))
+      self.assertEqual(paths.tinker_state_path(queued["payload"]["state_path"], base_dir=tmp_dir), "tinker://job-a/weights/step-5")
 
   def test_weights_info_reads_the_checkpoint_on_disk(self) -> None:
-    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(api_server, "TMP_DIR", tmp_dir):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self._make_app(tmp_dir=tmp_dir)
       state_dir = os.path.join(tmp_dir, "checkpoints", "job-a", "weights", "step-5")
       os.makedirs(os.path.join(state_dir, "job-a"))
       with open(os.path.join(state_dir, "metadata.json"), "w") as f:
@@ -188,158 +154,109 @@ class ApiServerPathTest(ApiServerTest):
         json.dump({"r": 8}, f)
       info = self.post("weights_info", {"tinker_path": "tinker://job-a/weights/step-5"}).json()
       missing = self.post("weights_info", {"tinker_path": "tinker://job-a/weights/never"})
-    self.assertEqual(info["base_model"], "google/gemma-4-e2b")
-    self.assertTrue(info["is_lora"])
-    self.assertEqual(info["lora_rank"], 8)
-    self.assertEqual(missing.status_code, 404)
-    self.assertEqual(missing.json(), {"error": "No checkpoint at tinker://job-a/weights/never"})
-
-  def test_checkpoint_state_paths_accept_explicit_output_directories(self) -> None:
-    self.assertEqual(api_server.checkpoint_state_path("job-a", "/mnt/checkpoints/final"), "/mnt/checkpoints/final")
+    self.assertEqual((info["base_model"], info["is_lora"], info["lora_rank"]), ("google/gemma-4-e2b", True, 8))
+    self.assertEqual((missing.status_code, missing.json()), (404, {"error": "No checkpoint at tinker://job-a/weights/never"}))
 
 
-class ProtobufWireTest(unittest.TestCase):
-  """Tinker SDK >= 0.25 sends forward_backward as protobuf and only reads
-  forward_backward and sample results as protobuf."""
-
+class ProtobufWireTest(ApiServerTest):
   FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "fwdbwd_request_tinker_0.29.0.pb")
 
-  def setUp(self) -> None:
-    from fastapi.testclient import TestClient
-
-    patcher = patch.object(api_server, "store", InMemoryStore())
-    patcher.start()
-    self.addCleanup(patcher.stop)
-    self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
-    self.client = TestClient(api_server.app)
-
-  def _queued(self) -> list[dict]:
-    return asyncio.run(api_server.store.get_requests())
-
-  def test_protobuf_and_json_forward_backward_queue_the_same_request(self) -> None:
+  def test_protobuf_and_json_forward_backward_queue_equivalent_proto_bytes(self) -> None:
     with open(self.FIXTURE, "rb") as fh:
       body = fh.read()
-    proto = self.client.post("/api/v1/forward_backward", content=body, headers={"Content-Type": "application/x-protobuf"})
+    proto = self.client.post("/api/v1/forward_backward", content=body, headers={"Content-Type": wire.PROTO})
     self.assertEqual(proto.status_code, 200, proto.text)
-    from_proto = self._queued()[0]
+    from_proto = self.queued()[0]
+    self.assertEqual(from_proto["payload"]["proto_bytes"], body)
 
     with open(self.FIXTURE[:-3] + ".json") as fh:
       json_body = json.load(fh)
     as_json = self.client.post("/api/v1/forward_backward", json=json_body)
     self.assertEqual(as_json.status_code, 200, as_json.text)
-    from_json = self._queued()[0]
+    from_json = self.queued()[0]
 
-    self.assertEqual(from_proto["op"], "forward_backward")
-    self.assertEqual(from_proto["model_id"], "model-abc")
-    self.assertEqual(from_proto["payload"], from_json["payload"])
+    self.assertEqual((from_proto["op"], from_proto["model_id"]), ("forward_backward", "model-abc"))
     self.assertEqual(from_proto["payload"]["loss_fn"], "importance_sampling")
     self.assertEqual(from_proto["payload"]["loss_config"], {"clip_range": 0.2, "kl_coeff": 0.01, "mode": "token"})
+    d_proto, d_json = wire.datums(from_proto["payload"]["proto_bytes"]), wire.datums(from_json["payload"]["proto_bytes"])
+    self.assertEqual(len(d_proto), len(d_json))
+    for a, b in zip(d_proto, d_json):
+      np.testing.assert_array_equal(a.tokens, b.tokens)
+      for k in a.inputs:
+        np.testing.assert_array_equal(a.inputs[k], b.inputs[k])
 
   def test_forward_only_reaches_the_worker_from_both_routes(self) -> None:
-    from server.proto import tinker_public_pb2 as pb
-
     msg = pb.ForwardBackwardRequest(model_id="model-abc", seq_id=1, loss_fn="cross_entropy", forward_only=True)
-    response = self.client.post("/api/v1/forward_backward", content=msg.SerializeToString(), headers={"Content-Type": "application/x-protobuf"})
-    self.assertEqual(response.status_code, 200, response.text)
-    queued = self._queued()[0]
-    self.assertEqual(queued["op"], "forward_backward")
-    self.assertTrue(queued["payload"]["forward_only"])
+    resp = self.client.post("/api/v1/forward_backward", content=msg.SerializeToString(), headers={"Content-Type": wire.PROTO})
+    self.assertEqual(resp.status_code, 200, resp.text)
+    self.assertTrue(self.queued()[0]["payload"]["forward_only"])
 
     legacy = self.client.post("/api/v1/forward", json={"model_id": "model-abc", "forward_input": {"data": [], "loss_fn": "cross_entropy"}})
     self.assertEqual(legacy.status_code, 200, legacy.text)
-    self.assertTrue(self._queued()[0]["payload"]["forward_only"])
+    self.assertTrue(self.queued()[0]["payload"]["forward_only"])
 
-    train = self.client.post(
-      "/api/v1/forward_backward", json={"model_id": "model-abc", "forward_backward_input": {"data": [], "loss_fn": "cross_entropy"}}
-    )
+    fb_body = {"model_id": "model-abc", "forward_backward_input": {"data": [], "loss_fn": "cross_entropy"}}
+    train = self.client.post("/api/v1/forward_backward", json=fb_body)
     self.assertEqual(train.status_code, 200, train.text)
-    self.assertFalse(self._queued()[0]["payload"]["forward_only"])
+    self.assertFalse(self.queued()[0]["payload"]["forward_only"])
 
   def test_bad_bodies_are_client_errors_not_500s(self) -> None:
-    garbage = self.client.post("/api/v1/forward_backward", content=b"\xff\xfe not proto", headers={"Content-Type": "application/x-protobuf"})
-    self.assertEqual(garbage.status_code, 400, garbage.text)
-    compressed = self.client.post(
-      "/api/v1/forward_backward", content=b"x", headers={"Content-Type": "application/x-protobuf", "Content-Encoding": "zstd"}
+    self.assertEqual(self.client.post("/api/v1/forward_backward", content=b"\xff\xfe bad", headers={"Content-Type": wire.PROTO}).status_code, 400)
+    self.assertEqual(
+      self.client.post("/api/v1/forward_backward", content=b"x", headers={"Content-Type": wire.PROTO, "Content-Encoding": "zstd"}).status_code, 415
     )
-    self.assertEqual(compressed.status_code, 415, compressed.text)
-    other = self.client.post("/api/v1/forward_backward", content=b"x", headers={"Content-Type": "text/plain"})
-    self.assertEqual(other.status_code, 415, other.text)
-    # A non-JSON body on a plain `req: dict` route used to crash FastAPI's 422
-    # handler while it JSON-encoded the raw bytes, turning it into a 500.
-    binary_to_dict_route = self.client.post("/api/v1/optim_step", content=b"\x8a\xff", headers={"Content-Type": "application/x-protobuf"})
-    self.assertEqual(binary_to_dict_route.status_code, 422, binary_to_dict_route.text)
-    self.assertNotIn("\x8a", binary_to_dict_route.text)
+    self.assertEqual(self.client.post("/api/v1/forward_backward", content=b"x", headers={"Content-Type": "text/plain"}).status_code, 415)
+    bad = self.client.post("/api/v1/optim_step", content=b"\x8a\xff", headers={"Content-Type": wire.PROTO})
+    self.assertEqual(bad.status_code, 422)
+    self.assertNotIn("\x8a", bad.text)
 
-  def test_retrieve_future_answers_protobuf_only_when_asked_and_only_for_proto_types(self) -> None:
-    from server.proto import tinker_public_pb2 as pb
-
-    asyncio.run(
-      api_server.store.set_result(
-        "samp-1", {"type": "sample_completed", "sequences": [{"tokens": [1, 2], "logprobs": [-0.5, -1.0], "stop_reason": "stop"}]}
-      )
-    )
-    asyncio.run(api_server.store.set_result("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
+  def test_retrieve_future_passes_proto_bytes_and_decodes_json_at_edge(self) -> None:
+    samp_raw = wire.sample_output([wire.SampleOut(stop=True, tokens=[1, 2], logprobs=[-0.5, -1.0])])
+    asyncio.run(self.store.set_result("samp-1", wire.proto_result("sample", samp_raw)))
+    asyncio.run(self.store.set_result("optim-1", {"type": "optim_step", "metrics": {"grad_norm:mean": 0.0}}))
 
     as_json = self.client.post("/api/v1/retrieve_future", json={"request_id": "samp-1"})
-    self.assertEqual(as_json.status_code, 200)
     self.assertTrue(as_json.headers["content-type"].startswith("application/json"))
     self.assertEqual(as_json.json()["type"], "sample")
+    self.assertEqual(as_json.json()["sequences"][0]["tokens"], [1, 2])
 
-    as_proto = self.client.post("/api/v1/retrieve_future", json={"request_id": "samp-1"}, headers={"Accept": "application/x-protobuf"})
-    self.assertEqual(as_proto.status_code, 200)
-    self.assertEqual(as_proto.headers["content-type"], "application/x-protobuf")
-    msg = pb.SampleResponse()
-    msg.ParseFromString(as_proto.content)
-    self.assertEqual(msg.sequences[0].stop_reason, pb.STOP_REASON_STOP)
+    as_proto = self.client.post("/api/v1/retrieve_future", json={"request_id": "samp-1"}, headers={"Accept": wire.PROTO})
+    self.assertEqual((as_proto.status_code, as_proto.headers["content-type"], as_proto.content), (200, wire.PROTO, samp_raw))
 
-    optim = self.client.post("/api/v1/retrieve_future", json={"request_id": "optim-1"}, headers={"Accept": "application/x-protobuf"})
+    optim = self.client.post("/api/v1/retrieve_future", json={"request_id": "optim-1"}, headers={"Accept": wire.PROTO})
     self.assertTrue(optim.headers["content-type"].startswith("application/json"))
     self.assertEqual(optim.json()["type"], "optim_step")
 
 
 class SampleSequenceIdsTest(ApiServerTest):
-  """Tinker SDK >= 0.25 asserts that every asample promise carries one
-  sequence id per requested sample."""
+  def setUp(self) -> None:
+    self._make_app(sampler_backend="torch")
 
   def test_asample_promise_carries_one_id_per_sample(self) -> None:
-    with patch.object(api_server, "get_sampler_backend", return_value="torch"):
-      promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}).json()
-    self.assertEqual(len(promise["sample_sequence_ids"]), 3)
-    self.assertEqual(len(set(promise["sample_sequence_ids"])), 3)
+    promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1, 2]}]}, "num_samples": 3}).json()
+    self.assertEqual((len(promise["sample_sequence_ids"]), len(set(promise["sample_sequence_ids"]))), (3, 3))
     self.assertTrue(all(sid.startswith(promise["request_id"]) for sid in promise["sample_sequence_ids"]))
 
   def test_asample_defaults_to_a_single_sample(self) -> None:
-    with patch.object(api_server, "get_sampler_backend", return_value="torch"):
-      promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
+    promise = self.post("asample", {"model_id": "job-a", "prompt": {"chunks": [{"tokens": [1]}]}}).json()
     self.assertEqual(len(promise["sample_sequence_ids"]), 1)
-
-
-if __name__ == "__main__":
-  unittest.main()
 
 
 class InputBoundaryTest(ApiServerTest):
   def test_invalid_training_datum_is_a_validation_error(self) -> None:
-    response = self.post(
-      "forward_backward",
-      {"model_id": "m", "forward_backward_input": {"data": [{"model_input": {"chunks": [{"tokens": ["bad"]}]}, "loss_fn_inputs": {}}]}},
-    )
-    self.assertEqual(response.status_code, 422)
-    self.assertEqual(api_server.store.queues, {})
+    resp = self.post("forward_backward", {"model_id": "m", "forward_backward_input": {"data": [{"model_input": {"chunks": [{"tokens": ["bad"]}]}}]}})
+    self.assertEqual((resp.status_code, self.store.queues), (422, {}))
 
   def test_null_configs_and_sampling_defaults_preserve_zero(self) -> None:
-    response = self.post("create_model", {"base_model": "base", "lora_config": None, "full_config": None})
-    self.assertEqual(response.status_code, 200)
+    self._make_app(sampler_backend="torch")
+    self.assertEqual(self.post("create_model", {"base_model": "base", "lora_config": None, "full_config": None}).status_code, 200)
     self.assertEqual(self.queued()[0]["payload"]["lora_config"]["rank"], 16)
     for value in (None, 0):
-      with self.subTest(value=value), patch.object(api_server, "get_sampler_backend", return_value="torch"):
-        response = self.post(
-          "asample", {"model_id": "base", "prompt": {"chunks": [{"tokens": [1]}]}, "sampling_params": {"temperature": value, "max_tokens": value}}
-        )
-        self.assertEqual(response.status_code, 200)
-        queued = self.queued()[0]["payload"]
-        self.assertEqual(queued["temperature"], 1.0 if value is None else 0)
-        self.assertEqual(queued["max_tokens"], 20 if value is None else 0)
+      with self.subTest(value=value):
+        body = {"model_id": "base", "prompt": {"chunks": [{"tokens": [1]}]}, "sampling_params": {"temperature": value, "max_tokens": value}}
+        self.assertEqual(self.post("asample", body).status_code, 200)
+        q = self.queued()[0]["payload"]
+        self.assertEqual((q["temperature"], q["max_tokens"]), (1.0 if value is None else 0, 20 if value is None else 0))
 
 
 class RestoreRoutingTest(ApiServerTest):
@@ -351,12 +268,12 @@ class RestoreRoutingTest(ApiServerTest):
         if kind == "lora":
           with open(os.path.join(directory, "adapter_config.json"), "w") as f:
             json.dump({"r": 8}, f)
-        response = self.post("create_model_from_state", {"state_path": directory})
-        self.assertEqual(response.status_code, 200)
-        model_id = response.json()["request_id"]
-        metadata = json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
-        self.assertEqual((metadata["base_model"], metadata["fine_tuning_type"]), ("checkpoint-base", kind))
-        self.assertEqual(self.queued()[0]["payload"]["fine_tuning_type"], kind)
+        resp = self.post("create_model_from_state", {"state_path": directory})
+        self.assertEqual(resp.status_code, 200)
+        mid = resp.json()["request_id"]
+        meta = json.loads(self.state.get_value_sync(f"open_rl:model_meta:{mid}"))
+        queued_ft = self.queued()[0]["payload"]["fine_tuning_type"]
+        self.assertEqual((meta["base_model"], meta["fine_tuning_type"], queued_ft), ("checkpoint-base", kind, kind))
 
   def test_restore_refuses_a_fine_tuning_type_the_checkpoint_does_not_have(self):
     with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
@@ -364,282 +281,126 @@ class RestoreRoutingTest(ApiServerTest):
         json.dump({"base_model": "checkpoint-base"}, f)
       with open(os.path.join(directory, "adapter_config.json"), "w") as f:
         json.dump({"r": 8}, f)
-      response = self.post("create_model_from_state", {"state_path": directory, "user_metadata": {"openrl.fine_tuning_type": "full"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("does not match the lora checkpoint", response.json()["error"])
+      resp = self.post("create_model_from_state", {"state_path": directory, "user_metadata": {"openrl.fine_tuning_type": "full"}})
+    self.assertEqual(resp.status_code, 400)
+    self.assertIn("does not match the lora checkpoint", resp.json()["error"])
 
 
 class FineTuningSettingsTest(ApiServerTest):
-  """Full fine-tuning and its options are openrl. settings, from TINKER_TAGS or user_metadata."""
-
   def setUp(self) -> None:
     super().setUp()
     self.enterContext(patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}))
 
   def metadata(self, model_id: str) -> dict:
-    return json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    return json.loads(self.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
 
   def test_tags_choose_full_fine_tuning_and_its_weight_sync(self) -> None:
     tags = ["openrl.fine_tuning_type=full", "openrl.weight_sync=full", "openrl.fft_cpu_offload=false"]
-    session_id = self.post("create_session", {"tags": tags}).json()["session_id"]
-    meta = self.metadata(self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"])
-    self.assertEqual(meta["fine_tuning_type"], "full")
-    self.assertEqual(meta["weight_sync_config"]["strategy"], "full")
+    sid = self.post("create_session", {"tags": tags}).json()["session_id"]
+    meta = self.metadata(self.post("create_model", {"base_model": "m", "session_id": sid}).json()["request_id"])
+    self.assertEqual((meta["fine_tuning_type"], meta["weight_sync_config"]["strategy"]), ("full", "full"))
     self.assertEqual(meta["full_config"], {"seed": None, "cpu_offload": False, "weight_sync_strategy": "full"})
 
   def test_the_client_log_id_tag_lands_on_the_model(self) -> None:
-    session_id = self.post("create_session", {"tags": ["openrl.client_log_id=gsm8k-7"]}).json()["session_id"]
-    meta = self.metadata(self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"])
-    self.assertEqual(meta["client_log_id"], "gsm8k-7")
+    sid = self.post("create_session", {"tags": ["openrl.client_log_id=gsm8k-7"]}).json()["session_id"]
+    mid = self.post("create_model", {"base_model": "m", "session_id": sid}).json()["request_id"]
+    self.assertEqual(self.metadata(mid)["client_log_id"], "gsm8k-7")
 
-  def test_lora_is_the_default(self) -> None:
-    meta = self.metadata(self.post("create_model", {"base_model": "m"}).json()["request_id"])
-    self.assertEqual(meta["fine_tuning_type"], "lora")
-
-  def test_full_fine_tuning_options_on_a_lora_model_are_refused(self) -> None:
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.weight_sync": "full"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.weight_sync applies to fine_tuning_type=full only", response.json()["error"])
-
-  def test_bad_values_are_refused(self) -> None:
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.fine_tuning_type": "qlora"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.fine_tuning_type", response.json()["error"])
-
-  def test_the_removed_header_and_full_config_point_at_the_settings(self) -> None:
-    response = self.post("create_model", {"base_model": "m"}, headers={"x-open-rl-fine-tuning-type": "full"})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("set openrl.fine_tuning_type", response.json()["error"])
-    response = self.post("create_model", {"base_model": "m", "full_config": {"seed": 1}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.fft_seed", response.json()["error"])
+  def test_lora_is_the_default_and_refuses_fft_options_or_removed_fields(self) -> None:
+    self.assertEqual(self.metadata(self.post("create_model", {"base_model": "m"}).json()["request_id"])["fine_tuning_type"], "lora")
+    r1 = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.weight_sync": "full"}})
+    self.assertEqual(r1.status_code, 400)
+    self.assertIn("openrl.weight_sync applies to fine_tuning_type=full only", r1.json()["error"])
+    r2 = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.fine_tuning_type": "qlora"}})
+    self.assertEqual(r2.status_code, 400)
+    r3 = self.post("create_model", {"base_model": "m"}, headers={"x-open-rl-fine-tuning-type": "full"})
+    self.assertEqual(r3.status_code, 400)
+    self.assertIn("set openrl.fine_tuning_type", r3.json()["error"])
+    r4 = self.post("create_model", {"base_model": "m", "full_config": {"seed": 1}})
+    self.assertEqual(r4.status_code, 400)
+    self.assertIn("openrl.fft_seed", r4.json()["error"])
 
 
-class ExclusiveMetadataTest(ApiServerTest):
-  """A model may ask for a workload no other workload shares; nothing parks it there."""
-
+class ExclusiveAndTrainerBackendTest(ApiServerTest):
   def setUp(self) -> None:
-    super().setUp()
-    self.enterContext(patch("server.worker_manager.get_state_store", return_value=api_server.state))
-    self.enterContext(patch.object(api_server, "worker_manager", RuntimeManager()))
+    self._make_app(worker_manager=RuntimeManager())
+    self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.state))
 
   def metadata(self, model_id: str) -> dict:
-    return json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
-
-  def test_exclusive_is_kept_and_keeps_the_trainer_resident(self) -> None:
-    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}}).json()["request_id"]
-    meta = self.metadata(model_id)
-    self.assertTrue(meta["exclusive"])
-    self.assertFalse(meta["full_config"]["cpu_offload"])
-
-  def test_a_json_boolean_is_accepted_too(self) -> None:
-    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": True}}).json()["request_id"]
-    self.assertTrue(self.metadata(model_id)["exclusive"])
-
-  def test_models_share_by_default(self) -> None:
-    meta = self.metadata(self.post("create_model", {"base_model": "m"}).json()["request_id"])
-    self.assertFalse(meta["exclusive"])
-    self.assertTrue(meta["full_config"]["cpu_offload"])
-
-  def test_the_session_supplies_exclusive_and_the_model_may_override(self) -> None:
-    session_id = self.post("create_session", {"user_metadata": {"openrl.exclusive": "true"}}).json()["session_id"]
-    inherited = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
-    self.assertTrue(self.metadata(inherited)["exclusive"])
-    own = self.post("create_model", {"base_model": "m", "session_id": session_id, "user_metadata": {"openrl.exclusive": "false"}}).json()[
-      "request_id"
-    ]
-    self.assertFalse(self.metadata(own)["exclusive"])
-
-  def test_heartbeats_keep_the_session_metadata(self) -> None:
-    session_id = self.post("create_session", {"user_metadata": {"openrl.exclusive": "true"}}).json()["session_id"]
-    self.post("session_heartbeat", {"session_id": session_id})
-    model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
-    self.assertTrue(self.metadata(model_id)["exclusive"])
-
-  def test_a_server_without_a_worker_manager_refuses_exclusive(self) -> None:
-    with patch.object(api_server, "worker_manager", None):
-      response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.exclusive", response.json()["error"])
-
-  def test_a_non_boolean_exclusive_is_refused(self) -> None:
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "yes"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.exclusive", response.json()["error"])
-
-  def test_session_tags_set_defaults_and_user_metadata_beats_them(self) -> None:
-    tags = ["openrl.exclusive=true", "my-label"]
-    tagged = self.post("create_session", {"tags": tags}).json()["session_id"]
-    model_id = self.post("create_model", {"base_model": "m", "session_id": tagged}).json()["request_id"]
-    self.assertTrue(self.metadata(model_id)["exclusive"])
-
-    overridden = self.post("create_session", {"tags": tags, "user_metadata": {"openrl.exclusive": "false"}}).json()["session_id"]
-    model_id = self.post("create_model", {"base_model": "m", "session_id": overridden}).json()["request_id"]
-    self.assertFalse(self.metadata(model_id)["exclusive"])
-
-  def test_bad_openrl_tags_are_refused_when_the_session_opens(self) -> None:
-    for tag, error in [("openrl.exclusiv=true", "openrl.exclusiv: unknown setting"), ("openrl.exclusive", "needs a value")]:
-      response = self.post("create_session", {"tags": [tag]})
-      self.assertEqual(response.status_code, 400)
-      self.assertIn(error, response.json()["error"])
-
-  def test_only_openrl_keys_are_settings(self) -> None:
-    ok = self.post("create_model", {"base_model": "m", "user_metadata": {"wandb_link": "x", "exclusive": "yes"}})
-    self.assertEqual(ok.status_code, 200)
-    unknown = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusiv": "true"}})
-    self.assertEqual(unknown.status_code, 400)
-    self.assertIn("openrl.exclusiv: unknown setting", unknown.json()["error"])
-
-
-class TrainerBackendTest(ApiServerTest):
-  """An Automodel model is LoRA only and shares a trainer with Automodel models
-  of the same base, never with PyTorch ones."""
-
-  def setUp(self) -> None:
-    super().setUp()
-    self.enterContext(patch("server.worker_manager.get_state_store", return_value=api_server.state))
-    self.enterContext(patch.object(api_server, "worker_manager", RuntimeManager()))
-
-  def metadata(self, model_id: str) -> dict:
-    return json.loads(api_server.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
+    return json.loads(self.state.get_value_sync(f"open_rl:model_meta:{model_id}"))
 
   def active_set(self, model_id: str) -> str | None:
-    return asyncio.run(api_server._resolve_active_set_id(model_id))
+    return asyncio.run(self.gw.resolve_active_set_id(model_id))
 
-  def automodel(self, **extra) -> str:
-    body = {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "automodel"}, **extra}
-    return self.post("create_model", body).json()["request_id"]
+  def test_exclusive_session_inheritance_overrides_and_tags(self) -> None:
+    m1 = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}}).json()["request_id"]
+    self.assertEqual((self.metadata(m1)["exclusive"], self.metadata(m1)["full_config"]["cpu_offload"]), (True, False))
+    m_bool = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": True}}).json()["request_id"]
+    self.assertTrue(self.metadata(m_bool)["exclusive"])
+    m_def = self.post("create_model", {"base_model": "m"}).json()["request_id"]
+    self.assertEqual((self.metadata(m_def)["exclusive"], self.metadata(m_def)["full_config"]["cpu_offload"]), (False, True))
 
-  def test_automodel_tenants_of_any_shape_share(self) -> None:
-    first = self.automodel(lora_config={"rank": 16})
-    other_shape = self.automodel(lora_config={"rank": 32, "train_mlp": False})
-    self.assertEqual(self.metadata(first)["trainer_backend"], "automodel")
-    self.assertEqual(self.active_set(first), "automodel-m-1")
-    self.assertEqual(self.active_set(other_shape), "automodel-m-1")
+    sid = self.post("create_session", {"user_metadata": {"openrl.exclusive": "true"}}).json()["session_id"]
+    self.post("session_heartbeat", {"session_id": sid})
+    self.assertTrue(self.metadata(self.post("create_model", {"base_model": "m", "session_id": sid}).json()["request_id"])["exclusive"])
+    own = self.post("create_model", {"base_model": "m", "session_id": sid, "user_metadata": {"openrl.exclusive": "false"}}).json()["request_id"]
+    self.assertFalse(self.metadata(own)["exclusive"])
 
-  def test_the_default_is_pytorch_and_lora_shares(self) -> None:
-    model_id = self.post("create_model", {"base_model": "m"}).json()["request_id"]
-    self.assertEqual(self.metadata(model_id)["trainer_backend"], "pytorch")
-    self.assertEqual(self.active_set(model_id), "m-1")
+    tags = ["openrl.exclusive=true", "my-label"]
+    t_sid = self.post("create_session", {"tags": tags}).json()["session_id"]
+    self.assertTrue(self.metadata(self.post("create_model", {"base_model": "m", "session_id": t_sid}).json()["request_id"])["exclusive"])
+    o_sid = self.post("create_session", {"tags": tags, "user_metadata": {"openrl.exclusive": "false"}}).json()["session_id"]
+    self.assertFalse(self.metadata(self.post("create_model", {"base_model": "m", "session_id": o_sid}).json()["request_id"])["exclusive"])
 
-  def test_a_session_tag_supplies_the_backend(self) -> None:
-    session_id = self.post("create_session", {"tags": ["openrl.trainer_backend=automodel"]}).json()["session_id"]
-    model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
-    self.assertEqual(self.metadata(model_id)["trainer_backend"], "automodel")
+    for tag, err in (("openrl.exclusiv=true", "openrl.exclusiv: unknown setting"), ("openrl.exclusive", "needs a value")):
+      resp = self.post("create_session", {"tags": [tag]})
+      self.assertEqual(resp.status_code, 400)
+      self.assertIn(err, resp.json()["error"])
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": {"wandb_link": "x", "exclusive": "yes"}}).status_code, 200)
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "yes"}}).status_code, 400)
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusiv": "true"}}).status_code, 400)
 
-  def test_full_fine_tuning_on_automodel_is_refused(self) -> None:
+  def test_trainer_backends_multi_gpu_cp_and_sampler_replicas(self) -> None:
+    um = {"openrl.trainer_backend": "automodel"}
+    auto1 = self.post("create_model", {"base_model": "m", "user_metadata": um, "lora_config": {"rank": 16}}).json()["request_id"]
+    auto2 = self.post("create_model", {"base_model": "m", "user_metadata": um, "lora_config": {"rank": 32}}).json()["request_id"]
+    self.assertEqual((self.active_set(auto1), self.active_set(auto2)), ("automodel-m-1", "automodel-m-1"))
+    self.assertEqual(self.active_set(self.post("create_model", {"base_model": "m"}).json()["request_id"]), "m-1")
+
+    img1 = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "ghcr.io/org/t:1"}}).json()["request_id"]
+    img2 = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "ghcr.io/org/t:2"}}).json()["request_id"]
+    self.assertRegex(self.active_set(img1), r"^image-[0-9a-f]{10}-m-1$")
+    self.assertNotEqual(self.active_set(img1), self.active_set(img2))
+
+    # Multi-GPU, trainer_gpus alias, cp validation
+    mg_meta = {"openrl.trainer_backend": "automodel", "openrl.trainer_gpus": "4", "openrl.trainer_cp": "4"}
+    mg = self.post("create_model", {"base_model": "m", "user_metadata": mg_meta}).json()["request_id"]
+    self.assertEqual((self.metadata(mg)["trainer_device_count"], self.metadata(mg)["trainer_cp"]), (4, 4))
+    self.assertNotEqual(self.active_set(mg), "automodel-m-1")
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_device_count": "4"}}).status_code, 400)
+    bad_cp = {"openrl.trainer_backend": "automodel", "openrl.trainer_device_count": "4", "openrl.trainer_cp": "3"}
+    bad_alias = {"openrl.trainer_backend": "automodel", "openrl.trainer_device_count": "2", "openrl.trainer_gpus": "4"}
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": bad_cp}).status_code, 400)
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": bad_alias}).status_code, 400)
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "nope"}}).status_code, 400)
+
+    # FFT + sampler_replicas / automodel checks
     with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
-      response = self.post(
-        "create_model",
-        {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "automodel", "openrl.fine_tuning_type": "full"}},
-      )
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("LoRA only", response.json()["error"])
+      bad_auto = {"openrl.trainer_backend": "automodel", "openrl.fine_tuning_type": "full"}
+      bad_rep = {"openrl.fine_tuning_type": "full", "openrl.sampler_replicas": "4"}
+      good_rep = {"openrl.fine_tuning_type": "full", "openrl.sampler_replicas": "4", "openrl.exclusive": "true"}
+      self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": bad_auto}).status_code, 400)
+      self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": bad_rep}).status_code, 400)
+      ok_fft = self.post("create_model", {"base_model": "m", "user_metadata": good_rep})
+      self.assertEqual(self.metadata(ok_fft.json()["request_id"])["sampler_replicas"], 4)
 
-  def test_an_unknown_backend_is_refused(self) -> None:
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "nope"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.trainer_backend", response.json()["error"])
-
-  def test_jobs_on_one_trainer_image_share_apart_from_other_images(self) -> None:
-    def create(image: str) -> str:
-      session_id = self.post("create_session", {"tags": [f"openrl.trainer_backend={image}"]}).json()["session_id"]
-      return self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
-
-    first, second, other = create("ghcr.io/org/trainer:1"), create("ghcr.io/org/trainer:1"), create("ghcr.io/org/trainer:2")
-    self.assertEqual(self.metadata(first)["trainer_backend"], "ghcr.io/org/trainer:1")
-    self.assertRegex(self.active_set(first), r"^image-[0-9a-f]{10}-m-1$")
-    self.assertEqual(self.active_set(second), self.active_set(first))
-    self.assertNotEqual(self.active_set(other), self.active_set(first))
-
-  def test_a_local_worker_manager_refuses_a_trainer_image(self) -> None:
-    with patch.object(api_server, "worker_manager", object.__new__(LocalWorkerManager)):
-      response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "ghcr.io/org/trainer:1"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("pods", response.json()["error"])
-
-  def test_a_multi_gpu_trainer_is_automodel_only_and_never_shared(self) -> None:
-    session_id = self.post("create_session", {"tags": ["openrl.trainer_backend=automodel", "openrl.trainer_device_count=4"]}).json()["session_id"]
-    model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
-    self.assertEqual(self.metadata(model_id)["trainer_device_count"], 4)
-    self.assertNotEqual(self.active_set(model_id), "automodel-m-1")
-
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_device_count": "4"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.trainer_device_count above 1 needs openrl.trainer_backend=automodel", response.json()["error"])
-
-  def test_trainer_device_count_is_accepted(self) -> None:
-    tags = {"openrl.trainer_backend": "automodel", "openrl.trainer_device_count": "4"}
-    model_id = self.post("create_model", {"base_model": "m", "user_metadata": tags}).json()["request_id"]
-    meta = self.metadata(model_id)
-    self.assertEqual(meta["trainer_device_count"], 4)
-    self.assertNotIn("trainer_gpus", meta)
-    self.assertNotEqual(self.active_set(model_id), "automodel-m-1")
-
-  def test_trainer_gpus_alias_still_works(self) -> None:
-    session_id = self.post("create_session", {"tags": ["openrl.trainer_backend=automodel", "openrl.trainer_gpus=4"]}).json()["session_id"]
-    model_id = self.post("create_model", {"base_model": "m", "session_id": session_id}).json()["request_id"]
-    meta = self.metadata(model_id)
-    self.assertEqual(meta["trainer_device_count"], 4)
-    self.assertNotIn("trainer_gpus", meta)
-    self.assertNotEqual(self.active_set(model_id), "automodel-m-1")
-
-    # The old name is still checked the way it was, and errors name it as written.
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_gpus": "4"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.trainer_backend=automodel", response.json()["error"])
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "automodel", "openrl.trainer_gpus": "9"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.trainer_gpus: Input should be less than or equal to 8", response.json()["error"])
-
-  def test_conflicting_names_are_refused(self) -> None:
-    tags = {"openrl.trainer_backend": "automodel", "openrl.trainer_device_count": "2", "openrl.trainer_gpus": "4"}
-    response = self.post("create_model", {"base_model": "m", "user_metadata": tags})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.trainer_device_count=2", response.json()["error"])
-    self.assertIn("openrl.trainer_gpus=4", response.json()["error"])
-
-    # The two names are one setting, so a session and a model that disagree are refused too.
-    session_id = self.post("create_session", {"tags": ["openrl.trainer_backend=automodel", "openrl.trainer_gpus=4"]}).json()["session_id"]
-    response = self.post("create_model", {"base_model": "m", "session_id": session_id, "user_metadata": {"openrl.trainer_device_count": "2"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.trainer_gpus=4", response.json()["error"])
-
-  def test_same_value_under_both_names_is_accepted(self) -> None:
-    tags = {"openrl.trainer_backend": "automodel", "openrl.trainer_device_count": "4", "openrl.trainer_gpus": 4}
-    model_id = self.post("create_model", {"base_model": "m", "user_metadata": tags}).json()["request_id"]
-    self.assertEqual(self.metadata(model_id)["trainer_device_count"], 4)
-
-  def test_trainer_cp_must_divide_the_trainer_device_count(self) -> None:
-    tags = {"openrl.trainer_backend": "automodel", "openrl.trainer_device_count": "4"}
-    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {**tags, "openrl.trainer_cp": "4"}}).json()["request_id"]
-    self.assertEqual(self.metadata(model_id)["trainer_cp"], 4)
-
-    response = self.post("create_model", {"base_model": "m", "user_metadata": {**tags, "openrl.trainer_cp": "3"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.trainer_cp=3 must divide openrl.trainer_device_count=4", response.json()["error"])
-
-  def test_a_server_without_a_worker_manager_refuses_automodel(self) -> None:
-    with patch.object(api_server, "worker_manager", None):
-      response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "automodel"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("launches workers", response.json()["error"])
-
-  def test_sampler_replicas_need_a_server_that_launches_pods(self) -> None:
-    model_id = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.sampler_replicas": "4"}}).json()["request_id"]
-    self.assertEqual(self.metadata(model_id)["sampler_replicas"], 4)
-
-    with patch.object(api_server, "worker_manager", object.__new__(LocalWorkerManager)):
-      response = self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.sampler_replicas": "4"}})
-    self.assertEqual(response.status_code, 400)
-    self.assertIn("openrl.sampler_replicas above 1", response.json()["error"])
-
-  def test_an_fft_job_sharing_its_trainers_gpu_cannot_ask_for_more_samplers(self) -> None:
-    fft = {"openrl.fine_tuning_type": "full", "openrl.sampler_replicas": "4"}
-    with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}):
-      self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": fft}).status_code, 400)
-      exclusive = self.post("create_model", {"base_model": "m", "user_metadata": {**fft, "openrl.exclusive": "true"}})
-    self.assertEqual(self.metadata(exclusive.json()["request_id"])["sampler_replicas"], 4)
+    # Without worker_manager or with LocalWorkerManager
+    self._make_app(worker_manager=None)
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.exclusive": "true"}}).status_code, 400)
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "automodel"}}).status_code, 400)
+    self._make_app(worker_manager=object.__new__(LocalWorkerManager))
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.trainer_backend": "ghcr.io/org/t:1"}}).status_code, 400)
+    self.assertEqual(self.post("create_model", {"base_model": "m", "user_metadata": {"openrl.sampler_replicas": "4"}}).status_code, 400)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
-from server import api_server
+from server.api_server import create_app
 from server.estimator import footprint
 from server.model_metadata import TrainingModelMetadata, decode_model_metadata
 from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager
@@ -569,12 +569,9 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
     with (
       patch.dict(os.environ, env),
       patch("server.worker_manager.get_state_store", return_value=state),
-      patch.object(api_server, "store", store),
-      patch.object(api_server, "state", state),
-      patch.object(api_server, "get_store", return_value=store),
-      patch.object(api_server, "worker_manager", SchedulerWorkerManager(custom_api=api, apps_api=FakeApi(), networking_api=FakeApi())),
     ):
-      async with asgi_client() as client:
+      app = create_app(store=store, state=state, worker_manager=SchedulerWorkerManager(custom_api=api, apps_api=FakeApi(), networking_api=FakeApi()))
+      async with asgi_client(app) as client:
         for model_id in ("lora-a", "fft-a", "lora-b"):
           await post_json(client, "create_sampling_session", {"model_path": f"tinker://{model_id}/sampler_weights/checkpoint"})
 

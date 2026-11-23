@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from server import api_server
+from server.api import paths
+from server.api_server import CreateModelRequest, create_app
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStateStore
 from server.worker_manager import LocalWorkerManager
@@ -80,14 +81,12 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
     self.worker_manager = WorkerManagerStub()
-    self.enterContext(patch.object(api_server, "store", self.store))
-    self.enterContext(patch.object(api_server, "state", self.store))
-    self.enterContext(patch.object(api_server, "worker_manager", self.worker_manager))
-    self.enterContext(patch.object(api_server, "session_registry", SessionRegistry(self.store)))
+    self.app = create_app(store=self.store, state=self.store, worker_manager=self.worker_manager, session_registry=SessionRegistry(self.store))
+    self.gw = self.app.state.server
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.store))
 
   async def asyncSetUp(self) -> None:
-    self.client = await self.enterAsyncContext(asgi_client())
+    self.client = await self.enterAsyncContext(asgi_client(self.app))
     self.session_id = (await self.post("create_session", {}))["session_id"]
 
   async def post(self, path: str, body: dict) -> dict:
@@ -121,7 +120,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self.store.futures[model_id], {"type": "RequestFailedResponse", "error_message": "boom"})
 
   async def test_create_model_from_state_launches_worker_then_enqueues(self) -> None:
-    self.enterContext(patch.object(api_server, "checkpoint_info", return_value={"base_model": "restored-base", "is_lora": True}))
+    self.enterContext(patch.object(paths, "checkpoint_info", return_value={"base_model": "restored-base", "is_lora": True}))
     import json
 
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
@@ -163,8 +162,8 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
           "fine_tuning_type": "full",
         }
       )
-      await api_server.bind_session(self.session_id, "model-x")
-      await api_server.ensure_sampler_launched("model-x")
+      await self.gw.bind_session(self.session_id, "model-x")
+      await self.gw.ensure_sampler_launched("model-x")
 
     self.assertEqual(self.worker_manager.launched_sampler_model_ids, ["model-x"])
 
@@ -204,8 +203,9 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
 
 class ApiServerLifespanTest(unittest.IsolatedAsyncioTestCase):
   async def test_lifespan_full_mode_requires_redis(self) -> None:
+    app = create_app()
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
-      async with api_server.lifespan(api_server.app):
+      async with app.state.server.lifespan(app):
         pass
 
 
@@ -294,112 +294,20 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
 class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
-    self.enterContext(patch.object(api_server, "store", self.store))
-    self.enterContext(patch.object(api_server, "state", self.store))
+    self.gw = create_app(store=self.store, state=self.store).state.server
 
   async def test_extract_and_persist_metadata_from_settings(self) -> None:
     import json
 
     user_metadata = {"openrl.fine_tuning_type": "full", "openrl.weight_sync": "full", "openrl.fft_seed": "7"}
     with patch.dict("os.environ", {"OPEN_RL_ENABLE_FFT": "true"}):
-      model_id, _ = await api_server._extract_and_persist_model_metadata(
-        api_server.CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B", user_metadata=user_metadata)
-      )
+      model_id, _ = await self.gw.extract_and_persist_model_metadata(CreateModelRequest(base_model="Qwen/Qwen2.5-0.5B", user_metadata=user_metadata))
 
     meta_dict = json.loads(self.store.kv_store.get(f"open_rl:model_meta:{model_id}"))
     self.assertEqual(meta_dict["base_model"], "Qwen/Qwen2.5-0.5B")
     self.assertEqual(meta_dict["fine_tuning_type"], "full")
     self.assertEqual(meta_dict["weight_sync_config"]["strategy"], "full")
     self.assertEqual(meta_dict["full_config"], {"seed": 7, "cpu_offload": True, "weight_sync_strategy": "full"})
-
-
-class ApiServerFutureTranslationTest(unittest.TestCase):
-  def test_create_model_result_translates_to_tinker_shape(self) -> None:
-    self.assertEqual(
-      api_server.translate_future_result(
-        {
-          "type": "model_created",
-          "model_id": "model-a",
-          "base_model": "base-model",
-          "fine_tuning_type": "full",
-        }
-      ),
-      {
-        "type": "create_model",
-        "model_id": "model-a",
-        "base_model": "base-model",
-        "is_lora": True,
-        "lora_rank": 16,
-      },
-    )
-
-  def test_create_model_from_state_result_translates_to_tinker_shape(self) -> None:
-    self.assertEqual(
-      api_server.translate_future_result(
-        {
-          "type": "model_loaded_from_state",
-          "model_id": "model-a",
-          "base_model": "base-model",
-          "fine_tuning_type": "full",
-        }
-      ),
-      {
-        "type": "create_model_from_state",
-        "model_id": "model-a",
-        "base_model": "base-model",
-        "is_lora": True,
-        "lora_rank": 16,
-      },
-    )
-
-  def test_lora_create_model_result_translates_rank_to_tinker_shape(self) -> None:
-    self.assertEqual(
-      api_server.translate_future_result(
-        {
-          "type": "model_created",
-          "model_id": "model-a",
-          "base_model": "base-model",
-          "rank": 4,
-          "fine_tuning_type": "lora",
-        }
-      ),
-      {
-        "type": "create_model",
-        "model_id": "model-a",
-        "base_model": "base-model",
-        "is_lora": True,
-        "lora_rank": 4,
-      },
-    )
-
-  def test_internal_future_result_types_translate_to_tinker_types(self) -> None:
-    cases = [
-      ("forward_backward_completed", "forward_backward"),
-      ("optim_step_completed", "optim_step"),
-      ("sample_completed", "sample"),
-      ("state_saved", "save_weights"),
-      ("weights_loaded", "load_weights"),
-      ("sampler_weights_saved", "save_weights_for_sampler"),
-      ("weights_saved", "save_weights"),
-    ]
-
-    for internal_type, public_type in cases:
-      with self.subTest(internal_type=internal_type):
-        self.assertEqual(
-          api_server.translate_future_result({"type": internal_type, "path": "/tmp/x"}),
-          {"type": public_type, "path": "/tmp/x"},
-        )
-
-  def test_save_results_keep_delta_metrics_out_of_the_client_response(self) -> None:
-    """The worker's delta metrics ride on the result for the op record; the SDK's save responses do not carry them."""
-    metrics = {"delta/density_pct": 6.97, "delta/total_elements": 494032768.0}
-    for internal_type in ("state_saved", "sampler_weights_saved", "weights_saved"):
-      with self.subTest(internal_type=internal_type):
-        translated = api_server.translate_future_result({"type": internal_type, "path": "/tmp/x", "metrics": metrics})
-        self.assertNotIn("metrics", translated)
-    # forward_backward keeps its metrics: the client reads them
-    translated = api_server.translate_future_result({"type": "forward_backward_completed", "metrics": {"loss:mean": 1.0}})
-    self.assertEqual(translated["metrics"], {"loss:mean": 1.0})
 
 
 class LocalWorkerManagerSamplerLaunchTest(unittest.TestCase):

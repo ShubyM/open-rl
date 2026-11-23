@@ -1,14 +1,18 @@
 import unittest
 
+from server.api import wire
 from training import commands
-from training.types import Datum
 
 
 class CommandWireFormatTest(unittest.TestCase):
   def test_commands_round_trip_through_the_wire(self) -> None:
+    fb_proto = wire.json_to_fb_proto(
+      {"model_id": "m", "forward_backward_input": {"data": [{"model_input": [1, 2], "loss_fn_inputs": {"target_tokens": [2, 3]}}]}}
+    )
     for command in (
       commands.CreateModel(request_id="r", model_id="m", base_model="base", fine_tuning_type="full", full_config={"cpu_offload": False}),
       commands.CreateModelFromState(request_id="r", model_id="m", state_path="/ckpt", restore_optimizer=True),
+      commands.ForwardBackward(request_id="r", model_id="m", proto_bytes=fb_proto, loss_fn="importance_sampling", forward_only=True),
       commands.OptimStep(request_id="r", model_id="m", adam_params={"learning_rate": 1e-4}),
       commands.Sample(request_id="r", model_id="m", prompt_tokens=[1, 2, 3], max_tokens=4),
       commands.SaveState(request_id="r", model_id="m", state_path="/ckpt", include_optimizer=True, kind="weights"),
@@ -21,31 +25,6 @@ class CommandWireFormatTest(unittest.TestCase):
         self.assertEqual(raw["op"], command.op)
         self.assertEqual(commands.parse_command(raw), command)
 
-  def test_forward_backward_flattens_the_tinker_datum(self) -> None:
-    raw = {
-      "request_id": "r",
-      "model_id": "m",
-      "op": "forward_backward",
-      "loss_fn": "importance_sampling",
-      "forward_only": True,
-      "data": [
-        {
-          "model_input": {"chunks": [{"tokens": [1, 2]}, {"tokens": [3]}]},
-          "loss_fn_inputs": {"target_tokens": [2, 3, 4], "weights": {"data": [1.0, 0.5, 0.25]}},
-        }
-      ],
-    }
-    command = commands.parse_command(raw)
-    self.assertIsInstance(command, commands.ForwardBackward)
-    self.assertTrue(command.forward_only)
-    datum = command.data[0]
-    self.assertEqual(datum.model_input, [1, 2, 3])
-    self.assertEqual(datum.loss_fn_inputs["target_tokens"].data, [2, 3, 4])
-    self.assertEqual(datum.loss_fn_inputs["weights"].data, [1.0, 0.5, 0.25])
-    # Once flat, the datum survives another trip unchanged.
-    self.assertEqual(commands.parse_command(commands.wire(command)), command)
-    self.assertEqual(Datum.model_validate(datum.model_dump()), datum)
-
   def test_unknown_op_is_rejected(self) -> None:
     with self.assertRaises(ValueError):
       commands.parse_command({"request_id": "r", "model_id": "m", "op": "frobnicate"})
@@ -56,15 +35,9 @@ class CommandWireFormatTest(unittest.TestCase):
     self.assertEqual(command.adam_params, {"learning_rate": 0.02})
     self.assertEqual(commands.wire(command)["payload"]["adam_params"], {"learning_rate": 0.02})
 
-  def test_wire_data_is_readable_by_existing_workers(self) -> None:
-    command = commands.ForwardBackward(request_id="r", model_id="m", data=[Datum(model_input=[1, 2], loss_fn_inputs={})])
-    datum = commands.wire(command)["payload"]["data"][0]
-    self.assertEqual([token for chunk in datum["model_input"]["chunks"] for token in chunk["tokens"]], [1, 2])
-
   def test_enqueue_stamp_keeps_the_envelope_existing_workers_accept(self) -> None:
     trace_context = {"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", commands.ENQUEUED_AT_KEY: "1700000000.5"}
     raw = commands.wire(commands.OptimStep(request_id="r", model_id="m", trace_context=trace_context))
-    # A worker from before the stamp forbids any envelope key it does not know.
     self.assertEqual(set(raw), {"op", "request_id", "model_id", "trace_context", "payload"})
     self.assertEqual(commands.parse_command(raw).enqueued_at, 1700000000.5)
 

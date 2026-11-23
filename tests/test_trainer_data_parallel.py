@@ -3,13 +3,15 @@
 import os
 import unittest
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-from training.trainer_worker import BaseTrainerWorker, Datum
+from server.api import wire
+from training.trainer_worker import BaseTrainerWorker
 
 VOCAB = 12
 
@@ -60,12 +62,21 @@ class TableWorker(BaseTrainerWorker):
     return model(target_token_ids)
 
 
-def table_data() -> list[Datum]:
+def table_data() -> list[wire.Datum]:
   # Three datums over two ranks: rank 1 runs one filler pass.
   return [
-    Datum(model_input=[1, 2, 3], loss_fn_inputs={"target_tokens": {"data": [2, 3, 4]}, "weights": {"data": [1.0, 0.5, 0.25]}}),
-    Datum(model_input=[5, 6], loss_fn_inputs={"target_tokens": {"data": [6, 7]}, "weights": {"data": [2.0, 0.75]}}),
-    Datum(model_input=[8], loss_fn_inputs={"target_tokens": {"data": [9]}, "weights": {"data": [1.5]}}),
+    wire.Datum(
+      np.asarray([1, 2, 3], dtype=np.int32),
+      {"target_tokens": np.asarray([2, 3, 4], dtype=np.int64), "weights": np.asarray([1.0, 0.5, 0.25], dtype=np.float32)},
+    ),
+    wire.Datum(
+      np.asarray([5, 6], dtype=np.int32),
+      {"target_tokens": np.asarray([6, 7], dtype=np.int64), "weights": np.asarray([2.0, 0.75], dtype=np.float32)},
+    ),
+    wire.Datum(
+      np.asarray([8], dtype=np.int32),
+      {"target_tokens": np.asarray([9], dtype=np.int64), "weights": np.asarray([1.5], dtype=np.float32)},
+    ),
   ]
 
 
@@ -74,11 +85,11 @@ def run_fsdp_data_parallel(rank: int, world_size: int, port: int) -> None:
   dist.init_process_group("gloo", rank=rank, world_size=world_size)
   try:
     reference_model = TableModel()
-    expected = TableWorker(None).forward_backward(reference_model, table_data(), "cross_entropy")
+    expected = wire.fb_output_to_json(TableWorker(None).forward_backward(reference_model, table_data(), "cross_entropy")["proto_bytes"])
 
     mesh = init_device_mesh("cpu", (world_size,))
     model = fully_shard(TableModel(), mesh=mesh)
-    actual = TableWorker(mesh.get_group()).forward_backward(model, table_data(), "cross_entropy")
+    actual = wire.fb_output_to_json(TableWorker(mesh.get_group()).forward_backward(model, table_data(), "cross_entropy")["proto_bytes"])
 
     # FSDP2 averaged the gradient over the mesh; the loss scaling must turn
     # that average back into the full-batch sum.

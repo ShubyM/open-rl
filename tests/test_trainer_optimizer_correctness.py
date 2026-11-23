@@ -9,7 +9,10 @@ import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import patch
 
+import numpy as np
 import torch
+
+from server.api import wire
 
 
 def _load_trainer_modules():
@@ -233,14 +236,14 @@ class _TimeSlicerStub:
 
 
 def _datum(model_input, target_tokens, *, weights=None, logprobs=None, advantages=None):
-  loss_fn_inputs = {"target_tokens": {"data": target_tokens}}
+  inputs = {"target_tokens": np.asarray(target_tokens, dtype=np.int64)}
   if weights is not None:
-    loss_fn_inputs["weights"] = {"data": weights}
+    inputs["weights"] = np.asarray(weights, dtype=np.float32)
   if logprobs is not None:
-    loss_fn_inputs["logprobs"] = {"data": logprobs}
+    inputs["logprobs"] = np.asarray(logprobs, dtype=np.float32)
   if advantages is not None:
-    loss_fn_inputs["advantages"] = {"data": advantages}
-  return trainer_worker_module.Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs)
+    inputs["advantages"] = np.asarray(advantages, dtype=np.float32)
+  return wire.Datum(tokens=np.asarray(model_input, dtype=np.int32), inputs=inputs)
 
 
 class TestLoraTargetModules(unittest.TestCase):
@@ -446,9 +449,9 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(config.rank, 2)
     result = store.results["req-a"]
     self.assertEqual(result["model_id"], "adapter-a")
-    self.assertEqual(result["rank"], 2)
-    self.assertEqual(result["fine_tuning_type"], "lora")
-    self.assertEqual(result["type"], "model_created")
+    self.assertEqual(result["lora_rank"], 2)
+    self.assertTrue(result["is_lora"])
+    self.assertEqual(result["type"], "create_model")
 
   async def test_full_processor_create_model_uses_model_worker(self) -> None:
     worker = _RecordingFullWorker()
@@ -478,8 +481,9 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     result = store.results["req-a"]
     self.assertEqual(result["model_id"], "model-a")
     self.assertEqual(result["base_model"], "base-model")
-    self.assertEqual(result["fine_tuning_type"], "full")
-    self.assertEqual(result["type"], "model_created")
+    self.assertEqual(result["lora_rank"], 16)
+    self.assertTrue(result["is_lora"])
+    self.assertEqual(result["type"], "create_model")
 
   async def test_full_processor_saves_sampler_checkpoint_as_full_state(self) -> None:
     worker = _RecordingFullWorker()
@@ -509,12 +513,12 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       {
         "path": "tinker://model-a/sampler_weights/final",
         "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7",
-        "type": "sampler_weights_saved",
+        "type": "save_weights_for_sampler",
       },
     )
 
   async def test_full_processor_sampler_save_records_delta_metrics(self) -> None:
-    """A delta save's density and size travel with the op result, where the command record keeps them."""
+    """A delta save's density and size travel with handle_request for telemetry, and are stripped from the stored SDK future."""
 
     class _DeltaWorker(_RecordingFullWorker):
       def save_state(self, model_id, state_path, include_optimizer=False, kind="state"):
@@ -524,20 +528,20 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     worker = _DeltaWorker()
     store = _FutureStoreStub()
     time_slicer = _TimeSlicerStub()
+    req = {
+      "request_id": "req-a",
+      "model_id": "model-a",
+      "op": "save_weights_for_sampler",
+      "payload": {"path": "tinker://model-a/sampler_weights/final", "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7"},
+    }
     with patch.dict(os.environ, {"OPEN_RL_TMP_DIR": "/tmp/open-rl-test", "REDIS_URL": "redis://localhost:6379"}):
       processor = training_requests_processor_module.TrainingRequestsProcessor(store, worker, "model-a", time_slicer=time_slicer)
-      await processor.process_request(
-        {
-          "request_id": "req-a",
-          "model_id": "model-a",
-          "op": "save_weights_for_sampler",
-          "payload": {"path": "tinker://model-a/sampler_weights/final", "sampling_session_id": "tinker://model-a/sampler_weights/sampler-7"},
-        },
-      )
-    result = store.results["req-a"]
-    self.assertEqual(result["type"], "sampler_weights_saved")
-    self.assertEqual(result["metrics"]["delta/density_pct"], 6.97)
-    self.assertEqual(result["metrics"]["delta/total_elements"], 494032768.0)
+      _, handled = await processor.handle_request(req)
+      await processor.publish_result("req-a", handled)
+    self.assertEqual(handled["type"], "save_weights_for_sampler")
+    self.assertEqual(handled["metrics"]["delta/density_pct"], 6.97)
+    self.assertEqual(handled["metrics"]["delta/total_elements"], 494032768.0)
+    self.assertNotIn("metrics", store.results["req-a"])
 
   async def test_full_processor_requires_redis(self) -> None:
     with patch.dict(os.environ, {"OPEN_RL_ENABLE_FFT": "true"}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL"):
@@ -632,7 +636,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
       await processor.run_once()
 
     self.assertEqual([event[0] for event in events], ["acquire", "release", "set_result"])
-    self.assertEqual(store.results["req-a"]["type"], "model_created")
+    self.assertEqual(store.results["req-a"]["type"], "create_model")
 
 
 class TestTrainerPaddedBatchingMath(unittest.TestCase):
@@ -670,8 +674,8 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     input_ids, attention_mask, input_lengths = worker.pad_model_inputs(data)
     target_token_ids, weights, lengths = worker.pad_targets_and_weights(data, input_lengths)
     logprobs = worker.compute_target_logprobs(model, input_ids, attention_mask, target_token_ids)
-    old_logprobs = worker.pad_sequences([datum.loss_fn_inputs["logprobs"].data for datum in data], lengths, torch.float32)
-    advantages = worker.pad_sequences([datum.loss_fn_inputs["advantages"].data for datum in data], lengths, torch.float32)
+    old_logprobs = worker.pad_sequences([datum.inputs["logprobs"] for datum in data], lengths, torch.float32)
+    advantages = worker.pad_sequences([datum.inputs["advantages"] for datum in data], lengths, torch.float32)
     return logprobs, weights, old_logprobs, advantages, lengths
 
   def test_padded_batch_logprobs_and_losses_match_per_example_math(self) -> None:
@@ -745,7 +749,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     seen = [idx for batch in batches for idx, _datum in batch]
     self.assertCountEqual(seen, range(len(data)))
     for batch in batches:
-      padded_tokens = max(len(datum.model_input) for _idx, datum in batch) * len(batch)
+      padded_tokens = max(len(datum.tokens) for _idx, datum in batch) * len(batch)
       self.assertTrue(len(batch) == 1 or padded_tokens <= 6)
 
   def test_long_sequence_starts_a_new_pass_instead_of_padding_short_ones(self) -> None:
@@ -761,14 +765,14 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     data = self._data()
 
     with patch.dict(os.environ, {"OPEN_RL_TRAIN_TOKEN_BUDGET": "12"}):
-      result = worker.forward_backward(model, data, "cross_entropy")
+      result = wire.fb_output_to_json(worker.forward_backward(model, data, "cross_entropy")["proto_bytes"])
 
     self.assertEqual(len(result["loss_fn_outputs"]), len(data))
     self.assertGreater(len(model.calls), 0)
     self.assertTrue(any(call[0].shape[0] > 1 for call in model.calls))
     for datum, output in zip(data, result["loss_fn_outputs"], strict=True):
       logprobs = output["logprobs"]
-      self.assertEqual(logprobs["shape"], [min(len(datum.model_input), len(datum.loss_fn_inputs["target_tokens"].data))])
+      self.assertEqual(logprobs["shape"], [min(len(datum.tokens), len(datum.inputs["target_tokens"]))])
 
   def test_forward_backward_batches_without_a_budget_setting(self) -> None:
     worker = self._worker()
@@ -787,7 +791,7 @@ class TestTrainerPaddedBatchingMath(unittest.TestCase):
     worker.model = _LogitModelStub()
     data = self._data()
 
-    result = worker.forward_backward(data, "cross_entropy")
+    result = wire.fb_output_to_json(worker.forward_backward(data, "cross_entropy")["proto_bytes"])
 
     self.assertEqual(len(result["loss_fn_outputs"]), len(data))
     self.assertGreater(len(worker.model.calls), 0)

@@ -1,38 +1,11 @@
-"""Wire types shared by the API server, the request queue and the trainer workers.
+"""Training configuration types shared by the API server, commands, and trainer workers.
 
-Nothing here imports torch, so the API server can build and validate commands
-without loading a training stack.
+Nothing here imports torch, so the API server can validate configs without loading a training stack.
 """
 
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, model_validator
-
-
-class TensorData(BaseModel):
-  data: list[int] | list[float]
-
-
-class Datum(BaseModel):
-  """One training example: input tokens and the per-position loss inputs."""
-
-  model_input: list[int]
-  loss_fn_inputs: dict[str, TensorData]
-
-  @model_validator(mode="before")
-  @classmethod
-  def flatten_wire_format(cls, raw: Any) -> Any:
-    """Accept the Tinker wire datum, whose model_input is a list of token chunks
-    and whose loss_fn_inputs may be bare lists."""
-    if not isinstance(raw, dict) or not isinstance(raw.get("model_input"), dict):
-      return raw
-    tokens: list[int] = []
-    for chunk in raw["model_input"].get("chunks", []):
-      tokens.extend(chunk.get("tokens", []))
-    loss_fn_inputs = {
-      key: value if isinstance(value, dict) and "data" in value else {"data": value} for key, value in raw.get("loss_fn_inputs", {}).items()
-    }
-    return {"model_input": tokens, "loss_fn_inputs": loss_fn_inputs}
+from pydantic import BaseModel
 
 
 class LoraConfig(BaseModel):

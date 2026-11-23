@@ -8,9 +8,10 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from server import training_requests_processor as trp
+from server.api import wire
 from server.store import InMemoryStore
 from training import commands
-from training.types import Datum, FFTConfig, TensorData
+from training.types import FFTConfig
 
 
 class PerModelStore(InMemoryStore):
@@ -50,13 +51,20 @@ class ExclusiveTrainerTest(unittest.IsolatedAsyncioTestCase):
   async def test_a_full_step_runs_without_a_time_slicer(self) -> None:
     store = PerModelStore()
     row = [3, 5, 8, 13, 21, 34]
-    datum = Datum(model_input=row[:-1], loss_fn_inputs={"target_tokens": TensorData(data=row[1:]), "weights": TensorData(data=[1.0] * 5)})
+    pb_bytes = wire.json_to_fb_proto(
+      {
+        "model_id": "run-a",
+        "forward_backward_input": {
+          "data": [{"model_input": row[:-1], "loss_fn_inputs": {"target_tokens": row[1:], "weights": [1.0] * 5}}],
+        },
+      }
+    )
     with tempfile.TemporaryDirectory() as tmp:
       steps = [
         commands.CreateModel(
           request_id="create", model_id="run-a", base_model="tiny", fine_tuning_type="full", full_config=FFTConfig(cpu_offload=False)
         ),
-        commands.ForwardBackward(request_id="fb", model_id="run-a", data=[datum]),
+        commands.ForwardBackward(request_id="fb", model_id="run-a", proto_bytes=pb_bytes),
         commands.OptimStep(request_id="optim", model_id="run-a", adam_params={"learning_rate": 1e-3}),
         commands.SaveState(request_id="save", model_id="run-a", state_path=os.path.join(tmp, "state")),
       ]

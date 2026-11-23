@@ -8,6 +8,7 @@ from typing import Any
 
 import redis.asyncio as redis
 
+from server.store import encode_wire_dict
 from server.telemetry import sample_answered
 
 RESULT_TTL_SECONDS = 300
@@ -104,7 +105,7 @@ class SamplingStore:
       if not await pipe.xrange(stream, entry_id, entry_id):
         return False
       pipe.multi()
-      pipe.rpush(future, json.dumps(result))
+      pipe.rpush(future, encode_wire_dict(result))
       pipe.expire(future, RESULT_TTL_SECONDS)
       pipe.xdel(stream, entry_id)
       if key := record.get("idempotency_key"):

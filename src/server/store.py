@@ -1,6 +1,7 @@
 """Request transport and generic state backends, sharing Redis connections."""
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -13,6 +14,27 @@ from typing import Any
 import redis as sync_redis
 import redis.asyncio as redis
 from redis.exceptions import TimeoutError as RedisTimeoutError
+
+
+def encode_wire_dict(obj: dict[str, Any]) -> str:
+  """Serialize request/result dicts for UTF-8 Redis, base64-framing raw `proto_bytes` without `.tolist()`."""
+  if isinstance(raw := obj.get("proto_bytes"), (bytes, bytearray, memoryview)):
+    return json.dumps({**{k: v for k, v in obj.items() if k != "proto_bytes"}, "proto_b64": base64.b64encode(raw).decode("ascii")})
+  if isinstance(payload := obj.get("payload"), dict) and isinstance(raw := payload.get("proto_bytes"), (bytes, bytearray, memoryview)):
+    new_payload = {**{k: v for k, v in payload.items() if k != "proto_bytes"}, "proto_b64": base64.b64encode(raw).decode("ascii")}
+    return json.dumps({**obj, "payload": new_payload})
+  return json.dumps(obj)
+
+
+def decode_wire_dict(raw: str | bytes) -> dict[str, Any]:
+  """Deserialize a Redis wire dict, restoring `proto_b64` back into raw `proto_bytes`."""
+  obj = json.loads(raw)
+  if isinstance(obj, dict):
+    if isinstance(b64 := obj.pop("proto_b64", None), str):
+      obj["proto_bytes"] = base64.b64decode(b64)
+    if isinstance(payload := obj.get("payload"), dict) and isinstance(b64 := payload.pop("proto_b64", None), str):
+      payload["proto_bytes"] = base64.b64decode(b64)
+  return obj
 
 
 class RequestStore(ABC):
@@ -142,7 +164,7 @@ class RedisStore(RequestStore):
     active_list = f"open_rl:active_tenants:{active_set_id}" if active_set_id else self.active_list
 
     # 1. Add request to tenant-specific list
-    await self.redis.rpush(queue_key, json.dumps(req_data))
+    await self.redis.rpush(queue_key, encode_wire_dict(req_data))
 
     # 2. Add tenant to active set and list if not already there
     # SADD returns 1 if it was newly added, 0 if it already existed
@@ -182,7 +204,7 @@ class RedisStore(RequestStore):
         item = await self.redis.lpop(queue_key)
         if not item:
           break
-        batch.append(json.loads(item))
+        batch.append(decode_wire_dict(item))
 
       if batch:
         # Round-robin: move the tenant we just served from the head to the tail.
@@ -204,13 +226,13 @@ class RedisStore(RequestStore):
     if not result:
       return []
 
-    batch = [json.loads(result[1])]
+    batch = [decode_wire_dict(result[1])]
 
     while True:
       item = await self.redis.lpop(queue_key)
       if not item:
         break
-      batch.append(json.loads(item))
+      batch.append(decode_wire_dict(item))
 
     q_len = await self.redis.llen(queue_key)
     if q_len == 0:
@@ -225,7 +247,7 @@ class RedisStore(RequestStore):
     key = f"open_rl:future:{req_id}"
     # Keep the list format for existing workers, with one result per request.
     async with self.redis.pipeline(transaction=True) as pipeline:
-      pipeline.rpush(key, json.dumps(result))
+      pipeline.rpush(key, encode_wire_dict(result))
       pipeline.ltrim(key, -1, -1)
       pipeline.expire(key, 300)
       await pipeline.execute()
@@ -240,7 +262,7 @@ class RedisStore(RequestStore):
       raw_result = await self.redis.lindex(key, -1)
 
       if raw_result:
-        payload = json.loads(raw_result)
+        payload = decode_wire_dict(raw_result)
         await self.redis.expire(key, 300)
         return payload
 

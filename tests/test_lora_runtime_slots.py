@@ -1,10 +1,11 @@
 import asyncio
 import os
 import unittest
-from collections import defaultdict
 from unittest.mock import patch
 
 from server import api_server
+from server.api import settings
+from server.api_server import create_app
 from server.model_metadata import get_model_metadata
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStateStore, InMemoryStore
@@ -29,19 +30,14 @@ class LoraRuntimeSlotsTest(unittest.IsolatedAsyncioTestCase):
     self.state = YieldingStateStore()
     self.manager = RuntimeManager()
     self.registry = SessionRegistry(self.state)
-    self.enterContext(patch.object(api_server, "state", self.state))
-    self.enterContext(patch.object(api_server, "store", self.store))
-    self.enterContext(patch.object(api_server, "get_store", return_value=self.store))
+    self.app = create_app(store=self.store, state=self.state, worker_manager=self.manager, session_registry=self.registry)
+    self.gw = self.app.state.server
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.state))
-    self.enterContext(patch.object(api_server, "session_registry", self.registry))
-    self.enterContext(patch.object(api_server, "worker_manager", self.manager))
     # Pools keep requests in Redis, which this test has none of.
     self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "torch", "OPEN_RL_ENABLE_FFT": "true", "OPEN_RL_LORA_JOBS_PER_RUNTIME": "2"}))
-    self.enterContext(patch.object(api_server, "owner_locks", defaultdict(asyncio.Lock)))
-    self.enterContext(patch.object(api_server, "slot_locks", defaultdict(asyncio.Lock)))
 
   async def asyncSetUp(self):
-    self.client = await self.enterAsyncContext(asgi_client())
+    self.client = await self.enterAsyncContext(asgi_client(self.app))
     self.session = (await self.post("create_session", {}))["session_id"]
 
   async def post(self, path, body):
@@ -110,9 +106,9 @@ class LoraRuntimeSlotsTest(unittest.IsolatedAsyncioTestCase):
     async def prune_once_the_session_is_bound():
       while "sess-cold" not in (await get_model_metadata(self.state, job)).session_ids:
         await asyncio.sleep(0)
-      await api_server.prune_runtime_jobs("test-base")
+      await self.gw.prune_runtime_jobs("test-base")
 
-    await asyncio.gather(api_server.bind_session("sess-cold", job), prune_once_the_session_is_bound())
+    await asyncio.gather(self.gw.bind_session("sess-cold", job), prune_once_the_session_is_bound())
 
     self.assertTrue(await self.registry.live("sess-cold"))
     self.assertEqual(await self.state.set_members(api_server.runtime_jobs_key("test-base")), {job})
@@ -120,10 +116,10 @@ class LoraRuntimeSlotsTest(unittest.IsolatedAsyncioTestCase):
   def test_the_server_refuses_to_start_with_a_cap_that_is_not_a_count(self):
     for value in ("  ", "two", "-1"):
       with patch.dict(os.environ, {"OPEN_RL_LORA_JOBS_PER_RUNTIME": value}), self.assertRaisesRegex(RuntimeError, "OPEN_RL_LORA_JOBS_PER_RUNTIME"):
-        api_server.check_lora_jobs_per_runtime()
+        settings.check_lora_jobs_per_runtime()
     for value in ("", "0", "4"):
       with patch.dict(os.environ, {"OPEN_RL_LORA_JOBS_PER_RUNTIME": value}):
-        api_server.check_lora_jobs_per_runtime()
+        settings.check_lora_jobs_per_runtime()
 
   async def test_fft_and_exclusive_jobs_take_no_slot(self):
     for flag in ({"openrl.exclusive": "true"}, {"openrl.fine_tuning_type": "full"}):

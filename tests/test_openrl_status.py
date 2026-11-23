@@ -4,15 +4,14 @@ The ASGI client runs the real routes; the worker manager is the fake from the
 session lifecycle tests, so every entry here reflects what a client behind a
 port-forward would see, without a cluster."""
 
-import asyncio
 import os
 import unittest
-from collections import defaultdict
 from unittest.mock import patch
 
 from kubernetes import client
 
-from server import api_server
+from server.api import settings
+from server.api_server import create_app
 from server.scheduler_worker_manager import SchedulerWorkerManager, worker_state
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStateStore, InMemoryStore
@@ -28,18 +27,13 @@ class StatusViewsTest(unittest.IsolatedAsyncioTestCase):
     self.state = InMemoryStateStore()
     self.manager = RuntimeManager()
     self.registry = SessionRegistry(self.state)
-    self.enterContext(patch.object(api_server, "state", self.state))
-    self.enterContext(patch.object(api_server, "store", self.store))
-    self.enterContext(patch.object(api_server, "get_store", return_value=self.store))
+    self.app = create_app(store=self.store, state=self.state, worker_manager=self.manager, session_registry=self.registry, open_rl_version="v9.9.9")
+    self.gw = self.app.state.server
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.state))
-    self.enterContext(patch.object(api_server, "session_registry", self.registry))
-    self.enterContext(patch.object(api_server, "worker_manager", self.manager))
-    self.enterContext(patch.object(api_server, "owner_locks", defaultdict(asyncio.Lock)))
-    self.enterContext(patch.object(api_server, "OPEN_RL_VERSION", "v9.9.9"))
     self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true", "VLLM_MAX_MODEL_LEN": "8192"}))
 
   async def asyncSetUp(self):
-    self.client = await self.enterAsyncContext(asgi_client())
+    self.client = await self.enterAsyncContext(asgi_client(self.app))
 
   async def get(self, path: str):
     return await self.client.get(f"/api/v1/{path}")
@@ -79,7 +73,7 @@ class StatusViewsTest(unittest.IsolatedAsyncioTestCase):
     spec = (await self.client.get("/openapi.json")).json()
     schema = spec["components"]["schemas"]["OpenRLSettings"]
     props = schema["properties"]
-    self.assertEqual(set(props), {f"openrl.{name}" for name in api_server.Settings.model_fields})
+    self.assertEqual(set(props), {f"openrl.{name}" for name in settings.Settings.model_fields})
     kind = props["openrl.fine_tuning_type"]
     self.assertEqual([o for o in kind["anyOf"] if o.get("type") == "string"][0]["enum"], ["lora", "full"])
     self.assertIsNone(kind["default"])
@@ -94,7 +88,7 @@ class StatusViewsTest(unittest.IsolatedAsyncioTestCase):
     self.assertIn("OpenRLSettings", field["description"])
 
   async def test_a_dev_build_has_no_skill_url(self):
-    with patch.object(api_server, "OPEN_RL_VERSION", "sha-abc1234"):
+    with patch.object(self.gw, "open_rl_version", "sha-abc1234"):
       info = (await self.get("get_server_capabilities")).json()["openrl"]
     self.assertEqual(info["version"], "sha-abc1234")
     self.assertIsNone(info["skill_url"])
@@ -184,11 +178,11 @@ class StatusViewsTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_the_view_without_a_worker_manager_says_why_there_are_no_workers(self):
     _, model_id = await self.create_model()
-    with patch.object(api_server, "worker_manager", None):
+    with patch.object(self.gw, "worker_manager", None):
       body = (await self.get(f"openrl/models/{model_id}")).json()
     self.assertEqual(body["workers"], [])
     self.assertIn("standing deployments", body["summary"])
-    with patch.object(api_server, "worker_manager", None), patch.object(api_server, "is_single_process_mode", return_value=True):
+    with patch.object(self.gw, "worker_manager", None), patch.object(settings, "is_single_process_mode", return_value=True):
       body = (await self.get(f"openrl/models/{model_id}")).json()
     self.assertIn("inside the API server", body["summary"])
 

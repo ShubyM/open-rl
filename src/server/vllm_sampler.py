@@ -7,6 +7,7 @@ job shares a GPU with the trainer it takes a time-slicer turn around each batch,
 import argparse
 import asyncio
 import logging
+import math
 import os
 import signal
 import uuid
@@ -14,13 +15,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from accel_timeslicer.time_slicer import TimeSlicerClient, TimeSlicerRefused, time_slicer_client_from_env, time_slicing_enabled, workload_from_env
 from accel_timeslicer.workload import SAMPLER_CLAIM, WorkloadRef, local_workload_name
+from server.api import wire
 from server.lora_snapshots import snapshot_root
 from server.sampling_dispatcher import Dispatcher, RevisionUnloadable, delta_applies, failed, redis_client
 from server.sampling_store import SamplingStore
 from server.telemetry import gpu_turn, serving, set_phase
-from server.vllm_options import engine_args, sample_params, sample_result
+from server.vllm_options import engine_args, sample_params
 
 logger = logging.getLogger(__name__)
 
@@ -107,14 +111,26 @@ class Sampler:
       return failed("The sampler's vLLM engine died while serving this request")
     except EngineGenerateError as exc:
       return failed(f"Sampler failed the request: {exc.__cause__!r}")
-    sequences = []
-    for choice in final.outputs:
-      tokens = list(choice.token_ids)
-      sequences.append((tokens, [step[token].logprob for token, step in zip(tokens, choice.logprobs or [])], choice.finish_reason))
-    prompt_logprobs = None
-    if r["include_prompt_logprobs"]:
-      prompt_logprobs = [None if step is None else step[token].logprob for token, step in zip(prompt, final.prompt_logprobs)]
-    return sample_result(sequences, prompt_logprobs)
+    sequences = [
+      wire.SampleOut(
+        stop=choice.finish_reason == "stop",
+        tokens=np.asarray(choice.token_ids, dtype=np.int32),
+        logprobs=(
+          np.fromiter((step[tok].logprob for tok, step in zip(choice.token_ids, choice.logprobs)), dtype=np.float32, count=len(choice.token_ids))
+          if choice.logprobs
+          else None
+        ),
+      )
+      for choice in final.outputs
+    ]
+    prompt_logprobs = (
+      np.fromiter(
+        (math.nan if step is None else step[tok].logprob for tok, step in zip(prompt, final.prompt_logprobs)), dtype=np.float32, count=len(prompt)
+      )
+      if r["include_prompt_logprobs"]
+      else None
+    )
+    return wire.proto_result("sample", wire.sample_output(sequences, prompt_logprobs))
 
   def adapter(self, r: dict[str, Any]) -> Any:
     """The record's LoRA, or None for base weights. vLLM loads an adapter inside the engine step, where a missing one

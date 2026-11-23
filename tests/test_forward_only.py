@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import unittest
 
+import numpy as np
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
+from server.api import wire
 from training.trainer_worker import BaseTrainerWorker
-from training.types import Datum, TensorData
 
 
 def _tiny_model() -> LlamaForCausalLM:
@@ -30,12 +31,12 @@ def _tiny_model() -> LlamaForCausalLM:
   return LlamaForCausalLM(config)
 
 
-def _datums() -> list[Datum]:
+def _datums() -> list[wire.Datum]:
   rows = [[3, 5, 8, 13, 21, 34], [2, 7, 1, 8]]
   return [
-    Datum(
-      model_input=row[:-1],
-      loss_fn_inputs={"target_tokens": TensorData(data=row[1:]), "weights": TensorData(data=[1.0] * (len(row) - 1))},
+    wire.Datum(
+      np.asarray(row[:-1], dtype=np.int32),
+      {"target_tokens": np.asarray(row[1:], dtype=np.int64), "weights": np.ones(len(row) - 1, dtype=np.float32)},
     )
     for row in rows
   ]
@@ -51,7 +52,8 @@ class ForwardOnlyTest(unittest.TestCase):
     return sum(float(p.grad.norm()) for p in self.model.parameters() if p.grad is not None)
 
   def test_forward_only_leaves_no_gradients(self) -> None:
-    result = self.worker.forward_backward(self.model, _datums(), "cross_entropy", forward_only=True)
+    raw = self.worker.forward_backward(self.model, _datums(), "cross_entropy", forward_only=True)
+    result = wire.fb_output_to_json(raw["proto_bytes"])
     self.assertTrue(all(p.grad is None for p in self.model.parameters()))
     self.assertEqual(len(result["loss_fn_outputs"]), 2)
     self.assertEqual(len(result["loss_fn_outputs"][0]["logprobs"]["data"]), 5)
@@ -72,8 +74,8 @@ class ForwardOnlyTest(unittest.TestCase):
 
   def test_forward_only_returns_the_same_logprobs_as_a_training_pass(self) -> None:
     # No dropout in the tiny config, so eval and train mode agree.
-    forward_only = self.worker.forward_backward(self.model, _datums(), "cross_entropy", forward_only=True)
-    trained = self.worker.forward_backward(self.model, _datums(), "cross_entropy")
+    forward_only = wire.fb_output_to_json(self.worker.forward_backward(self.model, _datums(), "cross_entropy", forward_only=True)["proto_bytes"])
+    trained = wire.fb_output_to_json(self.worker.forward_backward(self.model, _datums(), "cross_entropy")["proto_bytes"])
     for lhs, rhs in zip(forward_only["loss_fn_outputs"], trained["loss_fn_outputs"], strict=True):
       for a, b in zip(lhs["logprobs"]["data"], rhs["logprobs"]["data"], strict=True):
         self.assertAlmostEqual(a, b, places=5)

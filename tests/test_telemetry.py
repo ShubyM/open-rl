@@ -15,7 +15,8 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from server import api_server, telemetry
+from server import telemetry
+from server.api_server import create_app
 from server.sampling_dispatcher import Dispatcher, RevisionUnloadable, failed
 from server.sampling_store import SamplingStore, future_key
 from server.store import InMemoryStateStore, InMemoryStore, StateStore
@@ -142,7 +143,7 @@ class FaultTest(TelemetryTest):
     store = RecorderOnlyStore()
     with patch.object(telemetry, "get_state_store", lambda: store):
       result, _, _ = self.serve(lambda: train(trainer(), optim_steps(2)))
-    self.assertEqual([r["type"] for r in result.values()], ["optim_step_completed"] * 2)
+    self.assertEqual([r["type"] for r in result.values()], ["optim_step"] * 2)
     self.assertEqual(store.intrusions, [])
     self.assertEqual(store.hashes[telemetry.key("ledger", "run-a")], {"popped": 2, "answered": 2})
 
@@ -185,17 +186,17 @@ class WorkerRecordTest(TelemetryTest):
 class LedgerTest(TelemetryTest):
   def setUp(self) -> None:
     super().setUp()
-    self.enterContext(patch.object(api_server, "store", InMemoryStore()))
-    self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
-    self.enterContext(patch("server.worker_manager.get_state_store", return_value=api_server.state))
+    self.qstore, self.sstore = InMemoryStore(), InMemoryStateStore()
+    self.app = create_app(store=self.qstore, state=self.sstore)
+    self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.sstore))
     self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "torch"}))
 
   def test_a_shared_trainers_delete_is_counted_neither_enqueued_nor_popped(self) -> None:
     async def run():
-      async with asgi_client() as client:
+      async with asgi_client(self.app) as client:
         created = (await client.post("/api/v1/create_model", json={"base_model": "m"})).json()
         (await client.post("/api/v1/delete_model", json={"model_id": created["request_id"]})).raise_for_status()
-      requests = await api_server.store.get_requests(active_set_id="m-1")
+      requests = await self.qstore.get_requests(active_set_id="m-1")
       self.assertEqual([r["op"] for r in requests], ["create_model", "delete_model"])
       telemetry.popped(requests)
       return created["request_id"]
@@ -211,11 +212,11 @@ class OpRecordTest(TelemetryTest):
   def test_ops_carry_the_runs_step_and_a_nan_metric_is_named_not_zeroed(self) -> None:
     asyncio.run(self.store.set_value(telemetry.key("steps", "run-a"), "5"))  # a restarted trainer resumes the run's count
     requests = [
-      request("fb-1", "forward_backward", data=[]),
+      request("fb-1", "forward_backward", proto_bytes=b""),
       request("os-1", "optim_step"),
       request("os-2", "optim_step", adam_params={"learning_rate": -1}),
-      request("fb-2", "forward_backward", data=[]),
-      request("ev-1", "forward_backward", data=[], forward_only=True),
+      request("fb-2", "forward_backward", proto_bytes=b""),
+      request("ev-1", "forward_backward", proto_bytes=b"", forward_only=True),
     ]
     answers, _, _ = self.serve(lambda: train(ScriptedTrainer(), requests))
     self.assertEqual(answers["os-1"]["metrics"]["grad_norm:mean"], 0.0, "the client still gets the sanitized value")
@@ -232,7 +233,7 @@ class OpRecordTest(TelemetryTest):
 
   def test_a_failure_answered_before_the_op_runs_is_recorded_once(self) -> None:
     async def fail():
-      store = BatchStore([request("fb-1", "forward_backward", data=[]), request("bad-1", "optim_step", adam_params="not a dict")])
+      store = BatchStore([request("fb-1", "forward_backward", proto_bytes=b""), request("bad-1", "optim_step", adam_params="not a dict")])
       with patch.dict(os.environ, {"REDIS_URL": "redis://test"}):
         await TrainingRequestsProcessor(store, BrokenWorker(), "run-a", time_slicer=SlicerStub()).run_once()
 
@@ -241,16 +242,17 @@ class OpRecordTest(TelemetryTest):
     self.assertEqual([(r["request_id"], r["status"]) for r in self.records("run-a")], [("fb-1", "failed"), ("bad-1", "failed")])
 
   def test_an_op_records_how_long_it_waited_in_the_queue(self) -> None:
+    qstore, sstore = InMemoryStore(), InMemoryStateStore()
+    app = create_app(store=qstore, state=sstore)
+
     async def run():
-      async with asgi_client() as client:
+      async with asgi_client(app) as client:
         created = (await client.post("/api/v1/create_model", json={"base_model": "m"})).json()
       await asyncio.sleep(0.2)
-      await TrainingRequestsProcessor(api_server.store, Mock(), active_tenant_set_id="m-1").run_once()
+      await TrainingRequestsProcessor(qstore, Mock(), active_tenant_set_id="m-1").run_once()
       return created["request_id"]
 
-    self.enterContext(patch.object(api_server, "store", InMemoryStore()))
-    self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
-    self.enterContext(patch("server.worker_manager.get_state_store", return_value=api_server.state))
+    self.enterContext(patch("server.worker_manager.get_state_store", return_value=sstore))
     with patch.dict(os.environ, {"SAMPLING_BACKEND": "torch"}):
       run_id, _, _ = self.serve(run)
     (created,) = self.records(run_id)
@@ -267,7 +269,7 @@ class StepsRouteTest(TelemetryTest):
     asyncio.run(self.store.set_value(telemetry.key("model_meta", "run-a"), "{}"))
     self.store.lists[telemetry.key("operations", "run-a")] = [json.dumps(op) for op in ops]
     with patch("server.observability.router.get_state_store", return_value=self.store):
-      return TestClient(api_server.app).get(f"/api/v1/inspect/runs/run-a/steps{query}").json()
+      return TestClient(create_app(state=self.store)).get(f"/api/v1/inspect/runs/run-a/steps{query}").json()
 
   def test_ops_after_the_last_step_join_it_and_a_step_in_progress_stands_alone(self) -> None:
     train = [self.op(0, "forward_backward", {"loss": 2.0}), self.op(0, "optim_step"), self.op(1, "forward_backward", {"loss": 1.0})]

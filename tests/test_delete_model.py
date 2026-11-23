@@ -7,9 +7,10 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from server import training_requests_processor as trp
+from server.api import wire
 from server.store import InMemoryStore
 from training import commands
-from training.types import Datum, LoraConfig, TensorData
+from training.types import LoraConfig
 
 
 def tiny_lora_worker() -> trp.LoraTrainingWorker:
@@ -45,9 +46,16 @@ class DeleteModelTest(unittest.IsolatedAsyncioTestCase):
 
   def train(self, model_id: str, step: int) -> list[commands.Command]:
     row = [3, 5, 8, 13, 21, 34]
-    datum = Datum(model_input=row[:-1], loss_fn_inputs={"target_tokens": TensorData(data=row[1:]), "weights": TensorData(data=[1.0] * 5)})
+    pb_bytes = wire.json_to_fb_proto(
+      {
+        "model_id": model_id,
+        "forward_backward_input": {
+          "data": [{"model_input": row[:-1], "loss_fn_inputs": {"target_tokens": row[1:], "weights": [1.0] * 5}}],
+        },
+      }
+    )
     return [
-      commands.ForwardBackward(request_id=f"fb-{model_id}-{step}", model_id=model_id, data=[datum]),
+      commands.ForwardBackward(request_id=f"fb-{model_id}-{step}", model_id=model_id, proto_bytes=pb_bytes),
       commands.OptimStep(request_id=f"optim-{model_id}-{step}", model_id=model_id, adam_params={"learning_rate": 1e-2}),
     ]
 

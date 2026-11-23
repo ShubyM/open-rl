@@ -18,6 +18,7 @@ from opentelemetry import propagate, trace
 
 from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_from_env, time_slicing_enabled, workload_from_env
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
+from server.api import paths, wire
 from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
 from server.sampling_store import SamplingStore
@@ -225,7 +226,8 @@ class TrainingRequestsProcessor:
   async def publish_result(self, request_id: str | None, result: dict[str, Any]) -> None:
     # Only rank 0 writes to the store; the other ranks computed the same result.
     if request_id is not None and is_primary():
-      await self.store.set_result(request_id, result)
+      stored = {k: v for k, v in result.items() if k != "metrics"} if result.get("type") in ("save_weights", "save_weights_for_sampler") else result
+      await self.store.set_result(request_id, stored)
       answered(request_id, result)
 
   async def run_once(self) -> None:
@@ -363,40 +365,36 @@ class TrainingRequestsProcessor:
         is_lora = command.fine_tuning_type == "lora"
         config = command.lora_config if is_lora else command.full_config
         await asyncio.to_thread(self.worker.create_model, command.base_model, command.model_id, config)
-        result = {
-          "base_model": command.base_model,
+        return {
+          "type": "create_model",
           "model_id": command.model_id,
-          "fine_tuning_type": command.fine_tuning_type,
-          "type": "model_created",
+          "is_lora": True,
+          "lora_rank": command.lora_config.rank if is_lora else 16,
+          "base_model": command.base_model,
         }
-        if is_lora:
-          result["rank"] = command.lora_config.rank
-        return result
       case commands.CreateModelFromState():
         result = await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
-        return {
-          "base_model": result.get("base_model"),
-          "model_id": result.get("model_id", command.model_id),
-          "fine_tuning_type": command.fine_tuning_type,
-          "type": "model_loaded_from_state",
-        }
+        out: dict[str, Any] = {"type": "create_model_from_state", "model_id": result.get("model_id", command.model_id), "is_lora": True}
+        if command.fine_tuning_type == "full":
+          out["lora_rank"] = 16
+        if bm := result.get("base_model"):
+          out["base_model"] = bm
+        return out
       case commands.ForwardBackward():
-        result = await asyncio.to_thread(
+        return await asyncio.to_thread(
           self.worker.forward_backward,
-          command.data,
+          wire.datums(command.proto_bytes),
           command.loss_fn,
           command.loss_config,
           command.model_id,
           forward_only=command.forward_only,
         )
-        result["type"] = "forward_backward_completed"
-        return result
       case commands.OptimStep():
         result = await asyncio.to_thread(self.worker.optim_step, command.adam_params, command.model_id)
-        result["type"] = "optim_step_completed"
+        result["type"] = "optim_step"
         return result
       case commands.Sample():
-        result = await asyncio.to_thread(
+        return await asyncio.to_thread(
           self.worker.generate,
           command.prompt_tokens,
           command.max_tokens,
@@ -405,14 +403,13 @@ class TrainingRequestsProcessor:
           command.model_id,
           command.prompt_logprobs,
         )
-        result["type"] = "sample_completed"
-        return result
       case commands.SaveState():
         result = await asyncio.to_thread(self.worker.save_state, command.model_id, command.state_path, command.include_optimizer, command.kind)
-        return {"path": result.get("path", command.state_path), "type": "state_saved", **self.save_metrics()}
+        saved_path = paths.tinker_state_path(result.get("path", command.state_path), base_dir=os.getenv("OPEN_RL_TMP_DIR", "/tmp/open-rl"))
+        return {"path": saved_path, "type": "save_weights", **self.save_metrics()}
       case commands.LoadWeights():
         await asyncio.to_thread(self.worker.load_from_state, command.model_id, command.state_path, command.restore_optimizer)
-        return {"path": command.state_path, "type": "weights_loaded"}
+        return {"path": command.state_path, "type": "load_weights"}
       case commands.SaveWeightsForSampler():
         ref = command.path or command.sampling_session_id
         checkpoint = await asyncio.to_thread(self.worker.save_for_sampler, command.model_id, command.alias, ref)
@@ -421,7 +418,7 @@ class TrainingRequestsProcessor:
         elif self.sampling is not None and is_primary() and ref:
           # A sampler serves a LoRA save by its reference, so the adapter is frozen under that name.
           await asyncio.to_thread(freeze_adapter, command.model_id, self.worker.base_model_name, command.path, command.sampling_session_id)
-        return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved", **self.save_metrics()}
+        return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "save_weights_for_sampler", **self.save_metrics()}
       case commands.DeleteModel():
         await asyncio.to_thread(self.worker.delete_model, command.model_id)
         return {"status": "ok", "type": "model_deleted"}

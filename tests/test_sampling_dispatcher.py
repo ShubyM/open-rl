@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import numpy as np
 import safetensors.torch
 import torch
 import uvicorn
@@ -14,12 +15,13 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from server.api import wire
 from server.sampling_dispatcher import Dispatcher, HttpSampler, revision_file
 from server.sampling_store import SamplingStore, future_key
+from server.store import decode_wire_dict
 from tests.redis_server import RedisTestCase
 from tests.test_exclusive_trainer import tiny_worker
 from training.fft_trainer_worker import FFTTrainingWorker
-from training.types import Datum, TensorData
 
 SAMPLE = {"type": "sample", "sequences": [{"tokens": [100, 101], "logprobs": [-0.5, -0.25], "stop_reason": "length"}]}
 CHOICE = {"token_ids": [100, 101], "finish_reason": "length", "logprobs": {"content": [{"logprob": -0.5}, {"logprob": -0.25}]}}
@@ -42,7 +44,8 @@ def fft_worker() -> FFTTrainingWorker:
 
 def train_step(worker: FFTTrainingWorker) -> None:
   row = [3, 5, 8, 13, 21, 34]
-  datum = Datum(model_input=row[:-1], loss_fn_inputs={"target_tokens": TensorData(data=row[1:]), "weights": TensorData(data=[1.0] * 5)})
+  inputs = {"target_tokens": np.asarray(row[1:], dtype=np.int64), "weights": np.ones(5, dtype=np.float32)}
+  datum = wire.Datum(np.asarray(row[:-1], dtype=np.int32), inputs)
   worker.forward_backward([datum], "cross_entropy")
   worker.optim_step({"learning_rate": 1e-2})
 
@@ -201,7 +204,11 @@ class SamplingDispatcherTest(RedisTestCase):
   async def results(self, request_id: str) -> list[dict]:
     await until(lambda: self.redis.llen(future_key(request_id)))
     await asyncio.sleep(0.3)  # a second result would show by now
-    return [json.loads(raw) for raw in await self.redis.lrange(future_key(request_id), 0, -1)]
+    out = []
+    for raw in await self.redis.lrange(future_key(request_id), 0, -1):
+      decoded = decode_wire_dict(raw)
+      out.append(wire.sample_response_to_json(decoded["proto_bytes"]) if wire.is_proto_result(decoded) else decoded)
+    return out
 
   async def test_each_request_is_generated_once(self):
     replicas = await self.replicas("default", "default")

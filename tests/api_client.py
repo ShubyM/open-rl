@@ -1,17 +1,12 @@
-"""An httpx client bound to the API server's ASGI app, for async tests.
-
-Requests go through routing, body validation and the error handlers, so a test
-exercises what the tinker client sees rather than a handler called as a function.
-The lifespan is not run.
-"""
+"""An httpx client bound to an ASGI FastAPI app, for async tests."""
 
 import httpx
 
 from server import api_server
 
 
-def asgi_client() -> httpx.AsyncClient:
-  return httpx.AsyncClient(transport=httpx.ASGITransport(app=api_server.app), base_url="http://test")
+def asgi_client(app=None) -> httpx.AsyncClient:
+  return httpx.AsyncClient(transport=httpx.ASGITransport(app=api_server.app if app is None else app), base_url="http://test")
 
 
 async def post_json(client: httpx.AsyncClient, path: str, body: dict, **kwargs) -> dict:

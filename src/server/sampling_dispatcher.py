@@ -8,6 +8,7 @@ import contextlib
 import itertools
 import json
 import logging
+import math
 import os
 import signal
 import time
@@ -16,11 +17,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import numpy as np
 import redis.asyncio as redis
 
+from server.api import wire
 from server.sampling_store import SamplingStore, accepted_at, job_of
 from server.telemetry import serving, set_phase
-from server.vllm_options import sample_params, sample_result
+from server.vllm_options import sample_params
 
 logger = logging.getLogger(__name__)
 
@@ -66,13 +69,20 @@ class RevisionUnloadable(Exception):
 
 
 def to_result(body: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
-  """The result for a vLLM /inference/v1/generate response."""
-  sequences = [(c["token_ids"], [e["logprob"] for e in c["logprobs"]["content"]], c["finish_reason"]) for c in body["choices"]]
+  """The result for a vLLM /inference/v1/generate response, packed as binary SampleResponse protobuf."""
+  sequences = [
+    wire.SampleOut(
+      stop=c["finish_reason"] == "stop",
+      tokens=np.asarray(c["token_ids"], dtype=np.int32),
+      logprobs=np.fromiter((e["logprob"] for e in c["logprobs"]["content"]), dtype=np.float32, count=len(c["logprobs"]["content"])),
+    )
+    for c in body["choices"]
+  ]
   prompt_logprobs = None
   if record["include_prompt_logprobs"]:
     pairs = zip(record["prompt_token_ids"], body["prompt_logprobs"], strict=True)
-    prompt_logprobs = [None if e is None else e[str(token)]["logprob"] for token, e in pairs]
-  return sample_result(sequences, prompt_logprobs)
+    prompt_logprobs = np.fromiter((math.nan if e is None else e[str(tok)]["logprob"] for tok, e in pairs), dtype=np.float32)
+  return wire.proto_result("sample", wire.sample_output(sequences, prompt_logprobs))
 
 
 class Dispatcher:

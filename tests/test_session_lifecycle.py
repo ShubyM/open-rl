@@ -1,10 +1,9 @@
 import asyncio
 import os
 import unittest
-from collections import defaultdict
 from unittest.mock import patch
 
-from server import api_server
+from server.api_server import create_app
 from server.session_registry import SessionRegistry
 from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import owner_of, runtime_of
@@ -49,19 +48,15 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
     self.store = InMemoryStore()
     self.state = InMemoryStateStore()
-    self.enterContext(patch.object(api_server, "state", self.state))
     self.manager = RuntimeManager()
     self.registry = SessionRegistry(self.state)
-    self.enterContext(patch.object(api_server, "store", self.store))
-    self.enterContext(patch.object(api_server, "get_store", return_value=self.store))
+    self.app = create_app(store=self.store, state=self.state, worker_manager=self.manager, session_registry=self.registry)
+    self.gw = self.app.state.server
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.state))
-    self.enterContext(patch.object(api_server, "session_registry", self.registry))
-    self.enterContext(patch.object(api_server, "worker_manager", self.manager))
     self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "vllm", "OPEN_RL_ENABLE_FFT": "true"}))
-    self.enterContext(patch.object(api_server, "owner_locks", defaultdict(asyncio.Lock)))
 
   async def asyncSetUp(self):
-    self.client = await self.enterAsyncContext(asgi_client())
+    self.client = await self.enterAsyncContext(asgi_client(self.app))
 
   async def post(self, path, body, **kwargs):
     return await post_json(self.client, path, body, **kwargs)
@@ -72,7 +67,7 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
   async def reap(self):
     for owner in await self.registry.owners():
-      await api_server.reap_owner(owner)
+      await self.gw.reap_owner(owner)
 
   async def test_shared_lora_owner_outlives_the_session_that_created_it(self):
     # Pools keep requests in Redis, which this test has none of, and reaping an owner deletes its pools' empty streams.
@@ -156,9 +151,9 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
       return {"test-base"}
 
     self.manager.release_owner = release_owner
-    reap = asyncio.create_task(api_server.reap_owner("test-base"))
+    reap = asyncio.create_task(self.gw.reap_owner("test-base"))
     await slow.wait()  # the reaper has decided and is mid-delete
-    await api_server.bind_session("b", "test-base")
+    await self.gw.bind_session("b", "test-base")
     await reap
     self.assertEqual(self.manager.released, ["test-base"])
     self.assertTrue(await self.registry.in_use("test-base"))

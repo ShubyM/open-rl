@@ -10,7 +10,7 @@ from unittest import mock
 import httpx
 from fastapi.testclient import TestClient
 
-from server import api_server
+from server.api_server import create_app
 from server.model_metadata import TrainingModelMetadata
 from server.observability import cloud_logging, fleet, metrics
 from server.store import InMemoryStateStore
@@ -37,6 +37,7 @@ def cluster(*states: str) -> dict:
 class ApiTest(unittest.TestCase):
   def setUp(self):
     self.store = InMemoryStateStore()
+    self.app = create_app(state=self.store)
     fleet.cache.clear()
     self.enterContext(mock.patch.object(fleet, "get_state_store", return_value=self.store))
     self.enterContext(mock.patch("server.observability.router.get_state_store", return_value=self.store))
@@ -46,7 +47,7 @@ class ApiTest(unittest.TestCase):
       asyncio.run(self.store.set_value(f"open_rl:{key}", value))
     if cluster is not None:
       self.enterContext(mock.patch.object(fleet, "kubernetes", mock.AsyncMock(return_value=copy.deepcopy(cluster))))
-    return TestClient(api_server.app).get(path).json()
+    return TestClient(self.app).get(path).json()
 
   def serve_workloads(self, *workloads: dict) -> None:
     def listing(items) -> object:
@@ -187,7 +188,7 @@ class ActivityTest(ApiTest):
   def test_live_lanes_come_back_with_an_error_when_redis_fails(self):
     self.serve_workloads(workload("fft-a", "fft-1", "fft", placedAt="2026-10-28T11:30:00Z"))
     self.enterContext(mock.patch.object(self.store, "scan_values", mock.AsyncMock(side_effect=ConnectionError("redis down"))))
-    response = TestClient(api_server.app).get("/api/v1/inspect/activity?since=2026-10-28T11:00:00Z&until=2026-10-28T12:00:00Z")
+    response = TestClient(self.app).get("/api/v1/inspect/activity?since=2026-10-28T11:00:00Z&until=2026-10-28T12:00:00Z")
 
     self.assertEqual(response.status_code, 200)
     self.assertEqual([(lane["name"], lane["gpu_uuids"]) for lane in response.json()["lanes"]], [("fft-a", ["GPU-fft-a"])])
