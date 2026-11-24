@@ -1,4 +1,4 @@
-"""Tests for StateStore (in-memory & Redis), StreamQueue live-Redis integration, and model metadata decoding."""
+"""Tests for StateStore (in-memory and Redis), StreamQueue live-Redis integration, and model metadata decoding."""
 
 import asyncio
 import os
@@ -73,9 +73,10 @@ class RedisStoreIntegrationTest(unittest.IsolatedAsyncioTestCase):
     await self.queue.set_result("req-1", {"type": "sample", "ok": True})
     self.assertEqual(await self.queue.get_result("req-1", timeout=1.0), {"type": "sample", "ok": True})
 
-    qa, qb = train_queue("tenant-a"), train_queue("tenant-b")
-    await self.queue.enqueue(qa, {"model_id": "tenant-a", "request_id": "a0"}, group="base-1")
-    await self.queue.enqueue(qb, {"model_id": "tenant-b", "request_id": "b0"}, group="base-1")
+    queue_a = train_queue("tenant-a")
+    queue_b = train_queue("tenant-b")
+    await self.queue.enqueue(queue_a, {"model_id": "tenant-a", "request_id": "a0"}, group="base-1")
+    await self.queue.enqueue(queue_b, {"model_id": "tenant-b", "request_id": "b0"}, group="base-1")
     served = []
     for _ in range(2):
       batch = await self.queue.next_batch("base-1", timeout_ms=1000)
