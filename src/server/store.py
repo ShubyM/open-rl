@@ -14,102 +14,97 @@ import redis as sync_redis
 import redis.asyncio as redis
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from server.queue import StreamQueue, train_queue
+
+
+def _id_key(entry_id: str) -> tuple[int, int]:
+  ms, _, seq = entry_id.partition("-")
+  return int(ms), int(seq or 0)
+
 
 class RequestStore(ABC):
   """Request queues and results, keyed by request ID."""
 
   @abstractmethod
-  async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
-    """Push a request into the tenant queue and assign to an active set."""
-    pass
-
+  async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None: ...
   @abstractmethod
-  async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]:
-    """Block until at least 1 request is available in the active set, then return all currently queued requests."""
-    pass
-
+  async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]: ...
   @abstractmethod
-  async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    """Block until this model has at least 1 request, then return all queued requests for it."""
-    pass
-
+  async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]: ...
   @abstractmethod
-  async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
-    """Resolve a future by its request ID."""
-    pass
-
+  async def set_result(self, req_id: str, result: dict[str, Any]) -> None: ...
   @abstractmethod
-  async def get_result(self, req_id: str, timeout: float) -> dict[str, Any] | None:
-    """Block until the future resolves or the timeout is reached."""
-    pass
-
+  async def get_result(self, req_id: str, timeout: float) -> dict[str, Any] | None: ...
   @abstractmethod
-  async def queued(self, model_id: str) -> int:
-    """How many of the model's requests wait in its queue."""
-    pass
+  async def queued(self, model_id: str) -> int: ...
+
+  async def pending_for_model(self, model_id: str, *, after: str = "0-0") -> list[dict[str, Any]]:
+    return await self.get_requests_for_model(model_id) if await self.queued(model_id) > 0 else []
+
+  async def complete_request(self, record: dict[str, Any], result: dict[str, Any]) -> bool:
+    if req_id := record.get("request_id"):
+      await self.set_result(req_id, result)
+    return True
+
+  async def ack_request(self, record: dict[str, Any]) -> bool:
+    return True
 
 
 class InMemoryStore(RequestStore):
   def __init__(self):
-    # tenant_id -> queue of requests
-    self.queues: dict[str, asyncio.Queue] = {}
-    # active_set_id -> list of tenant model_ids for round-robin
+    self.queues: dict[str, dict[str, dict[str, Any]]] = {}
     self.active_tenants: dict[str, list[str]] = {}
-    self.active_tenants_cv = asyncio.Condition()
     self.futures_store: dict[str, dict[str, Any]] = {}
-    self.futures_cv = asyncio.Condition()
+    self.active_tenants_cv, self.futures_cv, self._seq = asyncio.Condition(), asyncio.Condition(), 0
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
-    model_id = req_data.get("model_id", "default")
-    set_key = active_set_id or "default"
-
+    model_id, set_key = req_data.get("model_id", "default"), active_set_id or "default"
     async with self.active_tenants_cv:
-      if model_id not in self.queues:
-        self.queues[model_id] = asyncio.Queue()
-
-      await self.queues[model_id].put(req_data)
-
-      tenants_list = self.active_tenants.setdefault(set_key, [])
-      if model_id not in tenants_list:
-        tenants_list.append(model_id)
-        self.active_tenants_cv.notify_all()
+      self._seq += 1
+      eid = f"{int(time.time() * 1000)}-{self._seq}"
+      self.queues.setdefault(model_id, {})[eid] = {**req_data, "entry_id": eid}
+      tenants = self.active_tenants.setdefault(set_key, [])
+      if model_id not in tenants:
+        tenants.append(model_id)
+      self.active_tenants_cv.notify_all()
 
   async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]:
     async with self.active_tenants_cv:
       while True:
-        tenants_list = None
-        if active_set_id:
-          tenants_list = self.active_tenants.get(active_set_id)
-        else:
-          for t_list in self.active_tenants.values():
-            if t_list:
-              tenants_list = t_list
-              break
-
-        if tenants_list:
-          model_id = tenants_list[0]
-          queue = self.queues[model_id]
-
-          # Drain only what was pending on entry. Requests this tenant enqueues
-          # while we drain wait for its next turn, so a tenant whose producer
-          # outruns the consumer cannot hold the queue open indefinitely.
-          pending = queue.qsize()
-          if pending:
-            batch = [queue.get_nowait() for _ in range(pending)]
-            # Round-robin: rotate the tenant we just served to the tail.
-            tenants_list.append(tenants_list.pop(0))
-            return batch
-          else:
-            tenants_list.pop(0)
-            continue
-
-        await self.active_tenants_cv.wait()
+        tenants = self.active_tenants.get(active_set_id) if active_set_id else next((t for t in self.active_tenants.values() if t), None)
+        if not tenants:
+          await self.active_tenants_cv.wait()
+          continue
+        if entries := self.queues.get(tenants[0]):
+          tenants.append(tenants.pop(0))
+          return list(entries.values())
+        tenants.pop(0)
 
   async def queued(self, model_id: str) -> int:
-    return queue.qsize() if (queue := self.queues.get(model_id)) else 0
+    return len(self.queues.get(model_id, ()))
+
+  async def pending_for_model(self, model_id: str, *, after: str = "0-0") -> list[dict[str, Any]]:
+    cutoff = _id_key(after)
+    return [r for eid, r in self.queues.get(model_id, {}).items() if _id_key(eid) > cutoff]
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
     raise RuntimeError("Per-model full fine-tuning workers require REDIS_URL; in-memory queues cannot be shared across processes")
+
+  async def complete_request(self, record: dict[str, Any], result: dict[str, Any]) -> bool:
+    if result.get("status") == "pending":
+      return False
+    if (eid := record.get("entry_id")) is not None:
+      entries = self.queues.get(record.get("model_id", "default"))
+      if not entries or entries.pop(eid, None) is None:
+        return False
+    if req_id := record.get("request_id"):
+      await self.set_result(req_id, result)
+    return True
+
+  async def ack_request(self, record: dict[str, Any]) -> bool:
+    if (eid := record.get("entry_id")) is None:
+      return True
+    return self.queues.get(record.get("model_id", "default"), {}).pop(eid, None) is not None
 
   async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
     if result.get("status") == "pending":
@@ -128,131 +123,87 @@ class InMemoryStore(RequestStore):
 
 
 class RedisStore(RequestStore):
+  """Training request store over the unified StreamQueue."""
+
   def __init__(self, client: redis.Redis):
-    self.redis = client
-    self.active_list = "open_rl:active_tenants"
-    # We also keep a set to guarantee O(1) deduplication before RPushing
-    self.active_set = "open_rl:active_tenants_set"
+    self.redis, self.queue = client, StreamQueue(client)
+    self.active_list, self.active_set = "open_rl:active_tenants", "open_rl:active_tenants_set"
+
+  def _active_keys(self, active_set_id: str | None) -> tuple[str, str]:
+    return (f"{self.active_set}:{active_set_id}", f"{self.active_list}:{active_set_id}") if active_set_id else (self.active_set, self.active_list)
+
+  async def _mark_active(self, active_set: str, active_list: str, model_id: str) -> None:
+    if await self.redis.sadd(active_set, model_id) == 1:
+      await self.redis.rpush(active_list, model_id)
 
   async def put_request(self, req_data: dict[str, Any], active_set_id: str | None = None) -> None:
     model_id = req_data.get("model_id", "default")
-    queue_key = f"open_rl:queue:{model_id}"
-
-    active_set = f"open_rl:active_tenants_set:{active_set_id}" if active_set_id else self.active_set
-    active_list = f"open_rl:active_tenants:{active_set_id}" if active_set_id else self.active_list
-
-    # 1. Add request to tenant-specific list
-    await self.redis.rpush(queue_key, json.dumps(req_data))
-
-    # 2. Add tenant to active set and list if not already there
-    # SADD returns 1 if it was newly added, 0 if it already existed
-    is_new = await self.redis.sadd(active_set, model_id)
-    if is_new == 1:
-      await self.redis.rpush(active_list, model_id)
+    await self.queue.enqueue(train_queue(model_id), req_data)
+    await self._mark_active(*self._active_keys(active_set_id), model_id)
 
   async def get_requests(self, active_set_id: str | None = None) -> list[dict[str, Any]]:
-    active_set = f"open_rl:active_tenants_set:{active_set_id}" if active_set_id else self.active_set
-    active_list = f"open_rl:active_tenants:{active_set_id}" if active_set_id else self.active_list
-
+    active_set, active_list = self._active_keys(active_set_id)
     while True:
-      model_id_bytes = await self.redis.lindex(active_list, 0)
-      if not model_id_bytes:
+      raw = await self.redis.lindex(active_list, 0)
+      if not raw:
         try:
-          result = await self.redis.brpoplpush(active_list, active_list, timeout=5)
+          raw = await self.redis.brpoplpush(active_list, active_list, timeout=5)
         except RedisTimeoutError:
           return []
-        if not result:
+        if not raw:
           return []
-        model_id = result.decode() if isinstance(result, bytes) else str(result)
-      else:
-        model_id = model_id_bytes.decode() if isinstance(model_id_bytes, bytes) else str(model_id_bytes)
-
-      queue_key = f"open_rl:queue:{model_id}"
-      # Snapshot the depth before draining: requests this tenant enqueues while
-      # we drain belong to its next turn, otherwise a producer that outruns the
-      # consumer keeps the drain loop alive and never yields the head slot.
-      q_len = await self.redis.llen(queue_key)
-      if q_len == 0:
+      model_id = raw.decode() if isinstance(raw, bytes) else str(raw)
+      q = train_queue(model_id)
+      if not (batch := await self.queue.pending(q)):
         await self.redis.lrem(active_list, 0, model_id)
         await self.redis.srem(active_set, model_id)
+        if await self.queue.queued(q) > 0:
+          await self._mark_active(active_set, active_list, model_id)
+        else:
+          await self.queue.delete_if_empty(q)
         continue
-
-      batch = []
-      for _ in range(q_len):
-        item = await self.redis.lpop(queue_key)
-        if not item:
-          break
-        batch.append(json.loads(item))
-
-      if batch:
-        # Round-robin: move the tenant we just served from the head to the tail.
-        # Draining a tenant's whole batch keeps training batches intact; rotating
-        # afterwards keeps a continuously-enqueueing tenant from starving peers.
-        await self.redis.lmove(active_list, active_list, "LEFT", "RIGHT")
-        return batch
+      await self.redis.lmove(active_list, active_list, "LEFT", "RIGHT")
+      return batch
 
   async def queued(self, model_id: str) -> int:
-    return await self.redis.llen(f"open_rl:queue:{model_id}")
+    return await self.queue.queued(train_queue(model_id))
+
+  async def pending_for_model(self, model_id: str, *, after: str = "0-0") -> list[dict[str, Any]]:
+    return await self.queue.pending(train_queue(model_id), after=after)
 
   async def get_requests_for_model(self, model_id: str) -> list[dict[str, Any]]:
-    queue_key = f"open_rl:queue:{model_id}"
+    q = train_queue(model_id)
+    if batch := await self.queue.pending(q):
+      return batch
     try:
-      result = await self.redis.blpop(queue_key, timeout=5)
+      await self.queue.wait_for_new(q, after="0-0", timeout_ms=5000)
     except RedisTimeoutError:
       return []
+    return await self.queue.pending(q)
 
-    if not result:
-      return []
+  async def complete_request(self, record: dict[str, Any], result: dict[str, Any]) -> bool:
+    req_id, eid, q = record.get("request_id"), record.get("entry_id"), train_queue(record.get("model_id", "default"))
+    if eid is None:
+      if req_id:
+        await self.queue.set_result(req_id, result)
+      return True
+    return await self.queue.complete(q, eid, req_id, result) if req_id else await self.queue.ack(q, eid)
 
-    batch = [json.loads(result[1])]
-
-    while True:
-      item = await self.redis.lpop(queue_key)
-      if not item:
-        break
-      batch.append(json.loads(item))
-
-    q_len = await self.redis.llen(queue_key)
-    if q_len == 0:
-      await self.redis.lrem(self.active_list, 0, model_id)
-      await self.redis.srem(self.active_set, model_id)
-
-    return batch
+  async def ack_request(self, record: dict[str, Any]) -> bool:
+    return True if (eid := record.get("entry_id")) is None else await self.queue.ack(train_queue(record.get("model_id", "default")), eid)
 
   async def set_result(self, req_id: str, result: dict[str, Any]) -> None:
-    if result.get("status") == "pending":
-      return
-    key = f"open_rl:future:{req_id}"
-    # Keep the list format for existing workers, with one result per request.
-    async with self.redis.pipeline(transaction=True) as pipeline:
-      pipeline.rpush(key, json.dumps(result))
-      pipeline.ltrim(key, -1, -1)
-      pipeline.expire(key, 300)
-      await pipeline.execute()
+    await self.queue.set_result(req_id, result)
 
   async def get_result(self, req_id: str, timeout: float) -> dict[str, Any] | None:
-    key = f"open_rl:future:{req_id}"
-    deadline = time.monotonic() + timeout
-    while True:
-      remaining = deadline - time.monotonic()
-      if remaining <= 0:
-        return {"type": "try_again", "request_id": req_id, "queue_state": "active"}
-      raw_result = await self.redis.lindex(key, -1)
-
-      if raw_result:
-        payload = json.loads(raw_result)
-        await self.redis.expire(key, 300)
-        return payload
-
-      await asyncio.sleep(0.1)
+    return await self.queue.get_result(req_id, timeout)
 
 
 @dataclass
 class Writes:
-  """Writes applied together, each key expiring a TTL after: JSON items appended to lists that keep their newest
-  `limit`, amounts added to counters and to counts in hashes, and values set."""
+  """Writes applied together with a shared TTL: list appends (capped to `limit`), counters, hash counts, and values."""
 
-  appends: dict[str, tuple[list[str], int]] = field(default_factory=dict)  # key -> (items, limit)
+  appends: dict[str, tuple[list[str], int]] = field(default_factory=dict)
   counts: Counter[str] = field(default_factory=Counter)
   fields: dict[str, Counter[str]] = field(default_factory=dict)
   values: dict[str, str] = field(default_factory=dict)
@@ -262,76 +213,38 @@ class StateStore(ABC):
   """Application state stored as values with expiry and sets of members."""
 
   @abstractmethod
-  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
-    """Store a simple string value by key, gone after ttl_seconds if given."""
-    pass
-
+  async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None: ...
   @abstractmethod
-  async def get_value(self, key: str) -> str | None:
-    """Fetch a string value by key."""
-    pass
-
+  async def get_value(self, key: str) -> str | None: ...
   @abstractmethod
-  def get_value_sync(self, key: str) -> str | None:
-    """Synchronously fetch a string value by key."""
-    pass
-
+  def get_value_sync(self, key: str) -> str | None: ...
   @abstractmethod
-  async def delete_values(self, *keys: str) -> None:
-    """Delete one or more keys."""
-    pass
-
+  async def delete_values(self, *keys: str) -> None: ...
   @abstractmethod
-  async def add_to_set(self, key: str, member: str) -> None:
-    pass
-
+  async def add_to_set(self, key: str, member: str) -> None: ...
   @abstractmethod
-  async def remove_from_set(self, key: str, member: str) -> None:
-    pass
-
+  async def remove_from_set(self, key: str, member: str) -> None: ...
   @abstractmethod
-  async def set_members(self, key: str) -> set[str]:
-    pass
-
+  async def set_members(self, key: str) -> set[str]: ...
   @abstractmethod
-  async def scan_values(self, prefix: str) -> dict[str, str]:
-    """Every live value whose key starts with prefix."""
-    pass
-
+  async def scan_values(self, prefix: str) -> dict[str, str]: ...
   @abstractmethod
-  def push_recent_sync(self, key: str, values: list[str], keep: int, ttl_seconds: float) -> None:
-    """Synchronously put values at the head of the list at key and keep its newest `keep`. Redis drops the list
-    ttl_seconds after the last push."""
-    pass
-
+  def push_recent_sync(self, key: str, values: list[str], keep: int, ttl_seconds: float) -> None: ...
   @abstractmethod
-  async def recent(self, key: str) -> list[str]:
-    """The list push_recent_sync keeps at key, newest first."""
-    pass
-
+  async def recent(self, key: str) -> list[str]: ...
   @abstractmethod
-  def write_sync(self, writes: Writes, ttl_seconds: float) -> None:
-    """Apply writes in one round trip, without the event loop, for a thread."""
-    pass
-
+  def write_sync(self, writes: Writes, ttl_seconds: float) -> None: ...
   @abstractmethod
-  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
-    """The JSON items of a list write_sync appends to, oldest first, or only its last ones."""
-    pass
-
+  async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]: ...
   @abstractmethod
-  async def read_counts(self, key: str) -> dict[str, int]:
-    """The counts in a hash write_sync adds to."""
-    pass
+  async def read_counts(self, key: str) -> dict[str, int]: ...
 
 
 class InMemoryStateStore(StateStore):
   def __init__(self):
-    self.kv_store: dict[str, str] = {}
-    self.expiries: dict[str, float] = {}
+    self.kv_store, self.expiries = {}, {}
     self.sets: dict[str, set[str]] = {}
-    self.lists: dict[str, list[str]] = {}
-    self.hashes: dict[str, Counter[str]] = {}
+    self.lists, self.hashes = {}, {}
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     self.kv_store[key] = value
@@ -350,9 +263,8 @@ class InMemoryStateStore(StateStore):
 
   async def delete_values(self, *keys: str) -> None:
     for k in keys:
-      self.kv_store.pop(k, None)
-      self.expiries.pop(k, None)
-      self.sets.pop(k, None)
+      for d in (self.kv_store, self.expiries, self.sets):
+        d.pop(k, None)
 
   async def add_to_set(self, key: str, member: str) -> None:
     self.sets.setdefault(key, set()).add(member)
@@ -373,7 +285,6 @@ class InMemoryStateStore(StateStore):
     return list(self.lists.get(key, []))
 
   def write_sync(self, writes: Writes, ttl_seconds: float) -> None:
-    # Lists and hashes here never expire.
     for key, (items, limit) in writes.appends.items():
       self.lists[key] = [*self.lists.get(key, []), *items][-limit:]
     for key, amount in writes.counts.items():
@@ -394,8 +305,7 @@ class InMemoryStateStore(StateStore):
 
 class RedisStateStore(StateStore):
   def __init__(self, client: redis.Redis, sync_client: sync_redis.Redis):
-    self.redis = client
-    self.sync_redis = sync_client
+    self.redis, self.sync_redis = client, sync_client
 
   async def set_value(self, key: str, value: str, ttl_seconds: float | None = None) -> None:
     await self.redis.set(key, value, px=None if ttl_seconds is None else int(ttl_seconds * 1000))
@@ -446,7 +356,6 @@ class RedisStateStore(StateStore):
 
   async def read_samples(self, key: str, last: int | None = None) -> list[dict[str, Any]]:
     raw = await self.redis.lrange(key, -(last or 0), -1)
-    # Decoded off the event loop, since a list holds up to thousands of records.
     return await asyncio.to_thread(lambda: [json.loads(item) for item in raw])
 
   async def read_counts(self, key: str) -> dict[str, int]:
@@ -455,22 +364,18 @@ class RedisStateStore(StateStore):
 
 @cache
 def redis_client(redis_url: str) -> redis.Redis:
-  # The socket timeout must outlast the 5s blocking pops: redis-py 8 defaults it
-  # to 5s, and a read timing out as the server hands over an item loses it.
+  # Socket timeout outlasts 10s XREAD BLOCK chunks so live streams never drop on read timeout.
   return redis.from_url(redis_url, decode_responses=True, health_check_interval=2, max_connections=10000, socket_timeout=30)
 
 
 @cache
 def get_store() -> RequestStore:
-  redis_url = os.environ.get("REDIS_URL")
-  return RedisStore(redis_client(redis_url)) if redis_url else InMemoryStore()
+  return RedisStore(redis_client(url)) if (url := os.environ.get("REDIS_URL")) else InMemoryStore()
 
 
 @cache
 def get_state_store() -> StateStore:
-  redis_url = os.environ.get("REDIS_URL")
-  if redis_url:
-    # Timeouts, so a Redis that stops answering costs a thread its call rather than the thread.
-    sync_client = sync_redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
-    return RedisStateStore(redis_client(redis_url), sync_client)
-  return InMemoryStateStore()
+  if not (url := os.environ.get("REDIS_URL")):
+    return InMemoryStateStore()
+  sync_client = sync_redis.Redis.from_url(url, decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
+  return RedisStateStore(redis_client(url), sync_client)

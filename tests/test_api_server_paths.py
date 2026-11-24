@@ -29,7 +29,13 @@ class ApiServerTest(unittest.TestCase):
     return self.client.post(f"/api/v1/{path}", content=body, headers={"Content-Type": media_type})
 
   def queued(self) -> list[dict]:
-    return asyncio.run(api_server.store.get_requests())
+    async def drain() -> list[dict]:
+      batch = await api_server.store.get_requests()
+      for r in batch:
+        await api_server.store.ack_request(r)
+      return batch
+
+    return asyncio.run(drain())
 
 
 class GetInfoTest(ApiServerTest):
@@ -214,7 +220,13 @@ class ProtobufWireTest(unittest.TestCase):
     self.client = TestClient(api_server.app)
 
   def _queued(self) -> list[dict]:
-    return asyncio.run(api_server.store.get_requests())
+    async def drain() -> list[dict]:
+      batch = await api_server.store.get_requests()
+      for r in batch:
+        await api_server.store.ack_request(r)
+      return batch
+
+    return asyncio.run(drain())
 
   def test_protobuf_and_json_forward_backward_queue_the_same_request(self) -> None:
     with open(self.FIXTURE, "rb") as fh:

@@ -11,7 +11,7 @@ import redis
 from server import api_server
 from server.lora_snapshots import freeze_adapter, snapshot_name
 from server.model_metadata import TrainingModelMetadata, persist_model_metadata
-from server.sampling_store import SamplingStore, stream_key
+from server.queue import StreamQueue, sample_queue, stream_key
 from server.scheduler_worker_manager import SchedulerWorkerManager
 from server.session_registry import SessionRegistry
 from server.store import RedisStateStore, RedisStore
@@ -39,7 +39,7 @@ class PoolAcceptTest(RedisTestCase):
     return {"session": session, "status": response.status_code, **response.json()}
 
   async def pending(self, pool: str, field: str) -> list:
-    return [r[field] for r in await SamplingStore(self.redis).pending(pool)]
+    return [r[field] for r in await StreamQueue(self.redis).pending(sample_queue(pool))]
 
   async def test_a_retried_seq_id_is_one_request_and_another_session_gets_its_own(self) -> None:
     first = await self.sample(7, base_model=self.base)
@@ -124,9 +124,9 @@ class PoolAcceptTest(RedisTestCase):
     self.apps.objects.clear()
 
   async def answer(self, pool: str, count: int = 1) -> None:
-    sampling = SamplingStore(self.redis)
-    for r in (await sampling.pending(pool))[:count]:
-      await sampling.set_result(r, {"type": "sample", "sequences": []})
+    sampling = StreamQueue(self.redis)
+    for r in (await sampling.pending(sample_queue(pool)))[:count]:
+      await sampling.complete_sample(r, {"type": "sample", "sequences": []})
 
   async def test_the_reaper_deletes_a_released_pools_stream_once_nothing_is_pending_in_it(self) -> None:
     pool = default_metadata(self.base).pool(self.base)
@@ -148,7 +148,7 @@ class PoolAcceptTest(RedisTestCase):
     meta = TrainingModelMetadata(base_model=self.base, fine_tuning_type="full")
     await persist_model_metadata(self.state, model_id, meta)
     record = {"request_id": str(uuid.uuid4()), "pool": meta.pool(model_id), "job": model_id, "revision": "", "model": self.base}
-    await SamplingStore(self.redis).accept({**record, "idempotency_key": None, "prompt_token_ids": [1]})
+    await StreamQueue(self.redis).accept({**record, "idempotency_key": None, "prompt_token_ids": [1]})
     await self.answer(meta.pool(model_id))
     self.assertTrue(await self.redis.exists(stream_key(meta.pool(model_id))))
     self.assertEqual((await self.client.post("/api/v1/delete_model", json={"model_id": model_id})).status_code, 200)
@@ -159,7 +159,7 @@ class PoolAcceptTest(RedisTestCase):
     model_id = uuid.uuid4().hex
     meta = TrainingModelMetadata(base_model=self.base, fine_tuning_type="full")
     record = {"request_id": str(uuid.uuid4()), "pool": meta.pool(model_id), "job": model_id, "revision": "", "model": self.base}
-    await SamplingStore(self.redis).accept({**record, "idempotency_key": None, "prompt_token_ids": [1]})
+    await StreamQueue(self.redis).accept({**record, "idempotency_key": None, "prompt_token_ids": [1]})
     await self.answer(meta.pool(model_id))
     await api_server.reconcile_pools()
     self.assertFalse(await self.redis.exists(stream_key(meta.pool(model_id))))

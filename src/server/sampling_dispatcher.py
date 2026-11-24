@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import redis.asyncio as redis
 
-from server.sampling_store import SamplingStore, accepted_at, job_of
+from server.queue import StreamQueue, accepted_at, job_of, sample_queue
 from server.telemetry import serving, set_phase
 from server.vllm_options import sample_params, sample_result
 
@@ -78,8 +78,8 @@ def to_result(body: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
 class Dispatcher:
   """Serves `pool` with `sampler`, which loads a revision with ensure_weights and answers a record with generate."""
 
-  def __init__(self, store: SamplingStore, pool: str, sampler: Any, concurrency: int) -> None:
-    self.store, self.pool, self.sampler, self.concurrency = store, pool, sampler, concurrency
+  def __init__(self, store: StreamQueue, pool: str, sampler: Any, concurrency: int) -> None:
+    self.store, self.pool, self.queue, self.sampler, self.concurrency = store, pool, sample_queue(pool), sampler, concurrency
     self.revision = ""
     # Each record is read once and dropped when its result is saved.
     self.records: dict[str, dict[str, Any]] = {}
@@ -93,7 +93,7 @@ class Dispatcher:
       while True:
         try:
           await self.dispatch()
-          await self.store.wait_for_new(self.pool, self.newest, RETRY_MS)
+          await self.store.wait_for_new(self.queue, self.newest, RETRY_MS)
         except Exception:
           # A Redis or Kubernetes hiccup must not end the pool's dispatching.
           logger.exception("Dispatching pool %s failed; retrying", self.pool)
@@ -133,7 +133,7 @@ class Dispatcher:
   async def read(self) -> None:
     """Reads new records, fails those past their deadline, and switches revision once nothing pending names the
     current one."""
-    for r in await self.store.pending(self.pool, after=self.newest):
+    for r in await self.store.pending(self.queue, after=self.newest, compact=True):
       self.records[r["entry_id"]] = r
       self.newest = r["entry_id"]
     # The API server's deadline sweep and reconcile save results too, so a record they answered is dropped.
@@ -167,7 +167,7 @@ class Dispatcher:
     return [r for turn in itertools.zip_longest(*(records for _, records in turns)) for r in turn if r is not None]
 
   async def set_result(self, r: dict[str, Any], result: dict[str, Any], started_at: float | None = None) -> None:
-    await self.store.set_result(r, result, started_at)
+    await self.store.complete_sample(r, result, started_at)
     self.records.pop(r["entry_id"], None)
 
   async def send(self, r: dict[str, Any]) -> None:
@@ -364,7 +364,7 @@ async def main() -> None:
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
   logging.getLogger("httpx").setLevel(logging.WARNING)
   router = os.getenv("OPEN_RL_SAMPLER_ROUTER", "http://127.0.0.1:8081")
-  store, pool = SamplingStore(redis_client(os.environ["REDIS_URL"])), os.environ["OPEN_RL_SAMPLER_POOL"]
+  store, pool = StreamQueue(redis_client(os.environ["REDIS_URL"])), os.environ["OPEN_RL_SAMPLER_POOL"]
   async with serving("dispatcher", pool), http_client() as http:
     set_phase("ready")
     sampler = HttpSampler(http, pool, router, [])

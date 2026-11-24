@@ -15,8 +15,8 @@ from accel_timeslicer.serve import start_time_slicer
 from accel_timeslicer.single_node import SingleNodeTimeSlicer
 from accel_timeslicer.time_slicer import SocketTimeSlicerClient, TimeSlicerRefused
 from accel_timeslicer.workload import WorkloadRef
+from server.queue import StreamQueue, future_key
 from server.sampling_dispatcher import Dispatcher
-from server.sampling_store import SamplingStore, future_key
 from server.vllm_sampler import Sampler, TimeSlicedDispatcher, run_sampling_worker
 from tests.redis_server import RedisTestCase
 from tests.test_sampling_dispatcher import SAMPLE, until
@@ -112,7 +112,7 @@ class InProcessSamplerTest(RedisTestCase):
 
   async def asyncSetUp(self) -> None:
     await super().asyncSetUp()
-    self.store, self.pool = SamplingStore(self.redis), f"sampler-{uuid.uuid4()}"
+    self.store, self.pool = StreamQueue(self.redis), f"sampler-{uuid.uuid4()}"
     self.enterContext(patch.dict(sys.modules, fake_vllm()))
     self.tmp = self.enterContext(tempfile.TemporaryDirectory())
     self.enterContext(patch.dict(os.environ, {"OPEN_RL_TMP_DIR": self.tmp}))
@@ -129,7 +129,7 @@ class InProcessSamplerTest(RedisTestCase):
     return run
 
   async def results(self, r: dict) -> list[dict]:
-    return [json.loads(raw) for raw in await self.redis.lrange(future_key(r["request_id"]), 0, -1)]
+    return [json.loads(fields["data"]) for _, fields in await self.redis.xrange(future_key(r["request_id"]))]
 
   async def test_a_request_that_kills_the_engine_fails_once_and_the_restarted_engine_never_gets_it(self):
     poison = await self.accepted([6, 6, 6])
@@ -168,7 +168,7 @@ class TimeSlicedPoolTest(RedisTestCase):
 
   async def asyncSetUp(self) -> None:
     await super().asyncSetUp()
-    self.store, self.pool, self.log, self.gpu = SamplingStore(self.redis), f"sampler-{uuid.uuid4()}", [], set()
+    self.store, self.pool, self.log, self.gpu = StreamQueue(self.redis), f"sampler-{uuid.uuid4()}", [], set()
     self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
     self.socket_path = socket_path = str(self.tmp / "slicer.sock")
     self.restorer = RecordingRestorer(self.log)
@@ -190,7 +190,7 @@ class TimeSlicedPoolTest(RedisTestCase):
 
   async def saved(self, *records: dict) -> None:
     for r in records:
-      await until(lambda r=r: self.redis.llen(future_key(r["request_id"])))
+      await until(lambda r=r: self.redis.xlen(future_key(r["request_id"])))
 
   async def test_each_batch_runs_inside_one_turn_and_the_trainer_steps_between_batches(self):
     w1 = str(self.tmp / "w1")
@@ -216,7 +216,8 @@ class TimeSlicedPoolTest(RedisTestCase):
     turn += [("sleep", "sampler"), ("park", "sampler")]
     expected = [*wake, *batch, ("sleep", "sampler"), ("park", "sampler"), ("step", "trainer"), ("park", "trainer"), *turn]
     self.assertEqual(self.log, expected)
-    self.assertEqual([json.loads(raw) for r in first + second for raw in await self.redis.lrange(future_key(r["request_id"]), 0, -1)], [SAMPLE] * 5)
+    got = [json.loads(fields["data"]) for r in first + second for _, fields in await self.redis.xrange(future_key(r["request_id"]))]
+    self.assertEqual(got, [SAMPLE] * 5)
 
   async def test_a_sampler_the_slicer_refuses_fails_the_pending_requests_with_the_reason_and_exits(self):
     """A restarted sampler whose name the snapshot agent still holds for a dead process is refused at REGISTER. Its
@@ -233,4 +234,4 @@ class TimeSlicedPoolTest(RedisTestCase):
     self.assertIn("holds job sampler as SAVED", result["error_message"])
 
   async def results(self, r: dict) -> list[dict]:
-    return [json.loads(raw) for raw in await self.redis.lrange(future_key(r["request_id"]), 0, -1)]
+    return [json.loads(fields["data"]) for _, fields in await self.redis.xrange(future_key(r["request_id"]))]

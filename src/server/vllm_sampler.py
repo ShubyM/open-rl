@@ -17,8 +17,8 @@ from typing import Any
 from accel_timeslicer.time_slicer import TimeSlicerClient, TimeSlicerRefused, time_slicer_client_from_env, time_slicing_enabled, workload_from_env
 from accel_timeslicer.workload import SAMPLER_CLAIM, WorkloadRef, local_workload_name
 from server.lora_snapshots import snapshot_root
+from server.queue import StreamQueue, sample_queue
 from server.sampling_dispatcher import Dispatcher, RevisionUnloadable, delta_applies, failed, redis_client
-from server.sampling_store import SamplingStore
 from server.telemetry import gpu_turn, serving, set_phase
 from server.vllm_options import engine_args, sample_params, sample_result
 
@@ -152,9 +152,7 @@ async def holding_gpu(time_slicer: TimeSlicerClient | None, workload: WorkloadRe
 class TimeSlicedDispatcher(Dispatcher):
   """A pool's dispatcher when its sampler shares the GPU with the trainer. Each batch runs inside one time-slicer turn."""
 
-  def __init__(
-    self, store: SamplingStore, pool: str, sampler: Sampler, concurrency: int, time_slicer: TimeSlicerClient, workload: WorkloadRef
-  ) -> None:
+  def __init__(self, store: StreamQueue, pool: str, sampler: Sampler, concurrency: int, time_slicer: TimeSlicerClient, workload: WorkloadRef) -> None:
     super().__init__(store, pool, sampler, concurrency)
     self.time_slicer, self.workload = time_slicer, workload
 
@@ -188,14 +186,14 @@ async def run_sampling_worker(pool: str) -> None:
   breaks off, or the slicer cannot park this process. Each of those exits with an error, so the worker restarts."""
   time_slicer = time_slicer_client_from_env() if time_slicing_enabled() else None
   workload = workload_from_env(os.getpid(), name=local_workload_name("sampler", pool), claim=SAMPLER_CLAIM) if time_slicer else None
-  store = SamplingStore(redis_client(os.environ["REDIS_URL"]))
+  store = StreamQueue(redis_client(os.environ["REDIS_URL"]))
   if time_slicer is not None:
     try:
       await time_slicer.register(workload)
     except TimeSlicerRefused as exc:
       # No process under this name can serve the pool again, so its requests fail now instead of at their deadline.
-      for r in await store.pending(pool, limit=None):
-        await store.set_result(r, failed(f"The sampler for pool {pool} cannot run: {exc}"))
+      for r in await store.pending(sample_queue(pool), limit=None, compact=True):
+        await store.complete_sample(r, failed(f"The sampler for pool {pool} cannot run: {exc}"))
       await store.redis.aclose()
       raise
   sampler = task = None

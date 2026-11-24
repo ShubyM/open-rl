@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from server import training_requests_processor as trp
 from server.model_metadata import TrainingModelMetadata, persist_model_metadata
-from server.sampling_store import SamplingStore
+from server.queue import StreamQueue
 from server.store import InMemoryStateStore, InMemoryStore, RedisStore
 from tests.redis_server import RedisTestCase
 from tests.test_fft_batch_failure import SlicerStub
@@ -55,7 +55,7 @@ class PinnedVersionTest(RedisTestCase):
     versions = os.path.join(tmp, "sampler_full", "run-a", "sampler_weights")
     pinned = {"request_id": "waiting", "pool": meta.pool("run-a"), "job": "run-a", "model": "base", "idempotency_key": None}
     pinned["revision"] = os.path.join(versions, "sampler-1")
-    await SamplingStore(self.redis).accept(pinned)
+    await StreamQueue(self.redis).accept(pinned)
     proc = trp.TrainingRequestsProcessor(RedisStore(self.redis), RecordingWorker(), "run-a", time_slicer=SlicerStub())
     for step in range(1, 6):
       await proc.dispatch_operation(

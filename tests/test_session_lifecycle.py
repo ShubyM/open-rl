@@ -121,8 +121,9 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
     shared = (await self.post("create_model", {"base_model": "test-base", "session_id": session}))["request_id"]
     body = {"base_model": "test-base", "session_id": session, "user_metadata": {"openrl.exclusive": "true"}}
     exclusive = (await self.post("create_model", body))["request_id"]
-    await self.store.get_requests(active_set_id="test-base-1")
-    await self.store.get_requests(active_set_id=f"{exclusive}-1")
+    for active_set in ("test-base-1", f"{exclusive}-1"):
+      for r in await self.store.get_requests(active_set_id=active_set):
+        await self.store.ack_request(r)
 
     await self.post("delete_model", {"model_id": shared})
     await self.post("delete_model", {"model_id": exclusive})

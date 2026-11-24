@@ -8,20 +8,19 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from server import training_requests_processor as trp
-from server.store import InMemoryStore
+from server.store import InMemoryStore, RedisStore
+from tests.test_queue import FakeRedis
 from training import commands
 from training.types import Datum, FFTConfig, TensorData
 
 
 class PerModelStore(InMemoryStore):
-  """The in-memory store, draining one model's queue the way RedisStore does."""
+  """The in-memory store, draining one model's queue non-destructively the way RedisStore does."""
 
   async def get_requests_for_model(self, model_id):
-    queue = self.queues.setdefault(model_id, asyncio.Queue())
-    batch = [await queue.get()]
-    while not queue.empty():
-      batch.append(queue.get_nowait())
-    return batch
+    async with self.active_tenants_cv:
+      await self.active_tenants_cv.wait_for(lambda: bool(self.queues.get(model_id)))
+      return list(self.queues[model_id].values())
 
 
 def tiny_worker() -> trp.FFTTrainingWorker:
@@ -80,6 +79,34 @@ class ExclusiveTrainerTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(result.get("type"), "RequestFailedResponse", f"{request_id}: {result}")
       self.assertFalse(torch.equal(before, worker.model.lm_head.weight))
       self.assertTrue(os.listdir(os.path.join(tmp, "state")))
+
+  async def test_crashing_mid_command_leaves_request_for_restarted_processor(self) -> None:
+    class CrashingWorker:
+      def optim_step(self, adam_params, model_id):
+        raise asyncio.CancelledError("simulated worker crash before completion")
+
+    class HealthyWorker:
+      def optim_step(self, adam_params, model_id):
+        return {"metrics": {"grad_norm:mean": 0.5}}
+
+    for label, store in (("in_memory", PerModelStore()), ("redis_stream", RedisStore(FakeRedis()))):
+      with self.subTest(store=label):
+        step = commands.OptimStep(request_id="opt-crash", model_id="run-a", adam_params={"learning_rate": 1e-3})
+        await store.put_request(commands.wire(step))
+        with patch.dict(os.environ, {"REDIS_URL": "redis://test"}):
+          crashed = trp.TrainingRequestsProcessor(store, CrashingWorker(), "run-a")
+          with self.assertRaises(asyncio.CancelledError):
+            await crashed.run_once()
+          # Entry stayed in the queue and no future was written.
+          self.assertEqual(await store.queued("run-a"), 1)
+          self.assertEqual((await store.get_result("opt-crash", timeout=0.01))["type"], "try_again")
+
+          restarted = trp.TrainingRequestsProcessor(store, HealthyWorker(), "run-a")
+          await restarted.run_once()
+
+        result = await store.get_result("opt-crash", timeout=5)
+        self.assertEqual(result, {"metrics": {"grad_norm:mean": 0.5}, "type": "optim_step_completed"})
+        self.assertEqual(await store.queued("run-a"), 0)
 
 
 if __name__ == "__main__":

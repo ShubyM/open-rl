@@ -37,10 +37,10 @@ from server.model_metadata import (
   pool_name,
 )
 from server.observability.router import router
+from server.queue import StreamQueue, sample_queue, train_queue
 from server.sampling_dispatcher import SAMPLE_DEADLINE_SECONDS
-from server.sampling_store import SamplingStore
 from server.session_registry import SessionRegistry
-from server.store import get_state_store, get_store
+from server.store import RedisStore, get_state_store, get_store
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_id, owner_of, runtime_of
 from training import commands
@@ -86,8 +86,10 @@ async def reap_owner(owner: str) -> None:
     print(f"[API_SERVER] No live session uses {owner}; tearing its workers down")
     for model in await asyncio.to_thread(worker_manager.release_owner, owner):
       await state.delete_values(f"open_rl:trainer_ready:{model}")
+      if isinstance(store, RedisStore):
+        await store.queue.delete_if_empty(train_queue(model))
       if get_sampler_backend() == "vllm":
-        await SamplingStore(store.redis).delete_if_empty(pool_name(model))
+        await StreamQueue(store.redis).delete_if_empty(sample_queue(pool_name(model)))
     await session_registry.forget(owner)
 
 
@@ -769,14 +771,14 @@ async def reconcile_pools() -> None:
   run without a worker manager and own their pools."""
   if worker_manager is None:
     return
-  sampling = SamplingStore(store.redis)
+  sampling = StreamQueue(store.redis)
   pairs = []
-  for pool in await sampling.pools():
+  for pool in await sampling.active_pools():
     try:
       jobs = await sampling.pending_jobs(pool)
       # Whichever path answered a pool's last request, its empty stream stays until something deletes it.
       if not jobs:
-        await sampling.delete_if_empty(pool)
+        await sampling.delete_if_empty(sample_queue(pool))
       pairs += [(pool, job) for job in jobs]
     except Exception:
       traceback.print_exc()
@@ -793,7 +795,7 @@ async def reconcile_pools() -> None:
       traceback.print_exception(outcome)
 
 
-async def reconcile_job(sampling: SamplingStore, pool: str, job: str) -> None:
+async def reconcile_job(sampling: StreamQueue, pool: str, job: str) -> None:
   meta, runtime, _ = await asyncio.to_thread(runtime_of, job)
   if meta.pool(job) != pool:
     return  # a record from before records named their job, whose model is no job on this pool
@@ -819,7 +821,7 @@ async def reconcile_job(sampling: SamplingStore, pool: str, job: str) -> None:
 async def sweep_sample_deadlines() -> None:
   """Fails pool requests past the deadline, which no dispatcher does while the pool is gone."""
   result = {"type": "RequestFailedResponse", "error_message": f"No sampler read the request within {SAMPLE_DEADLINE_SECONDS}s"}
-  if failed := await SamplingStore(store.redis).fail_older_than(SAMPLE_DEADLINE_SECONDS, result):
+  if failed := await StreamQueue(store.redis).fail_older_than(SAMPLE_DEADLINE_SECONDS, result):
     print(f"[API_SERVER] Failed {failed} sampling requests no sampler read in time")
 
 
@@ -1100,11 +1102,13 @@ async def delete_model(req: ModelRequest):
     await persist_model_metadata(state, model_id, meta)
     if get_sampler_backend() == "vllm":
       result = {"type": "RequestFailedResponse", "error_message": f"{model_id} was deleted"}
-      await SamplingStore(store.redis).fail_job(meta.pool(model_id), model_id, result)
+      await StreamQueue(store.redis).fail_job(meta.pool(model_id), model_id, result)
     if worker_manager is not None and not meta.shares_runtime():
       await asyncio.to_thread(worker_manager.release, model_id)
+      if isinstance(store, RedisStore):
+        await store.queue.delete_if_empty(train_queue(model_id))
       if get_sampler_backend() == "vllm":
-        await SamplingStore(store.redis).delete_if_empty(meta.pool(model_id))
+        await StreamQueue(store.redis).delete_if_empty(sample_queue(meta.pool(model_id)))
   return {"status": "ok"}
 
 
@@ -1440,7 +1444,7 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
 
   params = req.sampling_params
   stop, stop_token_ids = split_stop(params.stop)
-  return await SamplingStore(store.redis).accept(
+  return await StreamQueue(store.redis).accept(
     {
       "request_id": new_request_id(),
       "pool": pool,

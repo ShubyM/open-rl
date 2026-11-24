@@ -20,7 +20,7 @@ from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_fr
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
-from server.sampling_store import SamplingStore
+from server.queue import train_queue
 from server.store import RedisStore, RequestStore, StateStore, get_state_store, get_store
 from server.telemetry import answered, finish, gpu_turn, observe_operation, popped, serving, set_phase
 from training import commands
@@ -117,7 +117,7 @@ class TrainingRequestsProcessor:
 
     self.store = store
     # Sampling pools live in Redis, so the in-process trainer's in-memory store has none.
-    self.sampling = SamplingStore(store.redis) if isinstance(store, RedisStore) else None
+    self.sampling = store.queue if isinstance(store, RedisStore) else None
     self.worker = worker
     self.model_id = model_id
     self.active_tenant_set_id = active_tenant_set_id
@@ -126,7 +126,7 @@ class TrainingRequestsProcessor:
     self.snapshot_registered = False
     self.state: StateStore | None = None  # opened on first use; tests inject one
     self.ready_announced_at = float("-inf")
-    self.shutdown_drained = False  # a shutdown_workers taken while draining a turn; run_once honours it after answering
+    self.drained_shutdowns: list[dict[str, Any]] = []  # shutdown_workers taken while draining a turn; run_once honours them after answering
 
   async def run(self) -> None:
     print(f"[WORKER] Training requests processor started (model={self.model_id} active_set={self.active_tenant_set_id}).")
@@ -206,13 +206,12 @@ class TrainingRequestsProcessor:
       batch = await asyncio.to_thread(broadcast_object, batch)
     return batch or []
 
-  async def queued_now(self, deadline: float) -> list[dict[str, Any]]:
-    """Requests already queued for this model, without waiting for one, or none once the deadline has passed. Rank 0
-    decides and fans the result out, as next_batch does, so every rank runs the same sequence."""
+  async def queued_now(self, deadline: float, after: str = "0-0") -> list[dict[str, Any]]:
+    """Requests already queued for this model after `after`, without waiting for one, or none once the deadline has
+    passed. Rank 0 decides and fans the result out, as next_batch does, so every rank runs the same sequence."""
     batch = None
     if is_primary():
-      ready = self.dedicated and time.monotonic() < deadline and await self.store.queued(self.model_id) > 0
-      batch = await self.store.get_requests_for_model(self.model_id) if ready else []
+      batch = await self.store.pending_for_model(self.model_id, after=after) if self.dedicated and time.monotonic() < deadline else []
     if is_distributed():
       batch = await asyncio.to_thread(broadcast_object, batch)
     return batch or []
@@ -222,11 +221,20 @@ class TrainingRequestsProcessor:
       return await self.store.get_requests_for_model(self.model_id)
     return await self.store.get_requests(active_set_id=self.active_tenant_set_id)
 
-  async def publish_result(self, request_id: str | None, result: dict[str, Any]) -> None:
+  async def ack_request(self, raw_request: dict[str, Any]) -> None:
+    if is_primary():
+      await self.store.ack_request(raw_request)
+
+  async def publish_result(self, raw_request: dict[str, Any], request_id: str | None, result: dict[str, Any]) -> None:
     # Only rank 0 writes to the store; the other ranks computed the same result.
-    if request_id is not None and is_primary():
-      await self.store.set_result(request_id, result)
-      answered(request_id, result)
+    if not is_primary():
+      return
+    if request_id is not None:
+      record = raw_request if raw_request.get("request_id") == request_id else {**raw_request, "request_id": request_id}
+      if await self.store.complete_request(record, result):
+        answered(request_id, result)
+    else:
+      await self.store.ack_request(raw_request)
 
   async def run_once(self) -> None:
     batch = await self.next_batch()
@@ -234,24 +242,31 @@ class TrainingRequestsProcessor:
       await asyncio.sleep(0.1)
       return
 
-    shutdown = any(req.get("op") == "shutdown_workers" for req in batch)
+    self.drained_shutdowns = []
+    shutdown_reqs = [req for req in batch if req.get("op") == "shutdown_workers"]
     work = [req for req in batch if req.get("op") != "shutdown_workers"]
+    after = batch[-1].get("entry_id", "0-0")
     popped(work)
     model_id = batch[0].get("model_id", "default")
 
-    results: list[tuple[str | None, dict[str, Any]]] = []
+    results: list[tuple[dict[str, Any], str | None, dict[str, Any]]] = []
     failure: Exception | None = None
     with tracer.start_as_current_span("training_requests_batch") as batch_span:
       batch_span.set_attribute("batch_size", len(work))
       batch_span.set_attribute("model_id", model_id)
       if work:
         print(f"\n[TRAINING REQUESTS] Popped {len(work)} requests for model: {model_id}: {describe_requests(work)}")
-        results, failure = await self.answer_batch(work)
+        results, failure = await self.answer_batch(work, after=after)
 
-    for request_id, result in results:
-      await self.publish_result(request_id, result)
+    for raw_request, request_id, result in results:
+      await self.publish_result(raw_request, request_id, result)
     if failure is not None:
       raise failure
+    all_shutdowns = [*shutdown_reqs, *self.drained_shutdowns]
+    for req in all_shutdowns:
+      await self.ack_request(req)
+    if all_shutdowns and self.model_id and isinstance(self.store, RedisStore) and is_primary():
+      await self.store.queue.delete_if_empty(train_queue(self.model_id))
 
     if self.time_slicer is None:
       return
@@ -261,29 +276,44 @@ class TrainingRequestsProcessor:
       # from restarting on fresh weights mid-run; the run fails on its next call.
       print(f"[WORKER] Time slicer could not park this process: {self.time_slicer.faulted}. Exiting to free the accelerator.")
       await self.exit_gracefully(unregister=False)
-    if shutdown or self.shutdown_drained:
+    if all_shutdowns:
       await self.exit_gracefully()
 
-  async def answer_batch(self, requests: list[dict[str, Any]]) -> tuple[list[tuple[str | None, dict[str, Any]]], Exception | None]:
+  async def answer_batch(
+    self, requests: list[dict[str, Any]], after: str = "0-0"
+  ) -> tuple[list[tuple[dict[str, Any], str | None, dict[str, Any]]], Exception | None]:
     """Every request gets an answer: its result, or the failure that stopped the batch."""
-    results: list[tuple[str | None, dict[str, Any]]] = []
+    results: list[tuple[dict[str, Any], str | None, dict[str, Any]]] = []
+    published: set[int] = set()
     try:
-      await self.handle_batch(requests, results)
+      await self.handle_batch(requests, results, published=published, after=after)
     except Exception as exc:
-      answered = {request_id for request_id, _ in results}
+      answered_ids = {request_id for _, request_id, _ in results}
       for request in requests:
+        if id(request) in published:
+          continue
         request_id = request.get("request_id")
-        if request_id and request_id not in answered:
-          results.append((request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
+        if request_id is None:
+          results.append((request, None, {}))
+        elif request_id not in answered_ids:
+          results.append((request, request_id, {"type": "RequestFailedResponse", "error_message": f"Trainer worker error: {exc}"}))
       return results, exc
     return results, None
 
-  async def handle_batch(self, requests: list[dict[str, Any]], results: list[tuple[str | None, dict[str, Any]]]) -> None:
+  async def handle_batch(
+    self,
+    requests: list[dict[str, Any]],
+    results: list[tuple[dict[str, Any], str | None, dict[str, Any]]],
+    published: set[int] | None = None,
+    after: str = "0-0",
+  ) -> None:
     """GPU work under one time-slicer turn; saves need the device only when the worker is not offloaded."""
     if self.time_slicer is None:
       # No lease to hold, so each answer goes out as soon as it is ready.
       for request in requests:
         await self.process_request(request)
+        if published is not None:
+          published.add(id(request))
       return
 
     save_ops = {"save_state", "save_weights_for_sampler"}
@@ -295,23 +325,26 @@ class TrainingRequestsProcessor:
         await asyncio.to_thread(self.worker.wake_up)
         try:
           for request in gpu_reqs:
-            results.append(await self.handle_request(request))
+            request_id, result = await self.handle_request(request)
+            results.append((request, request_id, result))
           # Requests that queued while this turn waited or ran join it. The budget counts from here, after the batch
           # the turn was taken for, which on a busy GPU can itself run far longer than the budget; it bounds only the
           # work the drain adds. A save ends the drain: as within any batch, saves run after its GPU ops, so nothing
           # queued after a save may run before it.
           deadline = time.monotonic() + TURN_DRAIN_SECONDS
           while not save_reqs:
-            more = await self.queued_now(deadline)
+            more = await self.queued_now(deadline, after=after)
             if not more:
               break
-            self.shutdown_drained |= any(r.get("op") == "shutdown_workers" for r in more)
+            after = more[-1].get("entry_id", after)
+            self.drained_shutdowns.extend(r for r in more if r.get("op") == "shutdown_workers")
             more = [r for r in more if r.get("op") != "shutdown_workers"]
             requests.extend(more)  # so a failure answers them too
             popped(more)
             save_reqs.extend(r for r in more if r.get("op") in save_ops)
             for request in (r for r in more if r.get("op") not in save_ops):
-              results.append(await self.handle_request(request))
+              request_id, result = await self.handle_request(request)
+              results.append((request, request_id, result))
         finally:
           await asyncio.to_thread(self.worker.sleep)
 
@@ -319,22 +352,24 @@ class TrainingRequestsProcessor:
       return
     if self.worker.cpu_offload:
       for request in save_reqs:
-        results.append(await self.handle_request(request))
+        request_id, result = await self.handle_request(request)
+        results.append((request, request_id, result))
     else:
       async with gpu_turn(self.time_slicer.acquire(self.workload)):
         for request in save_reqs:
-          results.append(await self.handle_request(request))
+          request_id, result = await self.handle_request(request)
+          results.append((request, request_id, result))
 
   async def process_request(self, raw_request: dict[str, Any]) -> None:
     request_id, result = await self.handle_request(raw_request)
-    await self.publish_result(request_id, result)
+    await self.publish_result(raw_request, request_id, result)
 
   async def handle_request(self, raw_request: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     request_id = raw_request.get("request_id")
     token = None
 
     try:
-      command = parse_command(raw_request)
+      command = parse_command({k: v for k, v in raw_request.items() if k != "entry_id"})
       request_id = command.request_id
 
       ctx = propagate.extract(command.trace_context) if command.trace_context else None

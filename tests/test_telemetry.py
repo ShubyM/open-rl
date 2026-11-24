@@ -16,8 +16,8 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from server import api_server, telemetry
+from server.queue import StreamQueue, future_key
 from server.sampling_dispatcher import Dispatcher, RevisionUnloadable, failed
-from server.sampling_store import SamplingStore, future_key
 from server.store import InMemoryStateStore, InMemoryStore, StateStore
 from server.training_requests_processor import TrainingRequestsProcessor
 from server.vllm_sampler import Sampler
@@ -319,7 +319,7 @@ class SampleRecordTest(RedisTestCase):
 
   async def asyncSetUp(self) -> None:
     await super().asyncSetUp()
-    self.store, self.pool, self.telemetry = SamplingStore(self.redis), f"sampler-{uuid.uuid4()}", InMemoryStateStore()
+    self.store, self.pool, self.telemetry = StreamQueue(self.redis), f"sampler-{uuid.uuid4()}", InMemoryStateStore()
     self.enterContext(patch.object(telemetry, "get_state_store", lambda: self.telemetry))
     vllm = fake_vllm() | {name: types.ModuleType(name) for name in ("vllm.distributed", "vllm.distributed.weight_transfer.base")}
     vllm["vllm.distributed.weight_transfer.base"].WeightTransferUpdateRequest = dict
@@ -334,8 +334,8 @@ class SampleRecordTest(RedisTestCase):
     return r
 
   async def answer(self, r: dict) -> str | None:
-    raw = await self.redis.lindex(future_key(r["request_id"]), 0)
-    return json.loads(raw)["type"] if raw else None
+    entries = await self.redis.xrange(future_key(r["request_id"]), count=1)
+    return json.loads(entries[0][1]["data"])["type"] if entries else None
 
   def serve(self, sampler) -> None:
     """Serve the pool as a sampler process does, until it exits."""

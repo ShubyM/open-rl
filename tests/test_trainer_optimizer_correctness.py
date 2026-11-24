@@ -180,6 +180,14 @@ class _FutureStoreStub:
       self.events.append(("set_result", req_id))
     self.results[req_id] = result
 
+  async def complete_request(self, record, result):
+    if req_id := record.get("request_id"):
+      await self.set_result(req_id, result)
+    return True
+
+  async def ack_request(self, record):
+    return True
+
 
 class _TrainingRequestsStoreStub(_FutureStoreStub):
   def __init__(self, batches, events=None):
@@ -189,6 +197,9 @@ class _TrainingRequestsStoreStub(_FutureStoreStub):
 
   async def queued(self, model_id):
     return 0  # nothing waits between batches, so a turn takes no more than its batch
+
+  async def pending_for_model(self, model_id, *, after="0-0"):
+    return await self.get_requests_for_model(model_id) if await self.queued(model_id) > 0 else []
 
   async def get_requests_for_model(self, model_id):
     self.queried_model_ids.append(model_id)

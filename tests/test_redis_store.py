@@ -137,6 +137,12 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
 
     batch = await self.store.get_requests(active_set_id="base-1")
     self.assertEqual([r["request_id"] for r in batch], ["a0", "a1"])
+    # Entries stay pending until completed or acked (crash-durable non-destructive read).
+    self.assertEqual(await self.store.queued("tenant-a"), 2)
+    self.assertTrue(await self.store.complete_request(batch[0], {"type": "ok"}))
+    self.assertTrue(await self.store.ack_request(batch[1]))
+    self.assertEqual(await self.store.queued("tenant-a"), 0)
+    self.assertEqual(await self.store.get_result("a0", timeout=1.0), {"type": "ok"})
 
   async def test_values_expire_and_sets_hold_members(self) -> None:
     await self.state.set_value("k", "v", ttl_seconds=60)
@@ -198,6 +204,12 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
 
     batch = await self.store.get_requests(active_set_id="base-1")
     self.assertEqual([r["request_id"] for r in batch], ["a0", "a1"])
+    # Entries stay pending until completed or acked (crash-durable non-destructive read).
+    self.assertEqual(await self.store.queued("tenant-a"), 2)
+    self.assertTrue(await self.store.complete_request(batch[0], {"type": "ok"}))
+    self.assertTrue(await self.store.ack_request(batch[1]))
+    self.assertEqual(await self.store.queued("tenant-a"), 0)
+    self.assertEqual(await self.store.get_result("a0", timeout=1.0), {"type": "ok"})
 
   async def test_values_expire_and_sets_hold_members(self) -> None:
     await self.state.set_value("k", "v", ttl_seconds=60)

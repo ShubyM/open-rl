@@ -31,6 +31,9 @@ class QueueStore(InMemoryStore):
   async def queued(self, model_id):
     return len(self.batches[0]) if self.batches else 0
 
+  async def pending_for_model(self, model_id, *, after="0-0"):
+    return await self.get_requests_for_model(model_id) if await self.queued(model_id) > 0 else []
+
   async def set_result(self, request_id, result):
     self.futures[request_id] = result
 

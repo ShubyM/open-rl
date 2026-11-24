@@ -4,8 +4,12 @@ import os
 import unittest
 from unittest.mock import patch
 
-from server.store import InMemoryStore
+from server import training_requests_processor as trp
+from server.queue import queue_key, train_queue
+from server.store import InMemoryStore, RedisStore
 from server.training_requests_processor import TrainingRequestsProcessor
+from tests.test_queue import FakeRedis
+from training import commands
 
 
 class SlicerStub:
@@ -83,6 +87,60 @@ class FFTBatchFailureTest(unittest.TestCase):
     asyncio.run(proc.run_once())
     self.assertEqual(store.futures["sv-1"]["type"], "SaveWeightsResponse")
     self.assertEqual(exits, [False])
+
+  def test_poison_pill_acked_without_double_answering_completed_entries(self) -> None:
+    async def run() -> None:
+      fake = FakeRedis()
+      store = RedisStore(fake)
+      await store.put_request(commands.wire(commands.OptimStep(request_id="ok-1", model_id="run-a", adam_params={"learning_rate": 1e-3})))
+      await store.put_request({"op": "not_a_real_op", "model_id": "run-a"})  # malformed poison pill with request_id=None
+      await store.put_request(commands.wire(commands.OptimStep(request_id="after-1", model_id="run-a", adam_params={"learning_rate": 1e-3})))
+
+      class OkWorker:
+        def optim_step(self, adam_params, model_id):
+          return {"metrics": {"grad_norm:mean": 0.1}}
+
+      answered_calls: list[tuple[str, str]] = []
+      with (
+        patch.dict(os.environ, {"REDIS_URL": "redis://test"}),
+        patch.object(trp, "answered", side_effect=lambda rid, res: answered_calls.append((rid, res["type"]))),
+      ):
+        proc = TrainingRequestsProcessor(store, OkWorker(), "run-a")
+        with self.assertRaises(ValueError):
+          await proc.run_once()
+
+      # ok-1 succeeded once (not re-failed or double-reported), poison pill was acked, after-1 failed cleanly.
+      self.assertEqual(await store.queued("run-a"), 0)
+      self.assertEqual((await store.get_result("ok-1", timeout=1))["type"], "optim_step_completed")
+      self.assertEqual((await store.get_result("after-1", timeout=1))["type"], "RequestFailedResponse")
+      self.assertEqual(answered_calls, [("ok-1", "optim_step_completed"), ("after-1", "RequestFailedResponse")])
+
+    asyncio.run(run())
+
+  def test_shutdown_survives_batch_failure_and_deletes_empty_train_stream(self) -> None:
+    async def run() -> None:
+      fake = FakeRedis()
+      store = RedisStore(fake)
+      await store.put_request(commands.wire(commands.OptimStep(request_id="opt-1", model_id="run-a", adam_params={"learning_rate": 1e-3})))
+      await store.put_request({"op": "shutdown_workers", "model_id": "run-a"})
+      exits: list[bool] = []
+
+      async def record_exit(unregister=True):
+        exits.append(unregister)
+
+      proc = processor(store, SlicerStub())
+      proc.exit_gracefully = record_exit
+      with self.assertRaises(RuntimeError):
+        await proc.run_once()
+      self.assertEqual((await store.get_result("opt-1", timeout=1))["type"], "RequestFailedResponse")
+      self.assertEqual(await store.queued("run-a"), 1, "shutdown_workers must remain queued after batch failure")
+      self.assertEqual(exits, [])
+
+      await proc.run_once()
+      self.assertEqual(exits, [True])
+      self.assertEqual(await fake.exists(queue_key(train_queue("run-a"))), 0)
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
