@@ -8,7 +8,8 @@ from unittest.mock import patch
 from server import training_requests_processor as trp
 from server.model_metadata import TrainingModelMetadata, persist_model_metadata
 from server.queue import StreamQueue
-from server.store import InMemoryStateStore, InMemoryStore, RedisStore
+from server.store import InMemoryStateStore
+from tests.fake_redis import FakeRedis
 from tests.redis_server import RedisTestCase
 from tests.test_fft_batch_failure import SlicerStub
 from training import commands
@@ -34,7 +35,7 @@ class SamplerWeightRotationTest(unittest.TestCase):
       patch.object(trp, "SAMPLER_VERSIONS_KEPT", 3),
     ):
       worker = RecordingWorker()
-      proc = trp.TrainingRequestsProcessor(InMemoryStore(), worker, "run-a", time_slicer=SlicerStub())
+      proc = trp.TrainingRequestsProcessor(StreamQueue(FakeRedis()), worker, "run-a", time_slicer=SlicerStub())
       versions = os.path.join(tmp, "sampler_full", "run-a", "sampler_weights")
       for step in range(1, 6):
         command = commands.SaveWeightsForSampler(request_id=f"r{step}", model_id="run-a", path=f"tinker://run-a/sampler_weights/sampler-{step}")
@@ -56,7 +57,7 @@ class PinnedVersionTest(RedisTestCase):
     pinned = {"request_id": "waiting", "pool": meta.pool("run-a"), "job": "run-a", "model": "base", "idempotency_key": None}
     pinned["revision"] = os.path.join(versions, "sampler-1")
     await StreamQueue(self.redis).accept(pinned)
-    proc = trp.TrainingRequestsProcessor(RedisStore(self.redis), RecordingWorker(), "run-a", time_slicer=SlicerStub())
+    proc = trp.TrainingRequestsProcessor(StreamQueue(self.redis), RecordingWorker(), "run-a", time_slicer=SlicerStub())
     for step in range(1, 6):
       await proc.dispatch_operation(
         commands.SaveWeightsForSampler(request_id=f"r{step}", model_id="run-a", path=f"tinker://run-a/sampler_weights/sampler-{step}")

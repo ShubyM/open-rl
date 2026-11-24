@@ -11,10 +11,12 @@ from unittest.mock import Mock, patch
 from server import api_server
 from server.estimator import footprint
 from server.model_metadata import TrainingModelMetadata, decode_model_metadata
+from server.queue import StreamQueue
 from server.scheduler_worker_manager import GROUP, PLURAL, VERSION, SchedulerWorkerManager
-from server.store import InMemoryStateStore, InMemoryStore
+from server.store import InMemoryStateStore
 from server.worker_manager import owner_id
 from tests.api_client import asgi_client, post_json
+from tests.fake_redis import FakeRedis
 
 
 class ApiError(Exception):
@@ -103,7 +105,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
     self.api, self.k8s = FakeCustomObjectsApi(), FakeApi()
     self.manager = SchedulerWorkerManager(custom_api=self.api, apps_api=self.k8s, networking_api=self.k8s)
 
-  def store_with(self, model_id: str, meta: dict) -> InMemoryStore:
+  def store_with(self, model_id: str, meta: dict) -> InMemoryStateStore:
     s = InMemoryStateStore()
     s.kv_store[f"open_rl:model_meta:{model_id}"] = json.dumps(meta)
     return s
@@ -560,7 +562,7 @@ class SchedulerWorkerManagerTest(unittest.TestCase):
 
 class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
   async def test_lora_and_fft_sessions_launch_their_own_sampler_types(self) -> None:
-    store = InMemoryStore()
+    queue = StreamQueue(FakeRedis())
     state = InMemoryStateStore()
     for model_id, kind in (("lora-a", "lora"), ("lora-b", "lora"), ("fft-a", "full")):
       await state.set_value(f"open_rl:model_meta:{model_id}", json.dumps({"base_model": "Qwen/Qwen2.5-0.5B", "fine_tuning_type": kind}))
@@ -569,9 +571,9 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
     with (
       patch.dict(os.environ, env),
       patch("server.worker_manager.get_state_store", return_value=state),
-      patch.object(api_server, "store", store),
+      patch.object(api_server, "queue", queue),
       patch.object(api_server, "state", state),
-      patch.object(api_server, "get_store", return_value=store),
+      patch.object(api_server, "get_queue", return_value=queue),
       patch.object(api_server, "worker_manager", SchedulerWorkerManager(custom_api=api, apps_api=FakeApi(), networking_api=FakeApi())),
     ):
       async with asgi_client() as client:

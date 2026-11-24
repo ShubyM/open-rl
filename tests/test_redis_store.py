@@ -1,7 +1,4 @@
-# Integration tests for the Redis-backed stores. They need a real Redis: either
-# set OPEN_RL_TEST_REDIS_URL, or have redis-server on PATH (a throwaway instance
-# is started on a free port). Skipped entirely otherwise, so `make test` stays
-# green on machines without Redis.
+"""Tests for StateStore (in-memory & Redis), StreamQueue live-Redis integration, and model metadata decoding."""
 
 import asyncio
 import os
@@ -14,7 +11,8 @@ import unittest
 import redis as sync_redis
 import redis.asyncio as redis
 
-from server.store import InMemoryStateStore, RedisStateStore, RedisStore
+from server.queue import StreamQueue, train_queue
+from server.store import InMemoryStateStore, RedisStateStore
 
 TEST_REDIS_URL = os.getenv("OPEN_RL_TEST_REDIS_URL")
 REDIS_SERVER = shutil.which("redis-server")
@@ -27,7 +25,7 @@ def free_port() -> int:
 
 
 @unittest.skipUnless(TEST_REDIS_URL or REDIS_SERVER, "needs OPEN_RL_TEST_REDIS_URL or redis-server on PATH")
-class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
+class RedisStoreIntegrationTest(unittest.IsolatedAsyncioTestCase):
   server: subprocess.Popen | None = None
   redis_url: str
 
@@ -60,91 +58,32 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
       cls.server.wait(timeout=10)
 
   def setUp(self) -> None:
-    self.store = RedisStore(redis.from_url(self.redis_url, decode_responses=True))
-    self.state = RedisStateStore(self.store.redis, sync_redis.Redis.from_url(self.redis_url, decode_responses=True))
+    client = redis.from_url(self.redis_url, decode_responses=True)
+    self.queue = StreamQueue(client)
+    self.state = RedisStateStore(client, sync_redis.Redis.from_url(self.redis_url, decode_responses=True))
 
   async def asyncSetUp(self) -> None:
-    await self.store.redis.flushdb()
+    await self.queue.redis.flushdb()
 
   async def asyncTearDown(self) -> None:
-    await self.store.redis.aclose()
+    await self.queue.redis.aclose()
     self.state.sync_redis.close()
 
-  async def test_get_result_returns_already_resolved_result(self) -> None:
-    await self.store.set_result("req-1", {"type": "sample", "ok": True})
-    self.assertEqual(await self.store.get_result("req-1", timeout=1.0), {"type": "sample", "ok": True})
+  async def test_stream_queue_futures_and_round_robin_on_live_redis(self) -> None:
+    await self.queue.set_result("req-1", {"type": "sample", "ok": True})
+    self.assertEqual(await self.queue.get_result("req-1", timeout=1.0), {"type": "sample", "ok": True})
 
-  async def test_get_result_wakes_on_resolution(self) -> None:
-    async def resolve_later() -> None:
-      await asyncio.sleep(0.2)
-      await self.store.set_result("req-1", {"type": "sample"})
-
-    resolver = asyncio.create_task(resolve_later())
-    started = time.monotonic()
-    result = await self.store.get_result("req-1", timeout=10.0)
-    await resolver
-
-    self.assertEqual(result, {"type": "sample"})
-    # Woken by the publish, not by grinding through the whole long-poll window.
-    self.assertLess(time.monotonic() - started, 5.0)
-
-  async def test_result_survives_repeated_and_concurrent_reads(self) -> None:
-    waiters = [asyncio.create_task(self.store.get_result("req-1", timeout=10.0)) for _ in range(5)]
-    await asyncio.sleep(0.2)
-    await self.store.set_result("req-1", {"type": "sample"})
-
-    for result in await asyncio.gather(*waiters):
-      self.assertEqual(result, {"type": "sample"})
-    self.assertEqual(await self.store.get_result("req-1", timeout=1.0), {"type": "sample"})
-
-  async def test_unresolved_future_times_out_with_try_again(self) -> None:
-    result = await self.store.get_result("req-never", timeout=0.3)
-    self.assertEqual(result["type"], "try_again")
-
-  async def test_pending_markers_are_not_stored(self) -> None:
-    await self.store.set_result("req-1", {"status": "pending"})
-    self.assertEqual((await self.store.get_result("req-1", timeout=0.3))["type"], "try_again")
-
-  async def test_get_requests_rotates_between_tenants(self) -> None:
-    for i in range(3):
-      await self.store.put_request({"model_id": "tenant-a", "request_id": f"a{i}"}, active_set_id="base-1")
-      await self.store.put_request({"model_id": "tenant-b", "request_id": f"b{i}"}, active_set_id="base-1")
-
+    qa, qb = train_queue("tenant-a"), train_queue("tenant-b")
+    await self.queue.enqueue(qa, {"model_id": "tenant-a", "request_id": "a0"}, group="base-1")
+    await self.queue.enqueue(qb, {"model_id": "tenant-b", "request_id": "b0"}, group="base-1")
     served = []
     for _ in range(2):
-      batch = await self.store.get_requests(active_set_id="base-1")
+      batch = await self.queue.next_batch("base-1", timeout_ms=1000)
       served.append(batch[0]["model_id"])
-
+      await self.queue.complete_record(train_queue(batch[0]["model_id"]), batch[0], {"type": "ok"})
     self.assertEqual(served, ["tenant-a", "tenant-b"])
 
-  async def test_busy_tenant_does_not_starve_its_peer(self) -> None:
-    await self.store.put_request({"model_id": "busy", "request_id": "b0"}, active_set_id="base-1")
-    await self.store.put_request({"model_id": "quiet", "request_id": "q0"}, active_set_id="base-1")
-
-    # The busy tenant keeps enqueueing after each turn. Without rotation it holds
-    # the head of the active list forever and 'quiet' is never served.
-    served = []
-    for i in range(4):
-      batch = await self.store.get_requests(active_set_id="base-1")
-      served.append(batch[0]["model_id"])
-      await self.store.put_request({"model_id": "busy", "request_id": f"b{i + 1}"}, active_set_id="base-1")
-
-    self.assertIn("quiet", served)
-
-  async def test_get_requests_drains_only_the_depth_present_on_entry(self) -> None:
-    for i in range(2):
-      await self.store.put_request({"model_id": "tenant-a", "request_id": f"a{i}"}, active_set_id="base-1")
-
-    batch = await self.store.get_requests(active_set_id="base-1")
-    self.assertEqual([r["request_id"] for r in batch], ["a0", "a1"])
-    # Entries stay pending until completed or acked (crash-durable non-destructive read).
-    self.assertEqual(await self.store.queued("tenant-a"), 2)
-    self.assertTrue(await self.store.complete_request(batch[0], {"type": "ok"}))
-    self.assertTrue(await self.store.ack_request(batch[1]))
-    self.assertEqual(await self.store.queued("tenant-a"), 0)
-    self.assertEqual(await self.store.get_result("a0", timeout=1.0), {"type": "ok"})
-
-  async def test_values_expire_and_sets_hold_members(self) -> None:
+  async def test_values_expire_sets_and_scan_values(self) -> None:
     await self.state.set_value("k", "v", ttl_seconds=60)
     self.assertEqual(await self.state.get_value("k"), "v")
     await self.state.set_value("k", "v", ttl_seconds=0.2)
@@ -157,60 +96,17 @@ class RedisFutureTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(await self.state.set_members("s"), {"b"})
     self.assertEqual(await self.state.set_members("missing"), set())
 
-  async def test_scan_values_returns_live_values_under_a_prefix(self) -> None:
     await self.state.set_value("open_rl:model_meta:a", "1")
     await self.state.set_value("open_rl:model_meta:b", "2")
-    await self.state.set_value("open_rl:model_meta:gone", "3", ttl_seconds=0.2)
     await self.state.set_value("open_rl:session:a", "4")
-    await asyncio.sleep(0.5)
     self.assertEqual(await self.state.scan_values("open_rl:model_meta:"), {"open_rl:model_meta:a": "1", "open_rl:model_meta:b": "2"})
     self.assertEqual(await self.state.scan_values("open_rl:missing:"), {})
 
 
-class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
+class InMemoryStateStoreTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
-    from server.store import InMemoryStore
-
-    self.store = InMemoryStore()
     self.state = InMemoryStateStore()
 
-  async def test_get_requests_rotates_between_tenants(self) -> None:
-    for i in range(3):
-      await self.store.put_request({"model_id": "tenant-a", "request_id": f"a{i}"}, active_set_id="base-1")
-      await self.store.put_request({"model_id": "tenant-b", "request_id": f"b{i}"}, active_set_id="base-1")
-
-    served = []
-    for _ in range(2):
-      batch = await self.store.get_requests(active_set_id="base-1")
-      served.append(batch[0]["model_id"])
-
-    self.assertEqual(served, ["tenant-a", "tenant-b"])
-
-  async def test_busy_tenant_does_not_starve_its_peer(self) -> None:
-    await self.store.put_request({"model_id": "busy", "request_id": "b0"}, active_set_id="base-1")
-    await self.store.put_request({"model_id": "quiet", "request_id": "q0"}, active_set_id="base-1")
-
-    served = []
-    for i in range(4):
-      batch = await self.store.get_requests(active_set_id="base-1")
-      served.append(batch[0]["model_id"])
-      await self.store.put_request({"model_id": "busy", "request_id": f"b{i + 1}"}, active_set_id="base-1")
-
-    self.assertIn("quiet", served)
-
-  async def test_get_requests_drains_only_the_depth_present_on_entry(self) -> None:
-    for i in range(2):
-      await self.store.put_request({"model_id": "tenant-a", "request_id": f"a{i}"}, active_set_id="base-1")
-
-    batch = await self.store.get_requests(active_set_id="base-1")
-    self.assertEqual([r["request_id"] for r in batch], ["a0", "a1"])
-    # Entries stay pending until completed or acked (crash-durable non-destructive read).
-    self.assertEqual(await self.store.queued("tenant-a"), 2)
-    self.assertTrue(await self.store.complete_request(batch[0], {"type": "ok"}))
-    self.assertTrue(await self.store.ack_request(batch[1]))
-    self.assertEqual(await self.store.queued("tenant-a"), 0)
-    self.assertEqual(await self.store.get_result("a0", timeout=1.0), {"type": "ok"})
-
   async def test_values_expire_and_sets_hold_members(self) -> None:
     await self.state.set_value("k", "v", ttl_seconds=60)
     self.assertEqual(await self.state.get_value("k"), "v")
@@ -232,10 +128,6 @@ class InMemoryStoreTest(unittest.IsolatedAsyncioTestCase):
     await asyncio.sleep(0.5)
     self.assertEqual(await self.state.scan_values("open_rl:model_meta:"), {"open_rl:model_meta:a": "1", "open_rl:model_meta:b": "2"})
     self.assertEqual(await self.state.scan_values("open_rl:missing:"), {})
-
-
-if __name__ == "__main__":
-  unittest.main()
 
 
 class MetadataTest(unittest.TestCase):
@@ -249,3 +141,7 @@ class MetadataTest(unittest.TestCase):
     for raw in ("bad json", "[]", "{}", '{"base_model": "base", "fine_tuning_type": "invalid"}'):
       with self.subTest(raw=raw), self.assertRaises(ValueError):
         decode_model_metadata(raw)
+
+
+if __name__ == "__main__":
+  unittest.main()

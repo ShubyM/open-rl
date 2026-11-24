@@ -6,10 +6,12 @@ from unittest.mock import patch
 
 from server import api_server
 from server.model_metadata import get_model_metadata
+from server.queue import StreamQueue
 from server.session_registry import SessionRegistry
-from server.store import InMemoryStateStore, InMemoryStore
+from server.store import InMemoryStateStore
 from server.worker_manager import owner_id, owner_of
 from tests.api_client import asgi_client, post_json
+from tests.fake_redis import FakeRedis
 from tests.test_session_lifecycle import RuntimeManager
 
 
@@ -25,13 +27,13 @@ class LoraRuntimeSlotsTest(unittest.IsolatedAsyncioTestCase):
   """OPEN_RL_LORA_JOBS_PER_RUNTIME caps the LoRA jobs on one runtime; the next job starts another."""
 
   def setUp(self):
-    self.store = InMemoryStore()
+    self.queue = StreamQueue(FakeRedis())
     self.state = YieldingStateStore()
     self.manager = RuntimeManager()
     self.registry = SessionRegistry(self.state)
     self.enterContext(patch.object(api_server, "state", self.state))
-    self.enterContext(patch.object(api_server, "store", self.store))
-    self.enterContext(patch.object(api_server, "get_store", return_value=self.store))
+    self.enterContext(patch.object(api_server, "queue", self.queue))
+    self.enterContext(patch.object(api_server, "get_queue", return_value=self.queue))
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.state))
     self.enterContext(patch.object(api_server, "session_registry", self.registry))
     self.enterContext(patch.object(api_server, "worker_manager", self.manager))
@@ -65,7 +67,7 @@ class LoraRuntimeSlotsTest(unittest.IsolatedAsyncioTestCase):
     trainers = [model_id for model_id, role in self.manager.ensured if role == "trainer"]
     self.assertEqual(trainers, jobs)
     # Each runtime's trainer reads its own tenant set.
-    self.assertEqual([r["model_id"] for r in await self.store.get_requests(active_set_id="test-base#slot1-1")], [jobs[2]])
+    self.assertEqual([r["model_id"] for r in await self.queue.next_batch("test-base#slot1-1")], [jobs[2]])
 
   async def test_a_deleted_job_frees_its_place(self):
     first, second = await self.create(), await self.create()

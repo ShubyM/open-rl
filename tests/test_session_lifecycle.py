@@ -5,10 +5,12 @@ from collections import defaultdict
 from unittest.mock import patch
 
 from server import api_server
+from server.queue import StreamQueue, train_queue
 from server.session_registry import SessionRegistry
-from server.store import InMemoryStateStore, InMemoryStore
+from server.store import InMemoryStateStore
 from server.worker_manager import owner_of, runtime_of
 from tests.api_client import asgi_client, post_json
+from tests.fake_redis import FakeRedis
 
 
 class RuntimeManager:
@@ -47,13 +49,13 @@ class RuntimeManager:
 
 class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
-    self.store = InMemoryStore()
+    self.queue = StreamQueue(FakeRedis())
     self.state = InMemoryStateStore()
     self.enterContext(patch.object(api_server, "state", self.state))
     self.manager = RuntimeManager()
     self.registry = SessionRegistry(self.state)
-    self.enterContext(patch.object(api_server, "store", self.store))
-    self.enterContext(patch.object(api_server, "get_store", return_value=self.store))
+    self.enterContext(patch.object(api_server, "queue", self.queue))
+    self.enterContext(patch.object(api_server, "get_queue", return_value=self.queue))
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.state))
     self.enterContext(patch.object(api_server, "session_registry", self.registry))
     self.enterContext(patch.object(api_server, "worker_manager", self.manager))
@@ -106,8 +108,8 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
     exclusive = (await self.post("create_model", body))["request_id"]
 
     self.assertEqual(await self.registry.owners(), sorted(["test-base", exclusive.lower()]))
-    self.assertEqual([r["model_id"] for r in await self.store.get_requests(active_set_id="test-base-1")], [shared])
-    self.assertEqual([r["model_id"] for r in await self.store.get_requests(active_set_id=f"{exclusive}-1")], [exclusive])
+    self.assertEqual([r["model_id"] for r in await self.queue.next_batch("test-base-1")], [shared])
+    self.assertEqual([r["model_id"] for r in await self.queue.next_batch(f"{exclusive}-1")], [exclusive])
 
     await self.post("delete_model", {"model_id": shared})
     self.assertEqual(self.manager.released_models, [])
@@ -122,15 +124,15 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
     body = {"base_model": "test-base", "session_id": session, "user_metadata": {"openrl.exclusive": "true"}}
     exclusive = (await self.post("create_model", body))["request_id"]
     for active_set in ("test-base-1", f"{exclusive}-1"):
-      for r in await self.store.get_requests(active_set_id=active_set):
-        await self.store.ack_request(r)
+      for r in await self.queue.next_batch(active_set):
+        await self.queue.ack_record(train_queue(r["model_id"]), r)
 
     await self.post("delete_model", {"model_id": shared})
     await self.post("delete_model", {"model_id": exclusive})
 
     # The shared trainer drops one adapter; the exclusive job's workers shut down.
-    self.assertEqual([(r["op"], r["model_id"]) for r in await self.store.get_requests(active_set_id="test-base-1")], [("delete_model", shared)])
-    self.assertEqual([r["op"] for r in await self.store.get_requests(active_set_id=f"{exclusive}-1")], ["shutdown_workers"])
+    self.assertEqual([(r["op"], r["model_id"]) for r in await self.queue.next_batch("test-base-1")], [("delete_model", shared)])
+    self.assertEqual([r["op"] for r in await self.queue.next_batch(f"{exclusive}-1")], ["shutdown_workers"])
     self.assertEqual(self.manager.released_models, [exclusive])
 
   async def test_an_owner_stays_listed_until_forgotten(self):

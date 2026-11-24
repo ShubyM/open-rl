@@ -7,7 +7,8 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from server import training_requests_processor as trp
-from server.store import InMemoryStore
+from server.queue import StreamQueue
+from tests.fake_redis import FakeRedis
 from training import commands
 from training.types import Datum, LoraConfig, TensorData
 
@@ -38,7 +39,7 @@ class DeleteModelTest(unittest.IsolatedAsyncioTestCase):
     results = []
     for step in steps:
       await processor.process_request(commands.wire(step))
-      result = await processor.store.get_result(step.request_id, timeout=5)
+      result = await processor.queue.get_result(step.request_id, timeout=5)
       self.assertNotEqual(result.get("type"), "RequestFailedResponse", f"{step.request_id}: {result}")
       results.append(result)
     return results
@@ -57,7 +58,7 @@ class DeleteModelTest(unittest.IsolatedAsyncioTestCase):
   async def test_the_other_jobs_keep_training(self) -> None:
     with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"OPEN_RL_TMP_DIR": tmp}):
       worker = tiny_lora_worker()
-      processor = trp.TrainingRequestsProcessor(InMemoryStore(), worker)
+      processor = trp.TrainingRequestsProcessor(StreamQueue(FakeRedis()), worker)
       await self.run_commands(processor, self.create("a"), self.create("b"), *self.train("b", 0), *self.train("a", 0))
 
       # a is the active adapter when it goes.
@@ -74,7 +75,7 @@ class DeleteModelTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_deleting_an_unknown_job_is_a_no_op(self) -> None:
     worker = tiny_lora_worker()
-    processor = trp.TrainingRequestsProcessor(InMemoryStore(), worker)
+    processor = trp.TrainingRequestsProcessor(StreamQueue(FakeRedis()), worker)
     await self.run_commands(processor, commands.DeleteModel(request_id="delete", model_id="never-created"))
 
 

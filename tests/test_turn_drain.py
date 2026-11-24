@@ -9,33 +9,36 @@ import time
 import unittest
 from unittest.mock import patch
 
-from server.store import InMemoryStore
 from server.training_requests_processor import TrainingRequestsProcessor
 from tests.test_fft_batch_failure import SlicerStub
 from tests.test_telemetry import ScriptedTrainer, request
 
 
-class QueueStore(InMemoryStore):
-  """The model's queue as a list of batches: get_requests_for_model takes the next one, queued counts what waits."""
+class QueueStore:
+  """The model's queue as a list of batches: read_batch takes the next one, pending returns the next non-blockingly."""
 
   def __init__(self, *batches):
-    super().__init__()
     self.batches = [list(b) for b in batches]
     self.futures = {}
     self.fetches = 0
 
-  async def get_requests_for_model(self, model_id):
+  async def read_batch(self, queue):
     self.fetches += 1
     return self.batches.pop(0) if self.batches else []
 
-  async def queued(self, model_id):
-    return len(self.batches[0]) if self.batches else 0
+  async def pending(self, queue, *, after="0-0"):
+    return self.batches.pop(0) if self.batches else []
 
-  async def pending_for_model(self, model_id, *, after="0-0"):
-    return await self.get_requests_for_model(model_id) if await self.queued(model_id) > 0 else []
+  async def complete_record(self, queue, record, result):
+    if req_id := record.get("request_id"):
+      self.futures[req_id] = result
+    return True
 
-  async def set_result(self, request_id, result):
-    self.futures[request_id] = result
+  async def ack_record(self, queue, record):
+    return True
+
+  async def delete_if_empty(self, queue):
+    return True
 
 
 class CountingSlicer(SlicerStub):

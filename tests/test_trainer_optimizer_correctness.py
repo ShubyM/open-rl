@@ -180,13 +180,19 @@ class _FutureStoreStub:
       self.events.append(("set_result", req_id))
     self.results[req_id] = result
 
-  async def complete_request(self, record, result):
+  async def complete_record(self, queue, record, result):
     if req_id := record.get("request_id"):
       await self.set_result(req_id, result)
     return True
 
-  async def ack_request(self, record):
+  async def ack_record(self, queue, record):
     return True
+
+  async def delete_if_empty(self, queue):
+    return True
+
+  async def pinned_revisions(self, pool):
+    return set()
 
 
 class _TrainingRequestsStoreStub(_FutureStoreStub):
@@ -195,14 +201,11 @@ class _TrainingRequestsStoreStub(_FutureStoreStub):
     self.batches = list(batches)
     self.queried_model_ids = []
 
-  async def queued(self, model_id):
-    return 0  # nothing waits between batches, so a turn takes no more than its batch
+  async def pending(self, queue, *, after="0-0"):
+    return []  # nothing waits between batches, so a turn takes no more than its batch
 
-  async def pending_for_model(self, model_id, *, after="0-0"):
-    return await self.get_requests_for_model(model_id) if await self.queued(model_id) > 0 else []
-
-  async def get_requests_for_model(self, model_id):
-    self.queried_model_ids.append(model_id)
+  async def read_batch(self, queue):
+    self.queried_model_ids.append(queue.removeprefix("train:"))
     if self.batches:
       return self.batches.pop(0)
     raise asyncio.CancelledError()
@@ -567,7 +570,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         },
         clear=True,
       ),
-      patch.object(training_requests_processor_module, "get_store", return_value=store),
+      patch.object(training_requests_processor_module, "get_queue", return_value=store),
       patch.object(training_requests_processor_module, "time_slicer_client_from_env", return_value=time_slicer) as time_slicer_client_from_env,
     ):
       await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
@@ -603,7 +606,7 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
           "REDIS_URL": "redis://localhost:6379",
         },
       ),
-      patch.object(training_requests_processor_module, "get_store", return_value=store),
+      patch.object(training_requests_processor_module, "get_queue", return_value=store),
     ):
       await training_requests_processor_module.run_training_requests_processor(worker, "model-a", time_slicer=time_slicer)
 

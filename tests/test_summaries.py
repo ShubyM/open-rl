@@ -10,8 +10,10 @@ from fastapi.testclient import TestClient
 
 from server import api_server, telemetry
 from server.observability import facts, fleet, router
+from server.queue import StreamQueue, train_queue
 from server.session_registry import SessionRegistry
-from server.store import InMemoryStateStore, InMemoryStore, Writes
+from server.store import InMemoryStateStore, Writes
+from tests.fake_redis import FakeRedis
 from tests.test_observability import NO_CLUSTER, meta
 
 POD = "orw-fft-run-a-trainer"
@@ -19,13 +21,13 @@ POD = "orw-fft-run-a-trainer"
 
 class SummaryTest(unittest.TestCase):
   def setUp(self) -> None:
-    self.store, self.queues, self.now = InMemoryStateStore(), InMemoryStore(), time.time()
+    self.store, self.queues, self.now = InMemoryStateStore(), StreamQueue(FakeRedis()), time.time()
     fleet.cache.clear()
     facts.gaps.clear()
     telemetry.buffer.clear()
     for module in (fleet, facts, router, telemetry):
       self.enterContext(mock.patch.object(module, "get_state_store", return_value=self.store))
-    self.enterContext(mock.patch.object(facts, "get_store", return_value=self.queues))
+    self.enterContext(mock.patch.object(facts, "get_queue", return_value=self.queues))
     self.enterContext(mock.patch.object(fleet, "kubernetes", mock.AsyncMock(side_effect=lambda: json.loads(json.dumps(NO_CLUSTER)))))
     self.enterContext(mock.patch.object(router, "time", mock.Mock(time=lambda: self.now)))
     self.recorder = self.enterContext(mock.patch.object(telemetry, "recorder", telemetry.Recorder("api_server", None)))
@@ -61,7 +63,7 @@ class SummaryTest(unittest.TestCase):
   def test_a_request_is_lost_only_once_the_gap_outlasts_a_flush(self) -> None:
     self.run_a()
     self.record(*[("count", "run-a", "enqueued")] * 98, *[("count", "run-a", "popped")] * 94)
-    asyncio.run(self.queues.put_request({"model_id": "run-a"}))
+    asyncio.run(self.queues.enqueue(train_queue("run-a"), {"model_id": "run-a"}))
     self.assertNotIn("lost", self.summary()["requests"]["ledger"])
     self.now += telemetry.FLUSH_SECONDS + 1
     self.assertEqual(self.summary()["requests"]["ledger"], {"enqueued": 98, "popped": 94, "lost": 3})

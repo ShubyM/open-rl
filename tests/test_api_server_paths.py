@@ -8,9 +8,25 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from server import api_server
-from server.store import InMemoryStateStore, InMemoryStore
+from server.queue import StreamQueue, train_queue
+from server.store import InMemoryStateStore
 from server.worker_manager import LocalWorkerManager
+from tests.fake_redis import FakeRedis
 from tests.test_session_lifecycle import RuntimeManager
+
+
+def _drain_train_queues() -> list[dict]:
+  async def drain() -> list[dict]:
+    q = api_server.queue
+    out = []
+    async for key in q.redis.scan_iter(match="open_rl:q:train:*", _type="stream"):
+      name = key.removeprefix("open_rl:q:")
+      for r in await q.pending(name):
+        await q.ack_record(name, r)
+        out.append(r)
+    return out
+
+  return asyncio.run(drain())
 
 
 class ApiServerTest(unittest.TestCase):
@@ -18,7 +34,7 @@ class ApiServerTest(unittest.TestCase):
   error handlers are the ones the tinker client sees."""
 
   def setUp(self) -> None:
-    self.enterContext(patch.object(api_server, "store", InMemoryStore()))
+    self.enterContext(patch.object(api_server, "queue", StreamQueue(FakeRedis())))
     self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
     self.client = TestClient(api_server.app)
 
@@ -29,13 +45,7 @@ class ApiServerTest(unittest.TestCase):
     return self.client.post(f"/api/v1/{path}", content=body, headers={"Content-Type": media_type})
 
   def queued(self) -> list[dict]:
-    async def drain() -> list[dict]:
-      batch = await api_server.store.get_requests()
-      for r in batch:
-        await api_server.store.ack_request(r)
-      return batch
-
-    return asyncio.run(drain())
+    return _drain_train_queues()
 
 
 class GetInfoTest(ApiServerTest):
@@ -213,20 +223,14 @@ class ProtobufWireTest(unittest.TestCase):
   def setUp(self) -> None:
     from fastapi.testclient import TestClient
 
-    patcher = patch.object(api_server, "store", InMemoryStore())
+    patcher = patch.object(api_server, "queue", StreamQueue(FakeRedis()))
     patcher.start()
     self.addCleanup(patcher.stop)
     self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
     self.client = TestClient(api_server.app)
 
   def _queued(self) -> list[dict]:
-    async def drain() -> list[dict]:
-      batch = await api_server.store.get_requests()
-      for r in batch:
-        await api_server.store.ack_request(r)
-      return batch
-
-    return asyncio.run(drain())
+    return _drain_train_queues()
 
   def test_protobuf_and_json_forward_backward_queue_the_same_request(self) -> None:
     with open(self.FIXTURE, "rb") as fh:
@@ -286,11 +290,11 @@ class ProtobufWireTest(unittest.TestCase):
     from server.proto import tinker_public_pb2 as pb
 
     asyncio.run(
-      api_server.store.set_result(
+      api_server.queue.set_result(
         "samp-1", {"type": "sample_completed", "sequences": [{"tokens": [1, 2], "logprobs": [-0.5, -1.0], "stop_reason": "stop"}]}
       )
     )
-    asyncio.run(api_server.store.set_result("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
+    asyncio.run(api_server.queue.set_result("optim-1", {"type": "optim_step_completed", "metrics": {"grad_norm:mean": 0.0}}))
 
     as_json = self.client.post("/api/v1/retrieve_future", json={"request_id": "samp-1"})
     self.assertEqual(as_json.status_code, 200)
@@ -337,7 +341,7 @@ class InputBoundaryTest(ApiServerTest):
       {"model_id": "m", "forward_backward_input": {"data": [{"model_input": {"chunks": [{"tokens": ["bad"]}]}, "loss_fn_inputs": {}}]}},
     )
     self.assertEqual(response.status_code, 422)
-    self.assertEqual(api_server.store.queues, {})
+    self.assertEqual(asyncio.run(api_server.queue.queued(train_queue("m"))), 0)
 
   def test_null_configs_and_sampling_defaults_preserve_zero(self) -> None:
     response = self.post("create_model", {"base_model": "base", "lora_config": None, "full_config": None})

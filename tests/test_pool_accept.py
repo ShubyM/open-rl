@@ -14,7 +14,7 @@ from server.model_metadata import TrainingModelMetadata, persist_model_metadata
 from server.queue import StreamQueue, sample_queue, stream_key
 from server.scheduler_worker_manager import SchedulerWorkerManager
 from server.session_registry import SessionRegistry
-from server.store import RedisStateStore, RedisStore
+from server.store import RedisStateStore
 from server.worker_manager import default_metadata, owner_of
 from tests.api_client import asgi_client
 from tests.redis_server import RedisTestCase
@@ -26,8 +26,8 @@ class PoolAcceptTest(RedisTestCase):
     await super().asyncSetUp()
     self.tmp, self.base = self.enterContext(tempfile.TemporaryDirectory()), f"org/m-{uuid.uuid4().hex[:8]}"
     self.enterContext(patch.dict(os.environ, {"OPEN_RL_TMP_DIR": self.tmp, "SAMPLING_BACKEND": "vllm"}))
-    self.state, self.store = RedisStateStore(self.redis, redis.Redis.from_url(self.url, decode_responses=True)), RedisStore(self.redis)
-    patched = [("store", self.store), ("state", self.state), ("TMP_DIR", self.tmp), ("worker_manager", Mock()), ("SAVED_WEIGHTS_WAIT_SECONDS", 0.3)]
+    self.state, self.queue = RedisStateStore(self.redis, redis.Redis.from_url(self.url, decode_responses=True)), StreamQueue(self.redis)
+    patched = [("queue", self.queue), ("state", self.state), ("TMP_DIR", self.tmp), ("worker_manager", Mock()), ("SAVED_WEIGHTS_WAIT_SECONDS", 0.3)]
     for name, value in patched:
       self.enterContext(patch.object(api_server, name, value))
     self.client = await self.enterAsyncContext(asgi_client())

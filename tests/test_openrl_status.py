@@ -13,24 +13,26 @@ from unittest.mock import patch
 from kubernetes import client
 
 from server import api_server
+from server.queue import StreamQueue
 from server.scheduler_worker_manager import SchedulerWorkerManager, worker_state
 from server.session_registry import SessionRegistry
-from server.store import InMemoryStateStore, InMemoryStore
+from server.store import InMemoryStateStore
 from server.worker_manager import WORKER_STATES
 from tests.api_client import asgi_client, post_json
+from tests.fake_redis import FakeRedis
 from tests.test_scheduler_worker_manager import FakeCustomObjectsApi
 from tests.test_session_lifecycle import RuntimeManager
 
 
 class StatusViewsTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
-    self.store = InMemoryStore()
+    self.queue = StreamQueue(FakeRedis())
     self.state = InMemoryStateStore()
     self.manager = RuntimeManager()
     self.registry = SessionRegistry(self.state)
     self.enterContext(patch.object(api_server, "state", self.state))
-    self.enterContext(patch.object(api_server, "store", self.store))
-    self.enterContext(patch.object(api_server, "get_store", return_value=self.store))
+    self.enterContext(patch.object(api_server, "queue", self.queue))
+    self.enterContext(patch.object(api_server, "get_queue", return_value=self.queue))
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.state))
     self.enterContext(patch.object(api_server, "session_registry", self.registry))
     self.enterContext(patch.object(api_server, "worker_manager", self.manager))

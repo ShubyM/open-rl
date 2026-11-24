@@ -7,8 +7,10 @@ import os
 import unittest
 from unittest.mock import patch
 
-from server.store import InMemoryStateStore, InMemoryStore
+from server.queue import StreamQueue
+from server.store import InMemoryStateStore
 from server.training_requests_processor import TrainingRequestsProcessor
+from tests.fake_redis import FakeRedis
 
 
 class Worker:
@@ -25,7 +27,7 @@ class TrainerReadyTest(unittest.TestCase):
     self.enterContext(patch("server.training_requests_processor.is_primary", return_value=True))
     self.worker = Worker()
     self.state = InMemoryStateStore()
-    self.proc = TrainingRequestsProcessor(InMemoryStore(), self.worker, "google/gemma-4-e2b")
+    self.proc = TrainingRequestsProcessor(StreamQueue(FakeRedis()), self.worker, "google/gemma-4-e2b")
     self.proc.state = self.state
 
   def key(self):

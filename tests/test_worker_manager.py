@@ -24,8 +24,12 @@ class StoreStub:
     self.futures = {}
     self.kv_store = {}
 
-  async def put_request(self, req_data: dict, active_set_id: str | None = None) -> None:
-    self.forwarded_requests.append(req_data)
+  async def enqueue(self, queue: str, record: dict, *, group: str | None = None, **kwargs) -> str:
+    self.forwarded_requests.append(record)
+    return record.get("request_id", "")
+
+  async def delete_if_empty(self, queue: str) -> bool:
+    return True
 
   async def set_result(self, req_id: str, result: dict) -> None:
     self.futures[req_id] = result
@@ -80,7 +84,7 @@ class ApiServerInlineWorkerLaunchTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
     self.worker_manager = WorkerManagerStub()
-    self.enterContext(patch.object(api_server, "store", self.store))
+    self.enterContext(patch.object(api_server, "queue", self.store))
     self.enterContext(patch.object(api_server, "state", self.store))
     self.enterContext(patch.object(api_server, "worker_manager", self.worker_manager))
     self.enterContext(patch.object(api_server, "session_registry", SessionRegistry(self.store)))
@@ -294,7 +298,7 @@ class LocalWorkerManagerTest(unittest.IsolatedAsyncioTestCase):
 class ApiServerMetadataExtractionTest(unittest.IsolatedAsyncioTestCase):
   def setUp(self) -> None:
     self.store = StoreStub()
-    self.enterContext(patch.object(api_server, "store", self.store))
+    self.enterContext(patch.object(api_server, "queue", self.store))
     self.enterContext(patch.object(api_server, "state", self.store))
 
   async def test_extract_and_persist_metadata_from_settings(self) -> None:

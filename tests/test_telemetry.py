@@ -16,14 +16,15 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from server import api_server, telemetry
-from server.queue import StreamQueue, future_key
+from server.queue import StreamQueue, future_key, train_queue
 from server.sampling_dispatcher import Dispatcher, RevisionUnloadable, failed
-from server.store import InMemoryStateStore, InMemoryStore, StateStore
+from server.store import InMemoryStateStore, StateStore
 from server.training_requests_processor import TrainingRequestsProcessor
 from server.vllm_sampler import Sampler
 from tests.api_client import asgi_client
+from tests.fake_redis import FakeRedis
 from tests.redis_server import RedisTestCase
-from tests.test_fft_batch_failure import BatchStore, BrokenWorker, SlicerStub
+from tests.test_fft_batch_failure import BrokenWorker, SlicerStub
 from tests.test_sampling_dispatcher import SAMPLE, until
 from tests.test_vllm_sampler import FakeEngine, fake_vllm
 from training.trainer_worker import BaseTrainerWorker
@@ -67,11 +68,12 @@ def trainer() -> Mock:
 
 async def train(worker: Mock, requests: list[dict]) -> dict:
   """One time-sliced trainer batch. Returns what each request was answered."""
-  store = BatchStore(requests)
-  with patch.dict(os.environ, {"REDIS_URL": "redis://test"}):
-    processor = TrainingRequestsProcessor(store, worker, "run-a", time_slicer=SlicerStub())
+  queue = StreamQueue(FakeRedis())
+  for req in requests:
+    await queue.enqueue(train_queue("run-a"), req)
+  processor = TrainingRequestsProcessor(queue, worker, "run-a", time_slicer=SlicerStub())
   await processor.run_once()
-  return store.futures
+  return {req["request_id"]: await queue.get_result(req["request_id"], timeout=1) for req in requests if "request_id" in req}
 
 
 def optim_steps(count: int) -> list[dict]:
@@ -185,7 +187,7 @@ class WorkerRecordTest(TelemetryTest):
 class LedgerTest(TelemetryTest):
   def setUp(self) -> None:
     super().setUp()
-    self.enterContext(patch.object(api_server, "store", InMemoryStore()))
+    self.enterContext(patch.object(api_server, "queue", StreamQueue(FakeRedis())))
     self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=api_server.state))
     self.enterContext(patch.dict(os.environ, {"SAMPLING_BACKEND": "torch"}))
@@ -195,7 +197,7 @@ class LedgerTest(TelemetryTest):
       async with asgi_client() as client:
         created = (await client.post("/api/v1/create_model", json={"base_model": "m"})).json()
         (await client.post("/api/v1/delete_model", json={"model_id": created["request_id"]})).raise_for_status()
-      requests = await api_server.store.get_requests(active_set_id="m-1")
+      requests = await api_server.queue.next_batch("m-1")
       self.assertEqual([r["op"] for r in requests], ["create_model", "delete_model"])
       telemetry.popped(requests)
       return created["request_id"]
@@ -232,9 +234,10 @@ class OpRecordTest(TelemetryTest):
 
   def test_a_failure_answered_before_the_op_runs_is_recorded_once(self) -> None:
     async def fail():
-      store = BatchStore([request("fb-1", "forward_backward", data=[]), request("bad-1", "optim_step", adam_params="not a dict")])
-      with patch.dict(os.environ, {"REDIS_URL": "redis://test"}):
-        await TrainingRequestsProcessor(store, BrokenWorker(), "run-a", time_slicer=SlicerStub()).run_once()
+      queue = StreamQueue(FakeRedis())
+      for req in (request("fb-1", "forward_backward", data=[]), request("bad-1", "optim_step", adam_params="not a dict")):
+        await queue.enqueue(train_queue("run-a"), req)
+      await TrainingRequestsProcessor(queue, BrokenWorker(), "run-a", time_slicer=SlicerStub()).run_once()
 
     with self.assertRaisesRegex(RuntimeError, "CUDA out of memory"):
       self.serve(fail)
@@ -245,10 +248,10 @@ class OpRecordTest(TelemetryTest):
       async with asgi_client() as client:
         created = (await client.post("/api/v1/create_model", json={"base_model": "m"})).json()
       await asyncio.sleep(0.2)
-      await TrainingRequestsProcessor(api_server.store, Mock(), active_tenant_set_id="m-1").run_once()
+      await TrainingRequestsProcessor(api_server.queue, Mock(), active_tenant_set_id="m-1").run_once()
       return created["request_id"]
 
-    self.enterContext(patch.object(api_server, "store", InMemoryStore()))
+    self.enterContext(patch.object(api_server, "queue", StreamQueue(FakeRedis())))
     self.enterContext(patch.object(api_server, "state", InMemoryStateStore()))
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=api_server.state))
     with patch.dict(os.environ, {"SAMPLING_BACKEND": "torch"}):

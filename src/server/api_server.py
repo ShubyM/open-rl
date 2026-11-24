@@ -37,19 +37,24 @@ from server.model_metadata import (
   pool_name,
 )
 from server.observability.router import router
-from server.queue import StreamQueue, sample_queue, train_queue
+from server.queue import StreamQueue, get_queue, sample_queue, train_queue
 from server.sampling_dispatcher import SAMPLE_DEADLINE_SECONDS
 from server.session_registry import SessionRegistry
-from server.store import RedisStore, get_state_store, get_store
+from server.store import get_state_store
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_id, owner_of, runtime_of
 from training import commands
 from training.commands import Command
 from training.types import TRAINER_BACKENDS, Datum, FFTConfig, FineTuningType, LoraConfig
 
-store = get_store()
+queue: StreamQueue | None = get_queue() if os.environ.get("REDIS_URL") else None
 state = get_state_store()
 worker_manager: WorkerManager | None = None
+
+
+def _queue() -> StreamQueue:
+  return queue if queue is not None else get_queue()
+
 
 session_registry = SessionRegistry(state)
 SESSION_REAP_INTERVAL_SEC = 30
@@ -86,10 +91,9 @@ async def reap_owner(owner: str) -> None:
     print(f"[API_SERVER] No live session uses {owner}; tearing its workers down")
     for model in await asyncio.to_thread(worker_manager.release_owner, owner):
       await state.delete_values(f"open_rl:trainer_ready:{model}")
-      if isinstance(store, RedisStore):
-        await store.queue.delete_if_empty(train_queue(model))
+      await _queue().delete_if_empty(train_queue(model))
       if get_sampler_backend() == "vllm":
-        await StreamQueue(store.redis).delete_if_empty(sample_queue(pool_name(model)))
+        await _queue().delete_if_empty(sample_queue(pool_name(model)))
     await session_registry.forget(owner)
 
 
@@ -644,7 +648,8 @@ async def enqueue(command: Command) -> str:
 
   active_set_id = await _resolve_active_set_id(command.model_id)
   carrier[commands.ENQUEUED_AT_KEY] = str(time.time())
-  await store.put_request(commands.wire(command.model_copy(update={"trace_context": carrier})), active_set_id=active_set_id)
+  record = commands.wire(command.model_copy(update={"trace_context": carrier}))
+  await _queue().enqueue(train_queue(command.model_id), record, group=active_set_id or "default")
   run_records.enqueued(command.model_id)
   # One line per training request so a request that never reaches a worker can
   # be traced end to end (the workers log the same id when they pop it).
@@ -671,7 +676,7 @@ async def launch_worker_and_enqueue(command: Command, start_sampler: bool = Fals
     await asyncio.to_thread(worker_manager.ensure, command.model_id, "trainer")
   except Exception as exc:
     traceback.print_exc()
-    await store.set_result(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
+    await _queue().set_result(request_id, {"type": "RequestFailedResponse", "error_message": str(exc)})
     return request_id
   if start_sampler:
     await ensure_sampler_launched(command.model_id)
@@ -771,7 +776,7 @@ async def reconcile_pools() -> None:
   run without a worker manager and own their pools."""
   if worker_manager is None:
     return
-  sampling = StreamQueue(store.redis)
+  sampling = _queue()
   pairs = []
   for pool in await sampling.active_pools():
     try:
@@ -821,7 +826,7 @@ async def reconcile_job(sampling: StreamQueue, pool: str, job: str) -> None:
 async def sweep_sample_deadlines() -> None:
   """Fails pool requests past the deadline, which no dispatcher does while the pool is gone."""
   result = {"type": "RequestFailedResponse", "error_message": f"No sampler read the request within {SAMPLE_DEADLINE_SECONDS}s"}
-  if failed := await StreamQueue(store.redis).fail_older_than(SAMPLE_DEADLINE_SECONDS, result):
+  if failed := await _queue().fail_older_than(SAMPLE_DEADLINE_SECONDS, result):
     print(f"[API_SERVER] Failed {failed} sampling requests no sampler read in time")
 
 
@@ -831,6 +836,7 @@ async def lifespan(_: FastAPI):
   task = None
   check_sampler_backend()
   check_lora_jobs_per_runtime()
+  _queue()
   # The in-process trainer's records, and the requests this server enqueues, are written from here.
   run_records.start("api_server", worker_record=False)
   if is_fft_enabled() or os.getenv("REDIS_URL") or os.getenv("OPEN_RL_WORKER_MANAGER"):
@@ -850,7 +856,7 @@ async def lifespan(_: FastAPI):
       worker = training_requests_processor.LoraTrainingWorker()
       if base_model:
         await asyncio.to_thread(worker.load_base_model, base_model)
-      task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker))
+      task = asyncio.create_task(training_requests_processor.run_training_requests_processor(worker, queue=_queue()))
   reap_task = asyncio.create_task(reap_dead_sessions()) if worker_manager is not None else None
   pool_tasks = []
   if get_sampler_backend() == "vllm":
@@ -1089,10 +1095,11 @@ async def delete_model(req: ModelRequest):
     # Other jobs keep the trainer, so it only frees this job's adapter, after
     # the job's queued work.
     delete = commands.DeleteModel(request_id=str(uuid.uuid4()), model_id=model_id)
-    await store.put_request(commands.wire(delete), active_set_id=await _resolve_active_set_id(model_id))
+    await _queue().enqueue(train_queue(model_id), commands.wire(delete), group=await _resolve_active_set_id(model_id) or "default")
   elif worker_manager is not None:
     print(f"[API_SERVER] Requesting shutdown of workers for model {model_id}...")
-    await store.put_request(commands.wire(commands.Shutdown(model_id=model_id)), active_set_id=await _resolve_active_set_id(model_id))
+    shutdown = commands.Shutdown(model_id=model_id)
+    await _queue().enqueue(train_queue(model_id), commands.wire(shutdown), group=await _resolve_active_set_id(model_id) or "default")
   # Under the owner lock the reconcile takes, so it cannot bring back a pool for the job between these steps.
   async with owner_locks[await asyncio.to_thread(owner_of, model_id)]:
     now = time.time()
@@ -1102,13 +1109,12 @@ async def delete_model(req: ModelRequest):
     await persist_model_metadata(state, model_id, meta)
     if get_sampler_backend() == "vllm":
       result = {"type": "RequestFailedResponse", "error_message": f"{model_id} was deleted"}
-      await StreamQueue(store.redis).fail_job(meta.pool(model_id), model_id, result)
+      await _queue().fail_job(meta.pool(model_id), model_id, result)
     if worker_manager is not None and not meta.shares_runtime():
       await asyncio.to_thread(worker_manager.release, model_id)
-      if isinstance(store, RedisStore):
-        await store.queue.delete_if_empty(train_queue(model_id))
+      await _queue().delete_if_empty(train_queue(model_id))
       if get_sampler_backend() == "vllm":
-        await StreamQueue(store.redis).delete_if_empty(sample_queue(meta.pool(model_id)))
+        await _queue().delete_if_empty(sample_queue(meta.pool(model_id)))
   return {"status": "ok"}
 
 
@@ -1182,7 +1188,7 @@ async def retrieve_future(req: RetrieveFutureRequest, accept: str = Header(defau
   pending, failed, and every other result stay JSON.
   """
   request_id = req.request_id
-  result = await store.get_result(request_id, timeout=60.0)
+  result = await _queue().get_result(request_id, timeout=60.0)
   if result is None:
     return JSONResponse(status_code=400, content={"type": "RequestFailedResponse", "error_message": "Future not found"})
   if isinstance(result, dict) and result.get("type") == "RequestFailedResponse":
@@ -1444,7 +1450,7 @@ async def accept_pool_sample(req: AsampleRequest, prompt: list[int]) -> str:
 
   params = req.sampling_params
   stop, stop_token_ids = split_stop(params.stop)
-  return await StreamQueue(store.redis).accept(
+  return await _queue().accept(
     {
       "request_id": new_request_id(),
       "pool": pool,

@@ -20,8 +20,8 @@ from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_fr
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
-from server.queue import train_queue
-from server.store import RedisStore, RequestStore, StateStore, get_state_store, get_store
+from server.queue import StreamQueue, get_queue, train_queue
+from server.store import StateStore, get_state_store
 from server.telemetry import answered, finish, gpu_turn, observe_operation, popped, serving, set_phase
 from training import commands
 from training.commands import parse_command
@@ -100,7 +100,7 @@ class TrainingRequestsProcessor:
 
   def __init__(
     self,
-    store: RequestStore,
+    queue: StreamQueue,
     worker: TrainingWorker,
     model_id: str | None = None,
     active_tenant_set_id: str | None = None,
@@ -111,13 +111,8 @@ class TrainingRequestsProcessor:
     self.dedicated = bool(model_id) and not active_tenant_set_id
     if time_slicer is not None and not self.dedicated:
       raise RuntimeError("A time-sliced trainer needs --model-id and no tenant set")
-    # The API server's in-process trainer is the only one that works without Redis.
-    if self.dedicated and not os.getenv("REDIS_URL"):
-      raise RuntimeError("A dedicated trainer worker requires REDIS_URL so it can share queues and futures with the API server")
 
-    self.store = store
-    # Sampling pools live in Redis, so the in-process trainer's in-memory store has none.
-    self.sampling = store.queue if isinstance(store, RedisStore) else None
+    self.queue = queue
     self.worker = worker
     self.model_id = model_id
     self.active_tenant_set_id = active_tenant_set_id
@@ -211,30 +206,34 @@ class TrainingRequestsProcessor:
     passed. Rank 0 decides and fans the result out, as next_batch does, so every rank runs the same sequence."""
     batch = None
     if is_primary():
-      batch = await self.store.pending_for_model(self.model_id, after=after) if self.dedicated and time.monotonic() < deadline else []
+      batch = await self.queue.pending(train_queue(self.model_id), after=after) if self.dedicated and time.monotonic() < deadline else []
     if is_distributed():
       batch = await asyncio.to_thread(broadcast_object, batch)
     return batch or []
 
   async def fetch_requests(self) -> list[dict[str, Any]]:
     if self.dedicated:
-      return await self.store.get_requests_for_model(self.model_id)
-    return await self.store.get_requests(active_set_id=self.active_tenant_set_id)
+      return await self.queue.read_batch(train_queue(self.model_id))
+    return await self.queue.next_batch(self.active_tenant_set_id)
+
+  def _record_queue(self, raw_request: dict[str, Any]) -> str:
+    return train_queue(raw_request.get("model_id", self.model_id or "default"))
 
   async def ack_request(self, raw_request: dict[str, Any]) -> None:
     if is_primary():
-      await self.store.ack_request(raw_request)
+      await self.queue.ack_record(self._record_queue(raw_request), raw_request)
 
   async def publish_result(self, raw_request: dict[str, Any], request_id: str | None, result: dict[str, Any]) -> None:
     # Only rank 0 writes to the store; the other ranks computed the same result.
     if not is_primary():
       return
+    q = self._record_queue(raw_request)
     if request_id is not None:
       record = raw_request if raw_request.get("request_id") == request_id else {**raw_request, "request_id": request_id}
-      if await self.store.complete_request(record, result):
+      if await self.queue.complete_record(q, record, result):
         answered(request_id, result)
     else:
-      await self.store.ack_request(raw_request)
+      await self.queue.ack_record(q, raw_request)
 
   async def run_once(self) -> None:
     batch = await self.next_batch()
@@ -265,8 +264,8 @@ class TrainingRequestsProcessor:
     all_shutdowns = [*shutdown_reqs, *self.drained_shutdowns]
     for req in all_shutdowns:
       await self.ack_request(req)
-    if all_shutdowns and self.model_id and isinstance(self.store, RedisStore) and is_primary():
-      await self.store.queue.delete_if_empty(train_queue(self.model_id))
+    if all_shutdowns and self.model_id and is_primary():
+      await self.queue.delete_if_empty(train_queue(self.model_id))
 
     if self.time_slicer is None:
       return
@@ -453,7 +452,7 @@ class TrainingRequestsProcessor:
         checkpoint = await asyncio.to_thread(self.worker.save_for_sampler, command.model_id, command.alias, ref)
         if checkpoint:
           await self.drop_old_checkpoints(command.model_id, checkpoint)
-        elif self.sampling is not None and is_primary() and ref:
+        elif os.getenv("SAMPLING_BACKEND") != "torch" and is_primary() and ref:
           # A sampler serves a LoRA save by its reference, so the adapter is frozen under that name.
           await asyncio.to_thread(freeze_adapter, command.model_id, self.worker.base_model_name, command.path, command.sampling_session_id)
         return {"path": command.path, "sampling_session_id": command.sampling_session_id, "type": "sampler_weights_saved", **self.save_metrics()}
@@ -470,11 +469,10 @@ class TrainingRequestsProcessor:
     if not is_primary():
       return
     older = older_versions(local_path, SAMPLER_VERSIONS_KEPT)
-    if self.sampling is not None:
-      meta = await get_model_metadata(get_state_store(), model_id)
-      # A job with no metadata has no pool, so no request pins its versions.
-      pinned = await self.sampling.pinned_revisions(meta.pool(model_id)) if meta is not None else set()
-      older = [path for path in older if path not in pinned]
+    meta = await get_model_metadata(get_state_store(), model_id)
+    # A job with no metadata has no pool, so no request pins its versions.
+    pinned = await self.queue.pinned_revisions(meta.pool(model_id)) if meta is not None else set()
+    older = [path for path in older if path not in pinned]
     for path in older:
       shutil.rmtree(path, ignore_errors=True)
     if older:
@@ -487,13 +485,13 @@ async def run_training_requests_processor(
   time_slicer: TimeSlicerClient | None = None,
   active_tenant_set_id: str | None = None,
   *,
-  store: RequestStore | None = None,
+  queue: StreamQueue | None = None,
 ) -> None:
-  store = get_store() if store is None else store
+  queue = get_queue() if queue is None else queue
   pin_worker_threads_to_this_rank()
   if isinstance(worker, FFTTrainingWorker) and time_slicing_enabled():
     time_slicer = time_slicer or time_slicer_client_from_env()
-  await TrainingRequestsProcessor(store, worker, model_id, active_tenant_set_id, time_slicer).run()
+  await TrainingRequestsProcessor(queue, worker, model_id, active_tenant_set_id, time_slicer).run()
 
 
 def build_worker(is_lora: bool) -> TrainingWorker:
