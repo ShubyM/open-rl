@@ -213,14 +213,6 @@ def config(run: dict, workers: list[dict]) -> list[dict] | None:
   return found or None
 
 
-async def _queued(run_id: str) -> int:
-  try:
-    q = get_queue()
-  except RuntimeError:
-    return 0
-  return await q.queued(train_queue(run_id))
-
-
 async def summary(run: dict, workers: list[dict], now: float) -> dict:
   store, run_id, ended = get_state_store(), run["run_id"], run["lifecycle"] == "ended"
   ops, samples, count, times, ledger, queued, errors = await asyncio.gather(
@@ -229,7 +221,7 @@ async def summary(run: dict, workers: list[dict], now: float) -> dict:
     store.get_value(key("steps", run_id)),
     store.read_samples(key("step_times", run_id)),
     store.read_counts(key("ledger", run_id)),
-    _queued(run_id),
+    get_queue().queued(train_queue(run_id)),
     sdk_errors(run["session_ids"]),
   )
   steps = [s for s in ops if s["operation"] == "optim_step" and s["status"] == "succeeded"]
