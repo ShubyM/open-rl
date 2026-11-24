@@ -213,17 +213,17 @@ def config(run: dict, workers: list[dict]) -> list[dict] | None:
   return found or None
 
 
-async def summary(run: dict, workers: list[dict], now: float, queue: StreamQueue | None = None) -> dict:
+async def summary(run: dict, workers: list[dict], now: float, queue: StreamQueue) -> dict:
   store, run_id, ended = get_state_store(), run["run_id"], run["lifecycle"] == "ended"
-  ops, samples, count, times, ledger, errors = await asyncio.gather(
+  ops, samples, count, times, ledger, queued, errors = await asyncio.gather(
     store.read_samples(key("operations", run_id)),
     store.read_samples(key("operations", run_id, "samples")),
     store.get_value(key("steps", run_id)),
     store.read_samples(key("step_times", run_id)),
     store.read_counts(key("ledger", run_id)),
+    queue.queued(train_queue(run_id)),
     sdk_errors(run["session_ids"]),
   )
-  queued = await queue.queued(train_queue(run_id)) if queue is not None else 0
   steps = [s for s in ops if s["operation"] == "optim_step" and s["status"] == "succeeded"]
   if "enqueued" in ledger and (gone := lost(run_id, ledger["enqueued"] - ledger.get("popped", 0) - queued, now)) is not None:
     ledger["lost"] = gone

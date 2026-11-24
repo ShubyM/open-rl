@@ -119,11 +119,7 @@ async def run_summary(run_id: str):
   run = chosen[0]
   from server import api_server
 
-  try:
-    queue = api_server._queue()
-  except RuntimeError:
-    queue = None
-  return {"run_id": run["run_id"], **await facts.summary(run, facts.workers_of(found, run), now, queue)}
+  return {"run_id": run["run_id"], **await facts.summary(run, facts.workers_of(found, run), now, api_server.queue)}
 
 
 @router.get("/api/v1/inspect/sessions/{session_id}/summary")
