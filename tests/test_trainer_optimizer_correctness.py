@@ -570,10 +570,9 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
         },
         clear=True,
       ),
-      patch.object(training_requests_processor_module, "get_queue", return_value=store),
       patch.object(training_requests_processor_module, "time_slicer_client_from_env", return_value=time_slicer) as time_slicer_client_from_env,
     ):
-      await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a")
+      await training_requests_processor_module.run_training_requests_processor(_RecordingFullWorker(), "model-a", queue=store)
 
     time_slicer_client_from_env.assert_called_once_with()
     self.assertEqual([event[0] for event in time_slicer.events], ["register", "unregister", "close"])
@@ -598,17 +597,14 @@ class TestTrainingRequestsProcessorFullMode(unittest.IsolatedAsyncioTestCase):
     )
     time_slicer = _TimeSlicerStub()
 
-    with (
-      patch.dict(
-        os.environ,
-        {
-          "OPEN_RL_ENABLE_FFT": "true",
-          "REDIS_URL": "redis://localhost:6379",
-        },
-      ),
-      patch.object(training_requests_processor_module, "get_queue", return_value=store),
+    with patch.dict(
+      os.environ,
+      {
+        "OPEN_RL_ENABLE_FFT": "true",
+        "REDIS_URL": "redis://localhost:6379",
+      },
     ):
-      await training_requests_processor_module.run_training_requests_processor(worker, "model-a", time_slicer=time_slicer)
+      await training_requests_processor_module.run_training_requests_processor(worker, "model-a", time_slicer=time_slicer, queue=store)
 
     self.assertEqual(store.queried_model_ids, ["model-a", "model-a"])
     self.assertEqual([event[0] for event in time_slicer.events], ["register", "acquire", "release", "unregister", "close"])

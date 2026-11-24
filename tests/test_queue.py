@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 import unittest
 import uuid
@@ -15,7 +14,6 @@ from server.queue import (
   RESULT_TTL_SECONDS,
   StreamQueue,
   future_key,
-  get_queue,
   idempotency_key,
   queue_key,
   sample_queue,
@@ -184,7 +182,7 @@ class StreamQueueCpuTest(_QueueContractMixin, unittest.IsolatedAsyncioTestCase):
     self.assertFalse(deleted)
     self.assertEqual([record["request_id"] for record in await self.queue.pending(queue_name)], ["r1"])
 
-  async def test_key_layout_compact_prompt_telemetry_and_get_queue(self) -> None:
+  async def test_key_layout_compact_prompt_and_telemetry(self) -> None:
     self.assertEqual(queue_key(train_queue("m1")), "open_rl:q:train:m1")
     self.assertEqual(stream_key("p1"), "open_rl:q:sample:p1")
     self.assertEqual(idempotency_key(sample_queue("p1"), "k1"), "open_rl:q:sample:p1:idem:k1")
@@ -207,9 +205,6 @@ class StreamQueueCpuTest(_QueueContractMixin, unittest.IsolatedAsyncioTestCase):
       self.assertTrue(await self.queue.complete_sample(compact, {"type": "sample"}, started_at=123.0))
       self.assertFalse(await self.queue.complete_sample(compact, {"type": "sample"}, started_at=124.0))
     answered.assert_called_once_with("job-tel", self.pool, record["request_id"], {"type": "sample"}, 123.0)
-
-    with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(RuntimeError, "REDIS_URL is required"):
-      get_queue()
 
 
 class LiveRedisQueueTest(_QueueContractMixin, RedisTestCase):

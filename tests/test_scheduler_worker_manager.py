@@ -573,7 +573,6 @@ class MixedSamplingSessionTest(unittest.IsolatedAsyncioTestCase):
       patch("server.worker_manager.get_state_store", return_value=state),
       patch.object(api_server, "queue", queue),
       patch.object(api_server, "state", state),
-      patch.object(api_server, "get_queue", return_value=queue),
       patch.object(api_server, "worker_manager", SchedulerWorkerManager(custom_api=api, apps_api=FakeApi(), networking_api=FakeApi())),
     ):
       async with asgi_client() as client:

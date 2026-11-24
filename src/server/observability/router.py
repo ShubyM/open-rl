@@ -117,7 +117,13 @@ async def run_summary(run_id: str):
   if len(chosen) != 1:
     raise HTTPException(404 if not chosen else 409, f"No run {run_id}" if not chosen else f"Session {run_id} has {len(chosen)} runs")
   run = chosen[0]
-  return {"run_id": run["run_id"], **await facts.summary(run, facts.workers_of(found, run), now)}
+  from server import api_server
+
+  try:
+    queue = api_server._queue()
+  except RuntimeError:
+    queue = None
+  return {"run_id": run["run_id"], **await facts.summary(run, facts.workers_of(found, run), now, queue)}
 
 
 @router.get("/api/v1/inspect/sessions/{session_id}/summary")

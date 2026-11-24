@@ -20,8 +20,8 @@ from accel_timeslicer.time_slicer import TimeSlicerClient, time_slicer_client_fr
 from accel_timeslicer.workload import TRAINER_CLAIM, local_workload_name
 from server.lora_snapshots import freeze_adapter
 from server.model_metadata import get_model_metadata
-from server.queue import StreamQueue, get_queue, train_queue
-from server.store import StateStore, get_state_store
+from server.queue import StreamQueue, train_queue
+from server.store import StateStore, get_state_store, redis_client
 from server.telemetry import answered, finish, gpu_turn, observe_operation, popped, serving, set_phase
 from training import commands
 from training.commands import parse_command
@@ -487,7 +487,11 @@ async def run_training_requests_processor(
   *,
   queue: StreamQueue | None = None,
 ) -> None:
-  queue = get_queue() if queue is None else queue
+  if queue is None:
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+      raise RuntimeError("REDIS_URL is required")
+    queue = StreamQueue(redis_client(redis_url))
   pin_worker_threads_to_this_rank()
   if isinstance(worker, FFTTrainingWorker) and time_slicing_enabled():
     time_slicer = time_slicer or time_slicer_client_from_env()

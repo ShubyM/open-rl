@@ -55,7 +55,6 @@ class SessionLifecycleTest(unittest.IsolatedAsyncioTestCase):
     self.manager = RuntimeManager()
     self.registry = SessionRegistry(self.state)
     self.enterContext(patch.object(api_server, "queue", self.queue))
-    self.enterContext(patch.object(api_server, "get_queue", return_value=self.queue))
     self.enterContext(patch("server.worker_manager.get_state_store", return_value=self.state))
     self.enterContext(patch.object(api_server, "session_registry", self.registry))
     self.enterContext(patch.object(api_server, "worker_manager", self.manager))

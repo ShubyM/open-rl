@@ -27,7 +27,7 @@ class SummaryTest(unittest.TestCase):
     telemetry.buffer.clear()
     for module in (fleet, facts, router, telemetry):
       self.enterContext(mock.patch.object(module, "get_state_store", return_value=self.store))
-    self.enterContext(mock.patch.object(facts, "get_queue", return_value=self.queues))
+    self.enterContext(mock.patch.object(api_server, "queue", self.queues))
     self.enterContext(mock.patch.object(fleet, "kubernetes", mock.AsyncMock(side_effect=lambda: json.loads(json.dumps(NO_CLUSTER)))))
     self.enterContext(mock.patch.object(router, "time", mock.Mock(time=lambda: self.now)))
     self.recorder = self.enterContext(mock.patch.object(telemetry, "recorder", telemetry.Recorder("api_server", None)))

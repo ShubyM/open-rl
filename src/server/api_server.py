@@ -37,23 +37,29 @@ from server.model_metadata import (
   pool_name,
 )
 from server.observability.router import router
-from server.queue import StreamQueue, get_queue, sample_queue, train_queue
+from server.queue import StreamQueue, sample_queue, train_queue
 from server.sampling_dispatcher import SAMPLE_DEADLINE_SECONDS
 from server.session_registry import SessionRegistry
-from server.store import get_state_store
+from server.store import get_state_store, redis_client
 from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_id, owner_of, runtime_of
 from training import commands
 from training.commands import Command
 from training.types import TRAINER_BACKENDS, Datum, FFTConfig, FineTuningType, LoraConfig
 
-queue: StreamQueue | None = get_queue() if os.environ.get("REDIS_URL") else None
+queue: StreamQueue | None = StreamQueue(redis_client(url)) if (url := os.getenv("REDIS_URL")) else None
 state = get_state_store()
 worker_manager: WorkerManager | None = None
 
 
 def _queue() -> StreamQueue:
-  return queue if queue is not None else get_queue()
+  global queue
+  if queue is None:
+    url = os.getenv("REDIS_URL")
+    if not url:
+      raise RuntimeError("REDIS_URL is required")
+    queue = StreamQueue(redis_client(url))
+  return queue
 
 
 session_registry = SessionRegistry(state)

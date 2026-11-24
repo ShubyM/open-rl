@@ -7,7 +7,6 @@ worker leaves its entries behind for the next one. Results land in a single-entr
 from __future__ import annotations
 
 import json
-import os
 import time
 from array import array
 from typing import Any
@@ -15,7 +14,6 @@ from typing import Any
 import redis.asyncio as redis
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from server.store import redis_client
 from server.telemetry import sample_answered
 
 RESULT_TTL_SECONDS = 300
@@ -25,8 +23,6 @@ PENDING_TTL_SECONDS = 3 * 24 * 3600
 SWEEP_PAGE = 100
 # Keep each XREAD BLOCK chunk well below redis_client's 30s socket timeout.
 BLOCK_CHUNK_MS = 10_000
-
-_QUEUES: dict[str, StreamQueue] = {}
 
 
 def queue_key(name: str) -> str:
@@ -370,12 +366,3 @@ class StreamQueue:
   async def pinned_revisions(self, pool: str) -> set[str]:
     """Revisions still named by pending requests in `pool`, so their weights must remain on disk."""
     return {_job_and_revision(fields)[1] async for _, fields in self.entries(sample_queue(pool))} - {""}
-
-
-def get_queue() -> StreamQueue:
-  redis_url = os.environ.get("REDIS_URL")
-  if not redis_url:
-    raise RuntimeError("REDIS_URL is required")
-  if redis_url not in _QUEUES:
-    _QUEUES[redis_url] = StreamQueue(redis_client(redis_url))
-  return _QUEUES[redis_url]
